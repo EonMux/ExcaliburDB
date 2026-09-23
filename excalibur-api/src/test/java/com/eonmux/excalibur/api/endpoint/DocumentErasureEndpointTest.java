@@ -444,6 +444,51 @@ class DocumentErasureEndpointTest {
         }
 
         @Test
+        @DisplayName("a reindex in flight is stopped before the erasure, so nothing it writes survives")
+        void anInFlightReindexRestoresNothing() throws Exception {
+            // The race the deregistration exists to win. A re-crawl that is running when the
+            // erasure arrives finishes the document it is on when asked to stop; if the erasure
+            // did not wait for that, the document would land after the erasure had looked, and
+            // the source would read as erased while still holding it.
+            com.eonmux.excalibur.api.reindex.ReindexCoordinator coordinator =
+                new com.eonmux.excalibur.api.reindex.ReindexCoordinator();
+            ReindexEndpoint.InMemoryReindexStatusRegistry reindexes =
+                new ReindexEndpoint.InMemoryReindexStatusRegistry();
+            sources.setReindexCoordinator(coordinator);
+            sources.setReindexStatusRegistry(reindexes);
+            registerSource("docs");
+            ingest("docs", "a.md", 2);
+
+            com.eonmux.excalibur.api.reindex.ReindexCoordinator.Lease lease =
+                coordinator.tryAcquire("docs");
+            reindexes.startReindex("docs");
+            java.util.concurrent.CountDownLatch asked = new java.util.concurrent.CountDownLatch(1);
+            lease.onCancel(asked::countDown);
+            Thread run = Thread.ofVirtual().start(() -> {
+                try {
+                    asked.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                    Thread.sleep(50);
+                    ingest("docs", "late.md", 1);
+                    reindexes.cancelReindex("docs");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    lease.release();
+                }
+            });
+
+            Response response = post("{\"source_id\": \"docs\", \"scope\": \"source\"}");
+            run.join();
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(Json.at(response.json(), "documents_erased")).isEqualTo(2L);
+            assertThat(Json.at(response.json(), "documents_remaining")).isEqualTo(0L);
+            assertThat(storage).as("nothing the reindex wrote outlived the erasure").isEmpty();
+            assertThat(registry.getBySource("docs")).isEmpty();
+            assertThat(reindexes.getStatus("docs")).isNull();
+        }
+
+        @Test
         @DisplayName("a deregistration that could not be recorded erases nothing")
         void anUnrecordableDeregistrationErasesNothing() throws IOException {
             // The source comes out of the crawl first precisely so nothing restores what is

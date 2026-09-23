@@ -59,8 +59,14 @@ import java.util.concurrent.TimeUnit;
  * <p>A source can also be reindexed by the scheduler. Both entry points take the same
  * per-source claim from {@link com.eonmux.excalibur.api.reindex.ReindexCoordinator}: two runs
  * over one source compare against the same registry entries, and each retires the version it
- * replaced - which can be the one the other has just published. A request for a source that is already being reindexed is answered
- * with 409.</p>
+ * replaced - which can be the one the other has just published. A request for a source that is
+ * already being reindexed is answered with 409.</p>
+ *
+ * <h2>Removing the Source</h2>
+ * <p>Deregistering a source, and erasing one, stops its running reindex through the same claim
+ * and waits for it to end - see {@code InMemorySourceRegistry#remove}. The claim is therefore
+ * taken before registration is last checked, so a request cannot slip a new run in after the
+ * removal has finished waiting.</p>
  *
  * <h2>Without a Reindexer</h2>
  * <p>If no {@link DocumentReindexer} is wired, the endpoint answers 503. Accepting the
@@ -322,6 +328,15 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
                 }
                 if (lease == null) {
                     sendError(exchange, 409, "Reindex already in progress for source: " + sourceId);
+                    return;
+                }
+                // Asked again now the claim is held. Removing a source stops and waits for the
+                // reindex holding its claim, so a request that saw the source registered and
+                // claimed it only after a removal had finished waiting would otherwise open a
+                // status the removal has cleared, for a source nothing can name any more.
+                if (!sourceRegistry.isRegistered(sourceId)) {
+                    lease.release();
+                    sendError(exchange, 404, "Source not found: " + sourceId);
                     return;
                 }
 
@@ -705,6 +720,23 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         }
 
         /**
+         * Records that the run finished, and that some of its documents failed on the way.
+         *
+         * <p>{@code idle} like any finished run, because it did finish and what it indexed is
+         * published - reporting it {@link #STATE_FAILED} would have an operator treat a run that
+         * reindexed four hundred documents and lost one as a run that reindexed nothing. But not
+         * silently: this readback is the only place the outcome of a background run is visible,
+         * and a run that left documents behind has to be distinguishable from one that did
+         * not.</p>
+         *
+         * @param error What failed, in the terms the readback may carry
+         */
+        public void completeWithErrors(String error) {
+            complete();
+            this.lastError = error;
+        }
+
+        /**
          * Records that the run stopped because {@code DELETE /v1/reindex} asked it to.
          *
          * <p>The counters are left as the run last published them: how far a cancelled run got
@@ -742,6 +774,19 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         void startReindex(String sourceId);
         void updateProgress(String sourceId, String state, double progress, long processed, long total);
         void completeReindex(String sourceId);
+
+        /**
+         * Records that a run finished with some of its documents failed.
+         *
+         * <p>Separate from both {@link #completeReindex(String)} and
+         * {@link #failReindex(String, String)}: the run finished and its result is published,
+         * and it left documents behind, and the readback has to say both.</p>
+         *
+         * @param sourceId The source whose run finished
+         * @param error    How many documents failed, in the terms the readback may carry
+         */
+        void completeReindexWithErrors(String sourceId, String error);
+
         void failReindex(String sourceId, String error);
 
         /**
@@ -804,6 +849,14 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
             ReindexStatus status = statuses.get(sourceId);
             if (status != null) {
                 status.complete();
+            }
+        }
+
+        @Override
+        public void completeReindexWithErrors(String sourceId, String error) {
+            ReindexStatus status = statuses.get(sourceId);
+            if (status != null) {
+                status.completeWithErrors(error);
             }
         }
 

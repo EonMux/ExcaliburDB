@@ -8,6 +8,7 @@ import java.util.Locale;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.core.logging.StructuredLoggingHelper;
+import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -15,6 +16,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 /**
  * HTTP endpoint for the /v1/ingest/status API.
@@ -65,6 +67,14 @@ import java.util.concurrent.ConcurrentHashMap;
  *       documents were counted into {@code entries_pending} and none were indexed, and
  *       {@code last_error} says what to configure</li>
  * </ul>
+ *
+ * <h2>Across a restart</h2>
+ * <p>With a {@link SourceStatusFile} attached - see
+ * {@link InMemoryIngestionStatusRegistry#persistTo(SourceStatusFile)} - every run that ends is
+ * written down, and a source restored at startup reports that run: its counts, its error and its
+ * {@code last_updated_ms}, rather than zeros stamped with the moment the node came up. A run the
+ * restart interrupted never reached the file, so a restored source reports the last run that
+ * finished and never one that claims to still be going.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
@@ -261,6 +271,12 @@ public class IngestStatusEndpoint implements HttpHandler {
         private volatile String lastError;
         private volatile long lastUpdatedMs;
 
+        /**
+         * Told each time this status settles - reaches a state that ends a run - so that what
+         * the run ended with can be written down; null when nothing keeps a history.
+         */
+        private volatile Consumer<IngestionStatus> onSettled;
+
         public IngestionStatus(String sourceId) {
             this.sourceId = Objects.requireNonNull(sourceId, "sourceId cannot be null");
             this.state = "idle";
@@ -280,6 +296,74 @@ public class IngestStatusEndpoint implements HttpHandler {
         public long entriesSkipped() { return entriesSkipped; }
         public String lastError() { return lastError; }
         public long lastUpdatedMs() { return lastUpdatedMs; }
+
+        /**
+         * Whether this status describes a run that has ended rather than one under way.
+         *
+         * <p>{@code idle} and {@code unconfigured} are the two states a run is left in; every
+         * other state is reported while one is going.</p>
+         *
+         * @return true once no run is in progress
+         */
+        public boolean isSettled() {
+            String current = state;
+            return "idle".equals(current) || STATE_UNCONFIGURED.equals(current);
+        }
+
+        /**
+         * Hands a settled status to whoever keeps the history, if anyone does.
+         *
+         * <p>Called after every change rather than only after the last one of a run, because
+         * which change is the last is the caller's to know: a run ends with an update to
+         * {@code idle} and then, sometimes, a skipped count or an error. Each is written, so the
+         * history is never behind what the readback says.</p>
+         */
+        private void reportIfSettled() {
+            Consumer<IngestionStatus> listener = onSettled;
+            if (listener != null && isSettled()) {
+                listener.accept(this);
+            }
+        }
+
+        /**
+         * What this status would be remembered as.
+         *
+         * @return The entry the history keeps for it
+         */
+        SourceStatusFile.Entry snapshot() {
+            return new SourceStatusFile.Entry(sourceId, state, progress, entriesIngested,
+                entriesPending, entriesSkipped, lastUpdatedMs, lastError);
+        }
+
+        /**
+         * Rebuilds a status from what the history kept of it.
+         *
+         * <p>Only ended runs are written, so the state is one a run is left in. One that is not -
+         * a file this build did not write - is read as the run it describes having been cut
+         * short, rather than served as a run in progress that nothing is running.</p>
+         *
+         * @param entry What was remembered
+         * @return The status, with the time it was last updated as remembered
+         */
+        static IngestionStatus restoredFrom(SourceStatusFile.Entry entry) {
+            IngestionStatus status = new IngestionStatus(entry.sourceId());
+            status.state = entry.state();
+            status.progress = clampProgress(entry.progress());
+            status.entriesIngested = entry.ingested();
+            status.entriesPending = entry.pending();
+            status.entriesSkipped = entry.skipped();
+            status.lastError = entry.lastError();
+            status.lastUpdatedMs = entry.lastUpdatedMs();
+            if (!status.isSettled()) {
+                status.state = "idle";
+                status.lastError = INTERRUPTED_BY_RESTART;
+            }
+            return status;
+        }
+
+        /** What a restored status says about a run that was recorded as still going. */
+        static final String INTERRUPTED_BY_RESTART =
+            "The run in progress when the node stopped did not finish";
 
         /**
          * Updates the status.
@@ -304,6 +388,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             this.entriesIngested = Math.max(0, entriesIngested);
             this.entriesPending = Math.max(0, entriesPending);
             this.lastUpdatedMs = System.currentTimeMillis();
+            reportIfSettled();
         }
 
         /**
@@ -337,6 +422,7 @@ public class IngestStatusEndpoint implements HttpHandler {
         public void setSkipped(long entriesSkipped) {
             this.entriesSkipped = Math.max(0, entriesSkipped);
             this.lastUpdatedMs = System.currentTimeMillis();
+            reportIfSettled();
         }
 
         /**
@@ -346,6 +432,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             this.lastError = error;
             this.state = "idle";
             this.lastUpdatedMs = System.currentTimeMillis();
+            reportIfSettled();
         }
 
         /**
@@ -368,6 +455,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             this.entriesPending = Math.max(0, entriesPending);
             this.lastError = reason;
             this.lastUpdatedMs = System.currentTimeMillis();
+            reportIfSettled();
         }
 
         /**
@@ -381,6 +469,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             this.entriesSkipped = 0;
             this.lastError = null;
             this.lastUpdatedMs = System.currentTimeMillis();
+            reportIfSettled();
         }
     }
 
@@ -412,6 +501,19 @@ public class IngestStatusEndpoint implements HttpHandler {
         IngestionStatus getOrCreate(String sourceId);
 
         /**
+         * Returns the status for a source brought back at startup, as its last run left it.
+         *
+         * <p>A registry that keeps no history has nothing to restore from, and answers as
+         * {@link #getOrCreate(String)} does.</p>
+         *
+         * @param sourceId The source ID
+         * @return The status object to update
+         */
+        default IngestionStatus restore(String sourceId) {
+            return getOrCreate(sourceId);
+        }
+
+        /**
          * Removes status for a source.
          *
          * @param sourceId The source ID
@@ -421,9 +523,59 @@ public class IngestStatusEndpoint implements HttpHandler {
 
     /**
      * In-memory implementation of IngestionStatusRegistry.
+     *
+     * <p>In memory is where the statuses are served from, not necessarily where they end. With a
+     * {@link SourceStatusFile} attached through {@link #persistTo(SourceStatusFile)}, every run
+     * that ends is written to it and every removal taken back out, and {@link #restore(String)}
+     * brings a source's last run back at startup - the same arrangement the source registry has
+     * with its catalog.</p>
+     *
+     * <h2>What the file holds</h2>
+     * <p>One entry per source this process serves: the last run each one finished, or, for a
+     * restored source that has not run since, what the previous process remembered of it. A
+     * history no restored source claims - a source that could not be rebuilt at startup - is
+     * dropped at the first write, so the file never describes more than the node serves.</p>
+     *
+     * <h2>Thread Safety</h2>
+     * <p>Thread-safe. Reads are lock-free; writing the history holds a lock, so runs ending
+     * together serialise on the file rather than racing to replace it, and a removal cannot be
+     * undone by a run that was still reporting when it happened.</p>
      */
     public static class InMemoryIngestionStatusRegistry implements IngestionStatusRegistry {
+
+        private static final Logger HISTORY_LOGGER =
+            LoggerFactory.getLogger(InMemoryIngestionStatusRegistry.class);
+
         private final ConcurrentHashMap<String, IngestionStatus> statuses = new ConcurrentHashMap<>();
+
+        /** Guards {@link #history} and {@link #remembered}, and serialises writes of the file. */
+        private final Object historyLock = new Object();
+
+        /** What the file is to hold: the last settled status of every source served. */
+        private final Map<String, SourceStatusFile.Entry> history = new HashMap<>();
+
+        /** What the previous process left, waiting for its source to be restored. */
+        private final Map<String, SourceStatusFile.Entry> remembered = new HashMap<>();
+
+        private volatile SourceStatusFile file;
+
+        /**
+         * Makes the outcome of each run outlast the process.
+         *
+         * <p>Attached before any source is restored: what the file holds is read once, here, and
+         * handed out by {@link #restore(String)} as the sources it describes come back.</p>
+         *
+         * @param statusFile Where each source's last run is written
+         * @throws NullPointerException if the file is null
+         */
+        public void persistTo(SourceStatusFile statusFile) {
+            Objects.requireNonNull(statusFile, "statusFile cannot be null");
+            synchronized (historyLock) {
+                this.file = statusFile;
+                remembered.clear();
+                remembered.putAll(statusFile.loaded());
+            }
+        }
 
         @Override
         public IngestionStatus getStatus(String sourceId) {
@@ -437,12 +589,110 @@ public class IngestStatusEndpoint implements HttpHandler {
 
         @Override
         public IngestionStatus getOrCreate(String sourceId) {
-            return statuses.computeIfAbsent(sourceId, IngestionStatus::new);
+            return statuses.computeIfAbsent(sourceId, this::watched);
+        }
+
+        /**
+         * Returns a source's status as its last run left it, before this process ran it.
+         *
+         * <p>Taken from what the file held when it was attached, once; a source with nothing
+         * there - never crawled to the end, or registered on a node that kept no history - starts
+         * idle and empty, as a fresh registration does. The history taken over is kept in the
+         * file from then on even if the source does not run again before the next restart.</p>
+         *
+         * <p>Built outside the map's own locking and published with {@code putIfAbsent}: taking
+         * the history lock inside {@code computeIfAbsent} would order it after the map's bin lock,
+         * the reverse of {@link #remove(String)}, which takes the map's lock inside it.</p>
+         */
+        @Override
+        public IngestionStatus restore(String sourceId) {
+            IngestionStatus existing = statuses.get(sourceId);
+            if (existing != null) {
+                return existing;
+            }
+            SourceStatusFile.Entry entry;
+            synchronized (historyLock) {
+                entry = remembered.remove(sourceId);
+            }
+            IngestionStatus restored = entry == null
+                ? watched(sourceId) : watch(IngestionStatus.restoredFrom(entry));
+            IngestionStatus winner = statuses.putIfAbsent(sourceId, restored);
+            if (winner != null) {
+                return winner;
+            }
+            if (entry != null) {
+                synchronized (historyLock) {
+                    if (statuses.get(sourceId) == restored) {
+                        history.putIfAbsent(sourceId, restored.snapshot());
+                    }
+                }
+            }
+            return restored;
         }
 
         @Override
         public void remove(String sourceId) {
-            statuses.remove(sourceId);
+            synchronized (historyLock) {
+                statuses.remove(sourceId);
+                remembered.remove(sourceId);
+                if (history.remove(sourceId) != null) {
+                    writeHistory();
+                }
+            }
+        }
+
+        /** A new, empty status whose settling is written down. */
+        private IngestionStatus watched(String sourceId) {
+            return watch(new IngestionStatus(sourceId));
+        }
+
+        private IngestionStatus watch(IngestionStatus status) {
+            status.onSettled = this::settled;
+            return status;
+        }
+
+        /**
+         * Writes down what a run ended with.
+         *
+         * <p>Only for the status this registry still serves under that id: a run still reporting
+         * after its source was removed is describing something that is gone, and writing it
+         * would put back the history the removal took out.</p>
+         *
+         * @param status The status that settled
+         */
+        private void settled(IngestionStatus status) {
+            if (file == null) {
+                return;
+            }
+            synchronized (historyLock) {
+                if (statuses.get(status.sourceId()) != status) {
+                    return;
+                }
+                history.put(status.sourceId(), status.snapshot());
+                writeHistory();
+            }
+        }
+
+        /**
+         * Replaces the file with the history as it now stands, and never fails the caller.
+         *
+         * <p>The caller is an ingestion run or a removal, and neither should fail because a
+         * report could not be written: the run's result is in storage and the readback serves it
+         * either way. What is lost is that the next restart does not remember it, which the log
+         * says.</p>
+         */
+        private void writeHistory() {
+            SourceStatusFile target = file;
+            if (target == null) {
+                return;
+            }
+            try {
+                target.write(history.values());
+            } catch (IOException | RuntimeException e) {
+                HISTORY_LOGGER.warn("Could not write the ingest status history; the next "
+                    + "restart will report these sources from their next run: {}",
+                    e.toString());
+            }
         }
     }
 }

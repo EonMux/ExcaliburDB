@@ -68,7 +68,10 @@ public interface SourceRegistry extends AutoCloseable {
      * <p>Registration starts more than a map entry: an ingestion run, a status entry and a place
      * in the re-crawl schedule. An implementation that removed only the entry would leave the node
      * crawling a source no request can name and reporting one that no longer exists, so a removal
-     * must stop all three and close the source it owns.</p>
+     * must stop all three and close the source it owns. The schedule's own work counts too: a
+     * re-crawl already running is stopped and, within a bound, waited for before this returns,
+     * because a caller erasing the source removes its documents next and a re-crawl still writing
+     * would put them back.</p>
      *
      * <p>What it must <em>not</em> touch is the documents the source contributed. Stopping a crawl
      * and erasing what it produced are different operations, and only one of them is reversible.</p>

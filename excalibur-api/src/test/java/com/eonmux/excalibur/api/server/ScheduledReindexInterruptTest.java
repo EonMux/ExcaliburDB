@@ -57,7 +57,8 @@ class ScheduledReindexInterruptTest {
             new ReindexEndpoint.InMemoryReindexStatusRegistry();
         // No volume manager and no catalog, so the run takes the plain reindexAll(Source) path.
         return new ScheduledReindexRunner(coordinator,
-            new ReindexRun(reindexer, resolver, null, null, statuses, null), statuses);
+            new ReindexRun(reindexer, resolver, null, null, statuses, null), statuses,
+            id -> true);
     }
 
     @Test

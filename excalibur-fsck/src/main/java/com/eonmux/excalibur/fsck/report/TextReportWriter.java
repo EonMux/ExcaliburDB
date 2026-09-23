@@ -90,8 +90,9 @@ public final class TextReportWriter {
             counts.get(CheckStatus.MISSING));
         long rebuiltOnOpen = scan.rebuiltOnOpenCount();
         if (rebuiltOnOpen > 0) {
-            out.printf("  %d of the corrupt files the node rebuilds by itself when it next "
-                + "opens their segment - reported, and not counted as damage%n", rebuiltOnOpen);
+            out.printf("  %d of the corrupt files the node rebuilds or sets aside by itself "
+                + "when it next opens them - reported, and not counted as damage%n",
+                rebuiltOnOpen);
         }
         out.printf("  %d unsealed, %d legacy-unprotected, %d unchecked, %d only partly "
                 + "verified - these were NOT shown to be sound, only not shown to be "

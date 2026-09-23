@@ -381,7 +381,10 @@ segment's term sketch, `segment_<N>.tfs`, is the one derived file the node rebui
 sketch that fails its checksum is reported `CORRUPT` but not counted as damage, so it neither sets
 exit code `1` nor fails `--strict`, and the repair plan moves it aside (the node would rebuild it
 anyway). Only corruption is excused: a sketch the operating system will not read — an I/O error, a
-permission refused — is `UNREADABLE`, and fails the run like any file the device refuses. Every other derived file — a graph, a mapping, a codebook, an LSH table — is rebuilt only
+permission refused — is `UNREADABLE`, and fails the run like any file the device refuses. The
+source status history, `source-status`, is excused the same way for a different reason: it is not
+rebuilt, but the node reads one it cannot trust as no history and reports each source from its next
+run, so a damaged one costs how the last crawls ended and nothing the node serves. Every other derived file — a graph, a mapping, a codebook, an LSH table — is rebuilt only
 by a reindex or a retrain, and its damage fails the run. A `segment_<N>.hnsw.compact.docmap` is
 the mapping an HNSW compaction stages: beside its `segment_<N>.hnsw.compact` the compaction never
 swapped, both are staging leftovers, and the mapping is moved aside first; alone, the graph swap
@@ -858,8 +861,12 @@ belongs to whoever owns the source.
 `DELETE /v1/ingest` stops a crawl without destroying anything, which is the ordinary case — a source
 moved, a feed went stale, a job finished. It is a separate route from erasure on purpose: an
 operator stopping a runaway crawl should not have to reach for the button that also deletes. Both go
-through the same removal, which stops an ingestion run in flight, clears the source's
-`/v1/ingest/status` entry and cancels its place in the re-crawl schedule.
+through the same removal, which stops an ingestion run in flight, stops a re-crawl in flight and
+waits for it to end, clears the source's `/v1/ingest/status` and `/v1/reindex/status` entries and
+cancels its place in the re-crawl schedule. The re-crawl is waited for — up to thirty seconds,
+which is one document's fetch, embedding and writes — because it finishes the document it is on
+when asked to stop, and a document that landed after an erasure had looked would put back what
+the erasure removed.
 
 It stops short of the vector indexes, which are reclaimed per segment rather than per entry: until
 the segment holding an erased chunk is compacted, a vector query can still rank it — without
@@ -1579,6 +1586,12 @@ indexes nothing at all, and reporting that as a completed run would make a broke
 like a healthy one. A missing API key is *not* this state: that node has a pipeline and indexes
 lexically.
 
+The status outlives a restart. Each source's last finished run is kept in
+`<data dir>/source-status`, so a source the node brings back reports that run — counts, error and
+`last_updated_ms` unchanged — until its next run replaces it. A run the restart interrupted is
+never reported as still running: it comes back `idle`, with `last_error` saying the run in
+progress when the node stopped did not finish.
+
 | Count | What it counts |
 |-------|----------------|
 | `entries_ingested` | Chunks written and published by this run |
@@ -1704,12 +1717,15 @@ and `failed`, which the ingest status has no equivalent of. A run stopped throug
 parsing `state`: a stop that was asked for is not a crash, and reporting it as one sends an
 operator looking for a fault that is not there. `finished_at_ms` is when the run ended, `0`
 while one is still going, so how long it took and how stale its result is are both readable.
-A reindex that stops early leaves the old segments
-serving, and `last_error` says what kind of failure it was and how many documents it affected,
-pointing at the node's log for the reason itself — those reasons carry filesystem paths and
-embedding endpoint URLs, and this route answers any caller holding a read token. It is not
-reported as `idle`, because a failed run reported as idle-with-a-note reads as a run that
-finished.
+A run is `failed` only when it indexed nothing; it leaves the old segments serving, and
+`last_error` says what kind of failure it was and how many documents it affected. A run that
+indexed some documents and failed on others did finish, and reads `idle` at `progress: 1.0` with
+`last_error` counting the failures and the documents indexed (`"Reindex completed with 3 errors;
+400 documents indexed; ..."`), so a clean run is the one with `last_error: null`. Either way
+`last_error` points at the node's log for the reasons themselves — those carry filesystem paths
+and embedding endpoint URLs, and this route answers any caller holding a read token. A run that
+indexed nothing is not reported as `idle`, because a failed run reported as idle-with-a-note
+reads as a run that finished.
 
 A source that has never been reindexed is a 404 rather than an invented idle run: "nothing has
 been asked of it" and "it ran and did nothing" are different answers, and only the second means
@@ -1792,8 +1808,8 @@ kept.
 stores are compacted one after the other and reported independently, so a failure in one does
 not hide what the other did: `state` and `error` describe the segment store, and a chunk index
 that failed reads `{"performed": false, "error": "..."}` with no counts. `performed` false with a
-`reason` is either the index's policy finding nothing due (`"not due: ..."`) or a run stopped
-before it reached the index. `segments_rewritten` is how many lexical segments were rewritten,
+`reason` is the index's policy finding nothing due (`"not due: ..."`), a run stopped before it
+reached the index, or one stopped during the index's rewrite (`"stopped: ..."`). `segments_rewritten` is how many lexical segments were rewritten,
 `segments_produced` how many replaced them, and `chunks_removed` how many tombstoned chunks — and
 chunks the store no longer holds — did not survive the rewrite. `groups_abandoned` counts groups
 of segments the rewrite had to leave as they were, because reading a surviving chunk's text back out
@@ -1801,9 +1817,13 @@ of storage failed in a way a later attempt may not repeat; those segments keep t
 any erasure owed in them stays owed for the next compaction. A rewrite that abandoned every group
 it selected published nothing and reads `performed: false`, with a `reason` beginning `nothing
 published:`; one that published some groups and abandoned others reads `performed: true` with a
-`reason` beginning `partial:`. A stop that arrives while the index is being rewritten lets that
-rewrite finish: the index's files are shared with every query, and interrupting a thread in the
-middle of file I/O would close them underneath those queries.
+`reason` beginning `partial:`. A stop that arrives while the index is being rewritten ends the
+rewrite at its next checkpoint — before the next group of segments or the next chunk — rather
+than by interrupting it: the index's files are shared with every query, and interrupting a thread
+in the middle of file I/O would close them underneath those queries. What the rewrite had built so
+far is discarded and nothing is published, so the index is exactly as it was; the run reads
+`cancelled`, and `lexical` reads `performed: false` with a `reason` beginning `stopped:`. The next
+compaction plans again from what is there.
 
 ### Stats Example
 
@@ -2582,6 +2602,18 @@ sources were never registered in, so the node would come back silently having fo
 catalog written by a build older than the marker fails the start; see
 [Upgrading a data directory](USAGE.md#upgrading-a-data-directory-written-by-an-older-build).
 
+`<data dir>/source-status` records how each registered source's last run ended — its state, its
+progress and counts, when it finished, and its `last_error` — so `GET /v1/ingest/status` after a
+restart reports that run rather than zeros stamped with the moment the node came up. Only finished
+runs are written (`idle` or `unconfigured`); a crawl the restart cut short comes back `idle` with
+`last_error` saying that the run in progress when the node stopped did not finish, never still
+claiming to run. The file is written the way the catalog is — a `\#source-status|1` header, one
+line per source, a `\#end|<count>` marker, forced to disk and published by an atomic rename — but
+unlike the catalog, one that cannot be read does not fail the start. It is a report, not state the
+store depends on: the node logs it, treats the history as empty, and each source reports from its
+next run. A data directory from a build without the file needs nothing; it is written when the
+first run ends.
+
 ### Visibility and Consistency
 
 The system uses epoch-based visibility tracking to ensure:
@@ -2963,7 +2995,8 @@ reply is a `202` rather than a `200` until it is done.
 
 **How do I remove everything one source contributed?**
 `POST /v1/erasure` with `{"source_id": "...", "scope": "source"}` — no document ids, which the node
-looks up itself. It also deregisters the source, so the scheduler cannot re-crawl what you just
+looks up itself. It also deregisters the source first — stopping a re-crawl already running and
+waiting for it to end — so neither the scheduler nor a run in flight can put back what you just
 erased. Each request erases up to a thousand documents and reports `documents_remaining`; repeat
 until that is zero — and watch `documents_incomplete` alongside it, because a document the node
 could not fully erase is answered with a `500` and stays in the registry, so a loop keyed only on

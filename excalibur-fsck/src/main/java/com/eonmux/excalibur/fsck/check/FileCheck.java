@@ -101,10 +101,11 @@ public record FileCheck(
      * Reports whether this verdict is damage to the store, which is what fails a deploy gate.
      *
      * <p>Every corrupt, unreadable or missing file is, with one exception: a corrupt file of a
-     * kind the node rebuilds by itself when it opens ({@link FileKind#rebuiltOnOpen()}). That
-     * file is reported as corrupt, because its bytes do not match its checksum, and it costs
-     * the node a rebuild at start-up and nothing else, so it does not make the directory
-     * damaged. Only corruption is exempt. A file that could not be read at all says something
+     * kind the node recovers from by itself when it opens ({@link FileKind#recoveredOnOpen()}) -
+     * rebuilding it, as a term sketch is rebuilt, or setting it aside, as the source status
+     * history is. That file is reported as corrupt, because its bytes do not match what it
+     * declares, and it costs the node a rebuild or a history at start-up and nothing else, so it
+     * does not make the directory damaged. Only corruption is exempt. A file that could not be read at all says something
      * about the device or its permissions that reaches past the one file, and stays damage
      * whatever its kind.</p>
      *
@@ -115,7 +116,7 @@ public record FileCheck(
             return false;
         }
         return status != CheckStatus.CORRUPT
-            || !FileClassifier.classify(relative).rebuiltOnOpen();
+            || !FileClassifier.classify(relative).recoveredOnOpen();
     }
 
     /**

@@ -17,6 +17,7 @@ import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
+import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
 import com.eonmux.excalibur.ingest.source.SourceResolver;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
@@ -328,6 +329,23 @@ public class ExcaliburDBServer {
     public void withSourceCatalog(SourceCatalog catalog) {
         requireNotStarted("the source catalog");
         wiring.withSourceCatalog(catalog);
+    }
+
+    /**
+     * Makes {@code GET /v1/ingest/status} survive a restart.
+     *
+     * <p>Must be called before {@link #start()}, for the reason {@link #withSourceCatalog} must:
+     * the sources the catalog restores take their status from this file as they come back, so a
+     * source crawled before the restart reports that crawl rather than zeros stamped with the
+     * moment the node came up.</p>
+     *
+     * @param statusFile Where each source's last finished run is written
+     * @throws IllegalStateException if the server is already running
+     * @throws NullPointerException  if the file is null
+     */
+    public void withSourceStatus(SourceStatusFile statusFile) {
+        requireNotStarted("the source status file");
+        wiring.withSourceStatus(statusFile);
     }
 
     /** Attaches lexical retrieval, before the server starts. */

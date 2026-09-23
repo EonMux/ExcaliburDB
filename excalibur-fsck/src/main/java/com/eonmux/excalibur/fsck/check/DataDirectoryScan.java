@@ -94,7 +94,8 @@ public record DataDirectoryScan(
     }
 
     /**
-     * Counts corrupt files the node rebuilds by itself on open, which are not damage.
+     * Counts corrupt files the node recovers from by itself on open - rebuilding them or
+     * setting them aside - which are not damage.
      *
      * @return How many corrupt verdicts {@link FileCheck#isDamage()} exempts
      */

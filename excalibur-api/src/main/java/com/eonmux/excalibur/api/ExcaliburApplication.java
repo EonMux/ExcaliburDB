@@ -584,6 +584,12 @@ public final class ExcaliburApplication {
         // be read: starting with an empty registry would silently cancel every source on it.
         srv.withSourceCatalog(com.eonmux.excalibur.ingest.registry.SourceCatalog.open(dataDirectory));
 
+        // And how each of them was last crawled, so /v1/ingest/status after a restart reports
+        // that crawl rather than zeros. Never fatal: a history that cannot be read is logged and
+        // each source reports from its next run.
+        srv.withSourceStatus(
+            com.eonmux.excalibur.ingest.registry.SourceStatusFile.open(dataDirectory));
+
         // This enables /v1/ingest to trigger full document processing: chunking, embedding, storage
         attachIngestionPipeline(srv);
 

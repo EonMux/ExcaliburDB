@@ -125,6 +125,8 @@ public final class FileInspector {
                 file, relative, "document registry", "\\#document-registry");
             case SOURCE_CATALOG -> CountMarkedTextCheck.check(
                 file, relative, "source catalog", "\\#source-catalog");
+            case SOURCE_STATUS -> CountMarkedTextCheck.check(
+                file, relative, "source status history", "\\#source-status");
             case IN_FLIGHT_JOURNAL -> unverifiable(file, relative, "in-flight ingest journal",
                 "this journal carries neither a checksum nor a record count, by design: it is "
                     + "truncation-tolerant, because losing either half of a begin/end pair is "

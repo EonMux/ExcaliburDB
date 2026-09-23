@@ -870,6 +870,13 @@ progress. Without it an `idle` source reads the same whether it was crawled a mi
 before a restart three weeks back, and "is the index still following the source?" cannot be
 answered from the API at all.
 
+The whole response survives a restart. The node writes each source's last finished run to
+`<data dir>/source-status`, and a source it brings back reports that run — the same counts, error
+and `last_updated_ms` — until its next run replaces it. A run the restart cut short is not
+reported as still running: it comes back `idle`, with `last_error` reading `The run in progress
+when the node stopped did not finish`. A `source-status` the node cannot read is logged and
+ignored rather than failing the start; each source then reports from its next run.
+
 `entries_skipped` is how many of the files the crawl listed were not text and so had nothing in
 them to index — images, archives, compiled output, anything whose decoded bytes carry a U+0000 or
 run a third or more replacement characters. It is reported apart from `last_error` on purpose: a
@@ -1117,7 +1124,10 @@ curl http://localhost:8080/v1/reindex/status
 
 `state` is one of `crawling`, `embedding`, `indexing` while a run is in flight, `idle` at
 `progress: 1.0` once it finished, `cancelled` when someone stopped it, or `failed` with
-`last_error` set when it broke. `cancelled` and `failed` are different answers and the
+`last_error` set when it broke — which means it indexed nothing. A run that indexed some documents
+and failed on others finished, so it reads `idle`, with `last_error` counting what failed and what
+was indexed (`"Reindex completed with 3 errors; 400 documents indexed; see the node's log for the
+reason"`); a clean run is `idle` with `last_error: null`. `cancelled` and `failed` are different answers and the
 `cancelled` boolean says which without parsing `state`: a stopped run is the outcome you asked
 for, and reporting it as a crash sends an operator looking for a fault that is not there.
 `finished_at_ms` is when the run ended — `0` while one is still going — so how long it took, and
@@ -1215,8 +1225,10 @@ not a legal source id. **`413 Payload Too Large`** — the body is over the requ
 
 ### Stop crawling a source
 
-Takes a source out of the crawl: any ingestion run in flight is stopped, its `/v1/ingest/status`
-entry is cleared, and it is removed from the re-crawl schedule. **The documents it already indexed
+Takes a source out of the crawl: any ingestion run in flight is stopped, a re-crawl in flight is
+stopped and waited for (up to thirty seconds — it finishes the document it is on), its
+`/v1/ingest/status` and `/v1/reindex/status` entries are cleared, and it is removed from the
+re-crawl schedule. **The documents it already indexed
 are kept** and stay queryable — this is the routine case of a source that moved, went stale or
 finished, and it is deliberately not the same route as erasing them.
 
@@ -1276,12 +1288,14 @@ curl -X POST http://localhost:8080/v1/erasure \
 
 `scope` is a separate word rather than an omission: a request naming no document is a `400`, so
 "everything" cannot be reached by a client that forgot a field. It cannot be combined with
-`document_id` or `document_ids` either. A source-scoped erasure also **deregisters the source** —
-stopping any ingestion run in flight, clearing its `/v1/ingest/status` entry and cancelling its
-re-crawl schedule — so nothing restores what was just erased, and reports `source_deregistered`.
-Each request erases up to 1000 documents and reports `documents_remaining`; repeat until it reaches
-zero. A run stopped mid-flight finishes the document it was on, so one more may land between two
-calls, which is what the remaining count is for.
+`document_id` or `document_ids` either. A source-scoped erasure first **deregisters the source**
+— stopping any ingestion run in flight, stopping any re-crawl in flight and waiting for it to end,
+clearing its status entries and cancelling its re-crawl schedule — so nothing restores what was
+just erased, and reports `source_deregistered`. Each request erases up to 1000 documents and
+reports `documents_remaining`; repeat until it reaches zero. An ingestion run stopped mid-flight
+finishes the document it was on without being waited for, so one more may land between two calls,
+which is what the remaining count is for. A re-crawl is waited for before anything is erased, up
+to thirty seconds; one that outlives that is logged and may likewise land one more document.
 
 **Response — `200 OK`, or `202 Accepted` while the graph half is still queued**
 
@@ -2388,7 +2402,9 @@ It is charged against the mutate budget like starting one.
 The run is *asked* to stop and ends at its next segment boundary, keeping what it had already
 reclaimed. That is safe at any point: a rewrite builds its replacement beside the original and
 swaps it in only at the end, so what a stopped run loses is its own unfinished work, never data.
-`GET /v1/compact/status` reads `cancelled` once it has ended. Only a run started with
+The chunk index is rewritten as one replacement rather than segment by segment, so a stop during
+its rewrite keeps none of that rewrite: what it had built is discarded and the index is left
+exactly as it was. `GET /v1/compact/status` reads `cancelled` once it has ended. Only a run started with
 `POST /v1/compact` is stopped; the background sweeps carry on as configured.
 
 ### Compaction status
@@ -2444,7 +2460,7 @@ curl http://localhost:8080/v1/compact/status
 - **`lexical`** is the chunk index's half, present only on a node that keeps one. It is compacted
   after the segment store and reported whatever the store's half came to, so `state` and `error`
   describe the store alone. `performed: false` with a `reason` is the index's policy finding
-  nothing due, as above, or a run stopped before it reached the index; with an `error` instead of
+  nothing due, as above, or a run stopped before it reached the index or during its rewrite; with an `error` instead of
   counts, the index's compaction failed. **`segments_rewritten`** and **`segments_produced`** are
   lexical segments in and out, and **`chunks_removed`** is the tombstoned chunks — and chunks the
   store no longer holds — that did not survive the rewrite. **`groups_abandoned`** is groups of
@@ -2453,8 +2469,10 @@ curl http://localhost:8080/v1/compact/status
   next compaction. When every group was abandoned nothing was published: `performed` is `false`
   and the `reason` begins `nothing published:`. When only some were, `performed` is `true` and the
   `reason` begins `partial:`. A `DELETE /v1/compact` arriving while
-  the index is being rewritten lets that rewrite finish rather than interrupt I/O the index's
-  queries share.
+  the index is being rewritten ends the rewrite at its next checkpoint — the next group of
+  segments or the next chunk — rather than interrupt I/O the index's queries share. What it had
+  built is discarded and nothing is published, so the index is exactly as it was: the run reads
+  `cancelled` and `lexical` reads `performed: false` with a `reason` beginning `stopped:`.
 
 Only the most recent run is kept; the next one replaces it.
 
@@ -2557,8 +2575,8 @@ Logback is pre-configured with JSON structured logging via logstash-encoder. Poi
 ### Backups
 
 Every byte of a node's state lives under its data directory — segments, write logs, the segment
-catalog, the routing directory, the chunk index, the graph, the document registry and the source
-catalog. Nothing is kept anywhere else, so backing the node up is copying that one directory and
+catalog, the routing directory, the chunk index, the graph, the document registry, the source
+catalog and the source status history. Nothing is kept anywhere else, so backing the node up is copying that one directory and
 restoring it is putting the directory back.
 
 `excalibur-backup` does that copy and, unlike `cp`, can prove afterwards that it worked.
@@ -2740,6 +2758,13 @@ Two derived files are judged by what the node does with them rather than by name
   something about the device rather than about one derived file. Every other derived file is
   rebuilt only by a reindex or a retrain, so its damage fails the run. A sketch whose segment is gone is an orphaned index like any other,
   and a stranded `segment_<N>.tfs.<id>.tmp` is a staging leftover.
+- **`source-status`, how each source's last crawl ended**, is not derived and nothing rebuilds it,
+  but nothing the node serves depends on it either: a node that cannot trust it logs that, treats
+  the history as empty, and reports each source from its next run. So a `source-status` whose
+  record count disagrees with its records is reported `CORRUPT`, counted with the sketches under
+  `corruptRebuiltOnOpen` rather than as damage, and moved aside by the repair plan — what is lost
+  either way is the history, never indexed data. As with a sketch, one the operating system will
+  not read is `UNREADABLE` and fails the run.
 - **`segment_<N>.hnsw.compact.docmap`, a compaction's staged mapping**, means one of two things.
   Beside `segment_<N>.hnsw.compact`, the compaction never swapped its graph in: both are staging
   leftovers the node would discard, and the repair moves the mapping aside before the graph —
@@ -2859,6 +2884,10 @@ the ingredients instead and computes the bound at query time, against the statis
 use. An older segment is read with block pruning disabled — correct, and slower — and logs a
 `WARN` naming itself at open. Expect that warning after the upgrade; it is not data loss. A
 compaction rewrites the segment into the new format and the warning stops.
+
+**`<data dir>/source-status` — no step required.** A new file rather than a changed one: an
+older build never wrote it, so a directory it left has none, and every source reports from its
+next run exactly as it did before the upgrade. The file appears when the first run ends.
 
 ### Enabling debug logging
 

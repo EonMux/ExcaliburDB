@@ -69,6 +69,15 @@ public enum FileKind {
     /** {@code source-catalog}: which sources are registered. */
     SOURCE_CATALOG,
 
+    /**
+     * {@code source-status}: how each registered source's last crawl ended.
+     *
+     * <p>A report rather than state the store depends on: the node reads one it cannot trust as
+     * no history at all, and each source reports from its next run. See
+     * {@link #discardedOnOpen()}.</p>
+     */
+    SOURCE_STATUS,
+
     /** A log inside a tenant's {@code graph-staging} directory. */
     GRAPH_STAGING_LOG,
 
@@ -144,6 +153,31 @@ public enum FileKind {
      */
     public boolean rebuiltOnOpen() {
         return this == TERM_SKETCH;
+    }
+
+    /**
+     * Reports whether the node sets a damaged file of this kind aside by itself when it starts.
+     *
+     * <p>The other way damage can cost the node nothing but the file. The source status history
+     * is not rebuilt - what each source's last crawl did is not derivable from anything else -
+     * but nothing the node serves depends on it either: one that does not read back whole is
+     * logged and treated as empty, each source reports from its next run, and the file is
+     * rewritten when the first run ends. What is lost is the history, never data.</p>
+     *
+     * @return true for a kind the node discards, rather than refuses to start on, when damaged
+     */
+    public boolean discardedOnOpen() {
+        return this == SOURCE_STATUS;
+    }
+
+    /**
+     * Reports whether damage to a file of this kind is something the node recovers from on its
+     * own, by rebuilding it or by setting it aside.
+     *
+     * @return true when a corrupt file of this kind is not damage to the store
+     */
+    public boolean recoveredOnOpen() {
+        return rebuiltOnOpen() || discardedOnOpen();
     }
 
     /**

@@ -180,6 +180,11 @@ public final class RepairPlanner {
                 + "this file from the segment's live entries on its next open whether or not "
                 + "it is moved; moving it aside only means the damaged copy is no longer read "
                 + "first and rejected"
+            : kind.discardedOnOpen()
+            ? "Every byte is preserved under the quarantine directory. The node would read "
+                + "this history as empty on its next start whether or not it is moved, and "
+                + "report each source from its next run; what is lost either way is how the "
+                + "last crawls ended, never indexed data"
             : primary
             ? "Every byte is preserved under the quarantine directory, so this is reversible "
                 + "by hand. It is still a removal of primary data from the store: a damaged "

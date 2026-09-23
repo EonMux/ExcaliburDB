@@ -436,6 +436,10 @@ final class EndpointRegistrar {
         // already forgets what its ingestion did. /v1/reindex/status serves this registry,
         // and without the wiring it keeps answering for sources that are gone.
         inMemRegistry.setReindexStatusRegistry(in.reindexStatus());
+        // And so that deregistering it - or erasing it, which deregisters first - stops a
+        // re-crawl already running over it and waits for that to end, rather than leaving it to
+        // write the source's documents back after they are gone.
+        inMemRegistry.setReindexCoordinator(in.reindexCoordinator());
         LOGGER.info("IngestSourceRegistry wired to ReindexScheduler with interval={}ms", reindexIntervalMs);
 
         // The catalog is attached before its records are read back, so a source restored here

@@ -33,7 +33,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * trigger started it, so it is what shutdown drains: {@link #stopAccepting()} refuses new
  * claims, {@link #cancelAll()} asks every run to stop, and {@link #awaitIdle(long)} says whether
  * they all ended in time. A run is asked through the canceller it registered, which is expected
- * to be cooperative - see {@link Lease#onCancel(Runnable)}.</p>
+ * to be cooperative - see {@link Lease#onCancel(Runnable)}. Taking one source away drains that
+ * source alone the same way, through {@link #cancelAndAwait(String, long)}.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is thread-safe. Acquisition is a single atomic map operation, so
@@ -158,6 +159,43 @@ public final class ReindexCoordinator {
         }
         lease.cancel();
         return true;
+    }
+
+    /**
+     * Asks a running reindex of one source to stop, and waits until it has.
+     *
+     * <p>What taking a source away needs, where {@link #cancel(String)} is what an operator
+     * clearing a wedged run needs. A deregistration - and the erasure that begins with one - is
+     * only as good as the moment after it: a reindex still running then writes the source's
+     * documents back into what the erasure has just emptied, reads through a source that is
+     * about to be closed, and records a status for a source that no longer exists. So the stop is
+     * asked for and then waited on, until the run has released its claim.</p>
+     *
+     * <p>Bounded, because the run stops at its next checkpoint and a checkpoint is reached only
+     * as quickly as the document it is on can be fetched, embedded and written. A run that does
+     * not stop in time is still asked to; the caller learns it did not end, and goes on.</p>
+     *
+     * @param sourceId      The source whose reindex should stop
+     * @param timeoutMillis How long to wait at most
+     * @return true once no reindex of the source holds a claim; false if one still did when the
+     *         time ran out
+     * @throws InterruptedException if the waiting thread is interrupted
+     */
+    public boolean cancelAndAwait(String sourceId, long timeoutMillis)
+            throws InterruptedException {
+        Objects.requireNonNull(sourceId, "sourceId cannot be null");
+        cancel(sourceId);
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        synchronized (releaseMonitor) {
+            while (inFlight.containsKey(sourceId)) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    return false;
+                }
+                TimeUnit.NANOSECONDS.timedWait(releaseMonitor, remaining);
+            }
+            return true;
+        }
     }
 
     /**

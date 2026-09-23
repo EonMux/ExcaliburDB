@@ -201,6 +201,42 @@ class ReindexRunTest {
             assertThat(status().state())
                 .as("a run that reindexed 400 documents is not a failed reindex")
                 .isEqualTo("idle");
+            assertThat(status().progress()).isEqualTo(1.0);
+        }
+
+        @Test
+        @DisplayName("a run that finished with failed documents says how many, not which")
+        void partialRunReportsItsFailures() throws Exception {
+            // Idle, because it finished - but not silently. The readback is the only place a
+            // caller learns the outcome of a background run, and one that left three documents
+            // unindexed while answering last_error null read exactly like one that left none.
+            when(reindexer.reindexAll(eq(source), any(), any()))
+                .thenReturn(result(400, "/srv/docs/a.pdf unreadable", "b failed",
+                    "https://internal.example/c timed out"));
+
+            standardRun().execute(SOURCE_ID);
+
+            assertThat(status().state()).isEqualTo("idle");
+            assertThat(status().lastError())
+                .isEqualTo("Reindex completed with 3 errors; 400 documents indexed"
+                    + "; see the node's log for the reason");
+            assertThat(status().lastError())
+                .doesNotContain("/srv/docs")
+                .doesNotContain("internal.example");
+        }
+
+        @Test
+        @DisplayName("a clean run after a partial one clears what the partial one reported")
+        void aCleanRunClearsTheFailures() throws Exception {
+            when(reindexer.reindexAll(eq(source), any(), any()))
+                .thenReturn(result(400, "one bad document"))
+                .thenReturn(result(401));
+
+            standardRun().execute(SOURCE_ID);
+            statusRegistry.startReindex(SOURCE_ID);
+            standardRun().execute(SOURCE_ID);
+
+            assertThat(status().lastError()).isNull();
         }
 
         @Test
@@ -293,6 +329,9 @@ class ReindexRunTest {
             assertThat(status().state())
                 .as("the two branches must not disagree about the same corpus")
                 .isEqualTo("idle");
+            assertThat(status().lastError())
+                .isEqualTo("Reindex completed with 1 errors; 400 documents indexed"
+                    + "; see the node's log for the reason");
         }
 
         @Test
