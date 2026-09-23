@@ -2004,7 +2004,8 @@ curl http://localhost:8080/v1/stats
     "erasure": {"namespacesOwing": 1, "outstanding": 2, "overdueNamespaces": 0,
                 "unreadableNamespaces": 0, "oldestAgeMs": 91000},
     "ingest": {"documentsSeen": 20412, "factsStaged": 131877, "unresolvedDocuments": 0,
-               "extractionFailures": 3, "tenantFailures": 0, "sinkRefusals": 0}
+               "extractionFailures": 3, "tenantFailures": 0, "sinkRefusals": 0,
+               "withdrawalFailures": 0}
   }
 }
 ```
@@ -2669,7 +2670,7 @@ by comparing each slot against the record it names — the record keeps its own 
 hash, under the record's own checksum.
 
 The same standard covers the index files beside the segments: the HNSW graph, its
-node-to-document map, the PQ codebook and the LSH tables each carry a CRC32C over their payload
+node-to-chunk map, the PQ codebook and the LSH tables each carry a CRC32C over their payload
 plus one over their header, verified when they are opened. A corrupt one is refused by name
 rather than loaded, and — the failure that mattered most — a graph file whose magic number had
 been zeroed is not mistaken for "never initialised" and silently rebuilt as empty. A file
@@ -2704,6 +2705,19 @@ and nothing to undo; a file becomes protected the first time something rewrites 
 index that happens without being asked: compaction treats a segment in an older format as owing a
 rewrite, and upgrades a few of them on each pass until none are left.
 
+Each segment's graph, `segment_<N>.hnsw`, is accompanied by `segment_<N>.hnsw.docmap`, which
+names every graph node by the chunk it embeds — `source:document:chunk:N`, the key the chunk's
+text is stored under and the name the lexical index gives it. That is what a vector hit is
+returned as, so the two signals of a hybrid answer name one chunk alike and fuse on it, and
+`include_text` reads the chunk that matched. It is also what lets a vector be retired precisely:
+the integration worker replays each segment's write log in order, and a chunk written again
+supersedes the node of its previous version while a deleted chunk loses its node, so a document
+posted again or erased leaves nothing of its earlier versions rankable. A document that shrinks has
+the vectors of the chunks it no longer has retired as it is replaced, before those chunks are
+tombstoned. The mapping is format version 3; the document-keyed versions older builds wrote are
+re-keyed by the node itself — see
+[Upgrading a data directory](USAGE.md#upgrading-a-data-directory-written-by-an-older-build).
+
 The segment catalog beside them records which segment files this store owns and the lifecycle
 state, integrated offset, source and epochs of each. Its header is written to two slots in turn so
 a torn write always leaves one intact, and every record carries its own CRC, so a damaged row costs
@@ -2722,7 +2736,7 @@ Under `<data dir>/chunk-index` when the native engine is configured:
 | `manifest` | The segments the store consists of, one per line, with the epoch each became visible at and how many of its documents are tombstoned. A segment exists when this file names it and not before, so publication is one atomic rename |
 | `erasure.log` | Obligations recorded but not yet applied to disk, each with the time it was promised. Forced to disk before an erase call returns |
 | `seg-N/` | One segment's postings: `index.meta`, `terms.dict`, `terms.hash`, `post.off`, `post.blk`, `post.dat`, `docs.len`, all memory-mapped and read through the page cache |
-| `seg-N.keys` | The caller's name for each document, UTF-8, one per line. Text on purpose: this is what an operator opens to see what a segment holds |
+| `seg-N.keys` | The caller's name for each document, UTF-8, one per line — for ingested text, the chunk id `source:document:chunk:N`, the same name a vector hit on that chunk carries. Text on purpose: this is what an operator opens to see what a segment holds |
 | `seg-N.keyidx` | Byte offsets into `seg-N.keys`, so a name is a mapped read rather than heap |
 | `seg-N.keymap` | An open-addressed table from the hash of a name to its document, so erasing or republishing a name is a couple of probes rather than a pass over every name in the store. Derived data: rebuilt on open when it is missing or the wrong size |
 | `seg-N.tomb` | A bit per document, set when it has been erased and not yet rewritten out |
