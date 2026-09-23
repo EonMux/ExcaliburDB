@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.bench.retrieval;
 
-import com.eonmux.excalibur.api.ExcaliburApplication;
 import com.eonmux.excalibur.api.bootstrap.CoreComponents;
 import com.eonmux.excalibur.api.bootstrap.DocumentRegistryFactory;
 import com.eonmux.excalibur.api.bootstrap.GraphRagFactory;
@@ -14,6 +13,7 @@ import com.eonmux.excalibur.api.mcp.Json;
 import com.eonmux.excalibur.api.retrieval.HybridFusion;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.server.ExcaliburDBServer;
+import com.eonmux.excalibur.api.server.ShutdownBudget;
 import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.config.ConfigValidation;
 import com.eonmux.excalibur.config.QueryConfig;
@@ -220,7 +220,7 @@ final class EvaluationNode implements AutoCloseable {
             return new EvaluationNode(config, core, tracker, tenants, attachment, server);
         } catch (IOException | RuntimeException e) {
             if (server != null && tracker != null) {
-                shutdown(server, core, attachment, tracker, tenants);
+                shutdown(config, server, core, attachment, tracker, tenants);
             } else {
                 if (tenants != null) {
                     tenants.close();
@@ -403,17 +403,17 @@ final class EvaluationNode implements AutoCloseable {
     @Override
     public void close() {
         http.close();
-        shutdown(server, core, attachment, tracker, tenants);
+        shutdown(config, server, core, attachment, tracker, tenants);
     }
 
-    private static void shutdown(ExcaliburDBServer server, CoreComponents core,
+    private static void shutdown(Config config, ExcaliburDBServer server, CoreComponents core,
                                  IngestionWiring.Attachment attachment,
                                  DocumentVisibilityTracker tracker, GraphTenants tenants) {
         new NodeShutdown(server, core.indexOrchestrator(),
             attachment == null ? null : attachment.lexicalErasureSweep(),
             attachment == null ? null : attachment.chunkIndex(),
             tracker, tenants, core.storageEngine(), core.arena(),
-            ExcaliburApplication.SHUTDOWN_TIMEOUT_SECONDS).run();
+            ShutdownBudget.configuredTimeout(config.getEffectiveProperties())).run();
     }
 
     private record Reply(int status, Object json, String body) {
