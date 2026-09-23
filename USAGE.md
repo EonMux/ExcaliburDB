@@ -2892,8 +2892,13 @@ dependencies {
 }
 ```
 
-Each is named directly because the example below uses a class from each, and the library modules
-declare their own dependencies as `implementation`, so none of them hands its types on.
+Each is named directly because the example below uses a class from each. Some of them would
+arrive anyway, since a few modules expose theirs as `api` (`excalibur-vector` hands on
+`excalibur-core`, for one). Most declare their dependencies as `implementation`, which a consumer
+sees at run time and not at compile time, so relying on what happens to be exposed would break
+when a module's internals change. These seven are also enough: `excalibur-integration`'s
+`embeddedExampleTest` compiles and runs the example against exactly this list, through the same
+variants these POMs give a consumer, and nothing else.
 
 Gradle substitutes each coordinate with the project in the included build. The consuming project
 must also compile and run on Java 21 with `--enable-preview`, for the reason in
@@ -2905,7 +2910,8 @@ The example opens a data directory, ingests three documents and queries them, as
 order the server's own bootstrap uses. It is not a sketch: it is the body of
 `EmbeddedUsageExampleTest.ingestAndQuery` in `excalibur-integration`, which compiles it against the
 current API and runs it on every build, against an in-process stand-in for the embeddings
-endpoint.
+endpoint. A test beside it compares the block below with that method, token for token, so neither
+can change without the other.
 
 ```java
 import com.eonmux.excalibur.core.memory.ForeignMemoryBootstrap;

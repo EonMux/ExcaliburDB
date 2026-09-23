@@ -2839,11 +2839,21 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 - `LshHnswEntryIdContractTest` - The LSH pre-filter returns ids in the HNSW graph's id space, so stage 2 filters the right nodes
 - `SegmentPrefilterLifecycleTest` - A segment's vector pre-filter lives and dies with the graph it is keyed against, including across a split
 - `AtomicDocumentWriterTest` - The write-log driver the other suites ingest through records true offsets and keeps each document's chunks contiguous
-- `EmbeddedUsageExampleTest` - The embedded ingestion and query example in [USAGE.md](USAGE.md) compiles, ingests through a stand-in embeddings endpoint, and answers
 - `VectorApiResolutionTest` - The test JVM resolves `jdk.incubator.vector`, so the SIMD kernels are what the suites exercise rather than the scalar fallback
 
 ```bash
 ./gradlew :excalibur-integration:test
+```
+
+The embedded example in [USAGE.md](USAGE.md#programmatic-usage-jvm-embedded) runs in a source set
+of its own, `embeddedExample`. Its only dependencies are the seven coordinates USAGE.md lists, so
+it proves that list is enough. `check` runs it:
+
+- `EmbeddedUsageExampleTest` - The example compiles against those seven alone, ingests through a stand-in embeddings endpoint, and answers
+- `EmbeddedUsageDocumentationTest` - The code block in USAGE.md matches that test's method and helper token for token, and its imports are exactly the ones the example uses
+
+```bash
+./gradlew :excalibur-integration:embeddedExampleTest
 ```
 
 `RepositoryCompletenessTest` is the odd one out: it asks git rather than the filesystem. Every

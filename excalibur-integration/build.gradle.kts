@@ -28,6 +28,58 @@ dependencies {
     testImplementation(project(":excalibur-test"))
 }
 
+// The embedded example in USAGE.md, compiled and run from an embedder's position.
+//
+// USAGE.md tells an embedder that the seven coordinates it lists are the dependencies the
+// example needs. Inside `test` that claim is unverifiable: this module depends on every library
+// module and on the server, so the example would compile here whatever those seven expose. This
+// source set sees only the seven, through the same variants a consumer of the published POMs
+// resolves - each module's `api` dependencies at compile time, its `implementation` ones at run
+// time - so a type the example needs that none of them hands on fails this compile first.
+val embeddedExample: SourceSet by sourceSets.creating
+
+dependencies {
+    // Exactly the block USAGE.md shows; a change to one is a change to the other.
+    "embeddedExampleImplementation"(project(":excalibur-core"))
+    "embeddedExampleImplementation"(project(":excalibur-store"))
+    "embeddedExampleImplementation"(project(":excalibur-vector"))
+    "embeddedExampleImplementation"(project(":excalibur-shard"))
+    "embeddedExampleImplementation"(project(":excalibur-llm"))
+    "embeddedExampleImplementation"(project(":excalibur-ingest"))
+    "embeddedExampleImplementation"(project(":excalibur-query"))
+
+    "embeddedExampleImplementation"("org.junit.jupiter:junit-jupiter:5.11.3")
+    "embeddedExampleImplementation"("org.assertj:assertj-core:3.26.3")
+    "embeddedExampleRuntimeOnly"("org.junit.platform:junit-platform-launcher:1.11.3")
+}
+
+val embeddedExampleTest by tasks.registering(Test::class) {
+    group = "verification"
+    description = "Runs USAGE.md's embedded example against only the dependencies it documents"
+    testClassesDirs = embeddedExample.output.classesDirs
+    classpath = embeddedExample.runtimeClasspath
+    // The same flags as `test`, for the same reasons.
+    jvmArgs("--add-modules=jdk.incubator.vector")
+
+    // The documentation test reads USAGE.md and the example's source, neither of which Gradle
+    // can see through the classpath; without these the task stays up to date when either
+    // changes, which is the one case the test exists for.
+    val usage = rootProject.file("USAGE.md")
+    val exampleSource = file(
+        "src/embeddedExample/java/com/eonmux/excalibur/integration/EmbeddedUsageExampleTest.java")
+    inputs.file(usage).withPropertyName("usage").withPathSensitivity(PathSensitivity.RELATIVE)
+    // The source too, not only its classes: a comment in the example is part of what the
+    // documentation reproduces, and changes no class file.
+    inputs.file(exampleSource).withPropertyName("exampleSource")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    systemProperty("excalibur.usage", usage.absolutePath)
+    systemProperty("excalibur.embeddedExampleSource", exampleSource.absolutePath)
+}
+
+tasks.named("check") {
+    dependsOn(embeddedExampleTest)
+}
+
 tasks.withType<JavaCompile> {
     options.encoding = "UTF-8"
     options.release.set(21)
