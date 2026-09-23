@@ -11,12 +11,13 @@ import java.io.IOException;
 import java.time.Instant;
 import java.util.Objects;
 import java.util.OptionalLong;
+import java.util.function.LongSupplier;
 
 /**
  * Reads the graph half of a node into one {@link GraphStats}.
  *
- * <p>Three owners hold the figures and none of them is a stats component: the tenant registry,
- * the build runner and the ingest sink. This is the one place that knows where each lives, so
+ * <p>Four owners hold the figures and none of them is a stats component: the tenant registry,
+ * the build runner, the ingest sink and the ingestion that reports into it. This is the one place that knows where each lives, so
  * the collector asks one question and the renderers stay ignorant of the graph's structure.</p>
  *
  * <h2>Thread Safety</h2>
@@ -31,6 +32,7 @@ public final class GraphStatsReader {
     private final GraphTenants tenants;
     private final GraphBuildRunner builds;
     private final NamespaceRoutingGraphIngestSink ingest;
+    private final LongSupplier sinkRefusals;
 
     /**
      * Creates a reader over a node's graph.
@@ -38,13 +40,19 @@ public final class GraphStatsReader {
      * @param tenants Every namespace's graph
      * @param builds  The runner every build goes through
      * @param ingest  The sink ingestion stages facts through, or null on a node with none
-     * @throws NullPointerException if tenants or builds is null
+     * @param sinkRefusals How many documents the sink threw on, as the ingestion that reports
+     *                     into it counts them; ignored, and may be null, where ingest is null
+     * @throws NullPointerException if tenants or builds is null, or sinkRefusals is null while
+     *                              ingest is not
      */
     public GraphStatsReader(GraphTenants tenants, GraphBuildRunner builds,
-                            NamespaceRoutingGraphIngestSink ingest) {
+                            NamespaceRoutingGraphIngestSink ingest, LongSupplier sinkRefusals) {
         this.tenants = Objects.requireNonNull(tenants, "tenants cannot be null");
         this.builds = Objects.requireNonNull(builds, "builds cannot be null");
         this.ingest = ingest;
+        this.sinkRefusals = ingest == null
+            ? null
+            : Objects.requireNonNull(sinkRefusals, "sinkRefusals cannot be null");
     }
 
     /**
@@ -111,6 +119,7 @@ public final class GraphStatsReader {
             return null;
         }
         return new GraphStats.IngestStats(ingest.documentsSeen(), ingest.factsStaged(),
-            ingest.unresolvedDocuments(), ingest.extractionFailures(), ingest.tenantFailures());
+            ingest.unresolvedDocuments(), ingest.extractionFailures(), ingest.tenantFailures(),
+            sinkRefusals.getAsLong());
     }
 }

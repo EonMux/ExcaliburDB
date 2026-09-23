@@ -13,9 +13,11 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Compaction an operator can ask for, and an honest answer about what happened.
@@ -104,14 +106,13 @@ class IndexOrchestratorCompactNowTest {
     }
 
     @Test
-    @DisplayName("an interrupted run stops where it is and reports only what it did")
+    @DisplayName("an interrupt from a caller that still sends one is read as a stop")
     void anInterruptedRunStopsAndReportsHonestly() {
         int live = liveSegmentCount();
 
-        // The shutdown path interrupts the thread a forced run is on and then closes the
-        // storage engine's arena. A run that never looks at the flag carries on into segments
-        // whose memory is being unmapped underneath it, which takes the JVM down rather than
-        // raising anything the caller could report.
+        // The shutdown path no longer interrupts a run, but a caller that does must still get
+        // a run that stops at the next safe point rather than one that starts channel work on a
+        // thread whose next blocking channel call would close its channel.
         Thread.currentThread().interrupt();
         try {
             CompactionReport report = orchestrator.compactNow(true);
@@ -128,6 +129,74 @@ class IndexOrchestratorCompactNowTest {
         } finally {
             Thread.interrupted();
         }
+    }
+
+    @Test
+    @DisplayName("a run asked to stop before it starts examines nothing and interrupts nothing")
+    void aRunAskedToStopFirstDoesNothing() {
+        int live = liveSegmentCount();
+
+        CompactionReport report = orchestrator.compactNow(true, () -> true);
+
+        assertThat(report.segmentsConsidered()).isEqualTo(live);
+        assertThat(report.segmentsCompacted()).isZero();
+        assertThat(report.segmentsFailed()).isZero();
+        assertThat(report.segmentsSkipped()).isEqualTo(live);
+        assertThat(report.graphsConsidered()).isZero();
+        assertThat(Thread.currentThread().isInterrupted())
+            .as("the stop is a signal, not an interrupt")
+            .isFalse();
+    }
+
+    /**
+     * The shutdown drain used to stop a run by interrupting its thread, and an interrupt that
+     * lands inside a rewrite's channel operation closes that channel for every thread using it.
+     * The drain now sets a signal; the run reads it before each segment and before the graphs.
+     */
+    @Test
+    @DisplayName("a stop requested during a run takes effect before the next segment")
+    void aStopRequestedMidRunEndsAtTheNextSegment() {
+        int live = liveSegmentCount();
+        AtomicInteger reads = new AtomicInteger();
+
+        // False before the first segment, true from then on.
+        CompactionReport report = orchestrator.compactNow(true, () -> reads.getAndIncrement() > 0);
+
+        assertThat(report.segmentsCompacted())
+            .as("exactly the segment started before the stop was compacted")
+            .isEqualTo(Math.min(1, live));
+        assertThat(report.segmentsFailed()).isZero();
+        assertThat(report.graphsConsidered())
+            .as("no graph is examined once the run has been asked to stop")
+            .isZero();
+        for (Segment segment : storageEngine.getSegments().values()) {
+            assertThat(segment.isClosed())
+                .as("the segment the run did compact was replaced, not left half done")
+                .isFalse();
+        }
+    }
+
+    @Test
+    @DisplayName("a null stop signal is refused")
+    void aNullStopSignalIsRefused() {
+        assertThatThrownBy(() -> orchestrator.compactNow(true, null))
+            .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    @DisplayName("shutdown reports every worker ended, and says so again when asked twice")
+    void shutdownReportsWorkersEnded() {
+        orchestrator.start();
+
+        assertThat(orchestrator.shutdown()).isTrue();
+        assertThat(orchestrator.isRunning()).isFalse();
+        assertThat(orchestrator.shutdown()).isTrue();
+    }
+
+    @Test
+    @DisplayName("shutdown of an orchestrator never started reports ended")
+    void shutdownOfAnUnstartedOrchestrator() {
+        assertThat(orchestrator.shutdown()).isTrue();
     }
 
     @Test

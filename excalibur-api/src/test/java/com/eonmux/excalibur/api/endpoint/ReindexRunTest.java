@@ -137,13 +137,13 @@ class ReindexRunTest {
             assertThat(status().state())
                 .isEqualTo(ReindexEndpoint.ReindexStatus.STATE_FAILED);
             assertThat(status().lastError()).isEqualTo("Source not found: " + SOURCE_ID);
-            verify(reindexer, never()).reindexAll(any(), any());
+            verify(reindexer, never()).reindexAll(any(), any(), any());
         }
 
         @Test
         @DisplayName("a source that cannot be read fails without quoting the reason")
         void unreadableSourceFailsWithoutDetail() throws Exception {
-            when(reindexer.reindexAll(eq(source), any()))
+            when(reindexer.reindexAll(eq(source), any(), any()))
                 .thenThrow(new SourceException("https://internal.example/feed refused the token"));
 
             standardRun().execute(SOURCE_ID);
@@ -154,6 +154,24 @@ class ReindexRunTest {
                 .isEqualTo("Reindex failed (SourceException); see the node's log for the reason");
             assertThat(status().lastError()).doesNotContain("internal.example");
         }
+
+        @Test
+        @DisplayName("an Error ends the run as failed on its way up, rather than mid-reindex")
+        void anErrorFailsTheRunAndIsRethrown() throws Exception {
+            // Rethrown, because nothing here can recover from one. But a readback left reading
+            // "crawling" has a caller polling it for a run that no longer exists.
+            when(reindexer.reindexAll(eq(source), any(), any()))
+                .thenThrow(new StackOverflowError("parser recursed"));
+
+            assertThatThrownBy(() -> standardRun().execute(SOURCE_ID))
+                .isInstanceOf(StackOverflowError.class);
+
+            assertThat(status().state())
+                .isEqualTo(ReindexEndpoint.ReindexStatus.STATE_FAILED);
+            assertThat(status().lastError())
+                .isEqualTo("Reindex failed (StackOverflowError); see the node's log for the "
+                    + "reason");
+        }
     }
 
     @Nested
@@ -163,7 +181,7 @@ class ReindexRunTest {
         @Test
         @DisplayName("a clean run completes")
         void cleanRunCompletes() throws Exception {
-            when(reindexer.reindexAll(eq(source), any())).thenReturn(result(12));
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(result(12));
 
             standardRun().execute(SOURCE_ID);
 
@@ -175,7 +193,7 @@ class ReindexRunTest {
         @Test
         @DisplayName("one unreadable document does not fail a run that indexed the rest")
         void partialRunCompletes() throws Exception {
-            when(reindexer.reindexAll(eq(source), any()))
+            when(reindexer.reindexAll(eq(source), any(), any()))
                 .thenReturn(result(400, "one bad document"));
 
             standardRun().execute(SOURCE_ID);
@@ -188,7 +206,7 @@ class ReindexRunTest {
         @Test
         @DisplayName("a run that indexed nothing fails, counting the errors but not naming them")
         void emptyRunFails() throws Exception {
-            when(reindexer.reindexAll(eq(source), any()))
+            when(reindexer.reindexAll(eq(source), any(), any()))
                 .thenReturn(result(0, "/var/lib/excalibur/seg-4 is unwritable", "and again"));
 
             standardRun().execute(SOURCE_ID);
@@ -205,14 +223,14 @@ class ReindexRunTest {
         @DisplayName("is taken when the node can roll segments but the reindexer cannot")
         void fallsBackWhenTheReindexerHasNoRollingSupport() throws Exception {
             when(reindexer.hasRollingReplacement()).thenReturn(false);
-            when(reindexer.reindexAll(eq(source), any())).thenReturn(result(3));
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(result(3));
             VolumeManager volumeManager = mock(VolumeManager.class);
 
             new ReindexRun(reindexer, sourceResolver, volumeManager, mock(SegmentCatalog.class),
                 statusRegistry, null).execute(SOURCE_ID);
 
-            verify(reindexer).reindexAll(eq(source), any());
-            verify(reindexer, never()).reindexWithRollingReplacement(any(), any(), any());
+            verify(reindexer).reindexAll(eq(source), any(), any());
+            verify(reindexer, never()).reindexWithRollingReplacement(any(), any(), any(), any());
         }
     }
 
@@ -244,8 +262,8 @@ class ReindexRunTest {
             assertThat(status().state())
                 .isEqualTo(ReindexEndpoint.ReindexStatus.STATE_FAILED);
             assertThat(status().lastError()).isEqualTo("No volume available for reindex");
-            verify(reindexer, never()).reindexWithRollingReplacement(any(), any(), any());
-            verify(reindexer, never()).reindexAll(any(), any());
+            verify(reindexer, never()).reindexWithRollingReplacement(any(), any(), any(), any());
+            verify(reindexer, never()).reindexAll(any(), any(), any());
         }
 
         @Test
@@ -253,7 +271,7 @@ class ReindexRunTest {
         void cleanReplacementCompletes() throws Exception {
             VolumeManager volumeManager = mock(VolumeManager.class);
             when(volumeManager.getVolumeWithMostSpace()).thenReturn(volume);
-            when(reindexer.reindexWithRollingReplacement(eq(source), eq(volume), any()))
+            when(reindexer.reindexWithRollingReplacement(eq(source), eq(volume), any(), any()))
                 .thenReturn(rolling(result(9)));
 
             rollingRun(volumeManager).execute(SOURCE_ID);
@@ -267,7 +285,7 @@ class ReindexRunTest {
         void partialReplacementCompletes() throws Exception {
             VolumeManager volumeManager = mock(VolumeManager.class);
             when(volumeManager.getVolumeWithMostSpace()).thenReturn(volume);
-            when(reindexer.reindexWithRollingReplacement(eq(source), eq(volume), any()))
+            when(reindexer.reindexWithRollingReplacement(eq(source), eq(volume), any(), any()))
                 .thenReturn(rolling(result(400, "one bad document")));
 
             rollingRun(volumeManager).execute(SOURCE_ID);
@@ -282,7 +300,7 @@ class ReindexRunTest {
         void emptyReplacementFails() throws Exception {
             VolumeManager volumeManager = mock(VolumeManager.class);
             when(volumeManager.getVolumeWithMostSpace()).thenReturn(volume);
-            when(reindexer.reindexWithRollingReplacement(eq(source), eq(volume), any()))
+            when(reindexer.reindexWithRollingReplacement(eq(source), eq(volume), any(), any()))
                 .thenReturn(rolling(result(0, "https://internal.example/feed timed out")));
 
             rollingRun(volumeManager).execute(SOURCE_ID);

@@ -5,7 +5,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 
 import java.io.IOException;
-import java.time.Instant;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -219,18 +218,6 @@ class SourceTest {
         }
 
         @Test
-        @DisplayName("hasChanged returns correct value")
-        void hasChangedReturnsCorrectValue() throws SourceException {
-            TestSource source = new TestSource("test");
-            
-            source.setChanged(false);
-            assertFalse(source.hasChanged(Instant.now().minusSeconds(3600)));
-            
-            source.setChanged(true);
-            assertTrue(source.hasChanged(Instant.now().minusSeconds(3600)));
-        }
-
-        @Test
         @DisplayName("fetch returns document content")
         void fetchReturnsDocumentContent() throws SourceException, DocumentNotFoundException {
             Source source = new TestSource("test");
@@ -255,15 +242,10 @@ class SourceTest {
      */
     private static class TestSource implements Source {
         private final String sourceId;
-        private boolean changed = true;
         private final List<String> documentIds = List.of("doc-1", "doc-2", "doc-3");
 
         TestSource(String sourceId) {
             this.sourceId = sourceId;
-        }
-
-        void setChanged(boolean changed) {
-            this.changed = changed;
         }
 
         @Override
@@ -279,11 +261,6 @@ class SourceTest {
         @Override
         public Stream<String> crawl() {
             return documentIds.stream();
-        }
-
-        @Override
-        public boolean hasChanged(Instant since) {
-            return changed;
         }
 
         @Override

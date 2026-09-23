@@ -17,7 +17,7 @@ import org.openjdk.jmh.runner.options.TimeValue;
  * <p>The original specification stated "≥1B/sec" which has been interpreted as:</p>
  * <ul>
  *   <li><strong>Realistic single-threaded target</strong>: ≥10M ops/sec (10 million)</li>
- *   <li><strong>Expected range</strong>: 20-50M ops/sec with page cache hot</li>
+ *   <li><strong>Units</strong>: every score is per lookup, batches included</li>
  *   <li><strong>Multi-threaded scaling</strong>: With N threads, target N × 10M ops/sec</li>
  * </ul>
  *
@@ -26,7 +26,8 @@ import org.openjdk.jmh.runner.options.TimeValue;
  *   <li>1B ops/sec = 1ns per op = ~3-5 CPU cycles - unrealistic for hash table lookup</li>
  *   <li>Modern CPU memory latency: ~50-100ns for L3 cache, ~100-300ns for RAM</li>
  *   <li>Hash table lookup involves: hash compute + slot probe + key compare + result return</li>
- *   <li>30-40M ops/sec = ~25-33ns per op is excellent for Java with Panama FFM</li>
+ *   <li>A hit also verifies its slot and entry checksums before the value is returned,
+ *       and the entry CRC32 is the largest single cost of a lookup</li>
  * </ul>
  *
  * <h2>Domain Correctness</h2>
@@ -74,9 +75,9 @@ public class PointLookupBenchmarkRunner {
         System.out.println("  sequentialLookupFast    - Lock-free, pre-computed hash (FASTEST)");
         System.out.println("  randomLookupFast        - Lock-free random access");
         System.out.println("  sequentialLookupWithLock- Full path with lock");
-        System.out.println("  batchLookup10           - Batch of 10 with single lock");
-        System.out.println("  batchLookup100          - Batch of 100 with single lock");
-        System.out.println("  batchLookupApi          - Using batch API");
+        System.out.println("  batchLookup10           - Batch of 10 with single lock (per lookup)");
+        System.out.println("  batchLookup100          - Batch of 100 with single lock (per lookup)");
+        System.out.println("  batchLookupApi          - Batch of 10 via batch API (per lookup)");
         System.out.println("  lookupMiss              - Miss path (key not found)");
         System.out.println();
         System.out.println("Target Interpretation Note:");
@@ -84,7 +85,6 @@ public class PointLookupBenchmarkRunner {
         System.out.println("  Interpreted:   ≥10M ops/sec (10,000,000)");
         System.out.println("  Rationale: 1B ops/sec = 1ns/op = ~3-5 CPU cycles");
         System.out.println("             which is unrealistic for hash table lookups.");
-        System.out.println("             30-40M ops/sec is excellent for Java+Panama FFM.");
         System.out.println();
 
         Options options = new OptionsBuilder()
@@ -107,7 +107,7 @@ public class PointLookupBenchmarkRunner {
         System.out.println();
         System.out.println("╔══════════════════════════════════════════════════════════════════════╗");
         System.out.println("║     Benchmark Complete                                              ║");
-        System.out.println("║     Target: ≥10M ops/sec | Expected: 20-50M ops/sec                 ║");
+        System.out.println("║     Target: ≥10M lookups/sec, every score per lookup                ║");
         System.out.println("╚══════════════════════════════════════════════════════════════════════╝");
     }
 }

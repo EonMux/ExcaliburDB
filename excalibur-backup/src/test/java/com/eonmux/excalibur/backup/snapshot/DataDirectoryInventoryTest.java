@@ -45,6 +45,9 @@ class DataDirectoryInventoryTest {
         "chunk-index/seg-0/terms.dict,         REBUILDABLE",
         "shared/graph/edges.csr,               REBUILDABLE",
         "segment_0.pqcb,                       REBUILDABLE",
+        "segment_0.tfs,                        REBUILDABLE",
+        "segment_12.tfs,                       REBUILDABLE",
+        "segment_0.tfs.0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11.tmp, TRANSIENT",
         "routing.dir.tmp,                      TRANSIENT",
         "source-catalog.tmp,                   TRANSIENT",
         "segment_0.dat.compact,                TRANSIENT",
@@ -55,7 +58,13 @@ class DataDirectoryInventoryTest {
         "chunk-index/.compact-seg-0,           TRANSIENT",
         "chunk-index/seg-0.tomb.tmp,           TRANSIENT",
         "shared/graph-staging/triples.log.erasing, TRANSIENT",
-        "shared/graph/edges.csr.building,      TRANSIENT"
+        "shared/graph/edges.csr.building,      TRANSIENT",
+        "java_pid4242.hprof,                   DIAGNOSTIC",
+        "oom.hprof,                            DIAGNOSTIC",
+        "chunk-index/java_pid7.hprof,          DIAGNOSTIC",
+        "shared/graph/java_pid7.hprof,         DIAGNOSTIC",
+        "segment_0.hnsw.hprof,                 DIAGNOSTIC",
+        "java_pid4242.hprof.notes,             AUTHORITATIVE"
     })
     void classifies(String relativePath, Inclusion expected) {
         assertThat(DataDirectoryInventory.classify(relativePath.trim())).isEqualTo(expected);
@@ -66,6 +75,42 @@ class DataDirectoryInventoryTest {
     void unknownFilesAreKept() {
         assertThat(DataDirectoryInventory.classify("something-a-future-build-writes"))
             .isEqualTo(Inclusion.AUTHORITATIVE);
+    }
+
+    @Test
+    @DisplayName("a heap dump is never copied, and the reason says where it belongs instead")
+    void aHeapDumpIsNeverCopied() {
+        Inclusion inclusion = DataDirectoryInventory.classify("java_pid4242.hprof");
+
+        assertThat(inclusion.includedWhen(true)).isFalse();
+        assertThat(inclusion.includedWhen(false)).isFalse();
+        assertThat(DataDirectoryInventory.reason("java_pid4242.hprof"))
+            .contains("heap dump").contains("HeapDumpPath");
+    }
+
+    @Test
+    @DisplayName("a term sketch is derived state the node rebuilds on open, and says so")
+    void aTermSketchIsRebuildable() {
+        Inclusion inclusion = DataDirectoryInventory.classify("segment_0.tfs");
+
+        assertThat(inclusion.includedWhen(true)).isTrue();
+        assertThat(inclusion.includedWhen(false)).isFalse();
+        assertThat(DataDirectoryInventory.reason("segment_0.tfs"))
+            .contains("term sketch", "rebuilds", "start-up");
+    }
+
+    @Test
+    @DisplayName("a compaction's staged mapping is copied with or without derived state")
+    void aStagedMappingIsAlwaysCopied() {
+        String staged = "segment_0.hnsw.compact.docmap";
+        Inclusion inclusion = DataDirectoryInventory.classify(staged);
+
+        assertThat(inclusion.includedWhen(true)).isTrue();
+        assertThat(inclusion.includedWhen(false))
+            .as("alone, it is the only mapping that matches a graph whose swap completed")
+            .isTrue();
+        assertThat(DataDirectoryInventory.reason(staged))
+            .contains("staged", "installs on open");
     }
 
     @Test

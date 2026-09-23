@@ -15,11 +15,10 @@ package com.eonmux.excalibur.ingest.pipeline;
  * one document's bad luck is precisely what made a cancelled reindex walk the rest of the
  * crawl.</p>
  *
- * <p>Its cause is always an {@link InterruptedException}, and the interrupt flag is set again
- * before it is thrown. The endpoint cancels by interrupting the run thread and classifies the
- * outcome from whichever of those two survived, so a stop has to carry both: a blocking call
- * that reported the interrupt by throwing cleared the flag, and one that reported it by setting
- * the flag threw nothing.</p>
+ * <p>The type alone is what says the run was stopped. It carries no interrupt, and the thread
+ * that throws it is left with its interrupt flag clear: the stop was asked for through the run's
+ * {@link com.eonmux.excalibur.core.util.StopSignal}, and a flag left set would close the next
+ * channel the thread writes through - on a pooled or scheduled thread, some other run's.</p>
  *
  * @see ReindexCancellation
  */
@@ -31,9 +30,8 @@ public final class ReindexCancelledException extends RuntimeException {
      * Creates the signal.
      *
      * @param message Where the run stopped, for the log
-     * @param cause   The interrupt that asked for the stop
      */
-    public ReindexCancelledException(String message, InterruptedException cause) {
-        super(message, cause);
+    public ReindexCancelledException(String message) {
+        super(message);
     }
 }

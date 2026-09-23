@@ -30,7 +30,9 @@ import java.util.Objects;
  * <h2>Publishing</h2>
  * <p>The store is written to a sibling directory and moved into place, so a reader either sees the
  * previous graph or the new one. A half-written directory is never the one being served, and a
- * build that fails leaves the previous graph exactly as it was.</p>
+ * build that fails leaves the previous graph exactly as it was. An erasure compaction replaces the
+ * served directory by the same {@link #publish(Path, Path, Durability) publish}, so one
+ * {@link #recoverInterruptedPublish(Path) recovery} answers for a crash in either.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Stateless and safe to call from any thread, but two concurrent builds into the same target
@@ -47,6 +49,19 @@ public final class GraphBuilder {
 
     /** Suffix of the directory the previous graph is moved to while the new one is published. */
     public static final String PREVIOUS_SUFFIX = ".previous";
+
+    /**
+     * Suffix of a directory an erasure compaction's swap set the served graph aside under when it
+     * renamed directories by a protocol of its own.
+     *
+     * <p>Nothing writes it: a compaction publishes through {@link #publish(Path, Path, Durability)}
+     * like a build. Recovery still reads it, because a disk a crash left holding one holds either
+     * the only copy of the graph - the served name having gone - or, beside a served graph, a
+     * copy of facts an erasure removed from it. The first must be restored and the second must
+     * not survive, which is what {@link #recoverInterruptedPublish(Path)} does with a
+     * {@code .previous} directory in the same two positions.</p>
+     */
+    public static final String RETIRED_SUFFIX = ".retired";
 
     /** Dictionary naming entities, as {@code GraphRagFactory} expects to find it. */
     public static final String ENTITY_DICTIONARY = "entities";
@@ -237,6 +252,15 @@ public final class GraphBuilder {
      * removed afterwards, which means a failure between the two leaves something serveable rather
      * than nothing.
      *
+     * <h3>Recovery comes first</h3>
+     * <p>The name the previous graph is set aside under may already be taken when a publish
+     * starts, and what is there is not always debris. Beside a served graph it is the leftover of
+     * a publish that completed its renames, and deleting it is right. With nothing at the target
+     * it is the only graph there is - a crash between the renames, or a rollback whose own rename
+     * failed - and deleting it would leave this publish, and its rollback, with nothing to fall
+     * back to. So the directory is put through {@link #recoverInterruptedPublish(Path)} rather
+     * than cleared, which tells the two apart.</p>
+     *
      * <h3>Why a publish forces and an assembly does not</h3>
      * <p>Nothing earlier in a build needs to reach the device: a build whose bytes were lost is a
      * build to run again from the staging log that outlived it, and a half-assembled scratch
@@ -290,6 +314,12 @@ public final class GraphBuilder {
      * new graph goes back to {@code scratch} and the previous one back to {@code target}, and
      * the opener's exception propagates.</p>
      *
+     * <p>The opener must leave the previous graph alone: it is the rollback's source, and so it
+     * must not run {@link #recoverInterruptedPublish(Path)}, which reads this exact layout as a
+     * completed publish and deletes it. Should the previous graph be gone all the same, the new
+     * one is left at {@code target} rather than moved out, since it is then the only graph
+     * there is.</p>
+     *
      * @param <T>        What opening the graph produces
      * @param scratch    Where the build was assembled
      * @param target     Where it is to be served from
@@ -307,7 +337,7 @@ public final class GraphBuilder {
         Objects.requireNonNull(opener, "opener must not be null");
 
         Path previous = previousFor(target);
-        deleteRecursively(previous);
+        recoverInterruptedPublish(target);
 
         // Before either rename, and therefore while the previous graph is still the one being
         // served. A device error here costs the build and no data.
@@ -339,6 +369,14 @@ public final class GraphBuilder {
         try {
             opened = opener.open(target);
         } catch (IOException | RuntimeException e) {
+            if (hadPrevious && !Files.isDirectory(previous)) {
+                // Moving the new graph out now would leave nothing at the served path and
+                // nothing to put there, which is the one outcome the rollback exists to prevent.
+                // It stays: a graph that failed to open once is still the only copy there is.
+                e.addSuppressed(new IOException("cannot roll back to " + previous
+                    + ", which the opener removed; the new graph is left at " + target));
+                throw e;
+            }
             try {
                 Files.move(target, scratch, StandardCopyOption.ATOMIC_MOVE);
                 if (hadPrevious) {
@@ -367,6 +405,13 @@ public final class GraphBuilder {
      * forced before it was renamed, so it stands and the previous one is deleted: it may hold
      * facts an erasure has since removed from the served graph, and nothing will read it.</p>
      *
+     * <p>An erasure compaction publishes by this same protocol, so a restored graph may be the
+     * one an erasure was replacing: a graph still holding what the erasure removes. Nothing marks
+     * an obligation discharged before its publish has completed, so the obligation is still
+     * outstanding; a caller that serves the restored graph applies what is outstanding first
+     * when {@code true} comes back. A {@link #RETIRED_SUFFIX} directory is treated as a displaced
+     * graph too.</p>
+     *
      * @param target Where the graph is served from
      * @return Whether a displaced graph was restored
      * @throws IOException if the restoring rename or the removal fails
@@ -374,6 +419,7 @@ public final class GraphBuilder {
     public static boolean recoverInterruptedPublish(Path target) throws IOException {
         Objects.requireNonNull(target, "target must not be null");
         Path previous = previousFor(target);
+        adoptRetired(target, previous);
         if (!Files.isDirectory(previous)) {
             return false;
         }
@@ -387,6 +433,48 @@ public final class GraphBuilder {
         LOGGER.warn("restored the graph at {} from {}, which an interrupted publish left in its "
             + "place", target, previous);
         return true;
+    }
+
+    /**
+     * Whether a graph is set aside beside {@code target}, which recovery would restore or remove.
+     *
+     * <p>For a caller asking whether a namespace has a graph without opening it: a displaced
+     * graph with nothing at the target is a graph the next open restores.</p>
+     *
+     * @param target Where the graph is served from
+     * @return true if a displaced graph is on disk beside it
+     */
+    public static boolean hasDisplacedGraph(Path target) {
+        Objects.requireNonNull(target, "target must not be null");
+        return Files.isDirectory(previousFor(target)) || Files.isDirectory(retiredFor(target));
+    }
+
+    /**
+     * Folds a {@link #RETIRED_SUFFIX} directory into the {@code .previous} protocol.
+     *
+     * <p>Beside a served graph, or beside a displaced graph that recovery is about to restore, it
+     * is a copy of what an erasure compaction replaced, and is deleted. Alone, it is the only
+     * graph there is, and becomes the displaced graph recovery restores.</p>
+     *
+     * @param target   Where the graph is served from
+     * @param previous Where a publish sets the served graph aside
+     * @throws IOException if the rename or the removal fails
+     */
+    private static void adoptRetired(Path target, Path previous) throws IOException {
+        Path retired = retiredFor(target);
+        if (!Files.isDirectory(retired)) {
+            return;
+        }
+        if (Files.exists(target) || Files.isDirectory(previous)) {
+            deleteRecursively(retired);
+            LOGGER.info("removed {}, a graph an erasure compaction had already replaced", retired);
+            return;
+        }
+        Files.move(retired, previous, StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    private static Path retiredFor(Path target) {
+        return target.resolveSibling(target.getFileName() + RETIRED_SUFFIX);
     }
 
     /**

@@ -7,6 +7,7 @@ import org.openjdk.jmh.runner.options.OptionsBuilder;
 import org.openjdk.jmh.runner.options.TimeValue;
 
 import com.eonmux.excalibur.bench.benchmark.HnswRecallBenchmark;
+import com.eonmux.excalibur.bench.kernel.EmbeddingCorpus;
 
 /**
  * JMH Benchmark Runner for HNSW recall@10 validation.
@@ -75,14 +76,8 @@ public class HnswRecallBenchmarkRunner {
         System.out.println("Performance target:");
         System.out.println("  Recall@10: >= " + String.format("%.0f", TARGET_RECALL * 100) + "%");
         System.out.println();
-        System.out.println("Recall vs QPS Tradeoff (efSearch values tested):");
-        System.out.println("  efSearch=50:   ~80-85% recall, highest QPS");
-        System.out.println("  efSearch=100:  ~90-95% recall, high QPS");
-        System.out.println("  efSearch=150:  ~98-99% recall, medium QPS");
-        System.out.println("  efSearch=200:  >=99% recall, baseline QPS (TARGET)");
-        System.out.println("  efSearch=250:  ~99.2%+ recall, lower QPS");
-        System.out.println("  efSearch=300:  ~99.5%+ recall, lower QPS");
-        System.out.println("  efSearch=400:  ~99.8%+ recall, lowest QPS");
+        System.out.println("Corpus: EmbeddingCorpus (clustered, " + EmbeddingCorpus.LATENT_DIMENSION
+            + " directions of variance), efSearch values 50-400");
         System.out.println();
         System.out.println("========================================");
         System.out.println();
@@ -115,12 +110,9 @@ public class HnswRecallBenchmarkRunner {
             System.out.println("========================================");
             System.out.println();
             System.out.println("VALIDATION CRITERIA:");
-            System.out.println("  Check that measureRecall results show >= " + (TARGET_RECALL * 100) + "% for efSearch=200");
-            System.out.println();
-            System.out.println("Expected results based on HNSW paper:");
-            System.out.println("  efSearch=100:  ~90-95% recall@10");
-            System.out.println("  efSearch=200:  >=99% recall@10 (target)");
-            System.out.println("  efSearch=300:  ~99.5%+ recall@10");
+            System.out.println("  Each trial prints \"Initial recall@10\" after building its graph, and a trial at");
+            System.out.println("  efSearch >= " + com.eonmux.excalibur.vector.hnsw.HnswConfig.DEFAULT_EF_SEARCH
+                + " below " + (TARGET_RECALL * 100) + "% aborts in setup. JMH scores are ms per search.");
             System.out.println();
             System.out.println("QUERIES/SEC ANALYSIS:");
             System.out.println("  Compare searchThroughput benchmark results across efSearch values");

@@ -27,6 +27,15 @@ import java.util.TreeSet;
  * leave out and the one that catches a half-finished copy being mistaken for a whole one,
  * or two images written over each other in the same directory.</p>
  *
+ * <h2>What deep adds</h2>
+ * <p>A checksum proves a file is the one that was copied, not that it was sound when it was
+ * copied: a graph whose seal was already broken on the source is copied faithfully and
+ * verifies faithfully. A deep verification also compares every file's SHA-256, and hands
+ * every file to the checker for its format through {@link FormatChecks}, so an image that
+ * holds damage the node itself would refuse to load is failed here rather than at restore.
+ * Each format's verdict is kept in the report whether or not it found anything, because a
+ * file checked and unproven is something an operator should be able to see.</p>
+ *
  * <h2>Size before checksum</h2>
  * <p>A file whose length is wrong is reported as such rather than as a checksum mismatch.
  * They are the same verdict and different diagnoses: a truncated file is a copy that was
@@ -64,6 +73,12 @@ public final class SnapshotVerifier {
             filesChecked++;
         }
         problems.addAll(unexpectedFiles(payload, manifest));
+        if (depth == VerifyDepth.DEEP) {
+            List<ContentCheck> folded = FormatChecks.withLexicalStore(payload, contentChecks);
+            contentChecks.clear();
+            contentChecks.addAll(folded);
+            contentChecks.sort(Comparator.comparing(ContentCheck::path));
+        }
         contentChecks.forEach(check -> {
             if (!check.healthy()) {
                 problems.add(new Problem(check.path(),
@@ -110,7 +125,7 @@ public final class SnapshotVerifier {
         }
         checkChecksums(entry, actual, depth, problems);
         if (depth == VerifyDepth.DEEP) {
-            FormatChecks.check(payload, file, entry.path()).ifPresent(contentChecks::add);
+            contentChecks.add(FormatChecks.check(file, entry.path()));
         }
         return actual.size();
     }

@@ -52,6 +52,10 @@ import java.util.List;
  */
 final class SegmentSlots {
 
+    /** Bits the flag byte sits above within a slot's tail word: the distance byte. */
+    private static final int TAIL_FLAGS_SHIFT =
+        Byte.SIZE * (Segment.SLOT_FLAGS_OFFSET - Segment.SLOT_DISTANCE_OFFSET);
+
     /** The segment whose slot table this is. */
     private final Segment owner;
 
@@ -82,43 +86,64 @@ final class SegmentSlots {
      * @throws CorruptSegmentEntryException if a slot the answer depends on fails its checksum
      */
     int findSlot(long keyHash, byte[] key) {
+        return findSlot(owner.segment, keyHash, key);
+    }
+
+    /**
+     * Finds the slot index for a key in a given mapping of this segment's layout.
+     *
+     * <p>The live mapping and a split snapshot share one slot table geometry, so both are
+     * probed by this one loop and differ only in which bytes it reads.</p>
+     *
+     * @param mem     The mapping to probe, live or snapshot
+     * @param keyHash The 64-bit hash of the key
+     * @param key     The key bytes
+     * @return Slot index if found, -1 if not found
+     * @throws CorruptSegmentEntryException if a slot the answer depends on fails its checksum
+     */
+    int findSlot(MemorySegment mem, long keyHash, byte[] key) {
         int idealSlot = (int) (keyHash & (owner.slotCount - 1)); // hash % slotCount for power of 2
 
         for (int distance = 0; distance < Segment.MAX_PROBE_LENGTH; distance++) {
             int slotIndex = (idealSlot + distance) & (owner.slotCount - 1);
             long slotOffset = (long) slotIndex * Segment.SLOT_SIZE;
 
+            // The distance, flags and data offset share one word, so a probe step is two
+            // reads of the mapping: this word, and the key hash if the slot is still live.
+            long tailWord = SlotChecksum.tailWord(mem, slotOffset);
+
             // Check if slot is occupied
-            byte flags = owner.segment.get(Segment.BYTE_LAYOUT, slotOffset + Segment.SLOT_FLAGS_OFFSET);
+            byte flags = (byte) (tailWord >>> TAIL_FLAGS_SHIFT);
             if ((flags & Segment.FLAG_OCCUPIED) == 0) {
                 // Empty slot - key not found
-                return notFound(owner.segment, idealSlot, distance + 1);
+                return notFound(mem, idealSlot, distance + 1);
             }
 
             // Check if we've gone past all entries with smaller distances
-            byte slotDistance = owner.segment.get(Segment.BYTE_LAYOUT, slotOffset + Segment.SLOT_DISTANCE_OFFSET);
+            byte slotDistance = (byte) tailWord;
             if (slotDistance < distance) {
                 // Would have found it by now due to Robin Hood ordering
-                return notFound(owner.segment, idealSlot, distance + 1);
+                return notFound(mem, idealSlot, distance + 1);
             }
 
             // Check if hash matches
-            long slotKeyHash = owner.segment.get(Segment.LONG_LAYOUT, slotOffset + Segment.SLOT_KEY_HASH_OFFSET);
+            long slotKeyHash = mem.get(Segment.LONG_LAYOUT, slotOffset + Segment.SLOT_KEY_HASH_OFFSET);
             if (slotKeyHash != keyHash) {
                 continue;
             }
 
             // The record is about to be reached through this slot's data offset, so the
             // slot has to be shown to be the slot that was written before it is followed.
-            verifySlot(owner.segment, slotIndex);
+            // It is checked from the words already read, which are then the words followed.
+            verifySlot(mem, slotIndex, slotKeyHash, tailWord);
 
             // Hash matches - verify key bytes
-            if (owner.records.keyMatches(slotIndex, key)) {
+            if (owner.records.keyMatches(mem, slotIndex, SlotChecksum.dataRegionOffset(tailWord), key)) {
                 return slotIndex;
             }
         }
 
-        return notFound(owner.segment, idealSlot, Segment.MAX_PROBE_LENGTH);
+        return notFound(mem, idealSlot, Segment.MAX_PROBE_LENGTH);
     }
 
     /**
@@ -150,6 +175,23 @@ final class SegmentSlots {
     void verifySlot(MemorySegment mem, int slotIndex) {
         if (owner.format.hasSlotChecksum()
                 && !SlotChecksum.matches(mem, SlotChecksum.offsetOf(slotIndex))) {
+            throw slotFailure(mem, slotIndex);
+        }
+    }
+
+    /**
+     * Checks a slot against its stored checksum using the two covered words already read.
+     *
+     * @param mem       The mapping the slot lives in, live or snapshot
+     * @param slotIndex The slot to check
+     * @param keyHash   The slot's key hash word, as the probe read it
+     * @param tailWord  The slot's distance, flags and data offset word, as the probe read it
+     * @throws CorruptSegmentEntryException if the slot does not match its checksum
+     */
+    void verifySlot(MemorySegment mem, int slotIndex, long keyHash, long tailWord) {
+        if (owner.format.hasSlotChecksum()
+                && SlotChecksum.stored(mem, SlotChecksum.offsetOf(slotIndex))
+                    != SlotChecksum.compute(keyHash, tailWord)) {
             throw slotFailure(mem, slotIndex);
         }
     }

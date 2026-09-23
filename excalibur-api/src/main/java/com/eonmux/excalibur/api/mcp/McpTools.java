@@ -161,9 +161,7 @@ public final class McpTools {
             ToolSchema.object(
                 ToolSchema.required("query", "string",
                     "The question, in natural language."),
-                ToolSchema.optional("context_entities", "array",
-                    "Entity names that disambiguate the question, normally the candidates a "
-                    + "previous 'needs_input' answer returned.", "string"),
+                ContextEntities.property(),
                 ToolSchema.optional("as_of", "string",
                     "Answer as the facts stood at this point in valid time: an ISO-8601 date "
                     + "('2019-03-01'), an ISO-8601 instant ('2019-03-01T14:00:00Z'), or 'all' "
@@ -224,18 +222,38 @@ public final class McpTools {
                 ToolSchema.required("root_path", "string",
                     "Absolute path of the directory to index."),
                 ToolSchema.optional("included_extensions", "array",
-                    "File extensions to index, e.g. ['.md', '.txt']. Omit to accept the "
-                    + "server's default.", "string"),
+                    "File extensions to index, e.g. ['.md', '.txt']. Omit, or send an empty "
+                    + "list, to read every file under the root.", "string"),
                 ToolSchema.optional("excluded_directories", "array",
                     "Directory names to skip anywhere under the root, e.g. ['node_modules', "
-                    + "'target']. Omit to keep the server's default skip list.", "string"),
+                    + "'target']. Omit to keep the server's default skip list; an empty list "
+                    + "clears it, so every directory is walked.", "string"),
                 ToolSchema.optional("namespace", "string",
                     "Namespace whose graph this source's extracted facts are staged into, for "
                     + BUILD_GRAPH + " to build from. Fixed at registration. Omit for the "
                     + "configured default, or the shared one.", null),
                 ToolSchema.optional("max_depth", "integer",
                     "How many directory levels below the root to descend. Omit for the "
-                    + "server's default.", null))));
+                    + "server's default.", null),
+                ToolSchema.optional("follow_symlinks", "boolean",
+                    "Whether to descend through symbolic links. A link that leads outside the "
+                    + "root is still not followed: where it really points is what is checked. "
+                    + "Omit for the server's default, which does not follow them.", null),
+                ToolSchema.optional("include_hidden", "boolean",
+                    "Whether to index hidden files - those whose name starts with a dot, or "
+                    + "that the operating system marks hidden. Omit for the server's default, "
+                    + "which skips them.", null),
+                ToolSchema.optional("max_file_bytes", "integer",
+                    "Largest single file to index, in bytes, from 1 to 2147483648 (2 GiB). A "
+                    + "larger file is skipped rather than truncated. Omit for the server's "
+                    + "default.", null),
+                ToolSchema.optional("charset", "string",
+                    "The encoding the files are written in, for a directory that is not UTF-8, "
+                    + "e.g. 'windows-1252', 'ISO-8859-1', 'UTF-16LE'. Applies only to a file "
+                    + "with no byte-order mark: a file that starts with one is read in the "
+                    + "encoding the mark names, whatever is declared here. The server refuses "
+                    + "an encoding it does not know rather than falling back to UTF-8. Omit "
+                    + "for UTF-8.", null))));
 
         tools.add(ToolSchema.tool(ADD_DOCUMENTS,
             "Index documents by sending their text directly, for content you are holding rather "
@@ -314,7 +332,13 @@ public final class McpTools {
                     + "configured default, or the shared one.", null),
                 ToolSchema.optional("user_agent", "string",
                     "How the crawl identifies itself to the site. Omit for the server's "
-                    + "default.", null))));
+                    + "default.", null),
+                ToolSchema.optional("crawl_delay_ms", "integer",
+                    "Milliseconds to wait between two requests to the site, from 0 to 60000, "
+                    + "for a host that should be crawled more gently than usual. The server "
+                    + "has a minimum gap of its own and uses whichever is larger, so this can "
+                    + "only slow a crawl down: 0 means no preference, not no pause. Omit for "
+                    + "the server's pace.", null))));
 
         tools.add(ToolSchema.tool(REINDEX_SOURCE,
             "Re-crawl a registered source and bring the index back into step with it: new "
@@ -413,9 +437,9 @@ public final class McpTools {
             throws IOException, InterruptedException {
         Map<String, Object> body = Json.object();
         body.put("query", ToolArguments.requiredString(args, "query"));
-        List<String> mentions = ToolArguments.stringList(args, "context_entities");
-        if (!mentions.isEmpty()) {
-            body.put("context_entities", mentions);
+        List<Object> mentions = ContextEntities.read(args);
+        if (mentions != null) {
+            body.put(ContextEntities.FIELD, mentions);
         }
         // Omitted rather than defaulted: without one the node answers at the instant the
         // question implies, and sending "today" here would silently overrule that.
@@ -457,17 +481,22 @@ public final class McpTools {
         Map<String, Object> sourceConfig = Json.object();
         sourceConfig.put("source_id", ToolArguments.requiredString(args, "source_id"));
         sourceConfig.put("root_path", ToolArguments.requiredString(args, "root_path"));
-        List<String> extensions = ToolArguments.stringList(args, "included_extensions");
-        if (!extensions.isEmpty()) {
-            sourceConfig.put("included_extensions", extensions);
+        putStrings(args, sourceConfig, "included_extensions");
+        putStrings(args, sourceConfig, "excluded_directories");
+        putWholeNumber(args, sourceConfig, "max_depth");
+        putFlag(args, sourceConfig, "follow_symlinks");
+        putFlag(args, sourceConfig, "include_hidden");
+        // Read as a long: the node's ceiling is 2 GiB, one byte past what an int holds.
+        Long maxFileBytes = ToolArguments.wholeLong(args, "max_file_bytes");
+        if (maxFileBytes != null) {
+            sourceConfig.put("max_file_bytes", maxFileBytes);
         }
-        List<String> excluded = ToolArguments.stringList(args, "excluded_directories");
-        if (!excluded.isEmpty()) {
-            sourceConfig.put("excluded_directories", excluded);
-        }
-        Integer maxDepth = ToolArguments.wholeNumber(args, "max_depth");
-        if (maxDepth != null) {
-            sourceConfig.put("max_depth", maxDepth);
+        // Forwarded as named, not checked against this process's charsets: the encodings that
+        // matter are the ones the node can decode, and it answers an unknown one with a 400
+        // that names the field, which reaches the model as the tool's error.
+        String charset = ToolArguments.optionalString(args, "charset");
+        if (charset != null) {
+            sourceConfig.put("charset", charset);
         }
 
         Map<String, Object> body = Json.object();
@@ -503,8 +532,9 @@ public final class McpTools {
      *
      * <p>A tool of its own rather than a mode of {@link #INGEST_DOCUMENTS}, because the node
      * refuses a registration that carries the other type's settings rather than ignoring them.
-     * One tool covering both would offer a model six fields that make its call a 400, and the
-     * model has nothing to tell it which six except the prose.</p>
+     * One tool covering both would offer a model, on every call, the other type's settings -
+     * each of which makes that call a 400 - and the model would have nothing but the prose to
+     * tell it which ones those are.</p>
      */
     private ToolResult crawlWebsite(Map<String, Object> args)
             throws IOException, InterruptedException {
@@ -521,6 +551,7 @@ public final class McpTools {
         if (userAgent != null) {
             sourceConfig.put("user_agent", userAgent);
         }
+        putWholeNumber(args, sourceConfig, "crawl_delay_ms");
 
         Map<String, Object> body = Json.object();
         body.put("source_type", "http");
@@ -568,10 +599,30 @@ public final class McpTools {
     }
 
     /**
+     * Copies a true/false setting into a source configuration, absent staying absent.
+     *
+     * <p>False is forwarded, not dropped: it is a setting the model made, and the node's
+     * default is only what applies when none was made.</p>
+     *
+     * @param args   The call's arguments
+     * @param config The configuration being built
+     * @param field  The setting
+     */
+    private static void putFlag(Map<String, Object> args, Map<String, Object> config,
+                                String field) {
+        Boolean value = ToolArguments.optionalBoolean(args, field);
+        if (value != null) {
+            config.put(field, value);
+        }
+    }
+
+    /**
      * Copies a list setting into a source configuration, absent staying absent.
      *
      * <p>An empty list is forwarded, not dropped: the node reads it as "clear the default",
-     * which is how a caller turns off a crawl's default exclusions.</p>
+     * which is how a caller turns off a crawl's default exclusions or a directory's default
+     * skip list. Every list setting goes through here, so a tool never registers a different
+     * source than the same body sent over HTTP would.</p>
      *
      * @param args   The call's arguments
      * @param config The configuration being built

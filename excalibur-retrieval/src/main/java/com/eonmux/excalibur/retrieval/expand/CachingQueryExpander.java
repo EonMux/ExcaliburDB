@@ -84,6 +84,18 @@ public final class CachingQueryExpander implements QueryExpander {
             delegate == null ? QueryExpander.identity() : delegate, capacity);
     }
 
+    /**
+     * The expander this cache answers for when it has not seen a query.
+     *
+     * <p>So what the node reports about expansion - its circuit breaker - can be read through
+     * the cache, which has no state of that kind of its own.</p>
+     *
+     * @return The wrapped expander
+     */
+    public QueryExpander delegate() {
+        return delegate;
+    }
+
     @Override
     public List<SearchFormulation> expand(String query) {
         Objects.requireNonNull(query, "query must not be null");

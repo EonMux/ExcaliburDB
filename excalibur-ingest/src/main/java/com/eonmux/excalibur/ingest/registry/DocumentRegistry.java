@@ -35,6 +35,7 @@ import java.util.stream.Collectors;
  *   <li>Content length - size of the original document in bytes</li>
  *   <li>Chunk IDs - identifiers of the chunks this document was split into</li>
  *   <li>Index time - when this document was indexed</li>
+ *   <li>Entity tag - the validator the source's server named the indexed version by</li>
  * </ul>
  *
  * <h2>Change Detection</h2>
@@ -53,6 +54,19 @@ import java.util.stream.Collectors;
  * document follows, and a last line, {@code \#end|count}, closes the file. The header cannot
  * collide with a record and neither can the marker: {@link #escape(String)} doubles every
  * backslash, so no formatted record begins with a single one.</p>
+ *
+ * <p>A record may carry the entity tag as a last field after the chunk ids. It is persisted
+ * rather than held in memory because it is what a re-crawl sends back as {@code If-None-Match}: a
+ * node that forgot it at every restart would transfer every unchanged page again on its first
+ * re-crawl after one, which is exactly the crawl a restarted node runs.</p>
+ *
+ * <p>The field is optional within version 1 rather than a version of its own, and that is
+ * deliberate. Every version-1 reader reads the first seven fields of a record and ignores any
+ * after them, so a file with tags is one the previous build still opens - it loses the tags and
+ * nothing else, and a rollback is a rollback. A version bump would buy nothing a reader needs,
+ * since a record without the field already reads as a document without a tag, and it would make
+ * the previous build refuse the registry outright: a downgrade that cannot start, or starts only
+ * by deleting the registry and reingesting the corpus.</p>
  *
  * <p>Both lines earn their place against the same failure. A registry that lost its tail is a
  * registry of whole, well-formed records that simply omits documents, and those documents are
@@ -98,7 +112,12 @@ public final class DocumentRegistry {
     /** Introduces an escape sequence in a persisted field. */
     private static final char ESCAPE_CHAR = '\\';
 
-    /** The format this build writes. */
+    /**
+     * The format this build writes and the only versioned one it reads.
+     *
+     * <p>Still 1 with the entity tag, which is an optional trailing field that version-1 readers
+     * ignore; see the class documentation for why it is not a version of its own.</p>
+     */
     static final int FORMAT_VERSION = 1;
 
     /** Opens the first line, which names the format the rest of the file is in. */
@@ -270,6 +289,38 @@ public final class DocumentRegistry {
         String key = makeKey(metadata.getSourceId(), metadata.getDocumentId());
         documents.put(key, metadata);
         version.incrementAndGet();
+    }
+
+    /**
+     * Replaces a document's metadata, but only if it is still exactly what the caller read.
+     *
+     * <p>For a caller that derived the replacement from an earlier read and must not overwrite a
+     * newer registration made in between - a re-crawl refreshing the validators of an unchanged
+     * document while a reindex of the same document registers the version it just indexed. The
+     * reindex's metadata describes the chunks in storage; overwriting it with a copy of the old
+     * entry would point the registry at chunks that no longer exist.</p>
+     *
+     * @param expected    The metadata the caller read, compared by equality
+     * @param replacement What to register in its place, for the same document
+     * @return true if the replacement was registered, false if the entry had changed or gone
+     * @throws NullPointerException     if either argument is null
+     * @throws IllegalArgumentException if the two name different documents
+     */
+    public boolean replace(DocumentMetadata expected, DocumentMetadata replacement) {
+        Objects.requireNonNull(expected, "expected must not be null");
+        Objects.requireNonNull(replacement, "replacement must not be null");
+        if (!expected.getSourceId().equals(replacement.getSourceId())
+                || !expected.getDocumentId().equals(replacement.getDocumentId())) {
+            throw new IllegalArgumentException("replacement names " + replacement.getSourceId()
+                + KEY_SEPARATOR + replacement.getDocumentId() + ", not "
+                + expected.getSourceId() + KEY_SEPARATOR + expected.getDocumentId());
+        }
+        String key = makeKey(expected.getSourceId(), expected.getDocumentId());
+        if (!documents.replace(key, expected, replacement)) {
+            return false;
+        }
+        version.incrementAndGet();
+        return true;
     }
 
     /**
@@ -748,8 +799,11 @@ public final class DocumentRegistry {
     /**
      * Formats metadata for persistence.
      *
-     * <p>Format: {@code sourceId|documentId|lastModifiedMillis|contentHash|contentLength|indexTimeMillis|chunkId1,chunkId2,...}
-     * with every free-text field escaped.</p>
+     * <p>Format: {@code sourceId|documentId|lastModifiedMillis|contentHash|contentLength|indexTimeMillis|chunkId1,chunkId2,...|entityTag}
+     * with every free-text field escaped, and an empty last field for a document with no entity
+     * tag. The tag comes last, where a reader that knows nothing of it - the build before this
+     * one - reads past it, and where a record that ends at the chunk ids is a record with no
+     * tag.</p>
      *
      * <p>Escaping is not optional here: document ids are filesystem paths and absolute URLs, and
      * chunk ids are built from them, so all three delimiters - {@code |}, {@code ,} and the
@@ -773,7 +827,8 @@ public final class DocumentRegistry {
             Long.toString(metadata.getContentHash()),
             Long.toString(metadata.getContentLength()),
             Long.toString(metadata.getIndexTimeMillis()),
-            chunkIds.toString()
+            chunkIds.toString(),
+            metadata.getEntityTag() == null ? "" : escape(metadata.getEntityTag())
         );
     }
 
@@ -807,6 +862,9 @@ public final class DocumentRegistry {
                         builder.addChunkId(unescape(chunkId));
                     }
                 }
+            }
+            if (parts.size() > 7 && !parts.get(7).isEmpty()) {
+                builder.entityTag(unescape(parts.get(7)));
             }
 
             return builder.build();

@@ -3,6 +3,7 @@ package com.eonmux.excalibur.bench.report;
 import com.eonmux.excalibur.bench.metric.BenchmarkMetric;
 import com.eonmux.excalibur.bench.metric.BenchmarkResult;
 import com.eonmux.excalibur.bench.metric.BenchmarkResultSet;
+import com.eonmux.excalibur.bench.metric.ErroredBenchmark;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -69,10 +70,11 @@ public final class BenchmarkReportWriter {
         sb.append("## Summary\n\n");
         sb.append("| Metric | Value |\n");
         sb.append("|--------|-------|\n");
-        sb.append(String.format("| Total Benchmarks | %d |\n", results.resultCount()));
+        sb.append(String.format("| Total Benchmarks | %d |\n", results.totalCount()));
         sb.append(String.format("| Passed | %d |\n", results.passCount()));
         sb.append(String.format("| Failed | %d |\n", results.failCount()));
         sb.append(String.format("| Not Evaluated | %d |\n", results.unevaluatedCount()));
+        sb.append(String.format("| Errored | %d |\n", results.erroredCount()));
         sb.append(String.format("| No Target | %d |\n", results.skipCount()));
         sb.append(String.format("| Pass Rate | %.1f%% |\n", results.passRate()));
         sb.append(String.format("| Status | %s |\n\n", markdownStatus(results)));
@@ -105,6 +107,8 @@ public final class BenchmarkReportWriter {
             }
             sb.append("\n");
         }
+
+        appendErroredMarkdown(results.erroredBenchmarks(), sb);
 
         // Targets that could not be evaluated at all
         List<BenchmarkResult> unevaluated = results.getUnevaluatedResults();
@@ -164,6 +168,60 @@ public final class BenchmarkReportWriter {
     }
 
     /**
+     * Lists the combinations that errored: a table to scan, then each one's full
+     * failure output.
+     */
+    private static void appendErroredMarkdown(List<ErroredBenchmark> errored, StringBuilder sb) {
+        if (errored.isEmpty()) {
+            return;
+        }
+        sb.append("## Errored Benchmarks\n\n");
+        sb.append("These combinations threw before producing a measurement. Each one counts ")
+          .append("as a failure of the run:\n\n");
+        sb.append("| Category | Benchmark | Failure |\n");
+        sb.append("|----------|-----------|---------|\n");
+        for (ErroredBenchmark entry : errored) {
+            sb.append("| ").append(markdownCell(entry.category()))
+              .append(" | ").append(markdownCell(entry.label()))
+              .append(" | ").append(markdownCell(entry.message()))
+              .append(" |\n");
+        }
+        sb.append("\n");
+        for (ErroredBenchmark entry : errored) {
+            if (entry.detail().isBlank()) {
+                continue;
+            }
+            String fence = codeFence(entry.detail());
+            sb.append("### ").append(entry.label()).append("\n\n");
+            sb.append(fence).append("\n")
+              .append(entry.detail().strip()).append("\n")
+              .append(fence).append("\n\n");
+        }
+    }
+
+    /**
+     * Makes text safe inside one Markdown table cell: a pipe would end the cell and a
+     * line break the row.
+     */
+    private static String markdownCell(String text) {
+        return text.replace("\\", "\\\\").replace("|", "\\|").replaceAll("\\R", " ");
+    }
+
+    /**
+     * A backtick fence longer than any backtick run in the text, so the text cannot
+     * close its own code block.
+     */
+    private static String codeFence(String text) {
+        int longest = 0;
+        int run = 0;
+        for (int i = 0; i < text.length(); i++) {
+            run = text.charAt(i) == '`' ? run + 1 : 0;
+            longest = Math.max(longest, run);
+        }
+        return "`".repeat(Math.max(3, longest + 1));
+    }
+
+    /**
      * Generates a simple text report for console output.
      */
     public static String generateTextReport(BenchmarkResultSet results) {
@@ -189,7 +247,9 @@ public final class BenchmarkReportWriter {
         StringBuilder sb = new StringBuilder();
 
         // Header
-        sb.append("category,benchmark,mode,score,error,unit,target,meets_target\n");
+        // "error" is the score's confidence interval; "failure" is why a combination
+        // produced no score at all.
+        sb.append("category,benchmark,mode,score,error,unit,target,meets_target,failure\n");
 
         // Data rows
         for (Map.Entry<String, List<BenchmarkResult>> entry :
@@ -212,8 +272,16 @@ public final class BenchmarkReportWriter {
                 } else {
                     sb.append(",n/a");
                 }
-                sb.append("\n");
+                sb.append(",\n");
             }
+        }
+
+        for (ErroredBenchmark entry : results.erroredBenchmarks()) {
+            sb.append(escapeCsv(entry.category())).append(",");
+            sb.append(escapeCsv(entry.combination())).append(",");
+            sb.append(escapeCsv(entry.mode())).append(",");
+            sb.append(",,,,errored,");
+            sb.append(escapeCsv(entry.message())).append("\n");
         }
 
         return sb.toString();
@@ -293,7 +361,7 @@ public final class BenchmarkReportWriter {
     }
 
     private static String escapeCsv(String s) {
-        if (s.contains(",") || s.contains("\"") || s.contains("\n")) {
+        if (s.contains(",") || s.contains("\"") || s.contains("\n") || s.contains("\r")) {
             return "\"" + s.replace("\"", "\"\"") + "\"";
         }
         return s;
@@ -343,6 +411,9 @@ public final class BenchmarkReportWriter {
      * Overall run status for the Markdown summary table.
      */
     private static String markdownStatus(BenchmarkResultSet results) {
+        if (results.erroredCount() > 0) {
+            return "❌ BENCHMARKS ERRORED";
+        }
         if (results.resultCount() == 0) {
             return "❌ NO RESULTS CAPTURED";
         }

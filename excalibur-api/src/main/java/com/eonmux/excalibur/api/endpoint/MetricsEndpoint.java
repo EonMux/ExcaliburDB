@@ -303,7 +303,9 @@ public final class MetricsEndpoint implements HttpHandler {
             .counter("excalibur_graph_ingest_failures_total", failures,
                 Map.of("reason", "extraction"), ingest.extractionFailures())
             .counter("excalibur_graph_ingest_failures_total", failures,
-                Map.of("reason", "namespace_unavailable"), ingest.tenantFailures());
+                Map.of("reason", "namespace_unavailable"), ingest.tenantFailures())
+            .counter("excalibur_graph_ingest_failures_total", failures,
+                Map.of("reason", "sink_refused"), ingest.sinkRefusals());
     }
 
     /**
@@ -377,7 +379,7 @@ public final class MetricsEndpoint implements HttpHandler {
             .counter("excalibur_hnsw_vectors_integrated_total",
                 "Vectors integrated since startup", hnsw.vectorsIntegrated())
             .gauge("excalibur_cuckoo_pending_deletions",
-                "Deletions not yet applied to the membership filters",
+                "Filter entries of tombstoned segments not yet removed from the membership filters",
                 cuckoo.pendingDeletions())
             .counter("excalibur_cuckoo_deletions_total",
                 "Deletions applied to the membership filters", cuckoo.totalDeletions())
@@ -405,10 +407,18 @@ public final class MetricsEndpoint implements HttpHandler {
     /**
      * The states this node keeps serving through, each of which it answers 200 during.
      *
-     * <p>The breaker is exported as a number because an alert compares numbers: 0 closed,
-     * 1 half-open, 2 open, so {@code > 0} is "the node is not using its embedding provider".
-     * It is omitted entirely where there is no breaker, which is a different fact from a
-     * closed one.</p>
+     * <p>Each breaker is exported as a number because an alert compares numbers: 0 closed,
+     * 1 half-open, 2 open, so {@code > 0} is "the node is not using that part of its
+     * provider". The {@code breaker} label names which: {@code embedding},
+     * {@code llm_relevancy}, {@code query_expansion}, {@code graph_extraction},
+     * {@code graph_rerank}, {@code graph_query_embedding} or {@code graph_build_embedding}. A
+     * breaker is omitted entirely where there is no such component, which is a different fact
+     * from a closed one.</p>
+     *
+     * <p>The label takes those seven values and no others. The graph breakers in particular carry
+     * no namespace label: every tenant's graph reranks, embeds and builds through one client
+     * each, so one series is the whole truth, and a label per tenant would be a series per
+     * tenant for a state they all share.</p>
      *
      * @param text  The scrape being built
      * @param stats The snapshot
@@ -433,6 +443,31 @@ public final class MetricsEndpoint implements HttpHandler {
             text.gauge("excalibur_circuit_breaker_state",
                 "0 closed, 1 half-open, 2 open", Map.of("breaker", "llm_relevancy"),
                 breakerLevel(stats.llmRelevancyBreaker()));
+        }
+        if (stats.queryExpansionBreaker() != null) {
+            text.gauge("excalibur_circuit_breaker_state",
+                "0 closed, 1 half-open, 2 open", Map.of("breaker", "query_expansion"),
+                breakerLevel(stats.queryExpansionBreaker()));
+        }
+        if (stats.graphExtractionBreaker() != null) {
+            text.gauge("excalibur_circuit_breaker_state",
+                "0 closed, 1 half-open, 2 open", Map.of("breaker", "graph_extraction"),
+                breakerLevel(stats.graphExtractionBreaker()));
+        }
+        if (stats.graphRerankBreaker() != null) {
+            text.gauge("excalibur_circuit_breaker_state",
+                "0 closed, 1 half-open, 2 open", Map.of("breaker", "graph_rerank"),
+                breakerLevel(stats.graphRerankBreaker()));
+        }
+        if (stats.graphQueryEmbeddingBreaker() != null) {
+            text.gauge("excalibur_circuit_breaker_state",
+                "0 closed, 1 half-open, 2 open", Map.of("breaker", "graph_query_embedding"),
+                breakerLevel(stats.graphQueryEmbeddingBreaker()));
+        }
+        if (stats.graphBuildEmbeddingBreaker() != null) {
+            text.gauge("excalibur_circuit_breaker_state",
+                "0 closed, 1 half-open, 2 open", Map.of("breaker", "graph_build_embedding"),
+                breakerLevel(stats.graphBuildEmbeddingBreaker()));
         }
     }
 
@@ -476,6 +511,11 @@ public final class MetricsEndpoint implements HttpHandler {
                     .orElse(0.0))
             .gauge("excalibur_lexical_compaction_due",
                 "1 when the lexical index is due a compaction",
-                lexical.compactionDue() ? 1 : 0);
+                lexical.compactionDue() ? 1 : 0)
+            // A counter, because each drop is permanent: the chunk is gone from keyword search
+            // until its document is reindexed, and any increase means storage holds damage.
+            .counter("excalibur_lexical_unreadable_chunks_dropped_total",
+                "Chunks a lexical compaction dropped because their stored text was corrupt",
+                lexical.unreadableChunksDropped());
     }
 }

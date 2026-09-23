@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.shard.worker;
 
+import com.eonmux.excalibur.core.util.StopSignal;
 import com.eonmux.excalibur.store.LifecycleState;
 import com.eonmux.excalibur.store.Segment;
 import com.eonmux.excalibur.store.SegmentCatalog;
@@ -118,6 +119,20 @@ public class WarmingPhaseWorker {
 
     private volatile Thread workerThread;
 
+    /**
+     * How the running loop is told to stop, replaced on every {@link #start()}.
+     *
+     * <p>Never an interrupt. Warming a segment trains its quantizer, writes the codebook and
+     * re-encodes the graph it serves from, then moves the segment through the catalog; an
+     * interrupt landing inside any of that closes the channel it was writing, which the graph
+     * and the catalog share with every other thread using them. The signal is read between
+     * segments and wakes the pause between checks.</p>
+     */
+    private volatile StopSignal stopSignal = new StopSignal();
+
+    /** How long {@link #stop()} waits for a segment being warmed to finish. */
+    private static final long STOP_JOIN_TIMEOUT_MS = 5_000;
+
     // ==================== Constructors ====================
 
     /**
@@ -198,9 +213,11 @@ public class WarmingPhaseWorker {
         if (running.compareAndSet(false, true)) {
             stopped.set(false);
 
+            StopSignal signal = new StopSignal();
+            stopSignal = signal;
             workerThread = Thread.ofVirtual()
                 .name("excalibur-warming-phase-worker")
-                .start(this::runWarmingLoop);
+                .start(() -> runWarmingLoop(signal));
 
             LOGGER.info("WarmingPhaseWorker started");
             return true;
@@ -209,24 +226,36 @@ public class WarmingPhaseWorker {
     }
 
     /**
-     * Stops the background warming worker.
+     * Stops the background warming worker and says whether it actually ended.
+     *
+     * <p>Asked through the stop signal and waited for, never interrupted, for the reason given
+     * on {@code stopSignal}. A worker still warming a segment when the wait runs out is
+     * reported: the caller closes the arena that segment's graph is mapped from next.</p>
+     *
+     * @return true if the worker thread has ended, or was never started
      */
-    public void stop() {
+    public boolean stop() {
+        Thread worker = workerThread;
         if (stopped.compareAndSet(false, true)) {
             running.set(false);
+            stopSignal.request();
 
-            if (workerThread != null) {
-                workerThread.interrupt();
+            if (worker != null) {
                 try {
-                    workerThread.join(5000);
+                    worker.join(STOP_JOIN_TIMEOUT_MS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                }
+                if (worker.isAlive()) {
+                    LOGGER.warn("WarmingPhaseWorker did not finish warming within {}ms of being "
+                        + "asked to stop", STOP_JOIN_TIMEOUT_MS);
                 }
             }
 
             LOGGER.info("WarmingPhaseWorker stopped. PQ trained: {}, PQ failed: {}, Transitions: {}",
                 totalPqTrained.get(), totalPqFailed.get(), totalTransitions.get());
         }
+        return worker == null || !worker.isAlive();
     }
 
     /**
@@ -288,12 +317,12 @@ public class WarmingPhaseWorker {
     /**
      * Main warming loop that runs in the background virtual thread.
      */
-    private void runWarmingLoop() {
-        while (running.get() && !stopped.get()) {
+    private void runWarmingLoop(StopSignal signal) {
+        while (running.get() && !stopped.get() && !signal.isRequested()) {
             try {
                 // Process all segments in WARMING state
                 for (WarmableSegment warmable : registeredSegments) {
-                    if (!running.get() || stopped.get()) {
+                    if (!running.get() || stopped.get() || signal.isRequested()) {
                         break;
                     }
 
@@ -315,8 +344,10 @@ public class WarmingPhaseWorker {
                     }
                 }
 
-                // Sleep until next check
-                Thread.sleep(checkIntervalMs);
+                // Until the next check, or until stop() asks the loop to end.
+                if (signal.pause(checkIntervalMs)) {
+                    break;
+                }
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();

@@ -37,6 +37,15 @@ class MetricUnitsTest {
         }
 
         @Test
+        @DisplayName("Counts of work items per second are throughputs")
+        void workItemRatesAreThroughputs() {
+            for (String unit : new String[]{MetricUnits.COMPONENTS_PER_SEC, MetricUnits.ENTRIES_PER_SEC}) {
+                assertThat(MetricUnits.dimensionOf(unit)).isEqualTo(MetricUnits.Dimension.THROUGHPUT);
+                assertThat(MetricUnits.convert(5.0, unit, MetricUnits.OPS_PER_SEC)).isEqualTo(5.0);
+            }
+        }
+
+        @Test
         @DisplayName("Time-per-operation units are recognised")
         void timePerOperationUnits() {
             for (String unit : new String[]{"ns/op", "us/op", "ms/op", "s/op", "ms", "ns"}) {

@@ -88,11 +88,21 @@ public final class TextReportWriter {
         out.printf("  %d corrupt, %d unreadable, %d missing%n",
             counts.get(CheckStatus.CORRUPT), counts.get(CheckStatus.UNREADABLE),
             counts.get(CheckStatus.MISSING));
+        long rebuiltOnOpen = scan.rebuiltOnOpenCount();
+        if (rebuiltOnOpen > 0) {
+            out.printf("  %d of the corrupt files the node rebuilds by itself when it next "
+                + "opens their segment - reported, and not counted as damage%n", rebuiltOnOpen);
+        }
         out.printf("  %d unsealed, %d legacy-unprotected, %d unchecked, %d only partly "
                 + "verified - these were NOT shown to be sound, only not shown to be "
                 + "damaged%n",
             counts.get(CheckStatus.UNSEALED), counts.get(CheckStatus.LEGACY_UNPROTECTED),
             counts.get(CheckStatus.UNCHECKED), scan.partlyVerifiedCount());
+        long notData = counts.get(CheckStatus.NOT_DATA);
+        if (notData > 0) {
+            out.printf("  %d not engine data - JVM heap dumps, reported so the disk they take "
+                + "is seen, never read, and not counted as unverified%n", notData);
+        }
         out.println(scan.hasDamage()
             ? "  VERDICT: damage found"
             : "  VERDICT: no damage found");

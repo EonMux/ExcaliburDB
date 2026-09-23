@@ -24,6 +24,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 
@@ -275,7 +276,19 @@ public final class NativeChunkIndex implements ChunkIndex {
      * @param textOf Supplies a surviving chunk's text, normally from the storage engine
      */
     public CompactionResult compactIfDue(Function<String, String> textOf) throws IOException {
-        return compact(textOf, false);
+        return compact(textOf, Scope.IF_DUE, NEVER_STOP);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Checked before each segment group and each chunk of the rewrite; see
+     * {@link LexicalStore#buildUnlessStopped}.</p>
+     */
+    @Override
+    public CompactionResult compactIfDue(Function<String, String> textOf,
+                                         BooleanSupplier stopRequested) throws IOException {
+        return compact(textOf, Scope.IF_DUE, stopRequested);
     }
 
     /**
@@ -290,12 +303,64 @@ public final class NativeChunkIndex implements ChunkIndex {
      */
     @Override
     public CompactionResult compactNow(Function<String, String> textOf) throws IOException {
-        return compact(textOf, true);
+        return compact(textOf, Scope.FORCED, NEVER_STOP);
     }
 
-    private CompactionResult compact(Function<String, String> textOf, boolean forced)
-            throws IOException {
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Checked before each segment group and each chunk of the rewrite; see
+     * {@link LexicalStore#buildUnlessStopped}.</p>
+     */
+    @Override
+    public CompactionResult compactNow(Function<String, String> textOf,
+                                       BooleanSupplier stopRequested) throws IOException {
+        return compact(textOf, Scope.FORCED, stopRequested);
+    }
+
+    /**
+     * Rewrites every segment from the text storage supplies, dropping chunks it no longer holds.
+     *
+     * <p>This index stores postings and not text, so a chunk whose stored text was replaced or
+     * erased without an erasure reaching this index stays findable until a rewrite of its segment
+     * asks storage for it and gets nothing. Only a rewrite of every segment finds all of them.</p>
+     *
+     * @param textOf Supplies a surviving chunk's text, normally from the storage engine
+     */
+    @Override
+    public CompactionResult rewriteAll(Function<String, String> textOf) throws IOException {
+        return compact(textOf, Scope.ALL, NEVER_STOP);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Checked before each segment group and each chunk of the rewrite; see
+     * {@link LexicalStore#buildUnlessStopped}.</p>
+     */
+    @Override
+    public CompactionResult rewriteAll(Function<String, String> textOf,
+                                       BooleanSupplier stopRequested) throws IOException {
+        return compact(textOf, Scope.ALL, stopRequested);
+    }
+
+    /** The stop signal of a compaction nobody will ask to stop. */
+    private static final BooleanSupplier NEVER_STOP = () -> false;
+
+    /** How much a compaction rewrites. */
+    private enum Scope {
+        /** What the policy selects, and only when it says compaction is due. */
+        IF_DUE,
+        /** Everything erased, and every segment below the reader floor merged, now. */
+        FORCED,
+        /** Every segment. */
+        ALL
+    }
+
+    private CompactionResult compact(Function<String, String> textOf, Scope scope,
+                                     BooleanSupplier stopRequested) throws IOException {
         Objects.requireNonNull(textOf, "textOf must not be null");
+        Objects.requireNonNull(stopRequested, "stopRequested must not be null");
         if (!compacting.tryLock()) {
             // One at a time. Two compactions rewriting overlapping segments would have the second
             // reading files the first had already replaced, and queueing the second behind the
@@ -307,9 +372,11 @@ public final class NativeChunkIndex implements ChunkIndex {
             lock.writeLock().lock();
             try {
                 long floor = Math.max(0, epochs.getAsLong() - readerLagEpochs);
-                java.util.Optional<CompactionPlan> plan = forced
-                    ? java.util.Optional.of(store.forcedPlan(floor))
-                    : store.planCompaction(floor);
+                java.util.Optional<CompactionPlan> plan = switch (scope) {
+                    case IF_DUE -> store.planCompaction(floor);
+                    case FORCED -> java.util.Optional.of(store.forcedPlan(floor));
+                    case ALL -> java.util.Optional.of(store.fullPlan(floor));
+                };
                 if (plan.isEmpty()) {
                     var stats = store.compactionStats();
                     return CompactionResult.declined("not due: " + stats.tombstonedRecords()
@@ -325,7 +392,15 @@ public final class NativeChunkIndex implements ChunkIndex {
             // and writes only files the manifest does not name, so queries and ingestion both run
             // throughout. Holding a read lock here instead would not do - a writer queueing behind
             // it makes every query that arrives afterwards queue too.
-            LexicalStore.PreparedCompaction prepared = store.build(textOf, snapshot);
+            java.util.Optional<LexicalStore.PreparedCompaction> built =
+                store.buildUnlessStopped(textOf, snapshot, stopRequested);
+            if (built.isEmpty()) {
+                // Nothing was published and the manifest was never touched; what the rewrite had
+                // built is already gone. The next compaction plans again from what is there.
+                return CompactionResult.stopped("asked to stop during the rewrite ("
+                    + snapshot.reason() + ")");
+            }
+            LexicalStore.PreparedCompaction prepared = built.get();
 
             lock.writeLock().lock();
             try {
@@ -439,7 +514,7 @@ public final class NativeChunkIndex implements ChunkIndex {
             return new ChunkIndexStats(engine(), indexed.get(), compaction.segmentCount(),
                 store.liveDocuments(epoch), compaction.tombstonedRecords(),
                 store.outstandingErasureRequests().size(), compaction.oldestOutstanding(),
-                store.planCompaction(floor).isPresent());
+                store.planCompaction(floor).isPresent(), store.unreadableKeysDropped());
         } finally {
             lock.readLock().unlock();
         }

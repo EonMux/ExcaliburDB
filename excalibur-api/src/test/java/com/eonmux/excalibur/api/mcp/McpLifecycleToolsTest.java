@@ -172,7 +172,7 @@ class McpLifecycleToolsTest {
             .as("the node refuses a crawl carrying one of these with a 400, so offering "
                 + "them to the model is offering it a call that cannot succeed")
             .doesNotContainKeys("root_path", "included_extensions", "excluded_directories",
-                "follow_symlinks", "include_hidden", "max_file_bytes");
+                "follow_symlinks", "include_hidden", "max_file_bytes", "charset");
         assertThat(names(
             Json.objectAt(tool(McpTools.CRAWL_WEBSITE), "inputSchema").get("required")))
             .containsExactlyInAnyOrder("source_id", "base_url");

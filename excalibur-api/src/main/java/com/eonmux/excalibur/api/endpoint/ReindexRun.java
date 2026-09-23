@@ -1,6 +1,8 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.core.util.StopSignal;
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
+import com.eonmux.excalibur.ingest.pipeline.ReindexCancelledException;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
 import com.eonmux.excalibur.ingest.source.SourceResolver;
@@ -34,13 +36,16 @@ import java.util.Objects;
  * reindexed successfully.</p>
  *
  * <h2>Cancelled is not failed</h2>
- * <p>{@code DELETE /v1/reindex} interrupts the run thread and tells the caller to poll the
- * status for when it has stopped. The interrupt arrives here as an exception like any other, and
- * recording it as a failure made the one readback the route points at unable to answer the
- * question the route was asked. Both shapes the interrupt can take are recognised: the
- * exception, wrapped however deeply by whatever was blocked at the time, and the thread's own
- * interrupt flag, which is what survives when the blocked call reported the interrupt by
- * returning rather than by throwing.</p>
+ * <p>{@code DELETE /v1/reindex} requests the run's {@link StopSignal} and tells the caller to
+ * poll the status for when it has stopped. The run ends by throwing, like a run that broke, and
+ * recording that as a failure made the one readback the route points at unable to answer the
+ * question the route was asked. So a run whose signal was requested, or that ended in
+ * {@link ReindexCancelledException}, is recorded as cancelled - as is one ended by an interrupt
+ * from anywhere else, found in its cause chain or on its thread.</p>
+ *
+ * <p>The signal, not an interrupt of the run's thread, because the run spends its time writing
+ * through channels every writer of a segment shares, and an interrupt reaching one of those
+ * writes closes the channel for all of them for the life of the process.</p>
  *
  * <h2>Progress is counted, not assumed</h2>
  * <p>What the status reports is what the reindexer says it has finished, document by document.
@@ -56,7 +61,8 @@ import java.util.Objects;
  *
  * <h2>Thread Safety</h2>
  * <p>Thread-safe. Every field is final and the mutual exclusion that matters - one reindex per
- * source - is the caller's lease, taken before {@link #execute(String)} is reached.</p>
+ * source - is the caller's lease, taken before {@link #execute(String, StopSignal)} is
+ * reached.</p>
  *
  * @author ExcaliburDB
  */
@@ -125,21 +131,41 @@ public final class ReindexRun {
     /**
      * Reindexes one source, reporting every phase and every outcome to the status registry.
      *
-     * <p>Rolling replacement is used when this node can: new segments are created in
-     * BOOTSTRAPPING while the old ones keep serving queries, and the old ones are tombstoned
-     * only once the new ones are ACTIVE, so the data is never unavailable. A node without a
-     * volume manager or a segment catalog has nowhere to put the replacement and falls back to
-     * publishing in place.</p>
+     * <p>A node with a volume manager and a segment catalog takes the rolling route, which asks
+     * the storage engine for a segment to rebuild the source into. The engine never offers one,
+     * so that route ends in the same in-place rebuild the standard route runs directly; either
+     * way each changed document's previous version serves until its replacement is published.
+     * A node without the two has nothing to ask with and goes straight to the standard
+     * route.</p>
      *
-     * <p>Nothing is allowed to escape: this runs on a detached virtual thread, so an exception
+     * <p>No exception is allowed to escape: this runs on a detached virtual thread, so one
      * thrown here would be lost to the default handler and leave the source reading as
-     * mid-reindex forever.</p>
+     * mid-reindex forever. An {@link Error} is rethrown, as nothing here can recover from one,
+     * but only once the run has been recorded as failed.</p>
      *
      * @param sourceId The source to reindex
      * @return true when the run produced something, which is the same verdict the readback is
      *         given - a run that indexed nothing is the only kind that failed
      */
     public boolean execute(String sourceId) {
+        return execute(sourceId, new StopSignal());
+    }
+
+    /**
+     * As {@link #execute(String)}, for a run that can be asked to stop.
+     *
+     * <p>A stop is read by the reindexer between documents and never delivered as an interrupt;
+     * see {@link DocumentReindexer#reindexAll(Source, DocumentReindexer.ReindexProgress,
+     * StopSignal)}. The run returns with its thread's interrupt flag clear, whatever ended it,
+     * because the thread is pooled or scheduled and the next task it serves would otherwise
+     * close the first channel it touches.</p>
+     *
+     * @param sourceId The source to reindex
+     * @param stop     Asks the run to stop at its next document boundary
+     * @return true when the run produced something; false when it failed or was stopped
+     */
+    public boolean execute(String sourceId, StopSignal stop) {
+        Objects.requireNonNull(stop, "stop cannot be null");
         String threadName = Thread.currentThread().getName();
         LOGGER.info("[reindex-{}] Starting reindex execution for source: {}", threadName, sourceId);
 
@@ -159,11 +185,11 @@ public final class ReindexRun {
             boolean useRollingReplacement = volumeManager != null && segmentCatalog != null
                 && reindexer.hasRollingReplacement();
             return useRollingReplacement
-                ? runRolling(threadName, sourceId, source)
-                : runStandard(threadName, sourceId, source);
+                ? runRolling(threadName, sourceId, source, stop)
+                : runStandard(threadName, sourceId, source, stop);
 
         } catch (Exception e) {
-            if (wasCancelled(e)) {
+            if (wasCancelled(stop, e)) {
                 LOGGER.info("[reindex-{}] Reindex of source {} stopped on request after {} of "
                         + "{} document(s)", threadName, sourceId,
                     processedSoFar(sourceId), totalSoFar(sourceId));
@@ -175,6 +201,20 @@ public final class ReindexRun {
             statusRegistry.failReindex(sourceId,
                 "Reindex failed (" + e.getClass().getSimpleName() + ")" + SEE_THE_LOG);
             return false;
+        } catch (Throwable t) {
+            // An Error - out of memory, a stack overflow in a parser, a linkage failure - is not
+            // this run's to swallow, so it goes on up. But it must not leave the source reading
+            // as mid-reindex forever on its way: that is what the readback would say, and it is
+            // what a caller polling it would wait on.
+            LOGGER.error("[reindex-{}] Reindex of source {} ended by {}", threadName, sourceId,
+                t.toString(), t);
+            try {
+                statusRegistry.failReindex(sourceId,
+                    "Reindex failed (" + t.getClass().getSimpleName() + ")" + SEE_THE_LOG);
+            } catch (Throwable recording) {
+                t.addSuppressed(recording);
+            }
+            throw t;
         }
     }
 
@@ -203,23 +243,29 @@ public final class ReindexRun {
     /**
      * Whether this run stopped because someone asked it to, rather than because it broke.
      *
-     * <p>Both shapes are checked because the interrupt takes whichever the blocked call gave
-     * it. A call that threw {@link InterruptedException} cleared the flag on the way out and is
-     * findable only in the cause chain - and it may be wrapped several deep, because every
-     * layer between here and the fetch wraps what it catches. A call that was interrupted
-     * inside a channel throws {@link ClosedByInterruptException}, an {@code IOException},
-     * which no cause-chain test for {@code InterruptedException} would find. And a call that
-     * noticed the interrupt and returned without throwing leaves only the flag.</p>
+     * <p>The run's own signal and the exception the reindexer ends a stopped run with are the
+     * answer for every stop this node asks for. An interrupt from anywhere else is still a
+     * request to stop, and takes whichever shape the blocked call gave it: a call that threw
+     * {@link InterruptedException} cleared the flag on the way out and is findable only in the
+     * cause chain, possibly several wrappers deep; a call interrupted inside a channel of its
+     * own throws {@link ClosedByInterruptException}, an {@code IOException}; and a call that
+     * noticed the interrupt and returned leaves only the flag - which is cleared here, into the
+     * signal, so the thread goes back to its pool without it.</p>
      *
+     * @param stop    The run's stop signal
      * @param failure What ended the run
      * @return true if the run was cancelled
      */
-    private static boolean wasCancelled(Exception failure) {
-        if (Thread.currentThread().isInterrupted()) {
+    private static boolean wasCancelled(StopSignal stop, Exception failure) {
+        if (Thread.interrupted()) {
+            stop.request();
+        }
+        if (stop.isRequested()) {
             return true;
         }
         for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
-            if (cause instanceof InterruptedException
+            if (cause instanceof ReindexCancelledException
+                    || cause instanceof InterruptedException
                     || cause instanceof ClosedByInterruptException) {
                 return true;
             }
@@ -282,19 +328,20 @@ public final class ReindexRun {
     }
 
     /**
-     * Reindexes into a fresh segment, leaving the old one serving until the new one is ready.
+     * Reindexes by the rolling route, which asks for a segment to rebuild the source into.
      *
-     * <p>A volume has to be chosen before anything is written, and there may not be one. That is
-     * a failure rather than a fallback to publishing in place: the caller asked for the corpus to
-     * be rebuilt, and quietly rebuilding it over the top of the segments still answering queries
-     * is the outage rolling replacement exists to avoid.</p>
+     * <p>A volume has to be chosen before the candidate segment can be created, and there may
+     * not be one. That fails the run: a node whose volumes are all out of space has nowhere to
+     * write what the rebuild produces either.</p>
      *
      * @param threadName The worker thread, which is how a run is followed through the log
      * @param sourceId   The source being reindexed
      * @param source     The resolved source
+     * @param stop       Asks the run to stop
      * @throws SourceException if the source cannot be read
      */
-    private boolean runRolling(String threadName, String sourceId, Source source)
+    private boolean runRolling(String threadName, String sourceId, Source source,
+                               StopSignal stop)
             throws SourceException {
         LOGGER.info("[reindex-{}] Using rolling replacement for zero-downtime reindex of "
             + "source: {}", threadName, sourceId);
@@ -311,7 +358,8 @@ public final class ReindexRun {
             threadName, volumePath, sourceId);
 
         DocumentReindexer.RollingReindexResult result =
-            reindexer.reindexWithRollingReplacement(source, volumePath, progressFor(sourceId));
+            reindexer.reindexWithRollingReplacement(source, volumePath, progressFor(sourceId),
+                stop);
 
         return reportRolling(threadName, sourceId, result);
     }
@@ -320,8 +368,9 @@ public final class ReindexRun {
      * Records the verdict on a rolling run, and says which segments changed hands.
      *
      * <p>The new segment id and the tombstoned ones are logged on both the clean and the partial
-     * outcome because they are what an operator needs to inspect the result: nothing else in the
-     * node says which segment now holds this source.</p>
+     * outcome because they are what an operator needs to inspect the result. A run that rebuilt
+     * in place logs segment {@code -1} and none tombstoned, which is the answer to the same
+     * question: nothing changed hands.</p>
      *
      * @param threadName The worker thread, for the log
      * @param sourceId   The source that was reindexed
@@ -329,7 +378,7 @@ public final class ReindexRun {
      */
     private boolean reportRolling(String threadName, String sourceId,
                                   DocumentReindexer.RollingReindexResult result) {
-        reportSkipped(sourceId, result.getBasicResult().getDocumentsSkipped());
+        reportSkipped(sourceId, result.getBasicResult().getDocumentsNotText());
         if (result.hasErrors() && result.getDocumentsIndexed() == 0) {
             LOGGER.error("[reindex-{}] Reindex failed completely with {} errors for "
                     + "source {}: {}", threadName, result.getErrorCount(), sourceId,
@@ -358,15 +407,17 @@ public final class ReindexRun {
      * @param threadName The worker thread, for the log
      * @param sourceId   The source being reindexed
      * @param source     The resolved source
+     * @param stop       Asks the run to stop
      * @throws SourceException if the source cannot be read
      */
-    private boolean runStandard(String threadName, String sourceId, Source source)
+    private boolean runStandard(String threadName, String sourceId, Source source,
+                                StopSignal stop)
             throws SourceException {
         LOGGER.info("[reindex-{}] Using standard reindex (rolling replacement not configured) "
             + "for source: {}", threadName, sourceId);
 
         DocumentReindexer.ReindexResult result =
-            reindexer.reindexAll(source, progressFor(sourceId));
+            reindexer.reindexAll(source, progressFor(sourceId), stop);
 
         return reportStandard(threadName, sourceId, result);
     }
@@ -384,7 +435,7 @@ public final class ReindexRun {
      */
     private boolean reportStandard(String threadName, String sourceId,
                                    DocumentReindexer.ReindexResult result) {
-        reportSkipped(sourceId, result.getDocumentsSkipped());
+        reportSkipped(sourceId, result.getDocumentsNotText());
         if (result.hasErrors() && result.getDocumentsIndexed() == 0) {
             LOGGER.error("[reindex-{}] Reindex failed completely with {} errors for "
                     + "source {}: {}", threadName, result.getErrorCount(), sourceId,

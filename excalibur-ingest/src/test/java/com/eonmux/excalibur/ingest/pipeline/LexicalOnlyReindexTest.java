@@ -12,7 +12,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -160,11 +159,6 @@ class LexicalOnlyReindexTest {
         @Override
         public Stream<String> crawl() {
             return documents.keySet().stream();
-        }
-
-        @Override
-        public boolean hasChanged(Instant since) {
-            return true;
         }
 
         @Override

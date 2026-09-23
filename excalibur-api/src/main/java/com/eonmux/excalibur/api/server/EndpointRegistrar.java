@@ -157,9 +157,9 @@ final class EndpointRegistrar {
      * @param ingestSourceRegistry Where ingestion sources are registered
      * @param sourceCatalog        Where registrations are recorded across restarts, or null
      * @param ingestionStatus      What {@code GET /v1/ingest/status} serves
-     * @param ingestionOrchestrator Background ingestion, or null in stub mode
+     * @param ingestionOrchestrator Background ingestion, or null when no pipeline is wired
      * @param reindexStatus        What {@code GET /v1/reindex/status} serves
-     * @param documentReindexer    Executes a reindex, or null in stub mode
+     * @param documentReindexer    Executes a reindex, or null when reindexing answers 503
      * @param sourceResolver       Resolves a source id for the reindexer
      * @param reindexCoordinator   The claim shared with the scheduled reindex handler
      * @param documentErasure      The service behind {@code POST /v1/erasure}, or null
@@ -239,8 +239,10 @@ final class EndpointRegistrar {
             ? new GraphBuildRunner(in.graphTenants())
             : null;
         if (graphBuildRunner != null) {
-            collector.withGraph(new GraphStatsReader(
-                in.graphTenants(), graphBuildRunner, in.graphIngestSink()));
+            IngestionOrchestrator ingestion = in.ingestionOrchestrator();
+            collector.withGraph(new GraphStatsReader(in.graphTenants(), graphBuildRunner,
+                in.graphIngestSink(),
+                ingestion != null ? ingestion::graphReportFailures : () -> 0L));
         }
 
         // Where a result's text is read back from when a request asks for it. The indexes hold
@@ -275,7 +277,7 @@ final class EndpointRegistrar {
         registerReindex(target, notFound, reindexHandler);
         registerErasure(target, notFound, suppliedSources);
         CompactionRunner compactionRunner = new CompactionRunner(
-            in.indexOrchestrator()::compactNow);
+            in.indexOrchestrator()::compactNow, lexicalCompactor(chunkText));
         registerCompaction(target, notFound, compactionRunner);
         registerGraph(target, notFound, graphBuildRunner);
         target.createContext("/", wrapHandler(notFound));
@@ -335,14 +337,44 @@ final class EndpointRegistrar {
     }
 
     /**
-     * The ingest endpoint, wired to both the status registry and the orchestrator.
+     * The chunk index's half of {@code POST /v1/compact}, or null on a node that keeps none.
      *
-     * <p>The registry is what makes a status entry appear as soon as a source is registered;
-     * the orchestrator, where one is configured, is what then reports progress against it.</p>
+     * <p>A forced run rewrites every live segment of the index, so chunks the store no longer
+     * holds are dropped even where too few were tombstoned for the index's own policy to act; an
+     * ordinary run applies that policy. Either way the index reads each surviving chunk's text
+     * back out of the store, the same reader queries use - which throws, rather than answering
+     * that a chunk is gone, when storage cannot be read, so the rewrite leaves that part of the
+     * index as it is.</p>
      *
-     * @param suppliedSources The ids {@code POST /v1/documents} has taken
-     * @return The endpoint behind {@code POST /v1/ingest}
+     * @param chunkText Reads a chunk's text back out of the store
+     * @return What compacts the chunk index on demand, or null
      */
+    private CompactionRunner.LexicalCompactor lexicalCompactor(Function<String, String> chunkText) {
+        ChunkIndex chunkIndex = in.chunkIndex();
+        if (chunkIndex == null) {
+            return null;
+        }
+        // The stop signal reaches the rewrite itself, so a cancel or a shutdown ends it at the
+        // next segment group or chunk rather than after every segment has been read back. Whether
+        // it reads storage is the index's to say: a shutdown keeps storage open under a rewrite
+        // that does, and only the index's files under one that does not.
+        return new CompactionRunner.LexicalCompactor() {
+            @Override
+            public com.eonmux.excalibur.retrieval.lexical.native_.CompactionResult compact(
+                    boolean force, java.util.function.BooleanSupplier stopRequested)
+                    throws java.io.IOException {
+                return force
+                    ? chunkIndex.rewriteAll(chunkText, stopRequested)
+                    : chunkIndex.compactIfDue(chunkText, stopRequested);
+            }
+
+            @Override
+            public boolean readsStorage() {
+                return chunkIndex.compactionReadsStorage();
+            }
+        };
+    }
+
     /**
      * The rate this deployment paces crawls at.
      *
@@ -358,6 +390,15 @@ final class EndpointRegistrar {
             : com.eonmux.excalibur.config.IngestConfig.DEFAULT_CRAWL_DELAY_MS;
     }
 
+    /**
+     * The ingest endpoint, wired to both the status registry and the orchestrator.
+     *
+     * <p>The registry is what makes a status entry appear as soon as a source is registered;
+     * the orchestrator, where one is configured, is what then reports progress against it.</p>
+     *
+     * @param suppliedSources The ids {@code POST /v1/documents} has taken
+     * @return The endpoint behind {@code POST /v1/ingest}
+     */
     private IngestEndpoint newIngestEndpoint(InlineSourceIds suppliedSources) {
         IngestEndpoint ingestEndpoint = new IngestEndpoint(
             in.ingestSourceRegistry(),
@@ -368,7 +409,8 @@ final class EndpointRegistrar {
             minCrawlDelayMillis()
         );
         LOGGER.info("IngestEndpoint configured with status registry (orchestrator: {})",
-            in.ingestionOrchestrator() != null ? "enabled" : "disabled (stub mode)");
+            in.ingestionOrchestrator() != null ? "enabled"
+                : "disabled (sources register, status reports unconfigured)");
         return ingestEndpoint;
     }
 
@@ -451,6 +493,11 @@ final class EndpointRegistrar {
         collector.withLexicalIndex(in.chunkIndex());
         collector.withEmbeddingBreaker(embeddingBreakerState());
         collector.withLlmRelevancyBreaker(llmRelevancyBreakerState());
+        collector.withQueryExpansionBreaker(queryExpansionBreakerState());
+        collector.withGraphExtractionBreaker(graphExtractionBreakerState());
+        collector.withGraphRerankBreaker(graphRerankBreakerState());
+        collector.withGraphQueryEmbeddingBreaker(graphQueryEmbeddingBreakerState());
+        collector.withGraphBuildEmbeddingBreaker(graphBuildEmbeddingBreakerState());
         return collector;
     }
 
@@ -490,10 +537,7 @@ final class EndpointRegistrar {
         if (embeddings == null) {
             return null;
         }
-        return () -> {
-            CircuitBreaker breaker = embeddings.getCircuitBreaker();
-            return breaker == null ? null : breaker.getState().name();
-        };
+        return () -> stateOf(embeddings.getCircuitBreaker());
     }
 
     /**
@@ -513,10 +557,101 @@ final class EndpointRegistrar {
             || !(pipeline.getLlmScorer() instanceof LlmRelevancyScorer scorer)) {
             return null;
         }
-        return () -> {
-            CircuitBreaker breaker = scorer.getCircuitBreaker();
-            return breaker == null ? null : breaker.getState().name();
-        };
+        return () -> stateOf(scorer.getCircuitBreaker());
+    }
+
+    /**
+     * Reads the query-expansion breaker's state, or null on a node that expands no queries.
+     *
+     * <p>Read through the result cache the expander is normally wrapped in, which keeps no
+     * breaker of its own. Only the shipped chat-model expander owns one; any other expander -
+     * or none - reports absence, the same statement a node without a chat model makes.</p>
+     *
+     * @return A supplier of the state's name, or null where there is no breaker
+     */
+    private Supplier<String> queryExpansionBreakerState() {
+        com.eonmux.excalibur.retrieval.expand.QueryExpander expander = in.queryExpander();
+        if (expander instanceof com.eonmux.excalibur.retrieval.expand.CachingQueryExpander cached) {
+            expander = cached.delegate();
+        }
+        if (!(expander instanceof com.eonmux.excalibur.retrieval.expand.LlmQueryExpander llm)) {
+            return null;
+        }
+        return () -> stateOf(llm.getCircuitBreaker());
+    }
+
+    /**
+     * Reads the relation-extraction breaker's state, or null on a node that extracts no facts.
+     *
+     * <p>A graph sink over {@code RelationExtractor.none()} - a node with no chat model - has no
+     * breaker, and reports absence rather than a closed one.</p>
+     *
+     * @return A supplier of the state's name, or null where there is no breaker
+     */
+    private Supplier<String> graphExtractionBreakerState() {
+        NamespaceRoutingGraphIngestSink sink = in.graphIngestSink();
+        if (sink == null || !(sink.extractor()
+                instanceof com.eonmux.excalibur.ingest.graph.LlmRelationExtractor extractor)) {
+            return null;
+        }
+        return () -> stateOf(extractor.getCircuitBreaker());
+    }
+
+    /**
+     * Reads the graph route's rerank breaker's state, or null on a node that serves no graph.
+     *
+     * <p>Read from the tenants rather than from any one graph, because the breaker is the
+     * node's: every namespace's graph reranks through the one chat client the tenants hold. The
+     * supplier answers null until a graph that reranks with a model has been opened, and a node
+     * serving a pipeline it did not open itself has no tenants to ask.</p>
+     *
+     * @return A supplier of the state's name, or null where there is no graph to rerank
+     */
+    private Supplier<String> graphRerankBreakerState() {
+        GraphTenants tenants = in.graphTenants();
+        if (tenants == null) {
+            return null;
+        }
+        return () -> stateOf(tenants.models().rerankBreaker());
+    }
+
+    /**
+     * Reads the graph route's question-embedding breaker's state, or null on a node that serves
+     * no graph.
+     *
+     * <p>As {@link #graphRerankBreakerState()}, and answering null until a graph built with
+     * entity vectors - the only kind that embeds a question - has been opened.</p>
+     *
+     * @return A supplier of the state's name, or null where there is no graph to rerank
+     */
+    private Supplier<String> graphQueryEmbeddingBreakerState() {
+        GraphTenants tenants = in.graphTenants();
+        if (tenants == null) {
+            return null;
+        }
+        return () -> stateOf(tenants.models().queryEmbeddingBreaker());
+    }
+
+    /**
+     * Reads the graph build's entity-embedding breaker's state, or null on a node that serves
+     * no graph.
+     *
+     * <p>As {@link #graphRerankBreakerState()}, and answering null until a build has embedded
+     * an entity - a node whose builds write no vectors never creates the client.</p>
+     *
+     * @return A supplier of the state's name, or null where there is no graph to build
+     */
+    private Supplier<String> graphBuildEmbeddingBreakerState() {
+        GraphTenants tenants = in.graphTenants();
+        if (tenants == null) {
+            return null;
+        }
+        return () -> stateOf(tenants.models().buildEmbeddingBreaker());
+    }
+
+    /** A breaker's state by name, or null where there is no breaker. */
+    private static String stateOf(CircuitBreaker breaker) {
+        return breaker == null ? null : breaker.getState().name();
     }
 
     // ==================== Route registration ====================

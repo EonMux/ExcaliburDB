@@ -136,6 +136,36 @@ public final class DistanceValidator {
         validateMatchingDimensions(v1, v2);
     }
 
+    /**
+     * Validates the shape of a vector pair - both present, non-empty and of one dimension -
+     * without reading their components.
+     *
+     * <p>The distance functions call this up front and run the component check of
+     * {@link #validateVectorPair} only when a sum they accumulated comes back non-finite,
+     * which every NaN or infinite component forces: its square, its difference with anything
+     * finite and its product with anything are all infinite or NaN. A well-formed pair then
+     * costs no pass over its inputs beyond the ones the distance makes anyway, and a
+     * malformed one is still rejected with the same exception.</p>
+     *
+     * @param v1 The first vector
+     * @param v2 The second vector
+     * @param name1 The name of the first vector for error messages
+     * @param name2 The name of the second vector for error messages
+     * @throws NullPointerException if either vector is null
+     * @throws IllegalArgumentException if either vector is empty or the dimensions differ
+     */
+    public static void validateVectorShapes(float[] v1, float[] v2, String name1, String name2) {
+        Objects.requireNonNull(v1, name1 + " cannot be null");
+        Objects.requireNonNull(v2, name2 + " cannot be null");
+        if (v1.length == 0) {
+            throw new IllegalArgumentException(name1 + " cannot be empty");
+        }
+        if (v2.length == 0) {
+            throw new IllegalArgumentException(name2 + " cannot be empty");
+        }
+        validateMatchingDimensions(v1, v2);
+    }
+
     // ============================================================
     // OUTPUT VALIDATION METHODS
     // ============================================================

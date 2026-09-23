@@ -13,6 +13,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -42,6 +43,54 @@ class SnapshotRestorerTest {
 
     private static Path payload(Path snapshotDir, String name) {
         return snapshotDir.resolve(SnapshotLayout.PAYLOAD_DIRECTORY).resolve(name);
+    }
+
+    @Test
+    @DisplayName("an image without term sketches says the node rebuilds them at start-up")
+    void anImageWithoutSketchesSaysTheyAreRebuilt() throws IOException {
+        Path dataDir = DataDirectoryFixture.syntheticDirectory(tempDir.resolve("data"));
+        Files.write(dataDir.resolve("segment_0.tfs"), new byte[48]);
+        Path snapshotDir = tempDir.resolve("snap");
+        new SnapshotWriter().take(new SnapshotOptions(dataDir, snapshotDir, false, false));
+
+        RestoreResult result = new SnapshotRestorer().restore(new RestoreOptions(
+            snapshotDir, tempDir.resolve("restored"), false, VerifyDepth.CHECKSUM));
+
+        assertThat(tempDir.resolve("restored/segment_0.tfs"))
+            .as("derived state left out on request").doesNotExist();
+        assertThat(result.rebuildRequired())
+            .anySatisfy(line -> assertThat(line).contains("term sketches", "start-up"));
+    }
+
+    @Test
+    @DisplayName("an image with its term sketches has nothing to say about them")
+    void anImageWithSketchesSaysNothingAboutThem() throws IOException {
+        Path dataDir = DataDirectoryFixture.syntheticDirectory(tempDir.resolve("data"));
+        Files.write(dataDir.resolve("segment_0.tfs"), new byte[48]);
+        Path snapshotDir = tempDir.resolve("snap");
+        new SnapshotWriter().take(new SnapshotOptions(dataDir, snapshotDir, true, false));
+
+        RestoreResult result = new SnapshotRestorer().restore(new RestoreOptions(
+            snapshotDir, tempDir.resolve("restored"), false, VerifyDepth.CHECKSUM));
+
+        assertThat(tempDir.resolve("restored/segment_0.tfs")).exists();
+        assertThat(result.rebuildRequired())
+            .noneSatisfy(line -> assertThat(line).contains("term sketches"));
+    }
+
+    @Test
+    @DisplayName("a compaction's lone staged mapping survives an image without derived state")
+    void aLoneStagedMappingIsRestored() throws IOException {
+        Path dataDir = DataDirectoryFixture.syntheticDirectory(tempDir.resolve("data"));
+        Files.write(dataDir.resolve("segment_0.hnsw.compact.docmap"), new byte[24]);
+        Path snapshotDir = tempDir.resolve("snap");
+        new SnapshotWriter().take(new SnapshotOptions(dataDir, snapshotDir, false, false));
+
+        new SnapshotRestorer().restore(new RestoreOptions(
+            snapshotDir, tempDir.resolve("restored"), false, VerifyDepth.CHECKSUM));
+
+        assertThat(tempDir.resolve("restored/segment_0.hnsw.compact.docmap"))
+            .hasBinaryContent(new byte[24]);
     }
 
     @Test
@@ -160,5 +209,138 @@ class SnapshotRestorerTest {
             assertThat(siblings.map(p -> p.getFileName().toString()))
                 .noneMatch(name -> name.contains(SnapshotLayout.STAGING_INFIX));
         }
+    }
+
+    @Test
+    @DisplayName("a deep restore of a sound image walks every format and restores it")
+    void deepRestoreOfASoundImageSucceeds() throws IOException {
+        Path dataDir = DataDirectoryFixture.realIndexedDirectory(tempDir.resolve("data"));
+        Path snapshotDir = tempDir.resolve("snap");
+        new SnapshotWriter().take(new SnapshotOptions(dataDir, snapshotDir, true, false));
+        Path target = tempDir.resolve("restored");
+
+        RestoreResult result = new SnapshotRestorer()
+            .restore(new RestoreOptions(snapshotDir, target, false, VerifyDepth.DEEP));
+
+        assertThat(result.filesRestored()).isEqualTo(result.manifest().files().size());
+        assertThat(DataDirectoryFixture.digestTree(target))
+            .isEqualTo(DataDirectoryFixture.digestTree(dataDir));
+    }
+
+    @Test
+    @DisplayName("a deep restore refuses an image whose graph was damaged before it was taken")
+    void deepRestoreRefusesDamageTheChecksumsCopiedFaithfully() throws IOException {
+        Path dataDir = DataDirectoryFixture.realIndexedDirectory(tempDir.resolve("data"));
+        DataDirectoryFixture.flipAByte(dataDir.resolve(DataDirectoryFixture.DOCUMENT_MAPPING));
+        Path snapshotDir = tempDir.resolve("snap");
+        new SnapshotWriter().take(new SnapshotOptions(dataDir, snapshotDir, true, false));
+        Path target = tempDir.resolve("restored");
+
+        new SnapshotRestorer()
+            .restore(new RestoreOptions(snapshotDir, tempDir.resolve("shallow"), false,
+                VerifyDepth.CHECKSUM));
+        assertThatThrownBy(() -> new SnapshotRestorer()
+            .restore(new RestoreOptions(snapshotDir, target, false, VerifyDepth.DEEP)))
+            .isInstanceOf(RestoreRefusedException.class)
+            .hasMessageContaining(DataDirectoryFixture.DOCUMENT_MAPPING)
+            .extracting(e -> ((RestoreRefusedException) e).reason())
+            .isEqualTo(RestoreRefusedException.Reason.SNAPSHOT_DOES_NOT_VERIFY);
+        assertThat(target).doesNotExist();
+    }
+
+    @Test
+    @DisplayName("a swap that fails puts the displaced target back as it was")
+    void failedSwapRestoresTheDisplacedTarget() throws IOException {
+        Path snapshotDir = snapshot();
+        Path parent = Files.createDirectories(tempDir.resolve("volume"));
+        Path target = Files.createDirectories(parent.resolve("live"));
+        DataDirectoryFixture.writeRandom(target.resolve("catalog.dat"), 4096, 903L);
+        DataDirectoryFixture.writeRandom(target.resolve("nested/segment_0.dat"), 2048, 904L);
+        Map<String, String> before = DataDirectoryFixture.digestTree(target);
+
+        SnapshotRestorer restorer = new SnapshotRestorer(failingOnto(target, false));
+
+        assertThatThrownBy(() -> restorer
+            .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM)))
+            .isInstanceOf(IOException.class)
+            .hasMessageContaining("the swap onto the target failed");
+
+        assertThat(DataDirectoryFixture.digestTree(target))
+            .as("the operator must be left with the directory they had, not with none")
+            .isEqualTo(before);
+        try (var siblings = Files.list(parent)) {
+            assertThat(siblings.map(p -> p.getFileName().toString()))
+                .as("neither the staged tree nor the displaced one may be left beside it")
+                .containsExactly("live");
+        }
+    }
+
+    @Test
+    @DisplayName("a rollback that fails too is reported on the failure, not lost")
+    void failedRollbackIsAttachedToTheFailure() throws IOException {
+        Path snapshotDir = snapshot();
+        Path parent = Files.createDirectories(tempDir.resolve("volume"));
+        Path target = Files.createDirectories(parent.resolve("live"));
+        DataDirectoryFixture.writeRandom(target.resolve("catalog.dat"), 4096, 905L);
+
+        SnapshotRestorer restorer = new SnapshotRestorer(failingOnto(target, true));
+
+        assertThatThrownBy(() -> restorer
+            .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM)))
+            .isInstanceOf(IOException.class)
+            .satisfies(failure -> assertThat(failure.getSuppressed())
+                .anySatisfy(suppressed -> assertThat(suppressed)
+                    .hasMessageContaining("the rollback failed")));
+        try (var siblings = Files.list(parent)) {
+            assertThat(siblings.map(p -> p.getFileName().toString()))
+                .as("the displaced directory is still there, under the name the error gives")
+                .anyMatch(name -> name.contains(SnapshotLayout.STAGING_INFIX + "replaced-"));
+        }
+    }
+
+    @Test
+    @DisplayName("a swap that fails with no previous target leaves nothing behind")
+    void failedSwapWithNoPreviousTargetLeavesNothing() throws IOException {
+        Path snapshotDir = snapshot();
+        Path parent = Files.createDirectories(tempDir.resolve("volume"));
+        Path target = parent.resolve("fresh");
+
+        SnapshotRestorer restorer = new SnapshotRestorer(failingOnto(target, false));
+
+        assertThatThrownBy(() -> restorer
+            .restore(new RestoreOptions(snapshotDir, target, false, VerifyDepth.CHECKSUM)))
+            .isInstanceOf(IOException.class);
+        try (var siblings = Files.list(parent)) {
+            assertThat(siblings).isEmpty();
+        }
+    }
+
+    /**
+     * Returns a mover that refuses to rename anything onto the target.
+     *
+     * <p>Standing in for the one failure the swap guards against: the old directory has been
+     * renamed aside and the new one will not take its name. Every other rename is real, so
+     * what the restorer does next - putting the old directory back, and clearing up the
+     * staged tree - happens on the filesystem and is asserted there.</p>
+     *
+     * @param target         The name nothing may be renamed onto
+     * @param rollbackFails  Whether the rename that puts the old directory back fails too
+     * @return The mover
+     */
+    private static SnapshotRestorer.DirectoryMover failingOnto(Path target,
+                                                               boolean rollbackFails) {
+        return (source, destination) -> {
+            boolean onto = destination.toAbsolutePath().normalize()
+                .equals(target.toAbsolutePath().normalize());
+            boolean rollback = source.getFileName().toString()
+                .contains(SnapshotLayout.STAGING_INFIX + "replaced-");
+            if (onto && !rollback) {
+                throw new IOException("the swap onto the target failed");
+            }
+            if (onto && rollbackFails) {
+                throw new IOException("the rollback failed");
+            }
+            Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE);
+        };
     }
 }

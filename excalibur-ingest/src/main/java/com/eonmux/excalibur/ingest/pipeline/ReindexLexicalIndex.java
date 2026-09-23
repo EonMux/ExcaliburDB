@@ -12,6 +12,8 @@ import java.io.IOException;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 
 /**
@@ -123,8 +125,16 @@ final class ReindexLexicalIndex {
      * <p>Both at the end of the run for the reason the ingestion pipeline does it there: a
      * refresh is what makes a batch searchable at one instant, and a run that has just erased
      * documents is the moment there is something to reclaim.</p>
+     *
+     * <p>The compaction reads {@code stopRequested} where it can end without publishing anything
+     * half-done, so a stopped or shutting-down run is not held for a rewrite of the whole index;
+     * the erased chunks stay owed to the next one. It is never interrupted instead: the index's
+     * files are channels every query shares.</p>
+     *
+     * @param stopRequested Answers true once the compaction should end without publishing
      */
-    void settle() {
+    void settle(BooleanSupplier stopRequested) {
+        Objects.requireNonNull(stopRequested, "stopRequested must not be null");
         ChunkIndex target = this.index;
         if (target == null) {
             return;
@@ -140,14 +150,15 @@ final class ReindexLexicalIndex {
         if (text == null) {
             return;
         }
-        reclaim(target, text);
+        reclaim(target, text, stopRequested);
     }
 
     /** Rewrites the segments holding erased chunks, so they leave disk. */
-    private void reclaim(ChunkIndex target, Function<String, String> text) {
+    private void reclaim(ChunkIndex target, Function<String, String> text,
+                         BooleanSupplier stopRequested) {
         try {
             long started = System.currentTimeMillis();
-            CompactionResult result = target.compactIfDue(text);
+            CompactionResult result = target.compactIfDue(text, stopRequested);
             if (result.performed()) {
                 LOG.info("Lexical compaction after reindex: {} segment(s) rewritten to {}, {} "
                         + "chunk(s) physically removed in {}ms ({})", result.segmentsRewritten(),

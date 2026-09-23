@@ -123,12 +123,12 @@ class HnswGraphStructureTest {
     /**
      * Every edge an insertion writes exists in both directions.
      *
-     * <p>Distinct from {@link #shouldMaintainBidirectionalityAfterPruning()}, which forces
-     * pruning with a four-connection configuration and checks that dropping an edge also
-     * drops its back-edge. Here the default configuration allows 32 neighbours at layer 0
-     * and 16 above it, so twenty nodes can never reach a connection limit and the pruning
-     * path never runs: what is under test is that the insertion path writes the back-edge
-     * in the first place.</p>
+     * <p>Distinct from {@link #shouldKeepOutLinksWhenANeighbourPrunes()}, which forces
+     * pruning with a four-connection configuration, after which one-way edges are expected.
+     * Here the default configuration allows 32 neighbours at layer 0 and 16 above it, so
+     * twenty nodes can never reach a connection limit and no offered back-link is ever
+     * declined: what is under test is that the insertion path offers the back-link in the
+     * first place.</p>
      *
      * <p>The edge count is asserted too. "No edge lacks a back-edge" is satisfied by a
      * graph with no edges at all, so a test that only checked bidirectionality would go
@@ -389,31 +389,46 @@ class HnswGraphStructureTest {
     }
 
     /**
-     * Verifies that pruning maintains bidirectional edge invariant.
+     * A full list that drops a neighbour leaves that neighbour's own links alone.
      *
-     * <p>When pruning removes an edge from A to B, it must also remove
-     * the back-edge from B to A.</p>
+     * <p>With four connections above layer 0 and eight at it, a hundred insertions overflow
+     * lists constantly. Each overflow re-chooses the owner's list and may decline the
+     * newcomer or drop an older member; the other node keeps whatever it links to, because
+     * its out-links are what route searches through it. The graph must therefore contain
+     * one-way edges - proof that pruning ran - while every node still links somewhere at
+     * layer 0 and every structural invariant holds.</p>
      */
     @Test
-    void shouldMaintainBidirectionalityAfterPruning() throws IOException {
+    void shouldKeepOutLinksWhenANeighbourPrunes() throws IOException {
         HnswConfig smallConnConfig = new HnswConfig(4, 8, 50, 25, 1.0 / Math.log(4), 64);
 
         try (HnswGraph graph = new HnswGraph(graphPath, smallConnConfig, distanceFunction, 1000)) {
             Random seededRandom = new Random(33333);
-
-            // Insert enough to cause pruning
             for (int i = 0; i < 100; i++) {
                 graph.insert(generateNormalizedVector(64, seededRandom));
             }
 
-            // Verify bidirectional edges using invariant verifier
             HnswInvariantVerifier.VerificationResult result =
                 HnswInvariantVerifier.verifyAllInvariants(graph);
+            assertThat(result.violations())
+                .as("Structural invariants after heavy pruning")
+                .isEmpty();
 
-            assertThat(result.isValid())
-                .as("Bidirectional edge invariant should be maintained after pruning. Violations: %s",
-                    result.violations())
-                .isTrue();
+            long oneWayEdges = 0;
+            for (long nodeId = 0; nodeId < graph.nodeCount(); nodeId++) {
+                List<Long> neighbors = graph.readNode(nodeId).getNeighbors(0);
+                assertThat(neighbors)
+                    .as("Node %d must still link somewhere at layer 0", nodeId)
+                    .isNotEmpty();
+                for (long neighborId : neighbors) {
+                    if (!HnswInvariantVerifier.isEdgeBidirectional(graph, nodeId, neighborId, 0)) {
+                        oneWayEdges++;
+                    }
+                }
+            }
+            assertThat(oneWayEdges)
+                .as("Pruning declines some back-links without removing the forward link")
+                .isPositive();
         }
     }
 

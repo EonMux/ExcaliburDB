@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.retrieval.build;
 
+import com.eonmux.excalibur.graph.file.Durability;
 import com.eonmux.excalibur.graph.staging.GraphBuilder;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.graph.temporal.SupersessionPolicy;
@@ -29,6 +30,13 @@ import java.util.Objects;
  *
  * <p>So the whole directory is assembled beside the live one and renamed into place: a reader sees
  * the previous graph or the new one, never a mixture.</p>
+ *
+ * <h2>One way to build</h2>
+ * <p>{@link #build} is the only entry point, and the node's own build runs through it. It takes
+ * the opener the caller serves the graph through, because opening is part of publishing: the
+ * graph being replaced is deleted only once the new one has opened. A second, shorter path that
+ * published without opening would be a build the node never runs, and a test passing against it
+ * would say nothing about the one it does.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Stateless, but two concurrent builds for the same target would race over one scratch
@@ -74,6 +82,7 @@ public final class GraphDirectoryBuilder {
      * @param entities  how many entity ids it addresses
      * @param relations how many relations were named
      * @param indexed   how many entities got a text document
+     * @param embedded  how many entities got a vector
      * @param directory where it was published
      */
     public record BuildResult(long edges, int entities, int relations, int indexed,
@@ -82,6 +91,25 @@ public final class GraphDirectoryBuilder {
         /** Whether anything was published. */
         public boolean published() {
             return edges > 0;
+        }
+    }
+
+    /**
+     * What a build produced, and what opening it produced when it published.
+     *
+     * @param <T>    What the caller serves the graph through
+     * @param result What was built
+     * @param opened What the opener returned, or null when nothing was published
+     */
+    public record Published<T>(BuildResult result, T opened) {
+
+        /**
+         * Validates the result.
+         *
+         * @throws NullPointerException if result is null
+         */
+        public Published {
+            Objects.requireNonNull(result, "result must not be null");
         }
     }
 
@@ -105,56 +133,61 @@ public final class GraphDirectoryBuilder {
     }
 
     /**
-     * Builds the graph directory from staged facts and publishes it.
+     * Builds the graph directory from staged facts, publishes it, and opens it.
      *
-     * @param staging       The facts and the text to build from
-     * @param target        Where the graph is served from
-     * @param supersession  Which relations hold one value at a time
-     * @param ramBufferMb   Lucene write buffer, in megabytes
-     * @return What was built
-     * @throws IOException if any artifact cannot be written or published
-     */
-    public static BuildResult build(GraphStagingStore staging, Path target,
-                                    SupersessionPolicy supersession, double ramBufferMb)
-            throws IOException {
-        return build(staging, target, supersession, ramBufferMb, null, 0);
-    }
-
-    /**
-     * Builds the graph directory, including the vectors a rerank scores against.
+     * <p>The store, both indexes and the entity vectors are assembled beside the served
+     * directory, forced to the device, renamed into place and opened with {@code opener} - and
+     * the graph they replace is kept until that open succeeds, so a build that publishes
+     * something unopenable leaves the previous graph where it was. Nothing being served is
+     * touched before the rename, so a build that fails earlier leaves the node answering exactly
+     * as it did.</p>
      *
+     * <p>A build with nothing staged publishes nothing and opens nothing: an empty store would
+     * turn every question into a refusal, where the graph already on disk answers some of
+     * them.</p>
+     *
+     * @param <T>          What the caller serves the graph through
      * @param staging      The facts and the text to build from
      * @param target       Where the graph is served from
      * @param supersession Which relations hold one value at a time
      * @param ramBufferMb  Lucene write buffer, in megabytes
      * @param embedder     Produces entity vectors, or null to build without them
      * @param dimension    The dimension those vectors have
-     * @return What was built
-     * @throws IOException if any artifact cannot be written or published
+     * @param opener       Opens the published directory, before the previous one is deleted
+     * @return What was built, and what the opener returned
+     * @throws IOException if any artifact cannot be written, published or opened
+     * @throws NullPointerException if staging, target, supersession or opener is null
      */
-    public static BuildResult build(GraphStagingStore staging, Path target,
-                                    SupersessionPolicy supersession, double ramBufferMb,
-                                    EntityEmbedder embedder, int dimension) throws IOException {
+    public static <T> Published<T> build(GraphStagingStore staging, Path target,
+                                         SupersessionPolicy supersession, double ramBufferMb,
+                                         EntityEmbedder embedder, int dimension,
+                                         GraphBuilder.Opener<T> opener) throws IOException {
         Objects.requireNonNull(staging, "staging must not be null");
         Objects.requireNonNull(target, "target must not be null");
+        Objects.requireNonNull(supersession, "supersession must not be null");
+        Objects.requireNonNull(opener, "opener must not be null");
 
         GraphBuilder.BuildResult store = GraphBuilder.buildInto(staging, target, supersession);
         if (store.edges() == 0) {
             LOGGER.info("nothing staged for {}; leaving the existing graph in place", target);
-            return new BuildResult(0, store.entities(), store.relations(), 0, 0, target);
+            return new Published<>(
+                new BuildResult(0, store.entities(), store.relations(), 0, 0, target), null);
         }
 
         Path scratch = GraphBuilder.scratchFor(target);
         int indexed = writeLexicalIndexes(staging, scratch, ramBufferMb);
+        // Into the same scratch directory, so the vectors are published by the same rename as
+        // the store they describe. Vectors that arrived a moment later would be vectors for the
+        // previous numbering, and an entity id is always a valid entity id.
         long embedded = embedder == null
             ? 0
-            : writeEntityVectors(staging, scratch, embedder, dimension);
-        GraphBuilder.publish(scratch, target);
+            : writeEntityVectors(entityDocuments(staging), scratch, embedder, dimension);
+        T opened = GraphBuilder.publish(scratch, target, Durability.DEVICE, opener);
 
         LOGGER.info("published graph at {}: {} facts, {} entities ({} with text), {} relations",
             target, store.edges(), store.entities(), indexed, store.relations());
-        return new BuildResult(store.edges(), store.entities(), store.relations(), indexed,
-            embedded, target);
+        return new Published<>(new BuildResult(store.edges(), store.entities(),
+            store.relations(), indexed, embedded, target), opened);
     }
 
     /**
@@ -163,8 +196,7 @@ public final class GraphDirectoryBuilder {
      * <p>The same text the lexical index holds, so the two describe the same entity: BM25 decides
      * which entities are worth considering and these decide how close each one actually is. Writing
      * them into the scratch directory means they are published by the same rename as everything
-     * else - vectors that arrived a moment after the store they belong to would be vectors for the
-     * previous numbering.</p>
+     * else.</p>
      *
      * <p>An entity whose batch could not be embedded is written as having no vector rather than
      * failing the build. It stays traversable, stays in the lexical index, and simply keeps
@@ -220,18 +252,14 @@ public final class GraphDirectoryBuilder {
     /**
      * Writes the label and entity-text indexes into the directory the store was assembled in.
      *
-     * <p>Public so a caller that has to sequence the publish itself - closing what it is serving
-     * before the directory moves, because Lucene holds a per-path write lock for the whole JVM -
-     * can still assemble the same directory this class does.
-     *
      * @param staging     The staged text
      * @param scratch     Where the build is being assembled
      * @param ramBufferMb Lucene write buffer, in megabytes
      * @return How many entities got a text document
      * @throws IOException if an index cannot be written
      */
-    public static int writeLexicalIndexes(GraphStagingStore staging, Path scratch,
-                                          double ramBufferMb) throws IOException {
+    private static int writeLexicalIndexes(GraphStagingStore staging, Path scratch,
+                                           double ramBufferMb) throws IOException {
         List<String> labels = staging.entityLabels();
 
         try (LexicalIndex labelIndex = LexicalIndex.open(scratch.resolve(LABEL_INDEX),
@@ -264,6 +292,9 @@ public final class GraphDirectoryBuilder {
      * would make it unrankable rather than weakly ranked, and it is reachable by traversal either
      * way.</p>
      *
+     * <p>Public because erasure rewrites these same documents after removing a fact, and has to
+     * produce exactly what a build would.</p>
+     *
      * @param staging The staged text
      * @return One document per entity id
      * @throws IOException if the staged text cannot be read
@@ -291,26 +322,5 @@ public final class GraphDirectoryBuilder {
                 : document.toString());
         }
         return documents;
-    }
-
-    /**
-     * Embeds every entity's document and writes the vectors into the build being assembled.
-     *
-     * <p>Public because the caller that has to sequence the publish itself - closing what it is
-     * serving before the directory moves - assembles the same directory this class does.</p>
-     *
-     * @param staging   The staged text
-     * @param scratch   Where the build is being assembled
-     * @param embedder  Produces the vectors
-     * @param dimension The dimension every vector must have
-     * @return How many entities got a vector
-     * @throws IOException if the file cannot be written
-     */
-    public static long writeEntityVectors(GraphStagingStore staging, Path scratch,
-                                          EntityEmbedder embedder, int dimension)
-            throws IOException {
-        Objects.requireNonNull(staging, "staging must not be null");
-        Objects.requireNonNull(embedder, "embedder must not be null");
-        return writeEntityVectors(entityDocuments(staging), scratch, embedder, dimension);
     }
 }

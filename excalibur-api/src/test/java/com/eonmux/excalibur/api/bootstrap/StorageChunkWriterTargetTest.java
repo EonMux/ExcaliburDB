@@ -54,37 +54,6 @@ class StorageChunkWriterTargetTest {
             assertThat(writer.canWriteTo(catalogId))
                 .as("and it must be reported as unwritable before any chunk is embedded for it")
                 .isFalse();
-
-            // The behaviour the answer stands in for, so the two cannot drift apart.
-            assertThat(writer.writeChunkWithOffset(catalogId, "chunk-1", "text", new float[]{0.1f}))
-                .as("every write to it fails, one chunk at a time")
-                .isEqualTo(StorageChunkWriter.WRITE_FAILED);
-        }
-    }
-
-    @Test
-    @DisplayName("a writer bound to a segment answers for that segment, not the one asked about")
-    void aBoundWriterAnswersForItsOwnTarget(@TempDir Path tempDir) throws Exception {
-        Path dataDir = Files.createDirectories(tempDir.resolve("bound"));
-
-        try (Arena arena = Arena.ofShared();
-             StorageEngine engine = new StorageEngine(dataDir, arena)) {
-            engine.start();
-
-            StorageChunkWriter writer = new StorageChunkWriter(engine);
-            long unwritable = engine.getCatalog()
-                .create("a-source", dataDir.resolve("rolling.dat")).getSegmentId();
-
-            // Every write through this view goes to the bound segment whatever it is handed, so
-            // its reachability is the only one that decides whether a write can succeed.
-            var bound = writer.forSegment(unwritable);
-            assertThat(bound.canWriteTo(0L))
-                .as("the bound target is unwritable, whichever segment the caller names")
-                .isFalse();
-
-            assertThat(writer.forSegment(0L).canWriteTo(unwritable))
-                .as("and writable when the bound target is, for the same reason")
-                .isTrue();
         }
     }
 

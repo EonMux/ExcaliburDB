@@ -7,6 +7,8 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.StringJoiner;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 
 /**
@@ -27,6 +29,18 @@ import java.util.stream.Collectors;
  *   <li>For latency (lower is better): negative % = faster, positive % = slower</li>
  *   <li>Comparison values are computed as: ((current - baseline) / baseline) * 100</li>
  * </ul>
+ *
+ * <h2>Identity</h2>
+ * <p>A current result is compared with the baseline result of the same benchmark, mode
+ * and {@code @Param} values. Keyed on the method name alone, every parameter combination
+ * of a benchmark would collapse onto whichever baseline row was read last, and a
+ * regression in one combination could be compared against - and hidden by - another.</p>
+ *
+ * <h2>Errored combinations</h2>
+ * <p>Combinations the current run started but could not measure are carried through
+ * from {@link BenchmarkResultSet#erroredBenchmarks()}. They have no score to compare, so
+ * they are not comparison entries; {@link #hasErrors()} reports them, and a gate must
+ * treat them as failures just as it treats regressions.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is immutable and thread-safe.</p>
@@ -144,6 +158,24 @@ public final class BenchmarkComparison {
     }
 
     /**
+     * Gets the current run's combinations that errored and so could not be compared.
+     *
+     * @return the errored combinations
+     */
+    public List<ErroredBenchmark> erroredBenchmarks() {
+        return currentResults.erroredBenchmarks();
+    }
+
+    /**
+     * Checks whether any combination of the current run errored.
+     *
+     * @return true if the comparison is incomplete because a combination threw
+     */
+    public boolean hasErrors() {
+        return currentResults.erroredCount() > 0;
+    }
+
+    /**
      * Checks if there are any regressions.
      */
     public boolean hasRegressions() {
@@ -200,8 +232,19 @@ public final class BenchmarkComparison {
         sb.append(String.format("  Regressed:       %d\n", regressedCount));
         sb.append(String.format("  Unchanged:       %d\n", unchangedCount));
         sb.append(String.format("  New:             %d\n", newBenchmarksCount));
-        sb.append(String.format("  Status:          %s\n\n",
-            hasRegressions() ? "⚠ REGRESSIONS DETECTED" : "✓ NO REGRESSIONS"));
+        sb.append(String.format("  Errored:         %d\n", currentResults.erroredCount()));
+        sb.append(String.format("  Status:          %s\n\n", statusLabel()));
+
+        if (hasErrors()) {
+            sb.append("───────────────────────────────────────────────────────────────────────────\n");
+            sb.append("ERRORED (threw before producing a measurement; not compared)\n");
+            sb.append("───────────────────────────────────────────────────────────────────────────\n");
+            for (ErroredBenchmark entry : erroredBenchmarks()) {
+                sb.append(String.format("\n  [%s] %s\n", entry.category(), entry.label()));
+                sb.append(String.format("    %s\n", entry.message()));
+            }
+            sb.append("\n");
+        }
 
         // Show regressions if any
         List<ComparisonEntry> regressions = getRegressions();
@@ -211,7 +254,7 @@ public final class BenchmarkComparison {
             sb.append("───────────────────────────────────────────────────────────────────────────\n");
 
             for (ComparisonEntry entry : regressions) {
-                sb.append(String.format("\n  %s\n", entry.benchmarkName()));
+                sb.append(String.format("\n  %s\n", qualifiedLabel(entry)));
                 sb.append(String.format("    Baseline: %.2f %s\n", entry.baselineScore(), entry.unit()));
                 sb.append(String.format("    Current:  %.2f %s\n", entry.currentScore(), entry.unit()));
                 sb.append(String.format("    Change:   %.2f%% %s\n",
@@ -231,7 +274,7 @@ public final class BenchmarkComparison {
             int count = 0;
             for (ComparisonEntry entry : improvements) {
                 if (count++ >= 5) break;
-                sb.append(String.format("\n  %s\n", entry.benchmarkName()));
+                sb.append(String.format("\n  %s\n", qualifiedLabel(entry)));
                 sb.append(String.format("    Baseline: %.2f %s\n", entry.baselineScore(), entry.unit()));
                 sb.append(String.format("    Current:  %.2f %s\n", entry.currentScore(), entry.unit()));
                 sb.append(String.format("    Change:   %.2f%% %s\n",
@@ -243,6 +286,25 @@ public final class BenchmarkComparison {
 
         sb.append("═══════════════════════════════════════════════════════════════════════════\n");
         return sb.toString();
+    }
+
+    private String statusLabel() {
+        if (hasErrors()) {
+            return hasRegressions()
+                ? "✗ BENCHMARKS ERRORED, REGRESSIONS DETECTED"
+                : "✗ BENCHMARKS ERRORED";
+        }
+        return hasRegressions() ? "⚠ REGRESSIONS DETECTED" : "✓ NO REGRESSIONS";
+    }
+
+    /**
+     * The benchmark's class-qualified name with the entry's parameters, which is what
+     * tells two combinations of one method apart.
+     */
+    private static String qualifiedLabel(ComparisonEntry entry) {
+        String name = entry.benchmarkName();
+        int lastDot = name.lastIndexOf('.');
+        return lastDot < 0 ? entry.methodName() : name.substring(0, lastDot + 1) + entry.methodName();
     }
 
     /**
@@ -262,13 +324,26 @@ public final class BenchmarkComparison {
         sb.append("    \"regressed\": ").append(regressedCount).append(",\n");
         sb.append("    \"unchanged\": ").append(unchangedCount).append(",\n");
         sb.append("    \"new\": ").append(newBenchmarksCount).append(",\n");
-        sb.append("    \"hasRegressions\": ").append(hasRegressions()).append("\n");
+        sb.append("    \"errored\": ").append(currentResults.erroredCount()).append(",\n");
+        sb.append("    \"hasRegressions\": ").append(hasRegressions()).append(",\n");
+        sb.append("    \"hasErrors\": ").append(hasErrors()).append("\n");
         sb.append("  },\n");
 
         sb.append("  \"comparisons\": [\n");
         for (int i = 0; i < comparisons.size(); i++) {
             sb.append(comparisons.get(i).toJson());
             if (i < comparisons.size() - 1) {
+                sb.append(",");
+            }
+            sb.append("\n");
+        }
+        sb.append("  ],\n");
+
+        List<ErroredBenchmark> errored = erroredBenchmarks();
+        sb.append("  \"errored\": [\n");
+        for (int i = 0; i < errored.size(); i++) {
+            sb.append(errored.get(i).toJson());
+            if (i < errored.size() - 1) {
                 sb.append(",");
             }
             sb.append("\n");
@@ -480,21 +555,19 @@ public final class BenchmarkComparison {
                 throw new IllegalStateException("baselineResults required");
             }
 
-            // Build index of baseline results
             Map<String, BenchmarkResult> baselineMap = new HashMap<>();
             for (BenchmarkResult result : baselineResults.results()) {
-                baselineMap.put(result.benchmarkName(), result);
+                baselineMap.put(identity(result), result);
             }
 
-            // Compare each current result to baseline
             for (BenchmarkResult current : currentResults.results()) {
-                BenchmarkResult baseline = baselineMap.get(current.benchmarkName());
+                BenchmarkResult baseline = baselineMap.get(identity(current));
 
                 if (baseline == null) {
                     // New benchmark not in baseline
                     comparisons.add(new ComparisonEntry(
                         current.benchmarkName(),
-                        current.methodName(),
+                        combination(current),
                         current.primaryScore(),
                         0.0,
                         current.primaryScoreUnit(),
@@ -521,7 +594,7 @@ public final class BenchmarkComparison {
 
                     comparisons.add(new ComparisonEntry(
                         current.benchmarkName(),
-                        current.methodName(),
+                        combination(current),
                         current.primaryScore(),
                         baseline.primaryScore(),
                         current.primaryScoreUnit(),
@@ -535,6 +608,27 @@ public final class BenchmarkComparison {
             }
 
             return new BenchmarkComparison(this);
+        }
+
+        /**
+         * What makes a result the same measurement across runs: benchmark, mode and
+         * parameter values.
+         */
+        private static String identity(BenchmarkResult result) {
+            return result.benchmarkName() + '\u0000' + result.mode() + '\u0000'
+                + new TreeMap<>(result.parameters());
+        }
+
+        /**
+         * The method name with its parameters, e.g. {@code lookup [size=64]}.
+         */
+        private static String combination(BenchmarkResult result) {
+            if (result.parameters().isEmpty()) {
+                return result.methodName();
+            }
+            StringJoiner joiner = new StringJoiner(", ", result.methodName() + " [", "]");
+            new TreeMap<>(result.parameters()).forEach((k, v) -> joiner.add(k + "=" + v));
+            return joiner.toString();
         }
 
         private double computePercentChange(double current, double baseline, double reference) {

@@ -440,6 +440,13 @@ public final class ChunkLexicalIndex implements ChunkIndex {
      *
      * <p>{@code textOf} is unused. Lucene stores each chunk's text itself, so a rewrite has
      * everything it needs and never has to ask storage for it back.</p>
+     *
+     * <p>A stop request is honoured before the force-merge begins, by the inherited
+     * {@link ChunkIndex#compactIfDue(Function, java.util.function.BooleanSupplier)}, and not
+     * during it: Lucene offers no way to abandon a merge in progress short of rolling the writer
+     * back, which would discard chunks buffered since the last commit. Nothing a merge reads is
+     * the storage engine's, so one that runs on past a shutdown's stop request is not reading
+     * anything the shutdown closes first.</p>
      */
     @Override
     public CompactionResult compactIfDue(Function<String, String> textOf) throws IOException {
@@ -524,6 +531,30 @@ public final class ChunkLexicalIndex implements ChunkIndex {
     @Override
     public String engine() {
         return "lucene";
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Commits rather than refreshes, as {@link #close()} does: what a shutdown needs is the
+     * buffered chunks and the issued deletes durable and confirmed on the erasure log, and a
+     * refresh would also reopen a reader nothing is going to query.</p>
+     */
+    @Override
+    public void publishBuffered() throws IOException {
+        commit();
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>False. Lucene keeps each chunk's text in its own segments, so a force-merge rewrites
+     * from those and never calls the supplier; one that outlives a shutdown's drain is still
+     * using this index's files, and nothing of the storage engine's.</p>
+     */
+    @Override
+    public boolean compactionReadsStorage() {
+        return false;
     }
 
     /**

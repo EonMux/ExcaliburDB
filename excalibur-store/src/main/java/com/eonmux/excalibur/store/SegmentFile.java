@@ -197,20 +197,33 @@ final class SegmentFile {
             // Note: No TRUNCATE_EXISTING - we want to preserve existing data
         );
 
-        // Map the file into memory
-        MemorySegment segment = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, fileSize, arena);
+        // Until the segment exists nothing else owns the channel, so a failure to map, measure
+        // or recover the file closes it here; otherwise every retry of a start that trips on
+        // this file keeps one more descriptor open.
+        try {
+            // Map the file into memory
+            MemorySegment segment =
+                fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, fileSize, arena);
 
-        SegmentFormat format = detectFormat(segment, slotCount, slotTableSize);
+            SegmentFormat format = detectFormat(segment, slotCount, slotTableSize);
 
-        // Create a Segment instance using private constructor pattern
-        // We need to recover the state from the file
-        Segment result = new Segment(path, arena, fileChannel, segment, slotCount, slotTableSize,
-            loadFactorThreshold, format);
+            // Create a Segment instance using private constructor pattern
+            // We need to recover the state from the file
+            Segment result = new Segment(path, arena, fileChannel, segment, slotCount,
+                slotTableSize, loadFactorThreshold, format);
 
-        // Recover entry count and data offset by scanning the slot table
-        result.file.recoverState();
+            // Recover entry count and data offset by scanning the slot table
+            result.file.recoverState();
 
-        return result;
+            return result;
+        } catch (IOException | RuntimeException | Error e) {
+            try {
+                fileChannel.close();
+            } catch (IOException closeFailure) {
+                e.addSuppressed(closeFailure);
+            }
+            throw e;
+        }
     }
 
     /**
@@ -431,7 +444,8 @@ final class SegmentFile {
      * Closes the segment and everything mapped alongside it.
      *
      * <p>Under the write lock, and idempotent. The order is deliberate: the mapping is forced
-     * first, then each thing the segment owns a descriptor or a mapping for - its write log,
+     * first and the term sketch written beside it while the write log that dates it is still
+     * open, then each thing the segment owns a descriptor or a mapping for - its write log,
      * its HNSW graph, its LSH index, its file channel - is closed in turn, and a failure in
      * any one of them is logged rather than thrown, so that the ones after it still run. Each
      * of those was, at some point, leaked for the life of the process by a retired segment,
@@ -450,6 +464,9 @@ final class SegmentFile {
 
             // Force any dirty pages to disk
             owner.segment.force();
+
+            // Before the write log closes: the sketch is dated by the log's sequence number.
+            owner.terms.persist();
 
             // Close the write-ahead log this segment owns, so its descriptor and
             // final force() are not leaked when the segment is retired.

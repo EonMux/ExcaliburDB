@@ -2,7 +2,8 @@ package com.eonmux.excalibur.ingest.source;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.time.Instant;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.stream.Stream;
 
 /**
@@ -24,9 +25,9 @@ import java.util.stream.Stream;
  *
  * <h2>Thread Safety</h2>
  * <p>Implementations must be thread-safe. Multiple threads may call
- * {@link #crawl()}, {@link #hasChanged(Instant)}, and {@link #fetch(String)}
- * concurrently. The returned {@link Stream} from {@link #crawl()} should be
- * consumed by a single thread but may be processed in parallel.</p>
+ * {@link #crawl()}, {@link #fetch(String)} and {@link #fetchIfChanged} concurrently. The
+ * returned {@link Stream} from {@link #crawl()} should be consumed by a single thread but may
+ * be processed in parallel.</p>
  *
  * <h2>Resource Management</h2>
  * <p>Sources that hold resources (connections, file handles) should implement
@@ -39,7 +40,8 @@ import java.util.stream.Stream;
  *   <li>Source is instantiated with configuration</li>
  *   <li>{@link #crawl()} is called to discover document IDs</li>
  *   <li>{@link #fetch(String)} is called for each document ID</li>
- *   <li>On subsequent runs, {@link #hasChanged(Instant)} checks for updates</li>
+ *   <li>On subsequent runs, {@link #fetchIfChanged} is called for each document already
+ *       indexed, so an unchanged one need not be transferred again</li>
  *   <li>{@link #close()} is called when the source is no longer needed</li>
  * </ol>
  *
@@ -119,30 +121,6 @@ public interface Source extends Closeable {
     Stream<String> crawl() throws SourceException;
 
     /**
-     * Checks if this source may have changed since the given timestamp.
-     *
-     * <p>This method is used for incremental crawl optimization. If the source
-     * can determine that no documents have been added, modified, or deleted
-     * since the given instant, it returns {@code false} to skip re-crawling.</p>
-     *
-     * <p>Implementation guidance:</p>
-     * <ul>
-     *   <li>If uncertain, return {@code true} (safe default)</li>
-     *   <li>For filesystem sources, check directory modification time</li>
-     *   <li>For HTTP sources, use ETag/Last-Modified headers or a HEAD request</li>
-     *   <li>For databases, use a modification timestamp column</li>
-     * </ul>
-     *
-     * <p><strong>Note:</strong> This checks if the <em>source</em> has changed,
-     * not individual documents. Use with {@link #crawl()} for full change detection.</p>
-     *
-     * @param since The timestamp to compare against (non-null, typically from last successful crawl)
-     * @return {@code true} if the source may have changed, {@code false} if definitely unchanged
-     * @throws SourceException if change detection fails
-     */
-    boolean hasChanged(Instant since) throws SourceException;
-
-    /**
      * Fetches the content and metadata for a specific document.
      *
      * <p>Given a document ID previously returned by {@link #crawl()}, this method
@@ -163,6 +141,37 @@ public interface Source extends Closeable {
      * @throws IllegalArgumentException if documentId is null or empty
      */
     FetchedDocument fetch(String documentId) throws SourceException, DocumentNotFoundException;
+
+    /**
+     * Fetches a document unless the source can confirm it has not changed since the version the
+     * validators describe.
+     *
+     * <p>This is how a re-crawl avoids transferring what it already holds. The validators are
+     * what the source reported for the version that was indexed - an HTTP {@code ETag} and
+     * {@code Last-Modified} - and a source that can put them to its origin asks it
+     * conditionally: an HTTP source sends {@code If-None-Match} and {@code If-Modified-Since},
+     * and a {@code 304 Not Modified} answer means the indexed version is still current without
+     * the body ever being sent.</p>
+     *
+     * <p>Empty is a positive statement that the document is unchanged, never a guess. A source
+     * that cannot ask - a directory, whose modification times survive a copy and are too coarse
+     * to trust, or a set of supplied documents - fetches in full and leaves the comparison to
+     * the caller, which is what this default does. So does any source handed validators that
+     * carry nothing to ask with.</p>
+     *
+     * @param documentId The document ID to fetch (non-null, non-empty)
+     * @param previous   What the source reported for the version already held
+     * @return The document, or empty when the source confirmed it is unchanged
+     * @throws DocumentNotFoundException if the document does not exist
+     * @throws SourceException if fetching fails (I/O error, permission denied, etc.)
+     * @throws IllegalArgumentException if documentId is null or empty
+     * @throws NullPointerException if previous is null
+     */
+    default Optional<FetchedDocument> fetchIfChanged(String documentId, DocumentValidators previous)
+            throws SourceException, DocumentNotFoundException {
+        Objects.requireNonNull(previous, "previous must not be null");
+        return Optional.of(fetch(documentId));
+    }
 
     /**
      * Returns the total number of documents in this source, if known.

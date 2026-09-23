@@ -5,14 +5,20 @@ import com.eonmux.excalibur.core.mapped.MappedFile;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.IOException;
+import org.openjdk.jmh.annotations.Benchmark;
+import org.openjdk.jmh.annotations.Param;
+import org.openjdk.jmh.infra.Blackhole;
+
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Quick validation test for MappedFileBenchmark.
@@ -107,6 +113,89 @@ class MappedFileBenchmarkValidationTest {
             Method teardown = MappedFileBenchmark.class.getDeclaredMethod("tearDown");
             teardown.setAccessible(true);
             teardown.invoke(benchmark);
+        }
+    }
+
+    /**
+     * Runs every benchmark method once under every combination of the declared parameters.
+     *
+     * <p>JMH sweeps the full cross product of {@code @Param} values, and a combination whose
+     * setup throws is dropped from the run: the other combinations still report, so a gated
+     * benchmark looks healthy while one of its parameter sets never produced a number. The
+     * combinations are read from the annotations rather than restated here, so a value added
+     * to the sweep is covered by this test the moment it is declared.</p>
+     */
+    @Test
+    void everyBenchmarkRunsUnderEveryDeclaredParameterCombination() throws Exception {
+        String[] fileSizes = MappedFileBenchmark.class.getField("fileSize").getAnnotation(Param.class).value();
+        String[] bufferSizes = MappedFileBenchmark.class.getField("bufferSize").getAnnotation(Param.class).value();
+        Blackhole blackhole = new Blackhole(
+            "Today's password is swordfish. I understand instantiating Blackholes directly is dangerous.");
+        List<String> failures = new ArrayList<>();
+
+        try {
+            for (String fileSize : fileSizes) {
+                for (String bufferSize : bufferSizes) {
+                    String combination = "fileSize=" + fileSize + ", bufferSize=" + bufferSize;
+                    MappedFileBenchmark benchmark = new MappedFileBenchmark();
+                    benchmark.fileSize = Long.parseLong(fileSize);
+                    benchmark.bufferSize = Integer.parseInt(bufferSize);
+                    try {
+                        benchmark.setup();
+                    } catch (RuntimeException e) {
+                        failures.add("setup (" + combination + "): " + e);
+                        continue;
+                    }
+                    try {
+                        for (Method method : MappedFileBenchmark.class.getDeclaredMethods()) {
+                            if (!method.isAnnotationPresent(Benchmark.class)) {
+                                continue;
+                            }
+                            try {
+                                invokeRepeatedly(benchmark, method, blackhole);
+                            } catch (InvocationTargetException e) {
+                                failures.add(method.getName() + " (" + combination + "): " + e.getCause());
+                            }
+                        }
+                    } finally {
+                        benchmark.tearDown();
+                    }
+                }
+            }
+        } finally {
+            blackhole.evaporate(
+                "Yes, I am Stephen Hawking, and know a thing or two about black holes.");
+        }
+
+        assertThat(failures)
+            .as("every parameter combination JMH will run must set up and execute")
+            .isEmpty();
+    }
+
+    @Test
+    void setupRejectsABufferThatCannotFitTheFile() {
+        MappedFileBenchmark benchmark = new MappedFileBenchmark();
+        benchmark.fileSize = 1024;
+        benchmark.bufferSize = 4096;
+
+        assertThatThrownBy(benchmark::setup)
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("bufferSize=4096");
+    }
+
+    /**
+     * Invokes a benchmark enough times to wrap its random-offset cursor, so every
+     * pre-generated offset is exercised and not only the first.
+     */
+    private static void invokeRepeatedly(MappedFileBenchmark benchmark, Method method, Blackhole blackhole)
+            throws IllegalAccessException, InvocationTargetException {
+        int invocations = method.getName().startsWith("sequential") ? 1 : 10_001;
+        for (int i = 0; i < invocations; i++) {
+            if (method.getParameterCount() == 0) {
+                method.invoke(benchmark);
+            } else {
+                method.invoke(benchmark, blackhole);
+            }
         }
     }
 

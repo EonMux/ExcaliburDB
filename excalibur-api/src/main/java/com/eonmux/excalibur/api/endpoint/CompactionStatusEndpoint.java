@@ -35,15 +35,28 @@ import java.util.Objects;
  *   "graphs_considered": 64,
  *   "graphs_compacted": 4,
  *   "graphs_skipped": 2,
- *   "graphs_failed": 0
+ *   "graphs_failed": 0,
+ *   "lexical": {"performed": true, "segments_rewritten": 5, "segments_produced": 1,
+ *               "chunks_removed": 1840, "groups_abandoned": 0,
+ *               "reason": "due: 1840 of 7200 document(s) tombstoned across 12 segment(s)"}
  * }
  * }</pre>
  *
  * <p>{@code state} is {@code idle} before the first run, {@code running} while one is
- * happening, {@code completed} once it finished and {@code failed} when it raised an error, in
- * which case {@code error} carries the reason and there are no counts. A completed run with a
- * non-zero {@code segments_failed} is neither: it reclaimed what it reports and left the rest,
- * and the reasons are in the node's log.</p>
+ * happening, {@code completed} once it finished and {@code failed} when the segment store's half
+ * raised an error, in which case {@code error} carries the reason and there are no segment or
+ * graph counts. A completed run with a non-zero {@code segments_failed} is neither: it reclaimed
+ * what it reports and left the rest, and the reasons are in the node's log.</p>
+ *
+ * <p>{@code lexical} is the lexical chunk index's half of the run and is present only on a node
+ * that keeps one. It is reported whatever the store's half came to, because the two are
+ * compacted independently: {@code performed} false with a {@code reason} is a policy that found
+ * nothing due or a run stopped before reaching the index, and {@code performed} false with an
+ * {@code error} is a compaction of the index that failed. {@code groups_abandoned} counts groups
+ * of segments the rewrite left exactly as they were because storage could not read a surviving
+ * chunk's text back: with {@code performed} true the rewrite was partial, and with it false
+ * nothing was published at all - a forced rewrite that reports that has not succeeded, and any
+ * erasure in those segments is still owed.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Thread-safe; it reads an immutable snapshot.</p>
@@ -95,7 +108,36 @@ public final class CompactionStatusEndpoint implements HttpHandler {
             json.append(", \"error\": \"").append(JsonText.escape(snapshot.error())).append('"');
         }
         appendCounts(json, snapshot.report());
+        appendLexical(json, snapshot.lexical());
         return json.append('}').toString();
+    }
+
+    /**
+     * Appends the chunk index's half of a finished run, if this node keeps one.
+     *
+     * <p>A failure carries only its reason: counts beside it would read as work done. Anything
+     * else - a rewrite, a policy that found nothing due, a run stopped before it got there - is
+     * reported with its counts and the reason it gave.</p>
+     *
+     * @param json    The body being built
+     * @param lexical The chunk index's outcome, or null
+     */
+    private static void appendLexical(StringBuilder json, CompactionRunner.LexicalOutcome lexical) {
+        if (lexical == null) {
+            return;
+        }
+        json.append(", \"lexical\": {\"performed\": ").append(lexical.performed());
+        if (lexical.error() != null) {
+            json.append(", \"error\": \"").append(JsonText.escape(lexical.error())).append('"');
+        } else {
+            json.append(", \"segments_rewritten\": ").append(lexical.segmentsRewritten())
+                .append(", \"segments_produced\": ").append(lexical.segmentsProduced())
+                .append(", \"chunks_removed\": ").append(lexical.chunksRemoved())
+                .append(", \"groups_abandoned\": ").append(lexical.groupsAbandoned())
+                .append(", \"reason\": \"").append(JsonText.escape(lexical.reason()))
+                .append('"');
+        }
+        json.append('}');
     }
 
     /**

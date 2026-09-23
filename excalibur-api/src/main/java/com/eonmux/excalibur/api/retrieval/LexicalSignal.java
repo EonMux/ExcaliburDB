@@ -98,13 +98,20 @@ public final class LexicalSignal {
     }
 
     /**
-     * Stops the search if it is still running.
+     * Abandons the search if it is still running.
      *
-     * <p>A no-op once it has finished; on every path that did not read it, this is what stops
-     * an abandoned search outliving the request that asked for it.</p>
+     * <p>A no-op once it has finished. On every path that did not read it, this is what
+     * releases the request from an abandoned search: the future answers at once as cancelled,
+     * and the search ends on its own.</p>
+     *
+     * <p>Cancelled without interrupting it. A search reads nothing an interrupt could cut
+     * short - the native index and Lucene's {@code MMapDirectory} read through mappings, which
+     * never look at the flag - and on the one layout that does not map, Lucene's
+     * {@code NIOFSDirectory} fallback, an interrupt reaching a read closes the index file for
+     * every query that shares it. So the interrupt could only ever do harm.</p>
      */
     public void cancel() {
-        pending.cancel(true);
+        pending.cancel(false);
     }
 
     /**

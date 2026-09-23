@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.IntConsumer;
 import java.util.function.IntPredicate;
@@ -121,10 +122,21 @@ public final class LexicalStore implements AutoCloseable {
         }
     }
 
-    /** Everything a compaction has built, waiting for the one write that publishes it. */
-    public record PreparedCompaction(List<PreparedGroup> groups, String reason) {
+    /**
+     * Everything a compaction has built, waiting for the one write that publishes it.
+     *
+     * @param groups    The replacements built
+     * @param abandoned Planned groups left as they were because a surviving key's text could not
+     *                  be read back; carried to {@link #commit} so that a compaction which
+     *                  publishes nothing for that reason is not reported as one that ran
+     * @param reason    Why the compaction was planned
+     */
+    public record PreparedCompaction(List<PreparedGroup> groups, int abandoned, String reason) {
         public PreparedCompaction {
             groups = List.copyOf(groups);
+            if (abandoned < 0) {
+                throw new IllegalArgumentException("abandoned must not be negative: " + abandoned);
+            }
         }
 
         /** Whether anything was built. */
@@ -151,6 +163,17 @@ public final class LexicalStore implements AutoCloseable {
      */
     private final Map<String, String> unreadable = new LinkedHashMap<>();
     private final java.util.concurrent.atomic.AtomicLong nextSegment =
+        new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Keys a rewrite dropped because their stored text is permanently unreadable.
+     *
+     * <p>Counted since this store was opened, and reported rather than only logged: each is a
+     * chunk that stopped matching any query because storage lost it, and an operator needs the
+     * number to know that something has to be restored and reindexed. See
+     * {@link UnrecoverableTextException}.</p>
+     */
+    private final java.util.concurrent.atomic.AtomicLong unreadableKeysDropped =
         new java.util.concurrent.atomic.AtomicLong();
 
     private LexicalStore(Path directory, SegmentManifest manifest, CompactionPlanner planner,
@@ -710,6 +733,16 @@ public final class LexicalStore implements AutoCloseable {
         erasureLog.confirmApplied(unapplied);
     }
 
+    /**
+     * How many keys rewrites have dropped since this store opened because their stored text is
+     * permanently unreadable.
+     *
+     * @return The count; see {@link UnrecoverableTextException}
+     */
+    public long unreadableKeysDropped() {
+        return unreadableKeysDropped.get();
+    }
+
     /** Documents erased but not yet physically removed. */
     public int outstandingErasures() {
         return manifest.tombstonedDocuments();
@@ -784,6 +817,19 @@ public final class LexicalStore implements AutoCloseable {
     }
 
     /**
+     * What a compaction would rewrite if every segment were to be rewritten.
+     *
+     * <p>For an operator asking for the whole index to be rebuilt from the text the caller
+     * supplies, which drops every key whose text is gone - see
+     * {@link CompactionPlanner#fullPlan}.</p>
+     *
+     * @param floorEpoch The epoch below which segments may be merged with each other
+     */
+    public CompactionPlan fullPlan(long floorEpoch) {
+        return planner.fullPlan(manifest.entries(), floorEpoch);
+    }
+
+    /**
      * Executes a plan.
      *
      * <p>The index stores postings, not text - that is the point of it, since the text already
@@ -793,7 +839,9 @@ public final class LexicalStore implements AutoCloseable {
      *
      * <p>A supplier returning null drops that document. The store cannot know whether a key it
      * holds still has anything behind it, and a document whose text is gone would otherwise be
-     * rewritten as an empty one - present in every count, findable by nothing.</p>
+     * rewritten as an empty one - present in every count, findable by nothing. A supplier that
+     * throws {@link java.io.UncheckedIOException} is one that could not say, and the group it was
+     * asked for is left as it is - see {@link #buildUnlessStopped}.</p>
      *
      * @param textOf Supplies the text for a surviving key, or null to drop it
      * @param plan   Which segments to rewrite
@@ -852,22 +900,127 @@ public final class LexicalStore implements AutoCloseable {
     /**
      * Builds the replacement segments from a snapshot, touching nothing shared.
      *
-     * @param textOf   Supplies the text for a surviving key, or null to drop it
+     * @param textOf   Supplies the text for a surviving key, or null to drop it; see
+     *                 {@link #buildUnlessStopped} for a supplier that cannot tell
      * @param snapshot What {@link #snapshot} copied out
      */
     public PreparedCompaction build(Function<String, String> textOf, CompactionSnapshot snapshot)
             throws IOException {
-        Objects.requireNonNull(textOf, "textOf must not be null");
-        Objects.requireNonNull(snapshot, "snapshot must not be null");
-        List<PreparedGroup> prepared = new ArrayList<>(snapshot.groups().size());
-        for (GroupSnapshot group : snapshot.groups()) {
-            prepared.add(buildGroup(textOf, group));
-        }
-        return new PreparedCompaction(prepared, snapshot.reason());
+        return buildUnlessStopped(textOf, snapshot, () -> false).orElseThrow();
     }
 
-    private PreparedGroup buildGroup(Function<String, String> textOf, GroupSnapshot group)
+    /**
+     * Builds the replacement segments from a snapshot, unless asked to stop first.
+     *
+     * <h4>Stopping</h4>
+     * <p>{@code stopRequested} is read before each group and before each document, and once it
+     * answers true the build ends: every replacement already built is deleted, nothing is
+     * published and the manifest is not touched, so the store is exactly what it was. The caller
+     * that needs this is one about to take away what {@code textOf} reads - a shutdown closing
+     * the storage engine - or an operator cancelling a rewrite of the whole index. A rewrite has
+     * nothing to salvage half-way: its output replaces its inputs as a group or not at all.</p>
+     *
+     * <h4>A supplier that cannot tell</h4>
+     * <p>Null from {@code textOf} means the key's text is gone, and the rewrite drops the key. A
+     * read that failed is not that answer, and a supplier signals it by throwing
+     * {@link java.io.UncheckedIOException}. The group being built is then abandoned - its files
+     * deleted, its segments left in the manifest as they are - and the build goes on with the
+     * next group. Treating the failure as absence would drop the key's postings for good from a
+     * segment whose text storage still holds; abandoning costs only this rewrite, and the next
+     * compaction tries the group again. A supplier that knows the failure is permanent - the
+     * stored entry is damaged and will fail the same way every time - throws
+     * {@link UnrecoverableTextException} instead, and the key is dropped as if its text were
+     * gone, logged at error and counted in {@link #unreadableKeysDropped()}: abandoning would
+     * abandon the group on every attempt, and an erasure recorded in it could never be
+     * discharged. Any other exception fails the whole build, after the replacements built so far
+     * are deleted.</p>
+     *
+     * @param textOf        Supplies the text for a surviving key, null to drop it, throws
+     *                      {@link java.io.UncheckedIOException} when it cannot say, or throws
+     *                      {@link UnrecoverableTextException} when the text can never be read
+     * @param snapshot      What {@link #snapshot} copied out
+     * @param stopRequested Answers true once the build should end without publishing anything
+     * @return What was built, or empty when the build was stopped
+     */
+    public Optional<PreparedCompaction> buildUnlessStopped(Function<String, String> textOf,
+                                                           CompactionSnapshot snapshot,
+                                                           BooleanSupplier stopRequested)
             throws IOException {
+        Objects.requireNonNull(textOf, "textOf must not be null");
+        Objects.requireNonNull(snapshot, "snapshot must not be null");
+        Objects.requireNonNull(stopRequested, "stopRequested must not be null");
+        List<PreparedGroup> prepared = new ArrayList<>(snapshot.groups().size());
+        int abandoned = 0;
+        try {
+            for (GroupSnapshot group : snapshot.groups()) {
+                GroupBuild built = stopRequested.getAsBoolean()
+                    ? GroupBuild.STOPPED
+                    : buildGroup(textOf, group, stopRequested);
+                switch (built.fate()) {
+                    case BUILT -> prepared.add(built.group());
+                    case ABANDONED -> abandoned++;
+                    case STOPPED -> {
+                        discardAll(prepared);
+                        LOGGER.info("Compaction stopped on request after building {} of {} "
+                            + "group(s); nothing was published ({})", prepared.size(),
+                            snapshot.groups().size(), snapshot.reason());
+                        return Optional.empty();
+                    }
+                }
+            }
+        } catch (IOException | RuntimeException | Error e) {
+            discardAll(prepared, e);
+            throw e;
+        }
+        if (abandoned > 0) {
+            LOGGER.warn("Abandoned {} of {} compaction group(s) whose text storage could not "
+                + "read back; their segments stay as they are until the next compaction",
+                abandoned, snapshot.groups().size());
+        }
+        return Optional.of(new PreparedCompaction(prepared, abandoned, snapshot.reason()));
+    }
+
+    /** What became of one group's rewrite. */
+    private enum Fate {
+        /** Its replacement is built and waiting to be published. */
+        BUILT,
+        /** A key's text could not be read, so the group is left as it is. */
+        ABANDONED,
+        /** The build was asked to stop. */
+        STOPPED
+    }
+
+    /**
+     * One group's rewrite, and what came of it.
+     *
+     * @param fate  How it ended
+     * @param group The replacement, when it was built; null otherwise
+     */
+    private record GroupBuild(Fate fate, PreparedGroup group) {
+        static final GroupBuild ABANDONED = new GroupBuild(Fate.ABANDONED, null);
+        static final GroupBuild STOPPED = new GroupBuild(Fate.STOPPED, null);
+    }
+
+    /** Deletes the replacements a build that will publish nothing had already written. */
+    private void discardAll(List<PreparedGroup> prepared) throws IOException {
+        for (PreparedGroup group : prepared) {
+            discardPrepared(group);
+        }
+    }
+
+    /** As {@link #discardAll(List)}, attaching a failure to clean up to the one propagating. */
+    private void discardAll(List<PreparedGroup> prepared, Throwable failure) {
+        for (PreparedGroup group : prepared) {
+            try {
+                discardPrepared(group);
+            } catch (IOException | RuntimeException e) {
+                failure.addSuppressed(e);
+            }
+        }
+    }
+
+    private GroupBuild buildGroup(Function<String, String> textOf, GroupSnapshot group,
+                                  BooleanSupplier stopRequested) throws IOException {
         List<SegmentManifest.Entry> entries = group.entries();
         long epoch = 0;
         int before = 0;
@@ -881,9 +1034,11 @@ public final class LexicalStore implements AutoCloseable {
 
         String name = SEGMENT_PREFIX + nextSegment.getAndIncrement();
         Path scratch = directory.resolve(SCRATCH_PREFIX + name);
-        int survivors;
+        int survivors = 0;
+        Fate fate = Fate.BUILT;
         try (SegmentedIndexBuilder builder = new SegmentedIndexBuilder(scratch, bm25);
              SegmentKeys.Writer names = new SegmentKeys.Writer(directory, name)) {
+            fill:
             for (int at = 0; at < entries.size(); at++) {
                 SegmentKeys segmentKeys = group.keys().get(at);
                 boolean[] erased = group.tombstoned().get(at);
@@ -891,8 +1046,29 @@ public final class LexicalStore implements AutoCloseable {
                     if (erased[doc]) {
                         continue;
                     }
+                    if (stopRequested.getAsBoolean()) {
+                        fate = Fate.STOPPED;
+                        break fill;
+                    }
                     String key = segmentKeys.at(doc);
-                    String text = textOf.apply(key);
+                    String text;
+                    try {
+                        text = textOf.apply(key);
+                    } catch (UnrecoverableTextException e) {
+                        // Permanent, so abandoning would abandon this group on every attempt and
+                        // hold every erasure recorded in it hostage to a chunk it does not name.
+                        unreadableKeysDropped.incrementAndGet();
+                        LOGGER.error("Dropping {} from the lexical index while rewriting {}: its "
+                            + "stored text is permanently unreadable, so it can no longer be "
+                            + "matched. Restore the entry and reindex its document to bring it "
+                            + "back", key, names(entries), e);
+                        continue;
+                    } catch (java.io.UncheckedIOException e) {
+                        LOGGER.warn("Could not read the text of {} back while rewriting {}; the "
+                            + "group is left as it is: {}", key, names(entries), e.getMessage());
+                        fate = Fate.ABANDONED;
+                        break fill;
+                    }
                     if (text == null) {
                         continue;
                     }
@@ -900,13 +1076,38 @@ public final class LexicalStore implements AutoCloseable {
                     names.add(key);
                 }
             }
-            names.finish();
-            survivors = names.count();
-            if (survivors > 0) {
-                builder.build(directory.resolve(name));
+            if (fate == Fate.BUILT) {
+                names.finish();
+                survivors = names.count();
+                if (survivors > 0) {
+                    builder.build(directory.resolve(name));
+                }
             }
+        } catch (IOException | RuntimeException | Error e) {
+            // After the writers have closed, which is why this is here rather than inside: the
+            // key table's close forces and maps the files it wrote.
+            try {
+                discardUnpublished(name);
+            } catch (IOException | RuntimeException cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            throw e;
         }
-        return new PreparedGroup(entries, name, epoch, survivors, before);
+        if (fate != Fate.BUILT) {
+            discardUnpublished(name);
+            return fate == Fate.STOPPED ? GroupBuild.STOPPED : GroupBuild.ABANDONED;
+        }
+        return new GroupBuild(Fate.BUILT,
+            new PreparedGroup(entries, name, epoch, survivors, before));
+    }
+
+    /** The names of some manifest entries, for a log line. */
+    private static List<String> names(List<SegmentManifest.Entry> entries) {
+        List<String> names = new ArrayList<>(entries.size());
+        for (SegmentManifest.Entry entry : entries) {
+            names.add(entry.name());
+        }
+        return names;
     }
 
     /**
@@ -919,6 +1120,12 @@ public final class LexicalStore implements AutoCloseable {
      * The segments it was rewriting were tombstoned or replaced in the meantime, and publishing a
      * replacement built from the older versions would undo that - an erasure recorded during the
      * rewrite would silently come back. The next compaction rebuilds it from what is there now.</p>
+     *
+     * <p>A compaction that planned work and published none of it - every group abandoned or
+     * discarded - is reported as not performed, with the abandoned count and the reason; one that
+     * published some of its plan and abandoned the rest is performed and
+     * {@link CompactionResult#partial() partial}. Only a plan with nothing in it is performed
+     * with nothing rewritten, because that is the truthful "ran and found nothing to do".</p>
      */
     public CompactionResult commit(PreparedCompaction prepared) throws IOException {
         Objects.requireNonNull(prepared, "prepared must not be null");
@@ -967,15 +1174,44 @@ public final class LexicalStore implements AutoCloseable {
             LOGGER.info("Discarded {} prepared group(s) whose segments changed while they were "
                 + "being rewritten; the next compaction will redo them", discarded);
         }
-        LOGGER.info("Compacted {} segment(s) into {}, physically removing {} document(s) ({})",
-            rewritten, produced, removed, prepared.reason());
-        return new CompactionResult(true, rewritten, produced, removed, prepared.reason());
+        int abandoned = prepared.abandoned();
+        if (!changed && (abandoned > 0 || discarded > 0)) {
+            // Work was planned and none of it reached the manifest. Reporting that as a
+            // compaction that ran would tell an erasure's caller its chunks had left disk, and
+            // an operator's forced rewrite that it had succeeded, when every segment is exactly
+            // as it was.
+            String why = "nothing published: " + abandoned + " group(s) abandoned because stored "
+                + "text could not be read back, " + discarded + " discarded because their "
+                + "segments changed during the rewrite (" + prepared.reason() + ")";
+            LOGGER.warn("Compaction published nothing; {}", why);
+            return new CompactionResult(false, 0, 0, 0, abandoned, why);
+        }
+        LOGGER.info("Compacted {} segment(s) into {}, physically removing {} document(s){} ({})",
+            rewritten, produced, removed,
+            abandoned > 0 ? "; " + abandoned + " group(s) abandoned and left as they were" : "",
+            prepared.reason());
+        return new CompactionResult(true, rewritten, produced, removed, abandoned,
+            abandoned > 0
+                ? "partial: " + abandoned + " group(s) abandoned because stored text could not "
+                    + "be read back (" + prepared.reason() + ")"
+                : prepared.reason());
     }
 
     /** Removes files a prepared group built that will never be published. */
     private void discardPrepared(PreparedGroup group) throws IOException {
-        SegmentKeys.delete(directory, group.name());
-        deleteRecursively(directory.resolve(group.name()));
+        discardUnpublished(group.name());
+    }
+
+    /**
+     * Removes whatever a rewrite wrote under a segment name no manifest names.
+     *
+     * <p>Idempotent, so it serves a group abandoned half-way - whose key table may still be open
+     * and whose postings were never built - as well as one built whole. Its scratch directory is
+     * the builder's to remove, and the builder does on close.</p>
+     */
+    private void discardUnpublished(String name) throws IOException {
+        SegmentKeys.delete(directory, name);
+        deleteRecursively(directory.resolve(name));
     }
 
     /** The manifest's current record of the named segments, or null if any is gone. */

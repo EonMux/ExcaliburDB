@@ -38,6 +38,24 @@
 # either the TLS keystore settings or EXCALIBUR_API_ALLOW_PLAINTEXT=true where something in
 # front of this process terminates TLS. The image sets none of them: a default that listened on
 # every interface unauthenticated would be the one mistake this policy exists to prevent.
+#
+# Four directories belong to the node's user, and only the first is declared a volume:
+#
+#   /var/lib/excalibur              The data directory. A VOLUME, so it outlives the container.
+#   /var/lib/excalibur-diagnostics  Where an out-of-memory heap dump is written. Mount it to keep
+#                                   dumps past `docker rm`; unmounted, they sit in the
+#                                   container's writable layer until the container is removed.
+#   /var/lib/excalibur-quarantine   Where `excalibur-fsck --repair --quarantine-dir` moves the
+#                                   files it sets aside. Mount it, or the evidence a repair
+#                                   preserved is deleted with a `docker run --rm` container.
+#   /var/lib/excalibur-backups      Where `excalibur-backup snapshot --out` writes an image when
+#                                   run from this image. Mount it, for the same reason.
+#
+# A named volume mounted on any of them takes that directory's owner, so the process can write
+# to it; a host directory bind-mounted there has to be given uid 10001 first. The last three are
+# not VOLUMEs on purpose. A declared volume that is not mounted becomes an anonymous volume,
+# which `--rm` deletes with the container - so a declaration would promise a persistence that
+# only an explicit mount delivers, and hide that it was missing.
 
 # ==================== Build ====================
 
@@ -61,7 +79,8 @@ COPY . .
 # Tests run in CI against the whole tree; this stage builds the artefact. The jar is copied out
 # of the cached build directory so the runtime stage can take it from a stable path.
 RUN --mount=type=cache,target=/gradle-home,sharing=locked \
-    ./gradlew --no-daemon :excalibur-api:shadowJar :excalibur-fsck:installDist -x test \
+    ./gradlew --no-daemon :excalibur-api:shadowJar :excalibur-fsck:installDist \
+      :excalibur-backup:installDist -x test \
  && cp excalibur-api/build/libs/excalibur.jar /workspace/excalibur.jar
 
 # ==================== Runtime ====================
@@ -87,8 +106,10 @@ ARG EXCALIBUR_GID=10001
 RUN groupadd --system --gid "${EXCALIBUR_GID}" excalibur \
  && useradd --system --uid "${EXCALIBUR_UID}" --gid excalibur \
       --home-dir /var/lib/excalibur --shell /usr/sbin/nologin excalibur \
- && mkdir -p /var/lib/excalibur /opt/excalibur \
- && chown excalibur:excalibur /var/lib/excalibur
+ && mkdir -p /var/lib/excalibur /var/lib/excalibur-diagnostics /var/lib/excalibur-quarantine \
+      /var/lib/excalibur-backups /opt/excalibur \
+ && chown excalibur:excalibur /var/lib/excalibur /var/lib/excalibur-diagnostics \
+      /var/lib/excalibur-quarantine /var/lib/excalibur-backups
 
 # Owned by root and read-only to the process: the node has no reason to be able to rewrite its
 # own code, and an ingestion path that could would be a remote code execution.
@@ -97,11 +118,22 @@ COPY --from=build --chown=root:root --chmod=444 \
 
 # The integrity checker, so it is reachable when the node will not start - which is the only
 # time anyone wants it. `docker run --entrypoint excalibur-fsck <image> /var/lib/excalibur`
-# against the same volume: it maps every file READ_ONLY, and repair is off unless --repair is
-# passed, so a check cannot make a damaged directory worse.
+# against the same volume: without --repair it maps every file READ_ONLY and changes nothing.
+# --repair does write: it moves files into the quarantine directory, marks a catalog row purged
+# in place when the segment it names is gone, and clears the opcode of a write-ahead log's torn
+# last record so the log reads as ending before it. Its default quarantine is a new directory
+# beside the data directory, in /var/lib, which this user cannot create, so a repair in this
+# image passes --quarantine-dir=/var/lib/excalibur-quarantine with that directory mounted.
 COPY --from=build --chown=root:root \
      /workspace/excalibur-fsck/build/install/excalibur-fsck /opt/excalibur-fsck
-ENV PATH="/opt/excalibur-fsck/bin:${PATH}"
+
+# The backup tool, for the same reason: a snapshot is taken with the node stopped, and this
+# image is where the JVM flags it needs are already right. `docker run --entrypoint
+# excalibur-backup <image> snapshot --data-dir /var/lib/excalibur --out
+# /var/lib/excalibur-backups/<name>`, with the node's volume and a backup volume mounted.
+COPY --from=build --chown=root:root \
+     /workspace/excalibur-backup/build/install/excalibur-backup /opt/excalibur-backup
+ENV PATH="/opt/excalibur-fsck/bin:/opt/excalibur-backup/bin:${PATH}"
 
 # Where segments, write-ahead logs, catalogs, the lexical index and the source registry live.
 # ExcaliburApplication reads this variable and nothing else; there is no properties key for it.
@@ -112,10 +144,12 @@ ENV EXCALIBUR_DATA_DIR=/var/lib/excalibur
 # memory-mapped Arenas outside the heap, and a heap sized to crowd out the page cache turns
 # every search into disk reads. ExitOnOutOfMemoryError rather than a JVM that survives an OOM
 # in a worker and keeps answering /health while indexing nothing - the same three flags
-# excalibur-api/build.gradle.kts gives the start scripts, with the dump written to the volume
-# because the working directory is not the process's to write.
+# excalibur-api/build.gradle.kts gives the start scripts. The dump goes to a directory of its
+# own and not the data directory: a dump the size of the heap beside the segments is state
+# excalibur-backup would otherwise have to leave out and excalibur-fsck would have to explain,
+# and on a volume sized for the data it can be what fills the disk.
 ENV JAVA_OPTS="-XX:MaxRAMPercentage=60.0 -XX:InitialRAMPercentage=25.0 -XX:+UseG1GC \
--XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/lib/excalibur \
+-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/lib/excalibur-diagnostics \
 -XX:+ExitOnOutOfMemoryError"
 
 USER excalibur

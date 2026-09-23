@@ -231,6 +231,49 @@ class HnswInvariantVerifierEdgeCaseTest {
                 assertThat(count).isGreaterThanOrEqualTo(0);
             }
         }
+
+        @Test
+        @DisplayName("countDirectedEdges counts every out-edge between active nodes, one-way ones included")
+        void countDirectedEdgesCountsOutEdgesBetweenActiveNodes() throws IOException {
+            try (HnswGraph graph = new HnswGraph(graphPath, config, L2Distance.getInstance(), 1000)) {
+                for (int i = 0; i < 60; i++) {
+                    graph.insert(randomVector(64));
+                }
+                assertThat(HnswInvariantVerifier.countDirectedEdges(graph, 0))
+                    .as("each mutual edge is two out-edges")
+                    .isGreaterThanOrEqualTo(2 * HnswInvariantVerifier.countBidirectionalEdges(graph, 0));
+                graph.delete(7);
+
+                long expected = 0;
+                for (long id = 0; id < graph.nodeCount(); id++) {
+                    if (graph.isTombstoned(id)) {
+                        continue;
+                    }
+                    for (long neighbor : graph.readNode(id).getNeighbors(0)) {
+                        if (!graph.isTombstoned(neighbor)) {
+                            expected++;
+                        }
+                    }
+                }
+
+                assertThat(HnswInvariantVerifier.countDirectedEdges(graph, 0))
+                    .as("out-edges to the tombstoned node are not counted")
+                    .isEqualTo(expected)
+                    .isPositive();
+            }
+        }
+
+        @Test
+        @DisplayName("countDirectedEdges rejects a null graph and counts nothing at an absent level")
+        void countDirectedEdgesEdgeCases() throws IOException {
+            assertThatThrownBy(() -> HnswInvariantVerifier.countDirectedEdges(null, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+            try (HnswGraph graph = new HnswGraph(graphPath, config, L2Distance.getInstance(), 1000)) {
+                graph.insert(randomVector(64));
+                graph.insert(randomVector(64));
+                assertThat(HnswInvariantVerifier.countDirectedEdges(graph, 10)).isZero();
+            }
+        }
     }
 
     @Nested
@@ -260,7 +303,7 @@ class HnswInvariantVerifierEdgeCaseTest {
                     .contains("Entry point:")
                     .contains("Max level:")
                     .contains("Nodes per level")
-                    .contains("Bidirectional edges at level 0:");
+                    .contains("Mutual edges at level 0:");
             }
         }
 

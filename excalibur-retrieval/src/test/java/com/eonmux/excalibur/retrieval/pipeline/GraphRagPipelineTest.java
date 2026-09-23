@@ -838,5 +838,23 @@ class GraphRagPipelineTest {
                 .hasMessageContaining("forward");
             assertThat(ask(pipeline, TraversalDirection.BOTH).hasAnswer()).isTrue();
         }
+
+        @Test
+        @DisplayName("a caller can ask which walks the pipeline takes before asking it for one")
+        void supportsSaysWhatAnswerWillHonour() {
+            // What a server reads to refuse the request as the caller's to change, rather than
+            // letting the refusal arrive as the exception above and be reported as its own fault.
+            GraphRagPipeline without = pipeline();
+            GraphRagPipeline with = pipelineWithRelations();
+
+            assertThat(without.supports(TraversalDirection.BOTH)).isTrue();
+            assertThat(without.supports(TraversalDirection.FORWARD)).isFalse();
+            assertThat(without.supports(TraversalDirection.REVERSE)).isFalse();
+            for (TraversalDirection direction : TraversalDirection.values()) {
+                assertThat(with.supports(direction)).as("%s", direction).isTrue();
+            }
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> with.supports(null))
+                .isInstanceOf(IllegalArgumentException.class);
+        }
     }
 }

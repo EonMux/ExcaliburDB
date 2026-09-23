@@ -87,8 +87,10 @@ public final class JsonReportWriter {
             + ", \"unchecked\": " + counts.get(CheckStatus.UNCHECKED)
             + ", \"partlyVerified\": " + report.scan().partlyVerifiedCount()
             + ", \"corrupt\": " + counts.get(CheckStatus.CORRUPT)
+            + ", \"corruptRebuiltOnOpen\": " + report.scan().rebuiltOnOpenCount()
             + ", \"unreadable\": " + counts.get(CheckStatus.UNREADABLE)
             + ", \"missing\": " + counts.get(CheckStatus.MISSING)
+            + ", \"notData\": " + counts.get(CheckStatus.NOT_DATA)
             + "}";
     }
 
@@ -103,6 +105,7 @@ public final class JsonReportWriter {
             + ", \"format\": " + Json.string(file.format())
             + ", \"version\": " + Json.string(file.version())
             + ", \"status\": " + Json.string(file.status().name())
+            + ", \"damage\": " + file.isDamage()
             + ", \"unverifiedContent\": " + file.unverifiedContent()
             + ", \"sizeBytes\": " + file.sizeBytes()
             + ", \"detail\": " + Json.string(file.detail()) + "}";

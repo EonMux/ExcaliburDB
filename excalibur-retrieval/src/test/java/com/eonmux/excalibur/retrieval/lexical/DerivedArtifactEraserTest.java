@@ -14,6 +14,7 @@ import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.staging.ExtractedTriple;
 import com.eonmux.excalibur.graph.staging.GraphBuilder;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
+import com.eonmux.excalibur.graph.store.MappedEdgeStore;
 import com.eonmux.excalibur.graph.vector.EntityVectors;
 import com.eonmux.excalibur.retrieval.build.GraphDirectoryBuilder;
 
@@ -77,6 +78,16 @@ class DerivedArtifactEraserTest {
         return new Provenance(SourceType.DOCUMENT, sourceId, 90, 1);
     }
 
+    /**
+     * Opens the edge store a build published, as the node's stack does before the publish lets
+     * the previous graph go.
+     */
+    private static Long opensEdgeStore(Path published) throws IOException {
+        try (MappedEdgeStore store = MappedEdgeStore.open(published)) {
+            return store.edgeCount();
+        }
+    }
+
     /** Stages two documents' facts and prose, and publishes a graph built from them. */
     private static void stageAndBuild(GraphStagingStore staging, Path graph,
                                       GraphDirectoryBuilder.EntityEmbedder embedder)
@@ -92,7 +103,8 @@ class DerivedArtifactEraserTest {
         staging.flush();
 
         GraphDirectoryBuilder.build(staging, graph,
-            GraphBuilder.singleValued(staging, List.of()), RAM_BUFFER_MB, embedder, DIMENSION);
+            GraphBuilder.singleValued(staging, List.of()), RAM_BUFFER_MB, embedder, DIMENSION,
+            DerivedArtifactEraserTest::opensEdgeStore);
     }
 
     @Test
@@ -249,7 +261,7 @@ class DerivedArtifactEraserTest {
             staging.flush();
             GraphDirectoryBuilder.build(staging, graph,
                 GraphBuilder.singleValued(staging, List.of()), RAM_BUFFER_MB, embedder,
-                DIMENSION);
+                DIMENSION, DerivedArtifactEraserTest::opensEdgeStore);
 
             GraphErasureCoordinator coordinator = new GraphErasureCoordinator(
                 log, (stats, now) -> true, Clock.systemUTC(), staging,

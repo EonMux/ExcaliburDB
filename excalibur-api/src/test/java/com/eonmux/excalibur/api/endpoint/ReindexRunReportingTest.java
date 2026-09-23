@@ -73,8 +73,8 @@ class ReindexRunReportingTest {
                 .documentsIndexed(indexed)
                 .chunksCreated(indexed * 7);
         for (int i = 0; i < skipped; i++) {
-            builder.addDocumentResult(new DocumentReindexer.DocumentResult(
-                "photo-" + i, 0, 0, 0, 0L, "Not text"));
+            builder.addDocumentResult(DocumentReindexer.DocumentResult.skipped(
+                "photo-" + i, DocumentReindexer.DocumentResult.SkipReason.NOT_TEXT, 0L));
         }
         return builder.build();
     }
@@ -86,7 +86,7 @@ class ReindexRunReportingTest {
         @Test
         @DisplayName("is reported as cancelled when the interrupt arrives wrapped")
         void wrappedInterruptIsACancellation() throws Exception {
-            when(reindexer.reindexAll(eq(source), any()))
+            when(reindexer.reindexAll(eq(source), any(), any()))
                 .thenThrow(new SourceException("fetch abandoned", new InterruptedException()));
 
             run().execute(SOURCE_ID);
@@ -101,7 +101,7 @@ class ReindexRunReportingTest {
         @Test
         @DisplayName("is reported as cancelled when only the interrupt flag survives")
         void aSetInterruptFlagIsACancellation() throws Exception {
-            when(reindexer.reindexAll(eq(source), any())).thenAnswer(invocation -> {
+            when(reindexer.reindexAll(eq(source), any(), any())).thenAnswer(invocation -> {
                 Thread.currentThread().interrupt();
                 throw new SourceException("the crawl was cut short");
             });
@@ -118,7 +118,7 @@ class ReindexRunReportingTest {
         @Test
         @DisplayName("carries no error text, because there is no error")
         void aCancellationHasNoError() throws Exception {
-            when(reindexer.reindexAll(eq(source), any()))
+            when(reindexer.reindexAll(eq(source), any(), any()))
                 .thenThrow(new SourceException("abandoned", new InterruptedException()));
 
             run().execute(SOURCE_ID);
@@ -135,7 +135,7 @@ class ReindexRunReportingTest {
         @Test
         @DisplayName("is still a failure, not a cancellation")
         void anOrdinaryFailureIsNotACancellation() throws Exception {
-            when(reindexer.reindexAll(eq(source), any()))
+            when(reindexer.reindexAll(eq(source), any(), any()))
                 .thenThrow(new SourceException("the root no longer exists"));
 
             run().execute(SOURCE_ID);
@@ -153,7 +153,7 @@ class ReindexRunReportingTest {
         @Test
         @DisplayName("follow the documents the run has actually finished with")
         void countersFollowTheRun() throws Exception {
-            when(reindexer.reindexAll(eq(source), any())).thenAnswer(invocation -> {
+            when(reindexer.reindexAll(eq(source), any(), any())).thenAnswer(invocation -> {
                 DocumentReindexer.ReindexProgress progress = invocation.getArgument(1);
                 progress.documentsDone(0, 4);
                 assertThat(status().entriesTotal())
@@ -180,7 +180,7 @@ class ReindexRunReportingTest {
         @DisplayName("name the phase the node is actually in")
         void thePhaseSaysWhetherTheNodeEmbeds() throws Exception {
             when(reindexer.embedsChunks()).thenReturn(false);
-            when(reindexer.reindexAll(eq(source), any())).thenAnswer(invocation -> {
+            when(reindexer.reindexAll(eq(source), any(), any())).thenAnswer(invocation -> {
                 DocumentReindexer.ReindexProgress progress = invocation.getArgument(1);
                 progress.documentsDone(1, 2);
                 assertThat(status().state())
@@ -197,7 +197,7 @@ class ReindexRunReportingTest {
         @DisplayName("name the embedding phase on a node that embeds")
         void anEmbeddingNodeSaysEmbedding() throws Exception {
             when(reindexer.embedsChunks()).thenReturn(true);
-            when(reindexer.reindexAll(eq(source), any())).thenAnswer(invocation -> {
+            when(reindexer.reindexAll(eq(source), any(), any())).thenAnswer(invocation -> {
                 DocumentReindexer.ReindexProgress progress = invocation.getArgument(1);
                 progress.documentsDone(1, 2);
                 assertThat(status().state()).isEqualTo("embedding");
@@ -220,7 +220,7 @@ class ReindexRunReportingTest {
             // left there, a source re-crawled over a directory that had gained three hundred
             // photographs went on reporting whatever the first crawl happened to find.
             ingestionStatus.getOrCreate(SOURCE_ID).setSkipped(4);
-            when(reindexer.reindexAll(eq(source), any())).thenReturn(resultSkipping(2, 3));
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(resultSkipping(2, 3));
 
             run().execute(SOURCE_ID);
 
@@ -228,10 +228,35 @@ class ReindexRunReportingTest {
         }
 
         @Test
+        @DisplayName("an empty document is not reported as passed over")
+        void onlyDocumentsThatAreNotTextAreReported() throws Exception {
+            // The first crawl counts only documents that are not text. An empty file, or one
+            // the chunker finds nothing in, is skipped by a re-crawl too, but reporting it
+            // there would move the figure between two runs over the same unchanged source.
+            ingestionStatus.getOrCreate(SOURCE_ID).setSkipped(1);
+            DocumentReindexer.ReindexResult result =
+                new DocumentReindexer.ReindexResult.Builder(SOURCE_ID)
+                    .addDocumentResult(DocumentReindexer.DocumentResult.skipped(
+                        "photo.jpg", DocumentReindexer.DocumentResult.SkipReason.NOT_TEXT, 0L))
+                    .addDocumentResult(DocumentReindexer.DocumentResult.skipped(
+                        "empty.txt", DocumentReindexer.DocumentResult.SkipReason.EMPTY_CONTENT, 0L))
+                    .addDocumentResult(DocumentReindexer.DocumentResult.skipped(
+                        "blank.txt", DocumentReindexer.DocumentResult.SkipReason.NO_CHUNKS, 0L))
+                    .addDocumentResult(new DocumentReindexer.DocumentResult(
+                        "doc.txt", 7, 7, 0, 0L, null))
+                    .build();
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(result);
+
+            run().execute(SOURCE_ID);
+
+            assertThat(ingestionStatus.getStatus(SOURCE_ID).entriesSkipped()).isEqualTo(1);
+        }
+
+        @Test
         @DisplayName("a re-crawl that skips nothing clears what the last one reported")
         void aCleanRunClearsTheFigure() throws Exception {
             ingestionStatus.getOrCreate(SOURCE_ID).setSkipped(12);
-            when(reindexer.reindexAll(eq(source), any())).thenReturn(result(2));
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(result(2));
 
             run().execute(SOURCE_ID);
 
@@ -243,7 +268,7 @@ class ReindexRunReportingTest {
         @Test
         @DisplayName("a source with no ingestion status is not invented one")
         void anUnknownSourceIsLeftAlone() throws Exception {
-            when(reindexer.reindexAll(eq(source), any())).thenReturn(resultSkipping(2, 3));
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(resultSkipping(2, 3));
 
             run().execute(SOURCE_ID);
 

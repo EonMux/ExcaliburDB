@@ -3,6 +3,10 @@ package com.eonmux.excalibur.query.validation;
 import com.eonmux.excalibur.query.IndexCoverage;
 import com.eonmux.excalibur.query.QueryResponse;
 import com.eonmux.excalibur.query.QueryResultItem;
+import com.eonmux.excalibur.query.executor.ResultAggregator;
+import com.eonmux.excalibur.query.executor.SegmentQueryTask;
+import com.eonmux.excalibur.vector.distance.CosineSimilarity;
+import com.eonmux.excalibur.vector.hnsw.HnswSearchResult;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -500,14 +504,14 @@ class DomainCorrectnessValidatorTest {
                 createItem(3L)
             );
 
-            Set<Long> duplicates = DomainCorrectnessValidator.findDuplicateDocumentIds(items);
+            Set<String> duplicates = DomainCorrectnessValidator.findDuplicateDocumentIds(items);
             assertThat(duplicates).isEmpty();
         }
 
         @Test
         @DisplayName("returns empty set for empty list")
         void emptyListReturnsEmptySet() {
-            Set<Long> duplicates = DomainCorrectnessValidator.findDuplicateDocumentIds(Collections.emptyList());
+            Set<String> duplicates = DomainCorrectnessValidator.findDuplicateDocumentIds(Collections.emptyList());
             assertThat(duplicates).isEmpty();
         }
 
@@ -520,8 +524,8 @@ class DomainCorrectnessValidatorTest {
                 createItem(1L)  // Duplicate
             );
 
-            Set<Long> duplicates = DomainCorrectnessValidator.findDuplicateDocumentIds(items);
-            assertThat(duplicates).containsExactly(1L);
+            Set<String> duplicates = DomainCorrectnessValidator.findDuplicateDocumentIds(items);
+            assertThat(duplicates).containsExactly("1");
         }
 
         @Test
@@ -535,8 +539,81 @@ class DomainCorrectnessValidatorTest {
                 createItem(2L)   // Duplicate
             );
 
-            Set<Long> duplicates = DomainCorrectnessValidator.findDuplicateDocumentIds(items);
-            assertThat(duplicates).containsExactlyInAnyOrder(1L, 2L);
+            Set<String> duplicates = DomainCorrectnessValidator.findDuplicateDocumentIds(items);
+            assertThat(duplicates).containsExactlyInAnyOrder("1", "2");
+        }
+
+        @Test
+        @DisplayName("results from different segments that share a node id are not duplicates")
+        void sameNodeIdInDifferentSegmentsIsNotADuplicate() {
+            // Node ids restart at 0 in every segment's graph, and the aggregator carries the
+            // node id as the numeric id of every result it builds. Two different documents
+            // whose chunks are node 0 of their own segments are two results.
+            List<QueryResultItem> items = Arrays.asList(
+                new QueryResultItem(0L, "doc-a", 0.9f, null, 1L, 0L),
+                new QueryResultItem(0L, "doc-b", 0.8f, null, 2L, 0L)
+            );
+
+            assertThat(DomainCorrectnessValidator.findDuplicateDocumentIds(items)).isEmpty();
+        }
+
+        @Test
+        @DisplayName("unnamed results are told apart by the segment and node they came from")
+        void unnamedResultsAreIdentifiedBySegmentAndNode() {
+            List<QueryResultItem> distinct = Arrays.asList(
+                new QueryResultItem(0L, null, 0.9f, null, 1L, 0L),
+                new QueryResultItem(0L, null, 0.8f, null, 2L, 0L)
+            );
+            List<QueryResultItem> repeated = Arrays.asList(
+                new QueryResultItem(4L, null, 0.9f, null, 3L, 4L),
+                new QueryResultItem(4L, null, 0.8f, null, 3L, 4L)
+            );
+
+            assertThat(DomainCorrectnessValidator.findDuplicateDocumentIds(distinct)).isEmpty();
+            assertThat(DomainCorrectnessValidator.findDuplicateDocumentIds(repeated))
+                .containsExactly("segment 3 node 4");
+        }
+
+        @Test
+        @DisplayName("one document returned twice is a duplicate, whatever segments it came from")
+        void sameDocumentFromTwoSegmentsIsADuplicate() {
+            List<QueryResultItem> items = Arrays.asList(
+                new QueryResultItem(0L, "doc-a", 0.9f, null, 1L, 0L),
+                new QueryResultItem(5L, "doc-a", 0.8f, null, 2L, 5L)
+            );
+
+            assertThat(DomainCorrectnessValidator.findDuplicateDocumentIds(items))
+                .containsExactly("doc-a");
+        }
+
+        @Test
+        @DisplayName("the aggregator's own answer across segments passes validation")
+        void aggregatedAnswerAcrossSegmentsIsValid() {
+            // The path the warning was logged on: every segment's graph numbers its nodes from
+            // 0, so the best hit of each segment is commonly node 0 of it.
+            ResultAggregator aggregator = new ResultAggregator(10);
+            List<SegmentQueryTask.SegmentQueryResult> perSegment = List.of(
+                new SegmentQueryTask.SegmentQueryResult(1L,
+                    List.of(new HnswSearchResult(0L, 0.1f, "doc-a")), 0, 1, true, null),
+                new SegmentQueryTask.SegmentQueryResult(2L,
+                    List.of(new HnswSearchResult(0L, 0.2f, "doc-b")), 0, 1, true, null),
+                new SegmentQueryTask.SegmentQueryResult(3L,
+                    List.of(new HnswSearchResult(0L, 0.3f)), 0, 1, true, null),
+                new SegmentQueryTask.SegmentQueryResult(4L,
+                    List.of(new HnswSearchResult(0L, 0.4f)), 0, 1, true, null));
+
+            List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+                perSegment, CosineSimilarity.getInstance());
+            QueryResponse response = new QueryResponse(merged,
+                IndexCoverage.builder().totalSegments(4).activeSegments(4)
+                    .estimatedCorpusCoverage(1.0).build(),
+                5L);
+
+            assertThat(merged).hasSize(4);
+            DomainCorrectnessValidator.ValidationResult result =
+                DomainCorrectnessValidator.validateResponseWithResult(response);
+            assertThat(result.errors()).isEmpty();
+            assertThat(result.isValid()).isTrue();
         }
 
         @Test

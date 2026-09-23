@@ -78,6 +78,16 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
         return staging;
     }
 
+    /**
+     * Forces the staging store this sink writes into.
+     *
+     * @throws IOException if it cannot be forced
+     */
+    @Override
+    public void sync() throws IOException {
+        staging.sync();
+    }
+
     @Override
     public int stage(List<ExtractedTriple> triples) {
         if (triples == null || triples.isEmpty()) {

@@ -234,22 +234,38 @@ class IndexOrchestratorSwapTest {
 
     @Test
     @DisplayName("Re-registering a segment ID keeps its place in the filter hierarchy")
-    void reRegisteringASegmentIdKeepsItsHierarchyEntry() {
+    void reRegisteringASegmentIdKeepsItsHierarchyEntry() throws InterruptedException {
         HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(100_000L, 13, 1_000);
         orchestrator.setHierarchicalCuckooFilter(filter);
+
+        // Segment 0 holds a chunk mentioning the term, filed under it as ingestion files it.
+        storageEngine.getSegment(0L).put("doc-0#0".getBytes(StandardCharsets.UTF_8),
+            com.eonmux.excalibur.core.codec.ChunkPayloadCodec.encodeTextOnly("excalibur"));
 
         // Register index 0 against a stale instance, the state the orchestrator is in
         // after a compaction or a split has replaced the Segment behind an index.
         orchestrator.registerSegment(0L, storageEngine.getSegment(1L), null, null, null);
+        assertThat(orchestrator.awaitTermFilterRebuilds(10, java.util.concurrent.TimeUnit.SECONDS))
+            .isTrue();
 
         byte[] term = "excalibur".getBytes(StandardCharsets.UTF_8);
         assertThat(filter.insert(term, "0")).isTrue();
         assertThat(filter.findCandidateSegments(term)).contains("0");
+        com.eonmux.excalibur.filter.CuckooFilter level = filter.getSegmentFilter("0");
 
         orchestrator.syncSegmentsFromStorage();
 
-        // Stage 1 treats a filter miss as ground truth, so recreating the segment filter
-        // on re-registration would turn every term it held into an empty query result.
+        // Stage 1 treats a filter miss as ground truth. Whatever the re-registration does to
+        // the level, stage 1 must never be able to rule segment 0 out for a term it holds: the
+        // level either names it or does not claim to cover it.
+        assertThat(filter.findCandidateSegments(term).contains("0") || !filter.coversSegment("0"))
+            .isTrue();
+        assertThat(orchestrator.awaitTermFilterRebuilds(10, java.util.concurrent.TimeUnit.SECONDS))
+            .isTrue();
+        assertThat(filter.getSegmentFilter("0"))
+            .as("the id keeps its level, which every holder of it still sees")
+            .isSameAs(level);
+        assertThat(filter.coversSegment("0")).isTrue();
         assertThat(filter.findCandidateSegments(term)).contains("0");
     }
 

@@ -254,6 +254,37 @@ class GraphBuildRunnerTest {
             }
         }
 
+        /**
+         * A build writes each namespace's staged facts and graph files through channels the
+         * tenant's readers share, and an interrupt landing on one of those writes closes the
+         * channel for every reader. So shutdown asks the build to stop through its signal.
+         */
+        @Test
+        @DisplayName("a drain stops a running build through its signal, never an interrupt")
+        void drainStopsTheBuildCooperatively() {
+            CountDownLatch entered = new CountDownLatch(1);
+            java.util.concurrent.atomic.AtomicBoolean interrupted =
+                new java.util.concurrent.atomic.AtomicBoolean();
+            GraphBuildRunner runner = new GraphBuildRunner((namespace, cancelRequested) -> {
+                entered.countDown();
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+                while (!cancelRequested.getAsBoolean() && System.nanoTime() < deadline) {
+                    java.util.concurrent.locks.LockSupport.parkNanos(
+                        TimeUnit.MILLISECONDS.toNanos(5));
+                }
+                interrupted.set(Thread.currentThread().isInterrupted());
+                throw new BuildCancelledException("stopped at the next staged fact");
+            });
+            runner.start(ACME);
+            await(entered);
+
+            assertThat(runner.drain())
+                .as("the build ended within the drain, so the tenants may close")
+                .isTrue();
+            assertThat(interrupted).as("the build's thread was never interrupted").isFalse();
+            assertThat(runner.snapshot(ACME).state()).isEqualTo(GraphBuildRunner.STATE_CANCELLED);
+        }
+
         @Test
         @DisplayName("cancelling when nothing is running is answered, not refused")
         void cancellingNothing() {

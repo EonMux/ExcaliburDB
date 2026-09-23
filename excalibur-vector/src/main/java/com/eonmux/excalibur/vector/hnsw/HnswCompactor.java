@@ -90,8 +90,7 @@ final class HnswCompactor {
             // final ATOMIC_MOVE fail after the live mapping has been torn down.
             Path originalPath = graph.path;
             Path compactPath = HnswSidecarPaths.compactionStaging(originalPath);
-            Files.deleteIfExists(compactPath);
-            Files.deleteIfExists(HnswSidecarPaths.documentMapping(compactPath));
+            discardStagedPair(compactPath);
 
             LOGGER.info("Starting HNSW compaction: {} tombstoned nodes to remove", removed);
 
@@ -286,8 +285,14 @@ final class HnswCompactor {
         if (Files.exists(compactPath)) {
             LOGGER.warn("Discarding the remains of an HNSW compaction of {} that never "
                 + "swapped its graph into place.", graphPath);
-            deleteQuietly(compactPath);
-            deleteQuietly(stagedMapping);
+            try {
+                discardStagedPair(compactPath);
+            } catch (IOException e) {
+                // The pair is intact, so the next open reaches the same verdict and tries
+                // again; the live graph and mapping beside it are consistent either way.
+                LOGGER.warn("Could not remove the abandoned compaction of {}: {}",
+                    graphPath, e.toString());
+            }
             return;
         }
 
@@ -305,6 +310,30 @@ final class HnswCompactor {
                 + "the wrong document.", e);
         }
         DurableFiles.syncContainingDirectory(livePath);
+    }
+
+    /**
+     * Removes a staged graph and the staged mapping beside it, mapping first.
+     *
+     * <p>The order is the whole of the safety argument. {@link #finishInterruptedCompaction}
+     * reads a staged mapping with no staged graph beside it as a graph swap that completed, and
+     * installs that mapping over the live one. Removing the graph first would let a crash - or a
+     * failed delete - between the two removals leave exactly that state behind a compaction that
+     * never swapped anything, and the next open would then attribute every node of an
+     * uncompacted graph to the document the compacted numbering gave it. Removing the mapping
+     * first, and making its removal durable before the graph's, means every intermediate state
+     * is either the intact pair or a lone staged graph, which nothing reads.</p>
+     *
+     * @param compactPath The staging path of the compacted graph
+     * @throws IOException if the staged mapping cannot be removed, in which case the staged
+     *                     graph is left in place
+     */
+    private static void discardStagedPair(Path compactPath) throws IOException {
+        Path stagedMapping = HnswSidecarPaths.documentMapping(compactPath);
+        if (Files.deleteIfExists(stagedMapping)) {
+            DurableFiles.syncContainingDirectory(stagedMapping);
+        }
+        deleteQuietly(compactPath);
     }
 
     /**
@@ -403,8 +432,12 @@ final class HnswCompactor {
         // The staged mapping goes with the staged graph. Left alone it would tell the next
         // open that a graph swap had completed, and it would install a compacted numbering
         // over the graph that was never replaced.
-        deleteQuietly(compactPath);
-        deleteQuietly(HnswSidecarPaths.documentMapping(compactPath));
+        try {
+            discardStagedPair(compactPath);
+        } catch (IOException e) {
+            LOGGER.warn("Could not remove the staged compaction of {}: {}. The pair is intact "
+                + "and the next open discards it.", originalPath, e.toString());
+        }
     }
 
     /**

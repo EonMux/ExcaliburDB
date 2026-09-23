@@ -25,7 +25,6 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
@@ -928,11 +927,6 @@ class DocumentReindexerTest {
         @Override
         public Stream<String> crawl() {
             return documents.keySet().stream();
-        }
-
-        @Override
-        public boolean hasChanged(Instant since) {
-            return true;
         }
 
         @Override

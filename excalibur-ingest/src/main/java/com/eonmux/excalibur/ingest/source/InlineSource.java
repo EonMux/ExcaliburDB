@@ -1,7 +1,6 @@
 package com.eonmux.excalibur.ingest.source;
 
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -22,9 +21,9 @@ import java.util.stream.Stream;
  *
  * <h2>What it does not do</h2>
  * <p>It never changes. The documents arrived in one request and are ingested in that request,
- * and there is no target to go back to: {@link #hasChanged(Instant)} is false, so a scheduled
- * re-crawl has nothing to do rather than something wasteful to do. Replacing a document means
- * posting it again, which is the same operation as posting it the first time.</p>
+ * and there is no target to go back to, so there is nothing for a re-crawl to ask about.
+ * Replacing a document means posting it again, which is the same operation as posting it the
+ * first time.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Immutable, and the byte content it holds is copied in and out by {@link FetchedDocument}.</p>
@@ -112,11 +111,6 @@ public final class InlineSource implements Source {
     @Override
     public Stream<String> crawl() {
         return documents.keySet().stream();
-    }
-
-    @Override
-    public boolean hasChanged(Instant since) {
-        return false;
     }
 
     @Override

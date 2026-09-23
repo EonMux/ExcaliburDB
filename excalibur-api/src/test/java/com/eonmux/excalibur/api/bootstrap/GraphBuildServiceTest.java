@@ -58,6 +58,44 @@ class GraphBuildServiceTest {
                 from(1)));
     }
 
+    /** The node's model clients, as the tenants that own a build service would hold them. */
+    private static GraphModelClients models(Config config) {
+        return GraphModelClients.forConfig(config);
+    }
+
+    @Test
+    @DisplayName("a relation configured single-valued closes its predecessor in the served graph")
+    void singleValuedRelationsSupersede(@TempDir Path tempDir) throws IOException {
+        Path graphDirectory = tempDir.resolve("graph");
+        Config config = configFor(graphDirectory);
+
+        try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"));
+             GraphRagHolder holder = new GraphRagHolder(graphDirectory, null)) {
+            staging.append(new ExtractedTriple("Ada Lovelace", "employer", "Acme",
+                0, com.eonmux.excalibur.graph.temporal.TemporalFilter.OPEN, from(1)));
+            staging.append(new ExtractedTriple("Ada Lovelace", "employer", "Beta",
+                100, com.eonmux.excalibur.graph.temporal.TemporalFilter.OPEN, from(2)));
+            int ada = staging.entityIdOf("Ada Lovelace");
+            int acme = staging.entityIdOf("Acme");
+            int beta = staging.entityIdOf("Beta");
+
+            new GraphBuildService(staging, holder, config, models(config), List.of("employer"))
+                .build();
+
+            assertThat(holder.isPresent()).isTrue();
+            try (com.eonmux.excalibur.graph.store.MappedEdgeStore store =
+                     com.eonmux.excalibur.graph.store.MappedEdgeStore.open(graphDirectory)) {
+                long[] now = store.expand(new long[] { ada }, 1, null,
+                    com.eonmux.excalibur.graph.temporal.TemporalFilter.asOf(
+                        java.time.LocalDate.ofEpochDay(200)));
+                assertThat(now)
+                    .as("the service passes its single-valued relations to the build")
+                    .contains(beta)
+                    .doesNotContain(acme);
+            }
+        }
+    }
+
     @Test
     @DisplayName("a node with nothing staged serves no graph and says so")
     void anEmptyNodeServesNoGraph(@TempDir Path tempDir) throws IOException {
@@ -67,7 +105,8 @@ class GraphBuildServiceTest {
         try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"));
              GraphRagHolder holder = new GraphRagHolder(graphDirectory, null)) {
 
-            GraphBuildService service = new GraphBuildService(staging, holder, config, List.of());
+            GraphBuildService service =
+                new GraphBuildService(staging, holder, config, models(config), List.of());
 
             assertThat(holder.isPresent()).isFalse();
             assertThat(served(holder)).isEmpty();
@@ -91,7 +130,8 @@ class GraphBuildServiceTest {
              GraphRagHolder holder = new GraphRagHolder(graphDirectory, null)) {
 
             StagingGraphIngestSink sink = new StagingGraphIngestSink(staging, fixedFacts());
-            GraphBuildService service = new GraphBuildService(staging, holder, config, List.of());
+            GraphBuildService service =
+                new GraphBuildService(staging, holder, config, models(config), List.of());
 
             // Exactly what IngestionOrchestrator does once a document is durably published.
             sink.onDocumentPublished("docs:ada",
@@ -122,7 +162,8 @@ class GraphBuildServiceTest {
              GraphRagHolder holder = new GraphRagHolder(graphDirectory, null)) {
 
             StagingGraphIngestSink sink = new StagingGraphIngestSink(staging, fixedFacts());
-            GraphBuildService service = new GraphBuildService(staging, holder, config, List.of());
+            GraphBuildService service =
+                new GraphBuildService(staging, holder, config, models(config), List.of());
 
             sink.onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
             service.build();
@@ -135,6 +176,64 @@ class GraphBuildServiceTest {
             assertThat(second.edges()).isEqualTo(3);
             // A new stack, not the old one still mapping a directory the rebuild replaced.
             assertThat(served(holder).orElseThrow()).isNotSameAs(first);
+        }
+    }
+
+    @Test
+    @DisplayName("a build that publishes an unopenable graph leaves the served one on disk")
+    void anUnopenableBuildKeepsThePreviousGraph(@TempDir Path tempDir) throws IOException {
+        Path graphDirectory = tempDir.resolve("graph");
+        Config config = configFor(graphDirectory);
+
+        try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"));
+             GraphRagHolder holder = new GraphRagHolder(graphDirectory, null)) {
+            new StagingGraphIngestSink(staging, fixedFacts())
+                .onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
+            assertThat(new GraphBuildService(staging, holder, config, models(config), List.of())
+                .build().edges()).isEqualTo(2);
+            Object served = served(holder).orElseThrow();
+
+            // The embedder runs after the lexical indexes are written into the scratch
+            // directory and before the publish, which makes it the one place a test can remove
+            // an artifact the opener requires: a build that assembles something the reader
+            // cannot open, as a version mismatch or a missing file would.
+            GraphBuildService corrupting = new GraphBuildService(
+                staging, holder, config, models(config), List.of(),
+                texts -> {
+                    deleteTree(com.eonmux.excalibur.graph.staging.GraphBuilder
+                        .scratchFor(graphDirectory).resolve(GraphRagFactory.LABEL_INDEX));
+                    return texts.stream().map(text -> new float[] { 1f, 0f }).toList();
+                }, 2);
+            staging.append(ExtractedTriple.alwaysValid(
+                "Ada Lovelace", "wrote", "Note G", from(2)));
+
+            org.assertj.core.api.Assertions.assertThatThrownBy(corrupting::build)
+                .isInstanceOf(IOException.class);
+
+            assertThat(served(holder).orElseThrow())
+                .as("the node goes on serving the graph it served before")
+                .isSameAs(served);
+            assertThat(com.eonmux.excalibur.graph.staging.GraphBuilder.previousFor(graphDirectory))
+                .doesNotExist();
+        }
+
+        // What a restart would open: the previous graph, whole, at the served path.
+        try (GraphRagFactory.GraphRag reopened = GraphRagFactory.openAt(config, graphDirectory);
+             com.eonmux.excalibur.graph.store.MappedEdgeStore store =
+                 com.eonmux.excalibur.graph.store.MappedEdgeStore.open(graphDirectory)) {
+            assertThat(reopened).isNotNull();
+            assertThat(store.edgeCount()).isEqualTo(2);
+        }
+    }
+
+    /** Removes a directory tree, for a test that damages a build in progress. */
+    private static void deleteTree(Path root) {
+        try (java.util.stream.Stream<Path> walk = java.nio.file.Files.walk(root)) {
+            for (Path each : walk.sorted(java.util.Comparator.reverseOrder()).toList()) {
+                java.nio.file.Files.delete(each);
+            }
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException(e);
         }
     }
 
@@ -168,7 +267,7 @@ class GraphBuildServiceTest {
              GraphRagHolder holder = new GraphRagHolder(graphDirectory, null)) {
             new StagingGraphIngestSink(staging, fixedFacts())
                 .onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
-            new GraphBuildService(staging, holder, config, List.of()).build();
+            new GraphBuildService(staging, holder, config, models(config), List.of()).build();
         }
 
         // Staging lives beside the graph, not inside it: every build replaces the graph directory
@@ -188,7 +287,8 @@ class GraphBuildServiceTest {
         private GraphBuildService built(Path tempDir, GraphStagingStore staging,
                                         GraphRagHolder holder) throws IOException {
             GraphBuildService service = new GraphBuildService(
-                staging, holder, configFor(holder.directory()), List.of());
+                staging, holder, configFor(holder.directory()),
+                models(configFor(holder.directory())), List.of());
             new StagingGraphIngestSink(staging, fixedFacts())
                 .onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
             assertThat(service.build().published()).isTrue();

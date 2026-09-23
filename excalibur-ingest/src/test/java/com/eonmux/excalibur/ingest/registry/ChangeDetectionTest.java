@@ -8,7 +8,6 @@ import com.eonmux.excalibur.ingest.source.SourceException;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.Iterator;
 import java.util.List;
 import java.util.stream.Stream;
@@ -709,11 +708,6 @@ class ChangeDetectionTest {
         @Override
         public Stream<String> crawl() {
             return documentIds.stream();
-        }
-
-        @Override
-        public boolean hasChanged(Instant since) {
-            return true;
         }
 
         @Override

@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.ingest.registry;
 
 import com.eonmux.excalibur.ingest.source.DocumentNotFoundException;
+import com.eonmux.excalibur.ingest.source.DocumentValidators;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.IncompleteCrawlException;
 import com.eonmux.excalibur.ingest.source.Source;
@@ -8,9 +9,9 @@ import com.eonmux.excalibur.ingest.source.SourceException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.time.Instant;
 import java.util.HashSet;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
@@ -19,7 +20,11 @@ import java.util.stream.Stream;
  * Detects changed and deleted documents during re-crawl operations.
  *
  * <h2>Change Detection Strategy</h2>
- * <p>The detector uses multiple signals to determine if a document has changed:
+ * <p>A registered document is first put to its source conditionally, with the validators the
+ * registry recorded for the indexed version (see {@link Source#fetchIfChanged}). A source that
+ * confirms the version is current - an HTTP origin answering {@code 304 Not Modified} - settles
+ * it without transferring the body, and the document is unchanged. Every other answer carries
+ * the document, and the detector compares what came back:
  * <ol>
  *   <li><strong>Last Modified Timestamp:</strong> If the source provides lastModified,
  *       compare with the stored timestamp. Newer = changed.</li>
@@ -191,33 +196,83 @@ public class ChangeDetector {
     public boolean hasChanged(Source source, String documentId) throws SourceException {
         Objects.requireNonNull(source, "source must not be null");
         Objects.requireNonNull(documentId, "documentId must not be null");
-        
-        String sourceId = source.getSourceId();
-        DocumentMetadata existing = registry.get(sourceId, documentId);
-        
-        if (existing == null) {
-            return true;
-        }
-        
-        FetchedDocument fetched = source.fetch(documentId);
-        DocumentMetadata.FetchedDocumentInfo fetchedInfo = DocumentRegistry.toFetchedInfo(fetched);
-        
-        return existing.isChanged(fetchedInfo);
+
+        DocumentMetadata existing = registry.get(source.getSourceId(), documentId);
+        return existing == null || changedVersion(source, documentId, existing).isPresent();
     }
 
     /**
-     * Checks if a source has changed since the given timestamp.
+     * Asks the source whether the indexed version of a document is still current.
      *
-     * @param source The source to check
-     * @param lastCrawlTime The time of the last crawl
-     * @return true if the source may have changes
-     * @throws SourceException if change detection fails
+     * <p>The one place a registered document is compared with its source, so a re-crawl and a
+     * single-document check cannot come to different answers. The conditional fetch is tried
+     * first; only a document the source actually sent back is compared by timestamp, length and
+     * content hash.</p>
+     *
+     * <p>A document sent back in full and found unchanged still brought news: the validators
+     * its source now names this version by. They are recorded, so the next re-crawl asks with
+     * them - see {@link #refreshValidators}.</p>
+     *
+     * @param source     The source holding the document
+     * @param documentId The document
+     * @param existing   What the registry recorded for the indexed version
+     * @return What the source now holds, or empty when the indexed version is current
+     * @throws SourceException if the source cannot be asked
      */
-    public boolean hasSourceChanged(Source source, Instant lastCrawlTime) throws SourceException {
-        Objects.requireNonNull(source, "source must not be null");
-        Objects.requireNonNull(lastCrawlTime, "lastCrawlTime must not be null");
-        
-        return source.hasChanged(lastCrawlTime);
+    private Optional<DocumentMetadata.FetchedDocumentInfo> changedVersion(
+            Source source, String documentId, DocumentMetadata existing) throws SourceException {
+        Optional<FetchedDocument> fetched =
+            source.fetchIfChanged(documentId, existing.validators());
+        if (fetched.isEmpty()) {
+            return Optional.empty();
+        }
+        DocumentMetadata.FetchedDocumentInfo info = DocumentRegistry.toFetchedInfo(fetched.get());
+        if (existing.isChanged(info)) {
+            return Optional.of(info);
+        }
+        refreshValidators(existing, fetched.get().validators());
+        return Optional.empty();
+    }
+
+    /**
+     * Records the validators an unchanged document came back with, when they differ.
+     *
+     * <p>Only a changed document is reindexed, and reindexing is what otherwise writes a
+     * document's validators. Without this, one whose entity tag the registry never held - every
+     * document registered before tags were kept - or whose tag the server rotated over the same
+     * bytes, as a redeployment does, would be sent in full on every re-crawl for as long as its
+     * content did not change: each fetch asks with the stale tag, the server cannot match it,
+     * and the tag the answer carried is thrown away.</p>
+     *
+     * <p>Each validator is replaced only when the answer carried one. An answer without a tag
+     * is not evidence against the recorded one - the server can only ever answer 304 to a tag
+     * it currently issues, so a stale tag costs nothing a missing one would not - and a
+     * timestamp the answer did not state is still the best one known. The change is made in
+     * memory and reaches disk at the registry's next save, as every registration does; and only
+     * if the entry is still the one read, so a reindex that registered a new version meanwhile
+     * is never overwritten with this older one.</p>
+     *
+     * @param existing What the registry recorded for the indexed version
+     * @param received What the source named the same version by just now
+     */
+    private void refreshValidators(DocumentMetadata existing, DocumentValidators received) {
+        DocumentValidators recorded = existing.validators();
+        long lastModified = received.hasLastModified()
+            ? received.lastModifiedMillis()
+            : recorded.lastModifiedMillis();
+        String entityTag = received.hasEntityTag() ? received.entityTag() : recorded.entityTag();
+        if (lastModified == recorded.lastModifiedMillis()
+                && Objects.equals(entityTag, recorded.entityTag())) {
+            return;
+        }
+        DocumentMetadata refreshed = existing.toBuilder()
+            .lastModifiedMillis(lastModified)
+            .entityTag(entityTag)
+            .build();
+        if (registry.replace(existing, refreshed)) {
+            LOGGER.debug("Recorded new validators for unchanged document {} of source {}",
+                existing.getDocumentId(), existing.getSourceId());
+        }
     }
 
     /**
@@ -242,12 +297,8 @@ public class ChangeDetector {
         }
         
         try {
-            FetchedDocument fetched = source.fetch(documentId);
-            DocumentMetadata.FetchedDocumentInfo fetchedInfo = DocumentRegistry.toFetchedInfo(fetched);
-            
-            if (existing.isChanged(fetchedInfo)) {
-                builder.addChanged(documentId, existing, fetchedInfo);
-            }
+            changedVersion(source, documentId, existing)
+                .ifPresent(info -> builder.addChanged(documentId, existing, info));
             return true;
         } catch (DocumentNotFoundException e) {
             LOGGER.info("Document {} of source {} disappeared between crawl and fetch; treating as deleted",

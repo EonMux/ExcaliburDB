@@ -20,13 +20,18 @@ import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Mode;
 import org.openjdk.jmh.annotations.OutputTimeUnit;
+import org.openjdk.jmh.annotations.Param;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -81,6 +86,26 @@ class BenchmarkTargetRegistryTest {
     }
 
     @Test
+    @DisplayName("The batch lookup target is per lookup and holds the single-lookup target")
+    void batchLookupTargetIsPerLookupAndHoldsTheSingleLookupTarget() throws NoSuchMethodException {
+        String batch = PointLookupBenchmark.class.getName() + ".batchLookup100";
+        String single = PointLookupBenchmark.class.getName() + ".randomLookupFast";
+        double batchTarget = BenchmarkTargetRegistry.getTarget(batch).targetValue();
+        double singleTarget = BenchmarkTargetRegistry.getTarget(single).targetValue();
+
+        assertThat(PointLookupBenchmark.class
+                .getMethod("batchLookup100", org.openjdk.jmh.infra.Blackhole.class)
+                .getAnnotation(org.openjdk.jmh.annotations.OperationsPerInvocation.class)
+                .value())
+            .as("a per-lookup target only means something against a per-lookup score")
+            .isEqualTo(100);
+        assertThat(batchTarget)
+            .as("a batch is the single lookup under one shared lock, so it can hold that "
+                + "lookup's target but not exceed the lookup it repeats")
+            .isEqualTo(singleTarget);
+    }
+
+    @Test
     @DisplayName("Every registered target pattern matches at least one real benchmark")
     void everyTargetPatternMatchesARealBenchmark() {
         List<String> names = benchmarkNames();
@@ -96,6 +121,48 @@ class BenchmarkTargetRegistryTest {
         assertThat(deadPatterns)
             .as("a target that matches no benchmark is never evaluated and silently "
                 + "vanishes from every report")
+            .isEmpty();
+    }
+
+    @Test
+    @DisplayName("The benchmark class list is every class in the package that declares a @Benchmark")
+    void benchmarkClassListIsComplete() throws Exception {
+        assertThat(discoverBenchmarkClasses())
+            .as("a benchmark class missing from BENCHMARK_CLASSES is invisible to every check here, "
+                + "so a target naming it would pass as dead-pattern-free while never being tested")
+            .containsExactlyInAnyOrderElementsOf(BENCHMARK_CLASSES);
+    }
+
+    @Test
+    @DisplayName("Every scaled target scales by a numeric @Param of each benchmark it gates")
+    void everyScaleParameterIsADeclaredNumericParam() {
+        List<String> problems = new ArrayList<>();
+
+        for (Class<?> benchmarkClass : BENCHMARK_CLASSES) {
+            for (Method method : benchmarkMethods(benchmarkClass)) {
+                String name = benchmarkClass.getName() + "." + method.getName();
+                for (BenchmarkTargetRegistry.TargetConfig target : BenchmarkTargetRegistry.getTargets(name)) {
+                    String parameter = target.scaleByParameter();
+                    if (parameter == null) {
+                        continue;
+                    }
+                    String[] values = paramValues(benchmarkClass, parameter);
+                    if (values == null) {
+                        problems.add(name + " has no @Param '" + parameter + "'");
+                        continue;
+                    }
+                    for (String value : values) {
+                        if (!isNumber(value)) {
+                            problems.add(name + " @Param '" + parameter + "' value '" + value
+                                + "' is not numeric");
+                        }
+                    }
+                }
+            }
+        }
+
+        assertThat(problems)
+            .as("a scaled target whose parameter JMH never reports is NOT EVALUATED on every run")
             .isEmpty();
     }
 
@@ -203,6 +270,52 @@ class BenchmarkTargetRegistryTest {
             }
         }
         return methods;
+    }
+
+    /**
+     * Finds every top-level class in the benchmark package that declares a {@code @Benchmark}
+     * method, from the compiled classes on disk. JMH's generated harness classes live in a
+     * subpackage and are not walked.
+     */
+    private static List<Class<?>> discoverBenchmarkClasses() throws Exception {
+        String packageName = DistanceBenchmark.class.getPackageName();
+        Path packageDir = Path.of(DistanceBenchmark.class.getProtectionDomain().getCodeSource()
+            .getLocation().toURI()).resolve(packageName.replace('.', '/'));
+        List<Class<?>> found = new ArrayList<>();
+        try (Stream<Path> files = Files.list(packageDir)) {
+            for (Path file : files.toList()) {
+                String fileName = file.getFileName().toString();
+                if (!fileName.endsWith(".class") || fileName.contains("$")
+                        || fileName.equals("package-info.class")) {
+                    continue;
+                }
+                Class<?> candidate = Class.forName(
+                    packageName + "." + fileName.substring(0, fileName.length() - ".class".length()));
+                if (!benchmarkMethods(candidate).isEmpty()) {
+                    found.add(candidate);
+                }
+            }
+        }
+        return found;
+    }
+
+    private static String[] paramValues(Class<?> benchmarkClass, String parameter) {
+        for (Field field : benchmarkClass.getFields()) {
+            Param param = field.getAnnotation(Param.class);
+            if (param != null && field.getName().equals(parameter)) {
+                return param.value();
+            }
+        }
+        return null;
+    }
+
+    private static boolean isNumber(String value) {
+        try {
+            Double.parseDouble(value);
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
+        }
     }
 
     private static Mode modeOf(Class<?> benchmarkClass) {

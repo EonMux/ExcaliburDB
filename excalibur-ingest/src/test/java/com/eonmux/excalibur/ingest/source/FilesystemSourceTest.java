@@ -11,8 +11,6 @@ import java.io.UncheckedIOException;
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -195,30 +193,6 @@ class FilesystemSourceTest {
             assertThat(documentIds).containsExactlyInAnyOrder("file1.txt", "file2.md");
             assertThat(documentIds).doesNotContain("subdir/file3.txt");
         }
-    }
-
-    @Test
-    void hasChanged_whenRecentlyModified_returnsTrue() throws SourceException {
-        Instant past = Instant.now().minus(1, ChronoUnit.DAYS);
-
-        boolean changed = source.hasChanged(past);
-
-        assertThat(changed).isTrue();
-    }
-
-    @Test
-    void hasChanged_whenFutureTimestamp_returnsTrue() throws SourceException {
-        Instant future = Instant.now().plus(1, ChronoUnit.DAYS);
-
-        boolean changed = source.hasChanged(future);
-
-        assertThat(changed).isTrue();
-    }
-
-    @Test
-    void hasChanged_withNullTimestamp_throwsException() {
-        assertThatThrownBy(() -> source.hasChanged(null))
-            .isInstanceOf(NullPointerException.class);
     }
 
     @Test

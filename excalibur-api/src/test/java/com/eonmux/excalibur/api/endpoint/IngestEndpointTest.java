@@ -26,12 +26,14 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
@@ -273,9 +275,9 @@ class IngestEndpointTest {
     }
 
     @Test
-    @DisplayName("InMemorySourceRegistry should work without orchestrator configured (stub mode)")
-    void testStubModeWithoutOrchestrator() {
-        // Don't configure orchestrator - should use stub mode
+    @DisplayName("InMemorySourceRegistry registers a source without an orchestrator configured")
+    void registersWithoutOrchestrator() {
+        // No orchestrator: the source is recorded even though nothing will crawl it
         com.eonmux.excalibur.ingest.source.Source mockSource = createMockSource("stub-source");
         assertDoesNotThrow(() -> registry.register(mockSource));
 
@@ -537,6 +539,100 @@ class IngestEndpointTest {
     }
 
     @Nested
+    @DisplayName("Declared encoding")
+    class DeclaredEncoding {
+
+        @Test
+        @DisplayName("a filesystem walk reads unmarked files in the encoding it declares")
+        void aDeclaredCharsetReachesTheSource(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"charset\": \"windows-1252\"}}");
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(registry.get("docs"))
+                .isInstanceOfSatisfying(com.eonmux.excalibur.ingest.source.FilesystemSource.class,
+                    source -> assertThat(source.getCharset())
+                        .isEqualTo(java.nio.charset.Charset.forName("windows-1252")));
+        }
+
+        @Test
+        @DisplayName("the catalog records the encoding under its canonical name")
+        void theCatalogRecordsTheCanonicalName(@TempDir Path root, @TempDir Path dataDir)
+                throws IOException {
+            // Recorded so a restart restores the same walk; canonical so the config view shows
+            // the encoding the node will use rather than whichever alias was sent.
+            registry.setSourceCatalog(SourceCatalog.open(dataDir));
+
+            assertThat(post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"charset\": \"latin1\"}}").status()).isEqualTo(200);
+
+            assertThat(SourceCatalog.open(dataDir).all())
+                .singleElement()
+                .satisfies(descriptor -> assertThat(descriptor.get(SourceFactory.CHARSET))
+                    .isEqualTo("ISO-8859-1"));
+        }
+
+        @Test
+        @DisplayName("an encoding this node does not support is refused with a 400 naming the field")
+        void anUnknownCharsetIsRefused(@TempDir Path root) throws IOException {
+            // Falling back to UTF-8 would register fine and then index a replacement character
+            // in place of every accented letter the declared encoding would have decoded.
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"charset\": \"klingon-8\"}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("charset").contains("klingon-8");
+            assertThat(registry.isRegistered("docs")).isFalse();
+        }
+
+        @Test
+        @DisplayName("a malformed or blank encoding name is refused")
+        void aMalformedCharsetIsRefused(@TempDir Path root) throws IOException {
+            for (String name : new String[] {"utf 8!", "  "}) {
+                Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                    + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root
+                    + "\", \"charset\": \"" + name + "\"}}");
+
+                assertThat(response.status()).as(name).isEqualTo(400);
+                assertThat(response.body()).as(name).contains("charset");
+            }
+            assertThat(registry.isRegistered("docs")).isFalse();
+        }
+
+        @Test
+        @DisplayName("an HTTP crawl is refused an encoding, because every response names its own")
+        void anHttpCrawlTakesNoCharset(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://example.com/docs\", "
+                + "\"charset\": \"UTF-8\"}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("charset");
+            assertThat(registry.isRegistered("site")).isFalse();
+        }
+
+        @Test
+        @DisplayName("a catalog entry naming an unknown encoding is refused on restore too")
+        void theFactoryRechecksARestoredCharset(@TempDir Path root) {
+            // The catalog is a file on disk: a hand-edit must not build a walk that silently
+            // reads everything as UTF-8.
+            SourceFactory factory = new SourceFactory(
+                new IngestTargetValidator(ApiSecurityConfig.builder().allowIngestRoot(root).build()));
+            SourceDescriptor descriptor = new SourceDescriptor(SourceFactory.TYPE_FILESYSTEM,
+                "docs", Map.of(SourceFactory.ROOT_PATH, root.toString(),
+                    SourceFactory.CHARSET, "klingon-8"));
+
+            assertThatThrownBy(() -> factory.create(descriptor))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("config.charset");
+        }
+    }
+
+    @Nested
     @DisplayName("Crawling over supplied documents")
     class SuppliedDocuments {
 
@@ -749,11 +845,6 @@ class IngestEndpointTest {
             @Override
             public java.util.stream.Stream<String> crawl() {
                 return java.util.stream.Stream.empty();
-            }
-
-            @Override
-            public boolean hasChanged(java.time.Instant since) {
-                return false;
             }
 
             @Override

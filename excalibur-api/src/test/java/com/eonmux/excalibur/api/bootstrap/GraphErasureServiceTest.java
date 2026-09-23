@@ -149,7 +149,7 @@ class GraphErasureServiceTest {
                 new GraphErasureCoordinator(ErasureLog.open(root.resolve("erasure.log")),
                     CompactionPolicy.standard(0.2, Duration.ZERO, Integer.MAX_VALUE),
                     Clock.systemUTC()),
-                holder, config);
+                holder, config, GraphModelClients.forConfig(config));
             service.submit(new ErasureScope.Entity(ADA));
 
             GraphErasureService.ErasureOutcome outcome = service.compactNow();
@@ -158,6 +158,96 @@ class GraphErasureServiceTest {
             assertThat(outcome.edgesRemoved()).isEqualTo(1);
             assertThat(graph).isDirectory();
             assertThat(GraphBuilder.previousFor(graph)).doesNotExist();
+        }
+    }
+
+    @Nested
+    @DisplayName("After an erasure was interrupted")
+    class InterruptedErasure {
+
+        /** A service over a built graph that is not being served, as a tenant opens one. */
+        private GraphErasureService withheldServiceOver(Path graph, Duration maxLatency)
+                throws IOException {
+            buildGraph(graph);
+            Config config = new Config(Map.of());
+            holder = new GraphRagHolder(graph, null);
+            return new GraphErasureService(
+                new GraphErasureCoordinator(
+                    ErasureLog.open(graph.resolveSibling("erasure.log")),
+                    CompactionPolicy.standard(0.2, maxLatency, Integer.MAX_VALUE),
+                    Clock.systemUTC()),
+                holder, config, GraphModelClients.forConfig(config), markerBeside(graph));
+        }
+
+        private Path markerBeside(Path graph) {
+            return graph.resolveSibling("withheld");
+        }
+
+        @Test
+        @DisplayName("what is outstanding is applied, and only then is the graph served")
+        void appliesThenServes(@TempDir Path root) throws IOException {
+            GraphErasureService service = withheldServiceOver(root.resolve("graph"),
+                Duration.ofSeconds(3600));
+            service.submit(new ErasureScope.Entity(ADA));
+
+            GraphErasureService.ErasureOutcome outcome = service.finishInterruptedErasure();
+
+            assertThat(outcome.edgesRemoved())
+                .as("applied although the policy would not yet call it due")
+                .isEqualTo(1);
+            assertThat(outcome.ran()).isTrue();
+            assertThat(service.servingWithheld()).isFalse();
+            assertThat(holder.isPresent())
+                .as("the graph is served once the erasure is through")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("a graph the erasure could not be applied to stays unserved until it can be")
+        void staysWithheldUntilApplied(@TempDir Path root) throws IOException {
+            Path graph = root.resolve("graph");
+            GraphErasureService service = withheldServiceOver(graph, Duration.ofSeconds(3600));
+            service.submit(new ErasureScope.Entity(ADA));
+            Path descriptor = graph.resolve(
+                com.eonmux.excalibur.graph.format.EdgeStoreDescriptor.FILE_NAME);
+            Path aside = root.resolve("descriptor.aside");
+            java.nio.file.Files.move(descriptor, aside);
+
+            org.assertj.core.api.Assertions.assertThatThrownBy(service::finishInterruptedErasure)
+                .isInstanceOf(IOException.class);
+
+            assertThat(holder.isPresent())
+                .as("a graph that may still hold what was erased is not served")
+                .isFalse();
+            assertThat(service.servingWithheld()).isTrue();
+            assertThat(service.outstandingCount()).isEqualTo(1);
+            assertThat(markerBeside(graph))
+                .as("written down, so an eviction or a restart does not forget it")
+                .exists();
+
+            java.nio.file.Files.move(aside, descriptor);
+            GraphErasureService.ErasureOutcome retried = service.compactIfDue();
+
+            assertThat(retried.edgesRemoved())
+                .as("the scheduled attempt applies it without waiting for the policy")
+                .isEqualTo(1);
+            assertThat(holder.isPresent()).isTrue();
+            assertThat(service.servingWithheld()).isFalse();
+            assertThat(markerBeside(graph)).doesNotExist();
+        }
+
+        @Test
+        @DisplayName("an ordinary compaction of an unserved graph leaves it unserved")
+        void anOrdinaryCompactionDoesNotStartServing(@TempDir Path root) throws IOException {
+            GraphErasureService service = withheldServiceOver(root.resolve("graph"),
+                Duration.ZERO);
+            service.submit(new ErasureScope.Entity(ADA));
+
+            service.compactNow();
+
+            assertThat(holder.isPresent())
+                .as("only a graph withheld for an erasure is put back afterwards")
+                .isFalse();
         }
     }
 
@@ -175,7 +265,7 @@ class GraphErasureServiceTest {
             new GraphErasureCoordinator(log,
                 CompactionPolicy.standard(0.2, maxLatency, Integer.MAX_VALUE),
                 Clock.systemUTC()),
-            holder, config);
+            holder, config, GraphModelClients.forConfig(config));
     }
 
     /** Writes a complete, minimal graph store into {@code directory}. */

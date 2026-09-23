@@ -425,6 +425,70 @@ class GraphQueryEndpointTest {
     }
 
     @Test
+    @DisplayName("a context entity may carry its shape and turn, and still binds a pronoun")
+    void anEntityObjectBinds() throws IOException {
+        var node = parse(call("POST", "{\"query\": \"Who did she collaborate with?\","
+            + " \"context_entities\": [{\"name\": \"Ada Lovelace\","
+            + " \"grammar\": \"singular_person\", \"turn\": 2}]}"));
+
+        assertThat(node.get("status").asText()).isEqualTo("answered");
+        assertThat(node.get("context").asText()).contains("Charles Babbage");
+    }
+
+    @Test
+    @DisplayName("a context entity with a bad name, shape or turn is a 400 naming the entry")
+    void badEntityObjectsAreRefused() throws IOException {
+        // Refused rather than read as absent: a shape or turn the node ignored would bind the
+        // pronoun the caller sent it to rule out, and nothing in the answer would say so.
+        String[] bad = {
+            "{\"grammar\": \"singular_person\"}",
+            "{\"name\": \"\"}",
+            "{\"name\": 5}",
+            "{\"name\": \"" + "a".repeat(300) + "\"}",
+            "{\"name\": \"Ada Lovelace\", \"grammar\": \"person\"}",
+            "{\"name\": \"Ada Lovelace\", \"grammar\": 1}",
+            "{\"name\": \"Ada Lovelace\", \"turn\": -1}",
+            "{\"name\": \"Ada Lovelace\", \"turn\": 1.5}",
+            "{\"name\": \"Ada Lovelace\", \"turn\": \"2\"}",
+            "{\"name\": \"Ada Lovelace\", \"turn\": 2147483647}",
+            "{\"name\": \"Ada Lovelace\", \"turn\": 99999999999}",
+        };
+        for (String entry : bad) {
+            Response response = call("POST", "{\"query\": \"Who did she collaborate with?\","
+                + " \"context_entities\": [{\"name\": \"Charles Babbage\"}, " + entry + "]}");
+
+            assertThat(response.status()).as("entry: %s", entry).isEqualTo(400);
+            assertThat(parse(response).get("error").asText())
+                .as("entry: %s", entry)
+                .contains("context_entities");
+        }
+    }
+
+    @Test
+    @DisplayName("names and objects are not mixed in one context")
+    void mixedFormsAreRefused() throws IOException {
+        Response response = call("POST", "{\"query\": \"Who did she collaborate with?\","
+            + " \"context_entities\": [\"Ada Lovelace\", {\"name\": \"Charles Babbage\"}]}");
+
+        assertThat(response.status()).isEqualTo(400);
+        assertThat(parse(response).get("error").asText()).contains("context_entities");
+    }
+
+    @Test
+    @DisplayName("the entry bound applies to objects as it does to names")
+    void tooManyEntityObjects() throws IOException {
+        String entities = java.util.stream.IntStream.range(0, 129)
+            .mapToObj(i -> "{\"name\": \"E" + i + "\", \"turn\": " + i + "}")
+            .collect(java.util.stream.Collectors.joining(","));
+        Response response = call("POST",
+            "{\"query\": \"Who did Ada Lovelace collaborate with?\", \"context_entities\": ["
+                + entities + "]}");
+
+        assertThat(response.status()).isEqualTo(400);
+        assertThat(response.body()).contains("128");
+    }
+
+    @Test
     @DisplayName("a non-POST method is a 405")
     void wrongMethod() throws IOException {
         assertThat(call("GET", "").status()).isEqualTo(405);
@@ -441,6 +505,33 @@ class GraphQueryEndpointTest {
             assertThat(response.status()).as("direction: %s", bad).isEqualTo(400);
             assertThat(parse(response).get("error").asText()).contains("direction");
         }
+    }
+
+    @Test
+    @DisplayName("a one-way walk this pipeline cannot take is a 422 naming why, not a 500")
+    void anUnsupportedDirectionIsUnprocessable() throws IOException {
+        // The endpoint under test is built the way an embedded pipeline without a relation
+        // vocabulary is: it can walk both ways and nothing narrower. The request is well formed
+        // and would be answered by a node that has the vocabulary, so it is neither a malformed
+        // request nor a fault of this one - it is a request this node cannot carry out.
+        for (String direction : new String[] {"forward", "reverse"}) {
+            Response response = call("POST",
+                "{\"query\": \"Who did Ada Lovelace collaborate with?\", \"direction\": \""
+                    + direction + "\"}");
+
+            assertThat(response.status()).as("direction: %s", direction).isEqualTo(422);
+            String error = parse(response).get("error").asText();
+            assertThat(error).contains(direction).contains("both");
+            assertThat(response.body())
+                .as("nothing of the server's internals reaches the caller")
+                .doesNotContain("Exception")
+                .doesNotContain("at com.");
+        }
+
+        assertThat(call("POST", "{\"query\": \"Who did Ada Lovelace collaborate with?\", "
+            + "\"direction\": \"both\"}").status())
+            .as("the walk it can take is still answered")
+            .isEqualTo(200);
     }
 
     /**
@@ -609,6 +700,87 @@ class GraphQueryEndpointTest {
 
             assertThat(node.get("aggregate").get("valid_from").isNull()).isTrue();
             assertThat(node.get("aggregate").get("count").asInt()).isZero();
+        }
+
+        @Test
+        @DisplayName("a pronoun binds only a mention of its shape")
+        void shapeRulesOutABinding() throws IOException {
+            String entities = "[{\"name\": \"Analytical Engine\", \"grammar\": \"singular_thing\"},"
+                + " {\"name\": \"Ada Lovelace\", \"grammar\": \"SINGULAR_PERSON\"}]";
+
+            var she = ask("{\"query\": \"What did she write?\", \"context_entities\": "
+                + entities + "}");
+            assertThat(she.get("status").asText())
+                .as("\"she\" cannot mean the engine, so only Ada Lovelace is left")
+                .isEqualTo("answered");
+            assertThat(she.get("context").asText()).contains("Note G");
+
+            var it = ask("{\"query\": \"Who designed it?\", \"context_entities\": "
+                + entities + "}");
+            assertThat(it.get("status").asText())
+                .as("\"it\" cannot mean a person, so only the engine is left")
+                .isEqualTo("answered");
+            assertThat(it.get("context").asText()).contains("Charles Babbage").contains("designed");
+        }
+
+        @Test
+        @DisplayName("names without a shape stay ambiguous, as they always were")
+        void plainNamesKeepTheirMeaning() throws IOException {
+            var node = ask("{\"query\": \"What did she write?\", \"context_entities\": "
+                + "[\"Analytical Engine\", \"Ada Lovelace\"]}");
+
+            assertThat(node.get("status").asText()).isEqualTo("needs_input");
+            assertThat(node.get("reason").asText()).isEqualTo("ambiguous_pronoun");
+            assertThat(node.get("candidates"))
+                .extracting(com.fasterxml.jackson.databind.JsonNode::asText)
+                .containsExactlyInAnyOrder("Analytical Engine", "Ada Lovelace");
+        }
+
+        @Test
+        @DisplayName("the most recent turn wins between two mentions of the same shape")
+        void theLatestTurnWins() throws IOException {
+            // Forward only, so the two bindings answer differently: Ada Lovelace's own facts
+            // include Note G, and nothing Charles Babbage asserts leads there.
+            String question = "\"query\": \"What did she write?\", \"direction\": \"forward\"";
+
+            var ada = ask("{" + question + ", \"context_entities\": ["
+                + "{\"name\": \"Charles Babbage\", \"turn\": 0},"
+                + "{\"name\": \"Ada Lovelace\", \"turn\": 1}]}");
+            assertThat(ada.get("status").asText()).isEqualTo("answered");
+            assertThat(ada.get("context").asText()).contains("Note G");
+
+            var babbage = ask("{" + question + ", \"context_entities\": ["
+                + "{\"name\": \"Ada Lovelace\", \"turn\": 3},"
+                + "{\"name\": \"Charles Babbage\", \"turn\": 4}]}");
+            assertThat(babbage.get("status").asText())
+                .as("bound, not asked about: the turns settled it")
+                .isNotEqualTo("needs_input");
+            assertThat(babbage.path("context").asText()).doesNotContain("Note G");
+        }
+
+        @Test
+        @DisplayName("an entry without a turn belongs to the latest turn given")
+        void anUnnumberedEntryIsTheLatestTurn() throws IOException {
+            var node = ask("{\"query\": \"What did she write?\", \"context_entities\": ["
+                + "{\"name\": \"Charles Babbage\", \"turn\": 5},"
+                + "{\"name\": \"Ada Lovelace\"}]}");
+
+            assertThat(node.get("status").asText()).isEqualTo("needs_input");
+            assertThat(node.get("reason").asText())
+                .as("both in turn 5, and nothing within one turn says which was meant")
+                .isEqualTo("ambiguous_pronoun");
+        }
+
+        @Test
+        @DisplayName("a mention older than the window is not bound to")
+        void theWindowForgets() throws IOException {
+            // The question is turn 4; a three-turn window reaches back to turn 2.
+            var node = ask("{\"query\": \"What did she write?\", \"context_entities\": ["
+                + "{\"name\": \"Ada Lovelace\", \"grammar\": \"singular_person\", \"turn\": 0},"
+                + "{\"name\": \"London\", \"grammar\": \"singular_thing\", \"turn\": 3}]}");
+
+            assertThat(node.get("status").asText()).isEqualTo("needs_input");
+            assertThat(node.get("reason").asText()).isEqualTo("unbound_pronoun");
         }
 
         @Test

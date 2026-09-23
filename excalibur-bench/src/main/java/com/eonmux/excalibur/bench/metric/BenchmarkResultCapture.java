@@ -380,17 +380,16 @@ public final class BenchmarkResultCapture {
         String units = extractJsonString(metricJson, jmh ? "scoreUnit" : "unit");
         if (units == null) units = "ops/sec";
 
-        // Extract parameters
+        // JMH names the @Param values "params"; this tool's reports name them "parameters".
+        // Reading only the first dropped every report's parameters on reload, so each
+        // combination of a benchmark looked like the same measurement to a comparison.
         Map<String, String> params = new HashMap<>();
-        int paramsStart = json.indexOf("\"params\"");
-        if (paramsStart > 0) {
-            int paramsObjStart = json.indexOf("{", paramsStart);
-            int paramsObjEnd = findMatchingBrace(json, paramsObjStart);
-            if (paramsObjEnd > 0) {
-                String paramsJson = json.substring(paramsObjStart, paramsObjEnd + 1);
-                // Extract key-value pairs
-                extractParamsFromJson(paramsJson, params);
-            }
+        String paramsJson = objectFieldOf(json, "params");
+        if (paramsJson == null) {
+            paramsJson = objectFieldOf(json, "parameters");
+        }
+        if (paramsJson != null) {
+            extractParamsFromJson(paramsJson, params);
         }
 
         // Determine if higher is better from the measured unit (never from the target).

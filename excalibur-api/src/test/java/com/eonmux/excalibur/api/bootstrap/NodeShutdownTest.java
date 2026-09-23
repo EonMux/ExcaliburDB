@@ -60,6 +60,8 @@ class NodeShutdownTest {
         storageEngine = mock(StorageEngine.class);
         when(tracker.getRegistry()).thenReturn(registry);
         when(storageEngine.getCatalog()).thenReturn(new SegmentCatalog());
+        when(sweep.drain()).thenReturn(true);
+        when(chunkIndex.compactionReadsStorage()).thenReturn(true);
         arena = Arena.ofShared();
     }
 
@@ -97,10 +99,14 @@ class NodeShutdownTest {
         order.verify(server).stop(30);
         order.verify(indexOrchestrator).close();
         // The sweep before the index it compacts: a sweep in flight is inside a compaction of it.
-        order.verify(sweep).close();
-        // The index after ingestion has stopped and before storage closes: closing it publishes
-        // what was still buffered, and storage is where those chunks were written first.
+        order.verify(sweep).drain();
+        // The index after ingestion has stopped and before storage closes: its buffer is
+        // published first, and storage is where those chunks were written first.
+        order.verify(chunkIndex).publishBuffered();
         order.verify(chunkIndex).close();
+        // Staged facts before the registry: the registry is what stops their documents being
+        // extracted again, and it is forced to the device as it is written.
+        order.verify(tenants).syncStaging();
         order.verify(registry).persist();
         order.verify(tenants).close();
         order.verify(storageEngine).close();
@@ -111,7 +117,8 @@ class NodeShutdownTest {
     void skipsAbsentComponents() throws IOException {
         shutdown(null, null).run();
 
-        verify(sweep, never()).close();
+        verify(sweep, never()).drain();
+        verify(chunkIndex, never()).publishBuffered();
         verify(chunkIndex, never()).close();
         verify(registry).persist();
         verify(storageEngine).close();
@@ -130,6 +137,125 @@ class NodeShutdownTest {
         assertThatThrownBy(() -> arena.allocate(8, 8))
             .as("the arena must be closed even when earlier steps failed")
             .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    @DisplayName("storage stays open while a compaction the drain could not stop still reads it")
+    void leavesStorageOpenUnderARunningCompaction() throws IOException {
+        when(server.isStorageStillInUse()).thenReturn(true);
+
+        shutdown(sweep, chunkIndex).run();
+
+        verify(storageEngine, never()).close();
+        // Everything that does not pull storage out from under the run still happens.
+        verify(registry).persist();
+        verify(tenants).close();
+        org.assertj.core.api.Assertions.assertThat(arena.allocate(8, 8))
+            .as("the arena the run is reading through is still open")
+            .isNotNull();
+    }
+
+    @Test
+    @DisplayName("the graph tenants stay open while a build the drain could not stop writes them")
+    void leavesTheGraphTenantsOpenUnderARunningBuild() throws IOException {
+        when(server.isGraphsStillInUse()).thenReturn(true);
+
+        shutdown(sweep, chunkIndex).run();
+
+        verify(tenants, never()).close();
+        // A build writes graph files, not storage: the rest of the teardown still happens.
+        verify(registry).persist();
+        verify(storageEngine).close();
+    }
+
+    @Test
+    @DisplayName("staged graph facts reach disk even when the tenants must stay open")
+    void forcesStagingUnderARunningBuild() throws IOException {
+        // Closing the tenants is what would otherwise write out staging's buffers, and it is
+        // refused here. The registry already records the documents those facts came from, so a
+        // process exiting with them still buffered loses them for good.
+        when(server.isGraphsStillInUse()).thenReturn(true);
+
+        shutdown(sweep, chunkIndex).run();
+
+        verify(tenants).syncStaging();
+        verify(tenants, never()).close();
+    }
+
+    @Test
+    @DisplayName("staging that cannot be forced fails its own step and stops no other")
+    void aFailedStagingSyncIsAFailedStep() throws IOException {
+        when(tenants.syncStaging()).thenReturn(1);
+
+        shutdown(sweep, chunkIndex).run();
+
+        verify(registry).persist();
+        verify(tenants).close();
+        verify(storageEngine).close();
+    }
+
+    @Test
+    @DisplayName("the chunk index's buffer is published even when its files must stay open")
+    void publishesTheBufferUnderARunningCompaction() throws IOException {
+        // Chunks reach storage before the index, and nothing reindexes one the index was never
+        // told about: refusing to publish along with refusing to close would lose them.
+        when(server.isChunkIndexStillInUse()).thenReturn(true);
+
+        shutdown(sweep, chunkIndex).run();
+
+        verify(chunkIndex).publishBuffered();
+        verify(chunkIndex, never()).close();
+        verify(storageEngine).close();
+    }
+
+    @Test
+    @DisplayName("a sweep still compacting an index that reads storage keeps storage and the "
+        + "index open")
+    void aSweepThatDidNotDrainKeepsStorageOpen() throws IOException {
+        when(sweep.drain()).thenReturn(false);
+
+        shutdown(sweep, chunkIndex).run();
+
+        verify(chunkIndex).publishBuffered();
+        verify(chunkIndex, never()).close();
+        verify(storageEngine, never()).close();
+        org.assertj.core.api.Assertions.assertThat(arena.allocate(8, 8)).isNotNull();
+    }
+
+    @Test
+    @DisplayName("a sweep still force-merging an index that keeps its own text leaves storage "
+        + "free to close")
+    void aSweepThatReadsNoStorageDoesNotHoldStorage() throws IOException {
+        when(sweep.drain()).thenReturn(false);
+        when(chunkIndex.compactionReadsStorage()).thenReturn(false);
+
+        shutdown(sweep, chunkIndex).run();
+
+        verify(chunkIndex, never()).close();
+        verify(storageEngine).close();
+    }
+
+    @Test
+    @DisplayName("a sweep whose drain threw is taken to be still running")
+    void aSweepThatThrewIsStillRunning() throws IOException {
+        when(sweep.drain()).thenThrow(new IllegalStateException("scheduler refused"));
+
+        shutdown(sweep, chunkIndex).run();
+
+        verify(chunkIndex).publishBuffered();
+        verify(chunkIndex, never()).close();
+        verify(storageEngine, never()).close();
+    }
+
+    @Test
+    @DisplayName("a buffer that cannot be published does not keep the index or storage open")
+    void aFailedPublishStillReleases() throws IOException {
+        doThrow(new IOException("disk full")).when(chunkIndex).publishBuffered();
+
+        shutdown(sweep, chunkIndex).run();
+
+        verify(chunkIndex).close();
+        verify(storageEngine).close();
     }
 
     @Test

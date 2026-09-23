@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.bootstrap;
 import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.graph.build.BuildCancellation;
 import com.eonmux.excalibur.graph.erasure.CompactionPolicy;
+import com.eonmux.excalibur.graph.erasure.EdgeStoreCompactor;
 import com.eonmux.excalibur.graph.erasure.ErasureLog;
 import com.eonmux.excalibur.graph.erasure.GraphErasureCoordinator;
 import com.eonmux.excalibur.graph.erasure.ServedArtifactEraser;
@@ -63,6 +64,13 @@ public final class GraphTenant implements AutoCloseable {
     public static final String ERASURE_LOG = "erasure.log";
 
     /**
+     * File within the staging directory whose presence says the graph is withheld until an
+     * interrupted erasure has been applied to it; see
+     * {@link GraphErasureService#finishInterruptedErasure()}.
+     */
+    public static final String ERASURE_INTERRUPTED_MARKER = "erasure.interrupted";
+
+    /**
      * Subdirectory of a namespace's directory holding the graph it serves.
      *
      * <p>Named here rather than at the one call site that resolves it, because it is half of an
@@ -103,15 +111,18 @@ public final class GraphTenant implements AutoCloseable {
      * @param id        The namespace
      * @param directory Where its graph is served from
      * @param config    Configuration, for the read side and the erasure policy
+     * @param models    The node's model clients, which every stack this tenant opens - now,
+     *                  after a build and after a compaction - reranks and embeds through
      * @return The tenant
      * @throws IOException if the staging store, the erasure log or an existing graph cannot be
      *                     opened
      */
-    public static GraphTenant open(NamespaceId id, Path directory, Config config)
-            throws IOException {
+    public static GraphTenant open(NamespaceId id, Path directory, Config config,
+                                   GraphModelClients models) throws IOException {
         Objects.requireNonNull(id, "id must not be null");
         Objects.requireNonNull(directory, "directory must not be null");
         Objects.requireNonNull(config, "config must not be null");
+        Objects.requireNonNull(models, "models must not be null");
 
         Path stagingDirectory = stagingDirectoryOf(directory);
 
@@ -123,20 +134,23 @@ public final class GraphTenant implements AutoCloseable {
             ErasureLog erasureLog = ErasureLog.open(stagingDirectory.resolve(ERASURE_LOG));
             opened.push(erasureLog);
 
-            // openAt restores a graph an interrupted publish displaced before it looks, and
-            // answers null when there is still none.
-            GraphRagHolder holder =
-                new GraphRagHolder(directory, GraphRagFactory.openAt(config, directory));
+            // A graph an erasure was part-way through replacing is not served until the
+            // erasure has been applied to it; see erasureInterrupted. Otherwise openAt opens
+            // what is there, and answers null when there is no graph.
+            Path withheldMarker = stagingDirectory.resolve(ERASURE_INTERRUPTED_MARKER);
+            boolean withhold = erasureInterrupted(directory, withheldMarker, erasureLog);
+            GraphRagHolder holder = new GraphRagHolder(
+                directory, withhold ? null : GraphRagFactory.openAt(config, directory, models));
             opened.push(holder);
 
             // One embedder for the tenant rather than one per collaborator: the two that need
             // it are the build and the erasure rebuild, and they are producing the same vectors
-            // from the same endpoint.
-            GraphDirectoryBuilder.EntityEmbedder embedder = entityEmbedder(config);
+            // from the same endpoint - through the node's client, not one of the tenant's own.
+            GraphDirectoryBuilder.EntityEmbedder embedder = entityEmbedder(config, models);
             int dimension = embeddingDimension(config);
 
             GraphBuildService buildService = new GraphBuildService(
-                staging, holder, config, config.graph().getSingleValuedRelations(),
+                staging, holder, config, models, config.graph().getSingleValuedRelations(),
                 embedder, dimension);
 
             GraphErasureService erasureService = new GraphErasureService(
@@ -152,10 +166,16 @@ public final class GraphTenant implements AutoCloseable {
                     // exactly what the erasure removed.
                     staging,
                     servedArtifactErasers(config, staging, embedder, dimension)),
-                holder, config);
+                holder, config, models, withheldMarker);
+
+            if (withhold) {
+                finishInterruptedErasure(id, erasureService);
+            }
 
             LOGGER.info("graph tenant {} opened at {} ({} facts staged, graph {})",
-                id, directory, staging.stagedCount(), holder.isPresent() ? "present" : "not built");
+                id, directory, staging.stagedCount(), holder.isPresent() ? "present"
+                    : erasureService.servingWithheld() ? "withheld until an interrupted erasure "
+                    + "is applied" : "not built");
             return new GraphTenant(id, directory, staging, erasureLog, holder, buildService,
                 erasureService);
         } catch (IOException | RuntimeException e) {
@@ -169,6 +189,70 @@ public final class GraphTenant implements AutoCloseable {
                 }
             }
             throw e;
+        }
+    }
+
+    /**
+     * Whether the graph on disk may be one an erasure compaction died part-way through replacing.
+     *
+     * <h3>Why it matters before anything is served</h3>
+     * <p>A compaction erases staging, assembles the rewritten graph beside the served one and
+     * publishes it by the renames a build uses, and it marks its obligations discharged only
+     * after the publish. A process that dies before then leaves them outstanding and the graph
+     * on disk still holding what they erase - with staging, the other copy, possibly clean
+     * already. Three things on disk say so: crash recovery restoring a graph a publish had set
+     * aside; the compaction's scratch directory, which a compaction that finishes or fails
+     * never leaves behind; and the marker an earlier attempt to finish such an erasure left
+     * because it did not succeed. A restored graph may equally be one a build was replacing, and
+     * applying what is outstanding to it then is merely early; the other way round would serve
+     * an erased person's facts for as long as the policy took to call the obligation due.</p>
+     *
+     * <p>Recovery runs here, so the {@link GraphRagFactory#openAt} that follows finds nothing
+     * left to recover.</p>
+     *
+     * <p>A marker with nothing left to guard - no graph, or nothing outstanding - is removed.</p>
+     *
+     * @param directory      Where the graph is served from
+     * @param withheldMarker The marker a failed attempt to finish an erasure leaves
+     * @param erasureLog     The obligations this namespace owes
+     * @return true when a graph is on disk, an obligation is outstanding, and one of those signs
+     *         is present
+     * @throws IOException if recovery cannot restore or remove a displaced graph, or a stale
+     *                     marker cannot be removed
+     */
+    private static boolean erasureInterrupted(Path directory, Path withheldMarker,
+                                              ErasureLog erasureLog) throws IOException {
+        boolean restored = GraphBuilder.recoverInterruptedPublish(directory);
+        boolean scratchLeft = Files.isDirectory(EdgeStoreCompactor.scratchFor(directory));
+        boolean marked = Files.exists(withheldMarker);
+        boolean owed = Files.isDirectory(directory) && erasureLog.outstandingCount() > 0;
+        if (marked && !owed) {
+            Files.delete(withheldMarker);
+        }
+        return (restored || scratchLeft || marked) && owed;
+    }
+
+    /**
+     * Applies what a tenant owes to a graph an erasure was interrupted on, before serving it.
+     *
+     * <p>A failure does not fail the open. The tenant still has to accept obligations and stage
+     * facts, and its graph stays unserved - which the erasure service remembers, so the next
+     * compaction, the scheduled sweep's included, applies it and serves the graph.</p>
+     *
+     * @param id      The namespace, for the log lines
+     * @param erasure The tenant's erasure service
+     */
+    private static void finishInterruptedErasure(NamespaceId id, GraphErasureService erasure) {
+        LOGGER.warn("graph tenant {} found an erasure interrupted part-way through; applying {} "
+            + "outstanding obligation(s) before its graph is served", id,
+            erasure.outstandingCount());
+        try {
+            GraphErasureService.ErasureOutcome outcome = erasure.finishInterruptedErasure();
+            LOGGER.info("graph tenant {} finished the interrupted erasure: {}", id,
+                outcome.reason());
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("graph tenant {} could not apply its outstanding erasure(s), so its "
+                + "graph is not served until a later compaction does: {}", id, e.toString());
         }
     }
 
@@ -210,7 +294,7 @@ public final class GraphTenant implements AutoCloseable {
     public static boolean hasBuiltGraph(Path graphDirectory) {
         Objects.requireNonNull(graphDirectory, "graphDirectory must not be null");
         return Files.isDirectory(graphDirectory)
-            || Files.isDirectory(GraphBuilder.previousFor(graphDirectory));
+            || GraphBuilder.hasDisplacedGraph(graphDirectory);
     }
 
     /**
@@ -279,17 +363,21 @@ public final class GraphTenant implements AutoCloseable {
      * builds a graph ranked by term overlap alone, which is a weaker answer rather than a broken
      * one.</p>
      *
-     * @param config Configuration, for the LLM settings
+     * <p>Embedded through the node's build embedding client in {@link GraphModelClients}, not a
+     * client of this tenant's: the endpoint is the node's, so its breaker has to be too - one
+     * a provider outage trips once for every namespace, that a reopen does not reset, and that
+     * the node reports.</p>
+     *
+     * @param config Configuration, for whether entity vectors are wanted at all
+     * @param models The node's model clients
      * @return The embedder, or null when this node has no endpoint or was told not to
      */
-    private static GraphDirectoryBuilder.EntityEmbedder entityEmbedder(Config config) {
-        String apiKey = config.llm().getApiKey();
-        if (!config.graph().isEntityVectorsEnabled() || apiKey == null || apiKey.isBlank()) {
+    private static GraphDirectoryBuilder.EntityEmbedder entityEmbedder(Config config,
+                                                                      GraphModelClients models) {
+        if (!config.graph().isEntityVectorsEnabled()) {
             return null;
         }
-        com.eonmux.excalibur.llm.embedding.EmbeddingClient client = new com.eonmux.excalibur.llm.embedding.EmbeddingClient(
-            com.eonmux.excalibur.llm.client.LLMClientConfig.fromConfig(config.llm()));
-        return client::embedBatch;
+        return models.entityEmbedder();
     }
 
     /**

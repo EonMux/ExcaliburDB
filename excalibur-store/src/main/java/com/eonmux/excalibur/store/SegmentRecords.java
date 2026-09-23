@@ -4,6 +4,9 @@ import com.eonmux.excalibur.store.format.EntryChecksum;
 import com.eonmux.excalibur.store.hash.XxHash64;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.nio.ByteOrder;
 
 /**
  * The data region of one {@link Segment}: the variable-length entry records themselves, and
@@ -41,6 +44,14 @@ import java.lang.foreign.MemorySegment;
  * write lock, as it does for {@link SegmentSlots}.</p>
  */
 final class SegmentRecords {
+
+    /**
+     * Reads eight key bytes as one little-endian word, the order the mapping is read in, so
+     * that a key compares a word at a time against the record without being wrapped in a
+     * segment of its own.
+     */
+    private static final VarHandle KEY_WORD =
+        MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
 
     /** The segment whose records these are. */
     private final Segment owner;
@@ -160,30 +171,56 @@ final class SegmentRecords {
      * damage into absence - exactly the confusion the checksum exists to prevent. So a
      * failed comparison verifies the record before it answers.</p>
      *
-     * @param slotIndex The slot to compare against
-     * @param key       The key being looked up
+     * @param mem              The mapping the record lives in, live or snapshot
+     * @param slotIndex        The slot to compare against
+     * @param dataRegionOffset The record offset the slot names, as the probe read it
+     * @param key              The key being looked up
      * @return true if the record holds this key
      * @throws CorruptSegmentEntryException if the record does not hold this key and does not
      *                                      match its checksum either
      */
-    boolean keyMatches(int slotIndex, byte[] key) {
-        long dataRegionOffset = owner.slots.readDataOffset(slotIndex);
+    boolean keyMatches(MemorySegment mem, int slotIndex, long dataRegionOffset, byte[] key) {
         long entryOffset = owner.slotTableSize + dataRegionOffset;
 
-        // Read key length
-        int keyLen = owner.segment.get(Segment.INT_LAYOUT, entryOffset + Segment.ENTRY_KEY_LEN_OFFSET);
+        int keyLen = mem.get(Segment.INT_LAYOUT, entryOffset + Segment.ENTRY_KEY_LEN_OFFSET);
         if (keyLen != key.length) {
-            return notThisKey(owner.segment, entryOffset, slotIndex);
+            return notThisKey(mem, entryOffset, slotIndex);
         }
 
-        // Compare key bytes
-        for (int i = 0; i < keyLen; i++) {
-            byte entryByte = owner.segment.get(Segment.BYTE_LAYOUT, entryOffset + keyBytesOffset() + i);
-            if (entryByte != key[i]) {
-                return notThisKey(owner.segment, entryOffset, slotIndex);
+        // The comparison reads the whole key range, so a record whose key would run off the
+        // mapping is handed to verification first, which reports it as damage instead of
+        // letting it surface as an out-of-bounds read.
+        long keyStart = entryOffset + keyBytesOffset();
+        if (keyStart + keyLen > mem.byteSize() || !keyBytesEqual(mem, keyStart, key)) {
+            return notThisKey(mem, entryOffset, slotIndex);
+        }
+        return true;
+    }
+
+    /**
+     * Compares a key against the bytes at an offset in a mapping, a word at a time.
+     *
+     * <p>Words rather than {@link MemorySegment#mismatch}, which needs the key wrapped in a
+     * heap segment: that wrapper escapes into the comparison and costs an allocation on every
+     * hit, on the hottest path in the engine.</p>
+     *
+     * @param mem The mapping, whose range {@code [at, at + key.length)} the caller has checked
+     * @param at  Absolute offset of the stored key bytes
+     * @param key The key being looked up
+     * @return true if every byte matches
+     */
+    private static boolean keyBytesEqual(MemorySegment mem, long at, byte[] key) {
+        int i = 0;
+        for (; i + Long.BYTES <= key.length; i += Long.BYTES) {
+            if (mem.get(Segment.LONG_LAYOUT, at + i) != (long) KEY_WORD.get(key, i)) {
+                return false;
             }
         }
-
+        for (; i < key.length; i++) {
+            if (mem.get(Segment.BYTE_LAYOUT, at + i) != key[i]) {
+                return false;
+            }
+        }
         return true;
     }
 

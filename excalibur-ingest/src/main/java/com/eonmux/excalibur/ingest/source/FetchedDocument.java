@@ -18,6 +18,8 @@ import java.util.Objects;
  *   <li>Content-Type: MIME type string (e.g., "text/plain", "text/html", "application/pdf")</li>
  *   <li>Document ID: unique identifier within the source (non-null, non-empty)</li>
  *   <li>Timestamp: when the document was last modified (Instant.EPOCH if unknown)</li>
+ *   <li>Entity tag: the validator an HTTP server named this version by, or null where the
+ *       source has no such thing</li>
  * </ul>
  */
 public final class FetchedDocument {
@@ -27,6 +29,7 @@ public final class FetchedDocument {
     private final String contentType;
     private final Charset charset;
     private final long lastModifiedMillis;
+    private final String entityTag;
 
     /**
      * Creates a new FetchedDocument.
@@ -59,6 +62,28 @@ public final class FetchedDocument {
      */
     public FetchedDocument(String documentId, byte[] content, String contentType,
                            Charset charset, long lastModifiedMillis) {
+        this(documentId, content, contentType, charset, lastModifiedMillis, null);
+    }
+
+    /**
+     * Creates a new FetchedDocument carrying the entity tag its server named this version by.
+     *
+     * <p>The tag is what makes the next re-crawl cheap: sent back as {@code If-None-Match}, it
+     * lets the server answer {@code 304 Not Modified} instead of the body, and it is exact where
+     * {@code Last-Modified} has one-second resolution and is often absent from generated pages.
+     * It is kept verbatim, weak prefix and quotes included, because that is the form the server
+     * compares it in.</p>
+     *
+     * @param documentId        Unique identifier for this document (non-null, non-empty)
+     * @param content           Raw byte content of the document (defensively copied)
+     * @param contentType       MIME type (e.g., "text/plain", "text/html")
+     * @param charset           The encoding {@code content} is in; UTF-8 when null
+     * @param lastModifiedMillis Last modification timestamp in epoch millis (0 if unknown)
+     * @param entityTag         The server's entity tag for this version, or null for none
+     * @throws IllegalArgumentException if documentId is null or empty, or content is null
+     */
+    public FetchedDocument(String documentId, byte[] content, String contentType,
+                           Charset charset, long lastModifiedMillis, String entityTag) {
         if (documentId == null || documentId.isEmpty()) {
             throw new IllegalArgumentException("Document ID must be non-null and non-empty");
         }
@@ -70,6 +95,7 @@ public final class FetchedDocument {
         this.contentType = contentType != null ? contentType : "application/octet-stream";
         this.charset = charset != null ? charset : StandardCharsets.UTF_8;
         this.lastModifiedMillis = Math.max(0, lastModifiedMillis);
+        this.entityTag = entityTag == null || entityTag.isBlank() ? null : entityTag;
     }
 
     /**
@@ -135,12 +161,13 @@ public final class FetchedDocument {
      * Returns the content decoded with the encoding the source declared.
      *
      * <p>The one place the bytes become text, so no consumer has to assume an encoding the
-     * source already told us.</p>
+     * source already told us. A leading byte-order mark is dropped; see
+     * {@link TextEncoding#decode}.</p>
      *
      * @return The decoded text
      */
     public String getText() {
-        return new String(content, charset);
+        return TextEncoding.decode(content, charset);
     }
 
     /**
@@ -150,6 +177,24 @@ public final class FetchedDocument {
      */
     public long getLastModifiedMillis() {
         return lastModifiedMillis;
+    }
+
+    /**
+     * Returns the entity tag the source's server named this version by.
+     *
+     * @return The tag exactly as the server sent it, or null when there was none
+     */
+    public String getEntityTag() {
+        return entityTag;
+    }
+
+    /**
+     * What the source reported about this version, in the form a later re-crawl asks with.
+     *
+     * @return The last-modified time and entity tag this fetch carried
+     */
+    public DocumentValidators validators() {
+        return new DocumentValidators(lastModifiedMillis, entityTag);
     }
 
     /**
@@ -170,12 +215,14 @@ public final class FetchedDocument {
                Objects.equals(documentId, that.documentId) &&
                Objects.equals(contentType, that.contentType) &&
                Objects.equals(charset, that.charset) &&
+               Objects.equals(entityTag, that.entityTag) &&
                java.util.Arrays.equals(content, that.content);
     }
 
     @Override
     public int hashCode() {
-        int result = Objects.hash(documentId, contentType, charset, lastModifiedMillis);
+        int result = Objects.hash(documentId, contentType, charset, lastModifiedMillis,
+            entityTag);
         result = 31 * result + java.util.Arrays.hashCode(content);
         return result;
     }
@@ -188,6 +235,7 @@ public final class FetchedDocument {
                ", contentType='" + contentType + '\'' +
                ", charset=" + charset +
                ", lastModifiedMillis=" + lastModifiedMillis +
+               ", entityTag=" + entityTag +
                '}';
     }
 }

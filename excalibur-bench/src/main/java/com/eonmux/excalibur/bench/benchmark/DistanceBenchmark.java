@@ -126,6 +126,7 @@ public class DistanceBenchmark {
      * Benchmark batch cosine similarity computations.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int cosineSimilarity_batch(Blackhole bh) {
         int count = 0;
         for (int i = 0; i < 100; i++) {
@@ -167,6 +168,7 @@ public class DistanceBenchmark {
      * Benchmark batch L2 distance computations.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int l2Distance_batch(Blackhole bh) {
         int count = 0;
         for (int i = 0; i < 100; i++) {
@@ -202,6 +204,7 @@ public class DistanceBenchmark {
      * Benchmark batch inner product computations.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int innerProduct_batch(Blackhole bh) {
         int count = 0;
         for (int i = 0; i < 100; i++) {
@@ -249,6 +252,7 @@ public class DistanceBenchmark {
      * Computes distance from one query vector to 100 candidates.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int nearestNeighborSearch_cosine(Blackhole bh) {
         float[] query = vectors1[0];
         int bestIdx = -1;
@@ -271,6 +275,7 @@ public class DistanceBenchmark {
      * Benchmark distance computation for nearest neighbor search with L2.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int nearestNeighborSearch_l2(Blackhole bh) {
         float[] query = vectors1[0];
         int bestIdx = -1;
@@ -293,6 +298,7 @@ public class DistanceBenchmark {
      * Benchmark squared L2 for nearest neighbor search (avoids sqrt).
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int nearestNeighborSearch_l2Squared(Blackhole bh) {
         float[] query = vectors1[0];
         int bestIdx = -1;

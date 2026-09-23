@@ -94,9 +94,19 @@ class EntityVectorRerankTest {
         try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"))) {
             stage(staging);
             GraphDirectoryBuilder.build(staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB,
-                embedder, DIMENSION);
+                embedder, DIMENSION, EntityVectorRerankTest::openVectors);
         }
         return target;
+    }
+
+    /**
+     * Opens the vectors a build published, as the node's stack does before the publish lets the
+     * previous graph go.
+     */
+    private static Long openVectors(Path published) throws IOException {
+        try (EntityVectors vectors = EntityVectors.openIfPresent(published)) {
+            return vectors == null ? 0L : vectors.presentCount();
+        }
     }
 
     @Test
@@ -118,9 +128,11 @@ class EntityVectorRerankTest {
         Path target = tempDir.resolve("graph");
         try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"))) {
             stage(staging);
-            GraphDirectoryBuilder.BuildResult result = GraphDirectoryBuilder.build(
-                staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
-            assertThat(result.embedded()).isZero();
+            GraphDirectoryBuilder.Published<Long> built = GraphDirectoryBuilder.build(
+                staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB, null, 0,
+                EntityVectorRerankTest::openVectors);
+            assertThat(built.result().embedded()).isZero();
+            assertThat(built.opened()).as("nothing to open, and the graph opened anyway").isZero();
         }
 
         assertThat(EntityVectors.openIfPresent(target)).isNull();

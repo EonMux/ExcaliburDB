@@ -241,6 +241,12 @@ final class CompactionSwap implements CompactionListener {
             repointWorkers(segmentId, oldSegment, newSegment,
                 context.graph(), context.filter(), context.tracker());
 
+            // The level still counts every term the compacted-away entries held. That errs
+            // toward searching the segment, never away from it, but the replacement's own
+            // entries are the exact answer and cost one pass to file - the same pass the term
+            // sketch already makes when it counts every copied entry.
+            registry.rebuildTermFilter(segmentId);
+
             if (context.hasDriftedRegistration()) {
                 // The drifted entry names the segment the worker is about to close. Left in
                 // place it would answer every later lookup of that index with a closed segment,
@@ -315,11 +321,14 @@ final class CompactionSwap implements CompactionListener {
     /**
      * Moves the index structures a segment carries onto its compacted replacement.
      *
-     * <p>Compaction rewrites the segment's data only. The HNSW graph, its tail offset
-     * tracker and the term frequency sketch describe exactly the same entries and belong
-     * to the replacement - the query path reads them off the segment
-     * ({@code segment.getHnswGraph()}), so a replacement without them drops the whole
-     * segment out of vector search with no error.</p>
+     * <p>Compaction rewrites the segment's data only. The HNSW graph and its tail offset
+     * tracker describe exactly the same entries and belong to the replacement - the query path
+     * reads them off the segment ({@code segment.getHnswGraph()}), so a replacement without
+     * them drops the whole segment out of vector search with no error.</p>
+     *
+     * <p>The term frequency sketch is not carried: the replacement counted the terms of every
+     * entry copied into it, so its own sketch is exact where the original's still counts what
+     * compaction just removed.</p>
      *
      * <p>The LSH index is deliberately <strong>not</strong> carried: it is owned by the
      * old segment, whose {@code close()} closes it as soon as this listener returns, and
@@ -359,11 +368,6 @@ final class CompactionSwap implements CompactionListener {
                 workers.hnsw().drainPendingIntegration(oldSegment, graph, tracker);
             }
             rebaseCheckpointIfStale(newSegment, tracker);
-        }
-
-        com.eonmux.excalibur.filter.sketch.CountMinSketch sketch = oldSegment.getTermFrequencySketch();
-        if (sketch != null) {
-            newSegment.attachTermFrequencySketch(sketch);
         }
 
         // The pre-filter is keyed by the node ids of the graph carried over just above, and

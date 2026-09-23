@@ -244,6 +244,7 @@ docker build -t excalibur .
 docker run --rm \
   -p 8080:8080 \
   -v excalibur-data:/var/lib/excalibur \
+  -v excalibur-diagnostics:/var/lib/excalibur-diagnostics \
   -e EXCALIBUR_API_BIND_ADDRESS=0.0.0.0 \
   -e EXCALIBUR_API_AUTH_TOKEN="$TOKEN" \
   -e EXCALIBUR_API_ALLOW_PLAINTEXT=true \
@@ -271,19 +272,62 @@ times slower at every search.
 Heap comes from the container's limit rather than a fixed `-Xmx`, capped at 60% rather than the
 usual 75%: segments live in memory-mapped arenas outside the heap, and a heap sized to crowd out
 the page cache turns every search into a disk read. The image also sets `+UseG1GC`,
-`+HeapDumpOnOutOfMemoryError` with the dump written to the volume, and `+ExitOnOutOfMemoryError` —
-a JVM that survives an OOM in a worker goes on answering `/health` while indexing nothing.
+`+HeapDumpOnOutOfMemoryError`, and `+ExitOnOutOfMemoryError` — a JVM that survives an OOM in a
+worker goes on answering `/health` while indexing nothing.
 
-`excalibur-fsck` is on the image's `PATH`, so the check is reachable at the one moment anyone
-wants it — when the node will not start:
+The heap dump is written to `/var/lib/excalibur-diagnostics`, not the data directory. A dump is
+the size of the heap it records, and beside the segments it is a file every snapshot has to leave
+out, every check has to explain, and on a volume sized for the data, possibly the one that fills
+it. Mount a volume there, as above, to keep a dump past the container; without one it lives in the
+container's writable layer and goes with `docker rm`.
+
+The image owns four directories for its unprivileged user (uid 10001), and declares only the data
+directory a volume:
+
+| Directory | Holds | Mount it |
+|---|---|---|
+| `/var/lib/excalibur` | the data directory | always — it is the `VOLUME` |
+| `/var/lib/excalibur-diagnostics` | heap dumps from an out-of-memory exit | to keep a dump |
+| `/var/lib/excalibur-quarantine` | files `excalibur-fsck --repair` sets aside | for every repair |
+| `/var/lib/excalibur-backups` | snapshots `excalibur-backup` writes from the image | for every snapshot |
+
+The last three are deliberately not `VOLUME`s: an unmounted declared volume is an anonymous one,
+which `docker run --rm` deletes with the container — a repair's quarantined evidence or a fresh
+backup gone the moment the command returns, with nothing to say so. A named volume takes the
+directory's owner when first mounted; a host directory bind-mounted in its place needs
+`chown 10001:10001` first.
+
+Both operator tools are on the image's `PATH`, so they are reachable at the moments anyone wants
+them — when the node will not start, and when it has been stopped to be backed up. Stop the node
+first; then check its volume:
 
 ```bash
 docker run --rm -v excalibur-data:/var/lib/excalibur \
   --entrypoint excalibur-fsck excalibur /var/lib/excalibur
 ```
 
-`excalibur-backup` is not in the image. It requires the node to be stopped, which is not the
-shape a container that exists to run the node is in.
+A repair needs the quarantine directory named and mounted. Its default is a new directory beside
+the data directory, in `/var/lib`, which the image's user cannot create:
+
+```bash
+docker run --rm -v excalibur-data:/var/lib/excalibur \
+  -v excalibur-quarantine:/var/lib/excalibur-quarantine \
+  --entrypoint excalibur-fsck excalibur \
+  /var/lib/excalibur --repair --quarantine-dir=/var/lib/excalibur-quarantine
+```
+
+The two are separate mounts, which no rename can cross, so each file set aside is copied into the
+quarantine, forced to disk, compared byte for byte, and only then removed from the data directory.
+A snapshot is the same shape, into a backup volume:
+
+```bash
+docker run --rm -v excalibur-data:/var/lib/excalibur \
+  -v excalibur-backups:/var/lib/excalibur-backups \
+  --entrypoint excalibur-backup excalibur \
+  snapshot --data-dir /var/lib/excalibur --out /var/lib/excalibur-backups/2026-09-22
+```
+
+CI runs all three against a node the image started and stopped.
 
 Nothing is baked in. The API binds `127.0.0.1` by default and binding anything else requires a
 bearer token and either TLS or an explicit `EXCALIBUR_API_ALLOW_PLAINTEXT=true` where something in
@@ -291,14 +335,14 @@ front of the process terminates it — so the container ships with none of those
 default that listened on every interface unauthenticated is the one mistake that policy exists to
 prevent. `HEALTHCHECK` points at `/health/ready`, not `/health`: readiness answers 200 or 503 on
 whether this node can serve a query, where liveness answers 200 while it is still opening
-segments. Allow at least 30 seconds to stop — the shutdown hook closes the storage engine and the
-chunk index, which is what publishes the tail of an ingestion run.
+segments. Allow at least 30 seconds to stop — the shutdown hook publishes the chunk index's buffer,
+which is the tail of an ingestion run, and closes the storage engine.
 
 ## Operator tools
 
 Two commands ship beside the server. Both run against a data directory rather than a running
-node, both run and exit, and neither opens a port. `excalibur-fsck` is also in the container
-image; `excalibur-backup` is not, because a snapshot needs the node stopped.
+node, both run and exit, and neither opens a port. Both are also in the container image — see
+[In a container](#in-a-container) for the mounts each needs there.
 
 ```bash
 ./gradlew :excalibur-fsck:installDist :excalibur-backup:installDist
@@ -315,12 +359,16 @@ excalibur-fsck /var/lib/excalibur --json
 excalibur-fsck --help                          # the flags and the exit codes
 ```
 
-It never opens a file for writing: most are mapped read-only — enforced by the kernel, not by
-intention, because several of the engine's own open paths stamp headers or migrate formats on the
-way in — and the rest are streamed past a digest without being mapped at all. It reports each
-file as one of `INTACT`, `CORRUPT`, `UNREADABLE`, `MISSING`, `UNSEALED`, `LEGACY_UNPROTECTED` or
-`UNCHECKED`. Only `INTACT` means bytes were weighed against a stored checksum. The last three
-are reported as *not shown to be damaged*, which is deliberately not the same claim as *sound*.
+Without `--repair` it never opens a file for writing: most are mapped read-only — enforced by the
+kernel, not by intention, because several of the engine's own open paths stamp headers or migrate
+formats on the way in — and the rest are streamed past a digest without being mapped at all. It
+reports each file as one of `INTACT`, `CORRUPT`, `UNREADABLE`, `MISSING`, `UNSEALED`,
+`LEGACY_UNPROTECTED`, `UNCHECKED` or `NOT_DATA`. Only `INTACT` means bytes were weighed against a
+stored checksum. `UNSEALED`, `LEGACY_UNPROTECTED` and `UNCHECKED` are reported as *not shown to be
+damaged*, which is deliberately not the same claim as *sound*. `NOT_DATA` is a JVM heap dump
+(`*.hprof`) left in the directory by a node whose `-XX:HeapDumpPath` pointed there: it is reported
+with its size, so the disk it takes is seen, and never read — it is evidence about a process, not
+state, so it neither passes nor fails anything, `--strict` included.
 A file can also be `INTACT` and only partly verified — an older segment whose entries carry
 checksums but whose slot table does not — which is counted on its own axis rather than being
 mislabelled either way. `--strict` exits non-zero on all of these, which is how an operator asks
@@ -328,9 +376,27 @@ for proof rather than the absence of doubt. It also checks
 across files — a catalog row naming a segment that is not there, an index with no segment, a
 staged file a rename never published.
 
-Repair is off by default: without `--repair` the plan is printed and nothing is touched. **No
-repair ever deletes anything.** A damaged file is moved into a quarantine directory byte for
-byte, which is reversible by hand. What it will not attempt matters as much as what it will: a
+Two derived files are judged by what the node does with them rather than by their name alone. A
+segment's term sketch, `segment_<N>.tfs`, is the one derived file the node rebuilds by itself: a
+sketch that fails its checksum is reported `CORRUPT` but not counted as damage, so it neither sets
+exit code `1` nor fails `--strict`, and the repair plan moves it aside (the node would rebuild it
+anyway). Only corruption is excused: a sketch the operating system will not read — an I/O error, a
+permission refused — is `UNREADABLE`, and fails the run like any file the device refuses. Every other derived file — a graph, a mapping, a codebook, an LSH table — is rebuilt only
+by a reindex or a retrain, and its damage fails the run. A `segment_<N>.hnsw.compact.docmap` is
+the mapping an HNSW compaction stages: beside its `segment_<N>.hnsw.compact` the compaction never
+swapped, both are staging leftovers, and the mapping is moved aside first; alone, the graph swap
+completed and it is the mapping the node installs on its next open, so it is verified, reported
+as `compacted-mapping-pending`, and never repaired — a damaged one goes to an operator.
+
+Repair is off by default: without `--repair` the plan is printed and nothing is touched. With it,
+the tool writes, and each write is stated before it is made. **No repair ever deletes anything.**
+A damaged file, an index whose segment is gone, or a staged file a rename never published is moved
+into a quarantine directory byte for byte, which is reversible by hand. Two repairs write in place,
+each the smallest write that says what the check proved: a `catalog.dat` row naming a segment file
+that is gone is marked purged, through the engine's own catalog code, rather than cut out; and a
+write-ahead log that ends in a torn record — an append that never completed — has that record's
+opcode cleared, the same one-byte write the log itself makes when an append fails its fsync, so
+the log reads as ending before it. What it will not attempt matters as much as what it will: a
 damaged `catalog.dat`, a damaged `routing.dir`, a routing slot pointing at a missing segment, or
 a write-ahead log damaged in the middle are all reported under *needs an operator* and left
 alone. Which hash slot belongs to which segment after a split is not recoverable from file
@@ -340,7 +406,9 @@ the middle is not moved aside either, for the same reason: setting the file asid
 records aside with it, and unlike an index, nothing rebuilds a log.
 
 Damaged files are moved into a timestamped directory beside the data directory unless
-`--quarantine-dir=<path>` names another. It takes the `--flag=value` form only.
+`--quarantine-dir=<path>` names another. It takes the `--flag=value` form only. The default needs
+the data directory's parent to be writable; a quarantine on another filesystem works too, by a
+copy that is forced and compared before the original is removed, since a rename cannot cross.
 
 Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself
 failed, so nothing is known about the directory — which is not the same claim as `0`.
@@ -357,9 +425,28 @@ A snapshot is a self-describing image: the payload, plus a manifest naming every
 length, its CRC32C and its SHA-256, the format versions, and the epoch the image is coherent at.
 `verify` checks an image against that manifest in both directions — every named file must be
 present and match, and every present file must be named. By default matching means the length and
-the CRC32C; `--deep` adds the SHA-256 and hands each file to the engine's own integrity checker
-for its format, so a snapshot can be shown to hold openable segments and graphs rather than merely
-unaltered bytes. `restore` verifies before it writes anything, to the same default depth and to
+the CRC32C. `--deep` adds the SHA-256, and hands every file in the image to the checker for its
+format, so a snapshot can be shown to hold openable segments and graphs rather than merely
+unaltered bytes — a checksum only proves a file is the one that was copied, and damage that was
+already there when it was copied verifies faithfully:
+
+| Format | Checked by | Proven means |
+|---|---|---|
+| segments, `catalog.dat` | the storage engine, on a scratch copy | every entry's checksum, and the header and record CRCs |
+| HNSW graphs and document mappings, quantiser codebooks, LSH tables | the vector and filter modules, on a scratch copy | the seal a clean close writes |
+| a compaction's staged pair (`segment_<N>.hnsw.compact`, `.hnsw.compact.docmap`) | `excalibur-fsck`, read-only | nothing, while both are there: the compaction never swapped, the node discards the pair on open, and a torn pair does not fail the image. A staged mapping alone is the only mapping the swapped graph matches, and is verified against its seal like any mapping |
+| write-ahead logs | `excalibur-fsck`'s checkers, read-only | every record replayed against its checksum |
+| graph staging logs | `excalibur-fsck`, read-only | the erasure ledger: every record against its CRC. The triple, entity and label logs: only their header, because their one open path writes |
+| the lexical store | `excalibur-fsck`, read-only, as one structure | every column of every segment its manifest names |
+| segment term sketches (`segment_<N>.tfs`) | `excalibur-fsck`, read-only | a CRC32C over the header and one over the body. A damaged sketch is reported and does not fail the image: a node restored from it rebuilds the sketch when it opens the segment. One that cannot be read at all fails it |
+| `routing.dir`, the document registry and source catalog, the in-flight journal, lexical sidecars | `excalibur-fsck`, read-only | nothing — these formats carry no checksum, so they are well-formed at best |
+
+The engine's own checkers run on a scratch copy because several of them repair what they open;
+`excalibur-fsck`'s are the ones it surveys a live directory with, so the two tools cannot disagree
+about which checker a file belongs to. The report counts how many structures were proven against
+a checksum or seal and lists every one that was not, with the reason: a format that carries
+nothing to prove it by is reported as checked and unproven rather than left out, which would read
+as though nothing went unverified. `restore` verifies before it writes anything, to the same default depth and to
 the deeper one with `restore --deep`, then builds the new tree beside the target and renames it on
 in one move; an image that does not verify is refused with the target untouched, and a target that
 already holds something needs `--force`.
@@ -375,18 +462,30 @@ path kept accepting writes would be worse than none: it would look like a consis
 not be one.
 
 `--exclude-derived` leaves out what something will rebuild — the lexical chunk index, a tenant's
-built edge store, the quantiser codebooks. The HNSW graphs and their document mappings are never
-left out, derived though they are, because **nothing rebuilds them**: deleting a `.hnsw` gives an
-empty graph attached to a populated segment, not a repopulated one. The write-ahead logs are
+built edge store, the quantiser codebooks, the segments' term sketches (which the node rebuilds by
+itself as it opens each segment, at a cost in start-up time). The HNSW graphs and their document
+mappings are never left out, derived though they are, because **nothing rebuilds them**: deleting a
+`.hnsw` gives an empty graph attached to a populated segment, not a repopulated one. That includes
+a `segment_<N>.hnsw.compact.docmap` an interrupted compaction staged — alone, it is the only mapping
+that matches a graph whose swap already completed. The write-ahead logs are
 never left out either — a segment's data file is forced only on flush, every log append is
 fsynced before it is acknowledged, and the graph integration cursor points into the log.
+
+Two things are never copied, whatever the flags, and each is reported under `omitted` with the
+reason: staged names a crash left behind (`TRANSIENT`), which nothing reads, and JVM heap dumps
+(`*.hprof`, `DIAGNOSTIC`), which are a record of a process rather than state and roughly the size
+of its heap.
+
+`excalibur-backup <command> --help` (or `-h`) prints that command's options and the exit codes, and
+exits `0` without touching anything; `excalibur-backup --help` prints all three.
 
 Snapshots preserve sparseness. The engine maps write-ahead logs at 64 MiB and graphs at 755 MiB
 apiece, so a node holding 50 MB of data occupies 50 GB apparent; a copy that did not preserve
 holes would turn that into a 50 GB backup. Checksums still cover every logical byte.
 
-Exit codes: `0` done, `2` bad command line, `3` the image did not verify and nothing was
-restored, `4` the restore target or the snapshot's `--out` is not empty, `5` the data directory
+Exit codes: `0` done, `2` bad command line — including an `--out` inside `--data-dir`, a
+`--target` inside `--snapshot`, and a path the platform cannot name — `3` the image did not verify
+and nothing was restored, `4` the restore target or the snapshot's `--out` is not empty, `5` the data directory
 moved while being copied, `6` a file could not be read or written — or a copy did not read back as
 what was written — and `70` something this build did not anticipate, reported rather than hidden.
 
@@ -498,7 +597,7 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.llm.timeout-ms` | 60000 | LLM request timeout (ms). 1000 to 300000 |
 | `excalibur.llm.max-retries` | 3 | Maximum retry attempts. 0 to 10 |
 | `excalibur.llm.retry-base-delay-ms` | 500 | Base delay for exponential backoff (ms). 10 to 30000 |
-| `excalibur.llm.failure-threshold` | 5 | Consecutive failures before a circuit opens. Chat and embeddings have **one breaker each** — they are usually different endpoints and can fail alone, and one breaker for both would make a dead reranker stop ingestion. 1 to 100 |
+| `excalibur.llm.failure-threshold` | 5 | Consecutive failures before a circuit opens. Embeddings and each chat caller — relevancy scoring, query expansion, relation extraction, the graph rerank, the graph question embedding and the graph build's entity embedding — have **a breaker of their own** (the graph three one per node, shared by every namespace), all configured by these two keys. They can fail alone, and one breaker for all of them would make a dead reranker stop ingestion. Each is reported under `breakers` on `/v1/stats`. 1 to 100 |
 | `excalibur.llm.cooldown-period-ms` | 60000 | How long an open circuit stays open before it half-opens (ms). A half-open circuit admits **one** probe; everything else keeps failing fast until that probe settles the state, which is the stampede the breaker exists to prevent. 1000 to 600000 |
 | `excalibur.llm.max-prompts-per-query` | 10 | Max LLM prompts per query. 1 to 100 |
 | `excalibur.llm.max-batch-tokens` | 4000 | Max tokens per LLM batch. 100 to 100000 |
@@ -781,8 +880,8 @@ of its run rather than leaving them for whatever ingests next. A node that only 
 meets the erasure deadline.
 
 **Compaction.** Checked at the end of an ingestion run, at the end of a reindex, when an erasure
-arrives, and by a sweep every tenth of `lexical-max-latency-seconds` — which is what holds the
-deadline on a node doing none of the first three. It is due when any of three conditions holds,
+arrives, on `POST /v1/compact`, and by a sweep every tenth of `lexical-max-latency-seconds` — which
+is what holds the deadline on a node doing none of the others. It is due when any of three conditions holds,
 and *what* it rewrites depends on which:
 
 | Trigger | What it selects |
@@ -812,6 +911,17 @@ indexed, segments, live and erased chunk counts, and `oldestErasureAgeMs` — ho
 undischarged erasure request has been waiting, to compare against `lexical-max-latency-seconds`.
 Nothing else in that response would show a deadline going unmet, because nothing else in the node
 holds one.
+
+**What it does with damaged text.** The native index keeps postings, not text, so a compaction
+reads each surviving chunk's text back out of storage. Text whose stored entry fails its checksum
+or cannot be decoded will never read back, and waiting on it would hold every erasure owed in its
+segments hostage: such a chunk is dropped from the index, logged at ERROR, and counted in
+`lexical.unreadableChunksDropped` on `/v1/stats` and in
+`excalibur_lexical_unreadable_chunks_dropped_total` on `/metrics`. A dropped chunk stops matching
+keyword queries but is still served by vector search; any increase means a storage segment is
+damaged, and reindexing the chunk's document from its source restores it. Any other read failure
+is treated as passing: the group it belongs to is left as it was and retried by the next
+compaction.
 
 ### Query expansion
 
@@ -1013,6 +1123,10 @@ replaces the store wholesale, and the record the next build reads has to survive
 are assigned once and never renumbered, so the Lucene indexes that store them stay correct across a
 rebuild they did not take part in.
 
+A build sorts the namespace's staged facts in memory before writing them: about 48 bytes of heap per
+fact at its peak, up to 66 with the buffer's growth slack, and at most 2,147,483,639 facts in one
+build — see *How much memory does a build need?* in the FAQ for where those numbers come from.
+
 Each staged fact records the day it was stated: the document's own date where the source gives one,
 otherwise the day it was staged. This orders the values of a single-valued relation; it is never
 used as the fact's valid time. A staging log written in the earlier record format is upgraded in
@@ -1073,6 +1187,16 @@ graph first and waits for running queries to finish before touching them; a quer
 running thirty seconds later is failed rather than left to hold up the erasure. Builds and
 compactions of one namespace are serialised against each other, so a build cannot republish facts
 a compaction is removing.
+
+A compaction publishes its rewritten graph by the same two renames a build does, so the same
+recovery covers a crash in either. Its obligations are marked discharged only once that publish is
+durable, so a crash part-way through leaves them outstanding over a graph that may still hold what
+they erase — the original, restored by recovery or never replaced. A namespace that finds signs of
+that on open (a restored graph, a compaction's leftover scratch directory, or the
+`graph-staging/erasure.interrupted` marker a failed attempt to finish one leaves) does not serve
+its graph until the outstanding obligations have been applied to it. That happens as the namespace
+opens; if it fails there, the graph stays unserved and the erasure sweep retries it, whatever the
+latency policy says, and serves the graph once it gets through.
 
 Recency alone is the wrong rule when namespaces are not interchangeable: the shared index is read by
 nearly every query and costs seconds to reopen, so it is pinned. Two keys extend that judgement to
@@ -1352,7 +1476,8 @@ curl -X POST http://localhost:8080/v1/ingest \
       "source_id": "my-docs",
       "root_path": "/path/to/documents",
       "included_extensions": [".txt", ".md"],
-      "excluded_directories": [".git", "node_modules"]
+      "excluded_directories": [".git", "node_modules"],
+      "charset": "windows-1252"
     }
   }'
 ```
@@ -1377,6 +1502,7 @@ rather than a silent clamp:
 | `follow_symlinks` | filesystem | — | Whether the walk descends through symbolic links. A link out of the allowed root is still refused: the real path is what is checked |
 | `include_hidden` | filesystem | — | Whether dot-files are read |
 | `max_file_bytes` | filesystem | 1 – 2 GiB | Largest single file the walk will read |
+| `charset` | filesystem | any encoding the JVM supports | The encoding a file without a byte-order mark is read in; UTF-8 when absent. A name the node cannot decode is a 400, not a silent fall-back to UTF-8. Recorded under its canonical name, which is what `GET /v1/ingest` shows. Refused on an HTTP crawl, whose responses each name their own encoding — see [What gets indexed](#what-gets-indexed) |
 | `included_path_patterns` | http | — | Substrings a URL path must contain to be crawled |
 | `excluded_path_patterns` | http | — | Substrings that keep a URL path out of the crawl |
 | `max_documents` | http | 1 – 10000000 | How many pages one crawl fetches |
@@ -1448,14 +1574,32 @@ lexically.
 |-------|----------------|
 | `entries_ingested` | Chunks written and published by this run |
 | `entries_pending` | Documents the crawl listed and has not reached yet |
-| `entries_skipped` | Documents the crawl listed that are not text, so nothing was indexed from them. Not a failure, and deliberately not folded into `last_error`: a directory holding photographs beside its documents is the ordinary case, and calling those failures would leave every such source reading as broken |
+| `entries_skipped` | Documents the crawl listed that are not text, so nothing was indexed from them. Not a failure, and deliberately not folded into `last_error`: a directory holding photographs beside its documents is the ordinary case, and calling those failures would leave every such source reading as broken. An empty file, or one that decodes to nothing worth a chunk, is not counted here by the first crawl or by any re-crawl |
 
 ### What gets indexed
 
 Text, and only text. A crawl with no `included_extensions` lists **every** file under its root,
 and a file's content type is guessed from its extension, so neither its name nor its type says
 what it actually holds: a `.txt` can be a core dump and a `.dat` can be YAML. Each document's
-bytes are therefore decoded in the encoding its source declared and judged on what comes out:
+bytes are therefore decoded and judged on what comes out.
+
+The encoding is settled the same way for both source types, in this order:
+
+1. **A byte-order mark** at the front of the document — UTF-8, UTF-16LE/BE or UTF-32LE/BE. The
+   mark is written by the program that encoded these bytes, while a declared encoding is a claim
+   about a whole directory or a whole server made by someone who did not look at this file, so
+   when the two disagree the mark wins; it is the order the WHATWG encoding standard sets for the
+   web. The mark itself is dropped, so it is not glued to the document's first word.
+2. **What the source declares** — the `charset` a filesystem source was registered with, or the
+   `charset` parameter of an HTTP response's `Content-Type`.
+3. **UTF-8.**
+
+So a directory of windows-1252 exports is registered with `"charset": "windows-1252"`, and the
+one file in it that an editor saved as UTF-16 is still read as UTF-16. A UTF-16 file with no mark
+needs the declaration (`"UTF-16LE"`), because without one it is read as UTF-8 and fails the text
+test below.
+
+The decoded text is then judged:
 
 - Decoded characters containing **U+0000** mean the file is not text. No text format holds one and
   every binary container is full of them, which is the test `git` uses for the same question. It
@@ -1473,14 +1617,36 @@ there it is a 400 naming the document, because a caller holding its own content 
 is wrong with it where a crawl can only pass a file over and count it.
 
 `entries_skipped` is rewritten by every run, including a re-crawl, so it describes the state of
-the source's root now rather than the state it was in the first time the node walked it. A
-re-crawl that passes over nothing sets it back to zero; the rest of `/v1/ingest/status` is left
+the source's root now rather than the state it was in the first time the node walked it. Every
+run counts the same thing - documents that are not text, and nothing else - so an unchanged root
+reads the same after a re-crawl as after the crawl that first registered it. A re-crawl that
+passes over nothing sets it back to zero; the rest of `/v1/ingest/status` is left
 to the run that wrote it, because a reindex reports how far it got through
 `/v1/reindex/status`.
 
 There are no format parsers. A PDF, a `.docx` or an image is skipped, not extracted; the node
 indexes documents you can already read as text. `included_extensions` is still worth setting on a
 mixed root, because it stops those files being read at all rather than read and discarded.
+
+### How a re-crawl finds what changed
+
+A re-crawl lists the source again and asks about each document it already holds rather than
+reading it again. An HTTP source asks with a **conditional GET**: every fetch records the `ETag`
+and `Last-Modified` the server sent, the document registry keeps both beside the content hash, and
+the re-crawl sends them back as `If-None-Match` and `If-Modified-Since`. A `304 Not Modified` is
+taken as the server's word that the indexed version is current, so the page's body is not
+transferred and nothing about it is re-chunked, re-embedded or re-written. Any other answer is
+read in full and compared by content; a changed page is then fetched again and replaced. A server
+that ignores the conditions costs a full fetch per page and nothing worse. A `304` to a request
+that carried no condition — a page the server never gave validators for, or whose stored tag
+cannot travel in a header — names no version at all, so it fails that document's fetch rather
+than keeping it unchecked. The link walk still reads every HTML page it follows links from,
+because a page's links cannot be read from a `304`.
+
+The validators live in the registry file, not in memory, so this holds across a restart — the
+first re-crawl after one is exactly when a node would otherwise transfer the whole site again. A
+filesystem source has nothing to ask with and reads each file, and an unchanged one is recognised
+by its modification time, length and content hash.
 
 ### Reindex Status Example
 
@@ -1550,8 +1716,9 @@ and `progress` is their ratio.
 ### Compaction Example
 
 Tombstoned entries — erased documents, replaced versions of re-crawled ones, the losing side of a
-split — are invisible to queries and still occupy their bytes. Two background sweeps reclaim them
-on a timer. `POST /v1/compact` brings that forward.
+split — are invisible to queries and still occupy their bytes, both in the segment store and in the
+lexical chunk index. Background sweeps reclaim them on a timer. `POST /v1/compact` brings that
+forward for both.
 
 ```bash
 curl -X POST http://localhost:8080/v1/compact \
@@ -1565,9 +1732,12 @@ curl -X POST http://localhost:8080/v1/compact \
 
 `202`, because compaction on a large corpus is minutes of I/O and the run happens behind the
 response. A second request while one is running is `409`. `force` defaults to `false`, which
-applies the same thresholds the background sweeps apply and so only brings forward work that was
-going to happen; `true` rewrites every live segment and rebuilds every graph regardless, which is
-what to send after erasing a large fraction of the corpus and otherwise a lot of I/O for nothing.
+applies the same thresholds the background sweeps apply — and, for the chunk index, the index's
+own `lexical-*` policy — and so only brings forward work that was going to happen; `true` rewrites
+every live segment and rebuilds every graph regardless, and rewrites every live segment of the
+chunk index, dropping any chunk the store no longer holds. That is what to send after erasing a
+large fraction of the corpus, and otherwise a lot of I/O for nothing. Under
+`lexical-engine=lucene` a forced run expunges every deletion Lucene is holding.
 
 ```bash
 curl http://localhost:8080/v1/compact/status
@@ -1587,7 +1757,15 @@ curl http://localhost:8080/v1/compact/status
   "graphs_considered": 64,
   "graphs_compacted": 64,
   "graphs_skipped": 0,
-  "graphs_failed": 0
+  "graphs_failed": 0,
+  "lexical": {
+    "performed": true,
+    "segments_rewritten": 12,
+    "segments_produced": 3,
+    "chunks_removed": 1840,
+    "groups_abandoned": 0,
+    "reason": "full rewrite"
+  }
 }
 ```
 
@@ -1600,6 +1778,23 @@ which is why stopping one is safe at any point, and loses work rather than data.
 middle: what it reports was reclaimed, the rest was not, and each reason is in the node's log. A
 run is not all-or-nothing and is not collapsed into either extreme. Only the most recent run is
 kept.
+
+`lexical` is the chunk index's half of the run, present only on a node that keeps one. The two
+stores are compacted one after the other and reported independently, so a failure in one does
+not hide what the other did: `state` and `error` describe the segment store, and a chunk index
+that failed reads `{"performed": false, "error": "..."}` with no counts. `performed` false with a
+`reason` is either the index's policy finding nothing due (`"not due: ..."`) or a run stopped
+before it reached the index. `segments_rewritten` is how many lexical segments were rewritten,
+`segments_produced` how many replaced them, and `chunks_removed` how many tombstoned chunks — and
+chunks the store no longer holds — did not survive the rewrite. `groups_abandoned` counts groups
+of segments the rewrite had to leave as they were, because reading a surviving chunk's text back out
+of storage failed in a way a later attempt may not repeat; those segments keep their dead weight and
+any erasure owed in them stays owed for the next compaction. A rewrite that abandoned every group
+it selected published nothing and reads `performed: false`, with a `reason` beginning `nothing
+published:`; one that published some groups and abandoned others reads `performed: true` with a
+`reason` beginning `partial:`. A stop that arrives while the index is being rewritten lets that
+rewrite finish: the index's files are shared with every query, and interrupting a thread in the
+middle of file I/O would close them underneath those queries.
 
 ### Stats Example
 
@@ -1622,15 +1817,22 @@ curl http://localhost:8080/v1/stats
   "entries": {"total": 15000000},
   "volumes": {"count": 1, "totalBytes": 5368709120, "usedBytes": 3221225472},
   "hnsw": {"queueDepth": 50000, "queueDepthLimit": 100000, "vectorsIntegrated": 14000000},
-  "cuckoo": {"pendingDeletions": 100, "totalDeletions": 5000,
-             "avgFpRate": 0.000500, "maxFpRate": 0.001000,
+  "cuckoo": {"pendingDeletions": 0, "totalDeletions": 212,
+             "avgFpRate": 0.0000070547, "maxFpRate": 0.0000137324,
              "saturated": false, "saturatedSegments": 0},
   "visibility": {"epoch": 42, "registeredSegments": 1024, "visibleSegments": 1024},
   "coverage": 1.0000,
+  "workers": {"indexOrchestratorRunning": true},
+  "vectorIndex": {"segmentsWithoutIndex": 0},
+  "breakers": {"embedding": "CLOSED", "llmRelevancy": "CLOSED",
+               "queryExpansion": "CLOSED", "graphExtraction": "OPEN",
+               "graphRerank": "CLOSED", "graphQueryEmbedding": "CLOSED",
+               "graphBuildEmbedding": "CLOSED"},
   "lexical": {
     "engine": "native", "indexed": 15000000, "segments": 12,
     "liveChunks": 14980000, "erasedChunks": 20000, "erasedRatio": 0.0013,
-    "erasureRequests": 3, "oldestErasureAgeMs": 412000, "compactionDue": false
+    "erasureRequests": 3, "oldestErasureAgeMs": 412000, "compactionDue": false,
+    "unreadableChunksDropped": 0
   },
   "graph": {
     "namespaces": {"open": 3, "maxOpen": 16, "evictions": 41},
@@ -1641,14 +1843,31 @@ curl http://localhost:8080/v1/stats
     "erasure": {"namespacesOwing": 1, "outstanding": 2, "overdueNamespaces": 0,
                 "unreadableNamespaces": 0, "oldestAgeMs": 91000},
     "ingest": {"documentsSeen": 20412, "factsStaged": 131877, "unresolvedDocuments": 0,
-               "extractionFailures": 3, "tenantFailures": 0}
+               "extractionFailures": 3, "tenantFailures": 0, "sinkRefusals": 0}
   }
 }
 ```
 
 The `lexical` block is present only on a node that keeps a chunk index, and `graph` only on a node
-that serves a graph; `cuckoo.saturated` and `cuckoo.saturatedSegments` say whether the membership
-filter still has room to prune with. See [the stats section of USAGE.md](USAGE.md#stats) for what
+that serves a graph. `breakers` holds one entry per circuit breaker the node has — `embedding`,
+`llmRelevancy` for stage-5 re-ranking, `queryExpansion` for the chat call that widens a lexical
+query, `graphExtraction` for the chat call that finds a document's facts, `graphRerank` for the
+chat call `POST /v1/graph/query` reranks its candidates with, `graphQueryEmbedding` for the
+embedding call that lets a graph built with entity vectors rerank them exactly, and
+`graphBuildEmbedding` for the embedding call a graph build makes to produce those entity vectors —
+and leaves out any component the node does not run, because a missing breaker and a closed one are
+different facts. Each is `CLOSED`, `HALF_OPEN` or `OPEN`. The three graph breakers are one each for
+the node, not one per namespace: every namespace's graph calls the same endpoint through the same
+client, so one state is true for all of them and the block does not grow with the tenants. Each
+appears once it is first needed — `graphRerank` with the first graph opened, `graphQueryEmbedding`
+only once a graph with entity vectors is, and `graphBuildEmbedding` only once a build has embedded
+an entity. The two embedding breakers are separate even though they call the same endpoint and
+model: an open build breaker costs a build's entities their vectors until the next build, an open
+question breaker costs one query its vector rerank, and neither should decide the other.
+`cuckoo.saturated` and `cuckoo.saturatedSegments` say
+whether the membership filter still has room to prune with. `cuckoo.avgFpRate` and `maxFpRate` are
+the false-positive rates of the per-segment filters as they stand now, printed as exact decimals;
+the deletion figures count filter entries (one per distinct term per segment), not documents. See [the stats section of USAGE.md](USAGE.md#stats) for what
 every field means.
 
 `purged` is always `0`. Reclaiming a segment deletes its catalog row rather than keeping a
@@ -1668,8 +1887,15 @@ curl -X POST http://localhost:8080/v1/graph/build
 ```
 
 ```json
-{"state": "running", "namespace": "shared", "started_at_ms": 1736899200000}
+{"state": "running", "namespace": "shared", "started_at_ms": 1736899200000,
+ "extraction": "active"}
 ```
+
+`extraction` says whether ingestion on this node extracts the facts a build publishes: `active`,
+`disabled` when `excalibur.graph.extraction-enabled` is off, or `missing_api_key` when it is on but
+no LLM API key is configured — the one case that also carries a `warning`, because nobody chose it
+and the build it answers publishes nothing ingestion staged since startup. The status route carries
+the same two fields.
 
 `202`, not `200`. On a real corpus the build takes minutes — it replays every staged fact, embeds
 every entity and writes two Lucene indexes — so it runs behind the response and the request does
@@ -1700,7 +1926,14 @@ the node — it saturates the same disk and the same embedding endpoint either w
 `POST` while one is in flight is refused with `409` naming the namespace that holds it.
 
 A node that has staged nothing keeps serving the graph it already had — replacing it with an empty
-one would turn every question into a refusal.
+one would turn every question into a refusal. Its status says so and why, from `extraction`:
+
+```json
+{"state": "completed", "namespace": "shared", "extraction": "missing_api_key",
+ "warning": "excalibur.graph.extraction-enabled is true, but no LLM API key is configured, ...",
+ "message": "Nothing was staged, so nothing was published and this namespace is still serving the graph it had. excalibur.graph.extraction-enabled is true, but no LLM API key is configured, ...",
+ "published": false, "edges": 0, "staged_facts": 0, ...}
+```
 
 `DELETE /v1/graph/build` stops one started at the wrong moment:
 
@@ -1756,17 +1989,49 @@ Three statuses, and a client has to tell them apart:
 context, so they are absent on an `answered` response that carries none — read `context` and treat
 the five as optional rather than assuming a shape. `format` names the serializer that produced the
 context, so an A/B test can attribute an outcome to it. `timings_ms` carries only the stages that actually ran, drawn from a fixed set — `plan`, `link`,
-`traverse`, `rank`, `serialize`, `prefill`, `decode` — plus `total`. It comes back on all three
+`traverse`, `rank`, `serialize` — plus `total`. It comes back on all three
 statuses, because a refusal that took two seconds is as much a performance question as an answer
 that did.
 
-The request is bounded: `query` at 4096 characters, `context_entities` at 128 entries of at most 256
-characters each. Exceeding either is a 400 naming the bound. A context is refused rather than
-truncated, because dropping part of one silently changes which entity a pronoun binds to and the
-answer would read as though the whole conversation had been given.
+`context_entities` is the conversation the question is asked in, which is what a pronoun in it
+binds to. The node keeps no session, so the client sends it with every question. Two spellings:
+
+```json
+{"query": "What did she write?",
+ "context_entities": ["Analytical Engine", "Ada Lovelace"]}
+```
+
+```json
+{"query": "What did she write?",
+ "context_entities": [
+   {"name": "Charles Babbage",   "grammar": "singular_person", "turn": 0},
+   {"name": "Analytical Engine", "grammar": "singular_thing",  "turn": 1},
+   {"name": "Ada Lovelace",      "grammar": "singular_person", "turn": 1}]}
+```
+
+The first is names alone: every one of unknown shape and all mentioned in the same turn, so two of
+them leave a pronoun `ambiguous_pronoun` and the reply asks which was meant. The second says what
+the client knows about each, and both fields are optional:
+
+| Field | Values | What it decides |
+|-------|--------|-----------------|
+| `name` | the entity's name; required | what the pronoun is bound to |
+| `grammar` | `singular_person` (he, she, him, her…), `singular_thing` (it, this, that), `plural` (they, them, these…), `unknown` (any); case-insensitive; default `unknown` | which pronouns can refer to it — "she" never binds the engine above, "it" never binds a person |
+| `turn` | a whole number from 0, higher being more recent; default the latest turn given | between two entities a pronoun fits, the later turn wins; the question is asked in the turn after the latest one, and a pronoun reaches back three turns including the question's own, so an entity more than two turns before it is not bound to at all |
+
+So in the second example "she" binds Ada Lovelace: the engine is the wrong shape and Charles
+Babbage was a turn earlier. The two spellings are not mixed in one array — a client with a shape
+for some entities sends the rest as `{"name": ...}`. A shape that is not one of the four, a turn
+that is not a whole number in range, and an entry with no `name` are each a 400 naming the entry,
+rather than being read as absent: they were sent to rule a binding in or out.
+
+The request is bounded: `query` at 4096 characters, `context_entities` at 128 entries whose names
+are at most 256 characters each. Exceeding either is a 400 naming the bound. A context is refused
+rather than truncated, because dropping part of one silently changes which entity a pronoun binds
+to and the answer would read as though the whole conversation had been given.
 
 A field of the wrong type is a 400 with the reason in the body — `{"query": 7}`,
-`{"context_entities": "Ada"}` (a string where an array of strings is expected) or
+`{"context_entities": "Ada"}` (a string where an array is expected) or
 `{"as_of": 2019}` — rather than being read as though it had been left out; answering a question
 the caller did not ask is the worse outcome. An explicit `null` is the same as leaving the field
 out, so `{"query": null}` is the missing-`query` 400 and `{"as_of": null}` is answered as though
@@ -1802,7 +2067,10 @@ the current one. The context leads with the same line.
 
 `direction` restricts which way the walk steps from the entities the question names: `forward`
 reads the facts they are the subject of, `reverse` the facts they are the object of, `both` (the
-default) either. Anything else, or a non-string, is a 400.
+default) either. Anything else, or a non-string, is a 400. A one-way walk needs the graph's
+relation vocabulary; a graph pipeline embedded without one answers `forward` or `reverse` with a
+422 saying to omit `direction` or send `both`, never a 500 — the request is well formed, and a node
+with the vocabulary answers the same body.
 
 ```bash
 curl -X POST http://localhost:8080/v1/graph/erasure \
@@ -1831,6 +2099,15 @@ deadline that has to be able to say the data is gone. The scopes are
 `{"scope":"entity","entity_id":N}`, `{"scope":"entity","entity_name":"Ada Lovelace"}`,
 `{"scope":"source","source_type":"DOCUMENT","source_id":N}` and
 `{"scope":"extractor","version":N}`.
+
+In the source scope, `N` names one ingested document, not a registered source: it is the XxHash64
+(seed 0) of the UTF-8 bytes of the document's key, `<source_id>:<document_id>` — `my-docs:guide.md`
+for the document whose chunks come back from `/v1/query` as `my-docs:guide.md:chunk:N`. It is
+stamped on every fact and snippet extracted from that document, and a caller reads it back off the
+answers: each fact in a graph answer's `context` ends with its provenance, `{document#N conf=0.9
+ext=v1}`, and that `N` is the one to send. To withdraw a document from the corpus and the graph at
+once, use `POST /v1/erasure` with its `source_id` and `document_id` instead — it removes the chunks
+and submits this graph obligation for you, so nobody has to compute the hash.
 
 An entity id is internal and nothing this node serves hands one out, so `entity_name` is how
 "erase everything about this person" is actually asked. It is matched exactly, ignoring case and
@@ -1910,19 +2187,22 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 
 ### The tools
 
-| Tool | What it does |
-|------|--------------|
-| `ingest_documents` | Registers a directory and starts indexing it |
-| `crawl_website` | Registers an HTTP source and starts crawling it |
-| `add_documents` | Indexes documents sent in the call itself, for content the model is holding |
-| `ingestion_status` | How far indexing has got |
-| `reindex_source` | Re-reads a registered source and replaces what changed |
-| `reindex_status` | How far a reindex has got, and whether it finished, failed or was cancelled |
-| `deregister_source` | Stops a source being crawled again; the documents already indexed stay |
-| `search_documents` | Searches the indexed documents and returns the matching passages, best first |
-| `build_graph` | Publishes the staged facts as the served graph |
-| `graph_build_status` | How far a build has got, and what the last one published |
-| `search_graph` | Asks the graph a question, optionally `as_of` a date, an instant or `all` of history, and in one `direction` |
+| Tool | Arguments | What it does |
+|------|-----------|--------------|
+| `ingest_documents` | **`source_id`**, **`root_path`**, `included_extensions`, `excluded_directories`, `max_depth`, `follow_symlinks`, `include_hidden`, `max_file_bytes`, `charset`, `namespace` | Registers a directory and starts indexing it. Every setting a filesystem registration accepts over HTTP is here, with the same meaning and bounds — see the config fields under [Ingest Example](#ingest-example). An optional `charset` names the encoding its files are read in when they carry no byte-order mark (UTF-8 when omitted); a file with a mark is read in the encoding the mark names, and the node refuses an encoding it does not know |
+| `crawl_website` | **`source_id`**, **`base_url`**, `max_depth`, `max_documents`, `max_response_bytes`, `timeout_seconds`, `included_path_patterns`, `excluded_path_patterns`, `user_agent`, `crawl_delay_ms`, `namespace` | Registers an HTTP source and starts crawling it. Every setting an HTTP registration accepts is here, with the same meaning and bounds; `crawl_delay_ms` can only slow a crawl below the node's own `excalibur.ingest.crawl-delay-ms` pace, never speed it up |
+| `add_documents` | **`source_id`**, **`documents`** (each **`document_id`**, **`text`**) | Indexes documents sent in the call itself, for content the model is holding |
+| `ingestion_status` | `source_id` | How far indexing has got |
+| `reindex_source` | **`source_id`** | Re-reads a registered source and replaces what changed |
+| `reindex_status` | `source_id` | How far a reindex has got, and whether it finished, failed or was cancelled |
+| `deregister_source` | **`source_id`** | Stops a source being crawled again; the documents already indexed stay |
+| `search_documents` | **`query`**, `top_k` | Searches the indexed documents and returns the matching passages, best first |
+| `build_graph` | `namespace` | Publishes the staged facts as the served graph |
+| `graph_build_status` | `namespace` | How far a build has got, and what the last one published |
+| `search_graph` | **`query`**, `context_entities`, `as_of`, `direction`, `namespace` | Asks the graph a question, optionally `as_of` a date, an instant or `all` of history, in one `direction`, and in a conversation: `context_entities` names what was mentioned, each with an optional grammatical shape and turn so a pronoun binds the right one |
+
+Arguments in bold are required; every other one is optional and, when left out, is not sent, so
+the node's configured default applies rather than one the adapter chose.
 
 Together they are the whole loop, so a model can prepare a corpus as well as query one. The order
 matters: `build_graph` has to run after ingestion finishes - it answers as soon as the build
@@ -1963,14 +2243,26 @@ pass back as `context_entities`; `declined` means the graph does not hold enough
 result, not an error. `direction` takes `forward`, `reverse` or `both`; anything else is a tool
 error.
 
+`context_entities` is the conversation so far, in the same vocabulary as the HTTP route: each
+element a name, or an object `{"name", "grammar", "turn"}` whose `grammar` is `singular_person`,
+`singular_thing`, `plural` or `unknown` and whose `turn` is a whole number from 0, higher being more
+recent. Unlike the HTTP route, a model may mix the two - the tool sends every element as an object
+when any one is - so it need not rewrite the names it has no shape for. A shape outside the four, a
+negative or fractional turn, an object with no `name`, or a field other than those three is a tool
+error naming the element; the last because the node ignores a field it does not read, and a
+misspelt `"gramar"` would otherwise arrive as an entity of unknown shape.
+
 Arguments are checked before anything is sent. One of the wrong type - a number where a string is
 declared, a string where an array is - is returned as a tool error naming the argument rather than
 coerced or dropped, so a model learns what it got wrong. An integer argument accepts `5`, `5.0` or
-`"5"`, and refuses a fraction. Empty arrays are read two ways, deliberately: on `ingest_documents`
-an empty `included_extensions` or `excluded_directories` is the same as leaving it out and keeps the
-node's default, while on `crawl_website` an empty `excluded_path_patterns` is forwarded and clears
-the node's default skip list, because supplying that list replaces the default rather than adding
-to it.
+`"5"`, and refuses a fraction. A true/false argument accepts `true` or `"true"`, in any case, and
+refuses anything else - `1` and `"yes"` included - rather than guess which was meant. An empty
+array is forwarded, never dropped, exactly as the same body sent over HTTP would be: supplying a
+list replaces the node's default rather than adding to it, so an empty one clears it. An empty
+`excluded_directories` on `ingest_documents` walks every directory, `node_modules` and `target`
+included; an empty `included_extensions` reads every file, which is also what leaving it out does;
+and an empty `excluded_path_patterns` on `crawl_website` clears the crawl's default exclusions.
+Leaving a list out keeps the node's default.
 
 ### Without MCP
 
@@ -2053,14 +2345,40 @@ sketch is given the highest estimate rather than the lowest. What the ordering b
 stage after it, and a query that runs out of time, spend what time there is on the segments most
 likely to answer.
 
+Every segment keeps its own sketch. The storage engine counts the terms of each chunk it writes
+into a segment, whichever path the write came from (`POST /v1/ingest`, `POST /v1/documents`,
+`POST /v1/reindex`, or a split or compaction copying entries into a new segment), using the same
+tokenisation as the cuckoo filters, and the query's text is cut the same way. A term's estimate is
+its share of all the term occurrences counted in that segment; a query of several terms multiplies
+the shares.
+
+- **Deletes and overwrites over-count.** A sketch cannot take a count back, so a deleted or
+  overwritten chunk's terms stay counted until the segment is compacted, which builds the
+  replacement's sketch from the surviving entries only. The error only ever moves a segment
+  earlier.
+- **Persistence.** The sketch is written beside the segment as `segment_<N>.tfs` (versioned
+  header, CRC32C over header and body, staged and renamed into place) when the engine flushes or
+  closes the segment. The file records the write-log sequence number and entry counts it was taken
+  at. On start-up, after the write log has been replayed, a sidecar that matches is loaded; a
+  missing, damaged or out-of-date one (which is what a crash leaves) is rebuilt from the segment's
+  live entries. Deleting the file is always safe; it costs one rebuild. `excalibur-fsck` verifies it
+  and reports a damaged one without counting it as damage, and `excalibur-backup` copies it as
+  derived state that `--exclude-derived` leaves out.
+
 Stage 3 prunes only where the term filter can speak for a segment. Both write paths fill it:
 `POST /v1/reindex` through the batch publisher, which targets a segment it chose itself, and
-`POST /v1/ingest` through the storage engine, which reports the segment each chunk routed to. The
-filter is in memory only and is not reloaded at startup, so a restarted node prunes nothing until
-something is written again. Three things make a segment unprunable rather than excluded — the
-filter holding nothing for it, a level having refused a term for want of room, and no filter being
-configured at all — and in each case stage 3 passes the segment through. Pruning is an
-optimisation; the filter never costs a result.
+`POST /v1/ingest` through the storage engine, which reports the segment each chunk routed to.
+Entries also reach a segment without being written to it, and each such segment's level is refilled
+from the entries it holds, on a background thread, one segment at a time: every segment when the
+node starts (the filter is in memory only), both children of a split, and the replacement a
+compaction installs — which also drops the terms of the entries the compaction removed. A level is
+marked stale before the segment can take a write that would make it look complete — for a split,
+before either child is routed to — and a stale level is not trusted until its refill finishes, so
+a segment is searched in full meanwhile rather than pruned on a partial level. Four things make a
+segment unprunable rather than excluded — the filter holding nothing for it, its level waiting to
+be refilled, a level having refused a term for want of room, and no filter being configured at all
+— and in each case stage 3 passes the segment through. Pruning is an optimisation; the filter never
+costs a result.
 
 The pre-filter in stage 4 hands stage 5 a set of candidate ids per segment, and stage 5 answers
 with the nearest members of that set rather than the nearest of the whole graph. The set is carried
@@ -2221,8 +2539,9 @@ Under `<data dir>/chunk-index` when the native engine is configured:
 Anything on disk the manifest does not name is deleted when the store is opened: a segment is
 written before it is published, so a crash in between leaves files no reader will ever consult.
 
-Beside it, `<data dir>/document-registry` records which documents this node holds and the chunk ids
-each was written under. It is what change detection compares a re-crawl against and what an erasure
+Beside it, `<data dir>/document-registry` records which documents this node holds, the chunk ids
+each was written under, and the `ETag` and `Last-Modified` an HTTP source reported for it. It is
+what change detection compares a re-crawl against and what an erasure
 request resolves a document name through, so it is written after every ingestion, reindex and
 erasure. A node that lost it would read every document as new — reingesting the corpus beside the
 chunks already there and tombstoning none of them — and would report every erasure request as naming
@@ -2302,6 +2621,9 @@ memory-mapped Cuckoo run wants 4G). What they share — `--enable-preview`,
 for the tasks and once for the JMH forks the runners start (`ForkedJvm`), so a runner that selects
 by pattern cannot fork a JVM that is missing the Vector API its benchmarks call.
 
+Targets, which of them the capture gates, and the measured results of the latest full run are
+recorded in [`excalibur-bench/BENCHMARK_TARGETS.md`](excalibur-bench/BENCHMARK_TARGETS.md).
+
 ```bash
 # See them all
 ./gradlew :excalibur-bench:tasks --group benchmark
@@ -2314,9 +2636,17 @@ by pattern cannot fork a JVM that is missing the Vector API its benchmarks call.
 ./gradlew :excalibur-bench:runBenchmarksWithCapture -PbenchmarkPattern=Cuckoo -PoutputDir=build/bench
 ```
 
+The captured reports account for every benchmark × `@Param` combination the pattern selects.
+JMH's own results omit a combination whose `@Setup` or an iteration threw, or whose forked JVM
+died, so the runners watch the run and report each such combination as **errored** — with its
+exception and stack trace, an `Errored` count in every format, and an `errored` array in the
+JSON. An errored combination fails the capture (exit `1`) even when everything that did run met
+its target, and a standard run without `--capture` exits `1` on one too.
+
 | Task | Benchmark | What it measures |
 |------|-----------|------------------|
 | `runBenchmark` | all benchmarks by default | Takes one optional argument to narrow the pattern — see the note below the table |
+| `runBenchmarkComparison` | all benchmarks by default | Records a baseline, or compares a run or a recorded result against one — see below the table |
 | `runCuckooFilterBenchmark` | `CuckooFilterBenchmark` | Filter lookup throughput across load factors |
 | `runCuckooFilterDeleteBenchmark` | `CuckooFilterDeleteBenchmark` | Deletion throughput across load factors |
 | `runCuckooFilterFPRateBenchmark` | `CuckooFilterFPRateBenchmark` | Measured false positive rate (target ≤ 0.1%) |
@@ -2329,6 +2659,35 @@ by pattern cannot fork a JVM that is missing the Vector API its benchmarks call.
 | `runMappedFileBenchmark` | `MappedFileBenchmark` | Memory-mapped I/O throughput |
 | `runPointLookupBenchmark` | `PointLookupBenchmark` | Point lookup throughput (target ≥ 10M ops/sec) |
 | `runTailScanBenchmark` | `TailScanBenchmark` | Brute-force scan throughput at varying tail sizes |
+
+To compare two builds rather than measure one, `runBenchmarkComparison` runs
+`BenchmarkComparisonRunner`, which records a baseline, reruns against it, or diffs two recorded
+runs, and exits non-zero when anything regressed or errored — so a script can gate on it:
+
+```bash
+# Record a baseline, on the build you trust
+./gradlew :excalibur-bench:runBenchmarkComparison \
+  --args='--run --output build/benchmark-results/baseline'
+
+# Later, on the candidate: run again and compare against it
+./gradlew :excalibur-bench:runBenchmarkComparison \
+  --args='--compare --baseline build/benchmark-results/baseline/benchmark_results.json'
+
+# Or compare two runs already on disk, without running anything
+./gradlew :excalibur-bench:runBenchmarkComparison \
+  --args='--diff old/benchmark_results.json new/benchmark_results.json'
+```
+
+`--pattern` narrows which benchmarks run (default `.*Benchmark.*`). Relative paths resolve against
+`excalibur-bench/`, the task's working directory, and results land under
+`excalibur-bench/build/benchmark-results` unless `--output` says otherwise. With no arguments it
+prints its usage and exits `2`. Exit codes: `0` everything ran and nothing regressed, `1` a
+regression, `2` the command could not be carried out (a wrong command line, a missing file, or a
+run that measured nothing), `3` a combination errored and so was never measured or compared.
+`--run` still writes its reports when a combination errors, so the failure can be read there, and
+`--diff` reads a recorded run's errored combinations back and fails on them just the same.
+Results are matched to their baseline by benchmark, mode and `@Param` values, so each parameter
+combination is compared with its own baseline rather than with a sibling's.
 
 `CuckooFilterInsertBenchmark` has no task of its own; reach it with
 `./gradlew :excalibur-bench:runBenchmark --args='cuckoo-insert'` — the runner matches one
@@ -2398,6 +2757,28 @@ Reports are generated at:
 - `build/reports/jacoco/COVERAGE_SUMMARY.html` - Summary report
 - `build/reports/jacoco/aggregate/html/index.html` - Detailed aggregate report
 
+### Flaky tests
+
+A test that fails once in five runs is the hardest kind to catch, because the run that shows it is
+usually the one nobody is watching. `analyze-flaky-tests.sh`, at the repository root, runs one
+module's suite several times over and reports every test that passed in some runs and failed in
+others, with a flakiness score, and every test that failed in all of them:
+
+```bash
+./analyze-flaky-tests.sh                           # 5 runs of excalibur-integration
+./analyze-flaky-tests.sh 10                        # 10 runs
+./analyze-flaky-tests.sh -m excalibur-query -r 3   # 3 runs of another module
+./analyze-flaky-tests.sh -y -v                     # no confirmation prompt, Gradle output shown
+./analyze-flaky-tests.sh --help
+```
+
+Three runs is the minimum — fewer cannot tell a pattern from an accident. Each run is a full
+`--rerun` of the module's `test` task, so budget minutes per run; the script asks before starting
+unless given `-y` or run without a terminal. The analysis is `FlakyTestAnalyzer` in
+`excalibur-test`, which reads the JUnit XML reports Gradle writes for each run rather than scraping
+its console. Exit codes: `0` every test passed in every run, `1` flaky or consistently failing
+tests were found, `2` the command line was wrong or the analysis could not be carried out.
+
 ### Integration Tests
 
 Integration tests verify the core system requirements. They run as part of `./gradlew test` —
@@ -2421,9 +2802,12 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 - `DeletionLifecycleIntegrationTest` - Insert, query, delete and re-query across flat and hierarchical filters, then again at stress volume
 - `HierarchicalDeletionPropagationIntegrationTest` - A delete reaches the corpus and segment levels of the hierarchical filter, including under concurrency
 - `DocumentErasureIntegrationTest` - An erased document leaves storage, the lexical index's files and vector search, through the node's own erasure wiring
+- `GraphRouteIntegrationTest` - A document ingested from a directory, with extraction against a stand-in OpenAI-compatible chat endpoint, is built into the graph and answered from over HTTP as of a date after its fact began, and declined as of one before
 - `LshHnswEntryIdContractTest` - The LSH pre-filter returns ids in the HNSW graph's id space, so stage 2 filters the right nodes
 - `SegmentPrefilterLifecycleTest` - A segment's vector pre-filter lives and dies with the graph it is keyed against, including across a split
 - `AtomicDocumentWriterTest` - The write-log driver the other suites ingest through records true offsets and keeps each document's chunks contiguous
+- `EmbeddedUsageExampleTest` - The embedded ingestion and query example in [USAGE.md](USAGE.md) compiles, ingests through a stand-in embeddings endpoint, and answers
+- `VectorApiResolutionTest` - The test JVM resolves `jdk.incubator.vector`, so the SIMD kernels are what the suites exercise rather than the scalar fallback
 
 ```bash
 ./gradlew :excalibur-integration:test
@@ -2444,9 +2828,14 @@ runs the commands this README documents rather than a private variant of them. I
 `check` enforces. It then builds the three artefacts the README names
 (`:excalibur-api:shadowJar`, `:excalibur-fsck:installDist`, `:excalibur-backup:installDist`),
 because `installDist` is not part of `build` and a module with no build script would leave `build`
-green while those resolved to no such task. It runs `excalibur-fsck --help` and
-`excalibur-backup --help` from the installed start scripts, which checks that they carry the JVM
-flags the formats need without touching a data directory, and finishes with
+green while those resolved to no such task. Then it smoke-tests the operator tools against a data
+directory a real node wrote: it starts the shadow jar on its packaged default (loopback, no
+token, no LLM key, which still ingests lexically), indexes two documents through the synchronous
+`POST /v1/documents`, and stops it with `SIGTERM` the way a scheduler would. `excalibur-fsck` must
+find nothing damaged in what it left; `excalibur-backup` must snapshot it, `verify --deep` the
+snapshot with nothing but the report on stdout, and `restore --deep` it into a directory
+`excalibur-fsck` passes too. That runs every format checker against the formats a node writes,
+through the installed start scripts and the JVM flags they carry. It finishes with
 `./gradlew publishToMavenLocal`, the only thing that asks the library modules for a POM Maven can
 read.
 
@@ -2463,7 +2852,11 @@ question, answered on a machine whose clock you trust.
 **Image.** Builds the container image from the repository's `Dockerfile`, as `docker build .`
 does, starts it with the bind address, plaintext opt-in and token the image needs to come up,
 waits for `/health/ready`, and stops it the way a scheduler would. An image that builds and never
-reports ready fails here.
+reports ready fails here. Then it runs the two container commands [In a
+container](#in-a-container) documents against the stopped node's volume: an `excalibur-fsck
+--repair` into a mounted quarantine volume, after planting a staged file for it to set aside — it
+must arrive in the quarantine and be gone from the data directory, which must then check clean —
+and an `excalibur-backup snapshot` into a backup volume, verified `--deep` from a second container.
 
 ## FAQ
 
@@ -2664,11 +3057,19 @@ still arriving is the traffic that has not noticed yet. `DELETE /v1/drain` puts 
 restart clears the flag.
 
 **A node answers 200 to everything but its results are worse than its sibling's.**
-A circuit breaker has probably opened, and neither one says so anywhere a caller could see. The
-embedding breaker drops retrieval to lexical-only; the relevancy breaker bypasses LLM
-re-ranking and leaves the answer with the ranking it already had. Read `breakers` on `/v1/stats`,
-or alert on `excalibur_circuit_breaker_state > 0` from `/metrics` — both report under that one
-gauge, distinguished by a `breaker` label.
+A circuit breaker has probably opened, and none of them says so in a response. The embedding
+breaker drops retrieval to lexical-only; the relevancy breaker bypasses LLM re-ranking and leaves
+the answer with the ranking it already had; the query-expansion breaker searches every query as
+typed, without the formulations that widen its recall. The one in front of relation
+extraction does not touch queries at all: documents keep being indexed and none of them adds to
+the graph. On the graph route, the rerank breaker leaves answers in the order BM25 (or the exact
+vector rerank) gave them, and the question-embedding breaker skips that vector rerank. The
+build-embedding breaker leaves a graph build publishing its entities without vectors, so questions
+about them rank without the vector rerank until a later build embeds them. Read
+`breakers` on `/v1/stats`, or alert on `excalibur_circuit_breaker_state > 0` from `/metrics` — each
+of the seven reports under that one gauge, distinguished by a `breaker` label (`embedding`,
+`llm_relevancy`, `query_expansion`, `graph_extraction`, `graph_rerank`, `graph_query_embedding`,
+`graph_build_embedding`). The graph three carry no namespace label: every namespace shares them.
 
 **`/health` says `healthy` and `coverage: 1.0000`, but there is no data in the index.**
 Correct, if surprising. The coverage on `/health` is the share of this node's live segments that
@@ -2709,7 +3110,31 @@ staged to build from.
 
 **`/v1/graph/build` returned `"published": false`.**
 Nothing was staged, so the graph you were already serving was left alone. Replacing it with an
-empty one would turn every subsequent question into a refusal.
+empty one would turn every subsequent question into a refusal. The status's `message` says why
+nothing was staged, and `extraction` is the first thing to read.
+
+**I set `excalibur.graph.extraction-enabled=true` and nothing is ever staged.**
+Extraction is a chat-model call, so it also needs `excalibur.llm.api-key` (or
+`EXCALIBUR_LLM_API_KEY`). With the flag and no key the node starts, ingests and searches normally,
+and extracts nothing — so it says so everywhere you would look: a WARN at startup naming both
+settings, and `"extraction": "missing_api_key"` with a `warning` on the answer to
+`POST /v1/graph/build` and on `GET /v1/graph/build/status`. Set the key, restart, and re-ingest:
+documents ingested while extraction was inactive were never offered to the extractor, and a build
+cannot recover facts nobody extracted.
+
+**How much memory does a build need?**
+The edge store is sorted in memory before it is written, so a namespace's build holds every staged
+fact of that namespace on the heap at once — 36 bytes per fact in parallel columns (six `int`
+fields, the `long` source id, the `short` extractor version and two bytes of source type and
+confidence), plus three `int` permutations over all of them while the forward and reverse indexes
+are written, for about 48 bytes per fact at the peak. The buffer grows by half again at a time, so
+allow up to about 66: roughly 5 to 7 GB of heap for a hundred million facts. One build is capped at
+2,147,483,639 facts (2<sup>31</sup> − 9, the largest array a JVM allocates); past that it fails
+with a message naming the cap rather than an `OutOfMemoryError`, whatever the heap. The on-disk
+format has no such limit. Once the store is written the buffer is released, and the Lucene indexes
+are built next from each entity's text — held in memory too, up to 16,000 characters per entity —
+so a graph of many heavily-mentioned entities needs room for that as well. Builds are one at a time
+per node, so the heap has to cover the largest namespace, not the sum of them.
 
 **Why is erasure a 202 instead of a 200?**
 Because accepting is not removing. The obligation is recorded durably before the response is

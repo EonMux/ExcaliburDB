@@ -195,6 +195,9 @@ final class SegmentRewriter {
                                CompactionOutcome outcome) {
         try {
             if (outcome.retiresCompactedSegment()) {
+                // The replacement owns the canonical name now, sidecar included; closing with the
+                // sketch still attached would write the original's counts over it.
+                segment.detachTermFrequencySketch();
                 segment.close();
             }
             if (outcome.discardsReplacement()) {
@@ -291,7 +294,10 @@ final class SegmentRewriter {
      * so the old segment keeps serving reads until it is closed.</p>
      *
      * <p>The compacted segment starts from an empty write log at the canonical WAL
-     * name: everything the old log contained is already in the compacted file.</p>
+     * name: everything the old log contained is already in the compacted file. The original's
+     * term sketch sidecar is removed before the rename, because it describes the original's
+     * contents; the replacement's own sketch, counted as its entries were copied in, is written
+     * there on its next flush.</p>
      *
      * @param newSegment   The compacted segment
      * @param compactPath  Scratch path the compacted segment was built at
@@ -301,6 +307,7 @@ final class SegmentRewriter {
      */
     private static void swapIntoPlace(Segment newSegment, Path compactPath, Path canonicalPath,
                                       Path writeLogPath) throws IOException {
+        TermSketchFile.deleteFor(canonicalPath);
         Files.move(compactPath, canonicalPath,
             StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         newSegment.renamedTo(canonicalPath);

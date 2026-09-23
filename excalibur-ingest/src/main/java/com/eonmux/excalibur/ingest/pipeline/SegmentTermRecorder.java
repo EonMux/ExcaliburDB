@@ -1,11 +1,12 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
 import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
-import com.eonmux.excalibur.core.text.TermExtractor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashSet;
+import java.util.List;
 
 /**
  * Files the terms of written chunks under the segment that holds them, so the query pipeline can
@@ -54,21 +55,56 @@ final class SegmentTermRecorder {
      * <p>Nothing here can fail the write. A term the filter has no room for takes that segment
      * out of pruning - {@link HierarchicalCuckooFilter#coversSegment} then reports it - and the
      * query reads the segment in full, which is slower and not wrong.</p>
+     *
+     * <p>A filing that throws part-way has to leave the segment in that same state, and does not
+     * on its own. A segment a rebuild has vouched for stays trusted through the failure, with
+     * some of this chunk's terms in its level and the rest missing; a query for a missing one
+     * would then prune the very segment that holds it, which is not a slow answer but a wrong
+     * one. So the level is marked stale: the segment is read in full from here until the next
+     * rebuild of it - a compaction's, a split's or a restart's - refills the level from what the
+     * segment actually holds. The mark is all this layer can do; the rebuild queue belongs to
+     * the index orchestrator, which ingestion does not reach.</p>
+     *
+     * @param segmentId The segment the engine reported the chunk landed in
+     * @param chunkId   The chunk, for the log line a refusal leaves
+     * @param terms     The chunk's {@linkplain com.eonmux.excalibur.ingest.processor.TextChunk#terms()
+     *                  terms}, the same list the write handed the storage engine, so the
+     *                  filter and the segment's frequency sketch are fed from one tokenisation
      */
-    void record(long segmentId, String chunkId, String text) {
+    void record(long segmentId, String chunkId, List<String> terms) {
         HierarchicalCuckooFilter target = this.membershipFilter;
-        if (target == null || text == null || text.isEmpty()) {
+        if (target == null || terms.isEmpty()) {
             return;
         }
         String segment = String.valueOf(segmentId);
         try {
             target.registerSegment(segment);
-            for (String term : TermExtractor.extractUniqueTerms(text)) {
+            for (String term : new LinkedHashSet<>(terms)) {
                 target.insert(term.getBytes(StandardCharsets.UTF_8), segment);
             }
         } catch (RuntimeException e) {
+            distrust(target, segment, e);
             LOGGER.warn("Chunk {} stored but its terms were not filed for pruning; segment {} "
-                + "will be read in full: {}", chunkId, segment, e.toString());
+                + "will be read in full until its level is next rebuilt", chunkId, segment, e);
+        }
+    }
+
+    /**
+     * Takes a segment out of pruning after its terms could not all be filed.
+     *
+     * <p>Cannot itself fail the write either: a mark that throws is attached to the failure it
+     * was answering, which the caller logs.</p>
+     *
+     * @param target  The filter the filing failed against
+     * @param segment The segment's id
+     * @param failure Why the filing failed
+     */
+    private static void distrust(HierarchicalCuckooFilter target, String segment,
+                                 RuntimeException failure) {
+        try {
+            target.markSegmentStale(segment);
+        } catch (RuntimeException e) {
+            failure.addSuppressed(e);
         }
     }
 }

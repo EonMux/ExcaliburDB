@@ -5,10 +5,8 @@ import com.eonmux.excalibur.vector.quantization.ProductQuantizer;
 
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.List;
 import java.util.PriorityQueue;
-import java.util.Set;
 
 /**
  * The quantised half of the query path: the same descent and beam, scored from a
@@ -27,6 +25,10 @@ import java.util.Set;
  * without waiting for the beam to fill. This is the behaviour the graph has always had on this
  * path and is preserved exactly; the full-precision beam's rule, which also requires the beam
  * to be full, is documented on {@link HnswLayerSearch#searchLayerBeam}.</p>
+ *
+ * <h2>Reads</h2>
+ * <p>Like the full-precision walk, this one reads nodes through a {@link HnswTraversal} opened
+ * under the read lock and attaches document ids only to the results it returns.</p>
  *
  * <h2>Reranking</h2>
  * <p>{@link #searchWithPQThenRerank} exists because a segment's answer is merged with the write
@@ -96,16 +98,13 @@ final class HnswQuantizedSearch {
                 return new ArrayList<>();
             }
 
-            // Start from entry point
-            long currentNodeId = graph.entryPointId;
-            HnswGraph.NodeView current = graph.readNode(currentNodeId);
-
-            if (current == null || current.isTombstoned()) {
-                currentNodeId = HnswNodeRecords.findActiveNode(graph.mappedFile, graph.nodeCount);
-                if (currentNodeId < 0) {
+            HnswTraversal traversal = HnswTraversal.open(graph);
+            long current = graph.entryPointId;
+            if (!traversal.isActive(current)) {
+                current = HnswNodeRecords.findActiveNode(graph.mappedFile, graph.nodeCount);
+                if (current < 0) {
                     return new ArrayList<>();
                 }
-                current = graph.readNode(currentNodeId);
             }
 
             // As in search(): the layer-0 beam is trimmed to ef entries, so a beam narrower
@@ -113,37 +112,20 @@ final class HnswQuantizedSearch {
             // nothing to say it was short.
             final int efSearch = Math.max(graph.config.efSearch(), k);
 
-            // Search through layers from top to layer 1
             for (int level = graph.maxLevel; level > 0; level--) {
-                HnswGraph.NodeView closest = searchLayerSimple(query, current, level, distanceTable);
-                if (closest != null) {
-                    current = closest;
-                }
+                current = searchLayerSimple(traversal, query, current, level, distanceTable);
             }
 
-            // At layer 0, perform beam search with PQ
-            PriorityQueue<HnswSearchResult> results = searchLayerBeam(
-                query, current, 0, efSearch, distanceTable);
+            List<HnswSearchResult> nearestFirst = new ArrayList<>(
+                searchLayerBeam(traversal, query, current, 0, efSearch, distanceTable));
+            nearestFirst.sort(Comparator.comparingDouble(HnswSearchResult::distance));
 
-            // Extract and sort results, re-checking tombstones the way search() does: a node
-            // admitted to the beam can be tombstoned before it is extracted, and returning it
-            // hands back a deleted document.
-            List<HnswSearchResult> allResults = new ArrayList<>();
-            while (!results.isEmpty()) {
-                HnswSearchResult result = results.poll();
-                HnswGraph.NodeView node = graph.readNode(result.nodeId());
-                if (node != null && !node.isTombstoned()) {
-                    allResults.add(result);
-                }
+            int count = Math.min(k, nearestFirst.size());
+            List<HnswSearchResult> topResults = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                HnswSearchResult result = nearestFirst.get(i);
+                topResults.add(graph.createSearchResult(result.nodeId(), result.distance()));
             }
-
-            allResults.sort(Comparator.comparingDouble(HnswSearchResult::distance));
-
-            List<HnswSearchResult> topResults = new ArrayList<>();
-            for (int i = 0; i < Math.min(k, allResults.size()); i++) {
-                topResults.add(allResults.get(i));
-            }
-
             return topResults;
         } finally {
             graph.lock.readLock().unlock();
@@ -214,14 +196,13 @@ final class HnswQuantizedSearch {
 
         graph.lock.readLock().lock();
         try {
+            HnswTraversal traversal = HnswTraversal.open(graph);
             List<HnswSearchResult> measured = new ArrayList<>(candidates.size());
             for (HnswSearchResult candidate : candidates) {
-                HnswGraph.NodeView node = graph.readNode(candidate.nodeId());
-                if (node == null || node.isTombstoned()) {
-                    continue;
+                if (traversal.isActive(candidate.nodeId())) {
+                    measured.add(graph.createSearchResult(
+                        candidate.nodeId(), traversal.distance(query, candidate.nodeId())));
                 }
-                measured.add(graph.createSearchResult(
-                    candidate.nodeId(), graph.computeDistance(query, node.vector())));
             }
 
             measured.sort(Comparator.comparingDouble(HnswSearchResult::distance));
@@ -232,98 +213,88 @@ final class HnswQuantizedSearch {
     }
 
     /**
-     * Simple greedy search at a single layer using PQ distances.
+     * Simple greedy search at a single layer using PQ distances. Tombstoned nodes are skipped.
      */
-    private HnswGraph.NodeView searchLayerSimple(float[] query, HnswGraph.NodeView entry,
-                                                 int level, PQDistanceTable distanceTable) {
-        HnswGraph.NodeView current = entry;
-        float currentDist = quantization.distance(query, current, distanceTable);
+    private long searchLayerSimple(HnswTraversal traversal, float[] query, long entry,
+                                   int level, PQDistanceTable distanceTable) {
+        long current = entry;
+        float currentDist = quantization.distance(query, traversal, current, distanceTable);
         boolean improved = true;
 
         while (improved) {
             improved = false;
-            List<Long> neighbors = current.getActiveNeighbors(level);
-
-            for (long neighborId : neighbors) {
-                HnswGraph.NodeView neighbor = graph.readNode(neighborId);
-                if (neighbor == null || neighbor.isTombstoned()) {
+            int count = traversal.readNeighbors(current, level);
+            int[] neighbors = traversal.neighbors();
+            for (int i = 0; i < count; i++) {
+                long neighborId = neighbors[i];
+                if (!traversal.isActive(neighborId)) {
                     continue;
                 }
-
-                float dist = quantization.distance(query, neighbor, distanceTable);
+                float dist = quantization.distance(query, traversal, neighborId, distanceTable);
                 if (dist < currentDist) {
                     currentDist = dist;
-                    current = neighbor;
+                    current = neighborId;
                     improved = true;
                 }
             }
         }
-
         return current;
     }
 
     /**
-     * Beam search at a layer using PQ distances.
+     * Beam search at a layer using PQ distances. Tombstoned nodes are never measured or kept.
+     *
+     * @return A max-heap of the beam's contents, furthest first, without document ids
      */
     private PriorityQueue<HnswSearchResult> searchLayerBeam(
-            float[] query, HnswGraph.NodeView entry, int level, int ef,
+            HnswTraversal traversal, float[] query, long entry, int level, int ef,
             PQDistanceTable distanceTable) {
 
         PriorityQueue<HnswSearchResult> results = new PriorityQueue<>(
             Comparator.comparingDouble(HnswSearchResult::distance).reversed());
         PriorityQueue<HnswSearchResult> candidates = new PriorityQueue<>(
             Comparator.comparingDouble(HnswSearchResult::distance));
-        Set<Long> visited = new HashSet<>();
-
-        if (entry == null || entry.isTombstoned()) {
+        if (!traversal.isActive(entry)) {
             return results;
         }
 
-        float entryDist = quantization.distance(query, entry, distanceTable);
-        HnswSearchResult entryResult = graph.createSearchResult(entry.nodeId(), entryDist);
-        candidates.add(entryResult);
-        results.add(entryResult);
-        visited.add(entry.nodeId());
+        HnswVisitedPool.Marker visited = graph.visitedPool.borrow(traversal.nodeLimit());
+        try {
+            HnswSearchResult entryResult = new HnswSearchResult(
+                entry, quantization.distance(query, traversal, entry, distanceTable));
+            candidates.add(entryResult);
+            results.add(entryResult);
+            visited.visit((int) entry);
 
-        while (!candidates.isEmpty()) {
-            HnswSearchResult current = candidates.poll();
-            HnswGraph.NodeView currentNode = graph.readNode(current.nodeId());
-
-            if (currentNode == null || currentNode.isTombstoned()) {
-                continue;
-            }
-
-            if (!results.isEmpty() && current.distance() > results.peek().distance()) {
-                break;
-            }
-
-            List<Long> neighbors = currentNode.getActiveNeighbors(level);
-
-            for (long neighborId : neighbors) {
-                if (visited.contains(neighborId)) {
-                    continue;
-                }
-                visited.add(neighborId);
-
-                HnswGraph.NodeView neighbor = graph.readNode(neighborId);
-                if (neighbor == null || neighbor.isTombstoned()) {
-                    continue;
+            while (!candidates.isEmpty()) {
+                HnswSearchResult current = candidates.poll();
+                if (!results.isEmpty() && current.distance() > results.peek().distance()) {
+                    break;
                 }
 
-                float dist = quantization.distance(query, neighbor, distanceTable);
-                HnswSearchResult result = graph.createSearchResult(neighborId, dist);
+                int count = traversal.readNeighbors(current.nodeId(), level);
+                int[] neighbors = traversal.neighbors();
+                for (int i = 0; i < count; i++) {
+                    int neighborId = neighbors[i];
+                    if (!HnswLayerSearch.firstVisit(traversal, visited, neighborId)
+                            || !traversal.isActive(neighborId)) {
+                        continue;
+                    }
 
-                if (results.size() < ef || dist < results.peek().distance()) {
-                    candidates.add(result);
-                    results.add(result);
-
-                    while (results.size() > ef) {
-                        results.poll();
+                    float dist = quantization.distance(query, traversal, neighborId, distanceTable);
+                    if (results.size() < ef || dist < results.peek().distance()) {
+                        HnswSearchResult result = new HnswSearchResult(neighborId, dist);
+                        candidates.add(result);
+                        results.add(result);
+                        if (results.size() > ef) {
+                            results.poll();
+                        }
                     }
                 }
             }
+            return results;
+        } finally {
+            graph.visitedPool.release(visited);
         }
-
-        return results;
     }
 }

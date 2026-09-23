@@ -139,7 +139,7 @@ class ScheduledReindexIntegrationTest {
             when(mockResult.hasErrors()).thenReturn(false);
             when(mockSource.getSourceId()).thenReturn("1");
             when(mockResolver.resolve("1")).thenReturn(mockSource);
-            when(mockReindexer.reindexAll(eq(mockSource), any())).thenReturn(mockResult);
+            when(mockReindexer.reindexAll(eq(mockSource), any(), any())).thenReturn(mockResult);
 
             // Configure reindexer
             server.withReindexer(mockReindexer, mockResolver);
@@ -154,7 +154,7 @@ class ScheduledReindexIntegrationTest {
 
             // Verify reindex was triggered and reindexer was called
             assertThat(triggered).isTrue();
-            verify(mockReindexer, times(1)).reindexAll(eq(mockSource), any());
+            verify(mockReindexer, times(1)).reindexAll(eq(mockSource), any(), any());
         }
 
         @Test
@@ -180,7 +180,7 @@ class ScheduledReindexIntegrationTest {
 
             // Verify reindex was not triggered (returns false)
             assertThat(triggered).isFalse();
-            verify(mockReindexer, never()).reindexAll(any(), any());
+            verify(mockReindexer, never()).reindexAll(any(), any(), any());
         }
 
         @Test
@@ -193,7 +193,7 @@ class ScheduledReindexIntegrationTest {
 
             when(mockSource.getSourceId()).thenReturn("2");
             when(mockResolver.resolve("2")).thenReturn(mockSource);
-            when(mockReindexer.reindexAll(eq(mockSource), any()))
+            when(mockReindexer.reindexAll(eq(mockSource), any(), any()))
                 .thenThrow(new RuntimeException("Simulated reindex failure"));
 
             // Configure reindexer
@@ -209,7 +209,7 @@ class ScheduledReindexIntegrationTest {
 
             // Verify reindex was attempted but returned false due to exception
             assertThat(triggered).isFalse();
-            verify(mockReindexer, times(1)).reindexAll(eq(mockSource), any());
+            verify(mockReindexer, times(1)).reindexAll(eq(mockSource), any(), any());
         }
 
         @Test
@@ -224,7 +224,7 @@ class ScheduledReindexIntegrationTest {
             when(mockResult.hasErrors()).thenReturn(true);
             when(mockSource.getSourceId()).thenReturn("3");
             when(mockResolver.resolve("3")).thenReturn(mockSource);
-            when(mockReindexer.reindexAll(eq(mockSource), any())).thenReturn(mockResult);
+            when(mockReindexer.reindexAll(eq(mockSource), any(), any())).thenReturn(mockResult);
 
             // Configure reindexer
             server.withReindexer(mockReindexer, mockResolver);
@@ -239,7 +239,7 @@ class ScheduledReindexIntegrationTest {
 
             // Verify reindex was triggered but returned false due to errors
             assertThat(triggered).isFalse();
-            verify(mockReindexer, times(1)).reindexAll(eq(mockSource), any());
+            verify(mockReindexer, times(1)).reindexAll(eq(mockSource), any(), any());
         }
     }
 

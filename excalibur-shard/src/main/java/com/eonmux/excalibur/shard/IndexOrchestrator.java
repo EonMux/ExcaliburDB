@@ -29,6 +29,7 @@ import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.BooleanSupplier;
 
 /**
  * Coordinates all background index workers for ExcaliburDB.
@@ -629,9 +630,51 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * HnswIntegrationWorker → CuckooMetricsWorker → CuckooMaintenanceWorker →
      * EpochTickScheduler. The epoch ticker is last because its stop fences an
      * already-dispatched tick, a promise that only holds once nothing can publish new work.</p>
+     *
+     * <p>The workers are asked to stop, not interrupted, and each is waited for within its own
+     * bound; {@link #shutdown()} is the variant that says whether they all ended.</p>
      */
     public void stop() {
-        if (stopped.compareAndSet(false, true)) {
+        stopWorkers();
+    }
+
+    /**
+     * Stops every background worker and reports whether they all ended.
+     *
+     * <p>No worker is interrupted. Each rewrites, maps, grows or forces files through channels
+     * that queries and writers share, and an interrupt reaching one inside such an operation
+     * closes the channel for all of them; so each is asked through a signal it reads between
+     * units of work and waited for within its own bound. A worker still inside a segment
+     * rewrite or a graph swap when its bound runs out is left to finish it.</p>
+     *
+     * <p>The answer is what a caller about to close the storage engine needs: false means work
+     * is still running against segments mapped out of the engine's arena, and closing it would
+     * unmap memory under that work, which ends the process. Idempotent: a later call waits again
+     * for what an earlier one left running, and answers from the workers' state, not from
+     * whether this is the first call.</p>
+     *
+     * <p>Unlike {@link #stop()} this is final: it also drains the term filter rebuilds, which
+     * copy out of the same segment mappings, and a drained orchestrator is not started again.
+     * {@link #close()} still has to be called for the rest of what the orchestrator holds, and
+     * calls this first.</p>
+     *
+     * @return true if every background worker, the reconciliation sweep and every term filter
+     *         rebuild have ended
+     */
+    public boolean shutdown() {
+        boolean workersEnded = stopWorkers();
+        boolean rebuildsEnded = registry.close();
+        return workersEnded && rebuildsEnded;
+    }
+
+    /**
+     * Stops the reconciliation sweep and then the workers, once, and reports whether they ended.
+     *
+     * @return true if every one of them has ended
+     */
+    private boolean stopWorkers() {
+        boolean first = stopped.compareAndSet(false, true);
+        if (first) {
             running.set(false);
 
             LOGGER.info("Stopping index orchestrator...");
@@ -640,7 +683,10 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
             // one thing that registers new index structures, and it must not be able to do so
             // into a worker set that is going down.
             segmentSync.stop();
-            workers.stop();
+        }
+        boolean syncEnded = segmentSync.shutdown();
+        boolean workersEnded = workers.stop();
+        if (first) {
 
             LOGGER.info("Index orchestrator stopped. HNSW integrated: {}, Cuckoo deletions: {}, Reindexes: {}, Compactions: {}, HNSW compactions: {}, PQ trained: {}, Epoch ticks: {}, Cuckoo FP samples: {}",
                 workers.hnsw().getTotalIntegrated(), workers.cuckoo().getTotalDeletions(),
@@ -649,14 +695,25 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
                 workers.warming().getTotalPqTrained(), workers.epochTicks().getTickCount(),
                 workers.cuckooMetrics().getTotalSamplesRecorded());
         }
+        boolean ended = syncEnded && workersEnded;
+        if (!ended) {
+            LOGGER.warn("Index orchestrator stopped with background work still running; the "
+                + "storage engine it runs against must not be closed under it");
+        }
+        return ended;
     }
 
+    /**
+     * Stops the workers, as {@link #shutdown()}, and releases what the orchestrator holds.
+     *
+     * <p>Callers that go on to close the storage engine should call {@link #shutdown()} first
+     * and act on its answer; this cannot return one.</p>
+     */
     @Override
     public void close() {
-        stop();
+        shutdown();
         // Close the epoch tick scheduler to shut down its executor
         workers.close();
-        segmentSync.shutdown();
     }
 
     /**
@@ -900,12 +957,27 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     }
 
     /**
-     * Returns the number of pending Cuckoo filter deletions.
+     * Returns how many Cuckoo filter entries are waiting to be removed.
      *
-     * @return Pending deletion count
+     * <p>Every entry still held by a tombstoned segment the maintenance worker has not yet
+     * cleaned; see {@link CuckooMaintenanceWorker#getPendingDeletionCount()}.</p>
+     *
+     * @return Pending deletion count, in filter entries
      */
     public int getPendingCuckooDeletions() {
         return workers.cuckoo().getPendingDeletionCount();
+    }
+
+    /**
+     * Returns the estimated false-positive rates of the registered segments' Cuckoo filters.
+     *
+     * <p>Read now, from the filters themselves, rather than from the last scheduled sample;
+     * see {@link CuckooMetricsWorker#sample()}.</p>
+     *
+     * @return The average and worst rate over the segments whose filters hold anything
+     */
+    public CuckooMetricsWorker.FpRates getCuckooFpRates() {
+        return workers.cuckooMetrics().sample();
     }
 
     /**
@@ -1127,6 +1199,59 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     }
 
     /**
+     * Marks both children's term filter levels stale before either can take a write.
+     *
+     * <p>Each child holds a share of its parent's entries that no write ever filed under it. The
+     * right child's first write would otherwise leave its level non-empty and missing everything
+     * it inherited, and stage 1 of the query pipeline would rule it out for those terms from
+     * then until something noticed - a window that opens the moment routing reaches the child,
+     * before {@link #onSplitComplete} is called. The rebuilds that clear these marks are queued
+     * when the children are registered.</p>
+     *
+     * @param parent     The segment being split
+     * @param leftIndex  The left child's directory index
+     * @param rightIndex The right child's directory index
+     */
+    @Override
+    public void onSplitPublishing(Segment parent, long leftIndex, long rightIndex) {
+        registry.markTermFilterStale(leftIndex);
+        registry.markTermFilterStale(rightIndex);
+    }
+
+    /**
+     * Returns the parent's level to service after a split that was not published.
+     *
+     * <p>The parent still holds every key and is still registered under the left index, so its
+     * level is refilled from it, which clears the advance mark. Nothing serves the right index;
+     * its mark stays until a segment is registered there, which rebuilds it anyway.</p>
+     *
+     * @param parent     The segment that stays in service
+     * @param leftIndex  The index it is registered under
+     * @param rightIndex The index the right child would have taken
+     */
+    @Override
+    public void onSplitAbandoned(Segment parent, long leftIndex, long rightIndex) {
+        registry.rebuildTermFilter(leftIndex);
+    }
+
+    /**
+     * Waits until every queued refill of a segment's term filter level has finished.
+     *
+     * <p>A segment whose level is being refilled is searched in full, so nothing waits on this
+     * for correctness. It is for callers that want the pruning back before they measure - a
+     * benchmark after bootstrap, or a test.</p>
+     *
+     * @param timeout How long to wait
+     * @param unit    The unit of the timeout
+     * @return true if every queued refill finished in time
+     * @throws InterruptedException if the wait is interrupted
+     */
+    public boolean awaitTermFilterRebuilds(long timeout, java.util.concurrent.TimeUnit unit)
+            throws InterruptedException {
+        return registry.awaitTermFilterRebuilds(timeout, unit);
+    }
+
+    /**
      * Sets the handler for reindex operations.
      *
      * <p>When configured, scheduled reindex operations will delegate to this
@@ -1217,19 +1342,46 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * counted in the report. The report is the honest answer - partial success is reported as
      * partial success rather than as either extreme.</p>
      *
-     * <h3>Interruption</h3>
-     * <p>The run stops at the next segment boundary when its thread is interrupted, returns a
-     * report of what it had done by then, and leaves the interrupt flag set for the caller that
-     * set it. This is how a shutdown reclaims the thread: the drain interrupts a run that has
-     * outstayed its grace period and then closes the arena the segments are mapped out of, and
-     * a run that ignored the interrupt would go on copying entries out of memory being unmapped
-     * underneath it.</p>
+     * <p>This form cannot be stopped short except by interrupting its thread, which is read at
+     * the same points as the signal of {@link #compactNow(boolean, BooleanSupplier)} - but an
+     * interrupt that lands inside a rewrite's channel operation closes that channel for every
+     * thread using it, so anything that may need to stop a run should use that form instead.</p>
      *
      * @param force true to compact every live segment and graph regardless of the thresholds
      * @return What the run examined, reclaimed and failed on
      */
     public CompactionReport compactNow(boolean force) {
-        return onDemandCompaction.run(force);
+        return compactNow(force, () -> false);
+    }
+
+    /**
+     * As {@link #compactNow(boolean)}, and stoppable.
+     *
+     * <h3>Stopping</h3>
+     * <p>{@code stopRequested} is read before each segment, before the first graph and before
+     * each further graph. Once it answers true the run examines nothing more, returns a report
+     * of what it had done by then, and leaves unreached segments and graphs to the background
+     * workers - they are not counted as considered. A rewrite or rebuild already under way is
+     * finished rather than abandoned: it publishes files and swaps mappings in an order that
+     * only makes sense run to completion.</p>
+     *
+     * <p>This is how a shutdown reclaims a long run: it sets the signal, waits for this call to
+     * return, and only then closes the arena the segments are mapped out of - a run still going
+     * would be copying entries out of memory being unmapped underneath it. It must not interrupt
+     * the thread instead: every rewrite creates, maps, grows and forces files through channels
+     * that queries and writers go on to share, and an interrupt reaching the run inside one of
+     * those operations closes the channel for all of them. An interrupt that arrives anyway is
+     * read as a stop at the same points and its flag is left set.</p>
+     *
+     * @param force         true to compact every live segment and graph regardless of the
+     *                      thresholds
+     * @param stopRequested Answers true once the run should stop at its next safe point
+     * @return What the run examined, reclaimed and failed on
+     * @throws NullPointerException if stopRequested is null
+     */
+    public CompactionReport compactNow(boolean force, BooleanSupplier stopRequested) {
+        Objects.requireNonNull(stopRequested, "stopRequested cannot be null");
+        return onDemandCompaction.run(force, stopRequested);
     }
 
     /**

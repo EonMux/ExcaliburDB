@@ -478,19 +478,22 @@ public record CoreComponents(Arena arena,
     }
 
     /**
-     * Registers existing segments with the IndexOrchestrator for HNSW integration.
+     * Registers every segment opened at startup with the IndexOrchestrator.
      *
-     * <p>This method iterates through all existing segments in the storage engine
-     * and registers those with HNSW graphs with the IndexOrchestrator. This enables
-     * the HnswIntegrationWorker to integrate vectors from the write log.</p>
-     *
-     * <p>Segments without HNSW graphs (created before HNSW was enabled) are skipped.</p>
+     * <p>Registration is what schedules a segment's refill in the term membership filter, and
+     * a level no refill has vouched for is never trusted to rule its segment out of a query. A
+     * segment left unregistered here would stay searched in full until something else happened
+     * to register it, and would be integrated into no graph, compacted by nobody and invisible
+     * to epoch-based visibility for the same time. So every segment is registered, as the
+     * orchestrator's own reconciliation with the directory does; one without an HNSW graph or
+     * tail tracker is registered with none, and the HNSW workers are simply not told of it.</p>
      */
     private static void registerExistingSegmentsWithOrchestrator(StorageEngine storageEngine,
                                                                  IndexOrchestrator indexOrchestrator) {
         LOGGER.info("Registering existing segments with IndexOrchestrator...");
 
         int registeredCount = 0;
+        int withGraph = 0;
 
         // getSegments() returns the DISTINCT segments keyed by their canonical index.
         // Walking 0..getSegmentCount() instead walks the routing directory width, which
@@ -504,21 +507,21 @@ public record CoreComponents(Arena arena,
 
             HnswGraph graph = segment.getHnswGraph();
             TailOffsetTracker tracker = segment.getTailOffsetTracker();
-
+            indexOrchestrator.registerSegment(
+                segmentId,
+                segment,
+                graph,
+                null, // CuckooFilter - the segment's level in the hierarchy is resolved there
+                tracker
+            );
+            registeredCount++;
             if (graph != null && tracker != null) {
-                indexOrchestrator.registerSegment(
-                    segmentId,
-                    segment,
-                    graph,
-                    null, // CuckooFilter - handled separately
-                    tracker
-                );
-                registeredCount++;
-                LOGGER.debug("Registered segment {} with IndexOrchestrator", segmentId);
+                withGraph++;
             }
+            LOGGER.debug("Registered segment {} with IndexOrchestrator", segmentId);
         }
 
-        LOGGER.info("Registered {} segments with IndexOrchestrator for HNSW integration",
-            registeredCount);
+        LOGGER.info("Registered {} segments with IndexOrchestrator, {} of them for HNSW "
+            + "integration", registeredCount, withGraph);
     }
 }

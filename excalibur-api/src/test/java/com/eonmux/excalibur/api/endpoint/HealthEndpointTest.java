@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
+import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.store.LifecycleState;
 import com.eonmux.excalibur.store.SegmentCatalog;
@@ -42,6 +43,7 @@ class HealthEndpointTest {
     void setUp() {
         segmentCatalog = new SegmentCatalog();
         indexOrchestrator = mock(IndexOrchestrator.class);
+        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         visibilityTracker = new VisibilityTracker(segmentCatalog);
         
         when(indexOrchestrator.getVisibilityTracker()).thenReturn(visibilityTracker);

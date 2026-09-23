@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 
 import com.eonmux.excalibur.api.bootstrap.GraphRagFactory;
+import com.eonmux.excalibur.api.bootstrap.GraphTenant;
 import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.graph.dictionary.LabelDictionaryWriter;
 import com.eonmux.excalibur.graph.provenance.Provenance;
@@ -101,7 +102,7 @@ class GraphCalibrationHarnessTest {
     @Test
     @DisplayName("fits both axes against a real graph and reports what it measured")
     void fitsARealGraph(@TempDir Path dataDir) throws Exception {
-        Path graphDir = dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY);
+        Path graphDir = dataDir.resolve(GraphTenant.GRAPH_SUBDIRECTORY);
         buildGraph(graphDir);
 
         try (GraphRagFactory.GraphRag graph = GraphRagFactory.openAt(config(), graphDir)) {
@@ -126,7 +127,7 @@ class GraphCalibrationHarnessTest {
     @Test
     @DisplayName("the correctness rule reads the subgraph, not the best-matching candidate")
     void correctnessReadsTheSubgraph(@TempDir Path dataDir) throws Exception {
-        Path graphDir = dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY);
+        Path graphDir = dataDir.resolve(GraphTenant.GRAPH_SUBDIRECTORY);
         buildGraph(graphDir);
 
         try (GraphRagFactory.GraphRag graph = GraphRagFactory.openAt(config(), graphDir)) {
@@ -153,7 +154,7 @@ class GraphCalibrationHarnessTest {
     @Test
     @DisplayName("a judged answer this graph does not hold is excluded, not scored as wrong")
     void unjudgeableQuestionsAreExcluded(@TempDir Path dataDir) throws Exception {
-        Path graphDir = dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY);
+        Path graphDir = dataDir.resolve(GraphTenant.GRAPH_SUBDIRECTORY);
         buildGraph(graphDir);
 
         try (GraphRagFactory.GraphRag graph = GraphRagFactory.openAt(config(), graphDir)) {
@@ -177,7 +178,7 @@ class GraphCalibrationHarnessTest {
     @Test
     @DisplayName("overall coverage counts the questions that never reached abstention")
     void overallCoverageCountsEveryQuestion(@TempDir Path dataDir) throws Exception {
-        Path graphDir = dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY);
+        Path graphDir = dataDir.resolve(GraphTenant.GRAPH_SUBDIRECTORY);
         buildGraph(graphDir);
 
         try (GraphRagFactory.GraphRag graph = GraphRagFactory.openAt(config(), graphDir)) {
@@ -201,7 +202,7 @@ class GraphCalibrationHarnessTest {
     @Test
     @DisplayName("the printed configuration is the configuration that was fitted")
     void propertiesMatchTheFit(@TempDir Path dataDir) throws Exception {
-        Path graphDir = dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY);
+        Path graphDir = dataDir.resolve(GraphTenant.GRAPH_SUBDIRECTORY);
         buildGraph(graphDir);
 
         try (GraphRagFactory.GraphRag graph = GraphRagFactory.openAt(config(), graphDir)) {
@@ -231,7 +232,7 @@ class GraphCalibrationHarnessTest {
     @Test
     @DisplayName("calibrating against no judged questions is refused")
     void needsJudgedQuestions(@TempDir Path dataDir) throws Exception {
-        Path graphDir = dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY);
+        Path graphDir = dataDir.resolve(GraphTenant.GRAPH_SUBDIRECTORY);
         buildGraph(graphDir);
 
         try (GraphRagFactory.GraphRag graph = GraphRagFactory.openAt(config(), graphDir)) {
@@ -247,7 +248,7 @@ class GraphCalibrationHarnessTest {
     @Test
     @DisplayName("a set whose answers this graph holds none of is a failure, not an empty fit")
     void nothingFittableIsAFailure(@TempDir Path dataDir) throws Exception {
-        Path graphDir = dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY);
+        Path graphDir = dataDir.resolve(GraphTenant.GRAPH_SUBDIRECTORY);
         buildGraph(graphDir);
 
         try (GraphRagFactory.GraphRag graph = GraphRagFactory.openAt(config(), graphDir)) {

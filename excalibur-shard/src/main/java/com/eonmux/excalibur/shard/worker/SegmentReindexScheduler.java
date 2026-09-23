@@ -227,19 +227,27 @@ public class SegmentReindexScheduler {
     }
 
     /**
-     * Stops the background re-index scheduler.
+     * Stops the background re-index scheduler and says whether it actually ended.
      *
-     * <p>This method signals the scheduler to stop and waits for it to complete
-     * any in-progress scheduling operations.</p>
+     * <p>A scheduled re-index runs on the scheduler's own thread, and a re-index writes chunks
+     * into storage - every append forcing the segment's write log through a channel shared by
+     * every writer - and rewrites the lexical index and the document registry. So the scheduler
+     * is never interrupted: an interrupt landing on one of those writes closes the channel for
+     * the life of the process. A re-index is stopped through the claim it runs under, which the
+     * node drains before stopping this; what is left here is waited for and, if it outlives the
+     * wait, reported, because the caller closes the storage it is writing into next.</p>
+     *
+     * @return true if no scheduled re-index is still running
      */
-    public void stop() {
+    public boolean stop() {
         if (stopped.compareAndSet(false, true)) {
             running.set(false);
 
             scheduler.shutdown();
             try {
                 if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                    scheduler.shutdownNow();
+                    LOGGER.warn("A scheduled re-index was still running 5s after the scheduler "
+                        + "was asked to stop; it is left to reach its own stopping point");
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -248,6 +256,7 @@ public class SegmentReindexScheduler {
             LOGGER.info("Segment re-index scheduler stopped. Triggered: {}, completed: {}, failed: {}",
                 totalReindexesTriggered.get(), totalReindexesCompleted.get(), totalReindexesFailed.get());
         }
+        return scheduler == null || scheduler.isTerminated();
     }
 
     /**

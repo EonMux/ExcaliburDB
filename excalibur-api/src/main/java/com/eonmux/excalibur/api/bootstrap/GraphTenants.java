@@ -140,6 +140,28 @@ public final class GraphTenants implements AutoCloseable {
     private final ScheduledExecutorService erasureSweep;
 
     /**
+     * Set by {@link #close()}; read by the sweep before each namespace it would compact.
+     *
+     * <p>The sweep's stop. It is never interrupted: a compaction rewrites a namespace's store,
+     * forces its erasure log and reopens the served stack, all through channels the queries and
+     * erasure requests on that namespace share, and an interrupt reaching any of those
+     * operations closes the channel for every one of them. Between namespaces is the boundary
+     * where stopping leaves nothing half-done - an obligation not reached is still in its log
+     * and is discharged after the restart.</p>
+     */
+    private volatile boolean closing;
+
+    /**
+     * The chat and embedding clients every tenant's graph reranks and embeds through.
+     *
+     * <p>One set for the node, not one per tenant, because the breaker in front of a model call
+     * describes the endpoint and every tenant calls the same one; see {@link GraphModelClients}.
+     * It is also what bounds the breakers the node reports to one series each, however many
+     * namespaces it serves.</p>
+     */
+    private final GraphModelClients models;
+
+    /**
      * A lease on the shared namespace, held for the life of this registry.
      *
      * <p>The shared namespace is where every request without a {@value #NAMESPACE_HEADER} header
@@ -153,6 +175,16 @@ public final class GraphTenants implements AutoCloseable {
      * published document rather than holding a staging store across an eviction.</p>
      */
     private final NamespaceRegistry.Lease<GraphTenant> sharedLease;
+
+    /**
+     * Whether ingestion on this node extracts facts, as the ingestion wiring settled it.
+     *
+     * <p>Held here because this is the object every graph route is built over, and the build
+     * routes are where an operator finds out a build published nothing. Null until ingestion is
+     * wired, and on a node whose ingestion pipeline could not be built at all - in which case
+     * nothing is ingested and the reason is in the startup log.</p>
+     */
+    private volatile GraphExtraction extraction;
 
     /**
      * Opens the tenant registry rooted at {@code root}.
@@ -178,6 +210,7 @@ public final class GraphTenants implements AutoCloseable {
         this.erasureMaxLatency =
             Duration.ofSeconds(config.graph().getErasureMaxLatencySeconds());
         this.maxOpen = maxOpen;
+        this.models = GraphModelClients.forConfig(config);
         // Never more than the registry can hold open: beyond that a pass is only evicting the
         // tenants it reopened earlier in the same pass.
         this.reopensPerSweep = Math.max(1, Math.min(MAX_REOPENS_PER_SWEEP, maxOpen));
@@ -189,7 +222,8 @@ public final class GraphTenants implements AutoCloseable {
         this.registry = new NamespaceRegistry<>(
             this.root,
             (id, directory) ->
-                GraphTenant.open(id, directory.resolve(GraphTenant.GRAPH_SUBDIRECTORY), config),
+                GraphTenant.open(id, directory.resolve(GraphTenant.GRAPH_SUBDIRECTORY), config,
+                    models),
             GraphTenant::cost,
             budget,
             tiering,
@@ -265,6 +299,9 @@ public final class GraphTenants implements AutoCloseable {
     private int compactResidentNamespaces() {
         int owing = 0;
         for (NamespaceId id : openNamespaces()) {
+            if (closing) {
+                break;
+            }
             Optional<NamespaceRegistry.Lease<GraphTenant>> lease = borrowResident(id);
             if (lease.isEmpty()) {
                 // Evicted between listing and borrowing. borrowResident declines to reopen it
@@ -301,6 +338,9 @@ public final class GraphTenants implements AutoCloseable {
 
         int owing = 0;
         for (Overdue candidate : due.subList(0, Math.min(due.size(), reopensPerSweep))) {
+            if (closing) {
+                break;
+            }
             NamespaceId id = candidate.id();
             try {
                 // borrowIfPresent, not borrowResident: this one has to load. It also marks
@@ -383,32 +423,44 @@ public final class GraphTenants implements AutoCloseable {
     /**
      * Compacts one borrowed tenant if it owes anything.
      *
+     * <p>Nothing escapes it. The two passes visit namespaces in a loop, and a failure let out
+     * of one namespace - checked or not - ends the pass there, leaving every namespace after it
+     * unswept for as long as the one that failed keeps failing.</p>
+     *
      * @param id     The namespace, for the log lines
      * @param tenant Its graph, borrowed for the length of this call
-     * @return true if it had something outstanding, whether or not the compaction ran
+     * @return true if it had something outstanding, whether or not the compaction ran, and for
+     *         one that failed before that could be told
      */
     private boolean compactTenant(NamespaceId id, GraphTenant tenant) {
-        GraphErasureService erasure = tenant.erasureService();
-        if (erasure.outstandingCount() == 0) {
-            return false;
-        }
         try {
+            GraphErasureService erasure = tenant.erasureService();
+            if (erasure.outstandingCount() == 0) {
+                return false;
+            }
+            boolean servedBefore = tenant.holder().isPresent();
             GraphErasureService.ErasureOutcome outcome = erasure.compactIfDue();
             if (outcome.ran()) {
                 LOGGER.info("erasure deadline reached for namespace {}: {} edge(s) removed, "
                     + "{} request(s) discharged, {} withheld", id, outcome.edgesRemoved(),
                     outcome.requestsSatisfied(), outcome.requestsWithheld());
-                // The store the budget was told about is not the one now mapped, and a reopen
-                // that failed leaves the tenant serving nothing while still charged for a graph.
-                recost(id);
             } else {
                 LOGGER.debug("namespace {} owes {} erasure(s), none due yet: {}",
                     id, erasure.outstandingCount(), outcome.reason());
             }
-        } catch (IOException e) {
+            // The store the budget was told about is not the one now mapped after a rewrite. A
+            // reopen that failed leaves the tenant serving nothing while still charged for a
+            // graph, and a graph withheld for an interrupted erasure starts being served once
+            // the erasure is applied, whether or not that rewrote anything.
+            if (outcome.ran() || tenant.holder().isPresent() != servedBefore) {
+                recost(id);
+            }
+        } catch (IOException | RuntimeException e) {
             // One namespace's compaction failing must not stop the others being swept, and must
-            // not stop this one being retried on the next pass.
-            LOGGER.error("could not compact namespace {} for erasure: {}", id, e.toString());
+            // not stop this one being retried on the next pass. Unchecked failures too - a
+            // staging store or erasure log that refuses because it was closed throws one - since
+            // the loop calling this has no catch of its own.
+            LOGGER.error("could not compact namespace {} for erasure: {}", id, e.toString(), e);
         }
         return true;
     }
@@ -1052,6 +1104,25 @@ public final class GraphTenants implements AutoCloseable {
     }
 
     /**
+     * Records whether ingestion on this node extracts facts for the graph.
+     *
+     * @param state What the ingestion wiring settled
+     * @throws NullPointerException if state is null
+     */
+    public void reportExtraction(GraphExtraction state) {
+        this.extraction = Objects.requireNonNull(state, "state cannot be null");
+    }
+
+    /**
+     * Whether ingestion on this node extracts facts for the graph.
+     *
+     * @return The state, or empty when ingestion has not been wired
+     */
+    public Optional<GraphExtraction> extraction() {
+        return Optional.ofNullable(extraction);
+    }
+
+    /**
      * The shared namespace's graph, which is never evicted.
      *
      * <p>For a caller that needs the shared tenant without a borrow, which is safe only because
@@ -1062,6 +1133,18 @@ public final class GraphTenants implements AutoCloseable {
      */
     public GraphTenant shared() {
         return sharedLease.resource();
+    }
+
+    /**
+     * The model clients every tenant's graph reranks and embeds through.
+     *
+     * <p>So the node can report the breakers in front of the graph route's model calls: one
+     * each, because every tenant shares them.</p>
+     *
+     * @return The node's graph model clients
+     */
+    public GraphModelClients models() {
+        return models;
     }
 
     /**
@@ -1093,19 +1176,80 @@ public final class GraphTenants implements AutoCloseable {
         return NamespaceId.of(named);
     }
 
+    /**
+     * Forces every resident namespace's staged facts to the device.
+     *
+     * <h3>Why this is separate from {@link #close()}</h3>
+     * <p>Staged facts are buffered in this process until something flushes them, and closing a
+     * tenant is what normally does. But a shutdown can refuse to close the tenants - a build or a
+     * sweep that outlived its drain is still writing into them - and a process that exits with
+     * the tenants open takes those buffers with it. The facts in them were extracted from
+     * documents the registry already records as ingested, so nothing would ever extract them
+     * again. This runs whether or not the tenants may be closed, so what was staged reaches disk
+     * either way.</p>
+     *
+     * <p>It is also what makes it safe to write the document registry: a registry forced to the
+     * device while the facts of the documents it lists are not is, after a power loss, a registry
+     * that says those facts were taken. So a caller about to persist the registry calls this
+     * first.</p>
+     *
+     * <p>Each namespace is borrowed for the length of its sync, so eviction cannot close its
+     * store underneath, and one that cannot be forced does not stop the rest. A namespace that
+     * is not resident has nothing buffered: eviction closed its store, and closing forces it.</p>
+     *
+     * @return How many resident namespaces could not be forced; zero when everything reached the
+     *         device
+     */
+    public int syncStaging() {
+        int failed = 0;
+        for (NamespaceId id : openNamespaces()) {
+            Optional<NamespaceRegistry.Lease<GraphTenant>> lease = borrowResident(id);
+            if (lease.isEmpty()) {
+                continue;
+            }
+            try (NamespaceRegistry.Lease<GraphTenant> held = lease.get()) {
+                held.resource().staging().sync();
+            } catch (IOException | RuntimeException e) {
+                failed++;
+                LOGGER.error("could not force the staged facts of namespace {} to disk; a crash "
+                    + "or power loss before they are written loses them, and the documents they "
+                    + "came from will not be extracted again: {}", id, e.toString(), e);
+            }
+        }
+        return failed;
+    }
+
+    /**
+     * Stops the erasure sweep, waits for it, and closes every tenant.
+     *
+     * <p>The sweep first, and waited for: it borrows tenants and may be inside a compaction that
+     * has the served stack closed, so shutting the registry under it would race a reopen against
+     * the close. It is asked to stop between namespaces rather than interrupted, for the reason
+     * {@link #closing} gives, so a compaction already under way is finished.</p>
+     *
+     * @throws IllegalStateException if the sweep is still compacting when the wait runs out; the
+     *                               tenants are then left open rather than closed under it, and
+     *                               the failure is what tells the shutdown it did not finish
+     */
     @Override
     public void close() {
-        // The sweep first, and waited for: it borrows tenants and may be inside a compaction
-        // that has the served stack closed, so shutting the registry under it would race a
-        // reopen against the close.
-        erasureSweep.shutdownNow();
+        closing = true;
+        // shutdown, not shutdownNow: the periodic task is cancelled and a sweep in progress
+        // runs to its next namespace boundary uninterrupted.
+        erasureSweep.shutdown();
+        boolean sweepEnded;
         try {
-            if (!erasureSweep.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS)) {
-                LOGGER.warn("the graph erasure sweep did not stop within {}s",
-                    SHUTDOWN_WAIT_SECONDS);
-            }
+            sweepEnded = erasureSweep.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            sweepEnded = erasureSweep.isTerminated();
+        }
+        if (!sweepEnded) {
+            LOGGER.error("the graph erasure sweep was still compacting {}s after being asked to "
+                + "stop; the graph tenants are left open rather than closed under it",
+                SHUTDOWN_WAIT_SECONDS);
+            throw new IllegalStateException("left the graph tenants open: the erasure sweep is "
+                + "still compacting a namespace");
         }
 
         // The lease next: while it is outstanding the registry defers closing the shared tenant,

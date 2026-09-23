@@ -4,6 +4,7 @@ import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 
+import com.eonmux.excalibur.api.bootstrap.GraphExtraction;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.mcp.Json;
 
@@ -325,6 +326,104 @@ class GraphBuildEndpointTest {
         void nullRunnerIsRefused() {
             assertThatThrownBy(() -> new GraphBuildStatusEndpoint(null))
                 .isInstanceOf(NullPointerException.class);
+        }
+    }
+
+    @Nested
+    @DisplayName("saying whether ingestion extracts facts")
+    class Extraction {
+
+        @Test
+        @DisplayName("extraction asked for without a key is warned about when a build is asked for")
+        void aMissingKeyIsWarnedAbout() throws IOException {
+            tenants.reportExtraction(GraphExtraction.MISSING_API_KEY);
+
+            Object json = call(build, "POST", null).json();
+
+            assertThat(Json.stringAt(json, "extraction")).isEqualTo("missing_api_key");
+            assertThat(Json.stringAt(json, "warning"))
+                .as("both settings are named, so the operator knows which one to change")
+                .contains("excalibur.graph.extraction-enabled")
+                .contains("excalibur.llm.api-key");
+        }
+
+        @Test
+        @DisplayName("an empty build explains that extraction is inactive, and why")
+        void anEmptyBuildSaysWhy() throws IOException {
+            tenants.reportExtraction(GraphExtraction.MISSING_API_KEY);
+
+            call(build, "POST", null);
+            Object json = awaitState(null, GraphBuildRunner.STATE_COMPLETED);
+
+            assertThat(Json.at(json, "published")).isEqualTo(Boolean.FALSE);
+            assertThat(Json.stringAt(json, "extraction")).isEqualTo("missing_api_key");
+            assertThat(Json.stringAt(json, "message"))
+                .contains("Nothing was staged")
+                .contains("excalibur.llm.api-key")
+                .contains("inactive");
+        }
+
+        @Test
+        @DisplayName("an empty build on a node with extraction off says it is off")
+        void anEmptyBuildWithExtractionOff() throws IOException {
+            tenants.reportExtraction(GraphExtraction.DISABLED);
+
+            Response accepted = call(build, "POST", null);
+            assertThat(Json.stringAt(accepted.json(), "extraction")).isEqualTo("disabled");
+            assertThat(Json.at(accepted.json(), "warning"))
+                .as("a node deliberately not extracting is not warned about")
+                .isNull();
+
+            Object json = awaitState(null, GraphBuildRunner.STATE_COMPLETED);
+            assertThat(Json.stringAt(json, "message"))
+                .contains("excalibur.graph.extraction-enabled is false");
+        }
+
+        @Test
+        @DisplayName("an empty build on a node that does extract says to ingest first")
+        void anEmptyBuildWithExtractionActive() throws IOException {
+            tenants.reportExtraction(GraphExtraction.ACTIVE);
+
+            call(build, "POST", null);
+            Object json = awaitState(null, GraphBuildRunner.STATE_COMPLETED);
+
+            assertThat(Json.stringAt(json, "extraction")).isEqualTo("active");
+            assertThat(Json.stringAt(json, "message")).contains("Ingest documents");
+        }
+
+        @Test
+        @DisplayName("a node that has not said still explains an empty build")
+        void anEmptyBuildWithoutAState() throws IOException {
+            call(build, "POST", null);
+            Object json = awaitState(null, GraphBuildRunner.STATE_COMPLETED);
+
+            assertThat(Json.at(json, "extraction")).isNull();
+            assertThat(Json.stringAt(json, "message")).contains("LLM API key");
+        }
+
+        @Test
+        @DisplayName("a build that published has nothing to explain")
+        void aPublishedBuildHasNoMessage() throws IOException {
+            tenants.reportExtraction(GraphExtraction.ACTIVE);
+            stage(NamespaceId.SHARED, "Ada", "knows", "Babbage");
+
+            call(build, "POST", null);
+            Object json = awaitState(null, GraphBuildRunner.STATE_COMPLETED);
+
+            assertThat(Json.at(json, "published")).isEqualTo(Boolean.TRUE);
+            assertThat(Json.at(json, "message")).isNull();
+        }
+
+        @Test
+        @DisplayName("the state is on the status before any build")
+        void idleCarriesTheState() throws IOException {
+            tenants.reportExtraction(GraphExtraction.MISSING_API_KEY);
+
+            Object json = call(status, "GET", "acme").json();
+
+            assertThat(Json.stringAt(json, "state")).isEqualTo(GraphBuildRunner.STATE_IDLE);
+            assertThat(Json.stringAt(json, "extraction")).isEqualTo("missing_api_key");
+            assertThat(Json.stringAt(json, "warning")).isNotBlank();
         }
     }
 

@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpServer;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.bootstrap.NamespaceRoutingGraphIngestSink;
 import com.eonmux.excalibur.api.endpoint.BuildInfo;
+import com.eonmux.excalibur.api.endpoint.CompactionRunner;
 import com.eonmux.excalibur.api.endpoint.InMemorySourceRegistry;
 import com.eonmux.excalibur.api.endpoint.SourceNamespaceLookup;
 import com.eonmux.excalibur.api.endpoint.SourceRegistry;
@@ -23,7 +24,6 @@ import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.shard.allocator.VolumeManager;
 import com.eonmux.excalibur.config.Config;
-import com.eonmux.excalibur.llm.client.LLMHttpClient;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
 import com.eonmux.excalibur.store.StorageEngine;
 import com.eonmux.excalibur.tenancy.NamespaceId;
@@ -31,7 +31,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -43,19 +45,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * concurrent request handling.</p>
  *
  * <h2>Endpoints</h2>
- * <ul>
- *   <li>{@code GET /health} - Liveness check for load balancers and Kubernetes</li>
- *   <li>{@code GET /health/ready} - Readiness, answering 200 or 503 so a probe can act</li>
- *   <li>{@code GET /metrics} - Prometheus text exposition for a scraper</li>
- *   <li>{@code GET /v1/stats} - System statistics and observability</li>
- *   <li>{@code GET /v1/version} - Which build this process is running</li>
- *   <li>{@code POST}/{@code DELETE /v1/drain} - Take this node out of rotation, and back</li>
- *   <li>{@code GET /v1/query/status} - Queries in flight</li>
- *   <li>{@code POST /v1/query} - Query execution</li>
- *   <li>{@code POST /v1/ingest} - Register ingestion source</li>
- *   <li>{@code POST /v1/reindex} - Force reindex of a source</li>
- *   <li>{@code GET /v1/ingest/status} - Ingestion status per source</li>
- * </ul>
+ * <p>Every route, with its access level and rate-limit budget, is registered by
+ * {@link EndpointRegistrar}; {@link EndpointBanner} prints the same set at startup.
+ * Neither is repeated here, so there is one list to keep current.</p>
  *
  * <h2>What this class owns</h2>
  * <p>The listener and its lifecycle, and nothing else. What the node is made of is
@@ -115,6 +107,43 @@ public class ExcaliburDBServer {
 
     private volatile HttpServer server;
     private final AtomicBoolean running;
+
+    /**
+     * How long request threads still running after every other drain are given to end.
+     *
+     * <p>Short, because the listener has already given them its own grace period and everything
+     * that can end one early - the erasure's stop request, the interrupts to synchronous
+     * ingestion, the stopped query executor - has been delivered by then. What is still running
+     * after this is reported, and storage is left open under it.</p>
+     */
+    static final Duration REQUEST_DRAIN_GRACE = Duration.ofSeconds(10);
+
+    /** The executor requests are dispatched on, once {@link #start()} has created it. */
+    private volatile ExecutorService requestExecutor;
+
+    /**
+     * Whether the last {@link #stop(int)} left work running that still reads storage.
+     *
+     * <p>Set when a drain outlived its wait, and set before the drain starts and cleared only by
+     * a drain that returned: a drain step that threw may have left exactly the run it was meant
+     * to stop still going, and assuming otherwise would close storage underneath it. The storage
+     * engine and its arena must then stay open: a rewrite still reading a mapping whose arena has
+     * closed takes the JVM down rather than throwing, where leaving storage unclosed at exit
+     * costs only a replay of the write log on the next start.</p>
+     */
+    private volatile boolean storageStillInUse;
+
+    /**
+     * Whether the last {@link #stop(int)} left work running that still compacts or writes the
+     * chunk index. Held the same pessimistic way as {@link #storageStillInUse}.
+     */
+    private volatile boolean chunkIndexStillInUse;
+
+    /**
+     * Whether the last {@link #stop(int)} left work running that still builds into or reads the
+     * graph tenants. Held the same pessimistic way as {@link #storageStillInUse}.
+     */
+    private volatile boolean graphsStillInUse;
 
     /**
      * Creates a new ExcaliburDBServer with default port.
@@ -318,7 +347,7 @@ public class ExcaliburDBServer {
      * built: the graph sink and the membership filter both belong to stacks assembled later
      * than this server.</p>
      *
-     * @return The orchestrator, or null when ingestion runs in stub mode
+     * @return The orchestrator, or null when no ingestion pipeline is wired
      */
     public IngestionOrchestrator getIngestionOrchestrator() {
         return wiring.ingestionOrchestrator();
@@ -375,8 +404,8 @@ public class ExcaliburDBServer {
      *
      * <p>When configured, the {@code POST /v1/reindex} endpoint will execute
      * actual reindex operations in background virtual threads. Without this
-     * configuration, the endpoint operates in stub mode (accepts requests but
-     * performs no actual reindexing).</p>
+     * configuration the route still exists and answers 503, rather than accepting
+     * a reindex that nothing would run.</p>
      *
      * <h3>Zero-Downtime Rolling Replacement</h3>
      * <p>If VolumeManager and SegmentCatalog are available, scheduled reindexes
@@ -469,75 +498,22 @@ public class ExcaliburDBServer {
     }
 
     /**
-     * Configures the ingestion pipeline for background document processing.
+     * Configures the ingestion pipeline and the vector pre-filter used by stage 2 of queries.
      *
-     * <p>When configured, the {@code POST /v1/ingest} endpoint will trigger actual
-     * background ingestion: crawling, chunking, embedding, and indexing documents
-     * from registered sources. Without this configuration, the endpoint only stores
-     * source metadata without processing documents.</p>
+     * <p>With a pipeline attached, {@code POST /v1/ingest} crawls, chunks, embeds and indexes
+     * the documents of every source it registers, in the background. Without one it records
+     * the registration and indexes nothing, and {@code GET /v1/ingest/status} reports the
+     * source as {@code unconfigured}.</p>
      *
      * <h3>Document Atomicity</h3>
-     * <p>This method creates a DocumentVisibilityTracker that ensures documents become
-     * visible atomically - all chunks at once. The tracker is also wired to the query
-     * pipeline via the visibility checker, enabling the DocumentAtomicityFilter to
-     * exclude partial documents from query results.</p>
-     *
-     * <h3>Configuration</h3>
-     * <p>This method reads the following configuration from the provided Config:</p>
-     * <ul>
-     *   <li>{@code excalibur.ingest.document-atomicity-timeout-ms} - Timeout for HNSW backpressure (default 2000ms)</li>
-     * </ul>
-     *
-     * <h3>Domain Correctness</h3>
-     * <ul>
-     *   <li>TextChunker, LLMHttpClient must both be non-null</li>
-     *   <li>Method must be called before {@link #start()} to take effect</li>
-     *   <li>Ingestion runs in virtual threads for efficient concurrency</li>
-     *   <li>Document visibility is epoch-based for consistent query snapshots</li>
-     * </ul>
-     *
-     * <h3>Thread Safety</h3>
-     * <p>This method is NOT thread-safe and should only be called during initialization,
-     * before starting the server.</p>
-     *
-     * @param textChunker The text chunker for splitting documents into chunks
-     * @param llmClient The LLM client for generating embeddings
-     * @throws IllegalStateException if the server is already running
-     * @throws NullPointerException if any parameter is null
-     */
-    public void withIngestionPipeline(TextChunker textChunker, LLMHttpClient llmClient) {
-        requireNotStarted("ingestion pipeline");
-        wiring.withIngestionPipeline(textChunker, llmClient);
-    }
-
-    /**
-     * Configures the ingestion pipeline with an externally provided visibility tracker.
-     *
-     * <p>This overload allows sharing a DocumentVisibilityTracker between the application
-     * and the server, ensuring consistent document atomicity across the entire system.</p>
-     *
-     * <h3>Use Case</h3>
-     * <p>Use this method when ExcaliburApplication creates the visibility tracker and
-     * passes it to the server for ingestion pipeline configuration.</p>
-     *
-     * <h3>Thread Safety</h3>
-     * <p>This method is NOT thread-safe and should only be called during initialization,
-     * before starting the server.</p>
-     *
-     * @param textChunker The text chunker for splitting documents into chunks
-     * @param embeddingClient The embedding client for generating embeddings
-     * @param visibilityTracker The document visibility tracker for atomic visibility (may be null)
-     * @throws IllegalStateException if the server is already running
-     * @throws NullPointerException if textChunker or embeddingClient is null
-     */
-    public void withIngestionPipeline(TextChunker textChunker, EmbeddingClient embeddingClient,
-                                      DocumentVisibilityTracker visibilityTracker) {
-        requireNotStarted("ingestion pipeline");
-        wiring.withIngestionPipeline(textChunker, embeddingClient, visibilityTracker);
-    }
-
-    /**
-     * Configures the ingestion pipeline and the vector pre-filter used by stage 2 of queries.
+     * <p>The visibility tracker passed in is shared with the application rather than made
+     * here, so the application and this node agree about which documents are whole. Its
+     * registry is the persisted one: a tracker over a registry of its own would forget at
+     * every restart which chunks belong to which document. Unless
+     * {@code excalibur.ingest.document-atomicity} is {@code false}, the query pipeline is
+     * wrapped in the atomicity filter so a query never sees half of a document; how long one
+     * document may wait on HNSW backpressure is
+     * {@code excalibur.ingest.document-atomicity-timeout-ms}.</p>
      *
      * <p>The pre-filter is not populated here. It is keyed by HNSW node id, so it is written by the
      * integration worker as it assigns those ids; ingestion holds the vector before any id exists
@@ -591,15 +567,19 @@ public class ExcaliburDBServer {
         IndexOrchestrator indexOrchestrator = wiring.indexOrchestrator();
         HttpServer created = HttpListener.open(wiring.security(), port, backlog);
         boolean orchestratorStarted = false;
+        ExecutorService requests = Executors.newVirtualThreadPerTaskExecutor();
         try {
-            created.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+            created.setExecutor(requests);
 
             this.endpoints = EndpointRegistrar.register(created, wiring.endpointInputs());
 
             // Start the index orchestrator (including epoch tick scheduler) before accepting requests
             // This ensures the visibility epoch advances automatically without manual intervention
-            indexOrchestrator.start();
+            // Set before the call rather than after it: a start that throws part-way has already
+            // brought up the workers ahead of the one that failed, and they are as much in need
+            // of stopping as those of a start that returned.
             orchestratorStarted = true;
+            indexOrchestrator.start();
             LOGGER.info("Index orchestrator started - epoch tick scheduler running at {}ms interval",
                 indexOrchestrator.getEpochTickScheduler().getTickIntervalMs());
 
@@ -609,15 +589,57 @@ public class ExcaliburDBServer {
             // started orchestrator - behind on a failed start leaks both, because stop()
             // does nothing until `running` is set.
             created.stop(0);
+            requests.shutdown();
             if (orchestratorStarted) {
-                indexOrchestrator.close();
+                stopOrchestratorAfterFailedStart(indexOrchestrator, e);
             }
             throw e;
         }
 
         server = created;
+        requestExecutor = requests;
         running.set(true);
         logStarted();
+    }
+
+    /**
+     * Takes down an orchestrator a failed {@link #start()} brought up, and records whether it
+     * went.
+     *
+     * <p>A failed start never sets {@code running}, so {@link #stop(int)} returns without
+     * draining anything and the flags it would have set keep their defaults - which say storage
+     * is free. The shutdown that follows a failed start closes the storage engine and its arena
+     * on that word. A worker that outlived its bound here is still reading segments mapped out
+     * of that arena, and closing it under the worker ends the process rather than failing it;
+     * so the answer {@link IndexOrchestrator#shutdown()} gives is what the flag is set from,
+     * exactly as a drain's would be.</p>
+     *
+     * <p>{@link IndexOrchestrator#close()} still runs either way, for the executors it releases:
+     * it cannot report an answer, which is why it is not what the answer is read from. A failure
+     * of either is attached to the start's own failure rather than replacing it, and leaves
+     * storage held, since nothing then says the workers ended.</p>
+     *
+     * @param indexOrchestrator The orchestrator the start brought up, possibly only in part
+     * @param failure           Why the start failed, which is rethrown by the caller
+     */
+    private void stopOrchestratorAfterFailedStart(IndexOrchestrator indexOrchestrator,
+                                                  RuntimeException failure) {
+        boolean ended = false;
+        try {
+            ended = indexOrchestrator.shutdown();
+        } catch (RuntimeException e) {
+            failure.addSuppressed(e);
+        }
+        storageStillInUse = !ended;
+        if (!ended) {
+            LOGGER.error("The index orchestrator did not stop after a failed start; the storage "
+                + "engine is left open for the work still running against it");
+        }
+        try {
+            indexOrchestrator.close();
+        } catch (RuntimeException e) {
+            failure.addSuppressed(e);
+        }
     }
 
     /** What an operator needs once the node is accepting: where it is, and what it serves. */
@@ -653,19 +675,72 @@ public class ExcaliburDBServer {
 
         LOGGER.info("Stopping ExcaliburDB API server...");
 
-        // Order matters. Stop accepting first, then drain everything that can still be
-        // touching storage, and only then let the caller close the storage engine and
-        // the shared arena. A background task still writing into a mapping whose arena
-        // has been closed crashes the JVM rather than throwing.
+        // In use until a drain that returned says otherwise: anything below that throws leaves
+        // unknown what is still running, and unknown has to read as running to the caller that
+        // closes storage next.
+        storageStillInUse = true;
+        chunkIndexStillInUse = true;
+        graphsStillInUse = true;
+
+        // Order matters. Ask long requests to end, stop accepting, then drain everything that
+        // can still be touching storage, and only then let the caller close the storage engine
+        // and the shared arena. A background task still writing into a mapping whose arena has
+        // been closed crashes the JVM rather than throwing.
+        ShutdownSequence.askRequestsToStop(wiring);
         HttpServer current = server;
         if (current != null) {
             current.stop(timeoutSeconds);
             server = null;
         }
 
-        ShutdownSequence.drain(endpoints, wiring);
+        ShutdownSequence.Drained drained = ShutdownSequence.drain(endpoints, wiring,
+            requestExecutor, REQUEST_DRAIN_GRACE);
+        storageStillInUse = !drained.storageReleased();
+        chunkIndexStillInUse = !drained.chunkIndexReleased();
+        graphsStillInUse = !drained.graphsReleased();
 
         LOGGER.info("ExcaliburDB API server stopped");
+    }
+
+    /**
+     * Whether the last stop left work running that still reads the storage engine.
+     *
+     * <p>The caller that owns storage asks this before closing it. True means something - a
+     * compaction whose rewrite did not end when asked to - is still reading chunk text or
+     * segment mappings, and closing the engine or releasing its arena underneath it can crash
+     * the process; the safe course is to leave both open and let the process exit.</p>
+     *
+     * @return true if storage must not be closed yet
+     */
+    public boolean isStorageStillInUse() {
+        return storageStillInUse;
+    }
+
+    /**
+     * Whether the last stop left work running that still compacts or writes the chunk index.
+     *
+     * <p>The caller that owns the index asks this before releasing its files. It publishes the
+     * index's buffer either way - that is safe beside a running compaction, and skipping it
+     * would lose chunks storage already holds - and keeps the files open only when this is
+     * true.</p>
+     *
+     * @return true if the chunk index's files must not be released yet
+     */
+    public boolean isChunkIndexStillInUse() {
+        return chunkIndexStillInUse;
+    }
+
+    /**
+     * Whether the last stop left work running that still builds into or reads the graph tenants.
+     *
+     * <p>The caller that owns the tenants asks this before closing them. True means a graph
+     * build - or a request thread - outlived its drain, and closing the tenants would unmap
+     * files and close Lucene directories it is still using.</p>
+     *
+     * @return true if the graph tenants must not be closed yet
+     */
+    public boolean isGraphsStillInUse() {
+        return graphsStillInUse;
     }
 
     /**

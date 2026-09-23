@@ -446,16 +446,15 @@ final class LexicalAnswer {
             return null;
         }
         // Attached after the submit because it needs the future, and addListener runs
-        // immediately if a cancellation arrived in between. This is what makes the
-        // cancellation real rather than recorded: the search runs inside Lucene, which stops
-        // on the interrupt and nothing else.
-        token.addListener(() -> pending.cancel(true));
+        // immediately if a cancellation arrived in between. It releases the request, not the
+        // search, and never interrupts it: see abandon(Future).
+        token.addListener(() -> abandon(pending));
         try {
             return new Outcome(
                 pending.get(Deadline.remainingMillis(deadlineNanos), TimeUnit.MILLISECONDS),
                 false, false);
         } catch (TimeoutException e) {
-            pending.cancel(true);
+            abandon(pending);
             LOGGER.warn("Lexical query exceeded its {}ms budget", parsed.timeoutMs());
             return new Outcome(List.of(), true, false);
         } catch (CancellationException e) {
@@ -465,7 +464,7 @@ final class LexicalAnswer {
             // Restore the flag: swallowing it leaves the carrier thread unable to observe the
             // shutdown that interrupted it.
             Thread.currentThread().interrupt();
-            pending.cancel(true);
+            abandon(pending);
             ResponseBody.sendError(exchange, 503, "Query interrupted");
             return null;
         } catch (ExecutionException e) {
@@ -476,6 +475,21 @@ final class LexicalAnswer {
             ResponseBody.sendError(exchange, 500, "Query execution failed");
             return null;
         }
+    }
+
+    /**
+     * Gives up waiting for a search, leaving it to end on its own.
+     *
+     * <p>Cancelled without interrupting it. A search reads nothing an interrupt could cut
+     * short - the native index and Lucene's {@code MMapDirectory} read through mappings, which
+     * never look at the flag - and on the one layout that does not map, Lucene's
+     * {@code NIOFSDirectory} fallback, an interrupt reaching a read closes the index file for
+     * every query that shares it.</p>
+     *
+     * @param pending The search
+     */
+    private static void abandon(Future<?> pending) {
+        pending.cancel(false);
     }
 
     /**

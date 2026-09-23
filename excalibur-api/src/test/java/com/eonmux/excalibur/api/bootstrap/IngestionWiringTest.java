@@ -232,6 +232,39 @@ class IngestionWiringTest {
         assertThat(graph.has("ingest")).isFalse();
     }
 
+    @Test
+    @DisplayName("extraction asked for without a key is reported inactive, not silently ignored")
+    void extractionWithoutAKeyIsReported(@TempDir Path dataDir) throws IOException {
+        attach(config(Map.of("excalibur.graph.extraction-enabled", "true")), dataDir);
+
+        assertThat(tenants.extraction())
+            .as("the build routes read this, and it is what tells an operator why a build "
+                + "published nothing")
+            .contains(GraphExtraction.MISSING_API_KEY);
+    }
+
+    @Test
+    @DisplayName("extraction with a key is reported active")
+    void extractionWithAKeyIsActive(@TempDir Path dataDir) throws IOException {
+        attach(config(Map.of(
+            "excalibur.graph.extraction-enabled", "true",
+            "excalibur.llm.api-key", "test-key")), dataDir);
+
+        assertThat(tenants.extraction()).contains(GraphExtraction.ACTIVE);
+    }
+
+    @Test
+    @DisplayName("extraction not asked for is reported disabled, with or without a key")
+    void extractionOffIsDisabled(@TempDir Path withoutKey, @TempDir Path withKey)
+            throws IOException {
+        attach(config(Map.of()), withoutKey);
+        assertThat(tenants.extraction()).contains(GraphExtraction.DISABLED);
+        tearDown();
+
+        attach(config(Map.of("excalibur.llm.api-key", "test-key")), withKey);
+        assertThat(tenants.extraction()).contains(GraphExtraction.DISABLED);
+    }
+
     /**
      * Serves the attached node and reads its stats back over the socket.
      *

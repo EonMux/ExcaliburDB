@@ -12,7 +12,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -165,11 +164,6 @@ class ReindexProgressTest {
         @Override
         public Stream<String> crawl() {
             return documents.keySet().stream();
-        }
-
-        @Override
-        public boolean hasChanged(Instant since) {
-            return true;
         }
 
         @Override

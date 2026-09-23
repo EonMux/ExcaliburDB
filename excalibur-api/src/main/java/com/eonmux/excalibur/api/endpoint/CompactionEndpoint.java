@@ -19,6 +19,10 @@ import java.util.Objects;
  * answer - after a bulk erasure, before a snapshot, or ahead of a maintenance window - when
  * waiting an interval for the space back is not acceptable.</p>
  *
+ * <p>A run covers both places dead weight accumulates: the segment store with its graphs, and,
+ * on a node that keeps one, the lexical chunk index, whose replaced and erased chunks are
+ * tombstoned the same way.</p>
+ *
  * <h2>Request Format</h2>
  * <pre>{@code
  * POST /v1/compact HTTP/1.1
@@ -30,8 +34,9 @@ import java.util.Objects;
  * <p>{@code force} is optional and defaults to false, which applies exactly the thresholds the
  * background workers apply and so brings forward work that would have happened anyway. Forced,
  * every live segment is rewritten and every graph rebuilt whether or not there is dead weight
- * in them: what an operator wants after erasing a large fraction of the corpus, and otherwise
- * a great deal of I/O for nothing.</p>
+ * in them, and every live segment of the chunk index is rewritten too, dropping any chunk the
+ * store no longer holds: what an operator wants after erasing a large fraction of the corpus,
+ * and otherwise a great deal of I/O for nothing.</p>
  *
  * <h2>Response Format (Accepted)</h2>
  * <pre>{@code

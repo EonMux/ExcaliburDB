@@ -1,19 +1,13 @@
 package com.eonmux.excalibur.bench;
 
-import com.eonmux.excalibur.bench.metric.BenchmarkResult;
-import com.eonmux.excalibur.bench.metric.BenchmarkResultCapture;
 import com.eonmux.excalibur.bench.metric.BenchmarkResultSet;
-import org.openjdk.jmh.results.RunResult;
-import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.RunnerException;
 import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
 import org.openjdk.jmh.runner.options.TimeValue;
 
-import java.time.Instant;
+import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.Collection;
-import java.util.List;
 
 /**
  * Entry point for running benchmarks and comparing them against a baseline.
@@ -60,7 +54,8 @@ public final class BenchmarkComparisonRunner {
     /**
      * Runs the benchmarks matching a pattern and returns what JMH measured.
      *
-     * <p>Results are taken from JMH's own return value. A failure inside JMH
+     * <p>Results are taken from JMH's own return value, with the combinations it omits
+     * because they threw recovered by {@link JmhRun} as errored entries. A failure inside JMH
      * propagates to the caller: an earlier implementation returned from inside a
      * {@code finally} block, which discarded the exception and compared an empty
      * result set against the baseline, reporting "no regressions" for a run in which
@@ -85,17 +80,8 @@ public final class BenchmarkComparisonRunner {
             .shouldDoGC(true)
             .build();
 
-        Instant startTime = Instant.now();
-        Collection<RunResult> runResults = new Runner(options).run();
-        Instant endTime = Instant.now();
-
-        List<BenchmarkResult> results = BenchmarkResultCapture.fromRunResults(runResults);
-        return BenchmarkResultSet.builder()
-            .name("ExcaliburDB Benchmark Run " + TIMESTAMP_FORMAT.format(startTime))
-            .startTime(startTime)
-            .endTime(endTime)
-            .results(results)
-            .build();
+        return JmhRun.execute(options,
+            "ExcaliburDB Benchmark Run " + TIMESTAMP_FORMAT.format(LocalDateTime.now()));
     }
 
     private BenchmarkComparisonRunner() {

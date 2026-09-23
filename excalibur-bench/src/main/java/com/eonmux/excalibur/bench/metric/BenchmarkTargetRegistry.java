@@ -42,6 +42,11 @@ public final class BenchmarkTargetRegistry {
     public static final String PRIMARY_METRIC = "primary";
 
     /**
+     * Floor on vector components processed per second by one distance computation.
+     */
+    static final double DISTANCE_COMPONENTS_PER_SEC = 1_500_000_000.0;
+
+    /**
      * Registered targets, in declaration order.
      */
     private static final List<TargetConfig> TARGETS;
@@ -54,16 +59,26 @@ public final class BenchmarkTargetRegistry {
             10_000_000.0, "Realistic single-threaded target (interpreted from the 1B/sec spec)"));
         targets.add(throughputTarget(".*PointLookupBenchmark\\.randomLookupFast",
             10_000_000.0, "Realistic single-threaded target"));
+        // Per lookup (@OperationsPerInvocation(100)). A batch is the lock-free lookup of
+        // randomLookupFast repeated under one read lock, so that lookup is its ceiling: batching
+        // can only remove the lock, and an uncontended read lock shared by a hundred lookups
+        // costs nothing measurable. The target is therefore the single-lookup target - a batch
+        // must not cost anything per lookup - not a multiple of it.
         targets.add(throughputTarget(".*PointLookupBenchmark\\.batchLookup100",
-            50_000_000.0, "Batch amortizes lock overhead"));
+            10_000_000.0, "Per lookup: a batch shares one read lock, so it must hold the "
+                + "single-lookup target"));
         targets.add(throughputTarget(".*SegmentBenchmark\\.(sequentialLookup|randomLookup)",
             10_000_000.0, "Segment lookup throughput"));
 
         // ===== Cuckoo Filter (Phase 3) =====
+        // Both targets are per lookup and per insert. The methods that make several calls per
+        // invocation (lookupMixed, batchLookupHit, batchInsert100, batchInsert1000,
+        // insertVariedKeySizes) declare @OperationsPerInvocation, so JMH already reports them
+        // per call; the batch count is not a JMH parameter, so scaling here could not do it.
         targets.add(throughputTarget(".*CuckooFilterBenchmark\\..*[Ll]ookup.*",
             5_000_000.0, "Cuckoo filter O(1) lookup"));
         targets.add(throughputTarget(".*CuckooFilterInsertBenchmark\\..*[Ii]nsert.*",
-            1_000_000.0, "Insert throughput at high load factor"));
+            1_000_000.0, "Insert throughput at every load factor up to 0.95"));
 
         // ===== HNSW (Phase 4) =====
         // Recall is not a JMH score: HnswRecallBenchmark runs in AverageTime mode, so its
@@ -74,16 +89,28 @@ public final class BenchmarkTargetRegistry {
             10.0, "HNSW search latency target"));
 
         // ===== Distance Functions (Phase 4) =====
-        targets.add(throughputTarget(".*DistanceBenchmark\\.cosineSimilarity_single",
-            50_000_000.0, "Cosine similarity throughput"));
-        targets.add(throughputTarget(".*DistanceBenchmark\\.l2Distance_single",
-            50_000_000.0, "L2 distance throughput"));
-        targets.add(throughputTarget(".*DistanceVectorApiBenchmark\\.(cosine|l2|innerProduct)_vectorApi",
-            100_000_000.0, "Vector API distance throughput"));
+        // One op is one distance between two vectors of `dimension` components, and the
+        // benchmarks sweep dimension from 64 to 1536: ops/sec falls in proportion to the
+        // dimension, so a flat ops/sec threshold was a different demand at every parameter
+        // value. The dimension-independent rate is components/sec. The SIMD kernels sustain
+        // 2.4-6.4G components/sec across the sweep on an AVX2 core - the low end at 64, where
+        // the fixed per-call cost dominates - while a scalar loop manages 0.5G (the benchmark's
+        // own *_scalar reference kernels), so the floor fails any path that falls off the
+        // Vector API with room to spare for a noisy host. DistanceBenchmark's *_single and
+        // DistanceVectorApiBenchmark's *_vectorApi call the same production method and share it.
+        targets.add(componentRateTarget(".*DistanceBenchmark\\.cosineSimilarity_single",
+            "Cosine similarity throughput per vector component"));
+        targets.add(componentRateTarget(".*DistanceBenchmark\\.l2Distance_single",
+            "L2 distance throughput per vector component"));
+        targets.add(componentRateTarget(".*DistanceVectorApiBenchmark\\.(cosine|l2|innerProduct)_vectorApi",
+            "Vector API distance throughput per vector component"));
 
         // ===== Tail Scan (Phase 6) =====
-        targets.add(throughputTarget(".*TailScanBenchmark\\.tailScan_entryThroughput",
-            1_000_000.0, "Tail scan brute-force throughput"));
+        // One op scans the whole tail, and the benchmark sweeps tailSize from 100 to 50,000
+        // entries, so the size-independent rate is entries/sec.
+        targets.add(new TargetConfig(".*TailScanBenchmark\\.tailScan_(l2|cosine|largeK)",
+            PRIMARY_METRIC, 1_000_000.0, true, MetricUnits.ENTRIES_PER_SEC, "tailSize",
+            "Tail scan brute-force throughput per entry"));
 
         // ===== End-to-End Query (Phase 10) - Mode.SampleTime, percentiles are secondary metrics =====
         targets.add(new TargetConfig(".*EndToEndQueryBenchmark\\.fullQueryPipeline",
@@ -125,6 +152,11 @@ public final class BenchmarkTargetRegistry {
     private static TargetConfig throughputTarget(String pattern, double opsPerSec, String description) {
         return new TargetConfig(pattern, PRIMARY_METRIC, opsPerSec, true,
             MetricUnits.OPS_PER_SEC, null, description);
+    }
+
+    private static TargetConfig componentRateTarget(String pattern, String description) {
+        return new TargetConfig(pattern, PRIMARY_METRIC, DISTANCE_COMPONENTS_PER_SEC, true,
+            MetricUnits.COMPONENTS_PER_SEC, "dimension", description);
     }
 
     private static TargetConfig latencyTarget(String pattern, double ms, String description) {
@@ -226,8 +258,10 @@ public final class BenchmarkTargetRegistry {
          * @param targetValue the threshold, expressed in {@code unit}
          * @param higherIsBetter true if the measurement must be at or above the threshold
          * @param unit the unit {@code targetValue} is expressed in
-         * @param scaleByParameter JMH parameter whose numeric value multiplies the
-         *        measurement before comparison, or null for no scaling
+         * @param scaleByParameter JMH parameter whose numeric value is how many units of
+         *        {@code unit}'s work one operation performs - bytes, entries, vector
+         *        components - so that ops/sec times it is a rate in {@code unit}; or null for
+         *        no scaling
          * @param description human-readable rationale
          */
         public TargetConfig(String pattern, String metric, double targetValue,

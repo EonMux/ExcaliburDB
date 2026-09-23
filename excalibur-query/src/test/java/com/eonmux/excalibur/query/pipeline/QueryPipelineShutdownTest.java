@@ -62,7 +62,9 @@ class QueryPipelineShutdownTest {
             .build(), new CancellationToken())
             .get(30, TimeUnit.SECONDS);
 
-        pipeline.shutdown();
+        assertThat(pipeline.shutdown())
+            .as("shutdown() reports that the threads it waited for ended")
+            .isTrue();
 
         assertThat(pipeline.isShutdown())
             .as("shutdown() returns when the pipeline has stopped, not when it has been asked to")
@@ -72,7 +74,7 @@ class QueryPipelineShutdownTest {
     @Test
     @DisplayName("a pipeline that never ran a query is shut down once shutdown returns")
     void shutdownOfAnUnusedPipeline() {
-        pipeline.shutdown();
+        assertThat(pipeline.shutdown()).isTrue();
 
         assertThat(pipeline.isShutdown()).isTrue();
     }
@@ -80,8 +82,8 @@ class QueryPipelineShutdownTest {
     @Test
     @DisplayName("shutting down twice is not an error")
     void shutdownIsIdempotent() {
-        pipeline.shutdown();
-        pipeline.shutdown();
+        assertThat(pipeline.shutdown()).isTrue();
+        assertThat(pipeline.shutdown()).isTrue();
 
         assertThat(pipeline.isShutdown()).isTrue();
     }

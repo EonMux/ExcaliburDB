@@ -45,5 +45,14 @@ tasks.test {
         events("passed", "skipped", "failed")
         showStandardStreams = true
     }
-    jvmArgs("--enable-preview")
+    // The same flags the node starts with. --enable-native-access because the engine maps its
+    // files through Panama; --add-modules because without the Vector API resolved, the
+    // distance kernels fall back to scalar arithmetic silently, and an end-to-end suite would
+    // then prove the search path production does not take. No source here imports the
+    // incubator package, so the compiler needs no matching flag.
+    jvmArgs(
+        "--enable-preview",
+        "--enable-native-access=ALL-UNNAMED",
+        "--add-modules=jdk.incubator.vector"
+    )
 }

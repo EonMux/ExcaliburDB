@@ -348,6 +348,119 @@ class ReindexEndpointTest {
         }
 
         @Test
+        @DisplayName("a drain with nothing running says so, and refuses later work")
+        void anIdleDrainIsClean() {
+            ReindexEndpoint endpoint = new ReindexEndpoint(sourceRegistry, statusRegistry,
+                org.mockito.Mockito.mock(com.eonmux.excalibur.ingest.pipeline.DocumentReindexer.class),
+                org.mockito.Mockito.mock(com.eonmux.excalibur.ingest.source.SourceResolver.class),
+                null, null, new com.eonmux.excalibur.api.reindex.ReindexCoordinator(), null);
+
+            assertThat(endpoint.drain()).isTrue();
+            assertThat(endpoint.drain()).as("a second drain has nothing left to wait for").isTrue();
+        }
+
+        /**
+         * A reindex spends its time writing through channels every writer of a segment shares,
+         * and an interrupt that lands on one of those writes closes the channel for the life of
+         * the process. So a DELETE reaches the run only as its stop request.
+         */
+        @Test
+        @DisplayName("a DELETE reaches the running reindex as a stop request, never an interrupt")
+        void cancellingNeverInterruptsTheRun() throws Exception {
+            BlockingRun run = new BlockingRun();
+            ReindexEndpoint endpoint = run.endpoint();
+
+            endpoint.handle(exchange("POST", "{\"source_id\": \"docs\"}",
+                new java.io.ByteArrayOutputStream()));
+            assertThat(run.started.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            endpoint.handle(exchange("DELETE", "{\"source_id\": \"docs\"}",
+                new java.io.ByteArrayOutputStream()));
+
+            assertThat(run.finished.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            assertThat(run.sawStop).as("the run read its stop request").isTrue();
+            assertThat(run.interrupted).as("the run's thread was never interrupted").isFalse();
+            assertThat(endpoint.drain()).isTrue();
+        }
+
+        @Test
+        @DisplayName("a drain stops the running reindex cooperatively, waits for it, then refuses more")
+        void drainStopsTheRunAndRefusesMore() throws Exception {
+            BlockingRun run = new BlockingRun();
+            ReindexEndpoint endpoint = run.endpoint();
+            endpoint.handle(exchange("POST", "{\"source_id\": \"docs\"}",
+                new java.io.ByteArrayOutputStream()));
+            assertThat(run.started.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+            assertThat(endpoint.drain())
+                .as("the run ended within the drain, so nothing is left writing to storage")
+                .isTrue();
+            assertThat(run.sawStop).isTrue();
+            assertThat(run.interrupted).isFalse();
+            assertThat(run.coordinator.isRunning("docs")).isFalse();
+
+            endpoint.handle(exchange("POST", "{\"source_id\": \"docs\"}",
+                new java.io.ByteArrayOutputStream()));
+            org.mockito.Mockito.verify(lastExchange)
+                .sendResponseHeaders(org.mockito.ArgumentMatchers.eq(503),
+                    org.mockito.ArgumentMatchers.anyLong());
+        }
+
+        /**
+         * A claim taken a moment before a shutdown's drain closed the run executor. The request
+         * has done nothing wrong and the server has no fault: the node is going down, which is
+         * what a claim refused a moment later is told, and the run it would have started was
+         * stopped by that, not failed.
+         */
+        @Test
+        @DisplayName("a run the closing executor refuses is answered 503 and recorded cancelled")
+        void aRunRefusedByTheClosingExecutor() throws Exception {
+            sourceRegistry.register(sourceNamed("docs"));
+            java.util.concurrent.atomic.AtomicReference<ReindexEndpoint> endpoint =
+                new java.util.concurrent.atomic.AtomicReference<>();
+            java.util.concurrent.atomic.AtomicBoolean drained =
+                new java.util.concurrent.atomic.AtomicBoolean();
+            java.util.concurrent.atomic.AtomicReference<Thread> drainer =
+                new java.util.concurrent.atomic.AtomicReference<>();
+            ReindexEndpoint.InMemoryReindexStatusRegistry statuses =
+                new ReindexEndpoint.InMemoryReindexStatusRegistry() {
+                    @Override
+                    public void startReindex(String sourceId) {
+                        super.startReindex(sourceId);
+                        // The drain closes the executor and then waits for this request's
+                        // claim, so once it is waiting the executor is certainly closed.
+                        Thread thread = Thread.ofPlatform().start(
+                            () -> drained.set(endpoint.get().drain()));
+                        drainer.set(thread);
+                        long deadline = System.nanoTime()
+                            + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+                        while (thread.getState() != Thread.State.TIMED_WAITING
+                                && thread.getState() != Thread.State.WAITING
+                                && System.nanoTime() < deadline) {
+                            Thread.onSpinWait();
+                        }
+                    }
+                };
+            com.eonmux.excalibur.api.reindex.ReindexCoordinator coordinator =
+                new com.eonmux.excalibur.api.reindex.ReindexCoordinator();
+            endpoint.set(new ReindexEndpoint(sourceRegistry, statuses,
+                org.mockito.Mockito.mock(com.eonmux.excalibur.ingest.pipeline.DocumentReindexer.class),
+                org.mockito.Mockito.mock(com.eonmux.excalibur.ingest.source.SourceResolver.class),
+                null, null, coordinator, null));
+
+            endpoint.get().handle(exchange("POST", "{\"source_id\": \"docs\"}",
+                new java.io.ByteArrayOutputStream()));
+
+            org.mockito.Mockito.verify(lastExchange)
+                .sendResponseHeaders(org.mockito.ArgumentMatchers.eq(503),
+                    org.mockito.ArgumentMatchers.anyLong());
+            assertThat(statuses.getStatus("docs").state())
+                .isEqualTo(ReindexEndpoint.ReindexStatus.STATE_CANCELLED);
+            assertThat(coordinator.isRunning("docs")).as("the claim was released").isFalse();
+            drainer.get().join(java.util.concurrent.TimeUnit.SECONDS.toMillis(10));
+            assertThat(drained).as("the drain had nothing left to wait for").isTrue();
+        }
+
+        @Test
         @DisplayName("refuses a method that is neither POST nor DELETE")
         void refusesOtherMethods() throws IOException {
             ReindexEndpoint endpoint = new ReindexEndpoint(sourceRegistry, statusRegistry);
@@ -378,5 +491,50 @@ class ReindexEndpointTest {
             .thenReturn(new com.sun.net.httpserver.Headers());
         this.lastExchange = exchange;
         return exchange;
+    }
+    /**
+     * A reindex of {@code docs} that runs until it is asked to stop, recording how it was asked.
+     */
+    private final class BlockingRun {
+        final java.util.concurrent.CountDownLatch started = new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch finished = new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.atomic.AtomicBoolean sawStop =
+            new java.util.concurrent.atomic.AtomicBoolean();
+        final java.util.concurrent.atomic.AtomicBoolean interrupted =
+            new java.util.concurrent.atomic.AtomicBoolean();
+        final com.eonmux.excalibur.api.reindex.ReindexCoordinator coordinator =
+            new com.eonmux.excalibur.api.reindex.ReindexCoordinator();
+
+        ReindexEndpoint endpoint() throws Exception {
+            Source source = sourceNamed("docs");
+            sourceRegistry.register(source);
+            com.eonmux.excalibur.ingest.source.SourceResolver resolver =
+                mock(com.eonmux.excalibur.ingest.source.SourceResolver.class);
+            when(resolver.resolve("docs")).thenReturn(source);
+            com.eonmux.excalibur.ingest.pipeline.DocumentReindexer reindexer =
+                mock(com.eonmux.excalibur.ingest.pipeline.DocumentReindexer.class);
+            when(reindexer.reindexAll(org.mockito.ArgumentMatchers.any(),
+                    org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(invocation -> {
+                    com.eonmux.excalibur.core.util.StopSignal stop = invocation.getArgument(2);
+                    started.countDown();
+                    try {
+                        long deadline = System.nanoTime()
+                            + java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
+                        while (!stop.isRequested() && System.nanoTime() < deadline) {
+                            java.util.concurrent.locks.LockSupport.parkNanos(
+                                java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(5));
+                        }
+                        sawStop.set(stop.isRequested());
+                        interrupted.set(Thread.currentThread().isInterrupted());
+                    } finally {
+                        finished.countDown();
+                    }
+                    throw new com.eonmux.excalibur.ingest.pipeline.ReindexCancelledException(
+                        "stopped between documents");
+                });
+            return new ReindexEndpoint(sourceRegistry, statusRegistry, reindexer, resolver,
+                null, null, coordinator, null);
+        }
     }
 }

@@ -6,6 +6,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.query.*;
 import com.eonmux.excalibur.query.executor.CancellationToken;
+import com.eonmux.excalibur.query.executor.ExecutorDrain;
 import com.eonmux.excalibur.query.executor.QueryRegistry;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -1152,18 +1153,32 @@ public class QueryEndpoint implements HttpHandler {
     }
 
     /**
-     * Shuts down the endpoint and releases resources.
+     * Stops the endpoint's executor taking work, waits for the work it has, and says whether it
+     * ended.
+     *
+     * <p>The executor runs a query's BM25 search, its relevancy scoring and its embedding
+     * request. The first two read the chunk index and the storage engine through memory
+     * mappings, and the caller closes both - and the arena the mappings belong to - once this
+     * returns, so a shutdown that stopped waiting while one was still reading would unmap
+     * memory under it, which ends the process. Interrupting them first would not help: nothing
+     * in a mapped read looks at the flag, so it shortens no wait. The work is therefore given a
+     * bounded time to finish and never interrupted wholesale; a query that runs out of time is
+     * still abandoned the way it always is, one future at a time. False means the work outlived
+     * the wait and the storage and the chunk index must stay open.</p>
+     *
+     * @return true if nothing the endpoint started is still running
      */
-    public void shutdown() {
-        executorService.shutdown();
-        try {
-            if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
-                executorService.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            executorService.shutdownNow();
-            Thread.currentThread().interrupt();
+    public boolean shutdown() {
+        // The default deadline is what bounds almost every such task. A query that asked for a
+        // longer one and is still running when this runs out is reported rather than waited out.
+        long waitMillis = defaultTimeoutMs + PIPELINE_RESPONSE_GRACE_MILLIS;
+        boolean ended = ExecutorDrain.drain(executorService, waitMillis,
+            "Query work (BM25 search, relevancy scoring, embedding)");
+        if (!ended) {
+            LOGGER.error("Query work was still running {}ms after the query endpoint was shut "
+                + "down; the storage and the chunk index it reads must stay open", waitMillis);
         }
+        return ended;
     }
 }
 

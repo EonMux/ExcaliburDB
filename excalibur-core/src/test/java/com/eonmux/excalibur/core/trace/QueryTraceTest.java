@@ -79,8 +79,8 @@ class QueryTraceTest {
         QueryTrace trace = new QueryTrace();
         trace.record(Stage.PLAN, 100);
 
-        assertThat(trace.nanosIn(Stage.DECODE)).isZero();
-        assertThat(trace.entriesIn(Stage.DECODE)).isZero();
+        assertThat(trace.nanosIn(Stage.SERIALIZE)).isZero();
+        assertThat(trace.entriesIn(Stage.SERIALIZE)).isZero();
         assertThat(trace.byStage())
             .containsOnlyKeys(Stage.PLAN);
     }
@@ -91,7 +91,7 @@ class QueryTraceTest {
         QueryTrace trace = new QueryTrace();
         trace.record(Stage.PLAN, 1);
 
-        assertThatThrownBy(() -> trace.byStage().put(Stage.DECODE, 5L))
+        assertThatThrownBy(() -> trace.byStage().put(Stage.RANK, 5L))
             .isInstanceOf(UnsupportedOperationException.class);
     }
 
@@ -153,14 +153,16 @@ class QueryTraceTest {
         String summary = trace.toString();
 
         assertThat(summary).contains("plan=1.50ms").contains("serialize=2.00ms").contains("total=");
-        assertThat(summary).doesNotContain("decode");
+        assertThat(summary).doesNotContain("rank");
     }
 
     @Test
-    @DisplayName("every stage of the documented pipeline exists")
-    void stagesCoverThePipeline() {
-        assertThat(Stage.values()).containsExactly(
-            Stage.PLAN, Stage.LINK, Stage.TRAVERSE, Stage.RANK,
-            Stage.SERIALIZE, Stage.PREFILL, Stage.DECODE);
+    @DisplayName("the stages are exactly the ones the pipeline runs")
+    void stagesAreThePipeline() {
+        // Only stages something records. A stage nothing times is still a name a response can be
+        // documented as carrying, and a client written against that documentation waits for a
+        // number this node never produces - it does no generation, so it has no prefill or decode.
+        assertThat(Stage.values()).extracting(Enum::name).containsExactly(
+            "PLAN", "LINK", "TRAVERSE", "RANK", "SERIALIZE");
     }
 }

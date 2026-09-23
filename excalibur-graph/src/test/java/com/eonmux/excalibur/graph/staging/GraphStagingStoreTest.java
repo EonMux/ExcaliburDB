@@ -253,6 +253,70 @@ class GraphStagingStoreTest {
     }
 
     @Nested
+    @DisplayName("durability")
+    class Durability {
+
+        /** Bytes in a staging file as the next open would read them. */
+        private static long bytesOnDisk(Path directory, String name) throws IOException {
+            return Files.size(directory.resolve(name));
+        }
+
+        @Test
+        @DisplayName("an appended fact is held by this process until a sync writes it out")
+        void aSyncWritesOutWhatIsBuffered(@TempDir Path tempDir) throws IOException {
+            try (GraphStagingStore staging = GraphStagingStore.open(tempDir)) {
+                long labels = bytesOnDisk(tempDir, GraphStagingStore.ENTITY_LABELS);
+                long text = bytesOnDisk(tempDir, GraphStagingStore.ENTITY_TEXT_LOG);
+                staging.append(fact("Ada", "knows", "Babbage"));
+                staging.appendEntityText(staging.entityIdOf("Ada"), "Ada wrote the first program",
+                    from(1));
+
+                // What a process that died now would leave: nothing of the fact, its labels or
+                // its prose - the reason a shutdown that keeps the store open must still sync.
+                Path log = tempDir.resolve(GraphStagingStore.TRIPLE_LOG);
+                assertThat(GraphStagingStore.factsOnDisk(log)).isZero();
+
+                staging.sync();
+
+                assertThat(GraphStagingStore.factsOnDisk(log)).isEqualTo(1);
+                assertThat(bytesOnDisk(tempDir, GraphStagingStore.ENTITY_LABELS))
+                    .isGreaterThan(labels);
+                assertThat(bytesOnDisk(tempDir, GraphStagingStore.ENTITY_TEXT_LOG))
+                    .isGreaterThan(text);
+            }
+        }
+
+        @Test
+        @DisplayName("a sync with nothing new to write is harmless, and one after close is inert")
+        void aSyncIsIdempotent(@TempDir Path tempDir) throws IOException {
+            GraphStagingStore staging = GraphStagingStore.open(tempDir);
+            staging.sync();
+            staging.append(fact("Ada", "knows", "Babbage"));
+            staging.sync();
+            staging.sync();
+            staging.close();
+            staging.sync();
+
+            try (GraphStagingStore reopened = GraphStagingStore.open(tempDir)) {
+                assertThat(reopened.stagedCount()).isEqualTo(1);
+            }
+        }
+
+        @Test
+        @DisplayName("close writes out everything, whatever was synced before it")
+        void closeWritesOutEverything(@TempDir Path tempDir) throws IOException {
+            GraphStagingStore staging = GraphStagingStore.open(tempDir);
+            staging.append(fact("Ada", "knows", "Babbage"));
+            staging.sync();
+            staging.append(fact("Babbage", "knows", "Ada"));
+            staging.close();
+
+            assertThat(GraphStagingStore.factsOnDisk(tempDir.resolve(GraphStagingStore.TRIPLE_LOG)))
+                .isEqualTo(2);
+        }
+    }
+
+    @Nested
     @DisplayName("entity text")
     class EntityText {
 

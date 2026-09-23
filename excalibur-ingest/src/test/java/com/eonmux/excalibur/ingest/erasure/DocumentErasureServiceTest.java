@@ -408,6 +408,55 @@ class DocumentErasureServiceTest {
         }
 
         @Test
+        @DisplayName("a forced compaction that abandoned the group holding the chunks is not "
+            + "reported as having taken them off disk")
+        void anAbandonedRewriteIsNotCompacted() throws Exception {
+            open(never());
+            ingest("docs", "secret.md", "zzconfidentialmarker");
+            ingest("docs", "keep.md", "routine capacity planning");
+            index.refresh();
+            epoch.incrementAndGet();
+
+            // The surviving document's text cannot be read back, so the rewrite of the segment
+            // holding both is abandoned and the erased chunk stays where it is.
+            DocumentErasureService unreadable = new DocumentErasureService(registry, adapter,
+                index, key -> {
+                    throw new java.io.UncheckedIOException(new IOException("device busy"));
+                });
+
+            DocumentErasureService.Outcome outcome =
+                unreadable.erase("docs", List.of("secret.md"), true);
+
+            assertThat(outcome.compacted()).isFalse();
+            assertThat(outcome.outstanding()).isEqualTo(1);
+            assertThat(outcome.detail()).contains("abandoned");
+            assertThat(anyIndexFileContains("zzconfidentialmarker")).isTrue();
+        }
+
+        @Test
+        @DisplayName("once asked to stop, a forced compaction ends without publishing and the "
+            + "erasure stays owed")
+        void aStoppedServiceLeavesTheErasureOwed() throws Exception {
+            open(never());
+            ingest("docs", "secret.md", "zzconfidentialmarker");
+            ingest("docs", "keep.md", "routine capacity planning");
+            index.refresh();
+            epoch.incrementAndGet();
+            DocumentErasureService service = service();
+
+            service.requestStop();
+            DocumentErasureService.Outcome outcome =
+                service.erase("docs", List.of("secret.md"), true);
+
+            assertThat(outcome.documentsErased())
+                .as("hiding and removing are not what a shutdown cuts short")
+                .isEqualTo(1);
+            assertThat(outcome.compacted()).isFalse();
+            assertThat(outcome.outstanding()).isEqualTo(1);
+            assertThat(outcome.detail()).startsWith("stopped:");
+        }
+
+        @Test
         @DisplayName("a due compaction reclaims without being asked")
         void dueCompactionRunsOnItsOwn() throws Exception {
             open(eager());
@@ -734,6 +783,29 @@ class DocumentErasureServiceTest {
             assertThat(registry.contains("docs", "secret.md")).isTrue();
             assertThat(outcome.documentsErased()).isZero();
             assertThat(outcome.documentsIncomplete()).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("chunks an index refused to erase are not reported compacted")
+        void indexRefusalIsNotCompacted() throws Exception {
+            // The index recorded no obligation for chunks it would not erase, so it owes nothing
+            // and a forced compaction finds nothing to do - while every one of them still
+            // matches. Owing nothing is not the same as holding nothing.
+            open(never());
+            ingest("docs", "secret.md", "zzconfidentialmarker");
+            index.refresh();
+            epoch.incrementAndGet();
+
+            DocumentErasureService.Outcome outcome =
+                new DocumentErasureService(registry, adapter, refusingErase(index), storage::get)
+                    .erase("docs", List.of("secret.md"), true);
+
+            assertThat(outcome.outstanding()).isZero();
+            assertThat(outcome.chunksStillSearchable()).isEqualTo(1);
+            assertThat(outcome.compacted())
+                .as("the chunks are still in the index, so they are not off disk")
+                .isFalse();
+            assertThat(hits("zzconfidentialmarker")).isEqualTo(1);
         }
 
         @Test

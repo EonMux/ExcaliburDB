@@ -118,8 +118,8 @@ public final class CosineSimilarity implements DistanceFunction {
      */
     @Override
     public float compute(float[] v1, float[] v2) {
-        // Validate inputs using DistanceValidator for consistent error handling
-        DistanceValidator.validateVectorPair(v1, v2, "v1", "v2");
+        // Components are checked only if a sum comes back non-finite; see validateVectorShapes.
+        DistanceValidator.validateVectorShapes(v1, v2, "v1", "v2");
 
         final int length = v1.length;
 
@@ -185,6 +185,10 @@ public final class CosineSimilarity implements DistanceFunction {
             norm2 = norm2T;
         }
 
+        if (!(Double.isFinite(dotProduct) && Double.isFinite(norm1) && Double.isFinite(norm2))) {
+            DistanceValidator.validateVectorPair(v1, v2, "v1", "v2");
+        }
+
         // Handle zero vectors
         final double normProduct = norm1 * norm2;
         if (normProduct == 0.0) {
@@ -202,7 +206,7 @@ public final class CosineSimilarity implements DistanceFunction {
     }
 
     /**
-     * Vectorized implementation using Vector API via reflection.
+     * Vectorized implementation on the Vector API kernels in {@link SimdVectorOperations}.
      *
      * <p>Processes vectors in chunks of the preferred SIMD width, then
      * handles the tail with scalar operations.</p>
@@ -245,6 +249,10 @@ public final class CosineSimilarity implements DistanceFunction {
             dotProduct += (double) a * (double) b;
             norm1 += (double) a * (double) a;
             norm2 += (double) b * (double) b;
+        }
+
+        if (!(Double.isFinite(dotProduct) && Double.isFinite(norm1) && Double.isFinite(norm2))) {
+            DistanceValidator.validateVectorPair(v1, v2, "v1", "v2");
         }
 
         // Handle zero vectors

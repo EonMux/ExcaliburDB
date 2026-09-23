@@ -4,6 +4,7 @@ import com.eonmux.excalibur.fsck.check.CatalogCheck;
 import com.eonmux.excalibur.fsck.check.CatalogRecord;
 import com.eonmux.excalibur.fsck.check.CheckStatus;
 import com.eonmux.excalibur.fsck.check.ConsistencyFinding;
+import com.eonmux.excalibur.fsck.check.CrossFileChecks;
 import com.eonmux.excalibur.fsck.check.DataDirectoryScan;
 import com.eonmux.excalibur.fsck.check.FileCheck;
 import com.eonmux.excalibur.fsck.check.FileClassifier;
@@ -138,6 +139,15 @@ public final class RepairPlanner {
      * @return What to weigh
      */
     private static String unrepairableAdvice(FileCheck file) {
+        if (FileClassifier.classify(file.relative()) == FileKind.HNSW_STAGED_DOCUMENT_MAP) {
+            return file.relative() + " is damaged: " + file.detail() + ". It is not moved "
+                + "aside automatically, and it must not be: the graph beside it already holds "
+                + "the compacted numbering, and without this file the node would serve that "
+                + "graph through the pre-compaction mapping, attributing results to the wrong "
+                + "documents rather than failing. Restore the segment's graph and both of its "
+                + "mappings together from a backup, or rebuild the segment's vector index by "
+                + "reindexing it";
+        }
         if (FileClassifier.classify(file.relative()) == FileKind.WRITE_AHEAD_LOG) {
             return file.relative() + " is damaged in a way no repair here can act on: "
                 + file.detail() + ". It is not moved aside automatically, and it must not be: "
@@ -163,8 +173,14 @@ public final class RepairPlanner {
      * @return The action
      */
     private static RepairAction quarantineCorrupt(DataDirectoryScan scan, FileCheck file) {
-        boolean primary = FileClassifier.classify(file.relative()) == FileKind.SEGMENT_DATA;
-        String rationale = primary
+        FileKind kind = FileClassifier.classify(file.relative());
+        boolean primary = kind == FileKind.SEGMENT_DATA;
+        String rationale = kind.rebuiltOnOpen()
+            ? "Every byte is preserved under the quarantine directory. The node would rebuild "
+                + "this file from the segment's live entries on its next open whether or not "
+                + "it is moved; moving it aside only means the damaged copy is no longer read "
+                + "first and rejected"
+            : primary
             ? "Every byte is preserved under the quarantine directory, so this is reversible "
                 + "by hand. It is still a removal of primary data from the store: a damaged "
                 + "segment cannot be served, because a read of the damaged record fails "
@@ -227,6 +243,11 @@ public final class RepairPlanner {
             case "routing-names-missing-segment", "lexical-segment-missing",
                  "lexical-column-missing" ->
                 operator.add(finding.subject() + ": " + finding.detail());
+            case CrossFileChecks.PENDING_MAPPING -> {
+                // Named rather than left to the default, because this is the one finding
+                // about a file that must never become a repair: the file is the state the
+                // node's own recovery completes a compaction from.
+            }
             default -> {
                 // A warning with no action: reported by the survey, nothing to decide.
             }

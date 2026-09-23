@@ -1,7 +1,6 @@
 package com.eonmux.excalibur.store.format;
 
 import java.lang.foreign.MemorySegment;
-import java.util.zip.CRC32;
 
 /**
  * Computes the CRC32 that a {@link SegmentFormat#V3} slot carries.
@@ -34,10 +33,12 @@ import java.util.zip.CRC32;
  */
 public final class SlotChecksum {
 
-    /** Scratch space for {@link #compute}, reused so that a verification allocates nothing. */
-    private static final ThreadLocal<byte[]> SCRATCH =
-        ThreadLocal.withInitial(() -> new byte[SegmentLayout.SLOT_CHECKSUMMED_LENGTH]);
+    /** Offset of the word holding the distance, flags and data offset. */
+    private static final int TAIL_WORD_OFFSET = SegmentLayout.SLOT_DISTANCE_OFFSET;
 
+    /** Bits the data offset sits above within the tail word: the distance and flag bytes. */
+    private static final int DATA_OFFSET_SHIFT =
+        Byte.SIZE * (SegmentLayout.SLOT_DATA_OFFSET_OFFSET - TAIL_WORD_OFFSET);
 
     /** Not instantiable: this class is a single computation. */
     private SlotChecksum() {
@@ -62,17 +63,47 @@ public final class SlotChecksum {
      * @throws IndexOutOfBoundsException if the slot does not lie inside the mapping
      */
     public static int compute(MemorySegment mapped, long slotOffset) {
-        byte[] scratch = SCRATCH.get();
-        MemorySegment.copy(mapped, SegmentLayout.BYTE_LAYOUT,
-            slotOffset + SegmentLayout.SLOT_CHECKSUMMED_HEAD_OFFSET, scratch, 0,
-            SegmentLayout.SLOT_CHECKSUMMED_HEAD_LENGTH);
-        MemorySegment.copy(mapped, SegmentLayout.BYTE_LAYOUT,
-            slotOffset + SegmentLayout.SLOT_CHECKSUMMED_TAIL_OFFSET, scratch,
-            SegmentLayout.SLOT_CHECKSUMMED_HEAD_LENGTH,
-            SegmentLayout.SLOT_CHECKSUMMED_TAIL_LENGTH);
-        CRC32 crc = new CRC32();
-        crc.update(scratch, 0, SegmentLayout.SLOT_CHECKSUMMED_LENGTH);
-        return (int) crc.getValue();
+        return compute(mapped.get(SegmentLayout.LONG_LAYOUT,
+                slotOffset + SegmentLayout.SLOT_CHECKSUMMED_HEAD_OFFSET),
+            tailWord(mapped, slotOffset));
+    }
+
+    /**
+     * Computes a slot checksum from the two words that hold every covered byte.
+     *
+     * <p>The slot's first sixteen bytes are two little-endian words: the key hash, then the
+     * distance byte followed by the flag byte and the six-byte data offset. The covered run
+     * is the first word and the last seven bytes of the second, so dropping the distance is
+     * a single shift, the whole slot costs two reads of the mapping, and the checksum is
+     * computed from the words where they are, by {@link Crc32Words}, with no copy.</p>
+     *
+     * @param keyHash  The slot's key hash word
+     * @param tailWord The slot's second word, as {@link #tailWord} reads it
+     * @return The CRC32 of the slot's key hash, flags and data offset
+     */
+    public static int compute(long keyHash, long tailWord) {
+        return Crc32Words.of15(keyHash, tailWord >>> Byte.SIZE);
+    }
+
+    /**
+     * Reads the word holding a slot's distance, flags and data offset.
+     *
+     * @param mapped     The mapped segment file, or a read-only view of one
+     * @param slotOffset Absolute offset of the slot
+     * @return The distance in the low byte, the flags above it and the data offset above those
+     */
+    public static long tailWord(MemorySegment mapped, long slotOffset) {
+        return mapped.get(SegmentLayout.LONG_LAYOUT, slotOffset + TAIL_WORD_OFFSET);
+    }
+
+    /**
+     * Extracts the data region offset from a slot's tail word.
+     *
+     * @param tailWord The slot's second word, as {@link #tailWord} reads it
+     * @return The data region offset the slot points at
+     */
+    public static long dataRegionOffset(long tailWord) {
+        return tailWord >>> DATA_OFFSET_SHIFT;
     }
 
     /**
@@ -151,11 +182,6 @@ public final class SlotChecksum {
      * @return The data region offset the slot points at
      */
     public static long dataRegionOffset(MemorySegment mapped, long slotOffset) {
-        long offset = 0;
-        for (int i = 0; i < SegmentLayout.SLOT_DATA_OFFSET_LENGTH; i++) {
-            offset |= (mapped.get(SegmentLayout.BYTE_LAYOUT,
-                slotOffset + SegmentLayout.SLOT_DATA_OFFSET_OFFSET + i) & 0xFFL) << (8 * i);
-        }
-        return offset;
+        return dataRegionOffset(tailWord(mapped, slotOffset));
     }
 }

@@ -359,16 +359,17 @@ final class HnswQuantization {
      * Computes distance using PQ when available, falling back to full precision.
      *
      * @param query The query vector, kept at full precision
-     * @param node The node being scored
+     * @param traversal Read access opened under the graph's lock
+     * @param nodeId The node being scored, which must exist
      * @param distanceTable The precomputed query-to-centroid table
      * @return The distance on the table's scale, or the ordering distance if there is no
      *         quantizer at all
      */
-    float distance(float[] query, HnswGraph.NodeView node, PQDistanceTable distanceTable) {
+    float distance(float[] query, HnswTraversal traversal, long nodeId, PQDistanceTable distanceTable) {
         // Try PQ-based distance first
         ConcurrentHashMap<Long, byte[]> codeMap = this.pqCodes;
         if (codeMap != null) {
-            byte[] codes = codeMap.get(node.nodeId());
+            byte[] codes = codeMap.get(nodeId);
             if (codes != null) {
                 return distanceTable.lookup(codes);
             }
@@ -380,14 +381,14 @@ final class HnswQuantization {
         // encoding they happen to have, so encode on the fly instead.
         ProductQuantizer quantizer = this.pq;
         if (quantizer != null && quantizer.isTrained()) {
-            byte[] codes = quantizer.encode(node.vector());
+            byte[] codes = quantizer.encode(traversal.vector(nodeId));
             if (codeMap != null) {
-                codeMap.put(node.nodeId(), codes);
+                codeMap.put(nodeId, codes);
             }
             return distanceTable.lookup(codes);
         }
 
         // No quantizer at all: fall back to the ordering distance (smaller is closer).
-        return graph.computeDistance(query, node.vector());
+        return traversal.distance(query, nodeId);
     }
 }

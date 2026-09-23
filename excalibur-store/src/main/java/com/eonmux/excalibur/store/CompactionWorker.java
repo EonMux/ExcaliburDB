@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.store;
 
+import com.eonmux.excalibur.core.util.StopSignal;
+
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.util.ArrayList;
@@ -222,6 +224,17 @@ public class CompactionWorker {
     private volatile Thread workerThread;
 
     /**
+     * How the background loop is told to stop, replaced on every {@link #start()}.
+     *
+     * <p>Never an interrupt. The loop spends its working time rewriting segments: creating the
+     * replacement's file and write log, mapping them, forcing them to disk and swapping them in
+     * for the queries that read them next. An interrupt landing on any of those channel
+     * operations closes the channel, which leaves the replacement unwritable or the swap half
+     * done. The signal is read between segments and wakes the pause between sweeps.</p>
+     */
+    private volatile StopSignal stopSignal = new StopSignal();
+
+    /**
      * The threads {@link #requestCompaction(Segment)} has rewrites running on.
      *
      * <p>A requested rewrite runs on a thread of its own so the request does not block its
@@ -396,10 +409,12 @@ public class CompactionWorker {
         if (running.compareAndSet(false, true)) {
             stopped.set(false);
 
+            StopSignal signal = new StopSignal();
+            stopSignal = signal;
             // Create and start a virtual thread
             workerThread = Thread.ofVirtual().name("excalibur-compaction-worker").start(() -> {
                 LOGGER.log(Level.INFO, "Compaction worker started");
-                runCompactionLoop();
+                runCompactionLoop(signal);
             });
 
             return true;
@@ -428,35 +443,45 @@ public class CompactionWorker {
      * <p>A worker whose loop was never started still drains the compactions requested of it.
      * Requests that arrive from here on are refused rather than started, because after this
      * returns there is nothing left that would wait for them.</p>
+     *
+     * @return true if no compaction this worker started is still running, false if the wait
+     *         expired first and the Arena must be left open
      */
-    public void stop() {
-        if (stopped.compareAndSet(false, true)) {
+    public boolean stop() {
+        boolean first = stopped.compareAndSet(false, true);
+        if (first) {
             running.set(false);
-
-            long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(stopTimeoutMs);
-            awaitCompactionLoop(deadlineNanos);
-            awaitRequestedCompactions(deadlineNanos);
-
+        }
+        // Outside the guard, so a second call waits again for whatever the first left running
+        // instead of answering from a snapshot of it.
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(stopTimeoutMs);
+        awaitCompactionLoop(deadlineNanos);
+        awaitRequestedCompactions(deadlineNanos);
+        if (first) {
             LOGGER.log(Level.INFO, "Compaction worker stopped. Total compactions: {0}, bytes reclaimed: {1}",
                 new Object[] { compactionCount.get(), bytesReclaimed.get() });
         }
+        Thread loop = workerThread;
+        return (loop == null || !loop.isAlive()) && requestedCompactionThreads.isEmpty();
     }
 
     /**
-     * Interrupts the background loop and waits for it to leave whatever sweep it was in.
+     * Asks the background loop to stop and waits for it to leave whatever sweep it was in.
      *
-     * <p>The interrupt lands on the sleep between sweeps; a rewrite already under way is not
-     * abandoned partway, because it renames files into place and closes mappings in an order
-     * that only makes sense run to completion.</p>
+     * <p>The stop signal wakes the pause between sweeps and is read between segments; a
+     * rewrite already under way is not abandoned partway, because it renames files into place
+     * and closes mappings in an order that only makes sense run to completion - and it is not
+     * interrupted, because an interrupt reaching it inside a channel operation closes that
+     * channel and leaves exactly the half-done rewrite this avoids.</p>
      *
      * @param deadlineNanos Nanotime the whole shutdown wait is bounded by
      */
     private void awaitCompactionLoop(long deadlineNanos) {
+        stopSignal.request();
         Thread loop = workerThread;
         if (loop == null) {
             return;
         }
-        loop.interrupt();
         joinUntil(loop, deadlineNanos);
         if (loop.isAlive()) {
             LOGGER.log(Level.WARNING, "The compaction loop did not finish within {0}ms; a "
@@ -687,20 +712,22 @@ public class CompactionWorker {
     /**
      * Main compaction loop that runs in the background virtual thread.
      */
-    private void runCompactionLoop() {
+    private void runCompactionLoop(StopSignal signal) {
         // The configured delay before the first check. It exists so an operator can keep
         // compaction off the back of a bulk load: the work is not urgent, and contending with a
         // load for the same disk makes both slower.
         if (startDelayMs > 0) {
             try {
-                Thread.sleep(startDelayMs);
+                if (signal.pause(startDelayMs)) {
+                    return;
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
             }
         }
 
-        while (running.get() && !stopped.get()) {
+        while (running.get() && !stopped.get() && !signal.isRequested()) {
             try {
                 // Find and compact eligible segments
                 List<Segment> candidates = findCompactionCandidates();
@@ -711,7 +738,7 @@ public class CompactionWorker {
                     // Compact up to maxConcurrentCompactions at a time
                     int compacted = 0;
                     for (Segment segment : candidates) {
-                        if (!running.get() || stopped.get()) {
+                        if (!running.get() || stopped.get() || signal.isRequested()) {
                             break;
                         }
                         if (compacted >= maxConcurrentCompactions) {
@@ -727,11 +754,12 @@ public class CompactionWorker {
                     }
                 }
 
-                // Sleep until next check
-                Thread.sleep(compactionIntervalMs);
+                // Until the next check, or until stop() asks the loop to end.
+                if (signal.pause(compactionIntervalMs)) {
+                    break;
+                }
 
             } catch (InterruptedException e) {
-                // Expected during shutdown
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception e) {

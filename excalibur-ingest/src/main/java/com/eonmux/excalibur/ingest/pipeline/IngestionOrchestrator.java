@@ -1,7 +1,6 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
 import com.eonmux.excalibur.ingest.processor.TextChunker;
-import com.eonmux.excalibur.ingest.processor.TermFrequencyTracker;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.source.Source;
@@ -11,6 +10,7 @@ import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.core.logging.StructuredLoggingHelper;
+import com.eonmux.excalibur.core.util.StopSignal;
 import com.eonmux.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -44,6 +44,17 @@ import java.util.stream.Stream;
  * excalibur-shard derives from the storage key and excalibur-query's atomicity filter asks
  * about. A document whose chunks could not all be embedded or written is rolled back and never
  * registered, so a query can never observe half of it.</p>
+ *
+ * <h2>Stopping a run</h2>
+ * <p>A run is stopped through its {@link StopSignal}, read between documents, and never by
+ * interrupting its thread outright. The thread goes from each fetch straight into storage writes,
+ * and every append to a segment's write log forces a channel that all writers of that segment
+ * share: an interrupt still set when it gets there closes the channel for the life of the
+ * process, and every later write to that segment - by any run, reindex or erasure - fails.
+ * What the signal does interrupt is the part of a document that touches no shared file: the
+ * crawl, the fetch, the embedding request and the backpressure wait, each of which may block for
+ * as long as a remote end chooses. So a stop is prompt where waiting is, and cooperative where
+ * the thread is writing.</p>
  *
  * <h2>Source Ownership</h2>
  * <p>The orchestrator does <strong>not</strong> own the {@link Source} it is handed and never
@@ -165,19 +176,30 @@ public class IngestionOrchestrator {
     private volatile long lexicalRefreshIntervalMs = DEFAULT_LEXICAL_REFRESH_INTERVAL_MS;
 
     private final Set<String> activeIngestions;
-    private final Map<String, Thread> ingestionThreads;
+
+    /** The background runs in flight, by source: the thread each owns, and how it is stopped. */
+    private final Map<String, Run> ingestionThreads;
 
     /**
-     * The threads running {@link #ingestNow}, by source.
+     * The runs of {@link #ingestNow} in flight, by source.
      *
-     * <p>Kept apart from {@link #ingestionThreads} because these are not threads this class
-     * owns - they are request threads that go back to serving requests afterwards. Shutdown may
-     * interrupt one, to break it out of a blocking write, but must never join one: a pooled
-     * thread does not die when the run it is executing ends, so a join would wait forever. So
-     * shutdown waits for the entry to be removed instead of for the thread to stop.</p>
+     * <p>Kept apart from {@link #ingestionThreads} because their threads are not this class's -
+     * they are request threads that go back to serving requests afterwards. Shutdown asks one to
+     * stop but must never join its thread: a pooled thread does not die when the run it is
+     * executing ends, so a join would wait forever. So shutdown waits for the entry to be removed
+     * instead of for the thread to stop.</p>
      */
-    private final Map<String, Thread> synchronousIngestions = new ConcurrentHashMap<>();
+    private final Map<String, Run> synchronousIngestions = new ConcurrentHashMap<>();
     private final AtomicBoolean shutdown;
+
+    /**
+     * One run in flight.
+     *
+     * @param thread The thread carrying it out
+     * @param stop   How it is asked to stop
+     */
+    private record Run(Thread thread, StopSignal stop) {
+    }
 
     /**
      * Default document timeout in milliseconds.
@@ -209,7 +231,7 @@ public class IngestionOrchestrator {
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry) {
         this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry,
-             null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
+             null, DEFAULT_DOCUMENT_TIMEOUT_MS);
     }
 
     /**
@@ -233,7 +255,7 @@ public class IngestionOrchestrator {
                                   StatusRegistry statusRegistry,
                                   DocumentVisibilityTracker visibilityTracker) {
         this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry,
-             visibilityTracker, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
+             visibilityTracker, DEFAULT_DOCUMENT_TIMEOUT_MS);
     }
 
     /**
@@ -247,7 +269,6 @@ public class IngestionOrchestrator {
      * @param indexOrchestrator Index orchestrator for coordinating indexing
      * @param statusRegistry Status registry for tracking progress
      * @param visibilityTracker Tracker for document visibility epochs (may be null)
-     * @param termFrequencyTracker Tracker for term frequencies in segment sketches (may be null to disable selectivity estimation)
      * @param documentTimeoutMs Timeout for awaiting backpressure release in milliseconds
      * @throws NullPointerException if required parameters are null
      */
@@ -257,7 +278,6 @@ public class IngestionOrchestrator {
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry,
                                   DocumentVisibilityTracker visibilityTracker,
-                                  TermFrequencyTracker termFrequencyTracker,
                                   int documentTimeoutMs) {
         // The collaborators below re-check what they are handed, but they are built in
         // dependency order rather than parameter order. Checking here first means a caller that
@@ -270,16 +290,15 @@ public class IngestionOrchestrator {
         this.documentRegistry = visibilityTracker != null ? visibilityTracker.getRegistry() : null;
         this.lexicalSideIndex = new LexicalSideIndex(storageEngine);
         this.documentIngestor = new DocumentIngestor(textChunker, embeddingClient, storageEngine,
-            visibilityTracker, this.documentRegistry, termFrequencyTracker,
+            visibilityTracker, this.documentRegistry,
             this.lexicalSideIndex, this.termRecorder, this.graphReporter);
         this.documentTimeoutMs = documentTimeoutMs > 0 ? documentTimeoutMs : DEFAULT_DOCUMENT_TIMEOUT_MS;
         this.activeIngestions = ConcurrentHashMap.newKeySet();
         this.ingestionThreads = new ConcurrentHashMap<>();
         this.shutdown = new AtomicBoolean(false);
 
-        LOGGER.info("IngestionOrchestrator initialized with visibilityPublishing={}, termFrequencyTracking={}, documentTimeoutMs={}",
+        LOGGER.info("IngestionOrchestrator initialized with visibilityPublishing={}, documentTimeoutMs={}",
             (visibilityTracker != null ? "enabled" : "disabled"),
-            (termFrequencyTracker != null ? "enabled" : "disabled"),
             this.documentTimeoutMs);
     }
 
@@ -335,6 +354,19 @@ public class IngestionOrchestrator {
     }
 
     /**
+     * How many published documents the graph sink refused outright.
+     *
+     * <p>Beside whatever the sink counts itself: this is what a sink that threw - rather than
+     * logging and counting as it is meant to - cost, and those documents are published and will
+     * not be offered to the graph again unless they change.</p>
+     *
+     * @return The count since this orchestrator was created
+     */
+    public long graphReportFailures() {
+        return graphReporter.failures();
+    }
+
+    /**
      * Wires the eraser that retires a rolled back document's graph nodes.
      *
      * <p>Set after construction, like the lexical index and the membership filter: the vector
@@ -384,9 +416,10 @@ public class IngestionOrchestrator {
         // takes the JVM down rather than throwing. Publishing first makes the two orders the
         // only two outcomes: either shutdown sees this run and waits for it, or this run sees
         // the flag and backs out.
-        synchronousIngestions.put(sourceId, Thread.currentThread());
+        Run run = new Run(Thread.currentThread(), new StopSignal());
+        synchronousIngestions.put(sourceId, run);
         if (shutdown.get()) {
-            synchronousIngestions.remove(sourceId, Thread.currentThread());
+            synchronousIngestions.remove(sourceId, run);
             activeIngestions.remove(sourceId);
             throw new IllegalStateException("The node is shutting down and is not ingesting");
         }
@@ -395,7 +428,7 @@ public class IngestionOrchestrator {
         try (StructuredLoggingHelper.ScopedContext ctx = StructuredLoggingHelper.scopedContext()
                 .withSourceId(sourceId)
                 .build()) {
-            return ingestSource(source, sourceId, status);
+            return ingestSource(source, sourceId, status, run.stop());
         } catch (SourceException e) {
             String error = "Ingestion failed: " + e.getMessage();
             LOGGER.error("{}", error, e);
@@ -415,13 +448,14 @@ public class IngestionOrchestrator {
             status.setError(error);
             throw new IngestionFailedException(error, e);
         } finally {
-            synchronousIngestions.remove(sourceId, Thread.currentThread());
+            synchronousIngestions.remove(sourceId, run);
             activeIngestions.remove(sourceId);
-            // Cleared before the thread goes back to whatever it was doing. The interrupt was
-            // addressed to this run - by shutdown(), or by a stop of this source - and this is a
-            // request thread from a pool: carried away, the flag fails the next request served
-            // on it at its first interruptible channel operation with ClosedByInterruptException,
-            // which closes that channel for good.
+            // Cleared before the thread goes back to whatever it was doing. Nothing this class
+            // delivers is still set by now, but an interrupt from elsewhere that arrived after the
+            // run's last check was addressed to this run, and this is a request thread from a
+            // pool: carried away, the flag fails the next request served on it at its first
+            // interruptible channel operation with ClosedByInterruptException, which closes that
+            // channel for good.
             Thread.interrupted();
         }
     }
@@ -487,21 +521,23 @@ public class IngestionOrchestrator {
 
         LOGGER.info("Starting background ingestion for source: {}", sourceId);
 
+        StopSignal stop = new StopSignal();
         Thread worker = Thread.ofVirtual().name("ingestion-" + sourceId).unstarted(() -> {
             try {
-                runIngestion(source);
+                runIngestion(source, stop);
             } finally {
                 ingestionThreads.remove(sourceId);
                 activeIngestions.remove(sourceId);
             }
         });
-        // Published before the flag is read, for the reason ingestNow gives: shutdown()
-        // interrupts and joins what is in this map, so a worker that enters it afterwards is one
-        // nothing waits for. Registered unstarted, so backing out here costs no thread.
-        ingestionThreads.put(sourceId, worker);
+        // Published before the flag is read, for the reason ingestNow gives: shutdown() stops
+        // and joins what is in this map, so a worker that enters it afterwards is one nothing
+        // waits for. Registered unstarted, so backing out here costs no thread.
+        Run run = new Run(worker, stop);
+        ingestionThreads.put(sourceId, run);
         if (shutdown.get()) {
             LOGGER.warn("Cannot start ingestion: orchestrator is shutting down");
-            ingestionThreads.remove(sourceId, worker);
+            ingestionThreads.remove(sourceId, run);
             activeIngestions.remove(sourceId);
             return;
         }
@@ -512,8 +548,9 @@ public class IngestionOrchestrator {
      * Runs the complete ingestion pipeline for a source.
      *
      * @param source The source to ingest
+     * @param stop   How the run is asked to stop
      */
-    private void runIngestion(Source source) {
+    private void runIngestion(Source source, StopSignal stop) {
         String sourceId = source.getSourceId();
         IngestionStatus status = statusRegistry.getOrCreate(sourceId);
 
@@ -522,7 +559,7 @@ public class IngestionOrchestrator {
                 .withSourceId(sourceId)
                 .build()) {
             try {
-                ingestSource(source, sourceId, status);
+                ingestSource(source, sourceId, status, stop);
             } catch (SourceException e) {
                 String error = "Crawl failed: " + e.getMessage();
                 LOGGER.error("{}", error, e);
@@ -538,17 +575,22 @@ public class IngestionOrchestrator {
 
     /**
      * Crawls a source and ingests every document it yields.
+     *
+     * <p>The crawl may be interrupted by a stop: listing a source reads the source and nothing
+     * this node shares.</p>
      */
-    private IngestionOutcome ingestSource(Source source, String sourceId, IngestionStatus status)
+    private IngestionOutcome ingestSource(Source source, String sourceId, IngestionStatus status,
+                                          StopSignal stop)
             throws SourceException {
         status.update("crawling", 0.0, 0, 0);
         StructuredLoggingHelper.setStage("crawling");
         LOGGER.info("Phase 1: Starting crawl");
 
-        List<String> documentIds;
-        try (Stream<String> crawlStream = source.crawl()) {
-            documentIds = crawlStream.toList();
-        }
+        List<String> documentIds = stop.interruptibly(() -> {
+            try (Stream<String> crawlStream = source.crawl()) {
+                return crawlStream.toList();
+            }
+        });
 
         long totalPending = documentIds.size();
         LOGGER.info("Discovered {} documents", totalPending);
@@ -567,9 +609,9 @@ public class IngestionOrchestrator {
         status.setSkipped(0);
 
         try {
-            return ingestDocuments(source, sourceId, status, documentIds);
+            return ingestDocuments(source, sourceId, status, documentIds, stop);
         } catch (RuntimeException e) {
-            finishFailedRun();
+            finishFailedRun(stop);
             throw e;
         }
     }
@@ -578,7 +620,8 @@ public class IngestionOrchestrator {
      * Ingests the documents a crawl listed, refreshing the lexical index as it goes.
      */
     private IngestionOutcome ingestDocuments(Source source, String sourceId,
-                                             IngestionStatus status, List<String> documentIds) {
+                                             IngestionStatus status, List<String> documentIds,
+                                             StopSignal stop) {
         long totalPending = documentIds.size();
         long lastLexicalRefresh = System.nanoTime();
         long totalIngested = 0;
@@ -587,13 +630,13 @@ public class IngestionOrchestrator {
         int skippedDocs = 0;
 
         for (String documentId : documentIds) {
-            if (shutdown.get() || Thread.currentThread().isInterrupted()) {
+            if (stopRequested(stop)) {
                 // Either the node is stopping or this source alone was stopped. Checked per
                 // document rather than per chunk: a document is written whole or not at all, and
                 // abandoning one halfway is the state the rollback exists to avoid.
                 LOGGER.info("Ingestion of {} stopped after {} of {} documents",
                     sourceId, processedDocs, totalPending);
-                finishStoppedRun();
+                finishStoppedRun(stop);
                 status.setSkipped(skippedDocs);
                 status.setError("Ingestion stopped");
                 return new IngestionOutcome(processedDocs - failedDocs - skippedDocs,
@@ -602,16 +645,16 @@ public class IngestionOrchestrator {
 
             if (System.nanoTime() - lastLexicalRefresh
                     >= lexicalRefreshIntervalMs * 1_000_000L) {
-                refreshLexicalIndexMidRun(sourceId);
+                refreshLexicalIndexMidRun(sourceId, stop);
                 lastLexicalRefresh = System.nanoTime();
             }
 
-            awaitBackpressureRelease();
+            awaitBackpressureRelease(stop);
 
             try {
                 StructuredLoggingHelper.setDocumentId(documentId);
                 DocumentIngestor.DocumentOutcome outcome =
-                    documentIngestor.ingest(source, sourceId, documentId);
+                    documentIngestor.ingest(source, sourceId, documentId, stop);
                 totalIngested += outcome.chunks();
                 // Counted here and not only in the catch arms below. Most of the ways a document
                 // fails to be ingested do not throw: too large, too many chunks, unembeddable,
@@ -645,12 +688,13 @@ public class IngestionOrchestrator {
 
         StructuredLoggingHelper.setStage("indexing");
         status.update("indexing", 0.9, totalIngested, 0);
-        awaitBackpressureRelease();
+        awaitBackpressureRelease(stop);
 
         StructuredLoggingHelper.setStage("idle");
         // The documents published since the last paced refresh become searchable here, rather
         // than waiting out the rest of the interval with nothing left to publish after them.
-        refreshLexicalIndex();
+        setAsideInterrupt(stop);
+        refreshLexicalIndex(stop);
         persistRegistry();
 
         status.update("idle", 1.0, totalIngested, 0);
@@ -709,38 +753,69 @@ public class IngestionOrchestrator {
     }
 
     /**
+     * Whether the run should end before its next document.
+     *
+     * <p>An interrupt found on the thread counts as a stop and is cleared into the run's signal
+     * rather than left set, for the reason {@link #setAsideInterrupt(StopSignal)} gives.</p>
+     *
+     * @param stop The run's stop signal
+     * @return true if the run has been asked to stop, or the node is shutting down
+     */
+    private boolean stopRequested(StopSignal stop) {
+        setAsideInterrupt(stop);
+        return stop.isRequested() || shutdown.get();
+    }
+
+    /**
+     * Clears an interrupt from the run's thread before it writes, keeping it as a stop request.
+     *
+     * <p>Nothing in this class interrupts a run outside the parts of a document that touch no
+     * shared file, and those clear the flag on the way out. An interrupt from anywhere else still
+     * means "stop", and is honoured as one - but carried into the writes that follow, it would
+     * close the channel the write log, the lexical index or the registry is written through,
+     * which the JDK does rather than fail the write.</p>
+     *
+     * @param stop The run's stop signal
+     */
+    private static void setAsideInterrupt(StopSignal stop) {
+        if (Thread.interrupted()) {
+            stop.request();
+        }
+    }
+
+    /**
      * Publishes the lexical writes so far and merges segments if that is now due.
      *
      * <p>Compaction is asked each time rather than only at a run's end, because every refresh
      * on the native engine adds a segment and a long run would otherwise leave queries visiting
-     * one per interval until it finished. The usual answer is that nothing is due.</p>
+     * one per interval until it finished. The usual answer is that nothing is due. A compaction
+     * reads the run's stop signal between groups of segments and between chunks, so stopping
+     * the run - or shutting the node down - ends one in progress without publishing it, rather
+     * than waiting out a rewrite of the whole index.</p>
+     *
+     * @param stop The run's stop signal
      */
-    private void refreshLexicalIndex() {
+    private void refreshLexicalIndex(StopSignal stop) {
         lexicalSideIndex.refresh();
-        lexicalSideIndex.compactIfDue();
+        lexicalSideIndex.compactIfDue(() -> stop.isRequested() || shutdown.get());
     }
 
     /**
      * Publishes the lexical writes so far without letting a stop or a failure spoil the run.
      *
-     * <p>A stop that lands during the refresh is set aside until it is done, for the reason
-     * {@link #finishStoppedRun()} gives, and is seen by the loop's check before the next document.
-     * A refresh that fails is logged and the run goes on: the documents stay published and become
-     * searchable at the next refresh, which is a delay, whereas failing the run would abandon the
-     * documents it had not reached for the sake of ones it already had.</p>
+     * <p>A stop that lands during the refresh is seen by the loop's check before the next
+     * document. A refresh that fails is logged and the run goes on: the documents stay published
+     * and become searchable at the next refresh, which is a delay, whereas failing the run would
+     * abandon the documents it had not reached for the sake of ones it already had.</p>
      */
-    private void refreshLexicalIndexMidRun(String sourceId) {
-        boolean interrupted = Thread.interrupted();
+    private void refreshLexicalIndexMidRun(String sourceId, StopSignal stop) {
+        setAsideInterrupt(stop);
         try {
-            refreshLexicalIndex();
+            refreshLexicalIndex(stop);
         } catch (RuntimeException e) {
             LOGGER.warn("Lexical index not refreshed partway through ingesting {}; the documents "
                 + "published so far become searchable by BM25 at the next refresh: {}",
                 sourceId, e.getMessage());
-        } finally {
-            if (interrupted) {
-                Thread.currentThread().interrupt();
-            }
         }
     }
 
@@ -751,8 +826,8 @@ public class IngestionOrchestrator {
      * visible to every signal but BM25 until a refresh. Best effort: the run is already failing,
      * and a refresh that fails as well must not replace the error the caller is owed.</p>
      */
-    private void finishFailedRun() {
-        boolean interrupted = Thread.interrupted();
+    private void finishFailedRun(StopSignal stop) {
+        setAsideInterrupt(stop);
         try {
             lexicalSideIndex.refresh();
         } catch (RuntimeException e) {
@@ -765,9 +840,6 @@ public class IngestionOrchestrator {
                 LOGGER.warn("Document registry not persisted after a failed run: {}",
                     e.getMessage());
             }
-            if (interrupted) {
-                Thread.currentThread().interrupt();
-            }
         }
     }
 
@@ -777,21 +849,11 @@ public class IngestionOrchestrator {
      * <p>A stopped run's documents are published in storage: stopping abandons the documents it
      * had not reached, not the ones it had finished. Left unrefreshed they are visible to every
      * signal but BM25, and unrecorded they look new to the next re-crawl after a restart.</p>
-     *
-     * <p>The interrupt that stopped the run is set aside for the length of the writes. A channel
-     * written by an interrupted thread is closed by the JDK rather than written, and the index
-     * files are channels the whole node shares.</p>
      */
-    private void finishStoppedRun() {
-        boolean interrupted = Thread.interrupted();
-        try {
-            lexicalSideIndex.refresh();
-            persistRegistry();
-        } finally {
-            if (interrupted) {
-                Thread.currentThread().interrupt();
-            }
-        }
+    private void finishStoppedRun(StopSignal stop) {
+        setAsideInterrupt(stop);
+        lexicalSideIndex.refresh();
+        persistRegistry();
     }
 
     /**
@@ -808,6 +870,10 @@ public class IngestionOrchestrator {
         if (documentRegistry == null) {
             return;
         }
+        // The graph first. The registry is forced to the device when it is written and is what
+        // stops these documents being extracted again, so writing it ahead of their staged facts
+        // leaves, after a crash, a registry that says the facts were taken and no facts.
+        graphReporter.sync();
         try {
             documentRegistry.persist();
         } catch (IOException e) {
@@ -818,13 +884,19 @@ public class IngestionOrchestrator {
 
     /**
      * Throttles the embedding stage while the HNSW integration queue is over its limit.
+     *
+     * <p>A wait on the integration queue and nothing else, so a stop may interrupt it.</p>
+     *
+     * @param stop The run's stop signal
      */
-    private void awaitBackpressureRelease() {
+    private void awaitBackpressureRelease(StopSignal stop) {
         if (!indexOrchestrator.isBackpressured()) {
             return;
         }
         LOGGER.info("Backpressure detected, waiting for HNSW queue to drain");
-        if (!indexOrchestrator.awaitBackpressureRelease(documentTimeoutMs)) {
+        boolean released = stop.interruptibly(
+            () -> indexOrchestrator.awaitBackpressureRelease(documentTimeoutMs));
+        if (!released && !stop.isRequested()) {
             LOGGER.warn("Backpressure timeout after {}ms, continuing ingestion", documentTimeoutMs);
         }
     }
@@ -858,7 +930,9 @@ public class IngestionOrchestrator {
      *
      * <p>Stops at the next document boundary rather than immediately: the run checks for it
      * between documents, so what is already half-written is finished or rolled back rather than
-     * abandoned. Returns once the stop has been asked for, not once it has happened.</p>
+     * abandoned. A run blocked on its source or its embedding endpoint is interrupted out of the
+     * wait; one writing is left to finish the document. Returns once the stop has been asked for,
+     * not once it has happened.</p>
      *
      * @param sourceId The source whose ingestion should stop
      * @return true if a run was in flight and has been asked to stop
@@ -869,45 +943,49 @@ public class IngestionOrchestrator {
         // thread that supplied its documents, and an operator asking for one to stop does not
         // know or care which - looking only at the background threads meant a synchronous run
         // could not be stopped at all.
-        Thread worker = ingestionThreads.get(sourceId);
-        if (worker == null) {
-            worker = synchronousIngestions.get(sourceId);
+        Run run = ingestionThreads.get(sourceId);
+        if (run == null) {
+            run = synchronousIngestions.get(sourceId);
         }
-        if (worker == null) {
+        if (run == null) {
             return false;
         }
         LOGGER.info("Stopping ingestion of source {}", sourceId);
-        worker.interrupt();
+        run.stop().request();
         return true;
     }
 
     /**
-     * Shuts down the orchestrator, interrupting active ingestions and waiting for them to finish.
+     * Shuts down the orchestrator, asking active ingestions to stop and waiting for them to end.
      *
      * <p>This <strong>must</strong> be called - and must return - before the StorageEngine and
      * its Arena are closed. An ingestion thread still inside {@code storageEngine.put} writes
      * into a memory-mapped region; closing the Arena underneath it is undefined behaviour, not
-     * a caught exception.</p>
+     * a caught exception. False is the answer that has to be acted on: a run that did not reach
+     * its next document boundary in time is still writing, and what it writes must stay
+     * open.</p>
      *
-     * @return true if all ingestion threads finished within the shutdown timeout
+     * @return true if all ingestion runs finished within the shutdown timeout
      */
     public boolean shutdown() {
         LOGGER.info("Shutting down IngestionOrchestrator with {} active ingestions",
             activeIngestions.size());
         shutdown.set(true);
 
-        for (Thread worker : ingestionThreads.values()) {
-            worker.interrupt();
+        // Asked, never interrupted outright: see the class documentation. Synchronous runs are
+        // asked the same way but never joined, because their threads are request threads, and a
+        // pooled thread does not die when its run ends.
+        for (Run run : ingestionThreads.values()) {
+            run.stop().request();
         }
-        // Interrupted for the same reason - to break a blocking write - but never joined: these
-        // are request threads, and a pooled thread does not die when its run ends.
-        for (Thread caller : synchronousIngestions.values()) {
-            caller.interrupt();
+        for (Run run : synchronousIngestions.values()) {
+            run.stop().request();
         }
 
         long deadline = System.nanoTime() + SHUTDOWN_AWAIT_MILLIS * 1_000_000L;
         boolean clean = true;
-        for (Thread worker : ingestionThreads.values()) {
+        for (Run run : ingestionThreads.values()) {
+            Thread worker = run.thread();
             long remainingMillis = (deadline - System.nanoTime()) / 1_000_000L;
             if (remainingMillis <= 0) {
                 clean = false;

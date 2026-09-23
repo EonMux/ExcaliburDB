@@ -146,8 +146,8 @@ public final class InnerProduct implements DistanceFunction {
      */
     @Override
     public float compute(float[] v1, float[] v2) {
-        // Validate inputs using DistanceValidator for consistent error handling
-        DistanceValidator.validateVectorPair(v1, v2, "v1", "v2");
+        // Components are checked only if a sum comes back non-finite; see validateVectorShapes.
+        DistanceValidator.validateVectorShapes(v1, v2, "v1", "v2");
 
         final int length = v1.length;
 
@@ -198,11 +198,15 @@ public final class InnerProduct implements DistanceFunction {
             sum = t;
         }
 
+        if (!Double.isFinite(sum)) {
+            DistanceValidator.validateVectorPair(v1, v2, "v1", "v2");
+        }
+
         return clampToFloatRange(sum);
     }
 
     /**
-     * Vectorized implementation using Vector API via reflection.
+     * Vectorized implementation on the Vector API kernels in {@link SimdVectorOperations}.
      *
      * <p>Processes vectors in chunks of the preferred SIMD width, then
      * handles the tail with scalar operations. Uses double accumulation
@@ -245,6 +249,10 @@ public final class InnerProduct implements DistanceFunction {
         for (int i = upperBound; i < length; i++) {
             // Cast to double BEFORE multiplication for precision
             sum += (double) v1[i] * (double) v2[i];
+        }
+
+        if (!Double.isFinite(sum)) {
+            DistanceValidator.validateVectorPair(v1, v2, "v1", "v2");
         }
 
         return clampToFloatRange(sum);

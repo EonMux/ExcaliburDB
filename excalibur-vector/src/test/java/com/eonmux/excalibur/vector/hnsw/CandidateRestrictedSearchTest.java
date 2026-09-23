@@ -150,6 +150,20 @@ class CandidateRestrictedSearchTest {
             .containsExactlyElementsOf(real);
     }
 
+    @Test
+    @DisplayName("a k as large as an int holds is answered in full rather than overflowing the beam")
+    void aSaturatedKReturnsEveryAdmissibleNode() {
+        // k is client-controlled and widens the beam; at Integer.MAX_VALUE, sizing the beam from
+        // it overflowed, and doubling it for a restricted walk went negative.
+        float[] query = randomVector(new Random(55L));
+        Set<Long> candidates = everyNthNode(4);
+        assertThat(candidates).hasSizeGreaterThan(CROSSOVER);
+
+        assertThat(graph.search(query, Integer.MAX_VALUE)).hasSize(NODE_COUNT);
+        assertThat(idsOf(graph.search(query, Integer.MAX_VALUE, candidates)))
+            .containsExactlyElementsOf(nearestWithin(candidates, query, candidates.size()));
+    }
+
     /**
      * How far the walk goes before it stops.
      *

@@ -5,7 +5,6 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -112,17 +111,6 @@ class InlineSourceTest {
         @DisplayName("knows how many documents it holds without crawling")
         void knowsItsCount() throws Exception {
             assertThat(source.getDocumentCount()).isEqualTo(2);
-        }
-
-        /**
-         * The documents arrived in one request and are ingested in that same request. There is
-         * no later run for a change to be detected before, so claiming one may have happened
-         * would schedule re-crawls of a source that can never differ from what it already was.
-         */
-        @Test
-        @DisplayName("never claims to have changed, having nothing to re-crawl")
-        void neverChanges() throws Exception {
-            assertThat(source.hasChanged(Instant.EPOCH)).isFalse();
         }
 
         @Test

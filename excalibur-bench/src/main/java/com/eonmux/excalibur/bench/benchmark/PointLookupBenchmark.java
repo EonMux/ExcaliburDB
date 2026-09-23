@@ -20,26 +20,31 @@ import java.util.concurrent.TimeUnit;
  * <h2>Performance Target Interpretation</h2>
  * <p>The original specification stated "≥1B/sec" which has been interpreted:</p>
  * <ul>
- *   <li><strong>Realistic single-threaded target</strong>: ≥10M ops/sec (10 million)</li>
- *   <li><strong>Expected range</strong>: 20-50M ops/sec with page cache hot</li>
+ *   <li><strong>Realistic single-threaded target</strong>: ≥10M lookups/sec (10 million)</li>
  *   <li><strong>Rationale</strong>: 1B ops/sec = 1ns/op = ~3-5 CPU cycles, which is
  *       unrealistic for hash table lookups involving memory access</li>
  * </ul>
  *
- * <h2>Typical Results (single-threaded, page cache hot)</h2>
- * <ul>
- *   <li>sequentialLookupFast: 30-40M ops/sec</li>
- *   <li>sequentialLookupWithLock: 25-35M ops/sec</li>
- *   <li>randomLookupFast: 25-35M ops/sec</li>
- *   <li>lookupMiss: 15-25M ops/sec</li>
- * </ul>
+ * <h2>Units</h2>
+ * <p>Every score is per lookup. The batch methods declare {@link OperationsPerInvocation},
+ * so a batch of a hundred and a single lookup are read on the same scale and the difference
+ * between them is what the batch shares - one read lock acquisition - rather than a factor
+ * of a hundred.</p>
  *
- * <h2>Optimizations Applied</h2>
+ * <h2>What a lookup costs</h2>
+ * <p>A hit is verified before its value is handed out: the slot it was reached through
+ * against the slot checksum, and the whole record against the entry checksum. The entry
+ * checksum dominates: a CRC32 over the header, key and value, of which each call carries a
+ * fixed cost of the order of the whole computation for a record this size. That is the floor
+ * under every hit, batched or not, and the reason a batch cannot run several times faster
+ * than a single lookup: the lock it amortises is a fraction of what each lookup costs.</p>
+ *
+ * <h2>Access Patterns</h2>
  * <ul>
- *   <li>Pre-computed hashes to eliminate hash computation from hot path</li>
- *   <li>Lock-free reads using getByHashWithoutLock for read-only benchmark</li>
- *   <li>Manual lock acquisition outside benchmark loop for amortization</li>
- *   <li>Sequential and random access patterns tested</li>
+ *   <li>Pre-computed hashes, so hashing is not timed except where a method says so</li>
+ *   <li>Lock-free reads using getByHashWithoutLock, single-threaded</li>
+ *   <li>Sequential keys in insertion order, and a random stream the batches walk through</li>
+ *   <li>Misses against pre-built keys confirmed absent at setup</li>
  * </ul>
  *
  * <h2>Domain Correctness</h2>
@@ -74,8 +79,7 @@ public class PointLookupBenchmark {
      * Target throughput in ops/sec.
      *
      * <p>Interpreted from "≥1B/sec" as realistic single-threaded target.
-     * 10M ops/sec is achievable with memory-mapped I/O and page cache hot.
-     * Actual results typically range 20-50M ops/sec.</p>
+     * 10M ops/sec is achievable with memory-mapped I/O and page cache hot.</p>
      *
      * <p>Domain correctness: positive value in range [1M, 100M] for single-threaded</p>
      */
@@ -122,11 +126,45 @@ public class PointLookupBenchmark {
     private Path tempFile;
     private Segment segment;
 
+    /**
+     * Lookups per invocation of {@link #batchLookup10} and {@link #batchLookupApi}.
+     */
+    static final int SMALL_BATCH = 10;
+
+    /**
+     * Lookups per invocation of {@link #batchLookup100}.
+     */
+    static final int LARGE_BATCH = 100;
+
+    /**
+     * Length of the random index stream, a power of two so that a cursor wraps with a mask.
+     *
+     * <p>Long enough that a batch never sees the same keys two invocations running: a batch
+     * that replays a fixed handful of keys measures a working set that lives in L1, which no
+     * point lookup against a real segment does.</p>
+     */
+    static final int RANDOM_INDEX_COUNT = 1 << 14;
+
+    /**
+     * Number of distinct absent keys the miss benchmark cycles through, a power of two.
+     */
+    static final int MISS_KEY_COUNT = 1 << 12;
+
     // Pre-computed lookup data
     private byte[][] keys;
     private long[] keyHashes;
     private int[] randomIndices;
     private int sequentialIndex;
+    private int randomCursor;
+
+    // Pre-computed absent keys, so that the miss path times a lookup rather than building a key
+    private byte[][] missKeys;
+    private long[] missHashes;
+    private int missCursor;
+
+    // Reused request arrays for the batch API, so that the timed call is the only allocation
+    private byte[][] apiBatchKeys;
+    private long[] apiBatchHashes;
 
     @Setup(Level.Trial)
     public void setup() throws IOException {
@@ -192,12 +230,30 @@ public class PointLookupBenchmark {
         }
 
         // Generate random indices for random access pattern
-        int numRandomIndices = 10000;
-        randomIndices = new int[numRandomIndices];
-        for (int i = 0; i < numRandomIndices; i++) {
+        randomIndices = new int[RANDOM_INDEX_COUNT];
+        for (int i = 0; i < RANDOM_INDEX_COUNT; i++) {
             randomIndices[i] = random.nextInt(entryCount);
         }
         sequentialIndex = 0;
+        randomCursor = 0;
+
+        // Absent keys of the same length as the stored ones, each confirmed absent
+        missKeys = new byte[MISS_KEY_COUNT][];
+        missHashes = new long[MISS_KEY_COUNT];
+        for (int i = 0; i < MISS_KEY_COUNT; i++) {
+            byte[] missKey = new byte[keySize];
+            byte[] missBytes = ("miss-" + String.format("%08d", i)).getBytes();
+            System.arraycopy(missBytes, 0, missKey, 0, Math.min(missBytes.length, keySize));
+            missKeys[i] = missKey;
+            missHashes[i] = segment.hashKey(missKey);
+            if (segment.getByHash(missKey, missHashes[i]) != null) {
+                throw new IllegalStateException("Miss key " + i + " is present in the segment");
+            }
+        }
+        missCursor = 0;
+
+        apiBatchKeys = new byte[SMALL_BATCH][];
+        apiBatchHashes = new long[SMALL_BATCH];
 
         // Verify segment state
         if (segment.entryCount() != entryCount) {
@@ -236,8 +292,7 @@ public class PointLookupBenchmark {
      */
     @Benchmark
     public Object sequentialLookupFast(Blackhole bh) {
-        int idx = sequentialIndex % entryCount;
-        sequentialIndex++;
+        int idx = nextSequentialIndex();
         return segment.getByHashWithoutLock(keys[idx], keyHashes[idx]);
     }
 
@@ -247,8 +302,7 @@ public class PointLookupBenchmark {
      */
     @Benchmark
     public Object randomLookupFast(Blackhole bh) {
-        int idx = randomIndices[sequentialIndex % randomIndices.length];
-        sequentialIndex++;
+        int idx = randomIndices[nextRandomPosition(1)];
         return segment.getByHashWithoutLock(keys[idx], keyHashes[idx]);
     }
 
@@ -258,70 +312,53 @@ public class PointLookupBenchmark {
      */
     @Benchmark
     public Object sequentialLookupWithLock(Blackhole bh) {
-        int idx = sequentialIndex % entryCount;
-        sequentialIndex++;
+        int idx = nextSequentialIndex();
         return segment.getByHash(keys[idx], keyHashes[idx]);
     }
 
     /**
-     * Benchmark: Batch lookups with single lock acquisition.
-     * Measures throughput of batch operations.
+     * Benchmark: Batch of 10 random lookups under one read lock acquisition.
+     *
+     * <p>Reported per lookup. Each invocation takes the next ten keys of the random stream,
+     * so successive batches hit different records.</p>
      */
     @Benchmark
+    @OperationsPerInvocation(SMALL_BATCH)
     public int batchLookup10(Blackhole bh) {
-        int found = 0;
-        segment.readLock().lock();
-        try {
-            for (int i = 0; i < 10; i++) {
-                int idx = randomIndices[i % randomIndices.length];
-                if (segment.getByHashWithoutLock(keys[idx], keyHashes[idx]) != null) {
-                    found++;
-                }
-            }
-        } finally {
-            segment.readLock().unlock();
-        }
-        return found;
+        return lockedBatch(SMALL_BATCH);
     }
 
     /**
-     * Benchmark: Large batch lookups with single lock acquisition.
-     * Measures throughput of larger batch operations.
+     * Benchmark: Batch of 100 random lookups under one read lock acquisition.
+     *
+     * <p>Reported per lookup, so that it compares directly with the single-lookup benchmarks:
+     * what one lock acquisition per hundred lookups buys over one per lookup is the difference
+     * between this and {@link #sequentialLookupWithLock}.</p>
      */
     @Benchmark
+    @OperationsPerInvocation(LARGE_BATCH)
     public int batchLookup100(Blackhole bh) {
-        int found = 0;
-        segment.readLock().lock();
-        try {
-            for (int i = 0; i < 100; i++) {
-                int idx = randomIndices[i % randomIndices.length];
-                if (segment.getByHashWithoutLock(keys[idx], keyHashes[idx]) != null) {
-                    found++;
-                }
-            }
-        } finally {
-            segment.readLock().unlock();
-        }
-        return found;
+        return lockedBatch(LARGE_BATCH);
     }
 
     /**
-     * Benchmark: Ultra-fast batch using batch API.
-     * Tests the optimized batch lookup method.
+     * Benchmark: Batch of 10 random lookups through the segment's batch API.
+     *
+     * <p>Reported per lookup. The request arrays are reused; the result array the API
+     * returns is part of what is measured.</p>
      */
     @Benchmark
+    @OperationsPerInvocation(SMALL_BATCH)
     public int batchLookupApi(Blackhole bh) {
-        // Prepare batch of 10 keys
-        byte[][] batchKeys = new byte[10][];
-        long[] batchHashes = new long[10];
-        for (int i = 0; i < 10; i++) {
-            int idx = randomIndices[i % randomIndices.length];
-            batchKeys[i] = keys[idx];
-            batchHashes[i] = keyHashes[idx];
+        int start = nextRandomPosition(SMALL_BATCH);
+        for (int i = 0; i < SMALL_BATCH; i++) {
+            int idx = randomIndices[(start + i) & (RANDOM_INDEX_COUNT - 1)];
+            apiBatchKeys[i] = keys[idx];
+            apiBatchHashes[i] = keyHashes[idx];
         }
 
         int found = 0;
-        var results = segment.batchGetByHash(batchKeys, batchHashes);
+        var results = segment.batchGetByHash(apiBatchKeys, apiBatchHashes);
         for (var r : results) {
             if (r != null) found++;
         }
@@ -330,14 +367,61 @@ public class PointLookupBenchmark {
 
     /**
      * Benchmark: Miss path - lookups for non-existent keys.
-     * Tests the performance when keys are not found.
+     *
+     * <p>Cycles through keys generated and confirmed absent at setup, so the timed call is
+     * the lookup and not the construction and hashing of a new key.</p>
      */
     @Benchmark
     public Object lookupMiss(Blackhole bh) {
-        // Use a key that doesn't exist
-        byte[] missKey = ("miss-" + (sequentialIndex++)).getBytes();
-        long missHash = segment.hashKey(missKey);
-        return segment.getByHash(missKey, missHash);
+        int i = missCursor;
+        missCursor = (i + 1) & (MISS_KEY_COUNT - 1);
+        return segment.getByHash(missKeys[i], missHashes[i]);
+    }
+
+    /**
+     * Looks up the next keys of the random stream under a single read lock acquisition.
+     *
+     * @param batch Number of lookups
+     * @return Number of keys found
+     */
+    private int lockedBatch(int batch) {
+        int start = nextRandomPosition(batch);
+        int found = 0;
+        segment.readLock().lock();
+        try {
+            for (int i = 0; i < batch; i++) {
+                int idx = randomIndices[(start + i) & (RANDOM_INDEX_COUNT - 1)];
+                if (segment.getByHashWithoutLock(keys[idx], keyHashes[idx]) != null) {
+                    found++;
+                }
+            }
+        } finally {
+            segment.readLock().unlock();
+        }
+        return found;
+    }
+
+    /**
+     * Returns the next entry index in insertion order, wrapping at the entry count.
+     *
+     * @return An index into {@code keys}
+     */
+    private int nextSequentialIndex() {
+        int idx = sequentialIndex;
+        sequentialIndex = idx + 1 == entryCount ? 0 : idx + 1;
+        return idx;
+    }
+
+    /**
+     * Claims the next positions of the random index stream.
+     *
+     * @param count Number of positions claimed
+     * @return The first claimed position; the rest follow it, wrapping with the stream mask
+     */
+    private int nextRandomPosition(int count) {
+        int start = randomCursor;
+        randomCursor = (start + count) & (RANDOM_INDEX_COUNT - 1);
+        return start;
     }
 
     // ==================== Utility Methods ====================

@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.bench;
 
 import com.eonmux.excalibur.bench.metric.BenchmarkResultSet;
+import com.eonmux.excalibur.bench.metric.ErroredBenchmark;
 import com.eonmux.excalibur.bench.report.BenchmarkReportWriter;
 
 import java.io.IOException;
@@ -27,7 +28,10 @@ public final class BenchmarkCaptureCommand {
     /** Every target was compared and met. */
     public static final int EXIT_OK = 0;
 
-    /** A target was missed, could not be evaluated, or nothing was measured. */
+    /**
+     * A benchmark combination errored, a target was missed or could not be evaluated,
+     * or nothing was measured.
+     */
     public static final int EXIT_FAILED = 1;
 
     /** The arguments could not be acted on. */
@@ -46,9 +50,8 @@ public final class BenchmarkCaptureCommand {
          * Runs every benchmark matching a pattern.
          *
          * @param pattern the JMH include pattern
-         * @param capture whether the caller intends to report on the results; a
-         *        standard run may discard them
-         * @return the measurements
+         * @param capture whether the caller intends to write reports from the results
+         * @return the measurements, and every combination that errored instead
          * @throws Exception if the run fails
          */
         BenchmarkResultSet measure(String pattern, boolean capture) throws Exception;
@@ -137,20 +140,30 @@ public final class BenchmarkCaptureCommand {
         return reportOutcome(resultSet, pattern);
     }
 
+    /**
+     * Runs without writing reports. Targets are not judged here - JMH's console output is
+     * the report - but a combination that errored still fails the run, since the console
+     * scrolls its stack trace away and the summary table simply lacks the row.
+     */
     private int runStandard(String pattern) throws Exception {
-        benchmarkRun.measure(pattern, false);
-        return EXIT_OK;
+        BenchmarkResultSet resultSet = Objects.requireNonNull(
+            benchmarkRun.measure(pattern, false), "benchmark run returned no result set");
+        return reportErrored(resultSet) ? EXIT_FAILED : EXIT_OK;
     }
 
     /**
-     * Turns a run's outcome into an exit code, saying which of the three failure modes
-     * applies.
+     * Turns a run's outcome into an exit code, saying which of the failure modes applies.
      *
      * @param resultSet the captured results
      * @param pattern the include pattern that was run
      * @return {@link #EXIT_OK} only when every target was compared and met
      */
     private int reportOutcome(BenchmarkResultSet resultSet, String pattern) {
+        // Checked first: an errored combination is also why a run can have no results,
+        // and "nothing was measured" would hide the exception that explains it.
+        if (reportErrored(resultSet)) {
+            return EXIT_FAILED;
+        }
         if (resultSet.resultCount() == 0) {
             err.println("FAILED: the run produced no results for pattern '" + pattern
                 + "'. Nothing was measured, so no target can be reported as met.");
@@ -169,6 +182,24 @@ public final class BenchmarkCaptureCommand {
         out.println("PASSED: all " + resultSet.passCount()
             + " benchmark target(s) were evaluated and met.");
         return EXIT_OK;
+    }
+
+    /**
+     * Names every errored combination and its failure on the error stream.
+     *
+     * @return true if any combination errored
+     */
+    private boolean reportErrored(BenchmarkResultSet resultSet) {
+        if (resultSet.erroredCount() == 0) {
+            return false;
+        }
+        err.println("FAILED: " + resultSet.erroredCount()
+            + " benchmark combination(s) errored and produced no measurement:");
+        for (ErroredBenchmark entry : resultSet.erroredBenchmarks()) {
+            err.println("  [" + entry.category() + "] " + entry.label());
+            err.println("    " + entry.message());
+        }
+        return true;
     }
 
     private void writeReports(BenchmarkResultSet resultSet, Path outputPath) throws IOException {
@@ -209,8 +240,9 @@ public final class BenchmarkCaptureCommand {
               --help          Show this message
 
             Exit codes:
-              0 - every target was compared and met
-              1 - a target was missed, could not be evaluated, or nothing was measured
+              0 - every combination ran and every target was compared and met
+              1 - a combination errored, a target was missed or could not be
+                  evaluated, or nothing was measured
               2 - the arguments could not be acted on""");
     }
 }

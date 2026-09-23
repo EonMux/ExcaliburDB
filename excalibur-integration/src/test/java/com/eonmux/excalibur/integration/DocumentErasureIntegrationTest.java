@@ -118,7 +118,7 @@ class DocumentErasureIntegrationTest {
                 public void setError(String error) {
                 }
             },
-            visibility, null, 5000);
+            visibility, 5000);
         orchestrator.setLexicalIndex(lexical);
     }
 
@@ -369,11 +369,6 @@ class DocumentErasureIntegrationTest {
         @Override
         public Stream<String> crawl() {
             return documents.keySet().stream();
-        }
-
-        @Override
-        public boolean hasChanged(java.time.Instant since) {
-            return true;
         }
 
         @Override

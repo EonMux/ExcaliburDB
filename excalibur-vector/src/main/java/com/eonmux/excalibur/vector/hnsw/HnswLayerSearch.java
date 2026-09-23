@@ -2,7 +2,6 @@ package com.eonmux.excalibur.vector.hnsw;
 
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.List;
 import java.util.PriorityQueue;
 import java.util.Set;
@@ -24,16 +23,26 @@ import java.util.Set;
  * these methods: its values come from a lookup table on a different scale, and a queue holding
  * both would rank nodes by which encoding they happen to have.</p>
  *
- * <h2>Locking</h2>
+ * <h2>Locking and reads</h2>
  * <p>This class holds no state of its own and takes no lock that the graph did not already
  * define. The public entry points acquire the graph's read lock exactly where the methods they
- * were extracted from acquired it; the layer walks below assume it is already held, and re-enter
- * it through {@link HnswGraph#readNode(long)}. Tombstone checks are repeated on the way out
- * because a node admitted to the beam can be retired before the results are extracted, and the
- * read lock does not exclude that - {@link HnswGraph#delete(long)} takes the write lock, but a
- * result is only as fresh as the moment it was measured.</p>
+ * were extracted from acquired it, and read nodes through a {@link HnswTraversal} opened under
+ * it; the layer walks below are handed that traversal by their caller, who holds the lock -
+ * the read lock for a query, the write lock for an insert. Nothing the walks read can change
+ * while that lock is held, so a node found active when it was reached is still active when the
+ * results are extracted.</p>
+ *
+ * <h2>What a walk allocates</h2>
+ * <p>Nodes are handled by id. A node's vector is measured in a scratch buffer, its neighbours
+ * read into another, visited nodes are marked in a set borrowed from the graph's
+ * {@link HnswVisitedPool} rather than allocated at the graph's size, and the beam holds bare
+ * id-and-distance results. Document ids and the generation stamp are attached only to the k
+ * results a query returns, not to the thousands of nodes a walk passes through.</p>
  */
 final class HnswLayerSearch {
+
+    private static final Comparator<HnswSearchResult> NEAREST_FIRST =
+        Comparator.comparingDouble(HnswSearchResult::distance);
 
     private final HnswGraph graph;
 
@@ -65,61 +74,15 @@ final class HnswLayerSearch {
             if (graph.nodeCount == 0 || graph.entryPointId < 0) {
                 return new ArrayList<>();
             }
-
-            // Start from entry point
-            long currentNodeId = graph.entryPointId;
-            HnswGraph.NodeView current = graph.readNode(currentNodeId);
-
-            if (current == null || current.isTombstoned()) {
-                // Entry point is tombstoned, need to find a new starting point
-                currentNodeId = HnswNodeRecords.findActiveNode(graph.mappedFile, graph.nodeCount);
-                if (currentNodeId < 0) {
-                    return new ArrayList<>();
-                }
-                current = graph.readNode(currentNodeId);
+            HnswTraversal traversal = HnswTraversal.open(graph);
+            long entry = descend(traversal, query);
+            if (entry < 0) {
+                return new ArrayList<>();
             }
-
-            final float[] queryVec = query;
             // The layer-0 beam is trimmed to ef entries, so a beam narrower than k
             // can never yield k results.
-            final int efSearch = Math.max(graph.config.efSearch(), k);
-
-            // Search through layers from top to layer 1
-            for (int level = graph.maxLevel; level > 0; level--) {
-                // Greedy search: find the closest node at this level
-                HnswGraph.NodeView closest = searchLayerSimple(queryVec, current, level);
-                if (closest != null) {
-                    current = closest;
-                }
-            }
-
-            // At layer 0, perform beam search
-            PriorityQueue<HnswSearchResult> results = searchLayerBeam(
-                queryVec, current, 0, efSearch);
-
-            // Extract ALL results from the heap and find top-k closest
-            // Note: results is a max-heap, so polling gives furthest first
-            // We need to extract all, then sort to get the k closest
-            List<HnswSearchResult> allResults = new ArrayList<>();
-            while (!results.isEmpty()) {
-                HnswSearchResult result = results.poll();
-                // Verify node is not tombstoned
-                HnswGraph.NodeView node = graph.readNode(result.nodeId());
-                if (node != null && !node.isTombstoned()) {
-                    allResults.add(result);
-                }
-            }
-
-            // Sort by distance (closest first)
-            allResults.sort(Comparator.comparingDouble(HnswSearchResult::distance));
-
-            // Take top-k closest results
-            List<HnswSearchResult> topResults = new ArrayList<>();
-            for (int i = 0; i < Math.min(k, allResults.size()); i++) {
-                topResults.add(allResults.get(i));
-            }
-
-            return topResults;
+            int ef = Math.max(graph.config.efSearch(), k);
+            return topK(searchLayerBeam(traversal, query, entry, 0, ef, null), k);
         } finally {
             graph.lock.readLock().unlock();
         }
@@ -162,13 +125,18 @@ final class HnswLayerSearch {
 
             // As in search(): the beam is trimmed to ef entries, so one narrower than k can never
             // yield k results.
-            final int ef = Math.max(graph.config.efSearch(), k * 2);
+            final int ef = Math.max(graph.config.efSearch(), (int) Math.min(Integer.MAX_VALUE, 2L * k));
+            HnswTraversal traversal = HnswTraversal.open(graph);
 
             long named = candidateIds.size();
             if (named * named <= (long) ef * graph.nodeCount) {
-                return measureCandidates(query, k, candidateIds);
+                return measureCandidates(traversal, query, k, candidateIds);
             }
-            return walkAdmitting(query, k, ef, candidateIds);
+            long entry = descend(traversal, query);
+            if (entry < 0) {
+                return new ArrayList<>();
+            }
+            return topK(searchLayerBeam(traversal, query, entry, 0, ef, candidateIds), k);
         } finally {
             graph.lock.readLock().unlock();
         }
@@ -180,125 +148,96 @@ final class HnswLayerSearch {
      * <p>Exact, and independent of how the graph happens to link the names. Must be called with
      * the read lock held.</p>
      */
-    private List<HnswSearchResult> measureCandidates(float[] query, int k, Set<Long> candidateIds) {
+    private List<HnswSearchResult> measureCandidates(
+            HnswTraversal traversal, float[] query, int k, Set<Long> candidateIds) {
         List<HnswSearchResult> measured = new ArrayList<>(candidateIds.size());
         for (long nodeId : candidateIds) {
-            HnswGraph.NodeView node = graph.readNode(nodeId);
-            if (node == null || node.isTombstoned()) {
-                continue;
+            if (traversal.isActive(nodeId)) {
+                measured.add(new HnswSearchResult(nodeId, traversal.distance(query, nodeId)));
             }
-            measured.add(graph.createSearchResult(nodeId, graph.computeDistance(query, node.vector())));
         }
-
-        measured.sort(Comparator.comparingDouble(HnswSearchResult::distance));
-        return new ArrayList<>(measured.subList(0, Math.min(k, measured.size())));
+        measured.sort(NEAREST_FIRST);
+        return stamped(measured, k);
     }
 
     /**
-     * Answers a candidate-restricted search with the ordinary graph walk, admitting only named
-     * nodes to the results.
+     * Greedy descent from the entry point to layer 1, the start of every query.
      *
-     * <p>Traversal is unrestricted: a named node is reached through whatever unnamed nodes lie
-     * between it and the entry point, which is the only way a scattered set can be searched at
-     * all. Must be called with the read lock held.</p>
+     * <p>A tombstoned entry point is replaced by any active node, from which the walk proceeds as
+     * usual. Must be called with the read lock held.</p>
+     *
+     * @return The node to start the layer-0 beam from, or -1 when no node is active
      */
-    private List<HnswSearchResult> walkAdmitting(
-            float[] query, int k, int ef, Set<Long> candidateIds) {
-
-        HnswGraph.NodeView current = graph.readNode(graph.entryPointId);
-        if (current == null || current.isTombstoned()) {
-            long active = HnswNodeRecords.findActiveNode(graph.mappedFile, graph.nodeCount);
-            if (active < 0) {
-                return new ArrayList<>();
-            }
-            current = graph.readNode(active);
-            if (current == null) {
-                return new ArrayList<>();
+    private long descend(HnswTraversal traversal, float[] query) {
+        long current = graph.entryPointId;
+        if (!traversal.isActive(current)) {
+            current = HnswNodeRecords.findActiveNode(graph.mappedFile, graph.nodeCount);
+            if (current < 0) {
+                return -1;
             }
         }
-
         for (int level = graph.maxLevel; level > 0; level--) {
-            HnswGraph.NodeView closest = searchLayerSimple(query, current, level);
-            if (closest != null) {
-                current = closest;
-            }
+            current = searchLayerSimple(traversal, query, current, level);
         }
+        return current;
+    }
 
-        PriorityQueue<HnswSearchResult> results =
-            searchLayerBeam(query, current, 0, ef, candidateIds);
+    /**
+     * Sorts a beam nearest first and returns its k closest, with document ids attached.
+     */
+    private List<HnswSearchResult> topK(PriorityQueue<HnswSearchResult> beam, int k) {
+        List<HnswSearchResult> sorted = new ArrayList<>(beam);
+        sorted.sort(NEAREST_FIRST);
+        return stamped(sorted, k);
+    }
 
-        List<HnswSearchResult> admitted = new ArrayList<>();
-        while (!results.isEmpty()) {
-            HnswSearchResult result = results.poll();
-            // The beam admitted only named nodes; this re-read is for one tombstoned since.
-            HnswGraph.NodeView node = graph.readNode(result.nodeId());
-            if (node != null && !node.isTombstoned()) {
-                admitted.add(result);
-            }
+    /**
+     * The first k of a nearest-first list, each carrying its document id and the generation.
+     */
+    private List<HnswSearchResult> stamped(List<HnswSearchResult> nearestFirst, int k) {
+        int count = Math.min(k, nearestFirst.size());
+        List<HnswSearchResult> results = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            HnswSearchResult result = nearestFirst.get(i);
+            results.add(graph.createSearchResult(result.nodeId(), result.distance()));
         }
-
-        admitted.sort(Comparator.comparingDouble(HnswSearchResult::distance));
-        return new ArrayList<>(admitted.subList(0, Math.min(k, admitted.size())));
+        return results;
     }
 
     /**
      * Simple greedy search at a single layer.
      *
-     * <p>Tombstoned nodes are automatically skipped during traversal.</p>
+     * <p>Tombstoned nodes are skipped: they are neither measured nor stepped through.</p>
      *
+     * @param traversal Read access opened under the lock the caller holds
      * @param query The vector being navigated towards
-     * @param entry Where the descent starts at this layer
+     * @param entry An active node where the descent starts at this layer
      * @param level The layer to walk
      * @return The closest node reachable by strictly improving steps
      */
-    HnswGraph.NodeView searchLayerSimple(float[] query, HnswGraph.NodeView entry, int level) {
-        HnswGraph.NodeView current = entry;
-        float currentDist = graph.computeDistance(query, current.vector());
+    long searchLayerSimple(HnswTraversal traversal, float[] query, long entry, int level) {
+        long current = entry;
+        float currentDist = traversal.distance(query, current);
         boolean improved = true;
 
         while (improved) {
             improved = false;
-            // Use getActiveNeighbors to automatically filter tombstoned nodes
-            List<Long> neighbors = current.getActiveNeighbors(level);
-
-            for (long neighborId : neighbors) {
-                HnswGraph.NodeView neighbor = graph.readNode(neighborId);
-                // Double-check in case neighbor became tombstoned after getActiveNeighbors
-                if (neighbor == null || neighbor.isTombstoned()) {
+            int count = traversal.readNeighbors(current, level);
+            int[] neighbors = traversal.neighbors();
+            for (int i = 0; i < count; i++) {
+                long neighborId = neighbors[i];
+                if (!traversal.isActive(neighborId)) {
                     continue;
                 }
-
-                float dist = graph.computeDistance(query, neighbor.vector());
+                float dist = traversal.distance(query, neighborId);
                 if (dist < currentDist) {
                     currentDist = dist;
-                    current = neighbor;
+                    current = neighborId;
                     improved = true;
                 }
             }
         }
-
         return current;
-    }
-
-    /**
-     * Beam search at a layer, admitting every node it reaches.
-     *
-     * <p>Tombstoned nodes are automatically skipped during traversal:
-     * <ul>
-     *   <li>The entry node is checked for tombstone status before starting</li>
-     *   <li>All neighbor lists are filtered to exclude tombstoned nodes</li>
-     *   <li>Results are verified to exclude any nodes that became tombstoned during search</li>
-     * </ul>
-     *
-     * @param query The vector being searched for
-     * @param entry Where the beam starts
-     * @param level The layer to walk
-     * @param ef The beam width
-     * @return A max-heap of the beam's contents, furthest first
-     */
-    PriorityQueue<HnswSearchResult> searchLayerBeam(
-            float[] query, HnswGraph.NodeView entry, int level, int ef) {
-        return searchLayerBeam(query, entry, level, ef, null);
     }
 
     /**
@@ -312,91 +251,88 @@ final class HnswLayerSearch {
      *
      * <p>Because a traversed node is no longer necessarily a kept one, the walk stops on the beam
      * being both full and no longer improvable - not on the frontier passing the worst result,
-     * which for an unfilled beam would stop it before it had an answer.</p>
+     * which for an unfilled beam would stop it before it had an answer. Tombstoned nodes are
+     * never measured, stepped through or kept.</p>
      *
+     * @param traversal Read access opened under the lock the caller holds
      * @param query The vector being searched for
-     * @param entry Where the beam starts
+     * @param entry An active node where the beam starts
      * @param level The layer to walk
      * @param ef The beam width
      * @param admissible ids that may enter the results, or null to admit every node reached
-     * @return A max-heap of the beam's contents, furthest first
+     * @return A max-heap of the beam's contents, furthest first, without document ids
      */
-    PriorityQueue<HnswSearchResult> searchLayerBeam(
-            float[] query, HnswGraph.NodeView entry, int level, int ef, Set<Long> admissible) {
+    PriorityQueue<HnswSearchResult> searchLayerBeam(HnswTraversal traversal, float[] query,
+                                                    long entry, int level, int ef,
+                                                    Set<Long> admissible) {
+        // Sized for what the beam can actually hold: ef is caller-derived and may be as large as
+        // Integer.MAX_VALUE, but the beam never outgrows the nodes that exist.
+        int capacity = (int) Math.min(Math.min((long) ef, traversal.nodeLimit()) + 1, Integer.MAX_VALUE);
+        PriorityQueue<HnswSearchResult> results = new PriorityQueue<>(capacity, NEAREST_FIRST.reversed());
+        PriorityQueue<HnswSearchResult> candidates = new PriorityQueue<>(NEAREST_FIRST);
 
-        // Max-heap for results (furthest first so we can remove worst and peek at furthest)
-        PriorityQueue<HnswSearchResult> results = new PriorityQueue<>(
-            Comparator.comparingDouble(HnswSearchResult::distance).reversed()
-        );
-
-        // Min-heap for candidates (closest first so we process nearest first)
-        PriorityQueue<HnswSearchResult> candidates = new PriorityQueue<>(
-            Comparator.comparingDouble(HnswSearchResult::distance)
-        );
-
-        // Visited set
-        Set<Long> visited = new HashSet<>();
-
-        if (entry == null || entry.isTombstoned()) {
+        if (!traversal.isActive(entry)) {
             return results;
         }
 
-        float entryDist = graph.computeDistance(query, entry.vector());
-        HnswSearchResult entryResult = graph.createSearchResult(entry.nodeId(), entryDist);
-        candidates.add(entryResult);
-        if (admissible == null || admissible.contains(entry.nodeId())) {
-            results.add(entryResult);
-        }
-        visited.add(entry.nodeId());
-
-        while (!candidates.isEmpty()) {
-            HnswSearchResult current = candidates.poll();
-            HnswGraph.NodeView currentNode = graph.readNode(current.nodeId());
-
-            if (currentNode == null || currentNode.isTombstoned()) {
-                continue;
+        HnswVisitedPool.Marker visited = graph.visitedPool.borrow(traversal.nodeLimit());
+        try {
+            HnswSearchResult entryResult = new HnswSearchResult(entry, traversal.distance(query, entry));
+            candidates.add(entryResult);
+            if (admissible == null || admissible.contains(entry)) {
+                results.add(entryResult);
             }
+            visited.visit((int) entry);
 
-            // Nothing ahead of the frontier can improve a beam that is already full.
-            // results.peek() returns furthest since it's a max-heap
-            if (results.size() >= ef && current.distance() > results.peek().distance()) {
-                break;
-            }
+            while (!candidates.isEmpty()) {
+                HnswSearchResult current = candidates.poll();
 
-            // Use getActiveNeighbors to automatically filter tombstoned nodes
-            List<Long> neighbors = currentNode.getActiveNeighbors(level);
-
-            for (long neighborId : neighbors) {
-                if (visited.contains(neighborId)) {
-                    continue;
-                }
-                visited.add(neighborId);
-
-                HnswGraph.NodeView neighbor = graph.readNode(neighborId);
-                // Double-check in case neighbor became tombstoned after getActiveNeighbors
-                if (neighbor == null || neighbor.isTombstoned()) {
-                    continue;
+                // Nothing ahead of the frontier can improve a beam that is already full.
+                if (results.size() >= ef && current.distance() > results.peek().distance()) {
+                    break;
                 }
 
-                float dist = graph.computeDistance(query, neighbor.vector());
-                HnswSearchResult result = graph.createSearchResult(neighborId, dist);
+                int count = traversal.readNeighbors(current.nodeId(), level);
+                int[] neighbors = traversal.neighbors();
+                for (int i = 0; i < count; i++) {
+                    int neighborId = neighbors[i];
+                    if (!firstVisit(traversal, visited, neighborId) || !traversal.isActive(neighborId)) {
+                        continue;
+                    }
 
-                // Step through it while the beam is unfilled or it beats the worst kept result
-                if (results.size() < ef || dist < results.peek().distance()) {
-                    candidates.add(result);
-
-                    if (admissible == null || admissible.contains(neighborId)) {
-                        results.add(result);
-
-                        // Keep results bounded
-                        while (results.size() > ef) {
-                            results.poll();
+                    float dist = traversal.distance(query, neighborId);
+                    // Step through it while the beam is unfilled or it beats the worst kept result
+                    if (results.size() < ef || dist < results.peek().distance()) {
+                        HnswSearchResult result = new HnswSearchResult(neighborId, dist);
+                        candidates.add(result);
+                        if (admissible == null || admissible.contains((long) neighborId)) {
+                            results.add(result);
+                            if (results.size() > ef) {
+                                results.poll();
+                            }
                         }
                     }
                 }
             }
+            return results;
+        } finally {
+            graph.visitedPool.release(visited);
         }
+    }
 
-        return results;
+    /**
+     * Marks a neighbour id visited, reporting whether this walk is reaching it for the first time.
+     *
+     * <p>An id is only as trustworthy as the record it was read from. One outside the ids handed
+     * out names no node - a damaged list, not a neighbour - and is passed over before it can
+     * reach the visited set, which is sized by the ids that exist.</p>
+     *
+     * @param traversal The walk's read access, whose node limit bounds every real id
+     * @param visited The walk's visited set
+     * @param neighborId The id read from a neighbour list
+     * @return true if the id names a node this walk has not reached before
+     */
+    static boolean firstVisit(HnswTraversal traversal, HnswVisitedPool.Marker visited, int neighborId) {
+        return neighborId >= 0 && neighborId < traversal.nodeLimit() && visited.visit(neighborId);
     }
 }

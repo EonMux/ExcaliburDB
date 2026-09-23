@@ -4,6 +4,7 @@ import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.EpochTickScheduler;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
+import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
 
@@ -42,6 +43,7 @@ class RoutePathExactnessTest {
     void setUp() throws IOException {
         SegmentCatalog catalog = new SegmentCatalog();
         IndexOrchestrator indexOrchestrator = mock(IndexOrchestrator.class);
+        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         StorageEngine storageEngine = mock(StorageEngine.class);
         EpochTickScheduler scheduler = mock(EpochTickScheduler.class);
         when(indexOrchestrator.getVisibilityTracker())

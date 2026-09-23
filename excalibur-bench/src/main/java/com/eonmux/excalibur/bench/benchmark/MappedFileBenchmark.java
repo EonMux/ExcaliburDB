@@ -79,8 +79,19 @@ public class MappedFileBenchmark {
     private float testFloatValue;
     private float[] testFloatArray;
 
+    /**
+     * Number of pre-generated offsets the random-access benchmarks cycle through.
+     */
+    private static final int RANDOM_OFFSET_COUNT = 10_000;
+
     @Setup(Level.Trial)
     public void setup() throws IOException {
+        if (bufferSize < Long.BYTES || bufferSize > fileSize) {
+            throw new IllegalStateException("bufferSize must lie in [" + Long.BYTES + ", fileSize]"
+                + " so every random offset admits a whole buffer and a long: bufferSize="
+                + bufferSize + ", fileSize=" + fileSize);
+        }
+
         // Create temp file
         tempFile = Files.createTempFile("mappedfile_bench_", ".bin");
         tempFile.toFile().deleteOnExit();
@@ -103,14 +114,7 @@ public class MappedFileBenchmark {
         }
         mappedFile.flush();
 
-        // Generate random offsets for random access tests
-        // Ensure we have enough for the benchmark iterations
-        int numOffsets = 10000;
-        randomOffsets = new long[numOffsets];
-        long maxOffset = fileSize - bufferSize;
-        for (int i = 0; i < numOffsets; i++) {
-            randomOffsets[i] = Math.abs(random.nextLong() % maxOffset);
-        }
+        randomOffsets = randomTransferOffsets(random, fileSize, bufferSize, RANDOM_OFFSET_COUNT);
         offsetIndex = 0;
 
         // Initialize test values
@@ -128,6 +132,29 @@ public class MappedFileBenchmark {
         System.out.println("  File size: " + (fileSize / 1024) + " KB");
         System.out.println("  Buffer size: " + bufferSize + " bytes");
         System.out.println("  Mapped size: " + mappedFile.size() + " bytes");
+    }
+
+    /**
+     * Draws the offsets the random-access benchmarks transfer at.
+     *
+     * <p>Every offset admits a whole {@code bufferSize} transfer, so the byte, int and long
+     * accessors can all use it unmodified. The range is inclusive of {@code fileSize -
+     * bufferSize}: when the buffer spans the whole file that is the one valid offset, 0, and
+     * reducing a random long modulo the exclusive bound divided by zero there.</p>
+     *
+     * @param random the seeded source
+     * @param fileSize the mapped file's size
+     * @param bufferSize the size of one transfer, at most {@code fileSize}
+     * @param count how many offsets to draw
+     * @return offsets in {@code [0, fileSize - bufferSize]}
+     */
+    private static long[] randomTransferOffsets(Random random, long fileSize, int bufferSize, int count) {
+        long[] offsets = new long[count];
+        long bound = fileSize - bufferSize + 1;
+        for (int i = 0; i < count; i++) {
+            offsets[i] = random.nextLong(bound);
+        }
+        return offsets;
     }
 
     @TearDown(Level.Trial)
@@ -170,6 +197,7 @@ public class MappedFileBenchmark {
      * Measures ops/sec reading 4-byte integers sequentially.
      */
     @Benchmark
+    @OperationsPerInvocation(1000)
     public int sequentialRead_ints(Blackhole bh) {
         int count = 0;
         long maxOffset = fileSize - 4;
@@ -190,6 +218,7 @@ public class MappedFileBenchmark {
      * Measures ops/sec reading 8-byte longs sequentially.
      */
     @Benchmark
+    @OperationsPerInvocation(1000)
     public int sequentialRead_longs(Blackhole bh) {
         int count = 0;
         long maxOffset = fileSize - 8;
@@ -210,6 +239,7 @@ public class MappedFileBenchmark {
      * Measures throughput reading float vectors (common for embeddings).
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int sequentialRead_floatArray(Blackhole bh) {
         int count = 0;
         long offset = 0;
@@ -254,6 +284,7 @@ public class MappedFileBenchmark {
      * Measures ops/sec writing 4-byte integers sequentially.
      */
     @Benchmark
+    @OperationsPerInvocation(1000)
     public int sequentialWrite_ints(Blackhole bh) {
         int count = 0;
         long maxOffset = fileSize - 4;
@@ -273,6 +304,7 @@ public class MappedFileBenchmark {
      * Measures ops/sec writing 8-byte longs sequentially.
      */
     @Benchmark
+    @OperationsPerInvocation(1000)
     public int sequentialWrite_longs(Blackhole bh) {
         int count = 0;
         long maxOffset = fileSize - 8;
@@ -292,6 +324,7 @@ public class MappedFileBenchmark {
      * Measures throughput writing float vectors (common for embeddings).
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int sequentialWrite_floatArray(Blackhole bh) {
         int count = 0;
         long offset = 0;
@@ -323,7 +356,7 @@ public class MappedFileBenchmark {
         }
 
         long offset = randomOffsets[idx];
-        int read = mappedFile.read(offset, readBuffer, 0, Math.min(bufferSize, (int)(fileSize - offset)));
+        int read = mappedFile.read(offset, readBuffer, 0, bufferSize);
         bh.consume(readBuffer);
         return read;
     }
@@ -340,7 +373,7 @@ public class MappedFileBenchmark {
             idx = 0;
         }
 
-        long offset = randomOffsets[idx] % (fileSize - 4);
+        long offset = randomOffsets[idx];
         return mappedFile.readInt(offset);
     }
 
@@ -356,7 +389,7 @@ public class MappedFileBenchmark {
             idx = 0;
         }
 
-        long offset = randomOffsets[idx] % (fileSize - 8);
+        long offset = randomOffsets[idx];
         return mappedFile.readLong(offset);
     }
 
@@ -373,7 +406,7 @@ public class MappedFileBenchmark {
         }
 
         long offset = randomOffsets[idx];
-        int written = mappedFile.write(offset, writeBuffer, 0, Math.min(bufferSize, (int)(fileSize - offset)));
+        int written = mappedFile.write(offset, writeBuffer, 0, bufferSize);
         bh.consume(written);
         return written;
     }
@@ -390,7 +423,7 @@ public class MappedFileBenchmark {
             idx = 0;
         }
 
-        long offset = randomOffsets[idx] % (fileSize - 4);
+        long offset = randomOffsets[idx];
         mappedFile.writeInt(offset, testIntValue);
         return testIntValue;
     }
@@ -407,7 +440,7 @@ public class MappedFileBenchmark {
             idx = 0;
         }
 
-        long offset = randomOffsets[idx] % (fileSize - 8);
+        long offset = randomOffsets[idx];
         mappedFile.writeLong(offset, testLongValue);
         return testLongValue;
     }
@@ -426,7 +459,7 @@ public class MappedFileBenchmark {
             idx = 0;
         }
 
-        long offset = randomOffsets[idx] % (fileSize - bufferSize);
+        long offset = randomOffsets[idx];
 
         // 80% reads, 20% writes
         if (idx % 5 != 0) {
@@ -454,7 +487,7 @@ public class MappedFileBenchmark {
             idx = 0;
         }
 
-        long offset = randomOffsets[idx] % (fileSize - bufferSize);
+        long offset = randomOffsets[idx];
 
         // Write
         mappedFile.write(offset, writeBuffer);
@@ -479,7 +512,7 @@ public class MappedFileBenchmark {
             idx = 0;
         }
 
-        long offset = randomOffsets[idx] % (fileSize - bufferSize);
+        long offset = randomOffsets[idx];
         var slice = mappedFile.slice(offset, bufferSize);
         bh.consume(slice);
         return slice;

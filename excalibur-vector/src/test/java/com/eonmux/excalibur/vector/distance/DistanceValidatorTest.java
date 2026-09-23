@@ -7,6 +7,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.Arrays;
+
 import static org.assertj.core.api.Assertions.*;
 
 /**
@@ -661,5 +663,42 @@ class DistanceValidatorTest {
     @DisplayName("Invalid L2 distances")
     void invalidL2Distances(float value) {
         assertThat(DistanceValidator.isValidL2Distance(value)).isFalse();
+    }
+
+    @Nested
+    @DisplayName("Input vector finiteness")
+    class InputVectorFiniteness {
+
+        /** Long enough to span several lane groups and leave a scalar tail at any species width. */
+        private static final int LENGTH = 37;
+
+        @ParameterizedTest
+        @ValueSource(floats = {Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY})
+        @DisplayName("A non-finite component is rejected at every index, lane group and tail alike")
+        void shouldRejectANonFiniteComponentAtEveryIndex(float nonFinite) {
+            for (int index = 0; index < LENGTH; index++) {
+                float[] vector = new float[LENGTH];
+                Arrays.fill(vector, 1.0f);
+                vector[index] = nonFinite;
+                final int at = index;
+                assertThatThrownBy(() -> DistanceValidator.validateInputVector(vector, "v"))
+                    .as("non-finite value at index %d", at)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessage("v contains non-finite value at index " + at + ": " + nonFinite);
+            }
+        }
+
+        @Test
+        @DisplayName("Finite extremes, subnormals and signed zeros are accepted")
+        void shouldAcceptEveryFiniteExtreme() {
+            float[] extremes = {Float.MAX_VALUE, -Float.MAX_VALUE, Float.MIN_VALUE,
+                -Float.MIN_VALUE, Float.MIN_NORMAL, 0.0f, -0.0f};
+            float[] vector = new float[LENGTH];
+            for (int i = 0; i < LENGTH; i++) {
+                vector[i] = extremes[i % extremes.length];
+            }
+            assertThatCode(() -> DistanceValidator.validateInputVector(vector, "v"))
+                .doesNotThrowAnyException();
+        }
     }
 }

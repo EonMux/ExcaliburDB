@@ -46,6 +46,7 @@ final class SourceConfigView {
         SourceFactory.FOLLOW_SYMLINKS,
         SourceFactory.INCLUDE_HIDDEN,
         SourceFactory.MAX_FILE_BYTES,
+        SourceFactory.CHARSET,
         SourceFactory.MAX_DOCUMENTS,
         SourceFactory.MAX_RESPONSE_BYTES,
         SourceFactory.TIMEOUT_SECONDS,

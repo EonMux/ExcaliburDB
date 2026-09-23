@@ -15,6 +15,7 @@ import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer.ReindexProgress;
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer.ReindexResult;
 
 import com.eonmux.excalibur.core.text.ChunkIdentifiers;
+import com.eonmux.excalibur.core.util.StopSignal;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -44,6 +45,12 @@ import java.util.concurrent.atomic.AtomicInteger;
  * background thread, so the counter is the only thing anyone can watch, and one that stalls on
  * the first unreadable document is indistinguishable from a run that has stopped.</p>
  *
+ * <h2>Stopping</h2>
+ * <p>The pass is stopped through its {@link StopSignal}, read between documents; see
+ * {@link ReindexCancellation} for why never by an interrupt and why never inside a document. A
+ * stopped pass still writes out what it finished - the lexical refresh and the registry - and
+ * then throws {@link ReindexCancelledException}, with its thread's interrupt flag clear.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>An instance holds no mutable state of its own and is built per run, which is what keeps it
  * reading the lexical index and the vector eraser as they are wired now. Its collaborators carry
@@ -56,9 +63,8 @@ final class SourceReindexPass {
     /**
      * Re-indexes one document into wherever this pass is writing.
      *
-     * <p>The pass is identical whether the run is writing through the routing directory or into
-     * a segment created for a rolling replacement; this is the one thing that differs, so it is
-     * the one thing the pass is given.</p>
+     * <p>Given rather than built in: the pass owns the order of the phases and nothing about
+     * how one document is chunked, embedded or written.</p>
      */
     @FunctionalInterface
     interface DocumentStep {
@@ -67,48 +73,12 @@ final class SourceReindexPass {
          * @param sourceId   The source the document belongs to
          * @param documentId The document
          * @param fetched    What the source handed back
+         * @param stop       The run's stop signal, which may interrupt the step's waits on the
+         *                   embedding endpoint and nothing else
          * @return The outcome, carrying the chunk ids the new version consists of
          */
-        DocumentResult reindex(String sourceId, String documentId, FetchedDocument fetched);
-    }
-
-    /**
-     * Which of the two routes this pass is taking, for the operator reading the log.
-     *
-     * <p>Carried as data rather than as two copies of the pass: the routes differ in where the
-     * chunks land and in nothing else, and a second copy of the phases is a second place for the
-     * ordering above to be got wrong.</p>
-     */
-    enum Route {
-
-        /** Writing wherever the storage engine's routing directory sends each chunk. */
-        THROUGH_ROUTING_DIRECTORY(
-            "Starting re-index for source: {}",
-            "Re-index complete for {}: {} docs indexed, {} chunks created, {} errors"),
-
-        /** Writing into a segment created for a rolling replacement. */
-        INTO_TARGET_SEGMENT(
-            "Starting segment-targeted re-index for source: {}",
-            "Segment-targeted re-index complete for {}: {} docs indexed, {} chunks created, "
-                + "{} errors");
-
-        private final String startMessage;
-        private final String completeMessage;
-
-        Route(String startMessage, String completeMessage) {
-            this.startMessage = startMessage;
-            this.completeMessage = completeMessage;
-        }
-
-        /** Logged before change detection, naming the source. */
-        String startMessage() {
-            return startMessage;
-        }
-
-        /** Logged once the run has ended, naming the source and its totals. */
-        String completeMessage() {
-            return completeMessage;
-        }
+        DocumentResult reindex(String sourceId, String documentId, FetchedDocument fetched,
+                               StopSignal stop);
     }
 
     private final DocumentRegistry registry;
@@ -119,7 +89,6 @@ final class SourceReindexPass {
     private final DocumentErasureService.VectorEraser vectorEraser;
 
     private final DocumentStep documentStep;
-    private final Route route;
 
     /**
      * @param registry      Holds the previous pass's record of the source, which is this pass's
@@ -128,38 +97,53 @@ final class SourceReindexPass {
      * @param lexical       The lexical index to keep in step with storage
      * @param vectorEraser  Retires a removed document's graph nodes, or null for none
      * @param documentStep  Re-indexes one document
-     * @param route         Which of the two routes this pass is taking
      * @throws NullPointerException if any argument other than the eraser is null
      */
     SourceReindexPass(DocumentRegistry registry, UpsertHandler upsertHandler,
                       ReindexLexicalIndex lexical,
                       DocumentErasureService.VectorEraser vectorEraser,
-                      DocumentStep documentStep, Route route) {
+                      DocumentStep documentStep) {
         this.registry = Objects.requireNonNull(registry, "registry must not be null");
         this.upsertHandler =
             Objects.requireNonNull(upsertHandler, "upsertHandler must not be null");
         this.lexical = Objects.requireNonNull(lexical, "lexical must not be null");
         this.vectorEraser = vectorEraser;
         this.documentStep = Objects.requireNonNull(documentStep, "documentStep must not be null");
-        this.route = Objects.requireNonNull(route, "route must not be null");
     }
 
     /**
      * Runs the pass.
      *
+     * <p>Change detection crawls the source and may be interrupted by the stop, as the fetches
+     * may: both wait on the source and touch nothing this node shares.</p>
+     *
      * @param source   The source to re-index
      * @param progress Told how many documents the run has finished with
+     * @param stop     The run's stop signal
      * @return Result containing counts and any errors
      * @throws SourceException          if crawling or fetching fails catastrophically
      * @throws ReindexCancelledException if the run was asked to stop; what it finished before
      *                                   then is written out first
      */
-    ReindexResult run(Source source, ReindexProgress progress) throws SourceException {
+    ReindexResult run(Source source, ReindexProgress progress, StopSignal stop)
+            throws SourceException {
         String sourceId = source.getSourceId();
-        LOG.info(route.startMessage(), sourceId);
+        LOG.info("Starting re-index for source: {}", sourceId);
 
         ChangeDetector detector = new ChangeDetector(registry);
-        ChangeSet changeSet = detector.detectChanges(source);
+        ChangeSet changeSet;
+        try {
+            changeSet = stop.interruptibly(() -> detector.detectChanges(source));
+        } catch (SourceException | RuntimeException e) {
+            ReindexCancellation.stopIfCancelled(stop, sourceId, 0, 0, e);
+            throw e;
+        }
+        // A stop that landed during the crawl may have cut it short without a word - a source
+        // that treats an interrupted listing as its end - and a change set built from a short
+        // listing reads every document it missed as deleted. Nothing has been written yet, so
+        // this is also the cheapest place to stop.
+        ReindexCancellation.checkpoint(stop, sourceId, 0,
+            (long) changeSet.getNewCount() + changeSet.getChangedCount());
 
         LOG.info("Change detection complete for {}: new={}, changed={}, deleted={}",
                 sourceId, changeSet.getNewCount(), changeSet.getChangedCount(),
@@ -181,7 +165,7 @@ final class SourceReindexPass {
             // UpsertHandler.processDeletions. The lexical index is erased first: a document that
             // has been deleted should stop being findable before its bytes go, not after.
             lexical.retire(deletedChunkIds(changeSet));
-            retireVectors(sourceId, changeSet);
+            retireVectors(sourceId, changeSet, stop);
             UpsertHandler.UpsertResult tombstoneResult = upsertHandler.processDeletions(changeSet);
             resultBuilder.documentsTombstoned(tombstoneResult.getDocumentsDeleted());
             chunksTombstoned = tombstoneResult.getChunksTombstoned();
@@ -190,20 +174,22 @@ final class SourceReindexPass {
 
             for (String newDocId : changeSet.getNewDocuments()) {
                 // Before the fetch, so a run that has been asked to stop starts no new work.
-                ReindexCancellation.checkpoint(sourceId, documentsDone.get(), documentsTotal);
+                ReindexCancellation.checkpoint(stop, sourceId, documentsDone.get(),
+                    documentsTotal);
                 try {
-                    FetchedDocument fetched = source.fetch(newDocId);
-                    DocumentResult docResult = documentStep.reindex(sourceId, newDocId, fetched);
+                    FetchedDocument fetched = stop.interruptibly(() -> source.fetch(newDocId));
+                    DocumentResult docResult =
+                        documentStep.reindex(sourceId, newDocId, fetched, stop);
                     resultBuilder.addDocumentResult(docResult);
                 } catch (SourceException e) {
-                    ReindexCancellation.stopIfCancelled(sourceId, documentsDone.get(),
+                    ReindexCancellation.stopIfCancelled(stop, sourceId, documentsDone.get(),
                         documentsTotal, e);
                     String msg = "Failed to fetch new document " + newDocId + ": "
                         + e.getMessage();
                     LOG.error(msg, e);
                     resultBuilder.addError("fetch", newDocId, msg);
                 } catch (Exception e) {
-                    ReindexCancellation.stopIfCancelled(sourceId, documentsDone.get(),
+                    ReindexCancellation.stopIfCancelled(stop, sourceId, documentsDone.get(),
                         documentsTotal, e);
                     String msg = "Failed to re-index new document " + newDocId + ": "
                         + e.getMessage();
@@ -218,22 +204,24 @@ final class SourceReindexPass {
             }
 
             for (ChangeSet.ChangedDocument changed : changeSet.getChangedDocuments()) {
-                ReindexCancellation.checkpoint(sourceId, documentsDone.get(), documentsTotal);
+                ReindexCancellation.checkpoint(stop, sourceId, documentsDone.get(),
+                    documentsTotal);
                 try {
-                    FetchedDocument fetched = source.fetch(changed.getDocumentId());
+                    FetchedDocument fetched =
+                        stop.interruptibly(() -> source.fetch(changed.getDocumentId()));
                     DocumentResult docResult =
-                        documentStep.reindex(sourceId, changed.getDocumentId(), fetched);
+                        documentStep.reindex(sourceId, changed.getDocumentId(), fetched, stop);
                     resultBuilder.addDocumentResult(docResult);
                     chunksTombstoned += retireReplacedVersion(changed, docResult);
                 } catch (SourceException e) {
-                    ReindexCancellation.stopIfCancelled(sourceId, documentsDone.get(),
+                    ReindexCancellation.stopIfCancelled(stop, sourceId, documentsDone.get(),
                         documentsTotal, e);
                     String msg = "Failed to fetch changed document " + changed.getDocumentId()
                         + ": " + e.getMessage();
                     LOG.error(msg, e);
                     resultBuilder.addError("fetch", changed.getDocumentId(), msg);
                 } catch (Exception e) {
-                    ReindexCancellation.stopIfCancelled(sourceId, documentsDone.get(),
+                    ReindexCancellation.stopIfCancelled(stop, sourceId, documentsDone.get(),
                         documentsTotal, e);
                     String msg = "Failed to re-index changed document " + changed.getDocumentId()
                         + ": " + e.getMessage();
@@ -247,13 +235,13 @@ final class SourceReindexPass {
             cancelled = e;
         }
 
-        // The flag is cleared for the two writes below and set again on the way out. Both write
-        // files, and a channel write on an interrupted thread throws ClosedByInterruptException
-        // and closes that channel for good: the run would lose the registry entries it had
-        // already earned, leaving published chunks that nothing names.
-        Thread.interrupted();
+        // An interrupt from elsewhere is cleared into the signal before the two writes below.
+        // Both write files, and a channel write on an interrupted thread throws
+        // ClosedByInterruptException and closes that channel for good: the run would lose the
+        // registry entries it had already earned, leaving published chunks that nothing names.
+        ReindexCancellation.requested(stop);
         resultBuilder.chunksTombstoned(chunksTombstoned);
-        lexical.settle();
+        lexical.settle(stop);
         persistRegistry();
         ReindexResult result = resultBuilder.build();
 
@@ -261,15 +249,12 @@ final class SourceReindexPass {
             LOG.info("{} stopped on request after {} of {} document(s): {} indexed, {} chunks "
                     + "created", sourceId, documentsDone.get(), documentsTotal,
                 result.getDocumentsIndexed(), result.getChunksCreated());
-            // Set again only now: the endpoint tells a stop from a fault by reading the flag
-            // first, and a run that cleared it and never put it back would be filed as an
-            // outage.
-            Thread.currentThread().interrupt();
             throw cancelled;
         }
 
-        LOG.info(route.completeMessage(), sourceId, result.getDocumentsIndexed(),
-            result.getChunksCreated(), result.getErrorCount());
+        LOG.info("Re-index complete for {}: {} docs indexed, {} chunks created, {} errors",
+            sourceId, result.getDocumentsIndexed(), result.getChunksCreated(),
+            result.getErrorCount());
 
         return result;
     }
@@ -322,7 +307,7 @@ final class SourceReindexPass {
      * @return How many nodes were retired
      * @throws ReindexCancelledException if the run was asked to stop
      */
-    private int retireVectors(String sourceId, ChangeSet changeSet) {
+    private int retireVectors(String sourceId, ChangeSet changeSet, StopSignal stop) {
         DocumentErasureService.VectorEraser eraser = this.vectorEraser;
         if (eraser == null) {
             return 0;
@@ -331,7 +316,7 @@ final class SourceReindexPass {
         int considered = 0;
         int deletedTotal = changeSet.getDeletedDocuments().size();
         for (DocumentMetadata deleted : changeSet.getDeletedDocuments()) {
-            ReindexCancellation.checkpoint(sourceId, considered++, deletedTotal);
+            ReindexCancellation.checkpoint(stop, sourceId, considered++, deletedTotal);
             String documentKey = ChunkIdentifiers.documentKey(sourceId, deleted.getDocumentId());
             try {
                 retired += eraser.erase(documentKey);

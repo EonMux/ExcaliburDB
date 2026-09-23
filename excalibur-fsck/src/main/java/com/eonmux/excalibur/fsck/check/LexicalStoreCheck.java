@@ -49,8 +49,9 @@ public final class LexicalStoreCheck {
         if (!Files.exists(manifest)) {
             return new LexicalInspection(new FileCheck(manifest, manifestRelative, FORMAT, null,
                 CheckStatus.MISSING,
-                "the store directory exists but names no segments, so nothing in it can be "
-                    + "opened; a store that was never written looks the same", -1),
+                "the store directory holds files but no manifest naming its segments, so "
+                    + "nothing in it can be opened: something was written here and the record "
+                    + "of which segments are live is gone", -1),
                 List.of(), List.of());
         }
         SegmentManifest parsed;
@@ -143,6 +144,37 @@ public final class LexicalStoreCheck {
             java.util.Objects.requireNonNull(manifest, "manifest");
             findings = List.copyOf(java.util.Objects.requireNonNull(findings, "findings"));
             segments = List.copyOf(java.util.Objects.requireNonNull(segments, "segments"));
+        }
+
+        /**
+         * Returns every verdict this inspection reached: the manifest's, then each segment's.
+         *
+         * @return The verdicts, in that order
+         */
+        public List<FileCheck> verdicts() {
+            List<FileCheck> verdicts = new ArrayList<>(segments.size() + 1);
+            verdicts.add(manifest);
+            verdicts.addAll(segments);
+            return List.copyOf(verdicts);
+        }
+
+        /**
+         * Reports whether a file is already accounted for by one of these verdicts.
+         *
+         * <p>The manifest is its own verdict, and a segment's verdict covers every column
+         * inside that segment's directory, because the segment is verified by streaming all
+         * of them. A sidecar beside the segments - document keys, offsets, tombstones, the
+         * erasure log - is covered by nothing here and keeps its own verdict.</p>
+         *
+         * @param relative A file's path relative to the data directory, "/"-separated
+         * @return true if a verdict here speaks for it
+         */
+        public boolean covers(String relative) {
+            if (relative.equals(manifest.relative())) {
+                return true;
+            }
+            return segments.stream()
+                .anyMatch(segment -> relative.startsWith(segment.relative() + "/"));
         }
     }
 }

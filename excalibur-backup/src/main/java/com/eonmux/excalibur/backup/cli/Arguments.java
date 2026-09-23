@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.backup.cli;
 
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Objects;
@@ -31,14 +32,19 @@ public record Arguments(String command, Map<String, String> options, Set<String>
      *
      * @param name The option's name, without dashes
      * @return Its value
-     * @throws UsageException if the option was not given
+     * @throws UsageException if the option was not given, or names no possible path
      */
     public Path requiredPath(String name) throws UsageException {
         String value = options.get(name);
         if (value == null || value.isBlank()) {
             throw new UsageException("--" + name + " is required");
         }
-        return Path.of(value);
+        try {
+            return Path.of(value);
+        } catch (InvalidPathException e) {
+            throw new UsageException("--" + name + " is not a path this platform can name: "
+                + e.getReason());
+        }
     }
 
     /**

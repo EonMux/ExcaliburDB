@@ -44,10 +44,109 @@ jobs:
       # would still leave `build` green while these resolved to no such task.
       - run: ./gradlew :excalibur-api:shadowJar :excalibur-fsck:installDist :excalibur-backup:installDist
 
-      # Both commands run and exit, so running one is a real check that the start scripts carry
-      # the JVM flags the formats need. --help touches no data directory.
-      - run: ./excalibur-fsck/build/install/excalibur-fsck/bin/excalibur-fsck --help
-      - run: ./excalibur-backup/build/install/excalibur-backup/bin/excalibur-backup --help
+      # The operator tools against a data directory a real node wrote, not against --help, which
+      # loads no engine class and so proves neither the start scripts' JVM flags nor that the
+      # checkers agree with the formats. The node runs on its packaged default - loopback, no
+      # token, no LLM key, which still ingests lexically - takes two documents through the
+      # synchronous POST /v1/documents, and is stopped by SIGTERM the way a scheduler stops it,
+      # so its shutdown hook publishes what it wrote. The segments and the lexical store must
+      # then be on disk, because fsck and a snapshot pass an empty directory just as readily.
+      # fsck must find nothing damaged, a snapshot must verify --deep and restore --deep into a
+      # directory fsck passes as well, and a node started on the restored directory must answer
+      # a query with the document ingested before the snapshot, then stop cleanly in turn.
+      - name: Smoke-test the operator tools against a real data directory
+        run: |
+          set -euo pipefail
+          root="$PWD"
+          work="$RUNNER_TEMP/operator-smoke"
+          data="$work/data"
+          restored="$work/restored"
+          port=18080
+          fsck="$root/excalibur-fsck/build/install/excalibur-fsck/bin/excalibur-fsck"
+          backup="$root/excalibur-backup/build/install/excalibur-backup/bin/excalibur-backup"
+          mkdir -p "$work"
+
+          # Starts a node on a data directory, from a working directory with no
+          # excalibur.properties so the packaged default is what runs, and waits for it to
+          # report ready. Its pid is left in $node.
+          start_node() {
+            local dir="$1" log="$2"
+            (cd "$work" && EXCALIBUR_DATA_DIR="$dir" EXCALIBUR_PORT="$port" \
+              exec java --enable-preview --enable-native-access=ALL-UNNAMED \
+                --add-modules=jdk.incubator.vector \
+                -jar "$root/excalibur-api/build/libs/excalibur.jar") > "$log" 2>&1 &
+            node=$!
+            for _ in $(seq 1 60); do
+              if curl -fs -o /dev/null "http://127.0.0.1:$port/health/ready"; then
+                return 0
+              fi
+              kill -0 "$node" 2>/dev/null || break
+              sleep 2
+            done
+            echo "the node on $dir never reported ready"
+            cat "$log"
+            kill "$node" 2>/dev/null || true
+            return 1
+          }
+
+          # Stops it with SIGTERM. A JVM whose shutdown hook ran exits 143; anything else is a
+          # failure.
+          stop_node() {
+            local log="$1" status=0
+            kill -TERM "$node"
+            wait "$node" || status=$?
+            if [ "$status" -ne 0 ] && [ "$status" -ne 143 ]; then
+              echo "the node exited $status on SIGTERM"
+              cat "$log"
+              return 1
+            fi
+          }
+
+          start_node "$data" "$work/node.log"
+          curl -fsS -X POST "http://127.0.0.1:$port/v1/documents" \
+            -H 'Content-Type: application/json' \
+            -d '{"source_id": "smoke", "documents": [
+                  {"document_id": "a.md", "text": "The quick brown fox jumps over the lazy dog."},
+                  {"document_id": "b.md", "text": "Pack my box with five dozen liquor jugs."}]}'
+          echo
+          stop_node "$work/node.log"
+
+          if [ -z "$(find "$data" -maxdepth 1 -name 'segment_*.dat' -print -quit)" ]; then
+            echo "no segment file reached the disk"
+            ls -la "$data"
+            exit 1
+          fi
+          if [ -z "$(find "$data/chunk-index" -type f -print -quit 2>/dev/null)" ]; then
+            echo "the lexical store under chunk-index holds nothing"
+            ls -laR "$data"
+            exit 1
+          fi
+
+          "$fsck" "$data"
+          "$backup" snapshot --data-dir "$data" --out "$work/snapshot"
+          # stdout is the report and nothing else, because a wrapper script parses it.
+          report=$("$backup" verify --snapshot "$work/snapshot" --deep)
+          printf '%s\n' "$report"
+          case "$report" in
+            "verified "*) ;;
+            *) echo "verify wrote something other than its report to stdout"; exit 1 ;;
+          esac
+          "$backup" restore --snapshot "$work/snapshot" --target "$restored" --deep
+          "$fsck" "$restored"
+
+          start_node "$restored" "$work/restored-node.log"
+          answer=$(curl -fsS -X POST "http://127.0.0.1:$port/v1/query" \
+            -H 'Content-Type: application/json' \
+            -d '{"query": "quick brown fox", "top_k": 5}')
+          printf '%s\n' "$answer"
+          if ! jq -e '[.results[].document_id | select(startswith("smoke:a.md:"))] | length > 0' \
+              <<< "$answer" > /dev/null; then
+            echo "the restored node did not return the document ingested before the snapshot"
+            cat "$work/restored-node.log"
+            kill "$node" 2>/dev/null || true
+            exit 1
+          fi
+          stop_node "$work/restored-node.log"
 
       # The command USAGE.md gives an embedder, and the only thing that checks it. A module can
       # apply maven-publish and still produce a publication Maven cannot express - two artifacts
@@ -111,9 +210,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # It must start on loopback with no token and no TLS, which is the only shape the server
-      # will start in without one, and report itself ready. A node that builds and will not come
-      # up is the failure an image build alone cannot see.
+      # It must start bound to every interface, which the server allows only with a bearer token
+      # and either TLS or an explicit acknowledgement that something in front terminates it -
+      # the shape a container behind a TLS-terminating proxy runs in - and report itself ready.
+      # A node that builds and will not come up is the failure an image build alone cannot see.
       - name: Start it and wait for readiness
         run: |
           docker run -d --name excalibur-ci -p 8080:8080 \
@@ -132,6 +232,78 @@ jobs:
           docker logs excalibur-ci
           exit 1
 
+      # A document through the authenticated write path, so that what the steps below check,
+      # repair and back up is a volume a node wrote to, not one holding only what it creates on
+      # start - which every check passes as readily as a sound one.
+      - name: Ingest a document
+        run: |
+          set -euo pipefail
+          curl -fsS -X POST http://127.0.0.1:8080/v1/documents \
+            -H 'Authorization: Bearer ci-token' \
+            -H 'Content-Type: application/json' \
+            -d '{"source_id": "smoke", "documents": [
+                  {"document_id": "a.md", "text": "The quick brown fox jumps over the lazy dog."}]}'
+          echo
+
+      # Always, so a failed step above still leaves no node running over the volume. The exit
+      # code is the point: the entrypoint execs java so the JVM is PID 1 and receives SIGTERM
+      # itself, runs its shutdown hook and exits 143. A shell left as PID 1 ignores the signal,
+      # docker stop falls back to SIGKILL after the timeout, and the container exits 137 with
+      # nothing published - which only this check can tell apart from a clean stop.
       - name: Stop it the way a scheduler would
         if: always()
-        run: docker stop --time 40 excalibur-ci || true
+        run: |
+          set -euo pipefail
+          docker stop --time 40 excalibur-ci
+          code=$(docker inspect --format '{{.State.ExitCode}}' excalibur-ci)
+          if [ "$code" -ne 143 ]; then
+            echo "the node exited $code on SIGTERM, not 143: its shutdown hook did not run"
+            docker logs excalibur-ci
+            exit 1
+          fi
+
+      - name: Check the write reached the volume
+        run: |
+          set -euo pipefail
+          docker run --rm --volumes-from excalibur-ci --entrypoint sh excalibur:ci -c '
+            set -e
+            if [ -z "$(find /var/lib/excalibur -maxdepth 1 -name "segment_*.dat" -print -quit)" ]; then
+              echo "no segment file reached the volume"; ls -la /var/lib/excalibur; exit 1
+            fi
+            if [ -z "$(find /var/lib/excalibur/chunk-index -type f -print -quit 2>/dev/null)" ]; then
+              echo "the lexical store under chunk-index holds nothing"; exit 1
+            fi'
+
+      # The repair the README documents for this image, run the way it documents it: against the
+      # stopped node's volume, with the quarantine on a volume of its own. A staged name a crash
+      # would leave is planted first, so there is something to set aside, and it must arrive in
+      # the quarantine volume - across two mounts, which a rename cannot cross - and be gone
+      # from the data directory, which must then check clean.
+      - name: Repair the stopped node's volume in the image
+        run: |
+          set -euo pipefail
+          docker run --rm --volumes-from excalibur-ci --entrypoint sh excalibur:ci \
+            -c 'printf staged > /var/lib/excalibur/routing.dir.tmp'
+          docker run --rm --volumes-from excalibur-ci \
+            -v excalibur-ci-quarantine:/var/lib/excalibur-quarantine \
+            --entrypoint excalibur-fsck excalibur:ci \
+            /var/lib/excalibur --repair --quarantine-dir=/var/lib/excalibur-quarantine
+          docker run --rm -v excalibur-ci-quarantine:/q --entrypoint test excalibur:ci \
+            -f /q/routing.dir.tmp
+          docker run --rm --volumes-from excalibur-ci --entrypoint sh excalibur:ci \
+            -c '! test -e /var/lib/excalibur/routing.dir.tmp'
+          docker run --rm --volumes-from excalibur-ci --entrypoint excalibur-fsck excalibur:ci \
+            /var/lib/excalibur
+
+      # And the backup the README documents for this image: a snapshot of the stopped node's
+      # volume into a backup volume, verified --deep from a second container.
+      - name: Back up the stopped node's volume in the image
+        run: |
+          set -euo pipefail
+          docker run --rm --volumes-from excalibur-ci \
+            -v excalibur-ci-backups:/var/lib/excalibur-backups \
+            --entrypoint excalibur-backup excalibur:ci \
+            snapshot --data-dir /var/lib/excalibur --out /var/lib/excalibur-backups/ci
+          docker run --rm -v excalibur-ci-backups:/var/lib/excalibur-backups \
+            --entrypoint excalibur-backup excalibur:ci \
+            verify --snapshot /var/lib/excalibur-backups/ci --deep

@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.bootstrap.NamespaceRoutingGraphIngestSink;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
+import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
@@ -65,6 +66,7 @@ class GraphStatsExpositionTest {
     void setUp() throws IOException {
         SegmentCatalog catalog = new SegmentCatalog();
         IndexOrchestrator orchestrator = mock(IndexOrchestrator.class);
+        when(orchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         StorageEngine storage = mock(StorageEngine.class);
         when(orchestrator.getVisibilityTracker()).thenReturn(new VisibilityTracker(catalog));
         when(orchestrator.getHnswQueueDepthLimit()).thenReturn(100_000);
@@ -102,7 +104,7 @@ class GraphStatsExpositionTest {
         @Test
         @DisplayName("reads each block from the component that owns it")
         void readsEveryBlock() {
-            GraphStats stats = new GraphStatsReader(tenants, builds, sink).read();
+            GraphStats stats = new GraphStatsReader(tenants, builds, sink, () -> 4L).read();
 
             assertThat(stats.namespaces()).isEqualTo(new GraphStats.NamespaceStats(2, 8, 5));
             assertThat(stats.budget()).isEqualTo(new GraphStats.BudgetStats(30,
@@ -114,7 +116,7 @@ class GraphStatsExpositionTest {
             assertThat(stats.erasure().unreadableNamespaces()).isEqualTo(1);
             assertThat(stats.erasure().oldestAgeMs().getAsLong())
                 .isGreaterThanOrEqualTo(Duration.ofMinutes(90).toMillis());
-            assertThat(stats.ingest()).isEqualTo(new GraphStats.IngestStats(100, 640, 3, 9, 2));
+            assertThat(stats.ingest()).isEqualTo(new GraphStats.IngestStats(100, 640, 3, 9, 2, 4));
         }
 
         @Test
@@ -122,7 +124,7 @@ class GraphStatsExpositionTest {
         void unreadableBacklogIsAbsent() throws IOException {
             when(tenants.erasureBacklog()).thenThrow(new IOException("root unreadable"));
 
-            GraphStats stats = new GraphStatsReader(tenants, builds, sink).read();
+            GraphStats stats = new GraphStatsReader(tenants, builds, sink, () -> 4L).read();
 
             assertThat(stats.erasure()).isNull();
             assertThat(stats.namespaces()).isNotNull();
@@ -131,7 +133,7 @@ class GraphStatsExpositionTest {
         @Test
         @DisplayName("a node whose ingestion stages nothing has no ingest block")
         void noSinkNoIngest() {
-            assertThat(new GraphStatsReader(tenants, builds, null).read().ingest()).isNull();
+            assertThat(new GraphStatsReader(tenants, builds, null, null).read().ingest()).isNull();
         }
 
         @Test
@@ -140,16 +142,20 @@ class GraphStatsExpositionTest {
             when(tenants.erasureBacklog()).thenReturn(new GraphTenants.ErasureBacklog(0, 0, 0, 0,
                 Optional.empty(), Duration.ofHours(1)));
 
-            assertThat(new GraphStatsReader(tenants, builds, sink).read().erasure().oldestAgeMs())
-                .isEmpty();
+            GraphStats stats = new GraphStatsReader(tenants, builds, sink, () -> 4L).read();
+
+            assertThat(stats.erasure().oldestAgeMs()).isEmpty();
         }
 
         @Test
         @DisplayName("needs the tenants and the builds")
         void requiresItsSources() {
-            assertThatThrownBy(() -> new GraphStatsReader(null, builds, sink))
+            assertThatThrownBy(() -> new GraphStatsReader(null, builds, sink, () -> 4L))
                 .isInstanceOf(NullPointerException.class);
-            assertThatThrownBy(() -> new GraphStatsReader(tenants, null, sink))
+            assertThatThrownBy(() -> new GraphStatsReader(tenants, null, sink, () -> 4L))
+                .isInstanceOf(NullPointerException.class);
+            assertThatThrownBy(() -> new GraphStatsReader(tenants, builds, sink, null))
+                .as("a node that stages facts must say where refusals are counted")
                 .isInstanceOf(NullPointerException.class);
         }
 
@@ -157,7 +163,7 @@ class GraphStatsExpositionTest {
         @DisplayName("a graph that fails to report leaves the rest of the stats standing")
         void aFailingGraphIsAbsent() {
             when(tenants.budget()).thenThrow(new IllegalStateException("closed"));
-            collector.withGraph(new GraphStatsReader(tenants, builds, sink));
+            collector.withGraph(new GraphStatsReader(tenants, builds, sink, () -> 4L));
 
             NodeStats stats = collector.collect();
 
@@ -173,7 +179,7 @@ class GraphStatsExpositionTest {
         @Test
         @DisplayName("carries every block, under the names the docs give them")
         void rendersEveryBlock() throws IOException {
-            collector.withGraph(new GraphStatsReader(tenants, builds, sink));
+            collector.withGraph(new GraphStatsReader(tenants, builds, sink, () -> 4L));
 
             JsonNode graph = stats().path("graph");
 
@@ -212,6 +218,7 @@ class GraphStatsExpositionTest {
             assertThat(ingest.path("unresolvedDocuments").asLong()).isEqualTo(3);
             assertThat(ingest.path("extractionFailures").asLong()).isEqualTo(9);
             assertThat(ingest.path("tenantFailures").asLong()).isEqualTo(2);
+            assertThat(ingest.path("sinkRefusals").asLong()).isEqualTo(4);
         }
 
         @Test
@@ -221,7 +228,7 @@ class GraphStatsExpositionTest {
             when(tenants.budget()).thenReturn(unmeasured);
             when(tenants.erasureBacklog()).thenReturn(new GraphTenants.ErasureBacklog(0, 0, 0, 0,
                 Optional.empty(), Duration.ofHours(1)));
-            collector.withGraph(new GraphStatsReader(tenants, builds, null));
+            collector.withGraph(new GraphStatsReader(tenants, builds, null, null));
 
             JsonNode graph = stats().path("graph");
 
@@ -249,7 +256,7 @@ class GraphStatsExpositionTest {
         @Test
         @DisplayName("exposes every figure as a series, totalled across namespaces")
         void exposesEverySeries() throws IOException {
-            collector.withGraph(new GraphStatsReader(tenants, builds, sink));
+            collector.withGraph(new GraphStatsReader(tenants, builds, sink, () -> 4L));
 
             String body = scrape();
 
@@ -277,7 +284,8 @@ class GraphStatsExpositionTest {
                 "excalibur_graph_ingest_facts_staged_total 640",
                 "excalibur_graph_ingest_failures_total{reason=\"unresolved_source\"} 3",
                 "excalibur_graph_ingest_failures_total{reason=\"extraction\"} 9",
-                "excalibur_graph_ingest_failures_total{reason=\"namespace_unavailable\"} 2");
+                "excalibur_graph_ingest_failures_total{reason=\"namespace_unavailable\"} 2",
+                "excalibur_graph_ingest_failures_total{reason=\"sink_refused\"} 4");
             double age = body.lines()
                 .filter(line -> line.startsWith("excalibur_graph_erasure_oldest_age_seconds "))
                 .mapToDouble(line -> Double.parseDouble(line.split(" ")[1]))
@@ -288,7 +296,7 @@ class GraphStatsExpositionTest {
         @Test
         @DisplayName("no series carries a namespace, so the series count is fixed")
         void noNamespaceLabel() throws IOException {
-            collector.withGraph(new GraphStatsReader(tenants, builds, sink));
+            collector.withGraph(new GraphStatsReader(tenants, builds, sink, () -> 4L));
 
             assertThat(scrape()).doesNotContain("namespace=");
         }
@@ -297,7 +305,7 @@ class GraphStatsExpositionTest {
         @DisplayName("omits what it cannot measure rather than exporting a zero")
         void omitsTheUnknown() throws IOException {
             when(tenants.budget()).thenReturn(MappingBudget.of(1_000, 0.7, 0));
-            collector.withGraph(new GraphStatsReader(tenants, builds, null));
+            collector.withGraph(new GraphStatsReader(tenants, builds, null, null));
 
             String body = scrape();
 
@@ -312,7 +320,7 @@ class GraphStatsExpositionTest {
         @DisplayName("omits the erasure series when the backlog could not be read")
         void omitsAnUnreadableBacklog() throws IOException {
             when(tenants.erasureBacklog()).thenThrow(new IOException("root unreadable"));
-            collector.withGraph(new GraphStatsReader(tenants, builds, sink));
+            collector.withGraph(new GraphStatsReader(tenants, builds, sink, () -> 4L));
 
             assertThat(scrape()).doesNotContain("excalibur_graph_erasure");
         }
@@ -329,7 +337,7 @@ class GraphStatsExpositionTest {
         @Test
         @DisplayName("still declares each family once and writes every sample well formed")
         void staysWellFormed() throws IOException {
-            collector.withGraph(new GraphStatsReader(tenants, builds, sink));
+            collector.withGraph(new GraphStatsReader(tenants, builds, sink, () -> 4L));
 
             String body = scrape();
 
@@ -379,7 +387,7 @@ class GraphStatsExpositionTest {
             .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new GraphStats.ErasureStats(0, 0, 0, 0, null))
             .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> new GraphStats.IngestStats(0, 0, 0, -1, 0))
+        assertThatThrownBy(() -> new GraphStats.IngestStats(0, 0, 0, -1, 0, 0))
             .isInstanceOf(IllegalArgumentException.class);
     }
 

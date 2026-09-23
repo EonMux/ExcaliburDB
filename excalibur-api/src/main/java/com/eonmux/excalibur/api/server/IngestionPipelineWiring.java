@@ -3,16 +3,13 @@ package com.eonmux.excalibur.api.server;
 import com.eonmux.excalibur.api.endpoint.IngestStatusEndpoint;
 import com.eonmux.excalibur.ingest.lsh.LshIngestionService;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
-import com.eonmux.excalibur.ingest.processor.TermFrequencyTracker;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
-import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
 import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.config.Config;
-import com.eonmux.excalibur.llm.client.LLMHttpClient;
 import com.eonmux.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,13 +19,11 @@ import java.util.Objects;
 /**
  * Attaching an ingestion pipeline, and everything that follows from having one.
  *
- * <p>Three overloads on the public API offer a node three ways to say the same thing, differing
- * only in where the embedding client and the visibility tracker come from. What each of them
- * then has to do is identical and is not small: build an orchestrator over the storage engine,
- * the index orchestrator and the status registry; decide whether the atomicity filter goes onto
- * the query pipeline; read the document timeout out of configuration. Written three times that
- * drifts, and it drifted here before - which is why the knob, the timeout and the orchestrator
- * are each read in exactly one place below.</p>
+ * <p>Attaching a pipeline is not small: build an orchestrator over the storage engine, the index
+ * orchestrator and the status registry; hand the vector pre-filter to the two owners that keep
+ * it in step with the graph; decide whether the atomicity filter goes onto the query pipeline;
+ * read the document timeout out of configuration. Each of those is decided in exactly one place
+ * below, so the knob, the timeout and the orchestrator cannot come to disagree.</p>
  *
  * <p>Separate from {@link ServerWiring} because it is the one attachment that changes something
  * the node already had. Every other {@code with...} call stores a reference; this one also
@@ -120,63 +115,11 @@ final class IngestionPipelineWiring {
     }
 
     /**
-     * Attaches a pipeline that embeds through the given LLM client, on a visibility tracker
-     * this node creates for itself.
-     *
-     * @param textChunker   Splits documents into chunks
-     * @param llmClient     The LLM client the embedding client is built from
-     * @param queryPipeline The query pipeline the atomicity filter may wrap
-     * @return What the caller should now hold
-     * @throws NullPointerException if textChunker or llmClient is null
-     */
-    Attachment attach(TextChunker textChunker, LLMHttpClient llmClient,
-                      QueryPipeline queryPipeline) {
-        Objects.requireNonNull(textChunker, "TextChunker cannot be null");
-        Objects.requireNonNull(llmClient, "LLMHttpClient cannot be null");
-
-        // Create dedicated EmbeddingClient from LLMHttpClient's config
-        EmbeddingClient embeddings = new EmbeddingClient(llmClient.getConfig());
-
-        // Document visibility on the node's own epoch clock -- the same counter the query
-        // pipeline captures in stage 0. Sharing it is what makes the atomicity filter a
-        // snapshot bound rather than a completeness check; a tracker with a private counter
-        // would produce epochs the query has no way to compare against.
-        DocumentVisibilityTracker tracker = new DocumentVisibilityTracker(
-            new DocumentRegistry(), indexOrchestrator.getVisibilityTracker());
-
-        IngestionOrchestrator orchestrator = newOrchestrator(textChunker, embeddings, tracker);
-        QueryPipeline wrapped = withDocumentAtomicity(queryPipeline, tracker);
-        logAttached(embeddings, tracker, null);
-        return new Attachment(orchestrator, embeddings, wrapped);
-    }
-
-    /**
-     * Attaches a pipeline on a visibility tracker somebody else owns.
-     *
-     * <p>Sharing the tracker is the point: the application and this node then agree about which
-     * documents are whole, rather than each keeping its own answer.</p>
-     *
-     * @param textChunker       Splits documents into chunks
-     * @param embeddings        Embeds chunks
-     * @param visibilityTracker Makes a document's chunks visible together, or null for none
-     * @param queryPipeline     The query pipeline the atomicity filter may wrap
-     * @return What the caller should now hold
-     * @throws NullPointerException if textChunker or embeddings is null
-     */
-    Attachment attach(TextChunker textChunker, EmbeddingClient embeddings,
-                      DocumentVisibilityTracker visibilityTracker, QueryPipeline queryPipeline) {
-        Objects.requireNonNull(textChunker, "TextChunker cannot be null");
-        Objects.requireNonNull(embeddings, "EmbeddingClient cannot be null");
-
-        IngestionOrchestrator orchestrator =
-            newOrchestrator(textChunker, embeddings, visibilityTracker);
-        QueryPipeline wrapped = withDocumentAtomicity(queryPipeline, visibilityTracker);
-        logAttached(embeddings, visibilityTracker, null);
-        return new Attachment(orchestrator, embeddings, wrapped);
-    }
-
-    /**
      * Attaches a pipeline and the vector pre-filter stage 2 of a query prunes with.
+     *
+     * <p>The visibility tracker is the caller's, and it is expected to sit on the persisted
+     * document registry: the tracker records which chunks make up each document, and one over
+     * a registry of its own would forget that at every restart.</p>
      *
      * @param textChunker        Splits documents into chunks
      * @param embeddings         Embeds chunks, or null for lexical-only ingestion
@@ -214,12 +157,11 @@ final class IngestionPipelineWiring {
     }
 
     /**
-     * Builds the ingestion orchestrator behind every overload.
+     * Builds the ingestion orchestrator.
      *
-     * <p>The overloads differ only in where the embedding client and the visibility tracker come
-     * from. Everything else - the storage engine, the index orchestrator, the bridge onto what
+     * <p>Over the storage engine, the index orchestrator, the bridge onto what
      * {@code GET /v1/ingest/status} serves, a term frequency tracker and the configured document
-     * timeout - is one wiring, so it is written once rather than once per overload.</p>
+     * timeout.</p>
      *
      * @param chunker    Splits documents into chunks
      * @param embeddings Embeds chunks, or null for lexical-only ingestion
@@ -236,9 +178,6 @@ final class IngestionPipelineWiring {
             indexOrchestrator,
             new IngestionStatusBridge(ingestionStatus),
             visibility,
-            // Term frequency tracker for selectivity estimation: term frequencies in the segment
-            // sketches are what let the planner estimate a predicate rather than guess it.
-            new TermFrequencyTracker(),
             configuredDocumentTimeoutMs()
         );
     }
@@ -247,8 +186,8 @@ final class IngestionPipelineWiring {
      * The query pipeline with the atomicity filter on it, unless it is turned off or the
      * pipeline already carries one.
      *
-     * <p>Every overload goes through this, so the knob is honoured in one place rather than in
-     * three that can drift.</p>
+     * <p>The one place the knob is read, so the filter and the startup log line cannot disagree
+     * about it.</p>
      *
      * @param pipeline The pipeline as it stands
      * @param tracker  The tracker the filter reads, or null when this node has none
@@ -271,16 +210,16 @@ final class IngestionPipelineWiring {
     /**
      * Records what an operator can expect of the pipeline that was just attached.
      *
-     * <p>One message for all three overloads. They differ only in where their parts came from,
-     * and three near-identical lines drift until the log stops describing the node.</p>
+     * <p>Read back by an operator to learn which half of retrieval this node built, so every
+     * part that can be absent is named, including when it is.</p>
      *
      * @param embeddings The embedding client, or null for lexical-only ingestion
      * @param visibility The visibility tracker, or null when a document lands chunk by chunk
-     * @param prefilter  The vector pre-filter, or null when this overload wires none
+     * @param prefilter  The vector pre-filter, or null when this node wires none
      */
     private void logAttached(EmbeddingClient embeddings, DocumentVisibilityTracker visibility,
                              LshIngestionService prefilter) {
-        LOGGER.info("Ingestion pipeline configured: TextChunker, TermFrequencyTracker, "
+        LOGGER.info("Ingestion pipeline configured: TextChunker, "
                 + "embedding={}, documentTimeoutMs={}ms, documentAtomicity={}, vectorPreFilter={}",
             embeddings != null ? "enabled" : "disabled",
             configuredDocumentTimeoutMs(),

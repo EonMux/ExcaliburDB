@@ -107,7 +107,7 @@ final class HnswInserter {
             // Connect node to existing graph
             // Even if this node becomes the new entry point, we need to connect it
             // to the previous graph structure
-            connectNode(nodeId, level, vector, previousEntryPoint, previousMaxLevel);
+            linkNode(nodeId, level, vector, previousEntryPoint, previousMaxLevel);
 
             LOGGER.debug("Inserted node {} at level {} (total nodes: {})",
                 nodeId, level, graph.nodeCount);
@@ -169,7 +169,7 @@ final class HnswInserter {
             // If this is the first node, no connections to make
             if (graph.nodeCount > 1) {
                 // Connect node to existing graph
-                connectedNodes = connectNodeAndTrack(nodeId, level, vector,
+                connectedNodes = linkNode(nodeId, level, vector,
                     previousEntryPoint, previousMaxLevel);
                 connectionsMade = connectedNodes.size();
             }
@@ -229,7 +229,7 @@ final class HnswInserter {
                 graph.mappedFile.writeLong(HnswGraphHeader.OFFSET_NODE_COUNT, graph.nodeCount);
 
                 if (graph.nodeCount > 1) {
-                    connectNode(nodeId, level, vector, previousEntryPoint, previousMaxLevel);
+                    linkNode(nodeId, level, vector, previousEntryPoint, previousMaxLevel);
                 }
 
                 nodeIds.add(nodeId);
@@ -322,7 +322,7 @@ final class HnswInserter {
         int connectionsMade = 0;
 
         if (graph.nodeCount > 1) {
-            connectedNodes = connectNodeAndTrack(nodeId, level, vector,
+            connectedNodes = linkNode(nodeId, level, vector,
                 previousEntryPoint, previousMaxLevel);
             connectionsMade = connectedNodes.size();
         }
@@ -358,204 +358,93 @@ final class HnswInserter {
     }
 
     /**
-     * Connects a newly inserted node to the graph.
+     * Connects a newly inserted node to the graph (Malkov &amp; Yashunin, Algorithm 1).
      *
-     * <p>This method skips tombstoned nodes when searching for neighbors to connect to.
-     * Tombstoned nodes are never selected as connection targets.</p>
+     * <p>Descends greedily through the layers above the node's own, then at each layer it
+     * occupies gathers an {@code efConstruction}-wide beam, chooses the node's neighbours from
+     * it with {@link HnswNeighborLinker#selectNeighbors}, writes them as the node's adjacency
+     * list and offers each chosen neighbour a link back. The node keeps every neighbour it
+     * chose whether or not the back-link survives that neighbour's own shrink: edges are
+     * directed, and a node's out-links are what make it a way through the graph.</p>
+     *
+     * <p>The new node selects up to its layer's full limit - {@code maxConnectionsLayer0} at
+     * layer 0, as FAISS does, rather than the paper's {@code M} - because on high-dimensional
+     * data the heuristic already keeps far fewer than the limit, and a wider first list is
+     * measurably better connected there at no cost elsewhere. Tombstoned nodes never reach the
+     * beam, so they are never chosen.</p>
      *
      * @param nodeId The node to connect
      * @param nodeLevel The level of the node
      * @param vector The node's vector
      * @param startEntryPoint The entry point to start searching from (may be different from current entry point)
      * @param startMaxLevel The max level to start searching from
+     * @return The distinct nodes the new node now links to, across every layer
      */
-    private void connectNode(long nodeId, int nodeLevel, float[] vector,
-                             long startEntryPoint, int startMaxLevel) {
-        HnswGraph.NodeView newNode = graph.readNode(nodeId);
-        if (newNode == null) {
-            return;
+    private List<Long> linkNode(long nodeId, int nodeLevel, float[] vector,
+                                long startEntryPoint, int startMaxLevel) {
+        List<Long> linked = new ArrayList<>();
+        // Opened after writeNode has grown the file, so the mapping it reads is final for this insert
+        HnswTraversal traversal = HnswTraversal.open(graph);
+        long current = descentStart(traversal, startEntryPoint);
+        if (current < 0 || traversal.recordOffset(nodeId) < 0) {
+            return linked;
         }
 
-        // Start from the provided entry point (could be the previous entry point
-        // if this node is becoming the new entry point)
-        if (startEntryPoint < 0) {
-            return; // No nodes to connect to
-        }
-
-        HnswGraph.NodeView current = graph.readNode(startEntryPoint);
-        // Skip tombstoned entry points
-        if (current == null || current.isTombstoned()) {
-            current = graph.readNode(HnswNodeRecords.findActiveNode(graph.mappedFile, graph.nodeCount));
-            if (current == null) {
-                return;
-            }
-        }
-
-        // Search for entry points at each level
         for (int level = startMaxLevel; level > nodeLevel; level--) {
-            HnswGraph.NodeView closest = layerSearch.searchLayerSimple(vector, current, level);
-            if (closest != null) {
-                current = closest;
-            }
+            current = layerSearch.searchLayerSimple(traversal, vector, current, level);
         }
 
-        // Connect at each level from nodeLevel down to 0
         for (int level = Math.min(nodeLevel, startMaxLevel); level >= 0; level--) {
-            // Find efConstruction nearest neighbors at this level
-            // searchLayerBeam automatically filters tombstoned nodes
-            PriorityQueue<HnswSearchResult> neighbors = layerSearch.searchLayerBeam(
-                vector, current, level, graph.config.efConstruction());
+            List<HnswSearchResult> beam = nearestFirst(layerSearch.searchLayerBeam(
+                traversal, vector, current, level, graph.config.efConstruction(), null));
+            // Only reachable when every older node is tombstoned and the walk began at this one
+            beam.removeIf(result -> result.nodeId() == nodeId);
 
-            // Select neighbors (simple heuristic: take closest M)
-            List<Long> selectedNeighbors = selectNeighbors(neighbors,
+            List<Long> chosen = linker.selectNeighbors(traversal, beam,
                 HnswNodeRecords.maxConnectionsAt(graph.config, level));
-
-            // Filter out any tombstoned neighbors (defensive check)
-            selectedNeighbors.removeIf(nid -> {
-                HnswGraph.NodeView n = graph.readNode(nid);
-                return n == null || n.isTombstoned();
-            });
-
-            // Connect neighbors back to new node first (to check which accept us)
-            // Only keep neighbors that successfully add us to their list
-            List<Long> successfulNeighbors = new ArrayList<>();
-            for (long neighborId : selectedNeighbors) {
-                boolean added = linker.addConnection(neighborId, level, nodeId);
-                if (added) {
-                    successfulNeighbors.add(neighborId);
+            linker.writeConnections(traversal, nodeId, level, chosen);
+            for (long neighborId : chosen) {
+                linker.addConnection(traversal, neighborId, level, nodeId);
+                if (!linked.contains(neighborId)) {
+                    linked.add(neighborId);
                 }
             }
 
-            // Now connect new node only to neighbors that accepted us (bidirectional)
-            linker.addConnections(nodeId, level, successfulNeighbors);
-
-            // Update current for next level - use closest neighbor
-            current = closestActive(neighbors, current);
+            // The beam's nearest member is where the descent continues on the layer below
+            if (!beam.isEmpty()) {
+                current = beam.get(0).nodeId();
+            }
         }
+        return linked;
     }
 
     /**
-     * Connects a node to the graph and returns the list of connected nodes.
+     * Resolves where an insertion's descent starts: the given entry point, or any active node
+     * when that one has been tombstoned.
      *
-     * <p>This is similar to {@link #connectNode} but tracks which nodes were connected
-     * for the incremental insertion result.</p>
-     *
-     * @return List of node IDs that were connected to
+     * @param traversal Read access opened under the write lock
+     * @param entryPoint The entry point recorded before this insertion, or a negative id for none
+     * @return The node to descend from, or -1 when the graph holds no active node
      */
-    private List<Long> connectNodeAndTrack(long nodeId, int nodeLevel, float[] vector,
-                                           long startEntryPoint, int startMaxLevel) {
-        List<Long> allConnectedNodes = new ArrayList<>();
-
-        HnswGraph.NodeView newNode = graph.readNode(nodeId);
-        if (newNode == null) {
-            return allConnectedNodes;
+    private long descentStart(HnswTraversal traversal, long entryPoint) {
+        if (entryPoint < 0) {
+            return -1;
         }
-
-        if (startEntryPoint < 0) {
-            return allConnectedNodes;
-        }
-
-        HnswGraph.NodeView current = graph.readNode(startEntryPoint);
-        if (current == null || current.isTombstoned()) {
-            current = graph.readNode(HnswNodeRecords.findActiveNode(graph.mappedFile, graph.nodeCount));
-            if (current == null) {
-                return allConnectedNodes;
-            }
-        }
-
-        // Search for entry points at each level
-        for (int level = startMaxLevel; level > nodeLevel; level--) {
-            HnswGraph.NodeView closest = layerSearch.searchLayerSimple(vector, current, level);
-            if (closest != null) {
-                current = closest;
-            }
-        }
-
-        // Connect at each level from nodeLevel down to 0
-        for (int level = Math.min(nodeLevel, startMaxLevel); level >= 0; level--) {
-            PriorityQueue<HnswSearchResult> neighbors = layerSearch.searchLayerBeam(
-                vector, current, level, graph.config.efConstruction());
-
-            List<Long> selectedNeighbors = selectNeighbors(neighbors,
-                HnswNodeRecords.maxConnectionsAt(graph.config, level));
-
-            selectedNeighbors.removeIf(nid -> {
-                HnswGraph.NodeView n = graph.readNode(nid);
-                return n == null || n.isTombstoned();
-            });
-
-            // Connect neighbors back to new node first (to check which accept us)
-            // Only keep neighbors that successfully add us to their list (bidirectional)
-            List<Long> successfulNeighbors = new ArrayList<>();
-            for (long neighborId : selectedNeighbors) {
-                boolean added = linker.addConnection(neighborId, level, nodeId);
-                if (added) {
-                    successfulNeighbors.add(neighborId);
-                    if (!allConnectedNodes.contains(neighborId)) {
-                        allConnectedNodes.add(neighborId);
-                    }
-                }
-            }
-
-            // Now connect new node only to neighbors that accepted us
-            linker.addConnections(nodeId, level, successfulNeighbors);
-
-            // Update current for next level
-            current = closestActive(neighbors, current);
-        }
-
-        return allConnectedNodes;
+        return traversal.isActive(entryPoint)
+            ? entryPoint
+            : HnswNodeRecords.findActiveNode(graph.mappedFile, graph.nodeCount);
     }
 
     /**
-     * Picks the descent point for the next layer down: the nearest of this layer's beam that is
-     * still active.
+     * Drains a beam into a list ordered nearest first.
      *
-     * <p>The beam is a heap ordered furthest-first, so the nearest entry is found by scanning it
-     * rather than by polling. A beam that is empty, or whose every member has been tombstoned
-     * since it was gathered, leaves the descent where it was - the alternative is to carry a
-     * retired node down into the next layer and search from a vector no query may return.</p>
-     *
-     * @param neighbors This layer's beam
-     * @param current Where the descent currently stands
-     * @return The node to continue from
+     * @param beam A layer's beam, as the search returns it
+     * @return The beam's members, closest first
      */
-    private HnswGraph.NodeView closestActive(PriorityQueue<HnswSearchResult> neighbors,
-                                             HnswGraph.NodeView current) {
-        if (neighbors.isEmpty()) {
-            return current;
-        }
-        HnswSearchResult closest = null;
-        for (HnswSearchResult r : neighbors) {
-            HnswGraph.NodeView n = graph.readNode(r.nodeId());
-            if (n != null && !n.isTombstoned()) {
-                if (closest == null || r.distance() < closest.distance()) {
-                    closest = r;
-                }
-            }
-        }
-        if (closest != null) {
-            return graph.readNode(closest.nodeId());
-        }
-        return current;
-    }
-
-    /**
-     * Selects neighbors from candidate set.
-     */
-    private List<Long> selectNeighbors(PriorityQueue<HnswSearchResult> candidates, int maxConn) {
-        List<Long> selected = new ArrayList<>();
-        List<HnswSearchResult> sorted = new ArrayList<>(candidates);
+    private static List<HnswSearchResult> nearestFirst(PriorityQueue<HnswSearchResult> beam) {
+        List<HnswSearchResult> sorted = new ArrayList<>(beam);
         sorted.sort(Comparator.comparingDouble(HnswSearchResult::distance));
-
-        for (HnswSearchResult candidate : sorted) {
-            if (selected.size() >= maxConn) {
-                break;
-            }
-            selected.add(candidate.nodeId());
-        }
-
-        return selected;
+        return sorted;
     }
 
     /**

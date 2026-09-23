@@ -5,15 +5,13 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.charset.StandardCharsets;
+import java.nio.charset.Charset;
 import java.nio.file.FileSystemLoopException;
 import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.nio.file.attribute.FileTime;
-import java.time.Instant;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
@@ -37,8 +35,7 @@ import java.util.stream.StreamSupport;
  *
  * <h2>Thread Safety</h2>
  * <p>This class is thread-safe. The configuration is immutable after construction.
- * Multiple threads may call {@link #crawl()}, {@link #hasChanged(Instant)}, and
- * {@link #fetch(String)} concurrently.</p>
+ * Multiple threads may call {@link #crawl()} and {@link #fetch(String)} concurrently.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
@@ -48,8 +45,15 @@ import java.util.stream.StreamSupport;
  *   <li>Symlinks are not followed by default (configurable). When they are followed, a path
  *       whose real location lies outside the root is not part of the source</li>
  *   <li>Hidden files are excluded by default (configurable)</li>
- *   <li>Directory modification times are used for change detection</li>
  * </ul>
+ *
+ * <h2>Encoding</h2>
+ * <p>A file carries no {@code Content-Type}, so the encoding its bytes are in comes from two
+ * places: a byte-order mark at the front of the file, and the {@code charset} the operator
+ * declared for the whole source. The mark wins where there is one - it describes this file,
+ * where the declaration describes a directory someone else may have written into - and a file
+ * with neither is read as UTF-8. See {@link TextEncoding} for the reasoning behind that
+ * order.</p>
  *
  * <h2>Resource Management</h2>
  * <p>The {@link #crawl()} stream holds open directory handles. Callers should
@@ -113,6 +117,9 @@ public class FilesystemSource implements Source {
     private final boolean includeHidden;
     private final long maxFileSize;
     private final int maxDepth;
+
+    /** The encoding the operator declared for files without a byte-order mark, or null. */
+    private final Charset charset;
     private volatile boolean closed = false;
 
     private FilesystemSource(Builder builder) {
@@ -149,9 +156,11 @@ public class FilesystemSource implements Source {
         this.includeHidden = builder.includeHidden;
         this.maxFileSize = Math.max(1, builder.maxFileSize);
         this.maxDepth = Math.max(1, builder.maxDepth);
+        this.charset = builder.charset;
 
-        LOG.debug("FilesystemSource created: id={}, root={}, extensions={}, excluded={}",
-            sourceId, rootPath, includedExtensions, excludedDirectories);
+        LOG.debug("FilesystemSource created: id={}, root={}, extensions={}, excluded={}, "
+                + "charset={}", sourceId, rootPath, includedExtensions, excludedDirectories,
+            charset != null ? charset : "undeclared");
     }
 
     @Override
@@ -196,50 +205,6 @@ public class FilesystemSource implements Source {
     }
 
     @Override
-    public boolean hasChanged(Instant since) throws SourceException {
-        ensureOpen();
-        Objects.requireNonNull(since, "since must not be null");
-
-        if (since.isAfter(Instant.now())) {
-            LOG.warn("hasChanged called with future timestamp: {}", since);
-            return true;
-        }
-
-        try {
-            BasicFileAttributes rootAttrs = Files.readAttributes(
-                rootPath,
-                BasicFileAttributes.class,
-                LinkOption.NOFOLLOW_LINKS
-            );
-
-            FileTime lastModified = rootAttrs.lastModifiedTime();
-            Instant rootModified = lastModified.toInstant();
-
-            if (rootModified.isAfter(since)) {
-                LOG.debug("Source {} has changed (root modified at {} > {})",
-                    sourceId, rootModified, since);
-                return true;
-            }
-
-            if (rootAttrs.isDirectory()) {
-                FileTime created = rootAttrs.creationTime();
-                if (created.toInstant().isAfter(since)) {
-                    LOG.debug("Source {} has changed (root created at {} > {})",
-                        sourceId, created, since);
-                    return true;
-                }
-            }
-
-            LOG.debug("Source {} has not changed since {}", sourceId, since);
-            return false;
-
-        } catch (IOException e) {
-            LOG.warn("Could not check modification time for source {}: {}", sourceId, e.getMessage());
-            return true;
-        }
-    }
-
-    @Override
     public FetchedDocument fetch(String documentId) throws SourceException, DocumentNotFoundException {
         ensureOpen();
         Objects.requireNonNull(documentId, "documentId must not be null");
@@ -265,10 +230,13 @@ public class FilesystemSource implements Source {
             byte[] content = Files.readAllBytes(filePath);
             String contentType = detectContentType(filePath);
             long lastModifiedMillis = attrs.lastModifiedTime().toMillis();
+            Charset encoding = TextEncoding.resolve(content, charset);
 
-            LOG.debug("Fetched document: {} ({} bytes, {})", documentId, content.length, contentType);
+            LOG.debug("Fetched document: {} ({} bytes, {}, {})",
+                documentId, content.length, contentType, encoding);
 
-            return new FetchedDocument(documentId, content, contentType, lastModifiedMillis);
+            return new FetchedDocument(documentId, content, contentType, encoding,
+                lastModifiedMillis);
 
         } catch (IOException e) {
             if (e instanceof java.nio.file.NoSuchFileException) {
@@ -374,6 +342,16 @@ public class FilesystemSource implements Source {
 
     public int getMaxDepth() {
         return maxDepth;
+    }
+
+    /**
+     * The encoding declared for files that carry no byte-order mark.
+     *
+     * @return The declared charset, or null when none was declared and such files are read as
+     *         UTF-8
+     */
+    public Charset getCharset() {
+        return charset;
     }
 
     private void ensureOpen() throws SourceException {
@@ -721,6 +699,7 @@ public class FilesystemSource implements Source {
         private boolean includeHidden = false;
         private long maxFileSize = DEFAULT_MAX_FILE_SIZE;
         private int maxDepth = DEFAULT_MAX_DEPTH;
+        private Charset charset;
 
         public Builder sourceId(String sourceId) {
             this.sourceId = sourceId;
@@ -774,6 +753,20 @@ public class FilesystemSource implements Source {
 
         public Builder maxDepth(int depth) {
             this.maxDepth = depth;
+            return this;
+        }
+
+        /**
+         * Declares the encoding the source's files are in.
+         *
+         * <p>Applies only to a file with no byte-order mark: a mark describes the file it opens
+         * and outranks a declaration made for the whole directory. See {@link TextEncoding}.</p>
+         *
+         * @param charset The encoding, or null to read unmarked files as UTF-8
+         * @return This builder
+         */
+        public Builder charset(Charset charset) {
+            this.charset = charset;
             return this;
         }
 

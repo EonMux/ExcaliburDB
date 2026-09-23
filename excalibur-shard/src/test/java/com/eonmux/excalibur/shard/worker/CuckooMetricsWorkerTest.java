@@ -119,6 +119,61 @@ class CuckooMetricsWorkerTest {
 
             assertEquals(3, worker.getRegisteredFilterCount());
         }
+
+        @Test
+        @DisplayName("A different filter under a registered id replaces the old one")
+        void shouldReplaceASupersededFilter() {
+            CuckooMetricsWorker worker = new CuckooMetricsWorker();
+            CuckooFilter superseded = CuckooFilter.create(1000);
+            CuckooFilter current = CuckooFilter.create(1000);
+            current.insert("term".getBytes());
+
+            worker.registerFilter(1L, superseded);
+            worker.registerFilter(1L, current);
+
+            assertEquals(1, worker.getRegisteredFilterCount());
+            assertEquals(current.estimateFpRate(), worker.sample().average(), 1e-12,
+                "the filter now written to is the one sampled");
+        }
+    }
+
+    @Nested
+    @DisplayName("On-demand sample")
+    class OnDemandSampleTests {
+
+        @Test
+        @DisplayName("Reports nothing while no filter holds anything")
+        void emptyFiltersReportNone() {
+            CuckooMetricsWorker worker = new CuckooMetricsWorker();
+            worker.registerFilter(1L, CuckooFilter.create(1000));
+
+            assertEquals(CuckooMetricsWorker.FpRates.NONE, worker.sample());
+        }
+
+        @Test
+        @DisplayName("Averages and takes the worst over the filters that hold anything")
+        void averagesNonEmptyFilters() {
+            CuckooMetricsWorker worker = new CuckooMetricsWorker();
+            CuckooFilter light = CuckooFilter.create(1000);
+            CuckooFilter heavy = CuckooFilter.create(1000);
+            for (int i = 0; i < 10; i++) {
+                light.insert(("light" + i).getBytes());
+            }
+            for (int i = 0; i < 600; i++) {
+                heavy.insert(("heavy" + i).getBytes());
+            }
+            worker.registerFilter(1L, light);
+            worker.registerFilter(2L, heavy);
+            worker.registerFilter(3L, CuckooFilter.create(1000));
+
+            CuckooMetricsWorker.FpRates rates = worker.sample();
+
+            assertEquals(2, rates.filters());
+            assertEquals((light.estimateFpRate() + heavy.estimateFpRate()) / 2,
+                rates.average(), 1e-12);
+            assertEquals(heavy.estimateFpRate(), rates.max(), 1e-12);
+            assertTrue(rates.max() > rates.average());
+        }
     }
 
     @Nested

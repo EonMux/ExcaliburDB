@@ -34,14 +34,21 @@ public final class SnapshotCommand {
      * @param arguments The parsed command line
      * @param out       Where to report
      * @return Always {@link ExitCode#OK}; every failure is thrown
-     * @throws UsageException if a required option is missing
+     * @throws UsageException if a required option is missing, or --out is inside
+     *                        --data-dir
      * @throws IOException    if the snapshot cannot be taken
      */
     public static ExitCode execute(Arguments arguments, PrintStream out)
         throws UsageException, IOException {
-        SnapshotOptions options = new SnapshotOptions(arguments.requiredPath("data-dir"),
-            arguments.requiredPath("out"), !arguments.flag("exclude-derived"),
-            arguments.flag("allow-live"));
+        SnapshotOptions options;
+        try {
+            options = new SnapshotOptions(arguments.requiredPath("data-dir"),
+                arguments.requiredPath("out"), !arguments.flag("exclude-derived"),
+                arguments.flag("allow-live"));
+        } catch (IllegalArgumentException e) {
+            // The two paths contradict each other: a line to correct, not a failure.
+            throw new UsageException(e.getMessage());
+        }
         SnapshotResult result = new SnapshotWriter().take(options);
         report(result, out);
         return ExitCode.OK;

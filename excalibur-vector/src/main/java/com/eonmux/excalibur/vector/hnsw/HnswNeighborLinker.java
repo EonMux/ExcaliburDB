@@ -1,26 +1,39 @@
 package com.eonmux.excalibur.vector.hnsw;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 /**
- * Maintains the adjacency lists, including the back-edges that keep them bidirectional.
+ * Chooses and maintains the adjacency lists: which neighbours a node links to, and how a list
+ * at its limit makes room for one more.
  *
  * <h2>Why it is its own class</h2>
- * <p>Adding one edge is rarely one write. A node at its connection limit has to give something
- * up, and whatever it drops must also drop its edge back, or the graph acquires a one-way link
- * that the traversal will follow in one direction and never in the other - the failure mode that
- * makes a node unreachable while it still looks connected from its own adjacency list. Keeping
- * the add, the pruning and the back-edge removal together is what makes that invariant a
- * property of a single collaborator rather than a convention spread across the insert path.</p>
+ * <p>Both halves of edge maintenance run the same selection rule. A new node picks its
+ * neighbours from a search beam, and an existing node whose list overflows when a back-link
+ * arrives re-picks from what it had plus the newcomer. Keeping that rule in one place is what
+ * keeps the two from drifting apart.</p>
+ *
+ * <h2>The selection rule</h2>
+ * <p>Malkov &amp; Yashunin's heuristic (Algorithm 4, without candidate extension or refilling
+ * from discarded candidates, as hnswlib and FAISS run it): candidates are taken nearest first,
+ * and one is kept only if it is closer to the base node than to every neighbour already kept.
+ * A candidate that fails lies behind a kept neighbour and is reached through it. Keeping only
+ * the nearest candidates instead spends every edge of a node in a clustered corpus inside its
+ * own cluster, so nothing leads out of it and a search that starts elsewhere never arrives.</p>
+ *
+ * <h2>Edges are directed</h2>
+ * <p>A list's contents are its owner's choice alone. When an overflowing list drops a
+ * neighbour, the neighbour's own link back is left alone: removing it would take an out-link
+ * from a node that did nothing, and repeated over a build that steadily strips the graph of
+ * the edges it navigates by. Most edges end up mutual anyway, since every chosen neighbour is
+ * offered the link back.</p>
  *
  * <h2>Locking</h2>
- * <p>Every method here mutates the mapped file and must be called with the graph's write lock
- * held; insertion is the only caller, and it holds that lock for the whole of an insert. The
- * reads these methods make re-enter the graph's read lock through
- * {@link HnswGraph#readNode(long)}, which a writer already owning the write lock may do.</p>
+ * <p>Every method here must be called with the graph's write lock held, and is handed the
+ * {@link HnswTraversal} the caller opened under it; insertion is the only caller, and it holds
+ * that lock for the whole of an insert. Reads go through the traversal, writes through the
+ * mapped file, and both address the same mapping, so a list written here is what the next read
+ * of it sees.</p>
  */
 final class HnswNeighborLinker {
 
@@ -38,172 +51,120 @@ final class HnswNeighborLinker {
     /**
      * Replaces a node's neighbour list at one layer.
      *
+     * @param traversal Read access opened under the write lock
      * @param nodeId The node whose list is being written
      * @param level The layer to write
      * @param neighborIds The neighbours to store, truncated to the layer's limit
+     * @throws IllegalArgumentException if the node is not written or does not reach that layer:
+     *         a record reserves adjacency only for the layers its node spans, so a list for any
+     *         other would be written over the record that follows it
      */
-    void addConnections(long nodeId, int level, List<Long> neighborIds) {
-        HnswGraph.NodeView node = graph.readNode(nodeId);
-        if (node == null) {
-            return;
+    void writeConnections(HnswTraversal traversal, long nodeId, int level, List<Long> neighborIds) {
+        int nodeLevel = traversal.level(nodeId);
+        if (level < 0 || level > nodeLevel) {
+            throw new IllegalArgumentException("node " + nodeId + " at level " + nodeLevel
+                + " has no layer " + level + " to write");
         }
-
         HnswNodeRecords.writeNeighbors(
-            graph.mappedFile, graph.config, node.dataOffset(), level, neighborIds);
+            graph.mappedFile, graph.config, traversal.recordOffset(nodeId), level, neighborIds);
     }
 
     /**
-     * Adds a single connection to a node with pruning if necessary.
+     * Chooses up to {@code limit} neighbours for a base vector by the selection heuristic.
      *
-     * <p>When max connections is exceeded, uses the simple heuristic:
-     * keep the closest neighbors based on distance to the node's vector.</p>
+     * <p>Candidates that no longer name an active node are skipped.</p>
      *
-     * <p><strong>Bidirectional Edge Invariant:</strong> When pruning removes a neighbor,
-     * the corresponding back-edge is also removed to maintain bidirectionality.</p>
-     *
-     * @param nodeId The node to add connection to
-     * @param level The level for the connection
-     * @param neighborId The neighbor to connect
-     * @return true if the connection was successfully added, false if it was pruned
+     * @param traversal Read access opened under the write lock
+     * @param nearestFirst Candidates with their distance to the base, closest first
+     * @param limit The most neighbours to keep
+     * @return The chosen neighbours, closest first
      */
-    boolean addConnection(long nodeId, int level, long neighborId) {
-        HnswGraph.NodeView node = graph.readNode(nodeId);
-        if (node == null || node.isTombstoned()) {
-            return false;
-        }
+    List<Long> selectNeighbors(HnswTraversal traversal, List<HnswSearchResult> nearestFirst, int limit) {
+        List<Long> kept = new ArrayList<>(limit);
+        List<float[]> keptVectors = new ArrayList<>(limit);
+        // Most candidates are rejected, so each is read into one buffer and only a kept one is
+        // copied out to be compared against later.
+        float[] vector = new float[graph.config.dimension()];
 
-        // Read current connections
-        List<Long> currentNeighbors = node.getNeighbors(level);
-
-        // Check if already connected
-        if (currentNeighbors.contains(neighborId)) {
-            return true; // Already connected counts as success
-        }
-
-        // Check capacity
-        int maxConn = HnswNodeRecords.maxConnectionsAt(graph.config, level);
-
-        if (currentNeighbors.size() >= maxConn) {
-            // Prune connections using simple heuristic: keep closest neighbors
-            // This also removes back-edges from pruned nodes to maintain bidirectionality
-            currentNeighbors = pruneConnectionsAndRemoveBackEdges(nodeId, level, currentNeighbors, neighborId, maxConn);
-            // Check if the new neighbor was included after pruning
-            boolean added = currentNeighbors.contains(neighborId);
-            addConnections(nodeId, level, currentNeighbors);
-            return added;
-        } else {
-            currentNeighbors.add(neighborId);
-            addConnections(nodeId, level, currentNeighbors);
-            return true;
-        }
-    }
-
-    /**
-     * Prunes connections and removes back-edges from pruned neighbors.
-     *
-     * <p>This method ensures the bidirectional edge invariant is maintained:
-     * when a neighbor is pruned from this node's adjacency list, the corresponding
-     * back-edge from that neighbor to this node is also removed.</p>
-     *
-     * <p><strong>Why this is necessary:</strong> In HNSW, edges must be bidirectional.
-     * If node A has node B in its neighbor list, then node B must also have node A
-     * in its neighbor list. When pruning removes B from A's list, we must also
-     * remove A from B's list to maintain this invariant.</p>
-     *
-     * @param nodeId The node whose connections are being pruned
-     * @param level The level for connections
-     * @param currentNeighbors Current neighbor list
-     * @param newNeighborId The new neighbor to potentially add
-     * @param maxConn Maximum connections allowed
-     * @return Pruned list of neighbors (size &lt;= maxConn)
-     */
-    private List<Long> pruneConnectionsAndRemoveBackEdges(long nodeId, int level,
-                                                          List<Long> currentNeighbors,
-                                                          long newNeighborId, int maxConn) {
-        HnswGraph.NodeView node = graph.readNode(nodeId);
-        if (node == null) {
-            return currentNeighbors;
-        }
-
-        float[] nodeVector = node.vector();
-
-        // Build list of all candidates (current + new) with distances
-        List<NeighborCandidate> candidates = new ArrayList<>(currentNeighbors.size() + 1);
-
-        for (Long neighborId : currentNeighbors) {
-            HnswGraph.NodeView neighbor = graph.readNode(neighborId);
-            if (neighbor != null && !neighbor.isTombstoned()) {
-                float dist = graph.computeDistance(nodeVector, neighbor.vector());
-                candidates.add(new NeighborCandidate(neighborId, dist));
+        for (HnswSearchResult candidate : nearestFirst) {
+            if (kept.size() >= limit) {
+                break;
+            }
+            if (!traversal.isActive(candidate.nodeId())) {
+                continue;
+            }
+            traversal.readVector(candidate.nodeId(), vector);
+            if (isDiverse(vector, candidate.distance(), keptVectors)) {
+                kept.add(candidate.nodeId());
+                keptVectors.add(vector.clone());
             }
         }
-
-        // Add new neighbor
-        HnswGraph.NodeView newNeighbor = graph.readNode(newNeighborId);
-        if (newNeighbor != null && !newNeighbor.isTombstoned()) {
-            float dist = graph.computeDistance(nodeVector, newNeighbor.vector());
-            candidates.add(new NeighborCandidate(newNeighborId, dist));
-        }
-
-        // Sort by distance (ascending - closest first)
-        candidates.sort((a, b) -> Float.compare(a.distance, b.distance));
-
-        // Determine which neighbors to keep
-        Set<Long> keptNeighbors = new HashSet<>();
-        List<Long> pruned = new ArrayList<>(maxConn);
-        for (int i = 0; i < Math.min(maxConn, candidates.size()); i++) {
-            Long id = candidates.get(i).nodeId;
-            pruned.add(id);
-            keptNeighbors.add(id);
-        }
-
-        // Remove back-edges from pruned neighbors (those not in the kept set)
-        for (Long oldNeighborId : currentNeighbors) {
-            if (!keptNeighbors.contains(oldNeighborId)) {
-                // This neighbor was pruned - remove the back-edge
-                removeBackEdge(oldNeighborId, level, nodeId);
-            }
-        }
-
-        return pruned;
+        return kept;
     }
 
     /**
-     * Removes a back-edge from a node's neighbor list.
-     *
-     * <p>This method removes nodeId from neighborId's adjacency list at the specified level,
-     * maintaining the bidirectional edge invariant when pruning.</p>
-     *
-     * @param neighborId The node from whose list to remove the back-edge
-     * @param level The level of the edge
-     * @param nodeId The node to remove from the neighbor list
+     * Whether a candidate is at least as close to the base as to every neighbour already kept.
      */
-    private void removeBackEdge(long neighborId, int level, long nodeId) {
-        HnswGraph.NodeView neighbor = graph.readNode(neighborId);
-        if (neighbor == null || neighbor.isTombstoned()) {
+    private boolean isDiverse(float[] candidate, float distanceToBase, List<float[]> keptVectors) {
+        for (float[] kept : keptVectors) {
+            if (graph.computeDistance(candidate, kept) < distanceToBase) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Offers a node a link to a neighbour, shrinking its list by the heuristic when it is full.
+     *
+     * <p>A list with room simply takes the link. A full one re-chooses from its current members
+     * and the newcomer, measured from its own vector, which may leave the newcomer out or drop an
+     * older member; neither outcome touches any other node's list.</p>
+     *
+     * <p>A node that is inactive, or that does not reach the layer, declines the link. In a sound
+     * graph every node offered a link at a layer reaches it, because it was found by walking
+     * that layer; one that does not was named by a damaged list, and it has no list at that
+     * layer to hold the link.</p>
+     *
+     * @param traversal Read access opened under the write lock
+     * @param nodeId The node whose list is offered the link
+     * @param level The layer of the link
+     * @param neighborId The neighbour to link to
+     */
+    void addConnection(HnswTraversal traversal, long nodeId, int level, long neighborId) {
+        if (!traversal.isActive(nodeId) || traversal.level(nodeId) < level) {
             return;
         }
 
-        // Check if the neighbor exists at this level
-        if (neighbor.level() < level) {
-            return;
+        int count = traversal.readNeighbors(nodeId, level);
+        int[] current = traversal.neighbors();
+        List<Long> offered = new ArrayList<>(count + 1);
+        for (int i = 0; i < count; i++) {
+            if (current[i] == neighborId) {
+                return;
+            }
+            offered.add((long) current[i]);
         }
+        offered.add(neighborId);
 
-        List<Long> neighborList = neighbor.getNeighbors(level);
-        if (!neighborList.contains(nodeId)) {
-            return; // Already not connected
-        }
-
-        // Remove nodeId from neighbor's list
-        List<Long> updatedList = new ArrayList<>(neighborList);
-        updatedList.remove(Long.valueOf(nodeId));
-
-        // Write updated list back
-        addConnections(neighborId, level, updatedList);
+        int limit = HnswNodeRecords.maxConnectionsAt(graph.config, level);
+        List<Long> updated = offered.size() <= limit
+            ? offered
+            : selectNeighbors(traversal, measuredFrom(traversal, traversal.vector(nodeId), offered), limit);
+        writeConnections(traversal, nodeId, level, updated);
     }
 
     /**
-     * Helper record for connection pruning.
+     * Measures each active node in {@code ids} from {@code base}, closest first.
      */
-    private record NeighborCandidate(long nodeId, float distance) {}
+    private static List<HnswSearchResult> measuredFrom(HnswTraversal traversal, float[] base, List<Long> ids) {
+        List<HnswSearchResult> measured = new ArrayList<>(ids.size());
+        for (long id : ids) {
+            if (traversal.isActive(id)) {
+                measured.add(new HnswSearchResult(id, traversal.distance(base, id)));
+            }
+        }
+        measured.sort((a, b) -> Float.compare(a.distance(), b.distance()));
+        return measured;
+    }
 }

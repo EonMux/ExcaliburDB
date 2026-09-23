@@ -221,6 +221,65 @@ class QueryEndpointConfigurationTest extends QueryEndpointTestBase {
     }
 
     // Helper method to create mock Config with standard setup
+    /**
+     * The endpoint's executor runs BM25 searches and relevancy scoring over the chunk index and
+     * the storage engine, which the caller closes once shutdown returns. Interrupting that work
+     * shortens nothing - a mapped read never looks at the flag - and on the chunk index's
+     * NIOFSDirectory fallback it closes a channel every later query shares. So shutdown waits,
+     * and says when it ran out of time.
+     */
+    @Nested
+    @DisplayName("Shutting down")
+    class ShuttingDown {
+
+        @Test
+        @DisplayName("an endpoint with nothing running shuts down clean")
+        void idleShutdownIsClean() {
+            QueryEndpoint endpoint = new QueryEndpoint(queryPipeline, createMockConfig(),
+                Executors.newVirtualThreadPerTaskExecutor(), null, embeddingClient);
+
+            assertThat(endpoint.shutdown()).isTrue();
+        }
+
+        @Test
+        @DisplayName("work still running is reported rather than interrupted, and nothing new starts")
+        void runningWorkIsReportedNotInterrupted() throws Exception {
+            Config config = createMockConfig();
+            when(config.visibility().getQueryTimeoutMs()).thenReturn(50);
+            ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+            QueryEndpoint endpoint =
+                new QueryEndpoint(queryPipeline, config, executor, null, embeddingClient);
+            CountDownLatch reading = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            java.util.concurrent.atomic.AtomicBoolean interrupted =
+                new java.util.concurrent.atomic.AtomicBoolean();
+            executor.execute(() -> {
+                reading.countDown();
+                // Stands in for a mapped read, which never looks at the interrupt flag.
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+                while (release.getCount() > 0 && System.nanoTime() < deadline) {
+                    java.util.concurrent.locks.LockSupport.parkNanos(
+                        TimeUnit.MILLISECONDS.toNanos(5));
+                    interrupted.compareAndSet(false, Thread.currentThread().isInterrupted());
+                }
+            });
+            assertThat(reading.await(5, TimeUnit.SECONDS)).isTrue();
+
+            try {
+                assertThat(endpoint.shutdown())
+                    .as("the storage and the chunk index must stay open under the read")
+                    .isFalse();
+                assertThat(interrupted).as("the running work was never interrupted").isFalse();
+                assertThatThrownBy(() -> executor.execute(() -> { }))
+                    .isInstanceOf(RejectedExecutionException.class);
+            } finally {
+                release.countDown();
+            }
+            assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(interrupted).isFalse();
+        }
+    }
+
     private Config createMockConfig() {
         Config mockConfig = mock(Config.class);
         QueryConfig mockQueryConfig = mock(QueryConfig.class);

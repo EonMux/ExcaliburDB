@@ -18,7 +18,6 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.Map;
 import java.util.stream.Stream;
 
@@ -266,11 +265,6 @@ class SourceListEndpointTest {
         @Override
         public Stream<String> crawl() {
             return Stream.empty();
-        }
-
-        @Override
-        public boolean hasChanged(Instant since) {
-            return false;
         }
 
         @Override

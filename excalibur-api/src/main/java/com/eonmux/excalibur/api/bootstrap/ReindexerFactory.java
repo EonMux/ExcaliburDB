@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.bootstrap;
 
+import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.ingest.erasure.SegmentVectorEraser;
 import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
@@ -26,9 +27,18 @@ import java.util.Objects;
  * Builds the {@link DocumentReindexer} and everything it writes through.
  *
  * <p>Kept separate from the application bootstrap because the reindex path has its
- * own correctness requirements: superseded chunks must actually be tombstoned, and
- * chunks must land in the segment their key routes to (or, during rolling
- * replacement, in the new segment the caller nominated).</p>
+ * own correctness requirements: superseded chunks must actually be tombstoned, chunks
+ * must land in the segment their key routes to, and each chunk's terms must be filed in
+ * the membership filter under that segment.</p>
+ *
+ * <p>The last is the one a reindex could get wrong without anything failing. Once a
+ * segment's level is trusted, stage 1 of the query pipeline rules the segment out for every
+ * term the level does not name, so a reindexed-in term filed under any other segment - or
+ * under none - hides the chunk that holds it from every query for it until the segment is
+ * next rebuilt. The storage engine reports the segment each write landed in, and the
+ * reindexer files the chunk's terms there as it writes it, through the same recorder a first
+ * ingest uses. The batch publisher is given no filter of its own: a document's chunks span
+ * segments, so no one segment id could describe a publication.</p>
  *
  * <p>The lexical index is part of that. A reindex is the one operation that removes content a
  * query could still be matching, so a reindexer that wrote to storage alone would leave deleted
@@ -47,9 +57,6 @@ import java.util.Objects;
 public final class ReindexerFactory {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ReindexerFactory.class);
-
-    /** Segment ID the batch publisher uses until rolling replacement overrides it. */
-    private static final String DEFAULT_PUBLISH_SEGMENT_ID = "0";
 
     private ReindexerFactory() {
         // Utility class
@@ -87,7 +94,9 @@ public final class ReindexerFactory {
      * @param storageEngine      Storage engine chunks are written to and tombstoned in
      * @param volumeManager      Volume manager, enabling rolling replacement when present
      * @param indexOrchestrator  Orchestrator supplying the visibility tracker
-     * @param hierarchicalFilter Filter that must see both inserts and tombstones
+     * @param hierarchicalFilter Filter that must see both inserts and tombstones, and that
+     *                           each written chunk's terms are filed in under the segment it
+     *                           landed in; may be null on a node that prunes on none
      * @param registry           Document registry shared with the ingestion pipeline
      * @param chunkIndex         Lexical index to keep in step with storage, or null for none
      * @return A configured reindexer
@@ -124,8 +133,7 @@ public final class ReindexerFactory {
         DocumentBatchPublisher batchPublisher = new DocumentBatchPublisher(
             indexOrchestrator.getVisibilityTracker(),
             registry,
-            hierarchicalFilter,
-            DEFAULT_PUBLISH_SEGMENT_ID,
+            (CuckooFilter) null,
             () -> { /* write log sync is performed by the storage engine */ },
             null
         );
@@ -156,6 +164,8 @@ public final class ReindexerFactory {
                 batchPublisher
             );
         }
+
+        reindexer.setMembershipFilter(hierarchicalFilter);
 
         if (chunkIndex != null) {
             // The text supplier reads through the same storage engine the reindexer writes to,

@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
@@ -70,6 +71,8 @@ public final class RepairExecutor {
                 case DROP_CATALOG_RECORD -> droppedRecord(action);
                 case TRIM_TORN_LOG_TAIL -> trimmedTail(action);
             };
+        } catch (PartialQuarantineException e) {
+            return new RepairOutcome(action, false, "only partly done: " + e.getMessage());
         } catch (IOException | RuntimeException e) {
             return new RepairOutcome(action, false,
                 "failed, and the file is exactly as it was: " + e);
@@ -79,13 +82,53 @@ public final class RepairExecutor {
     /**
      * Moves a file into quarantine.
      *
+     * <p>A compacted graph is moved only once the staged mapping beside it is gone and its
+     * going is on the device. The mapping's own move forces its directory, but this does not
+     * rely on it: the mapping may have been removed by an earlier run, or by a move that
+     * failed after the rename, and in each case its absence can still be undone by a crash.
+     * Moving the graph then, and crashing, would bring the mapping back alone - the state the
+     * node reads as a finished compaction - so the directory is forced here first, as the
+     * engine's own {@code discardStagedPair} forces the mapping's removal before it touches
+     * the graph. A directory that cannot be forced leaves the graph where it is.</p>
+     *
      * @param action What to do
      * @return What happened
      * @throws IOException if the move fails
      */
     private RepairOutcome quarantined(RepairAction action) throws IOException {
+        Path stagedMapping = stagedMappingBeside(action.subject());
+        if (stagedMapping != null) {
+            if (Files.exists(stagedMapping)) {
+                return new RepairOutcome(action, false,
+                    "not moved, because " + stagedMapping.getFileName() + " is still beside it. "
+                        + "The node reads a staged mapping with no compacted graph next to it "
+                        + "as a finished compaction and installs it, so moving the graph alone "
+                        + "would have the uncompacted graph served through the compacted "
+                        + "numbering. Move the mapping aside first, then run the repair again");
+            }
+            quarantine.forceContainingDirectory(stagedMapping);
+        }
         Path destination = quarantine.take(action.subject(), action.relative());
         return new RepairOutcome(action, true, "moved to " + destination);
+    }
+
+    /**
+     * Names the staged mapping a compacted graph must not be moved without.
+     *
+     * <p>The planner already orders the pair so the mapping goes first; this is the check at
+     * the moment of acting that the first move actually happened. It is made here rather than
+     * trusted from the plan for the same reason a torn tail is re-scanned: the plan describes
+     * the directory as it was, and an earlier action in the same run can have failed.</p>
+     *
+     * @param file The file about to be moved
+     * @return The {@code .hnsw.compact.docmap} path when the file is a compacted graph, or null
+     */
+    private static Path stagedMappingBeside(Path file) {
+        String name = file.getFileName().toString();
+        if (!name.endsWith(".hnsw.compact")) {
+            return null;
+        }
+        return file.resolveSibling(name + ".docmap");
     }
 
     /**

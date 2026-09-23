@@ -45,6 +45,13 @@ import java.util.logging.Level;
  * directory already points at the children, so unwinding is not possible and letting one
  * observer's failure abort the notification would leave the rest permanently unaware of a
  * split that did happen.</p>
+ *
+ * <p>One notice is given under the lock, because it has to precede the first write a child
+ * can take: {@link SplitWorker.SplitListener#onSplitPublishing} names the indices the children
+ * are about to be published at, once the publication can no longer be refused and before any
+ * key routes to them. State that a child's inherited entries will never reach through writes -
+ * a membership filter filled by them - is marked there, not after the fact. A publication that
+ * then fails tells the same observers {@link SplitWorker.SplitListener#onSplitAbandoned}.</p>
  */
 final class SplitPublication {
 
@@ -107,26 +114,84 @@ final class SplitPublication {
      *         child cannot be moved into place
      */
     void handleSplitComplete(Segment parent, Segment leftChild, Segment rightChild) {
-        synchronized (engine.segmentLock) {
-            int oldRouting = engine.routingSegmentCount;
-
-            List<Long> parentSlots = engine.routingTable.directorySlotsOf(parent);
-            if (parentSlots.isEmpty()) {
-                throw new IllegalStateException(
-                    "Parent segment not found in routing directory during split publication: "
-                    + parent.path());
+        long[] published;
+        try {
+            synchronized (engine.segmentLock) {
+                published = publishUnderLock(parent, leftChild, rightChild);
             }
+        } catch (AnnouncedPublicationFailure failure) {
+            // Observers were told this split was coming, so they are owed the news that it did
+            // not happen - outside the lock, like every other notification that can take time.
+            notifySplitAbandoned(parent, failure.leftIndex, failure.rightIndex);
+            throw failure.failure;
+        }
 
-            long leftIndex = parentSlots.get(0);
-            long rightIndex = leftIndex + oldRouting;
+        StorageEngine.LOGGER.info(String.format(
+            "Split published: parent=%s -> left=%d, right=%d, routingCount=%d",
+            parent.path(), published[0], published[1], engine.routingSegmentCount));
 
-            // Before anything is moved: the catalog must be able to take both children at
-            // their indices. The only thing that can stop it is a segment created for a source
-            // under an older catalog at one of those ids, and once the renames below have run
-            // there is no way back - so the refusal has to come while the parent is untouched.
-            engine.catalog.checkRoutingRegistration(leftIndex);
-            engine.catalog.checkRoutingRegistration(rightIndex);
+        finishPublication(parent, leftChild, rightChild);
+    }
 
+    /**
+     * A publication that failed after observers were told it was coming.
+     *
+     * <p>Carries the failure out of the directory lock, so the observers are told it was
+     * abandoned without holding up routing, and then rethrown as it was.</p>
+     */
+    private static final class AnnouncedPublicationFailure extends RuntimeException {
+
+        private static final long serialVersionUID = 1L;
+
+        private final RuntimeException failure;
+        private final long leftIndex;
+        private final long rightIndex;
+
+        AnnouncedPublicationFailure(RuntimeException failure, long leftIndex, long rightIndex) {
+            super(failure.getMessage(), failure, false, false);
+            this.failure = failure;
+            this.leftIndex = leftIndex;
+            this.rightIndex = rightIndex;
+        }
+    }
+
+    /**
+     * The part of publication that mutates the directory. The caller holds
+     * {@code StorageEngine.segmentLock}.
+     *
+     * @param parent     The parent segment that was split
+     * @param leftChild  The left child
+     * @param rightChild The right child
+     * @return The left and right indices the children were published at
+     * @throws IllegalStateException if the publication is refused before observers were told
+     * @throws AnnouncedPublicationFailure if it fails after they were
+     */
+    private long[] publishUnderLock(Segment parent, Segment leftChild, Segment rightChild) {
+        int oldRouting = engine.routingSegmentCount;
+
+        List<Long> parentSlots = engine.routingTable.directorySlotsOf(parent);
+        if (parentSlots.isEmpty()) {
+            throw new IllegalStateException(
+                "Parent segment not found in routing directory during split publication: "
+                + parent.path());
+        }
+
+        long leftIndex = parentSlots.get(0);
+        long rightIndex = leftIndex + oldRouting;
+
+        // Before anything is moved: the catalog must be able to take both children at
+        // their indices. The only thing that can stop it is a segment created for a source
+        // under an older catalog at one of those ids, and once the renames below have run
+        // there is no way back - so the refusal has to come while the parent is untouched.
+        engine.catalog.checkRoutingRegistration(leftIndex);
+        engine.catalog.checkRoutingRegistration(rightIndex);
+
+        // Before the children become reachable: the first write routed to a child reaches it
+        // after this, so an observer that marks per-segment state here has it marked before any
+        // key could reach the segment it describes.
+        notifySplitPublishing(parent, leftIndex, rightIndex);
+
+        try {
             // Step 1: give the children discoverable identities before publishing them.
             // The right child goes first: its target name is unused, so a failure there
             // leaves everything untouched. The left child's target is the parent's own
@@ -196,12 +261,20 @@ final class SplitPublication {
             engine.visibilityTracker.advanceEpoch();
 
             engine.routingTable.publishRouting();
-
-            StorageEngine.LOGGER.info(String.format(
-                "Split published: parent slots=%s -> left=%d, right=%d, routingCount=%d",
-                parentSlots, leftIndex, rightIndex, engine.routingSegmentCount));
+        } catch (RuntimeException e) {
+            throw new AnnouncedPublicationFailure(e, leftIndex, rightIndex);
         }
+        return new long[] {leftIndex, rightIndex};
+    }
 
+    /**
+     * Makes a published split durable, tells observers, and retires the parent.
+     *
+     * @param parent     The parent segment that was split
+     * @param leftChild  The left child, now routed to
+     * @param rightChild The right child, now routed to
+     */
+    private void finishPublication(Segment parent, Segment leftChild, Segment rightChild) {
         // The directory just changed shape, and the shape is not recoverable from the segment
         // file names. Written before the observers run, so a crash during that work still leaves
         // a directory describing the split that is already durable.
@@ -219,10 +292,47 @@ final class SplitPublication {
         // unlinked the parent's file, so did the disk blocks behind it. One of each, per split,
         // forever. Its graph was already released above.
         try {
+            // The left child owns the parent's name and its sidecar now.
+            parent.detachTermFrequencySketch();
             parent.close();
         } catch (RuntimeException e) {
             StorageEngine.LOGGER.log(java.util.logging.Level.WARNING,
                 "Failed to retire the parent segment after splitting " + parent.path(), e);
+        }
+    }
+
+    /**
+     * Tells observers a split is about to become reachable. The caller holds the directory lock.
+     *
+     * <p>An observer that throws is logged and skipped: this is advance notice, and one observer
+     * failing to take it is no reason to refuse a split the others were told about.</p>
+     */
+    private void notifySplitPublishing(Segment parent, long leftIndex, long rightIndex) {
+        for (SplitWorker.SplitListener observer : splitObservers) {
+            try {
+                observer.onSplitPublishing(parent, leftIndex, rightIndex);
+            } catch (RuntimeException e) {
+                StorageEngine.LOGGER.log(java.util.logging.Level.SEVERE,
+                    "Split observer failed on the advance notice for parent " + parent.path()
+                        + "; the split proceeds and other observers are still told", e);
+            }
+        }
+    }
+
+    /**
+     * Tells observers that a split they were told was coming was not published.
+     *
+     * <p>An observer that throws is logged and skipped, so the rest still hear it.</p>
+     */
+    private void notifySplitAbandoned(Segment parent, long leftIndex, long rightIndex) {
+        for (SplitWorker.SplitListener observer : splitObservers) {
+            try {
+                observer.onSplitAbandoned(parent, leftIndex, rightIndex);
+            } catch (RuntimeException e) {
+                StorageEngine.LOGGER.log(java.util.logging.Level.SEVERE,
+                    "Split observer failed on the abandonment of the split of " + parent.path()
+                        + "; other observers are still told", e);
+            }
         }
     }
 
@@ -338,11 +448,16 @@ final class SplitPublication {
     /**
      * Renames a file onto a canonical name, replacing whatever is there.
      *
+     * <p>The term sketch sidecar at the target goes first: it describes the file the name held
+     * before - the parent, for the left child - and the child's own sketch is written there on
+     * its next flush.</p>
+     *
      * @param source The current path
      * @param target The canonical path
      * @throws IOException if the rename fails
      */
     private static void moveIntoPlace(Path source, Path target) throws IOException {
+        TermSketchFile.deleteFor(target);
         java.nio.file.Files.move(source, target,
             java.nio.file.StandardCopyOption.REPLACE_EXISTING,
             java.nio.file.StandardCopyOption.ATOMIC_MOVE);

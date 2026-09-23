@@ -8,6 +8,7 @@ import com.eonmux.excalibur.ingest.source.SourceDescriptor;
 import com.eonmux.excalibur.config.IngestConfig;
 
 import java.net.URI;
+import java.nio.charset.Charset;
 import java.nio.file.Path;
 import java.util.LinkedHashSet;
 import java.util.Locale;
@@ -51,6 +52,12 @@ public final class SourceFactory {
 
     /** Configuration key bounding the size of one file a filesystem crawl will read. */
     public static final String MAX_FILE_BYTES = "max_file_bytes";
+
+    /**
+     * Configuration key naming the encoding a filesystem crawl reads files without a byte-order
+     * mark in. A file that carries a mark is read in the encoding the mark names instead.
+     */
+    public static final String CHARSET = "charset";
 
     /** Configuration key bounding how many pages one crawl fetches. */
     public static final String MAX_DOCUMENTS = "max_documents";
@@ -185,6 +192,10 @@ public final class SourceFactory {
         if (fileBytes != null) {
             builder.maxFileSize(fileBytes);
         }
+        String charset = descriptor.get(CHARSET);
+        if (charset != null && !charset.isEmpty()) {
+            builder.charset(charset(charset));
+        }
 
         return builder.build();
     }
@@ -258,6 +269,35 @@ public final class SourceFactory {
         return requested == null
             ? minCrawlDelayMillis
             : Math.max(minCrawlDelayMillis, requested);
+    }
+
+    /**
+     * Resolves the encoding a registration names.
+     *
+     * <p>Shared by the endpoint, which refuses an unknown name before anything is registered, and
+     * by this factory, which re-checks it when a registration is restored from the catalog. A
+     * name this runtime does not support is refused rather than replaced with UTF-8: a directory
+     * of windows-1252 exports read as UTF-8 indexes a replacement character in place of every
+     * accented letter while every document reports as indexed.</p>
+     *
+     * @param name The encoding's name or one of its aliases, as {@link Charset#forName} takes it
+     * @return The charset
+     * @throws IllegalArgumentException naming the field, if the name is blank, malformed, or not
+     *                                  supported by this runtime
+     */
+    public static Charset charset(String name) {
+        if (name == null || name.isBlank()) {
+            throw new IllegalArgumentException(
+                "Field 'config." + CHARSET + "' must name an encoding");
+        }
+        try {
+            return Charset.forName(name.trim());
+        } catch (IllegalArgumentException e) {
+            // Both IllegalCharsetNameException and UnsupportedCharsetException land here; the
+            // caller is told which field and which value, not which of the two it was.
+            throw new IllegalArgumentException("Field 'config." + CHARSET + "' names an "
+                + "encoding this node does not support: " + name, e);
+        }
     }
 
     /**

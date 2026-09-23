@@ -1,8 +1,17 @@
 package com.eonmux.excalibur.backup.verify;
 
+import com.eonmux.excalibur.backup.io.AtomicPublish;
 import com.eonmux.excalibur.backup.io.SparseFileCopy;
-import com.eonmux.excalibur.filter.lsh.LshHashTable;
 import com.eonmux.excalibur.core.integrity.IntegrityReport;
+import com.eonmux.excalibur.filter.lsh.LshHashTable;
+import com.eonmux.excalibur.fsck.check.CheckStatus;
+import com.eonmux.excalibur.fsck.check.ConsistencyFinding;
+import com.eonmux.excalibur.fsck.check.FileCheck;
+import com.eonmux.excalibur.fsck.check.FileInspector;
+import com.eonmux.excalibur.fsck.check.FileKind;
+import com.eonmux.excalibur.fsck.check.FindingSeverity;
+import com.eonmux.excalibur.fsck.check.LexicalStoreCheck;
+import com.eonmux.excalibur.fsck.check.LshTableCheck;
 import com.eonmux.excalibur.store.Segment;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.SegmentIntegrityReport;
@@ -15,31 +24,62 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Hands each file in a snapshot to the engine's own checker for its format.
+ * Hands each file in a snapshot to the checker for its format.
  *
  * <h2>Why not re-derive what a valid file looks like</h2>
- * <p>Each of these formats already has a verifier that lives beside the code that writes
- * it: {@link Segment#verifyIntegrity()} walks every occupied slot and compares each entry's
- * stored checksum; {@link HnswGraph#verifyIntegrity(Path)} and
- * {@link NodeDocumentMapping#verifyIntegrity(Path)} check the seal a clean close writes;
- * {@link PQCodebookFile#verifyIntegrity(Path)} and
- * {@link LshHashTable#verifyIntegrity(Path)} do the same for their sidecars; and
- * {@link CatalogFile} validates its own header and record CRCs as it opens. A second
- * implementation here would be a second definition of "valid", and the two would drift.</p>
+ * <p>Every format a data directory holds already has a verifier, and a second implementation
+ * here would be a second definition of "valid" that drifts from the first. Two sets are
+ * used, and between them they cover every file an image can contain.</p>
  *
- * <h2>Why every check runs on a copy</h2>
- * <p>Several of these open their file read-write and repair it as they go - a catalog with
- * one damaged header slot is rewritten from the other, an interrupted HNSW compaction is
- * finished. That is right for a node opening its own data directory and wrong for a
- * verification, which must leave the image exactly as it found it, not least because it
- * has just certified the image's checksums. So each file is copied to scratch, checked
- * there and thrown away. The copy preserves holes, so checking a 755 MiB graph that holds
- * a few nodes costs what those few nodes cost.</p>
+ * <p>The engine's own, for the six formats whose verifier lives beside the code that writes
+ * them: {@link Segment#verifyIntegrity()} walks every occupied slot of a segment and compares
+ * each entry's stored checksum; {@link HnswGraph#verifyIntegrity(Path)} and
+ * {@link NodeDocumentMapping#verifyIntegrity(Path)} check the seal a clean close writes on a
+ * graph and its document mapping; {@link PQCodebookFile#verifyIntegrity(Path)} and
+ * {@link LshHashTable#verifyIntegrity(Path)} do the same for their sidecars; and
+ * {@link CatalogFile} validates its own header and record CRCs as it opens.</p>
+ *
+ * <p>{@code excalibur-fsck}'s, through {@link FileInspector}, for everything else: the
+ * write-ahead logs, whose records are replayed and their checksums compared; the routing
+ * directory; the segments' term sketches, whose checker reads without writing and so needs
+ * no scratch copy; the document registry and source catalog, which are checked against the
+ * record count they end with; the graph staging logs; and the native lexical store, which is
+ * checked as a whole by {@link #withLexicalStore} because its manifest and the segments it
+ * names are one structure. The same dispatch is what {@code excalibur-fsck} surveys a live
+ * directory with, so the two tools cannot disagree about which checker a file belongs to.</p>
+ *
+ * <p>That includes the pair an interrupted HNSW compaction stages,
+ * {@code segment_N.hnsw.compact} and {@code segment_N.hnsw.compact.docmap}, even though each
+ * is written in a format the engine checks. What the staged mapping is depends on its
+ * neighbour: beside the staged graph the compaction never swapped, the node discards both on
+ * open, and nothing reads either, so a torn pair is a leftover and not damage; alone, the
+ * graph swap completed, and the mapping is the only one that matches the live graph, so it is
+ * verified and its damage is real. Handed to the format checkers by name, a torn pair would
+ * fail an image that restores to a node that opens cleanly, and {@code excalibur-fsck} would
+ * pass the same directory - the disagreement one dispatch exists to rule out.</p>
+ *
+ * <h2>What "proven" means</h2>
+ * <p>Some formats carry nothing a checker could prove: the routing directory has no
+ * checksum, the in-flight ingest journal is truncation-tolerant by design, the lexical
+ * store's sidecars have no verifier. Those are reported as checked and unproven - healthy,
+ * because nothing wrong was found, and not proven, because nothing could have been - rather
+ * than left out, which would read as though nothing in the image went unverified.</p>
+ *
+ * <h2>Why the engine's checks run on a copy</h2>
+ * <p>Several of the engine's open paths open their file read-write and repair it as they go -
+ * a catalog with one damaged header slot is rewritten from the other, an interrupted HNSW
+ * compaction is finished. That is right for a node opening its own data directory and wrong
+ * for a verification, which must leave the image exactly as it found it, not least because
+ * it has just certified the image's checksums. So each such file is copied to scratch,
+ * checked there and thrown away. The copy preserves holes, so checking a 755 MiB graph that
+ * holds a few nodes costs what those few nodes cost. {@code excalibur-fsck}'s checkers map
+ * read-only and write nothing, so they read the image where it lies.</p>
  *
  * @author ExcaliburDB
  */
@@ -52,63 +92,102 @@ public final class FormatChecks {
     }
 
     /**
-     * Checks one file, if this build knows a checker for its format.
+     * Checks one file with the checker for its format.
      *
-     * @param payloadRoot  The payload root, so the report can name the file as the manifest
-     *                     does
      * @param file         The file inside the payload
-     * @param relativePath Its manifest path
-     * @return What the format said about itself, or empty if no checker applies
-     * @throws IOException          if scratch space cannot be created
-     * @throws NullPointerException if any argument is null
+     * @param relativePath Its manifest path, whose name and location decide its format
+     * @return What the format said about itself
+     * @throws IOException          if scratch space for an engine check cannot be created
+     * @throws NullPointerException if either argument is null
      */
-    public static Optional<ContentCheck> check(Path payloadRoot, Path file, String relativePath)
-        throws IOException {
-        Objects.requireNonNull(payloadRoot, "payloadRoot");
+    public static ContentCheck check(Path file, String relativePath) throws IOException {
         Objects.requireNonNull(file, "file");
         Objects.requireNonNull(relativePath, "relativePath");
-        String format = formatOf(relativePath);
+        String format = engineFormatOf(relativePath);
         if (format == null) {
-            return Optional.empty();
+            return fromFsck(FileInspector.inspect(file, relativePath).check());
         }
         Path scratch = Files.createTempDirectory("excalibur-backup-verify");
         try {
             Path copy = scratch.resolve(file.getFileName().toString());
             SparseFileCopy.copy(file, copy);
-            return Optional.of(run(format, copy, relativePath));
+            return run(format, copy, relativePath);
         } finally {
             deleteQuietly(scratch);
         }
     }
 
     /**
-     * Names the structure a path holds, or null if this build has no checker for it.
+     * Replaces the per-file verdicts on a lexical store's contents with the verdict on the
+     * store as a whole.
+     *
+     * <p>Every file under the store is, taken alone, a lexical store part with nothing to
+     * prove. The store is verified by reading its manifest and streaming every column of every
+     * segment the manifest names, so those verdicts speak for the manifest and for each
+     * segment directory, and supersede the per-file verdicts on the files inside them. A
+     * sidecar beside the segments is covered by none of them and keeps its own. A segment the
+     * manifest names and the image does not hold is a verdict here and nowhere else, since no
+     * per-file check can report a file that is not there.</p>
+     *
+     * @param payloadRoot The payload root
+     * @param checks      The per-file verdicts on the image
+     * @return The same verdicts with the lexical store's folded in, unchanged if the image has
+     *         no lexical store
+     * @throws NullPointerException if either argument is null
+     */
+    public static List<ContentCheck> withLexicalStore(Path payloadRoot,
+                                                      List<ContentCheck> checks) {
+        Objects.requireNonNull(payloadRoot, "payloadRoot");
+        Objects.requireNonNull(checks, "checks");
+        Optional<LexicalStoreCheck.LexicalInspection> store =
+            FileInspector.lexicalStore(payloadRoot);
+        if (store.isEmpty()) {
+            return List.copyOf(checks);
+        }
+        LexicalStoreCheck.LexicalInspection inspection = store.get();
+        List<ContentCheck> folded = new ArrayList<>(checks.size());
+        for (ContentCheck check : checks) {
+            if (!inspection.covers(check.path())) {
+                folded.add(check);
+            }
+        }
+        inspection.verdicts().forEach(verdict -> folded.add(fromFsck(verdict)));
+        inspection.findings().forEach(finding -> folded.add(fromFinding(finding)));
+        return List.copyOf(folded);
+    }
+
+    /**
+     * Names the structure a path holds, when one of the engine's own checkers owns it.
      *
      * @param relativePath The manifest path
-     * @return The format name, or null
+     * @return The format name, or null when {@code excalibur-fsck}'s dispatch owns the file
      */
-    private static String formatOf(String relativePath) {
+    private static String engineFormatOf(String relativePath) {
         String name = relativePath.substring(relativePath.lastIndexOf('/') + 1);
         if (name.equals(CATALOG_NAME)) {
             return "catalog";
         }
-        if (name.endsWith(".hnsw.docmap") || name.endsWith(".hnsw.compact.docmap")) {
+        // A compaction's staged pair ends in .hnsw.compact and .hnsw.compact.docmap, which
+        // neither test matches, so it falls through to excalibur-fsck's dispatch; see above.
+        if (name.endsWith(".hnsw.docmap")) {
             return "docmap";
         }
-        if (name.endsWith(".hnsw") || name.endsWith(".hnsw.compact")) {
+        if (name.endsWith(".hnsw")) {
             return "hnsw";
         }
         if (name.endsWith(PQCodebookFile.SUFFIX)) {
             return "codebook";
         }
-        if (name.endsWith(".lsh")) {
+        // Before the segment test: an LSH table is a .dat too, inside a segment's .lsh
+        // directory, and opened as a segment it would fail as one.
+        if (LshTableCheck.matches(name)) {
             return "lsh";
         }
-        return name.endsWith(".dat") ? "segment" : null;
+        return FileKind.SEGMENT_DATA_NAME.matcher(name).matches() ? "segment" : null;
     }
 
     /**
-     * Runs the checker for one format over a scratch copy.
+     * Runs the engine's checker for one format over a scratch copy.
      *
      * @param format       Which checker to use
      * @param copy         The scratch copy
@@ -139,17 +218,21 @@ public final class FormatChecks {
     private static ContentCheck checkCatalog(Path copy, String relativePath) {
         try (CatalogFile catalog = new CatalogFile(copy)) {
             List<SegmentCatalog.SegmentMetadata> records = catalog.readAll();
-            return new ContentCheck(relativePath, "catalog", true, "format version "
+            return new ContentCheck(relativePath, "catalog", true, true, "format version "
                 + CatalogFile.VERSION + ", " + records.size() + " segment records, header and "
                 + "record checksums all valid");
         } catch (IOException | RuntimeException e) {
-            return new ContentCheck(relativePath, "catalog", false,
+            return new ContentCheck(relativePath, "catalog", false, false,
                 "the catalog will not open: " + e);
         }
     }
 
     /**
      * Walks every occupied slot of a segment.
+     *
+     * <p>A segment is proven only when every entry in it carried a checksum. Entries written
+     * in the format that predates per-entry checksums can be found intact in shape and still
+     * not be shown to hold what was written.</p>
      *
      * @param copy         The scratch copy
      * @param relativePath The manifest path
@@ -163,22 +246,19 @@ public final class FormatChecks {
                 + report.entriesVerified() + " verified, " + report.entriesUnverifiable()
                 + " in a format carrying no checksum, " + report.damagedCount() + " damaged";
             if (report.isHealthy()) {
-                return new ContentCheck(relativePath, "segment", true, detail);
+                return new ContentCheck(relativePath, "segment", true,
+                    report.entriesUnverifiable() == 0, detail);
             }
-            return new ContentCheck(relativePath, "segment", false, detail + "; first fault: "
-                + report.damaged().get(0).detail());
+            return new ContentCheck(relativePath, "segment", false, false, detail
+                + "; first fault: " + report.damaged().get(0).detail());
         } catch (IOException | RuntimeException e) {
-            return new ContentCheck(relativePath, "segment", false,
+            return new ContentCheck(relativePath, "segment", false, false,
                 "the segment will not open: " + e);
         }
     }
 
     /**
-     * Flattens a single-file verdict into this package's shape.
-     *
-     * <p>The vector and filter formats share one report type, and the storage engine's
-     * segment walk has another shape entirely; both arrive here as a verdict and a
-     * sentence so that one verification report can cover an image holding all of them.</p>
+     * Flattens an engine checker's single-file verdict into this package's shape.
      *
      * @param relativePath The manifest path
      * @param format       The structure's name
@@ -187,8 +267,43 @@ public final class FormatChecks {
      */
     private static ContentCheck report(String relativePath, String format,
                                        IntegrityReport report) {
-        return new ContentCheck(relativePath, format, report.loadable(),
+        return new ContentCheck(relativePath, format, report.loadable(), report.verified(),
             report.status() + ": " + report.detail());
+    }
+
+    /**
+     * Flattens one of {@code excalibur-fsck}'s verdicts into this package's shape.
+     *
+     * <p>Only damage is unhealthy: a file whose format carries nothing to check, or one
+     * sealed at a version that predates its seal, is not evidence of a bad image. Damage is
+     * what {@link FileCheck#isDamage()} says it is, the same judgement {@code excalibur-fsck}
+     * gates on, so a term sketch that fails its checksum is healthy and unproven here as it
+     * is not damage there: a node restored from the image rebuilds it on open. Only a
+     * positively verified file with nothing in it left unverified is proven. The status leads
+     * the sentence so that the report says which of the two a healthy file was.</p>
+     *
+     * @param check The verdict
+     * @return The same verdict, in one shape
+     */
+    private static ContentCheck fromFsck(FileCheck check) {
+        CheckStatus status = check.status();
+        boolean healthy = !check.isDamage();
+        return new ContentCheck(check.relative(), check.format(), healthy,
+            healthy && status.isProven() && !check.unverifiedContent(),
+            status + ": " + check.detail());
+    }
+
+    /**
+     * Flattens an inconsistency the lexical store check found between its manifest and the
+     * directory.
+     *
+     * @param finding What was found
+     * @return A verdict on the thing it names, unhealthy when the finding is damage
+     */
+    private static ContentCheck fromFinding(ConsistencyFinding finding) {
+        boolean damage = finding.severity() == FindingSeverity.DAMAGE;
+        return new ContentCheck(finding.subject(), LexicalStoreCheck.FORMAT, !damage, false,
+            finding.severity() + " " + finding.kind() + ": " + finding.detail());
     }
 
     /**
@@ -198,7 +313,7 @@ public final class FormatChecks {
      */
     private static void deleteQuietly(Path root) {
         try {
-            com.eonmux.excalibur.backup.io.AtomicPublish.deleteTree(root);
+            AtomicPublish.deleteTree(root);
         } catch (IOException e) {
             root.toFile().deleteOnExit();
         }

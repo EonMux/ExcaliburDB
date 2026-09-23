@@ -43,7 +43,7 @@ class ScheduledReindexInterruptTest {
         SourceResolver resolver = id -> source;
 
         try {
-            when(reindexer.reindexAll(any(Source.class), any())).thenAnswer(invocation -> {
+            when(reindexer.reindexAll(any(Source.class), any(), any())).thenAnswer(invocation -> {
                 ran.set(true);
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("reindex was asked to stop",

@@ -141,7 +141,7 @@ public record GraphStats(NamespaceStats namespaces, BudgetStats budget, BuildSta
     /**
      * What ingestion has staged into the graph since startup.
      *
-     * <p>The three failure counts are the ones that matter, and each of them is invisible
+     * <p>The four failure counts are the ones that matter, and each of them is invisible
      * anywhere else: the document they belong to is published and searchable, and only the
      * graph is missing what it said.</p>
      *
@@ -151,14 +151,16 @@ public record GraphStats(NamespaceStats namespaces, BudgetStats budget, BuildSta
      *                            no namespace to stage them into
      * @param extractionFailures  Documents the relation extractor failed on
      * @param tenantFailures      Documents whose namespace's graph could not be opened
+     * @param sinkRefusals        Documents the sink threw on rather than counting under one of
+     *                            the reasons above
      */
     public record IngestStats(long documentsSeen, long factsStaged, long unresolvedDocuments,
-                              long extractionFailures, long tenantFailures) {
+                              long extractionFailures, long tenantFailures, long sinkRefusals) {
 
         /** Validates that no count is negative. */
         public IngestStats {
             if (documentsSeen < 0 || factsStaged < 0 || unresolvedDocuments < 0
-                    || extractionFailures < 0 || tenantFailures < 0) {
+                    || extractionFailures < 0 || tenantFailures < 0 || sinkRefusals < 0) {
                 throw new IllegalArgumentException("ingest counts must not be negative");
             }
         }

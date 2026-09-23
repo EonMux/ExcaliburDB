@@ -246,6 +246,7 @@ public class DistanceVectorApiBenchmark {
      * Benchmark batch cosine similarity (100 computations) - scalar.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int cosine_batch_scalar(Blackhole bh) {
         int count = 0;
         for (int i = 0; i < 100; i++) {
@@ -261,6 +262,7 @@ public class DistanceVectorApiBenchmark {
      * Benchmark batch cosine similarity (100 computations) - Vector API.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int cosine_batch_vectorApi(Blackhole bh) {
         int count = 0;
         for (int i = 0; i < 100; i++) {
@@ -276,6 +278,7 @@ public class DistanceVectorApiBenchmark {
      * Benchmark batch L2 distance (100 computations) - scalar.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int l2_batch_scalar(Blackhole bh) {
         int count = 0;
         for (int i = 0; i < 100; i++) {
@@ -291,6 +294,7 @@ public class DistanceVectorApiBenchmark {
      * Benchmark batch L2 distance (100 computations) - Vector API.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int l2_batch_vectorApi(Blackhole bh) {
         int count = 0;
         for (int i = 0; i < 100; i++) {
@@ -306,6 +310,7 @@ public class DistanceVectorApiBenchmark {
      * Benchmark batch inner product (100 computations) - scalar.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int innerProduct_batch_scalar(Blackhole bh) {
         int count = 0;
         for (int i = 0; i < 100; i++) {
@@ -321,6 +326,7 @@ public class DistanceVectorApiBenchmark {
      * Benchmark batch inner product (100 computations) - Vector API.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int innerProduct_batch_vectorApi(Blackhole bh) {
         int count = 0;
         for (int i = 0; i < 100; i++) {
@@ -338,6 +344,7 @@ public class DistanceVectorApiBenchmark {
      * Simulate nearest neighbor search with 100 candidates - scalar L2.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int nearestNeighbor_l2_scalar(Blackhole bh) {
         float[] query = vectors1[0];
         int bestIdx = -1;
@@ -360,6 +367,7 @@ public class DistanceVectorApiBenchmark {
      * Simulate nearest neighbor search with 100 candidates - Vector API L2.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int nearestNeighbor_l2_vectorApi(Blackhole bh) {
         float[] query = vectors1[0];
         int bestIdx = -1;
@@ -382,6 +390,7 @@ public class DistanceVectorApiBenchmark {
      * Simulate nearest neighbor search with 100 candidates - scalar cosine.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int nearestNeighbor_cosine_scalar(Blackhole bh) {
         float[] query = vectors1[0];
         int bestIdx = -1;
@@ -404,6 +413,7 @@ public class DistanceVectorApiBenchmark {
      * Simulate nearest neighbor search with 100 candidates - Vector API cosine.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int nearestNeighbor_cosine_vectorApi(Blackhole bh) {
         float[] query = vectors1[0];
         int bestIdx = -1;

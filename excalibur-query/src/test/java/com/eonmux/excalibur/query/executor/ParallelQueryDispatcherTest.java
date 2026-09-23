@@ -268,8 +268,8 @@ class ParallelQueryDispatcherTest {
     @Test
     @DisplayName("shutdown is idempotent")
     void shutdownIsIdempotent() {
-        dispatcher.shutdown();
-        dispatcher.shutdown();
+        assertThat(dispatcher.shutdown()).isTrue();
+        assertThat(dispatcher.shutdown()).isTrue();
     }
 
     @Test

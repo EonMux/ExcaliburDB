@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.shard.worker;
 
+import com.eonmux.excalibur.core.util.StopSignal;
 import com.eonmux.excalibur.vector.hnsw.HnswGraph;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -10,6 +11,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 
 /**
  * Background worker for HNSW graph compaction.
@@ -150,6 +152,18 @@ public class HnswCompactionWorker {
     private volatile Thread workerThread;
 
     /**
+     * How the running loop is told to stop, replaced on every {@link #start()}.
+     *
+     * <p>A signal rather than an interrupt. The loop spends its working time inside
+     * {@link HnswGraph#compact(Path)}, which writes the replacement graph, swaps it in and maps
+     * the swapped-in files again through channels every query of that graph then reads; an
+     * interrupt reaching the thread at any of those points closes the channel it lands on and
+     * leaves the graph closed or unmappable for everyone. The signal is read between graphs and
+     * wakes the pause between sweeps, which is all the interrupt was ever needed for.</p>
+     */
+    private volatile StopSignal stopSignal = new StopSignal();
+
+    /**
      * Optional listener notified after each compaction attempt.
      * Compaction renumbers node IDs, so components holding node-scoped state need to hear
      * about it.
@@ -240,9 +254,11 @@ public class HnswCompactionWorker {
     public boolean start() {
         if (running.compareAndSet(false, true)) {
             stopped.set(false);
+            StopSignal signal = new StopSignal();
+            stopSignal = signal;
             workerThread = Thread.ofVirtual()
                 .name("excalibur-hnsw-compaction-worker")
-                .start(this::runLoop);
+                .start(() -> runLoop(signal));
             LOGGER.info("HnswCompactionWorker started");
             return true;
         }
@@ -250,33 +266,39 @@ public class HnswCompactionWorker {
     }
 
     /**
-     * Stops the compaction worker.
+     * Stops the compaction worker and says whether it actually ended.
      *
-     * <p>A compaction already in progress is not interruptible: it closes the graph's
-     * mapping and renames files into place, and abandoning it midway would leave the
-     * graph closed or the files half swapped. This method therefore waits for the worker
-     * thread to finish before returning, so callers that tear down the arena and the
-     * storage engine afterwards cannot race a live file swap.</p>
+     * <p>A compaction already in progress is not abandoned: it closes the graph's mapping and
+     * renames files into place, and cutting it short would leave the graph closed or the files
+     * half swapped. The loop is told through its stop signal, which it reads between graphs and
+     * which wakes the pause between sweeps, and is never interrupted - an interrupt inside the
+     * swap closes the channel the swapped-in graph is being mapped through. This then waits for
+     * the thread, so callers that tear down the arena and the storage engine afterwards cannot
+     * race a live file swap, and reports a thread that outlived the wait rather than pretending
+     * it ended.</p>
+     *
+     * @return true if the worker thread has ended, or was never started
      */
-    public void stop() {
+    public boolean stop() {
+        Thread worker = workerThread;
         if (stopped.compareAndSet(false, true)) {
             running.set(false);
-            Thread worker = workerThread;
+            stopSignal.request();
             if (worker != null) {
-                worker.interrupt();
                 try {
                     worker.join(STOP_JOIN_TIMEOUT_MS);
-                    if (worker.isAlive()) {
-                        LOGGER.warn("HnswCompactionWorker did not finish within {}ms; a graph "
-                            + "compaction may still be swapping files", STOP_JOIN_TIMEOUT_MS);
-                    }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                }
+                if (worker.isAlive()) {
+                    LOGGER.warn("HnswCompactionWorker did not finish within {}ms; a graph "
+                        + "compaction may still be swapping files", STOP_JOIN_TIMEOUT_MS);
                 }
             }
             LOGGER.info("HnswCompactionWorker stopped. Total compactions: {}, total nodes removed: {}",
                 compactionCount.get(), totalNodesRemoved.get());
         }
+        return worker == null || !worker.isAlive();
     }
 
     /**
@@ -364,14 +386,14 @@ public class HnswCompactionWorker {
     /**
      * Main worker loop that periodically checks graphs for compaction.
      */
-    private void runLoop() {
+    private void runLoop(StopSignal signal) {
         LOGGER.debug("HnswCompactionWorker loop started");
 
-        while (running.get() && !stopped.get()) {
+        while (running.get() && !stopped.get() && !signal.isRequested()) {
             try {
                 // Check each registered graph
                 for (HnswGraph graph : registeredGraphs) {
-                    if (!running.get() || stopped.get()) {
+                    if (!running.get() || stopped.get() || signal.isRequested()) {
                         break;
                     }
 
@@ -382,8 +404,10 @@ public class HnswCompactionWorker {
                     }
                 }
 
-                // Sleep until next check
-                Thread.sleep(intervalMs);
+                // Until the next check, or until stop() asks the loop to end.
+                if (signal.pause(intervalMs)) {
+                    break;
+                }
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -419,11 +443,34 @@ public class HnswCompactionWorker {
      * @return What the run examined, rebuilt and failed on
      */
     public GraphCompactionSummary compactNow(boolean force) {
+        return compactNow(force, () -> false);
+    }
+
+    /**
+     * As {@link #compactNow(boolean)}, ending between graphs once asked to.
+     *
+     * <p>The stop is read before each graph and never acted on inside one: a rebuild swaps
+     * files and remaps the graph, and only a finished rebuild leaves the graph servable. A
+     * caller that must stop a long run - a shutdown about to close the arena, an operator's
+     * cancel - is answered within one graph's rebuild, and the graphs not reached are left to the
+     * background loop. They are not counted as considered, because nothing looked at them.</p>
+     *
+     * @param force         true to rebuild every registered graph regardless of its tombstone
+     *                      ratio
+     * @param stopRequested Read before each graph; true ends the run there
+     * @return What the run examined, rebuilt and failed on
+     */
+    public GraphCompactionSummary compactNow(boolean force, BooleanSupplier stopRequested) {
         int considered = 0;
         int compacted = 0;
         int failed = 0;
 
         for (HnswGraph graph : registeredGraphs) {
+            if (stopRequested.getAsBoolean()) {
+                LOGGER.info("On-demand HNSW compaction was asked to stop after {} graph(s)",
+                    considered);
+                break;
+            }
             considered++;
             switch (compactGraph(graph, force, false)) {
                 case COMPACTED -> compacted++;

@@ -25,6 +25,10 @@ import java.util.Optional;
  * @param erasureRequests      Erasure requests accepted and not yet discharged
  * @param oldestErasureRequest When the oldest of them was accepted, if any
  * @param compactionDue        Whether the index's policy would compact if asked right now
+ * @param unreadableChunksDropped Chunks a compaction dropped since the index opened because
+ *                             their stored text is permanently unreadable; each stopped matching
+ *                             any query and needs restoring and reindexing. Always zero for an
+ *                             index that keeps its own copy of the text
  */
 public record ChunkIndexStats(String engine,
                               long indexed,
@@ -33,15 +37,35 @@ public record ChunkIndexStats(String engine,
                               long erasedDocuments,
                               int erasureRequests,
                               Optional<Instant> oldestErasureRequest,
-                              boolean compactionDue) {
+                              boolean compactionDue,
+                              long unreadableChunksDropped) {
 
     public ChunkIndexStats {
         Objects.requireNonNull(engine, "engine must not be null");
         Objects.requireNonNull(oldestErasureRequest, "oldestErasureRequest must not be null");
         if (indexed < 0 || segments < 0 || liveDocuments < 0 || erasedDocuments < 0
-                || erasureRequests < 0) {
+                || erasureRequests < 0 || unreadableChunksDropped < 0) {
             throw new IllegalArgumentException("Counts must not be negative: " + engine);
         }
+    }
+
+    /**
+     * What an index that has dropped nothing for unreadable text says about itself.
+     *
+     * @param engine               Which implementation is answering
+     * @param indexed              Chunks this instance has been handed since it was opened
+     * @param segments             Segments a query has to visit
+     * @param liveDocuments        Chunks a query can currently match
+     * @param erasedDocuments      Chunks hidden from queries but still on disk
+     * @param erasureRequests      Erasure requests accepted and not yet discharged
+     * @param oldestErasureRequest When the oldest of them was accepted, if any
+     * @param compactionDue        Whether the index's policy would compact if asked right now
+     */
+    public ChunkIndexStats(String engine, long indexed, int segments, long liveDocuments,
+                           long erasedDocuments, int erasureRequests,
+                           Optional<Instant> oldestErasureRequest, boolean compactionDue) {
+        this(engine, indexed, segments, liveDocuments, erasedDocuments, erasureRequests,
+            oldestErasureRequest, compactionDue, 0L);
     }
 
     /**

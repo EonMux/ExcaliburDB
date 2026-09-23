@@ -5,6 +5,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -40,6 +44,11 @@ import java.util.List;
  * Neighbour ids are stored as 4-byte ints, which is why a graph's capacity cannot exceed
  * {@link Integer#MAX_VALUE}.</p>
  *
+ * <h2>Byte order</h2>
+ * <p>Every field is big-endian and unaligned, as {@link MappedFile} writes it. The
+ * {@link MemorySegment} readers below, which {@link HnswTraversal} uses to read a locked graph
+ * without a {@code MappedFile} lock per field, use the same layouts.</p>
+ *
  * <h2>Locking</h2>
  * <p>Nothing here takes a lock or holds any state. Every method is given the mapping and the
  * configuration to read the file through, because both are replaced wholesale when a compaction
@@ -67,6 +76,10 @@ final class HnswNodeRecords {
 
     /** Bytes preceding the vector in a node record: nodeId(8) + level(4) + vectorLen(4). */
     private static final int RECORD_PREFIX = 16;
+
+    private static final ValueLayout.OfInt INT = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+    private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+    private static final ValueLayout.OfFloat FLOAT = ValueLayout.JAVA_FLOAT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
 
     private HnswNodeRecords() {
     }
@@ -173,19 +186,96 @@ final class HnswNodeRecords {
     /**
      * Reads a node's vector out of its record.
      *
+     * <p>One bulk read, not one per component: every {@link MappedFile} accessor takes the
+     * mapping's read lock, and taking it per component made reading a vector cost more than
+     * the distance computed from it - search time grew with the dimension through the lock
+     * rather than through the arithmetic.</p>
+     *
      * @param file The mapping to read from
      * @param config The graph's configuration
      * @param recordOffset The absolute offset of the node record
      * @return A newly allocated copy of the vector
      */
     static float[] readVector(MappedFile file, HnswConfig config, long recordOffset) {
-        int dim = config.dimension();
-        float[] vec = new float[dim];
-        long vecOffset = recordOffset + RECORD_PREFIX;
-        for (int i = 0; i < dim; i++) {
-            vec[i] = file.readFloat(vecOffset + (long) i * 4);
-        }
-        return vec;
+        return file.readFloatArray(recordOffset + RECORD_PREFIX, config.dimension());
+    }
+
+    /**
+     * Reads a node's vector from a mapping captured under the graph's lock, into a caller's
+     * buffer.
+     *
+     * @param segment The mapping to read from
+     * @param config The graph's configuration
+     * @param recordOffset The absolute offset of the node record
+     * @param into The buffer to fill, at least {@code config.dimension()} long
+     */
+    static void readVector(MemorySegment segment, HnswConfig config, long recordOffset, float[] into) {
+        MemorySegment.copy(segment, FLOAT, recordOffset + RECORD_PREFIX, into, 0, config.dimension());
+    }
+
+    /**
+     * Reads a node's neighbour ids at one layer from a mapping captured under the graph's lock.
+     *
+     * <p>A stored count beyond the layer's limit, which only a damaged record can hold, is read
+     * as the limit.</p>
+     *
+     * @param segment The mapping to read from
+     * @param config The graph's configuration
+     * @param recordOffset The absolute offset of the node record
+     * @param level The layer to read
+     * @param into The buffer to fill, at least the layer's connection limit long
+     * @return How many ids were read
+     */
+    static int readNeighbors(MemorySegment segment, HnswConfig config, long recordOffset,
+                             int level, int[] into) {
+        long connOffset = adjacencyOffset(config, recordOffset, level);
+        int count = Math.max(0, Math.min(segment.get(INT, connOffset), maxConnectionsAt(config, level)));
+        MemorySegment.copy(segment, INT, connOffset + 4, into, 0, count);
+        return count;
+    }
+
+    /**
+     * Reads the id stored in a node index entry, from a mapping captured under the graph's lock.
+     *
+     * @param segment The mapping to read from
+     * @param indexOffset The entry's absolute offset
+     * @return The stored id
+     */
+    static long readEntryId(MemorySegment segment, long indexOffset) {
+        return segment.get(LONG, indexOffset);
+    }
+
+    /**
+     * Reads the data-region offset stored in a node index entry, from a captured mapping.
+     *
+     * @param segment The mapping to read from
+     * @param indexOffset The entry's absolute offset
+     * @return The node record's offset relative to the data region
+     */
+    static long readEntryDataOffset(MemorySegment segment, long indexOffset) {
+        return segment.get(LONG, indexOffset + ENTRY_DATA_OFFSET);
+    }
+
+    /**
+     * Reads the level stored in a node index entry, from a captured mapping.
+     *
+     * @param segment The mapping to read from
+     * @param indexOffset The entry's absolute offset
+     * @return The node's highest layer
+     */
+    static int readEntryLevel(MemorySegment segment, long indexOffset) {
+        return segment.get(INT, indexOffset + ENTRY_LEVEL);
+    }
+
+    /**
+     * Reads the flag word stored in a node index entry, from a captured mapping.
+     *
+     * @param segment The mapping to read from
+     * @param indexOffset The entry's absolute offset
+     * @return The flags
+     */
+    static int readEntryFlags(MemorySegment segment, long indexOffset) {
+        return segment.get(INT, indexOffset + ENTRY_FLAGS);
     }
 
     /**
@@ -223,11 +313,13 @@ final class HnswNodeRecords {
         long connOffset = adjacencyOffset(config, recordOffset, level);
 
         int count = Math.min(neighborIds.size(), maxConnectionsAt(config, level));
-        file.writeInt(connOffset, count);
-
+        ByteBuffer list = ByteBuffer.allocate(4 + count * 4).order(ByteOrder.BIG_ENDIAN);
+        list.putInt(count);
         for (int i = 0; i < count; i++) {
-            file.writeInt(connOffset + 4 + (long) i * 4, neighborIds.get(i).intValue());
+            list.putInt(neighborIds.get(i).intValue());
         }
+        // One write, so the count and the ids it covers land under a single file lock
+        file.write(connOffset, list.array());
     }
 
     /**

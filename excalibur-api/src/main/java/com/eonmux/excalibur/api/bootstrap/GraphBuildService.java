@@ -43,6 +43,7 @@ public final class GraphBuildService {
     private final GraphStagingStore staging;
     private final GraphRagHolder holder;
     private final Config config;
+    private final GraphModelClients models;
     private final List<String> singleValuedRelations;
 
     /**
@@ -62,11 +63,13 @@ public final class GraphBuildService {
      * @param staging               Where ingestion stages the facts it extracts
      * @param holder                The stack to replace once a build has published
      * @param config                Read for the Lucene write buffer and the graph directory
+     * @param models                The node's model clients, which the published graph is
+     *                              opened to rerank and embed through
      * @param singleValuedRelations Relations that hold one value at a time, by label
      */
     public GraphBuildService(GraphStagingStore staging, GraphRagHolder holder, Config config,
-                             List<String> singleValuedRelations) {
-        this(staging, holder, config, singleValuedRelations, null, 0);
+                             GraphModelClients models, List<String> singleValuedRelations) {
+        this(staging, holder, config, models, singleValuedRelations, null, 0);
     }
 
     /**
@@ -75,17 +78,20 @@ public final class GraphBuildService {
      * @param staging               Where ingestion stages the facts it extracts
      * @param holder                The stack to replace once a build has published
      * @param config                Read for the Lucene write buffer and the graph directory
+     * @param models                The node's model clients, which the published graph is
+     *                              opened to rerank and embed through
      * @param singleValuedRelations Relations that hold one value at a time, by label
      * @param embedder              Embeds each entity's text, or null to build without vectors
      * @param embeddingDimension    The dimension that embedder produces
      */
     public GraphBuildService(GraphStagingStore staging, GraphRagHolder holder, Config config,
-                             List<String> singleValuedRelations,
+                             GraphModelClients models, List<String> singleValuedRelations,
                              GraphDirectoryBuilder.EntityEmbedder embedder,
                              int embeddingDimension) {
         this.staging = Objects.requireNonNull(staging, "staging must not be null");
         this.holder = Objects.requireNonNull(holder, "holder must not be null");
         this.config = Objects.requireNonNull(config, "config must not be null");
+        this.models = Objects.requireNonNull(models, "models must not be null");
         this.singleValuedRelations = List.copyOf(
             Objects.requireNonNull(singleValuedRelations, "singleValuedRelations must not be null"));
         this.embedder = embedder;
@@ -120,47 +126,23 @@ public final class GraphBuildService {
             SupersessionPolicy supersession =
                 GraphBuilder.singleValued(staging, singleValuedRelations);
 
-            // Assembled beside the served directory. Nothing that is being served is touched
-            // yet, so a build that fails here leaves the node answering exactly as before.
-            GraphBuilder.BuildResult assembled =
-                GraphBuilder.buildInto(staging, target, supersession);
-            if (assembled.edges() == 0) {
-                LOGGER.info("graph build for {} had nothing to publish", target);
-                return new BuildOutcome(false, 0, assembled.entities(), assembled.relations(), 0,
-                    0, staging.stagedCount());
-            }
-
-            Path scratch = GraphBuilder.scratchFor(target);
-            int indexed = GraphDirectoryBuilder.writeLexicalIndexes(
-                staging, scratch, config.graph().getRamBufferMb());
-
-            // Into the same scratch directory, so the vectors are published by the same rename as
-            // the store they describe. Vectors that arrived a moment later would be vectors for
-            // the previous numbering, and an entity id is always a valid entity id.
-            long embedded = embedder == null
-                ? 0
-                : GraphDirectoryBuilder.writeEntityVectors(
-                    staging, scratch, embedder, embeddingDimension);
-
             // Opened from the directory that was just published, rather than from the objects
             // the build held: what the node serves has to be what is on disk, or a restart would
             // answer differently from the process that built it. The previous graph goes on
             // serving throughout - the stack opens read-only and takes no lock the replacement
             // needs - and is kept on disk until the new one has opened, so a build that
             // publishes something unopenable leaves the node serving what it served before.
-            GraphRagFactory.GraphRag opened = GraphBuilder.publish(scratch, target,
-                com.eonmux.excalibur.graph.file.Durability.DEVICE, published -> {
-                    GraphRagFactory.GraphRag stack = GraphRagFactory.openAt(config, published);
-                    if (stack == null) {
-                        throw new IOException("the published graph is not at " + published);
-                    }
-                    return stack;
-                });
-            holder.install(opened);
-
-            GraphDirectoryBuilder.BuildResult result = new GraphDirectoryBuilder.BuildResult(
-                assembled.edges(), assembled.entities(), assembled.relations(), indexed,
-                embedded, target);
+            GraphDirectoryBuilder.Published<GraphRagFactory.GraphRag> built =
+                GraphDirectoryBuilder.build(staging, target, supersession,
+                    config.graph().getRamBufferMb(), embedder, embeddingDimension,
+                    published -> GraphRagFactory.openPublished(config, published, models));
+            GraphDirectoryBuilder.BuildResult result = built.result();
+            if (!result.published()) {
+                LOGGER.info("graph build for {} had nothing to publish", target);
+                return new BuildOutcome(false, 0, result.entities(), result.relations(), 0,
+                    0, staging.stagedCount());
+            }
+            holder.install(built.opened());
 
             LOGGER.info("graph built and served from {}: {} facts over {} entities",
                 target, result.edges(), result.entities());

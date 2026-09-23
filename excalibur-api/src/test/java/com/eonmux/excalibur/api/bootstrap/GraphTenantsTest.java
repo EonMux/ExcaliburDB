@@ -112,6 +112,45 @@ class GraphTenantsTest {
         }
 
         @Test
+        @DisplayName("one namespace failing with an unchecked error does not end the pass")
+        void anUncheckedFailureIsContained(@TempDir Path root) throws Exception {
+            try (GraphTenants tenants = tenants(root, 4,
+                    Map.of("excalibur.graph.erasure-max-latency-seconds", "1"))) {
+                NamespaceId broken = NamespaceId.of("broken");
+                NamespaceId healthy = NamespaceId.of("healthy");
+                for (NamespaceId id : List.of(broken, healthy)) {
+                    try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(id)) {
+                        GraphTenant tenant = lease.resource();
+                        tenant.staging().append(
+                            ExtractedTriple.alwaysValid("Ada", "knows", "Babbage", from(1)));
+                        tenant.erasureService().submit(
+                            new ErasureScope.Entity(tenant.staging().entityIdOf("Ada")));
+                    }
+                }
+                // Refuses every erasure with an IllegalStateException, which is unchecked.
+                try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(broken)) {
+                    lease.resource().staging().close();
+                }
+                // Past the one-second bound, so the policy calls both obligations due.
+                Thread.sleep(1_100);
+
+                org.assertj.core.api.Assertions.assertThatCode(tenants::compactDueErasures)
+                    .doesNotThrowAnyException();
+
+                try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(healthy)) {
+                    assertThat(lease.resource().erasureService().outstandingCount())
+                        .as("discharged, whichever order the pass visited the two in")
+                        .isZero();
+                }
+                try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(broken)) {
+                    assertThat(lease.resource().erasureService().outstandingCount())
+                        .as("still owed, and retried on the next pass")
+                        .isEqualTo(1);
+                }
+            }
+        }
+
+        @Test
         @DisplayName("checks often enough that the bound is met rather than merely approached")
         void checksWellInsideTheBound() {
             assertThat(GraphTenants.sweepIntervalMillis(3600)).isEqualTo(360_000L);
@@ -125,6 +164,66 @@ class GraphTenantsTest {
                 .isGreaterThanOrEqualTo(GraphTenants.MIN_SWEEP_INTERVAL_MS);
             assertThat(GraphTenants.sweepIntervalMillis(0))
                 .isGreaterThanOrEqualTo(GraphTenants.MIN_SWEEP_INTERVAL_MS);
+        }
+    }
+
+    @org.junit.jupiter.api.Nested
+    @DisplayName("Forcing staged facts to disk")
+    class StagingSync {
+
+        private long factsOnDisk(Path root, NamespaceId id) throws IOException {
+            Path graph = root.resolve(id.value()).resolve(GraphTenant.GRAPH_SUBDIRECTORY);
+            return GraphTenant.stagedFactsOnDisk(graph);
+        }
+
+        @Test
+        @DisplayName("writes out every resident namespace's buffered facts, leaving it open")
+        void writesOutResidentNamespaces(@TempDir Path root) throws IOException {
+            try (GraphTenants tenants = tenants(root, 4)) {
+                NamespaceId acme = NamespaceId.of("acme");
+                try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(acme)) {
+                    lease.resource().staging().append(
+                        ExtractedTriple.alwaysValid("Ada", "knows", "Babbage", from(1)));
+                }
+                tenants.shared().staging().append(
+                    ExtractedTriple.alwaysValid("Grace", "knows", "Ada", from(2)));
+                assertThat(factsOnDisk(root, acme))
+                    .as("precondition: appends sit in this process until something writes them")
+                    .isZero();
+
+                assertThat(tenants.syncStaging()).isZero();
+
+                assertThat(factsOnDisk(root, acme)).isEqualTo(1);
+                assertThat(factsOnDisk(root, NamespaceId.SHARED)).isEqualTo(1);
+                assertThat(tenants.openNamespaces())
+                    .as("forced, not closed: a shutdown may be refused the close")
+                    .contains(acme);
+            }
+        }
+
+        @Test
+        @DisplayName("a namespace that cannot be forced is counted and does not stop the rest")
+        void aFailureIsCountedAndContained(@TempDir Path root) throws IOException {
+            try (GraphTenants tenants = tenants(root, 4)) {
+                NamespaceId acme = NamespaceId.of("acme");
+                try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(acme)) {
+                    lease.resource().staging().append(
+                        ExtractedTriple.alwaysValid("Ada", "knows", "Babbage", from(1)));
+                }
+                tenants.shared().staging().append(
+                    ExtractedTriple.alwaysValid("Grace", "knows", "Ada", from(2)));
+                // The directory a sync forces after the files, gone from under the store.
+                Path acmeStaging = GraphTenant.stagingDirectoryOf(
+                    root.resolve("acme").resolve(GraphTenant.GRAPH_SUBDIRECTORY));
+                Path aside = root.resolve("acme-staging-aside");
+                java.nio.file.Files.move(acmeStaging, aside);
+                try {
+                    assertThat(tenants.syncStaging()).isEqualTo(1);
+                    assertThat(factsOnDisk(root, NamespaceId.SHARED)).isEqualTo(1);
+                } finally {
+                    java.nio.file.Files.move(aside, acmeStaging);
+                }
+            }
         }
     }
 

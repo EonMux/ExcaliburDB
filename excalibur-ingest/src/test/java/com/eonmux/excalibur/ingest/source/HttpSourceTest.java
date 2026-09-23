@@ -9,8 +9,6 @@ import org.junit.jupiter.api.Nested;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
-import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -46,6 +44,7 @@ class HttpSourceTest {
         server.createContext("/redirect-excluded.html", new RedirectHandler("/api/data.json"));
         server.createContext("/echo-headers.html", new EchoHeadersHandler());
         server.createContext("/hub/", new HubHandler());
+        server.createContext("/always-not-modified.txt", new AlwaysNotModifiedHandler());
         
         ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
         server.setExecutor(executor);
@@ -316,28 +315,6 @@ class HttpSourceTest {
     }
 
     @Nested
-    @DisplayName("Change Detection")
-    class ChangeDetectionTest {
-
-        @Test
-        @DisplayName("hasChanged returns true for future timestamp")
-        void hasChanged_futureTimestamp_returnsTrue() throws SourceException {
-            Instant future = Instant.now().plus(1, ChronoUnit.DAYS);
-            
-            boolean changed = source.hasChanged(future);
-            
-            assertThat(changed).isTrue();
-        }
-
-        @Test
-        @DisplayName("hasChanged with null timestamp throws exception")
-        void hasChanged_nullTimestamp_throwsException() {
-            assertThatThrownBy(() -> source.hasChanged(null))
-                .isInstanceOf(NullPointerException.class);
-        }
-    }
-
-    @Nested
     @DisplayName("Crawl Operation")
     class CrawlTest {
 
@@ -504,16 +481,6 @@ class HttpSourceTest {
                 .isInstanceOf(SourceException.class)
                 .hasMessageContaining("closed");
         }
-
-        @Test
-        @DisplayName("hasChanged on closed source throws exception")
-        void hasChanged_onClosed_throwsException() {
-            source.close();
-
-            assertThatThrownBy(() -> source.hasChanged(Instant.now().minusSeconds(3600)))
-                .isInstanceOf(SourceException.class)
-                .hasMessageContaining("closed");
-        }
     }
 
     @Nested
@@ -565,6 +532,58 @@ class HttpSourceTest {
         @DisplayName("getEstimatedTotalSize returns -1")
         void getEstimatedTotalSize_returnsMinusOne() throws SourceException {
             assertThat(source.getEstimatedTotalSize()).isEqualTo(-1);
+        }
+    }
+
+    /**
+     * A {@code 304} means "the version you asked about is current", so it can only be taken as
+     * that when a version was asked about. Answered to a request that carried no condition, it
+     * names no version at all, and treating it as "unchanged" would keep whatever the index holds
+     * on the word of a server that was never asked.
+     */
+    @Nested
+    @DisplayName("Conditional Fetch")
+    class ConditionalFetchTest {
+
+        private String url() {
+            return baseUrl + "/always-not-modified.txt";
+        }
+
+        @Test
+        @DisplayName("a 304 to a request with a condition is the indexed version still current")
+        void aSolicitedNotModifiedIsUnchanged() throws Exception {
+            assertThat(source.fetchIfChanged(url(), new DocumentValidators(0L, "\"v1\"")))
+                .isEmpty();
+            assertThat(source.fetchIfChanged(url(), new DocumentValidators(1_700_000_000_000L, null)))
+                .isEmpty();
+        }
+
+        @Test
+        @DisplayName("a 304 to a request with nothing to ask with is an error, not unchanged")
+        void anUnsolicitedNotModifiedFails() {
+            assertThatThrownBy(() -> source.fetchIfChanged(url(), DocumentValidators.NONE))
+                .isInstanceOf(SourceException.class)
+                .hasMessageContaining("unconditional");
+        }
+
+        @Test
+        @DisplayName("a 304 after the only condition was left off is an error, not unchanged")
+        void aNotModifiedToADroppedTagFails() {
+            // A stored tag a header cannot carry is not sent, and with no timestamp beside it the
+            // request goes out unconditionally.
+            DocumentValidators unsendable = new DocumentValidators(0L, "\"v\u00e9\"");
+
+            assertThatThrownBy(() -> source.fetchIfChanged(url(), unsendable))
+                .isInstanceOf(SourceException.class)
+                .hasMessageContaining("unconditional");
+        }
+
+        @Test
+        @DisplayName("an ordinary fetch answered 304 is an error")
+        void anOrdinaryFetchAnsweredNotModifiedFails() {
+            assertThatThrownBy(() -> source.fetch(url()))
+                .isInstanceOf(SourceException.class)
+                .hasMessageContaining("unconditional");
         }
     }
 
@@ -866,6 +885,15 @@ class HttpSourceTest {
      * Serves the whole {@code /hub/} subtree: the hub page links to {@link #LEAF_COUNT} leaves
      * under the same base path, so a crawl has more to find than a small budget allows.
      */
+    /** A server that answers every request {@code 304 Not Modified}, asked or not. */
+    private static class AlwaysNotModifiedHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            exchange.sendResponseHeaders(304, -1);
+            exchange.close();
+        }
+    }
+
     private static class HubHandler implements HttpHandler {
         static final int LEAF_COUNT = 12;
 

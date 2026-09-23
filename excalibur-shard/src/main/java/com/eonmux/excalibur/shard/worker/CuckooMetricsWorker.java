@@ -199,25 +199,29 @@ public class CuckooMetricsWorker {
     /**
      * Registers a segment's Cuckoo filter for FP rate monitoring.
      *
+     * <p>A segment has one filter. Registering a different filter under an id already present
+     * replaces the old one, because the old one has been superseded - a hierarchy level
+     * installed for a segment that was first registered with a standalone filter, say - and
+     * sampling it would report a filter nothing writes to any more.</p>
+     *
      * @param segmentId The segment ID
      * @param filter   The Cuckoo filter for the segment
      */
-    public void registerFilter(long segmentId, CuckooFilter filter) {
+    public synchronized void registerFilter(long segmentId, CuckooFilter filter) {
         if (filter == null) {
             return;
         }
-        // Check if filter already registered
-        boolean alreadyRegistered = false;
         for (FilterEntry entry : registeredFilters) {
             if (entry.segmentId == segmentId) {
-                alreadyRegistered = true;
+                if (entry.filter == filter) {
+                    return;
+                }
+                registeredFilters.remove(entry);
                 break;
             }
         }
-        if (!alreadyRegistered) {
-            registeredFilters.add(new FilterEntry(segmentId, filter));
-            LOGGER.debug("Registered Cuckoo filter for FP rate monitoring: segment {}", segmentId);
-        }
+        registeredFilters.add(new FilterEntry(segmentId, filter));
+        LOGGER.debug("Registered Cuckoo filter for FP rate monitoring: segment {}", segmentId);
     }
 
     /**
@@ -242,88 +246,98 @@ public class CuckooMetricsWorker {
     // ==================== Sampling Cycle ====================
 
     /**
+     * Reads the false-positive rates of the registered filters as they stand now.
+     *
+     * <p>This is what {@code /v1/stats} and the {@code /metrics} gauges report, and it is read
+     * on request rather than taken from the last scheduled cycle. The cycle feeds a histogram of
+     * past samples for JMX, which answers a different question - how the rate has behaved over
+     * the life of the process - and a cached copy would hide a freshly ingested segment for up
+     * to one sampling interval. Each estimate is a closed-form function of one filter's load, so
+     * reading every registered filter costs a pass over a list.</p>
+     *
+     * <p>Empty filters are left out of both figures. A segment that has recorded no term has no
+     * rate to speak of, and averaging its zero in would report a node whose populated filters
+     * are near their ceiling as healthy because most of its segments are new.</p>
+     *
+     * @return The average and worst rate over the non-empty registered filters
+     */
+    public FpRates sample() {
+        int sampled = 0;
+        double total = 0.0;
+        double worst = 0.0;
+        for (FilterEntry entry : registeredFilters) {
+            try {
+                if (entry.filter.count() == 0) {
+                    continue;
+                }
+                double fpRate = entry.filter.estimateFpRate();
+                total += fpRate;
+                worst = Math.max(worst, fpRate);
+                sampled++;
+
+                if (LOGGER.isTraceEnabled()) {
+                    LOGGER.trace("Segment {} FP rate: {} (load factor: {})",
+                        entry.segmentId, String.format("%.6f", fpRate),
+                        String.format("%.4f", entry.filter.loadFactor()));
+                }
+            } catch (RuntimeException e) {
+                LOGGER.warn("Error estimating FP rate for segment {}: {}",
+                    entry.segmentId, e.getMessage());
+            }
+        }
+        return sampled == 0 ? FpRates.NONE : new FpRates(sampled, total / sampled, worst);
+    }
+
+    /**
      * Performs a sampling cycle.
      *
-     * <p>This method is called periodically by the scheduler and:</p>
-     * <ol>
-     *   <li>Iterates through all registered filters</li>
-     *   <li>Estimates FP rate for each filter</li>
-     *   <li>Records aggregate FP rate to metrics system</li>
-     * </ol>
+     * <p>Called periodically by the scheduler: takes {@link #sample()} and, when any filter
+     * holds anything, records the average into the histogram JMX reads.</p>
      */
     private void performSamplingCycle() {
-        if (!running.get() || stopped.get()) {
-            return;
-        }
-
-        if (registeredFilters.isEmpty()) {
+        if (!running.get() || stopped.get() || registeredFilters.isEmpty()) {
             return;
         }
 
         long startTime = System.currentTimeMillis();
-        int samplesRecorded = 0;
-        double totalFpRate = 0.0;
-        double maxFpRate = 0.0;
-        int filtersWithEntries = 0;
-
         try {
-            for (FilterEntry entry : registeredFilters) {
-                try {
-                    // Skip empty filters (no meaningful FP rate)
-                    if (entry.filter.count() == 0) {
-                        continue;
-                    }
+            FpRates rates = sample();
+            if (rates.filters() == 0) {
+                return;
+            }
+            Metrics.recordCuckooFpRate(rates.average());
 
-                    double fpRate = entry.filter.estimateFpRate();
-                    totalFpRate += fpRate;
-                    if (fpRate > maxFpRate) {
-                        maxFpRate = fpRate;
-                    }
-                    filtersWithEntries++;
-                    samplesRecorded++;
+            totalSamplesRecorded.addAndGet(rates.filters());
+            lastSampleTime.set(System.currentTimeMillis());
 
-                    // Log per-segment FP rate at trace level for debugging
-                    if (LOGGER.isTraceEnabled()) {
-                        LOGGER.trace("Segment {} FP rate: {} (load factor: {})",
-                            entry.segmentId, String.format("%.6f", fpRate),
-                            String.format("%.4f", entry.filter.loadFactor()));
-                    }
-                } catch (Exception e) {
-                    LOGGER.warn("Error estimating FP rate for segment {}: {}",
-                        entry.segmentId, e.getMessage());
-                }
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("Cuckoo FP rate sampling complete: avg={}, max={}, filters={}, "
+                    + "duration={}ms", String.format("%.6f", rates.average()),
+                    String.format("%.6f", rates.max()), rates.filters(),
+                    System.currentTimeMillis() - startTime);
             }
 
-            // Record aggregate metrics if we have any samples
-            if (filtersWithEntries > 0) {
-                // Record the average FP rate across all non-empty filters
-                double avgFpRate = totalFpRate / filtersWithEntries;
-                Metrics.recordCuckooFpRate(avgFpRate);
-
-                totalSamplesRecorded.addAndGet(samplesRecorded);
-                lastSampleTime.set(System.currentTimeMillis());
-
-                long duration = System.currentTimeMillis() - startTime;
-
-                // Log at debug level to avoid spamming logs
-                if (LOGGER.isDebugEnabled()) {
-                    LOGGER.debug("Cuckoo FP rate sampling complete: avg={}, max={}, " +
-                        "filters={}, samples={}, duration={}ms",
-                        String.format("%.6f", avgFpRate), String.format("%.6f", maxFpRate),
-                        filtersWithEntries, samplesRecorded, duration);
-                }
-
-                // Warn if FP rate is higher than expected (>0.1%)
-                if (avgFpRate > 0.001) {
-                    LOGGER.warn("Cuckoo filter FP rate ({}%) exceeds target (0.1%). " +
-                        "Consider increasing fingerprint bits or reducing load factor.",
-                        String.format("%.4f", avgFpRate * 100));
-                }
+            if (rates.average() > 0.001) {
+                LOGGER.warn("Cuckoo filter FP rate ({}%) exceeds target (0.1%). " +
+                    "Consider increasing fingerprint bits or reducing load factor.",
+                    String.format("%.4f", rates.average() * 100));
             }
-
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             LOGGER.error("Error during Cuckoo FP rate sampling cycle", e);
         }
+    }
+
+    /**
+     * The false-positive rates of the registered filters at one moment.
+     *
+     * @param filters How many non-empty filters the figures are taken over
+     * @param average Mean estimated rate across them, 0 when there are none
+     * @param max     Worst estimated rate of any one of them, 0 when there are none
+     */
+    public record FpRates(int filters, double average, double max) {
+
+        /** No filter holds anything, so there is no rate to report. */
+        public static final FpRates NONE = new FpRates(0, 0.0, 0.0);
     }
 
     // ==================== Statistics ====================

@@ -81,6 +81,24 @@ class NativeChunkIndexTest {
     class Publication {
 
         @Test
+        @DisplayName("publishing the buffer, as a shutdown does, makes it searchable")
+        void publishBufferedPublishes(@TempDir Path dir) throws Exception {
+            AtomicLong epoch = new AtomicLong(5);
+            try (NativeChunkIndex index =
+                     NativeChunkIndex.open(dir, epoch::get, 4, standard())) {
+                index.add("kb:a.txt:chunk:0", "buffered when the node stopped");
+
+                index.publishBuffered();
+                epoch.incrementAndGet();
+
+                assertThat(index.liveChunks()).isEqualTo(1);
+                assertThat(index.compactionReadsStorage())
+                    .as("a rewrite reads each surviving chunk's text back out of storage")
+                    .isTrue();
+            }
+        }
+
+        @Test
         @DisplayName("chunks are not searchable until the run is refreshed")
         void addingIsNotPublishing(@TempDir Path dir) throws Exception {
             AtomicLong epoch = new AtomicLong(5);
@@ -268,6 +286,124 @@ class NativeChunkIndexTest {
                 assertThat(index.liveChunks()).isEqualTo(1);
                 assertThat(anyFileContains(dir, "vanishedpayload")).isFalse();
                 assertThat(anyFileContains(dir, "confidentialpayload")).isFalse();
+            }
+        }
+
+        @Test
+        @DisplayName("a full rewrite finds a lost chunk in a segment nothing else would rewrite")
+        void rewriteAllReachesCleanSegments(@TempDir Path dir) throws Exception {
+            // No erasure, one segment: the forced plan has nothing to merge and nothing to purge,
+            // so only a rewrite of every segment asks storage about the chunk it lost.
+            AtomicLong epoch = new AtomicLong(1);
+            Map<String, String> storage = new LinkedHashMap<>();
+            storage.put("kb:kept.txt:chunk:0", "ordinary retained content");
+            storage.put("kb:gone.txt:chunk:0", "vanishedpayload from a replaced version");
+            try (NativeChunkIndex index = NativeChunkIndex.open(dir, epoch::get, 0, standard())) {
+                for (Map.Entry<String, String> chunk : storage.entrySet()) {
+                    index.add(chunk.getKey(), chunk.getValue());
+                }
+                index.refresh();
+                epoch.incrementAndGet();
+                storage.remove("kb:gone.txt:chunk:0");
+
+                assertThat(index.compactIfDue(storage::get).performed())
+                    .as("nothing is erased, so the policy has nothing due")
+                    .isFalse();
+                assertThat(index.compactNow(storage::get).segmentsRewritten())
+                    .as("a lone clean segment is nothing the forced plan touches")
+                    .isZero();
+
+                CompactionResult result = index.rewriteAll(storage::get);
+
+                assertThat(result.performed()).isTrue();
+                assertThat(result.segmentsRewritten()).isEqualTo(1);
+                assertThat(result.documentsRemoved()).isEqualTo(1);
+                assertThat(index.liveChunks()).isEqualTo(1);
+                assertThat(anyFileContains(dir, "vanishedpayload")).isFalse();
+            }
+        }
+
+        @Test
+        @DisplayName("a full rewrite asked to stop publishes nothing and keeps every chunk")
+        void aStoppedRewriteChangesNothing(@TempDir Path dir) throws Exception {
+            AtomicLong epoch = new AtomicLong(1);
+            Map<String, String> storage = new LinkedHashMap<>();
+            storage.put("kb:a.txt:chunk:0", "first retained body");
+            storage.put("kb:b.txt:chunk:0", "second retained body");
+            try (NativeChunkIndex index = NativeChunkIndex.open(dir, epoch::get, 0, standard())) {
+                for (Map.Entry<String, String> chunk : storage.entrySet()) {
+                    index.add(chunk.getKey(), chunk.getValue());
+                }
+                index.refresh();
+                epoch.incrementAndGet();
+
+                java.util.concurrent.atomic.AtomicBoolean stop =
+                    new java.util.concurrent.atomic.AtomicBoolean();
+                CompactionResult result = index.rewriteAll(key -> {
+                    stop.set(true);
+                    return storage.get(key);
+                }, stop::get);
+
+                assertThat(result.performed()).isFalse();
+                assertThat(result.reason()).startsWith("stopped:");
+                assertThat(index.liveChunks()).isEqualTo(2);
+                assertThat(index.rewriteAll(storage::get).performed())
+                    .as("the next rewrite is not refused as already running")
+                    .isTrue();
+            }
+        }
+
+        @Test
+        @DisplayName("a chunk storage failed to read is kept, not dropped as gone")
+        void aFailedReadKeepsTheChunk(@TempDir Path dir) throws Exception {
+            AtomicLong epoch = new AtomicLong(1);
+            try (NativeChunkIndex index = NativeChunkIndex.open(dir, epoch::get, 0, standard())) {
+                index.add("kb:a.txt:chunk:0", "unreadablepayload for a moment");
+                index.refresh();
+                epoch.incrementAndGet();
+
+                CompactionResult result = index.rewriteAll(key -> {
+                    throw new java.io.UncheckedIOException(new IOException("device busy"));
+                });
+
+                assertThat(result.documentsRemoved()).isZero();
+                assertThat(index.liveChunks()).isEqualTo(1);
+                assertThat(index.ranker(QueryExpander.identity())
+                    .rank(RetrievalQuery.ofText("unreadablepayload"), 5).documents())
+                    .as("still findable, from the segment the rewrite left alone")
+                    .hasSize(1);
+                assertThat(result.performed())
+                    .as("the one group it planned was abandoned, so nothing was compacted")
+                    .isFalse();
+                assertThat(result.groupsAbandoned()).isEqualTo(1);
+                assertThat(index.stats().unreadableChunksDropped()).isZero();
+            }
+        }
+
+        @Test
+        @DisplayName("a chunk whose stored text is damaged is dropped, counted, and frees the "
+            + "erasure beside it")
+        void aDamagedChunkIsDroppedAndCounted(@TempDir Path dir) throws Exception {
+            AtomicLong epoch = new AtomicLong(1);
+            try (NativeChunkIndex index = NativeChunkIndex.open(dir, epoch::get, 0, standard())) {
+                index.add("kb:a.txt:chunk:0", "damagedpayload beyond repair");
+                index.add("kb:b.txt:chunk:0", "erasedpayload owed to its owner");
+                index.refresh();
+                epoch.incrementAndGet();
+                index.erase(Set.of("kb:b.txt:chunk:0"));
+
+                CompactionResult result = index.compactNow(key -> {
+                    throw new com.eonmux.excalibur.retrieval.lexical.native_
+                        .UnrecoverableTextException(key, new IllegalStateException("checksum"));
+                });
+
+                assertThat(result.performed()).isTrue();
+                assertThat(result.groupsAbandoned()).isZero();
+                assertThat(index.stats().unreadableChunksDropped()).isEqualTo(1);
+                assertThat(index.stats().erasureRequests())
+                    .as("the erasure in the same segment is discharged, not held hostage")
+                    .isZero();
+                assertThat(anyFileContains(dir, "erasedpayload")).isFalse();
             }
         }
     }

@@ -535,11 +535,8 @@ public class MappedFile implements AutoCloseable {
 
         lock.readLock().lock();
         try {
-            MemorySegment currentSegment = activeSegment();
             float[] result = new float[count];
-            for (int i = 0; i < count; i++) {
-                result[i] = currentSegment.get(FLOAT_LAYOUT, offset + (long) i * 4L);
-            }
+            MemorySegment.copy(activeSegment(), FLOAT_LAYOUT, offset, result, 0, count);
             bytesRead.addAndGet(byteLength);
             return result;
         } finally {

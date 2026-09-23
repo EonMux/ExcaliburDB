@@ -17,7 +17,7 @@ import java.util.Set;
  * <p>This class provides methods to diagnose why HNSW graph searches may return
  * empty results. It checks:</p>
  * <ul>
- *   <li>Are vectors actually linked in the graph (bidirectional edges)?</li>
+ *   <li>Are vectors actually linked in the graph?</li>
  *   <li>Is the entry point valid and accessible?</li>
  *   <li>Is lastIntegratedOffset correct relative to write log state?</li>
  *   <li>Are there disconnected components in the graph?</li>
@@ -45,7 +45,7 @@ import java.util.Set;
  *   <li>lastIntegratedOffset should equal nodeCount if all vectors are integrated</li>
  *   <li>Entry point must be valid and not tombstoned</li>
  *   <li>All active nodes must be reachable from entry point</li>
- *   <li>All edges must be bidirectional</li>
+ *   <li>Adjacency lists name only existing nodes, within the connection limits</li>
  * </ul>
  *
  * <h2>Thread Safety</h2>
@@ -73,7 +73,7 @@ public final class HnswGraphDiagnostic {
      * @param maxLevel Maximum level in the graph
      * @param lastIntegratedOffset Current lastIntegratedOffset value
      * @param writeLogHead Current write log head position
-     * @param edgeCount Number of bidirectional edges at level 0
+     * @param edgeCount Directed out-edges between active nodes at level 0
      * @param reachableNodes Nodes reachable from entry point via level 0 edges
      * @param searchResultCount Results from self-search test
      * @param issues List of diagnostic issues found
@@ -232,7 +232,7 @@ public final class HnswGraphDiagnostic {
      *   <li>Basic graph state (node count, entry point, max level)</li>
      *   <li>lastIntegratedOffset consistency with write log</li>
      *   <li>Graph connectivity (all nodes reachable from entry point)</li>
-     *   <li>Edge bidirectionality</li>
+     *   <li>Edge invariants</li>
      *   <li>Self-search test (can the graph find results?)</li>
      * </ol>
      *
@@ -263,10 +263,10 @@ public final class HnswGraphDiagnostic {
         // === Check 4: Graph connectivity ===
         int reachableNodes = HnswGraphChecks.reportConnectivity(graph, issues);
 
-        // === Check 5: Edge bidirectionality ===
+        // === Check 5: Edge invariants ===
         HnswGraphChecks.reportEdgeInvariants(graph, issues);
 
-        long edgeCount = HnswInvariantVerifier.countBidirectionalEdges(graph, 0);
+        long edgeCount = HnswInvariantVerifier.countDirectedEdges(graph, 0);
 
         // === Check 6: Self-search test ===
         int searchResultCount = HnswGraphChecks.reportSelfSearch(
@@ -404,7 +404,7 @@ public final class HnswGraphDiagnostic {
         if (graph.nodeCount() == 0) {
             return true; // Empty graph is trivially OK
         }
-        return HnswInvariantVerifier.countBidirectionalEdges(graph, 0) > 0;
+        return HnswInvariantVerifier.countDirectedEdges(graph, 0) > 0;
     }
 
     /**
@@ -539,7 +539,7 @@ public final class HnswGraphDiagnostic {
         sb.append(String.format("Write Log Head: %d\n", result.writeLogHead()));
         sb.append(String.format("Tail Entries: %d\n", result.tailEntryCount()));
         sb.append(String.format("Integration Progress: %.1f%%\n", result.integrationProgress() * 100));
-        sb.append(String.format("Bidirectional Edges (Level 0): %d\n", result.edgeCount()));
+        sb.append(String.format("Directed Edges (Level 0): %d\n", result.edgeCount()));
         sb.append(String.format("Reachable Nodes: %d/%d (%.1f%%)\n",
             result.reachableNodes(), result.activeNodeCount(),
             result.connectivityRatio() * 100));

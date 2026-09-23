@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.ingest.processor;
 
+import com.eonmux.excalibur.ingest.source.TextEncoding;
+
 import java.nio.charset.Charset;
 import java.util.Objects;
 
@@ -56,6 +58,9 @@ public final class TextContent {
     /**
      * Decodes a document's bytes as text, or reports that they are not text.
      *
+     * <p>A byte-order mark the content opens with is dropped rather than kept as the first
+     * character; see {@link TextEncoding#decode}.</p>
+     *
      * @param content The bytes the source handed back
      * @param charset The encoding the source declared them to be in
      * @return The decoded text, or {@code null} when {@code content} is not text in
@@ -66,7 +71,7 @@ public final class TextContent {
         Objects.requireNonNull(content, "content must not be null");
         Objects.requireNonNull(charset, "charset must not be null");
 
-        String text = new String(content, charset);
+        String text = TextEncoding.decode(content, charset);
         return isText(text) ? text : null;
     }
 

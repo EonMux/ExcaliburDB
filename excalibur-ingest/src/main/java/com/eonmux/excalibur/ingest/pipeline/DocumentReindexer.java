@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
+import com.eonmux.excalibur.core.util.StopSignal;
+import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
@@ -34,7 +36,8 @@ import java.util.function.Function;
  *   <li>Generates an embedding for each chunk, on a node configured with an embedding
  *       endpoint; a node that indexes its corpus lexically skips this step and stores the
  *       chunk with no vector, exactly as its ingestion did</li>
- *   <li>Upserts the new chunks into storage</li>
+ *   <li>Upserts the new chunks into storage, filing each chunk's terms in the membership
+ *       filter under the segment its write landed in, as a first ingest does</li>
  *   <li>Tombstones old chunks via the UpsertHandler</li>
  *   <li>Removes old chunks from the Cuckoo filter hierarchy</li>
  *   <li>Updates the document registry with new metadata</li>
@@ -54,8 +57,8 @@ import java.util.function.Function;
  * <p>It owns the wiring and the entry points, and hands each phase to the collaborator that
  * owns it: {@link SourceReindexPass} for one pass over a source's change set,
  * {@link DocumentReindexStep} for one document end to end, {@link RollingReplacement} for the
- * segment choreography, and {@link ReindexLexicalIndex} and {@link ReindexRollback} for the two
- * things a reindex has to be able to undo. Each of those carries the reasoning for its own
+ * request for a replacement segment, and {@link ReindexLexicalIndex} and
+ * {@link ReindexRollback} for the two things a reindex has to be able to undo. Each of those carries the reasoning for its own
  * phase, and this one carries none of it twice.</p>
  *
  * <h2>Domain Correctness</h2>
@@ -110,6 +113,12 @@ public class DocumentReindexer {
     private final ReindexLexicalIndex lexical = new ReindexLexicalIndex();
 
     /**
+     * Files the terms of every chunk this reindex writes under the segment it landed in - the
+     * same recorder, with the same filter, that files them for a first ingest.
+     */
+    private final SegmentTermRecorder termRecorder = new SegmentTermRecorder();
+
+    /**
      * Retires the graph nodes of every document this reindex removes, or null for no vector
      * index.
      *
@@ -135,6 +144,27 @@ public class DocumentReindexer {
          * @return true if write succeeded
          */
         boolean writeChunk(String chunkId, String content, float[] embedding);
+
+        /**
+         * Writes a chunk the caller has already tokenised, and reports where it landed.
+         *
+         * <p>The same contract as
+         * {@link OffsetAwareStorageWriter#writeChunk(String, String, List, float[])}: a writer
+         * over a segmented store reports the segment the chunk landed in, so its terms can be
+         * filed there for pruning. The default is for writers that route by no segment, and
+         * reports none.</p>
+         *
+         * @param chunkId   Unique chunk identifier
+         * @param content   Chunk text content
+         * @param terms     The chunk's terms, with repetition
+         * @param embedding Embedding vector, or null on a node that embeds nothing
+         * @return Where the chunk landed, or {@link ChunkPlacement#FAILED}
+         */
+        default ChunkPlacement writeChunk(String chunkId, String content, List<String> terms,
+                                          float[] embedding) {
+            return writeChunk(chunkId, content, embedding)
+                ? ChunkPlacement.unrouted(0L) : ChunkPlacement.FAILED;
+        }
     }
 
     /**
@@ -331,6 +361,21 @@ public class DocumentReindexer {
     }
 
     /**
+     * Points this reindexer at the membership filter the query pipeline prunes segments with.
+     *
+     * <p>A reindex writes chunks exactly as a first ingest does, and once a segment's level is
+     * trusted the query pipeline rules the segment out for any term the level does not name. So
+     * every chunk written here has its terms filed under the segment its write landed in, as it
+     * is written; a reindexed-in term missing from that level would hide the chunk from every
+     * query for it until the segment's next rebuild.</p>
+     *
+     * @param membershipFilter The filter, or null to keep none
+     */
+    public void setMembershipFilter(HierarchicalCuckooFilter membershipFilter) {
+        termRecorder.setFilter(membershipFilter);
+    }
+
+    /**
      * Wires the eraser that retires a removed document's graph nodes.
      *
      * @param vectorEraser The eraser, or null on a node that keeps no vector index
@@ -352,12 +397,9 @@ public class DocumentReindexer {
     /**
      * Returns true if this reindexer is configured with rolling replacement support.
      *
-     * <p>Rolling replacement enables zero-downtime reindexing by:</p>
-     * <ul>
-     *   <li>Creating new segments in BOOTSTRAPPING state</li>
-     *   <li>Keeping old segments queryable during reindexing</li>
-     *   <li>Tombstoning old segments after new segments become ACTIVE</li>
-     * </ul>
+     * <p>That is, whether it has a segment catalog to ask for a replacement segment with. What
+     * comes of asking - and why the answer is always to rebuild in place - is set out on
+     * {@link RollingReplacement}.</p>
      *
      * @return true if rolling replacement is enabled
      */
@@ -368,10 +410,10 @@ public class DocumentReindexer {
     /**
      * Re-indexes all documents from a source with zero-downtime rolling replacement.
      *
-     * <p>The workflow, the reason a hash-routed engine offers no writable target, and what the
-     * run does instead when it does not, are all set out on {@link RollingReplacement}. In
-     * short: the old segments stay queryable for the whole run, and the returned segment ID is
-     * {@code -1} when no segment was replaced.</p>
+     * <p>Why a hash-routed engine offers no writable target, what the run does instead, and why
+     * a writable one would be refused rather than filled, are all set out on
+     * {@link RollingReplacement}. In short: the run rebuilds in place, the old segments stay
+     * exactly as they were, and the returned segment ID is {@code -1}.</p>
      *
      * <p><strong>Prerequisites:</strong> This method requires rolling replacement
      * support to be enabled (see
@@ -392,37 +434,59 @@ public class DocumentReindexer {
     /**
      * Re-indexes by rolling replacement, reporting progress as it goes.
      *
-     * <p>The progress a caller sees is the same whichever branch this run takes - a real
-     * replacement, or the fall back to re-indexing through the routing directory. Which of the
-     * two happens is a property of the storage engine rather than of anything the caller asked
-     * for, and a status that went silent on one of them would be reporting on the deployment
-     * rather than on the run.</p>
+     * <p>The progress a caller sees is the ordinary reindex's, reported as it goes.</p>
      *
      * @param source     The source to re-index
      * @param volumePath Where the new segment file should be created
      * @param progress   Told how many documents the run has finished with
      * @return Result containing counts, new segment ID, and any errors
-     * @throws SourceException      if crawling or fetching fails catastrophically
-     * @throws NullPointerException if any argument is null
+     * @throws SourceException       if crawling or fetching fails catastrophically
+     * @throws IllegalStateException if the writer reports the created segment writable
+     * @throws NullPointerException  if any argument is null
      * @see RollingReplacement
      */
     public RollingReindexResult reindexWithRollingReplacement(Source source, Path volumePath,
                                                               ReindexProgress progress)
             throws SourceException {
+        return reindexWithRollingReplacement(source, volumePath, progress, new StopSignal());
+    }
+
+    /**
+     * Re-indexes by rolling replacement, reporting progress as it goes, until asked to stop.
+     *
+     * <p>How the stop is read, and why it is never delivered as an interrupt, is set out on
+     * {@link ReindexCancellation}.</p>
+     *
+     * @param source     The source to re-index
+     * @param volumePath Where the new segment file should be created
+     * @param progress   Told how many documents the run has finished with
+     * @param stop       Asks the run to stop at its next document boundary
+     * @return Result containing counts, new segment ID, and any errors
+     * @throws SourceException           if crawling or fetching fails catastrophically
+     * @throws IllegalStateException     if the writer reports the created segment writable
+     * @throws NullPointerException      if any argument is null
+     * @throws ReindexCancelledException if the run was asked to stop
+     * @see RollingReplacement
+     */
+    public RollingReindexResult reindexWithRollingReplacement(Source source, Path volumePath,
+                                                              ReindexProgress progress,
+                                                              StopSignal stop)
+            throws SourceException {
         Objects.requireNonNull(source, "source must not be null");
         Objects.requireNonNull(volumePath, "volumePath must not be null");
         Objects.requireNonNull(progress, "progress must not be null");
+        Objects.requireNonNull(stop, "stop must not be null");
 
         // Fall back to regular reindex if rolling replacement not configured
         if (!hasRollingReplacement()) {
             LOG.warn("Rolling replacement not configured for source {}, falling back to regular reindex",
                 source.getSourceId());
-            ReindexResult basicResult = reindexAll(source, progress);
+            ReindexResult basicResult = reindexAll(source, progress, stop);
             return new RollingReindexResult(basicResult, -1, List.of());
         }
 
         return new RollingReplacement(segmentCatalog, visibilityTracker, offsetAwareWriter,
-            batchPublisher, this::reindexAll, this::reindexAllWithSegmentWriter)
+            (routedSource, routedProgress) -> reindexAll(routedSource, routedProgress, stop))
             .run(source, volumePath, progress);
     }
 
@@ -539,71 +603,36 @@ public class DocumentReindexer {
      */
     public ReindexResult reindexAll(Source source, ReindexProgress progress)
             throws SourceException {
-        Objects.requireNonNull(source, "source must not be null");
-        Objects.requireNonNull(progress, "progress must not be null");
-
-        return pass(this::reindexDocument, SourceReindexPass.Route.THROUGH_ROUTING_DIRECTORY)
-            .run(source, progress);
+        return reindexAll(source, progress, new StopSignal());
     }
 
     /**
-     * Re-indexes all changed and new documents from a source using segment-targeted writers.
+     * Re-indexes all changed and new documents from a source until asked to stop.
      *
-     * <p>This method is used during rolling replacement reindexing to ensure all
-     * reindexed data is written to the newly created segment. The segment-targeted
-     * writers route all writes to the specified segment instead of the default
-     * location.</p>
+     * <p>The stop is read between documents, never inside one, and is never delivered as an
+     * interrupt; see {@link ReindexCancellation}. An interrupt that reaches the run's thread
+     * anyway is taken as a stop at the next checkpoint - but one that lands during a write has
+     * already closed the channel it was writing through, which is why a caller that means to
+     * cancel the run requests {@code stop} instead.</p>
      *
-     * <p><strong>Domain Correctness:</strong></p>
-     * <ul>
-     *   <li>All chunks are written to the target segment specified by the writer</li>
-     *   <li>Cuckoo filter insertions are scoped to the target segment</li>
-     *   <li>Document metadata correctly tracks the segment association</li>
-     *   <li>Visibility epoch advances after all documents are indexed</li>
-     * </ul>
-     *
-     * @param source The source to re-index
-     * @param segmentWriter Storage writer bound to the target segment
-     * @param segmentPublisher Publisher bound to the target segment
+     * @param source   The source to re-index
+     * @param progress Told how many documents the run has finished with, as it finishes with
+     *                 them
+     * @param stop     Asks the run to stop at its next document boundary
      * @return Result containing counts and any errors
-     * @throws SourceException if crawling or fetching fails catastrophically
-     * @throws NullPointerException if any parameter is null
-     */
-    public ReindexResult reindexAllWithSegmentWriter(
-            Source source,
-            OffsetAwareStorageWriter segmentWriter,
-            DocumentBatchPublisher segmentPublisher) throws SourceException {
-        return reindexAllWithSegmentWriter(source, segmentWriter, segmentPublisher,
-            ReindexProgress.NONE);
-    }
-
-    /**
-     * Re-indexes into a target segment, reporting progress as it goes.
-     *
-     * @param source           The source to re-index
-     * @param segmentWriter    Storage writer bound to the target segment
-     * @param segmentPublisher Publisher bound to the target segment
-     * @param progress         Told how many documents the run has finished with
-     * @return Result containing counts and any errors
-     * @throws SourceException      if crawling or fetching fails catastrophically
-     * @throws NullPointerException if any parameter is null
+     * @throws SourceException           if crawling or fetching fails catastrophically
+     * @throws NullPointerException      if any argument is null
+     * @throws ReindexCancelledException if the run was asked to stop; what it finished before
+     *                                   then is written out first
      * @see SourceReindexPass
      */
-    public ReindexResult reindexAllWithSegmentWriter(
-            Source source,
-            OffsetAwareStorageWriter segmentWriter,
-            DocumentBatchPublisher segmentPublisher,
-            ReindexProgress progress) throws SourceException {
-
+    public ReindexResult reindexAll(Source source, ReindexProgress progress, StopSignal stop)
+            throws SourceException {
         Objects.requireNonNull(source, "source must not be null");
-        Objects.requireNonNull(segmentWriter, "segmentWriter must not be null");
-        Objects.requireNonNull(segmentPublisher, "segmentPublisher must not be null");
         Objects.requireNonNull(progress, "progress must not be null");
+        Objects.requireNonNull(stop, "stop must not be null");
 
-        DocumentReindexStep step =
-            step(new DocumentReindexStep.AtomicTarget(segmentWriter, segmentPublisher, true));
-        return pass(step::reindex, SourceReindexPass.Route.INTO_TARGET_SEGMENT)
-            .run(source, progress);
+        return pass(this::reindexDocument).run(source, progress, stop);
     }
 
     /**
@@ -637,15 +666,25 @@ public class DocumentReindexer {
      * @see DocumentReindexStep
      */
     public DocumentResult reindexDocument(String sourceId, String documentId, FetchedDocument fetched) {
+        return reindexDocument(sourceId, documentId, fetched, new StopSignal());
+    }
+
+    /**
+     * As {@link #reindexDocument(String, String, FetchedDocument)}, within a run that may be
+     * asked to stop: the stop may cut the document's embedding requests short, which leaves it
+     * on its previous version, and never interrupts its writes.
+     */
+    private DocumentResult reindexDocument(String sourceId, String documentId,
+                                           FetchedDocument fetched, StopSignal stop) {
         Objects.requireNonNull(sourceId, "sourceId must not be null");
         Objects.requireNonNull(documentId, "documentId must not be null");
         Objects.requireNonNull(fetched, "fetched must not be null");
 
         DocumentReindexStep step = hasAtomicPublication()
-            ? step(new DocumentReindexStep.AtomicTarget(offsetAwareWriter, batchPublisher, false))
+            ? step(new DocumentReindexStep.AtomicTarget(offsetAwareWriter, batchPublisher))
             : DocumentReindexStep.writingDirectly(chunker, llmClient, registry, upsertHandler,
-                lexical, storageWriter);
-        return step.reindex(sourceId, documentId, fetched);
+                lexical, termRecorder, storageWriter);
+        return step.reindex(sourceId, documentId, fetched, stop);
     }
 
     /**
@@ -655,22 +694,59 @@ public class DocumentReindexer {
      * eraser and the lexical index are wired after construction, and a pass built once at
      * construction would go on reindexing as though neither had ever been attached.</p>
      */
-    private SourceReindexPass pass(SourceReindexPass.DocumentStep documentStep,
-                                   SourceReindexPass.Route route) {
-        return new SourceReindexPass(registry, upsertHandler, lexical, vectorEraser, documentStep,
-            route);
+    private SourceReindexPass pass(SourceReindexPass.DocumentStep documentStep) {
+        return new SourceReindexPass(registry, upsertHandler, lexical, vectorEraser, documentStep);
     }
 
     /** Builds the per-document step for a run that publishes atomically. */
     private DocumentReindexStep step(DocumentReindexStep.AtomicTarget target) {
         return DocumentReindexStep.publishing(chunker, llmClient, registry, upsertHandler, lexical,
-            target);
+            termRecorder, target);
     }
 
     /**
      * Result of re-indexing a single document.
      */
     public static final class DocumentResult {
+
+        /**
+         * Why a document produced nothing without having failed.
+         *
+         * <p>Typed rather than read back out of the message, because the reasons are counted
+         * differently. Only {@link #NOT_TEXT} is what {@code entries_skipped} reports, on a
+         * re-crawl exactly as on the first crawl: a directory holding photographs beside its
+         * documents is worth being told about, and an empty file is not - the first crawl never
+         * counted one, and a count that moved between the two runs of the same unchanged source
+         * would say the source had changed when it had not. Matching on the wording instead would
+         * let a reworded message silently change what an operator is shown.</p>
+         */
+        public enum SkipReason {
+
+            /** The bytes are not text in the encoding the source declared them to be in. */
+            NOT_TEXT("Not text"),
+
+            /** The source handed back no bytes at all. */
+            EMPTY_CONTENT("Empty content"),
+
+            /** The document decoded to text the chunker found nothing to index in. */
+            NO_CHUNKS("No chunks produced");
+
+            private final String description;
+
+            SkipReason(String description) {
+                this.description = description;
+            }
+
+            /**
+             * The reason as a person reads it in a log line.
+             *
+             * @return A short phrase
+             */
+            public String description() {
+                return description;
+            }
+        }
+
         private final String documentId;
         private final int totalChunks;
         private final int successfulChunks;
@@ -678,6 +754,7 @@ public class DocumentReindexer {
         private final long elapsedMillis;
         private final String error;
         private final List<String> chunkIds;
+        private final SkipReason skipReason;
 
         public DocumentResult(String documentId, int totalChunks, int successfulChunks, 
                             int failedChunks, long elapsedMillis, String error) {
@@ -686,6 +763,13 @@ public class DocumentReindexer {
 
         public DocumentResult(String documentId, int totalChunks, int successfulChunks,
                             int failedChunks, long elapsedMillis, String error, List<String> chunkIds) {
+            this(documentId, totalChunks, successfulChunks, failedChunks, elapsedMillis, error,
+                chunkIds, null);
+        }
+
+        private DocumentResult(String documentId, int totalChunks, int successfulChunks,
+                               int failedChunks, long elapsedMillis, String error,
+                               List<String> chunkIds, SkipReason skipReason) {
             this.documentId = documentId;
             this.totalChunks = totalChunks;
             this.successfulChunks = successfulChunks;
@@ -693,6 +777,35 @@ public class DocumentReindexer {
             this.elapsedMillis = elapsedMillis;
             this.error = error;
             this.chunkIds = chunkIds != null ? List.copyOf(chunkIds) : List.of();
+            this.skipReason = skipReason;
+        }
+
+        /**
+         * A document that produced nothing and failed nothing.
+         *
+         * <p>It carries its reason's description as its message, so a log line about it says
+         * why, and the reason itself, so the run can count it without reading that message.</p>
+         *
+         * @param documentId    The document
+         * @param reason        Why it produced nothing
+         * @param elapsedMillis How long deciding that took
+         * @return The result
+         * @throws NullPointerException if reason is null
+         */
+        public static DocumentResult skipped(String documentId, SkipReason reason,
+                                             long elapsedMillis) {
+            Objects.requireNonNull(reason, "reason must not be null");
+            return new DocumentResult(documentId, 0, 0, 0, elapsedMillis, reason.description(),
+                List.of(), reason);
+        }
+
+        /**
+         * Why this document was skipped.
+         *
+         * @return The reason, or null when it was not skipped
+         */
+        public SkipReason getSkipReason() {
+            return skipReason;
         }
 
         /**
@@ -738,15 +851,16 @@ public class DocumentReindexer {
         /**
          * Whether this document produced nothing and failed nothing.
          *
-         * <p>An empty file, or one the chunker finds no text in, carries a reason so the run
-         * can account for it - and that reason is not a failure. Folding it in with the
-         * failures makes a run that indexed everything it could report itself as failed, and
-         * puts "Empty content" in front of an operator as the thing to investigate.</p>
+         * <p>An empty file, one the chunker finds no text in, or one that is not text at all
+         * carries a reason so the run can account for it - and that reason is not a failure.
+         * Folding it in with the failures makes a run that indexed everything it could report
+         * itself as failed, and puts "Empty content" in front of an operator as the thing to
+         * investigate.</p>
          *
          * @return true if the document was skipped rather than failed
          */
         public boolean wasSkipped() {
-            return hasError() && totalChunks == 0 && failedChunks == 0;
+            return skipReason != null;
         }
 
         public boolean isSuccess() {
@@ -774,6 +888,7 @@ public class DocumentReindexer {
         private final int chunksTombstoned;
         private final int chunksFailed;
         private final int documentsSkipped;
+        private final int documentsNotText;
         private final long elapsedMillis;
         private final List<OperationError> errors;
 
@@ -781,6 +896,7 @@ public class DocumentReindexer {
             this.sourceId = builder.sourceId;
             this.documentsIndexed = builder.documentsIndexed;
             this.documentsSkipped = builder.documentsSkipped;
+            this.documentsNotText = builder.documentsNotText;
             this.documentsTombstoned = builder.documentsTombstoned;
             this.chunksCreated = builder.chunksCreated;
             this.chunksTombstoned = builder.chunksTombstoned;
@@ -825,6 +941,19 @@ public class DocumentReindexer {
             return documentsSkipped;
         }
 
+        /**
+         * Documents skipped because they are not text.
+         *
+         * <p>The subset of {@link #getDocumentsSkipped()} that {@code entries_skipped} reports,
+         * which is the same set the first crawl of a source counts there. Empty documents are
+         * skipped too and are not in it; see {@link DocumentResult.SkipReason}.</p>
+         *
+         * @return How many documents were passed over as not text
+         */
+        public int getDocumentsNotText() {
+            return documentsNotText;
+        }
+
         public long getElapsedMillis() {
             return elapsedMillis;
         }
@@ -861,6 +990,7 @@ public class DocumentReindexer {
             private final String sourceId;
             private final long startTime = System.currentTimeMillis();
             private int documentsSkipped = 0;
+            private int documentsNotText = 0;
             private int documentsIndexed = 0;
             private int documentsTombstoned = 0;
             private int chunksCreated = 0;
@@ -918,6 +1048,9 @@ public class DocumentReindexer {
                 chunksFailed += docResult.getFailedChunks();
                 if (docResult.wasSkipped()) {
                     documentsSkipped++;
+                    if (docResult.getSkipReason() == DocumentResult.SkipReason.NOT_TEXT) {
+                        documentsNotText++;
+                    }
                 } else if (docResult.hasError()) {
                     errors.add(new OperationError("document", docResult.getDocumentId(),
                         docResult.getError()));

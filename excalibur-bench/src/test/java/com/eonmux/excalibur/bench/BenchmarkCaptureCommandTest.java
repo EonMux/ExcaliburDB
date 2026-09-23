@@ -4,6 +4,7 @@ import com.eonmux.excalibur.bench.metric.BenchmarkMetric;
 import com.eonmux.excalibur.bench.metric.BenchmarkResult;
 import com.eonmux.excalibur.bench.metric.BenchmarkResultSet;
 import com.eonmux.excalibur.bench.metric.BenchmarkTargetRegistry;
+import com.eonmux.excalibur.bench.metric.ErroredBenchmark;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -107,6 +108,48 @@ class BenchmarkCaptureCommandTest {
     }
 
     @Test
+    @DisplayName("an errored combination fails the run even when every measured target was met")
+    void erroredCombinationFails(@TempDir Path dir) throws Exception {
+        int exit = command(withErrored(passingRun()))
+            .execute(new String[]{"--capture", "--output", dir.toString()});
+
+        assertThat(exit).isEqualTo(BenchmarkCaptureCommand.EXIT_FAILED);
+        assertThat(stderr()).contains("1 benchmark combination(s) errored");
+        assertThat(stderr()).contains("lookup [size=64] (thrpt)");
+        assertThat(stderr()).contains("java.lang.IllegalStateException: setup exploded");
+        assertThat(stdout()).doesNotContain("PASSED:");
+        assertThat(Files.readString(dir.resolve("benchmark_results.json")))
+            .contains("setup exploded");
+        assertThat(Files.readString(dir.resolve("benchmark_results.md")))
+            .contains("| Errored | 1 |");
+        assertThat(Files.readString(dir.resolve("benchmark_results.csv")))
+            .contains(",errored,");
+        assertThat(Files.readString(dir.resolve("benchmark_results.txt")))
+            .contains("Errored: 1");
+    }
+
+    @Test
+    @DisplayName("a run in which everything errored names the errors rather than 'no results'")
+    void allErroredRunNamesTheErrors(@TempDir Path dir) throws Exception {
+        BenchmarkResultSet run = withErrored(BenchmarkResultSet.builder().name("run").build());
+
+        int exit = command(run).execute(new String[]{"--capture", "--output", dir.toString()});
+
+        assertThat(exit).isEqualTo(BenchmarkCaptureCommand.EXIT_FAILED);
+        assertThat(stderr()).contains("setup exploded");
+    }
+
+    @Test
+    @DisplayName("an errored combination fails a standard run too")
+    void standardModeFailsOnErrors(@TempDir Path dir) throws Exception {
+        int exit = command(withErrored(passingRun())).execute(new String[]{"--output", dir.toString()});
+
+        assertThat(exit).isEqualTo(BenchmarkCaptureCommand.EXIT_FAILED);
+        assertThat(stderr()).contains("setup exploded");
+        assertThat(Files.list(dir)).isEmpty();
+    }
+
+    @Test
     @DisplayName("--pattern selects which benchmarks run")
     void patternIsPassedThrough(@TempDir Path dir) throws Exception {
         command(passingRun()).execute(
@@ -195,6 +238,21 @@ class BenchmarkCaptureCommandTest {
             builder.addTarget(target);
         }
         return setOf(builder.build());
+    }
+
+    private static BenchmarkResultSet withErrored(BenchmarkResultSet run) {
+        return BenchmarkResultSet.builder()
+            .name(run.name())
+            .startTime(run.startTime())
+            .endTime(run.endTime())
+            .results(run.results())
+            .addErrored(new ErroredBenchmark(
+                "com.eonmux.excalibur.bench.benchmark.DemoBenchmark.lookup",
+                "thrpt",
+                java.util.Map.of("size", "64"),
+                "java.lang.IllegalStateException: setup exploded",
+                "java.lang.IllegalStateException: setup exploded\n\tat Demo.setup(Demo.java:1)"))
+            .build();
     }
 
     private static BenchmarkResultSet setOf(BenchmarkResult result) {

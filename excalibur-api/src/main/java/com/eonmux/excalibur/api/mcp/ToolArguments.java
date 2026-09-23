@@ -79,19 +79,50 @@ final class ToolArguments {
      * @throws IllegalArgumentException if it is present and is not a whole number
      */
     static Integer wholeNumber(Map<String, Object> args, String field) {
+        Long value = wholeLong(args, field);
+        if (value == null) {
+            return null;
+        }
+        if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                "Argument '" + field + "' must be a whole number, got: " + args.get(field));
+        }
+        return value.intValue();
+    }
+
+    /**
+     * Reads a whole-number argument that may exceed {@code int} range, or null when the model
+     * sent none.
+     *
+     * <p>For a quantity whose ceiling on the node is past what an {@code int} holds - a file
+     * size the node accepts up to 2 GiB is one. Reading it as an {@code int} would refuse the
+     * top of the range the HTTP API allows, and a limit only one of the two surfaces can reach
+     * is not a limit a model can be told about. The same tolerance as {@link #wholeNumber}
+     * applies: a quoted number is read, a fractional one is refused.</p>
+     *
+     * @param args  The call's arguments
+     * @param field The field name
+     * @return The value, or null
+     * @throws IllegalArgumentException if it is present and is not a whole number
+     */
+    static Long wholeLong(Map<String, Object> args, String field) {
         Object value = args.get(field);
         if (value == null) {
             return null;
         }
+        if (value instanceof Long || value instanceof Integer
+                || value instanceof Short || value instanceof Byte) {
+            // Read exactly: a long past 2^53 does not survive a trip through double.
+            return ((Number) value).longValue();
+        }
         if (value instanceof Number number) {
             double exact = number.doubleValue();
-            if (exact == Math.rint(exact)
-                    && exact >= Integer.MIN_VALUE && exact <= Integer.MAX_VALUE) {
-                return (int) exact;
+            if (exact == Math.rint(exact) && exact >= Long.MIN_VALUE && exact <= Long.MAX_VALUE) {
+                return (long) exact;
             }
         } else if (value instanceof String text) {
             try {
-                return Integer.valueOf(text.trim());
+                return Long.valueOf(text.trim());
             } catch (NumberFormatException e) {
                 throw new IllegalArgumentException(
                     "Argument '" + field + "' must be a whole number, got: " + text, e);
@@ -102,23 +133,43 @@ final class ToolArguments {
     }
 
     /**
-     * Reads a list-of-strings argument.
+     * Reads a true/false argument, or null when the model sent none.
+     *
+     * <p>Null rather than false when absent, because false is a setting of its own: a caller
+     * that says nothing leaves the node's default in place, and one that says false overrules
+     * it. The strings {@code "true"} and {@code "false"} are accepted in any case, for the same
+     * reason a quoted number is; any other value - {@code 1}, {@code "yes"} - is refused, since
+     * guessing which of the two it meant would decide a crawl's reach on the model's behalf.</p>
      *
      * @param args  The call's arguments
      * @param field The field name
-     * @return The non-blank elements, empty when the field is absent
-     * @throws IllegalArgumentException if it is present and is not a list of strings
+     * @return The value, or null
+     * @throws IllegalArgumentException if it is present and is not true or false
      */
-    static List<String> stringList(Map<String, Object> args, String field) {
-        List<String> values = optionalStringList(args, field);
-        return values != null ? values : List.of();
+    static Boolean optionalBoolean(Map<String, Object> args, String field) {
+        Object value = args.get(field);
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Boolean flag) {
+            return flag;
+        }
+        if (value instanceof String text) {
+            String trimmed = text.trim();
+            if ("true".equalsIgnoreCase(trimmed) || "false".equalsIgnoreCase(trimmed)) {
+                return Boolean.valueOf(trimmed.equalsIgnoreCase("true"));
+            }
+        }
+        throw new IllegalArgumentException(
+            "Argument '" + field + "' must be true or false, got: " + value);
     }
 
     /**
      * Reads a list-of-strings argument, telling an empty list apart from an absent one.
      *
-     * <p>The difference matters where the node gives an empty list a meaning of its own, as
-     * with a crawl's exclusions: absent keeps the node's defaults, empty clears them.</p>
+     * <p>The difference matters because the node gives an empty list a meaning of its own:
+     * absent keeps its default, empty clears it. There is deliberately no reader that folds the
+     * two together.</p>
      *
      * @param args  The call's arguments
      * @param field The field name

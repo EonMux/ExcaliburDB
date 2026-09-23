@@ -16,6 +16,9 @@ package com.eonmux.excalibur.bench.kernel;
  */
 public final class FalsePositiveTally {
 
+    /** Standard errors above the specification an observation must be to count as an excess. */
+    private static final double SIGNIFICANCE_SIGMAS = 6.0;
+
     private final double specification;
     private long falsePositives;
     private long queries;
@@ -75,6 +78,43 @@ public final class FalsePositiveTally {
      */
     public boolean meetsSpecification() {
         return queries > 0 && rate() <= specification;
+    }
+
+    /**
+     * Whether the accumulated rate is above the specification by more than sampling error.
+     *
+     * <p>{@link #meetsSpecification()} compares the observed rate with the specification as it
+     * stands, which is the right question for a run that has probed enough keys to pin the rate
+     * down and the wrong one for a correctness check that has to hold on every run: a filter
+     * whose true rate sits just under the specification exceeds it on a fair share of finite
+     * samples. This asks instead whether the observation is inconsistent with the specification
+     * - more than six standard errors above it, plus one collision's worth for a small sample -
+     * which a correct filter essentially never is, while a defect that multiplies the rate is
+     * caught as soon as the sample is large enough to see it.</p>
+     *
+     * <p>The standard error is taken over {@code independentProbes}, not over every recorded
+     * probe. A benchmark that cycles through a fixed set of keys probes each one repeatedly, and
+     * a key whose fingerprint collides collides again on every pass, so a million probes of ten
+     * thousand keys know the rate only as well as ten thousand draws do.</p>
+     *
+     * @param independentProbes how many of the recorded probes were independent draws; values
+     *        above the number of recorded probes are capped at it
+     * @return true if probes were recorded and their rate is significantly above the
+     *         specification
+     * @throws IllegalArgumentException if probes were recorded and {@code independentProbes}
+     *         is not positive
+     */
+    public boolean significantlyExceedsSpecification(long independentProbes) {
+        if (queries == 0) {
+            return false;
+        }
+        if (independentProbes <= 0) {
+            throw new IllegalArgumentException(
+                "independentProbes must be positive, got " + independentProbes);
+        }
+        double draws = Math.min(independentProbes, queries);
+        double standardError = Math.sqrt(specification * (1.0 - specification) / draws);
+        return rate() > specification + SIGNIFICANCE_SIGMAS * standardError + 1.0 / draws;
     }
 
     /**

@@ -1,0 +1,30 @@
+<!--
+  Logging for the backup tool, which is a command rather than a service.
+
+  Everything goes to stderr, and nothing below WARN goes anywhere. stdout is the report: the
+  lines naming the image, its epoch, its consistency and what was omitted from it are what an
+  operator reads and what a wrapper script greps, and a deep verify opens segments, graphs and
+  catalogs through the engine's own classes, each of which narrates its start-up at DEBUG and
+  INFO. Left at logback's default - DEBUG, to stdout - that narration is interleaved with the
+  report and buries it. A WARN still gets through, on stderr, because the few this tool emits
+  are the ones an operator has to act on: a directory whose entries could not be forced, so a
+  name created in it may not survive a crash of the host.
+
+  Named for this tool rather than logback.xml, and selected by -Dlogback.configurationFile in
+  the start scripts (build.gradle.kts). excalibur-fsck's jar is on this tool's classpath, for its
+  checkers, and carries a logback.xml of its own; two resources of the default name make
+  logback print a warning, and its whole status report with it, to stdout - into the report.
+-->
+
+<configuration>
+    <appender name="STDERR" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} : %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="WARN">
+        <appender-ref ref="STDERR"/>
+    </root>
+</configuration>

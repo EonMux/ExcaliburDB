@@ -107,8 +107,14 @@ public class CuckooFilterMemoryMappedBenchmark {
     private CuckooFilter sourceFilter;
 
     /**
+     * Offset at which the offset benchmarks place the filter image: one page, as when several
+     * filters share a segment behind a page-sized header.
+     */
+    private static final long IMAGE_OFFSET = 4096;
+
+    /**
      * Pre-allocated MemorySegment for serialization benchmarks.
-     * Sized to hold the filter exactly.
+     * Sized to hold the filter image at {@link #IMAGE_OFFSET}, which also covers offset zero.
      */
     private MemorySegment targetSegment;
 
@@ -155,7 +161,7 @@ public class CuckooFilterMemoryMappedBenchmark {
      *   <li>Filter capacity is validated as positive</li>
      *   <li>Load factor is clamped to [0.0, 1.0]</li>
      *   <li>Filter is pre-populated to exact target load factor</li>
-     *   <li>Memory segment is sized exactly to filter byte size</li>
+     *   <li>Memory segment holds the filter image at {@link #IMAGE_OFFSET}</li>
      * </ul>
      */
     @Setup(Level.Trial)
@@ -201,7 +207,7 @@ public class CuckooFilterMemoryMappedBenchmark {
 
         // Create shared arena and pre-allocate target segment
         sharedArena = Arena.ofShared();
-        targetSegment = sharedArena.allocate(sourceFilter.byteSize());
+        targetSegment = sharedArena.allocate(IMAGE_OFFSET + sourceFilter.byteSize());
 
         // Create temp directory for file-backed benchmarks
         tempDir = Files.createTempDirectory("cuckoo-filter-bench-");
@@ -334,6 +340,7 @@ public class CuckooFilterMemoryMappedBenchmark {
      * This tests the memory bandwidth without allocation overhead.</p>
      */
     @Benchmark
+    @OperationsPerInvocation(10)
     public int memorySegmentBatchWrite(Blackhole bh) {
         int bytesWritten = 0;
         for (int i = 0; i < 10; i++) {
@@ -478,9 +485,7 @@ public class CuckooFilterMemoryMappedBenchmark {
      */
     @Benchmark
     public void memorySegmentWriteWithOffset(Blackhole bh) {
-        // Use a 4KB offset (one page)
-        long offset = 4096;
-        sourceFilter.writeTo(targetSegment, offset);
+        sourceFilter.writeTo(targetSegment, IMAGE_OFFSET);
         bh.consume(targetSegment);
     }
 
@@ -492,13 +497,11 @@ public class CuckooFilterMemoryMappedBenchmark {
      */
     @Benchmark
     public CuckooFilter memorySegmentReadWithOffset(Blackhole bh) {
-        long offset = 4096;
-
         // Write at offset first
-        sourceFilter.writeTo(targetSegment, offset);
+        sourceFilter.writeTo(targetSegment, IMAGE_OFFSET);
 
         // Read from offset
-        CuckooFilter loaded = CuckooFilter.readFrom(targetSegment, offset);
+        CuckooFilter loaded = CuckooFilter.readFrom(targetSegment, IMAGE_OFFSET);
 
         bh.consume(loaded);
         return loaded;

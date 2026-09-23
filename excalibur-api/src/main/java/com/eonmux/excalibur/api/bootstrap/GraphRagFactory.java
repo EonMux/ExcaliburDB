@@ -11,7 +11,6 @@ import com.eonmux.excalibur.retrieval.rerank.BatchedLlmReranker;
 import com.eonmux.excalibur.retrieval.rerank.LexicalCandidateText;
 import com.eonmux.excalibur.retrieval.rerank.LlmBatchRelevanceModel;
 import com.eonmux.excalibur.llm.client.LLMHttpClient;
-import com.eonmux.excalibur.llm.client.LLMClientConfig;
 import com.eonmux.excalibur.retrieval.rerank.EmbeddingGatedRanker;
 import com.eonmux.excalibur.retrieval.rerank.FullPrecisionReranker;
 import com.eonmux.excalibur.vector.distance.DistanceFunctions;
@@ -63,9 +62,6 @@ import java.util.Objects;
 public final class GraphRagFactory {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(GraphRagFactory.class);
-
-    /** Subdirectory of the data directory holding the graph, when none is configured. */
-    public static final String DEFAULT_DIRECTORY = "graph";
 
     /** Lucene index over document text, searched by the lexical retrieval signal. */
     public static final String DOCUMENT_INDEX = "documents";
@@ -150,32 +146,18 @@ public final class GraphRagFactory {
     }
 
     /**
-     * Opens a single store under a data directory, at {@code <dataDir>/graph}.
+     * Opens the graph-RAG stack from a graph directory.
      *
-     * <p>Deliberately not a reader of {@code excalibur.graph.path}: that key names the root the
-     * node serves <em>namespaces</em> from, and a store lives one level inside it. Resolving it
-     * here would give this method and the running node two different answers for the same
-     * configuration - which is how a previous version of this class came to open a graph at a
-     * path nothing served.</p>
+     * <p>Every way the stack is opened takes the directory itself rather than resolving one
+     * from configuration. {@code excalibur.graph.path} names the root the node
+     * serves <em>namespaces</em> from and a store lives one level inside it, at
+     * {@link GraphTenant#GRAPH_SUBDIRECTORY} under its namespace; a second resolver here would be
+     * a second answer to where a graph is, and one of the two would eventually open a path the
+     * node does not serve. A caller that has just built a graph reopens the directory it wrote.</p>
      *
-     * @param config  Application configuration, for the read-side settings
-     * @param dataDir The node's data directory
-     * @return The opened stack, or null when there is no graph there
-     * @throws IOException if a graph is present but cannot be opened
-     */
-    public static GraphRag open(Config config, Path dataDir) throws IOException {
-        Objects.requireNonNull(config, "config cannot be null");
-        Objects.requireNonNull(dataDir, "dataDir cannot be null");
-        return openAt(config, dataDir.resolve(DEFAULT_DIRECTORY));
-    }
-
-    /**
-     * Opens the graph-RAG stack from a directory that is already resolved.
-     *
-     * <p>For a caller that has just built the graph and must reopen the directory it wrote rather
-     * than the one configuration would resolve. Those are the same path in every ordinary
-     * deployment and are not when {@code excalibur.graph.path} is set, where re-resolving would
-     * reopen somewhere else entirely.
+     * <p>With model clients of its own, which is right for a process that opens one graph - a
+     * calibration run, a tool. A node serving several passes the one {@link GraphModelClients}
+     * they share to {@link #openAt(Config, Path, GraphModelClients)}.</p>
      *
      * @param config    Configuration, for the read-side settings
      * @param directory The graph directory
@@ -184,7 +166,33 @@ public final class GraphRagFactory {
      */
     public static GraphRag openAt(Config config, Path directory) throws IOException {
         Objects.requireNonNull(config, "config cannot be null");
+        return openAt(config, directory, GraphModelClients.forConfig(config));
+    }
+
+    /**
+     * Opens the graph-RAG stack from a graph directory, reranking and embedding through clients
+     * shared with every other graph the caller serves.
+     *
+     * <p>See {@link GraphModelClients} for why a node has one of each rather than one per graph:
+     * the breaker in front of a model call describes the endpoint, and every graph calls the same
+     * one.</p>
+     *
+     * <p>This is the entry point for a directory found as it was left - at startup, when a
+     * tenant is opened, after a compaction - so it first puts back a graph that a publish
+     * interrupted by a crash displaced. A publish opening what it has just renamed into place
+     * uses {@link #openPublished(Config, Path, GraphModelClients)} instead.</p>
+     *
+     * @param config    Configuration, for the read-side settings
+     * @param directory The graph directory
+     * @param models    The model clients to rerank and embed through
+     * @return The opened stack, or null when the directory is not there
+     * @throws IOException if the directory exists but cannot be opened
+     */
+    public static GraphRag openAt(Config config, Path directory, GraphModelClients models)
+            throws IOException {
+        Objects.requireNonNull(config, "config cannot be null");
         Objects.requireNonNull(directory, "directory cannot be null");
+        Objects.requireNonNull(models, "models cannot be null");
 
         com.eonmux.excalibur.graph.staging.GraphBuilder.recoverInterruptedPublish(directory);
         if (!Files.isDirectory(directory)) {
@@ -192,7 +200,51 @@ public final class GraphRagFactory {
                 directory);
             return null;
         }
+        return open(config, directory, models);
+    }
 
+    /**
+     * Opens the graph a publish has just renamed into place, and nothing else.
+     *
+     * <p>The opener a publish hands this to runs while the graph it replaces sits beside the
+     * target under {@link com.eonmux.excalibur.graph.staging.GraphBuilder#previousFor(Path)},
+     * kept there so that a graph which fails to open can be rolled back. That is exactly the
+     * layout crash recovery reads as "a publish that completed its rename", and recovery deletes
+     * the previous copy - so {@link #openAt(Config, Path, GraphModelClients)}, which recovers
+     * before it opens, would destroy the fallback on the one path that exists to need it, and a
+     * failed open would roll back to nothing. This opens without recovering; recovery belongs to
+     * the paths that find a directory as a crash left it, not to one in the middle of changing
+     * it.</p>
+     *
+     * @param config    Configuration, for the read-side settings
+     * @param directory The directory the publish put the new graph in
+     * @param models    The model clients to rerank and embed through
+     * @return The opened stack
+     * @throws IOException if the directory is absent or cannot be opened
+     */
+    public static GraphRag openPublished(Config config, Path directory, GraphModelClients models)
+            throws IOException {
+        Objects.requireNonNull(config, "config cannot be null");
+        Objects.requireNonNull(directory, "directory cannot be null");
+        Objects.requireNonNull(models, "models cannot be null");
+
+        if (!Files.isDirectory(directory)) {
+            throw new IOException("the published graph is not at " + directory);
+        }
+        return open(config, directory, models);
+    }
+
+    /**
+     * Opens every artifact of a graph directory that is known to be there.
+     *
+     * @param config    Configuration, for the read-side settings
+     * @param directory The graph directory
+     * @param models    The model clients to rerank and embed through
+     * @return The opened stack
+     * @throws IOException if an artifact cannot be opened
+     */
+    private static GraphRag open(Config config, Path directory, GraphModelClients models)
+            throws IOException {
         GraphConfig settings = config.graph();
         Deque<AutoCloseable> opened = new ArrayDeque<>();
         try {
@@ -234,14 +286,14 @@ public final class GraphRagFactory {
                 // One signal, whose scores are handed through rather than fused: abstention
                 // reads them, and on the unit scale every stage below reports they measure the
                 // evidence. Reciprocal rank fusion would replace each with a function of its rank.
-                new HybridRetriever(List.of(rankerFor(config, documents, entityVectors)),
+                new HybridRetriever(List.of(rankerFor(config, models, documents, entityVectors)),
                     new ScorePassthrough(), config.query().getPerSignalOverFetch()),
                 new TripleSubgraphSerializer(entityNames, relationNames),
                 abstentionFor(settings),
                 new SerializationBudget(
                     settings.getContextTokenBudget(), BpeTokenCounter.defaultCounter()),
                 settings.getTopK(),
-                embedderFor(config, entityVectors),
+                embedderFor(models, entityVectors),
                 relationResolverFor(relationNames),
                 entityNames);
 
@@ -268,8 +320,8 @@ public final class GraphRagFactory {
      * <p>BM25 ranks by term overlap, which is what makes it a good first pass and a poor last one:
      * it cannot tell a passage that mentions the query's words from one that answers it. Reranking
      * the top of that list with a model is the step that separates them, and it is bounded - one
-     * call over a capped number of candidates, behind the same circuit breaker as every other model
-     * call, falling back to the BM25 order when the model is unavailable.</p>
+     * call over a capped number of candidates, behind the one circuit breaker every graph on the
+     * node reranks through, falling back to the order before it when the model is unavailable.</p>
      *
      * <p>Without an API key there is no model to ask, and the BM25 ranking is returned as it is.
      * That is a weaker answer, not a broken one.</p>
@@ -280,11 +332,14 @@ public final class GraphRagFactory {
      * similarity, and the model as the relevance it judged. A stage that falls back hands on the
      * scale of the stage before it, which is the same scale.</p>
      *
-     * @param config    Configuration, read for the LLM settings and the context budget
+     * @param config    Configuration, read for the distance metric and the context budget
+     * @param models    The node's model clients; the rerank goes through its chat client
      * @param documents The index over each entity's text
+     * @param vectors   The stored entity vectors, or null when the graph has none
      * @return The ranker the retriever should use
      */
-    private static Ranker rankerFor(Config config, LexicalIndex documents,
+    private static Ranker rankerFor(Config config, GraphModelClients models,
+                                    LexicalIndex documents,
                                     com.eonmux.excalibur.graph.vector.EntityVectors vectors) {
         // As a share of the attainable score rather than raw BM25, so that min-score reads the
         // same for a question naming a rare entity as for one naming a common one.
@@ -303,16 +358,15 @@ public final class GraphRagFactory {
                 ranked);
         }
 
-        String apiKey = config.llm().getApiKey();
-        if (apiKey == null || apiKey.isBlank()) {
+        LLMHttpClient client = models.rerankClient();
+        if (client == null) {
             LOGGER.info("No LLM API key; graph retrieval ranks by BM25{}",
                 vectors == null ? "" : " with an exact vector rerank");
             return ranked;
         }
 
         // And the most expensive correction last, over the smallest set: one model call, capped,
-        // behind the breaker every other model call uses.
-        LLMHttpClient client = new LLMHttpClient(LLMClientConfig.fromConfig(config.llm()));
+        // behind the breaker every graph on this node reranks through.
         return new BatchedLlmReranker(
             ranked,
             new LlmBatchRelevanceModel(client),
@@ -329,17 +383,23 @@ public final class GraphRagFactory {
      * entity vectors nothing in the chain reads the embedding, and producing one would be a model
      * call per query for nothing.</p>
      *
-     * @param config  Configuration, for the LLM settings
+     * <p>Checked in that order, so a node whose graphs carry no vectors never creates the
+     * embedding client - and so never reports a breaker in front of calls it does not make.</p>
+     *
+     * @param models  The node's model clients; the question is embedded through its embedding
+     *                client
      * @param vectors The stored entity vectors, or null when the graph has none
      * @return The embedder, or null
      */
     private static GraphRagPipeline.QueryEmbedder embedderFor(
-            Config config, com.eonmux.excalibur.graph.vector.EntityVectors vectors) {
-        String apiKey = config.llm().getApiKey();
-        if (vectors == null || apiKey == null || apiKey.isBlank()) {
+            GraphModelClients models, com.eonmux.excalibur.graph.vector.EntityVectors vectors) {
+        if (vectors == null) {
             return null;
         }
-        EmbeddingClient client = new EmbeddingClient(LLMClientConfig.fromConfig(config.llm()));
+        EmbeddingClient client = models.queryEmbeddingClient();
+        if (client == null) {
+            return null;
+        }
         return text -> client.embedWithCircuitBreaker(text);
     }
 

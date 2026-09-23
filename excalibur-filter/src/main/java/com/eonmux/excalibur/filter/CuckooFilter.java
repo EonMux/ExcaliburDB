@@ -83,13 +83,15 @@ import java.util.concurrent.locks.StampedLock;
  *   <li>Reads: optimistic and lock-free while no displacement is running. A bucket is read
  *       byte by byte, so a read is not atomic on its own; correctness comes from the
  *       displacement barrier below, not from the width of the read.</li>
- *   <li>Writes: striped locks by bucket index modulo 64, taken in stripe order.</li>
+ *   <li>Writes: the insert and delete fast paths hold the shared side of the displacement
+ *       barrier and one striped lock (bucket index modulo 64) at a time.</li>
  *   <li>Displacement barrier: a cuckoo displacement chain moves a victim out of one bucket
  *       before re-homing it in the next iteration, so mid-chain the victim is in neither of
  *       its two buckets. {@link #displace} therefore runs under the exclusive side of a
  *       {@link StampedLock}; readers validate an optimistic stamp and retry under the shared
  *       side if a displacement overlapped them. This is what makes the no-false-negatives
- *       guarantee hold for concurrent readers.</li>
+ *       guarantee hold for concurrent readers. The exclusive side also excludes every other
+ *       writer, so the chain itself takes no stripe locks.</li>
  * </ul>
  *
  * <h2>Insertion Graceful Failure Guarantee (CRITICAL)</h2>
@@ -157,6 +159,15 @@ public class CuckooFilter {
     private static final int CACHE_LINE_SIZE = 64;
     private static final int ALIGNED_BYTES_PER_BUCKET = 8;
 
+    // A bucket read as one word. Unaligned because the segment's base address is whatever the
+    // caller mapped; the bucket stride keeps each word inside its own bucket regardless.
+    private static final ValueLayout.OfLong BUCKET_WORD =
+        ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+
+    // Packing of one displacement-path entry: fingerprints are at most 16 bits wide.
+    private static final int PATH_SLOT_SHIFT = 16;
+    private static final int PATH_FINGERPRINT_MASK = (1 << PATH_SLOT_SHIFT) - 1;
+
     // Configuration
     private final int fingerprintBits;
     private final int fingerprintMask;
@@ -190,6 +201,11 @@ public class CuckooFilter {
     // the displacement barrier, so no further synchronization is needed.
     private long victimSelectionState;
 
+    // The slot and evicted fingerprint of each step of the running displacement chain, packed
+    // as (slot << PATH_SLOT_SHIFT) | fingerprint. Allocated on the first chain and reused:
+    // like victimSelectionState it is only touched under the exclusive displacement barrier.
+    private int[] displacementPath;
+
     // Arena owning the off-heap bucket storage, or null when the segment was supplied
     // by the caller. Automatic arenas release their memory once the filter becomes
     // unreachable, which is the only ownership model a class without close() can honour.
@@ -219,6 +235,37 @@ public class CuckooFilter {
     }
 
     /**
+     * How many buckets a filter created for {@code capacity} entries has.
+     *
+     * <p>Always a power of two, and never smaller for a larger capacity.</p>
+     *
+     * @param capacity The entries the filter is sized for
+     * @return The bucket count {@link #create} would give it
+     */
+    public static long bucketsFor(long capacity) {
+        long minBuckets = (capacity + FINGERPRINTS_PER_BUCKET - 1) / FINGERPRINTS_PER_BUCKET;
+        return nextPowerOfTwo(Math.max(minBuckets * 2, MIN_BUCKETS));
+    }
+
+    /**
+     * Rounds up to a power of two, which is what the bucket index depends on.
+     *
+     * <p>Rounding down would silently cancel the doubling above: twice the minimum for a
+     * capacity of 1000 is 500 buckets, and the largest power of two at or below 500 is 256 -
+     * fewer slots than the doubling is there to provide.</p>
+     *
+     * @param value The least acceptable number of buckets
+     * @return The smallest power of two at or above it, and never below {@link #MIN_BUCKETS}
+     */
+    private static long nextPowerOfTwo(long value) {
+        if (value <= MIN_BUCKETS) {
+            return MIN_BUCKETS;
+        }
+        long highest = Long.highestOneBit(value);
+        return highest == value ? value : highest << 1;
+    }
+
+    /**
      * Creates a new CuckooFilter with an explicit hash seed.
      *
      * <p>The seed selects the fingerprint and bucket assignment of every item, and also seeds
@@ -234,37 +281,6 @@ public class CuckooFilter {
      * @return A new CuckooFilter instance
      * @throws IllegalArgumentException if fingerprintBits is not in range [8, 16]
      */
-    /**
-     * Rounds up to a power of two, which is what the bucket index depends on.
-     *
-     * <p>Rounding down would silently cancel the doubling above: twice the minimum for a
-     * capacity of 1000 is 500 buckets, and the largest power of two at or below 500 is 256 -
-     * fewer slots than the doubling is there to provide.</p>
-     *
-     * @param value The least acceptable number of buckets
-     * @return The smallest power of two at or above it, and never below {@link #MIN_BUCKETS}
-     */
-    /**
-     * How many buckets a filter created for {@code capacity} entries has.
-     *
-     * <p>Always a power of two, and never smaller for a larger capacity.</p>
-     *
-     * @param capacity The entries the filter is sized for
-     * @return The bucket count {@link #create} would give it
-     */
-    public static long bucketsFor(long capacity) {
-        long minBuckets = (capacity + FINGERPRINTS_PER_BUCKET - 1) / FINGERPRINTS_PER_BUCKET;
-        return nextPowerOfTwo(Math.max(minBuckets * 2, MIN_BUCKETS));
-    }
-
-    private static long nextPowerOfTwo(long value) {
-        if (value <= MIN_BUCKETS) {
-            return MIN_BUCKETS;
-        }
-        long highest = Long.highestOneBit(value);
-        return highest == value ? value : highest << 1;
-    }
-
     public static CuckooFilter create(long capacity, int fingerprintBits, long seed) {
         if (fingerprintBits < 8 || fingerprintBits > 16) {
             throw new IllegalArgumentException(
@@ -623,6 +639,36 @@ public class CuckooFilter {
      */
     public long count() {
         return count.get();
+    }
+
+    /**
+     * Empties the filter in place.
+     *
+     * <p>In place rather than by replacement because a filter is shared by reference: a
+     * hierarchy level is held by the hierarchy, the maintenance worker and the metrics worker at
+     * once, and a replacement reaches only whichever holder the caller re-points. Emptying the
+     * one instance they all hold keeps them looking at the same filter.</p>
+     *
+     * <p>Runs under the exclusive side of the displacement barrier, so no insert, delete or
+     * displacement is inside a bucket while it is zeroed, and every reader whose optimistic read
+     * overlapped it retries and sees the empty filter. The integrity mark is left as it is: a
+     * live filter is already marked open, and emptying it is one more change of the kind that
+     * mark already says has happened.</p>
+     *
+     * @throws UnsupportedOperationException if the filter was opened over a read-only image
+     */
+    public void clear() {
+        if (segment.isReadOnly()) {
+            throw new UnsupportedOperationException("a filter over a read-only image cannot be "
+                + "cleared");
+        }
+        long stamp = displacementBarrier.writeLock();
+        try {
+            segment.asSlice(bucketDataOffset, numBuckets * bytesPerBucket).fill((byte) 0);
+            count.set(0);
+        } finally {
+            displacementBarrier.unlockWrite(stamp);
+        }
     }
 
     /**
@@ -1143,97 +1189,108 @@ public class CuckooFilter {
     /**
      * Runs the displacement chain. The caller must hold the exclusive displacement barrier.
      *
+     * <h3>No stripe locks</h3>
+     * <p>Every other writer - the insert and delete fast paths, and {@link #clear()} - holds
+     * one side or the other of the displacement barrier while it touches a bucket, so the
+     * exclusive side already keeps them all out of every bucket for the whole chain. Taking
+     * the stripe locks as well bought nothing and cost two lock round trips per step.</p>
+     *
+     * <h3>One-step look-ahead</h3>
+     * <p>Before kicking a random victim out of a full bucket, the chain checks whether any
+     * occupant's alternate bucket has a free slot and, if one has, moves that occupant there
+     * and finishes. A random walk only discovers such a slot one kick later - and, just as
+     * often, kicks a different occupant into another full bucket instead. At 95% load this
+     * shortens the average chain several-fold, and it is the kick count, not the per-kick
+     * cost, that dominates an insert near capacity.</p>
+     *
+     * <h3>Rollback from the victims alone</h3>
+     * <p>A step records only the slot it overwrote and the fingerprint it evicted. The
+     * alternate index is an involution - {@code alt(alt(b, fp), fp) == b} - so walking the
+     * record backwards from the bucket the last victim was headed for recovers every bucket
+     * of the chain. The record is kept between chains and reused, since the exclusive barrier
+     * means only one chain ever runs at a time; a filter that never fills never allocates it.</p>
+     *
      * @param bucket1     Bucket the chain starts from
      * @param fingerprint Fingerprint to insert
      * @return {@code true} if successful, {@code false} after a full rollback
      */
     private boolean displaceExclusive(long bucket1, int fingerprint) {
-        // Track displacement path for rollback if needed
-        // Each entry: [bucketIndex, slot, originalFingerprint]
-        long[] pathBuckets = new long[maxDisplacements];
-        int[] pathSlots = new int[maxDisplacements];
-        int[] pathFingerprints = new int[maxDisplacements];
+        int[] path = displacementPath;
+        if (path == null) {
+            path = new int[maxDisplacements];
+            displacementPath = path;
+        }
         int pathLength = 0;
 
         long currentBucket = bucket1;
         int currentFingerprint = fingerprint;
 
         for (int i = 0; i < maxDisplacements; i++) {
-            // Compute alternate bucket for the CURRENT fingerprint
-            // This is crucial: each fingerprint has its own pair of buckets
-            long altBucket = computeBucket2(currentBucket, currentFingerprint);
+            long word = readBucket(currentBucket);
+            int free = emptySlot(word);
+            if (free >= 0) {
+                writeFingerprint(currentBucket, free, currentFingerprint);
+                incrementCount();
+                return true;
+            }
 
-            // Order the two acquisitions by LOCK STRIPE, not by bucket index. Stripes are
-            // bucketIndex % 64, so bucket order and stripe order disagree as soon as there
-            // are more than 64 buckets, and ordering by bucket index lets two threads take
-            // the same pair of stripes in opposite orders (ABBA deadlock).
-            ReentrantLock firstLock = locks[Math.min(stripeOf(currentBucket), stripeOf(altBucket))];
-            ReentrantLock secondLock = locks[Math.max(stripeOf(currentBucket), stripeOf(altBucket))];
-
-            firstLock.lock();
-            try {
-                secondLock.lock(); // Reentrant when both buckets share a stripe
-                try {
-                    // First, try to find an empty slot in current bucket
-                    for (int slot = 0; slot < FINGERPRINTS_PER_BUCKET; slot++) {
-                        if (readFingerprint(currentBucket, slot) == 0) {
-                            writeFingerprint(currentBucket, slot, currentFingerprint);
-                            incrementCount();
-                            return true;
-                        }
-                    }
-
-                    // No empty slot - need to displace a victim
-                    int victimSlot = nextVictimSlot();
-                    int victimFingerprint = readFingerprint(currentBucket, victimSlot);
-
-                    if (victimFingerprint == 0) {
-                        // Race condition - slot became empty
-                        writeFingerprint(currentBucket, victimSlot, currentFingerprint);
-                        incrementCount();
-                        return true;
-                    }
-
-                    // Record victim for potential rollback BEFORE displacing
-                    pathBuckets[pathLength] = currentBucket;
-                    pathSlots[pathLength] = victimSlot;
-                    pathFingerprints[pathLength] = victimFingerprint;
-                    pathLength++;
-
-                    // Displace the victim: put current fingerprint in victim's slot
-                    writeFingerprint(currentBucket, victimSlot, currentFingerprint);
-
-                    // Now we need to find a home for the victim
-                    // The victim goes to its alternate bucket
-                    currentBucket = computeBucket2(currentBucket, victimFingerprint);
-                    currentFingerprint = victimFingerprint;
-
-                } finally {
-                    secondLock.unlock();
+            for (int slot = 0; slot < FINGERPRINTS_PER_BUCKET; slot++) {
+                int occupant = extractFingerprintFromLong(word, slot);
+                long alternate = computeBucket2(currentBucket, occupant);
+                int alternateFree = emptySlot(readBucket(alternate));
+                if (alternateFree >= 0) {
+                    writeFingerprint(alternate, alternateFree, occupant);
+                    writeFingerprint(currentBucket, slot, currentFingerprint);
+                    incrementCount();
+                    return true;
                 }
-            } finally {
-                firstLock.unlock();
             }
+
+            int victimSlot = nextVictimSlot();
+            int victimFingerprint = extractFingerprintFromLong(word, victimSlot);
+            path[pathLength++] = (victimSlot << PATH_SLOT_SHIFT) | victimFingerprint;
+            writeFingerprint(currentBucket, victimSlot, currentFingerprint);
+            currentBucket = computeBucket2(currentBucket, victimFingerprint);
+            currentFingerprint = victimFingerprint;
         }
 
-        // CRITICAL: Max displacements exceeded - ROLLBACK to prevent false negatives
-        // Restore all displaced victims to their original positions
+        // Max displacements exceeded: put every victim back where it was, newest first, so a
+        // slot the chain overwrote more than once ends holding its original occupant.
+        long bucket = currentBucket;
         for (int i = pathLength - 1; i >= 0; i--) {
-            long bucket = pathBuckets[i];
-            int slot = pathSlots[i];
-            int originalFingerprint = pathFingerprints[i];
+            int victim = path[i] & PATH_FINGERPRINT_MASK;
+            bucket = computeBucket2(bucket, victim);
+            writeFingerprint(bucket, path[i] >>> PATH_SLOT_SHIFT, victim);
+        }
+        return false;
+    }
 
-            // Restore the original fingerprint
-            // The slot currently holds the "new" fingerprint that was displacing it
-            acquireLock(bucket);
-            try {
-                writeFingerprint(bucket, slot, originalFingerprint);
-            } finally {
-                releaseLock(bucket);
+    /**
+     * Reads a whole bucket as one big-endian word, for {@link #extractFingerprintFromLong}.
+     *
+     * <p>A plain read: only the displacement chain uses it, and the exclusive barrier it holds
+     * keeps every writer out.</p>
+     *
+     * @param bucketIndex The bucket index
+     * @return The bucket's eight bytes, first byte most significant
+     */
+    private long readBucket(long bucketIndex) {
+        return segment.get(BUCKET_WORD, getBucketOffset(bucketIndex));
+    }
+
+    /**
+     * Finds the first empty slot of a bucket word read by {@link #readBucket}.
+     *
+     * @param word The bucket word
+     * @return The slot index, or -1 when all slots are occupied
+     */
+    private int emptySlot(long word) {
+        for (int slot = 0; slot < FINGERPRINTS_PER_BUCKET; slot++) {
+            if (extractFingerprintFromLong(word, slot) == 0) {
+                return slot;
             }
         }
-
-        return false; // Max displacements exceeded - insertion failed, but filter state is restored
+        return -1;
     }
 
     /**

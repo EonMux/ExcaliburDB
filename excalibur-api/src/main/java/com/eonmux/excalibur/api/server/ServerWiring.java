@@ -26,7 +26,6 @@ import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.shard.allocator.VolumeManager;
 import com.eonmux.excalibur.config.Config;
-import com.eonmux.excalibur.llm.client.LLMHttpClient;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
 import com.eonmux.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
@@ -103,14 +102,14 @@ final class ServerWiring {
      */
     private volatile SourceRegistry ingestSourceRegistry;
 
-    // Optional reindexing components (may be null for stub mode)
+    // Optional reindexing components; null when POST /v1/reindex answers 503
     private DocumentReindexer documentReindexer;
     private SourceResolver sourceResolver;
 
     /** Builds an ingestion pipeline and everything that follows from having one. */
     private final IngestionPipelineWiring ingestion;
 
-    // Optional ingestion pipeline components (may be null for stub mode)
+    // Optional ingestion pipeline components; null when sources register but nothing crawls them
     private EmbeddingClient embeddingClient;
     private IngestionOrchestrator ingestionOrchestrator;
 
@@ -251,9 +250,14 @@ final class ServerWiring {
         return ingestSourceRegistry;
     }
 
-    /** @return Background ingestion, or null when ingestion runs in stub mode */
+    /** @return Background ingestion, or null when no ingestion pipeline is wired */
     IngestionOrchestrator ingestionOrchestrator() {
         return ingestionOrchestrator;
+    }
+
+    /** @return The service behind {@code POST /v1/erasure}, or null when none is wired */
+    DocumentErasureService documentErasure() {
+        return documentErasure;
     }
 
     /**
@@ -354,8 +358,8 @@ final class ServerWiring {
     /**
      * Attaches a reindexer and the resolver it looks source ids up in, or clears both.
      *
-     * @param reindexer The document reindexer, or null for stub mode
-     * @param resolver  The source resolver, or null for stub mode
+     * @param reindexer The document reindexer, or null to have reindex requests answered 503
+     * @param resolver  The source resolver, or null alongside a null reindexer
      * @throws IllegalArgumentException if only one parameter is null
      */
     void withReindexer(DocumentReindexer reindexer, SourceResolver resolver) {
@@ -367,7 +371,7 @@ final class ServerWiring {
         this.sourceResolver = resolver;
         wireScheduledReindex();
         LOGGER.info("Document reindexer configured: {}",
-            reindexer != null ? "enabled" : "disabled (stub mode)");
+            reindexer != null ? "enabled" : "disabled (POST /v1/reindex answers 503)");
     }
 
     /**
@@ -425,30 +429,6 @@ final class ServerWiring {
      */
     boolean isDocumentAtomicityEnabled() {
         return ingestion.isDocumentAtomicityEnabled();
-    }
-
-    /**
-     * Attaches an ingestion pipeline that embeds through the given LLM client.
-     *
-     * @param textChunker The text chunker for splitting documents into chunks
-     * @param llmClient   The LLM client for generating embeddings
-     * @throws NullPointerException if any parameter is null
-     */
-    void withIngestionPipeline(TextChunker textChunker, LLMHttpClient llmClient) {
-        adopt(ingestion.attach(textChunker, llmClient, queryPipeline));
-    }
-
-    /**
-     * Attaches an ingestion pipeline on a visibility tracker somebody else owns.
-     *
-     * @param textChunker       The text chunker for splitting documents into chunks
-     * @param embeddings        The embedding client for generating embeddings
-     * @param visibilityTracker The document visibility tracker, or null for none
-     * @throws NullPointerException if textChunker or embeddings is null
-     */
-    void withIngestionPipeline(TextChunker textChunker, EmbeddingClient embeddings,
-                               DocumentVisibilityTracker visibilityTracker) {
-        adopt(ingestion.attach(textChunker, embeddings, visibilityTracker, queryPipeline));
     }
 
     /**

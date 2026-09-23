@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.store;
 
+import com.eonmux.excalibur.core.util.StopSignal;
 import com.eonmux.excalibur.store.Segment.SegmentSplitSnapshot;
 import com.eonmux.excalibur.store.format.SegmentEntry;
 
@@ -192,6 +193,17 @@ public class SplitWorker {
 
     private volatile Thread workerThread;
 
+    /**
+     * How the background loop is told to stop, replaced on every {@link #start()}.
+     *
+     * <p>Never an interrupt. A split writes two children through channels it maps and grows,
+     * forces them, and publishes them into routing that queries and writers read next; an
+     * interrupt landing on one of those channel operations closes the channel and leaves the
+     * split with children it can neither finish nor retire. The signal is read between segments
+     * and wakes the pause between sweeps.</p>
+     */
+    private volatile StopSignal stopSignal = new StopSignal();
+
     // ==================== Constructors ====================
 
     /**
@@ -283,10 +295,12 @@ public class SplitWorker {
         if (running.compareAndSet(false, true)) {
             stopped.set(false);
 
+            StopSignal signal = new StopSignal();
+            stopSignal = signal;
             // Create and start a virtual thread
             workerThread = Thread.ofVirtual().name("excalibur-split-worker").start(() -> {
                 LOGGER.log(Level.INFO, "Split worker started");
-                runSplitLoop();
+                runSplitLoop(signal);
             });
 
             return true;
@@ -317,35 +331,45 @@ public class SplitWorker {
      * <p>A worker whose loop was never started still drains the splits requested of it.
      * Requests that arrive from here on are refused rather than started, because after this
      * returns there is nothing left that would wait for them.</p>
+     *
+     * @return true if no split this worker started is still running, false if the wait expired
+     *         first and the Arena must be left open
      */
-    public void stop() {
-        if (stopped.compareAndSet(false, true)) {
+    public boolean stop() {
+        boolean first = stopped.compareAndSet(false, true);
+        if (first) {
             running.set(false);
-
-            long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(stopTimeoutMs);
-            awaitSplitLoop(deadlineNanos);
-            awaitRequestedSplits(deadlineNanos);
-
+        }
+        // Outside the guard, so a second call waits again for whatever the first left running
+        // instead of answering from a snapshot of it.
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(stopTimeoutMs);
+        awaitSplitLoop(deadlineNanos);
+        awaitRequestedSplits(deadlineNanos);
+        if (first) {
             LOGGER.log(Level.INFO, "Split worker stopped. Total splits: {0}, entries split: {1}",
                 new Object[] { splitCount.get(), entriesSplit.get() });
         }
+        Thread loop = workerThread;
+        return (loop == null || !loop.isAlive()) && requestedSplitThreads.isEmpty();
     }
 
     /**
-     * Interrupts the background loop and waits for it to leave whatever sweep it was in.
+     * Asks the background loop to stop and waits for it to leave whatever sweep it was in.
      *
-     * <p>The interrupt lands on the sleep between sweeps; a split already under way is not
-     * abandoned partway, because it publishes two children and retires their parent in an
-     * order that only makes sense run to completion.</p>
+     * <p>The stop signal wakes the pause between sweeps and is read between segments; a split
+     * already under way is not abandoned partway, because it publishes two children and retires
+     * their parent in an order that only makes sense run to completion - and it is not
+     * interrupted, because an interrupt reaching it inside a channel operation closes that
+     * channel and leaves exactly the half-done split this avoids.</p>
      *
      * @param deadlineNanos Nanotime the whole shutdown wait is bounded by
      */
     private void awaitSplitLoop(long deadlineNanos) {
+        stopSignal.request();
         Thread loop = workerThread;
         if (loop == null) {
             return;
         }
-        loop.interrupt();
         joinUntil(loop, deadlineNanos);
         if (loop.isAlive()) {
             LOGGER.log(Level.WARNING, "The split loop did not finish within {0}ms; a scheduled "
@@ -546,8 +570,8 @@ public class SplitWorker {
     /**
      * Main split loop that runs in the background virtual thread.
      */
-    private void runSplitLoop() {
-        while (running.get() && !stopped.get()) {
+    private void runSplitLoop(StopSignal signal) {
+        while (running.get() && !stopped.get() && !signal.isRequested()) {
             try {
                 // Find and split eligible segments
                 List<Segment> candidates = findSplitCandidates();
@@ -558,7 +582,7 @@ public class SplitWorker {
                     // Split up to maxConcurrentSplits at a time
                     int splitCount = 0;
                     for (Segment segment : candidates) {
-                        if (!running.get() || stopped.get()) {
+                        if (!running.get() || stopped.get() || signal.isRequested()) {
                             break;
                         }
                         if (splitCount >= maxConcurrentSplits) {
@@ -574,11 +598,12 @@ public class SplitWorker {
                     }
                 }
 
-                // Sleep until next check
-                Thread.sleep(splitIntervalMs);
+                // Until the next check, or until stop() asks the loop to end.
+                if (signal.pause(splitIntervalMs)) {
+                    break;
+                }
 
             } catch (InterruptedException e) {
-                // Expected during shutdown
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception e) {
@@ -925,6 +950,40 @@ public class SplitWorker {
          * @param rightChild The right child segment (entries whose split bit is 1)
          */
         void onSplitComplete(Segment parent, Segment leftChild, Segment rightChild);
+
+        /**
+         * Told, as a split observer, that a split is about to become reachable.
+         *
+         * <p>Called with the directory lock held, after the children's indices are fixed and
+         * before any key routes to either child. An observer that keeps state per segment which
+         * the children's entries will not reach by themselves - a membership filter filled by
+         * writes, for one - marks it here, because {@link #onSplitComplete} comes only after the
+         * children are routed to and have started taking writes. Anything done here holds up
+         * every routing decision in the engine, so it must be cheap and must not block. A
+         * throw is logged and does not stop the split. The worker's own listener, which
+         * publishes the split, is never called with this.</p>
+         *
+         * @param parent     The segment being split, still serving its keys
+         * @param leftIndex  The directory index the left child will be published at
+         * @param rightIndex The directory index the right child will be published at
+         */
+        default void onSplitPublishing(Segment parent, long leftIndex, long rightIndex) {
+        }
+
+        /**
+         * Told, as a split observer, that a split it heard {@link #onSplitPublishing} for was
+         * not published after all.
+         *
+         * <p>The parent goes back to serving its keys and the right index to routing nowhere.
+         * Called outside the directory lock. A throw is logged and does not change the
+         * outcome.</p>
+         *
+         * @param parent     The segment that was to be split, back in service
+         * @param leftIndex  The index the left child would have been published at
+         * @param rightIndex The index the right child would have been published at
+         */
+        default void onSplitAbandoned(Segment parent, long leftIndex, long rightIndex) {
+        }
     }
 
     // ==================== Object Methods ====================

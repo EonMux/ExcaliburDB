@@ -5,10 +5,7 @@ import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityRegistry;
 import com.eonmux.excalibur.filter.CuckooFilter;
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
-import com.eonmux.excalibur.core.text.TermExtractor;
-import com.eonmux.excalibur.store.Segment;
 import com.eonmux.excalibur.store.VisibilityTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,6 +14,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -37,11 +35,18 @@ import java.util.concurrent.locks.Lock;
  * <h2>Publication Pipeline</h2>
  * <ol>
  *   <li>Write all chunks to write log (via {@link DocumentBatchBuffer})</li>
- *   <li>Insert chunk keys into Cuckoo filter hierarchy</li>
+ *   <li>Insert chunk terms into the Cuckoo filter, where one is configured</li>
  *   <li>Fsync write log to ensure durability</li>
  *   <li>Advance visibility epoch (single atomic operation)</li>
  *   <li>Register document metadata in registry</li>
  * </ol>
+ *
+ * <h2>What this does not file</h2>
+ * <p>The per-segment membership filter the query pipeline prunes segments with is not written
+ * here. A document's chunks are routed by key across the storage engine's segments, so no one
+ * segment id describes a batch; each chunk's terms are filed under the segment its own write
+ * landed in, as it is written, by the writer's caller - see {@link DocumentReindexStep}. The
+ * filter this publisher takes is a single, segment-agnostic one.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is fully thread-safe. Publication operations acquire
@@ -67,8 +72,6 @@ public class DocumentBatchPublisher {
     private final DocumentRegistry documentRegistry;
     private final DocumentVisibilityRegistry visibilityRegistry;
     private final CuckooFilter cuckooFilter;
-    private final HierarchicalCuckooFilter hierarchicalFilter;
-    private final String segmentId;
     private final WriteLogAdapter writeLogAdapter;
     private final Lock publicationLock;
 
@@ -77,12 +80,6 @@ public class DocumentBatchPublisher {
      * When set, publications will block if the HNSW queue is overloaded.
      */
     private final IndexOrchestrator orchestrator;
-
-    /**
-     * Optional LSH ingestion service for vector indexing.
-     * When set, vectors will be inserted into segment LSH indices during publication.
-     */
-
 
     /**
      * Default backpressure timeout in milliseconds (30 seconds).
@@ -103,21 +100,6 @@ public class DocumentBatchPublisher {
     }
 
     /**
-     * Functional interface for segment lookup.
-     * Used by LSH ingestion to get segment instances for vector insertion.
-     */
-    @FunctionalInterface
-    public interface SegmentProvider {
-        /**
-         * Gets a segment by its ID.
-         *
-         * @param segmentId The segment ID
-         * @return The segment, or null if not found
-         */
-        Segment getSegment(String segmentId);
-    }
-
-    /**
      * Creates a new DocumentBatchPublisher.
      *
      * @param visibilityTracker The visibility tracker for epoch management
@@ -135,7 +117,7 @@ public class DocumentBatchPublisher {
             CuckooFilter cuckooFilter,
             WriteLogAdapter writeLogAdapter,
             Lock publicationLock) {
-        this(visibilityTracker, documentRegistry, visibilityRegistry, cuckooFilter, null, null,
+        this(visibilityTracker, documentRegistry, visibilityRegistry, cuckooFilter,
              writeLogAdapter, publicationLock, null);
     }
 
@@ -159,32 +141,10 @@ public class DocumentBatchPublisher {
             WriteLogAdapter writeLogAdapter,
             Lock publicationLock,
             IndexOrchestrator orchestrator) {
-        this(visibilityTracker, documentRegistry, visibilityRegistry, cuckooFilter, null, null,
-             writeLogAdapter, publicationLock, orchestrator);
-    }
-
-    /**
-     * The one constructor that assigns the fields; every public constructor funnels into it.
-     *
-     * <p>Having a single canonical form is what lets {@link #withTargetSegment(long)} rebind the
-     * segment without having to know which filter flavour this publisher was built with.</p>
-     */
-    private DocumentBatchPublisher(
-            VisibilityTracker visibilityTracker,
-            DocumentRegistry documentRegistry,
-            DocumentVisibilityRegistry visibilityRegistry,
-            CuckooFilter cuckooFilter,
-            HierarchicalCuckooFilter hierarchicalFilter,
-            String segmentId,
-            WriteLogAdapter writeLogAdapter,
-            Lock publicationLock,
-            IndexOrchestrator orchestrator) {
         this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "visibilityTracker must not be null");
         this.documentRegistry = Objects.requireNonNull(documentRegistry, "documentRegistry must not be null");
         this.visibilityRegistry = visibilityRegistry;
         this.cuckooFilter = cuckooFilter;
-        this.hierarchicalFilter = hierarchicalFilter;
-        this.segmentId = segmentId;
         this.writeLogAdapter = writeLogAdapter;
         this.publicationLock = publicationLock;
         this.orchestrator = orchestrator;
@@ -232,147 +192,6 @@ public class DocumentBatchPublisher {
     }
 
     /**
-     * Creates a new DocumentBatchPublisher with hierarchical filter support.
-     *
-     * @param visibilityTracker The visibility tracker
-     * @param documentRegistry The document registry
-     * @param visibilityRegistry The visibility registry for document-atomic visibility (may be null)
-     * @param hierarchicalFilter The hierarchical Cuckoo filter (may be null)
-     * @param segmentId The segment ID for hierarchical filter operations (required if hierarchicalFilter is set)
-     * @param writeLogAdapter The write log adapter
-     * @param publicationLock Lock for serializing publications
-     */
-    public DocumentBatchPublisher(
-            VisibilityTracker visibilityTracker,
-            DocumentRegistry documentRegistry,
-            DocumentVisibilityRegistry visibilityRegistry,
-            HierarchicalCuckooFilter hierarchicalFilter,
-            String segmentId,
-            WriteLogAdapter writeLogAdapter,
-            Lock publicationLock) {
-        this(visibilityTracker, documentRegistry, visibilityRegistry, hierarchicalFilter,
-             segmentId, writeLogAdapter, publicationLock, null);
-    }
-
-    /**
-     * Creates a new DocumentBatchPublisher with hierarchical filter and backpressure support.
-     *
-     * @param visibilityTracker The visibility tracker
-     * @param documentRegistry The document registry
-     * @param visibilityRegistry The visibility registry for document-atomic visibility (may be null)
-     * @param hierarchicalFilter The hierarchical Cuckoo filter (may be null)
-     * @param segmentId The segment ID for hierarchical filter operations (required if hierarchicalFilter is set)
-     * @param writeLogAdapter The write log adapter
-     * @param publicationLock Lock for serializing publications
-     * @param orchestrator The index orchestrator for backpressure checking (may be null)
-     */
-    public DocumentBatchPublisher(
-            VisibilityTracker visibilityTracker,
-            DocumentRegistry documentRegistry,
-            DocumentVisibilityRegistry visibilityRegistry,
-            HierarchicalCuckooFilter hierarchicalFilter,
-            String segmentId,
-            WriteLogAdapter writeLogAdapter,
-            Lock publicationLock,
-            IndexOrchestrator orchestrator) {
-        this(visibilityTracker, documentRegistry, visibilityRegistry, null, hierarchicalFilter,
-             segmentId, writeLogAdapter, publicationLock, orchestrator);
-    }
-
-    /**
-     * Creates a new DocumentBatchPublisher with hierarchical filter support (legacy compatibility).
-     *
-     * @param visibilityTracker The visibility tracker
-     * @param documentRegistry The document registry
-     * @param hierarchicalFilter The hierarchical Cuckoo filter (may be null)
-     * @param segmentId The segment ID for hierarchical filter operations (required if hierarchicalFilter is set)
-     * @param writeLogAdapter The write log adapter
-     * @param publicationLock Lock for serializing publications
-     */
-    public DocumentBatchPublisher(
-            VisibilityTracker visibilityTracker,
-            DocumentRegistry documentRegistry,
-            HierarchicalCuckooFilter hierarchicalFilter,
-            String segmentId,
-            WriteLogAdapter writeLogAdapter,
-            Lock publicationLock) {
-        this(visibilityTracker, documentRegistry, null, hierarchicalFilter,
-             segmentId, writeLogAdapter, publicationLock, null);
-    }
-
-    /**
-     * Creates a new DocumentBatchPublisher with hierarchical filter and backpressure support (legacy compatibility).
-     *
-     * @param visibilityTracker The visibility tracker
-     * @param documentRegistry The document registry
-     * @param hierarchicalFilter The hierarchical Cuckoo filter (may be null)
-     * @param segmentId The segment ID for hierarchical filter operations (required if hierarchicalFilter is set)
-     * @param writeLogAdapter The write log adapter
-     * @param publicationLock Lock for serializing publications
-     * @param orchestrator The index orchestrator for backpressure checking (may be null)
-     */
-    public DocumentBatchPublisher(
-            VisibilityTracker visibilityTracker,
-            DocumentRegistry documentRegistry,
-            HierarchicalCuckooFilter hierarchicalFilter,
-            String segmentId,
-            WriteLogAdapter writeLogAdapter,
-            Lock publicationLock,
-            IndexOrchestrator orchestrator) {
-        this(visibilityTracker, documentRegistry, null, hierarchicalFilter,
-             segmentId, writeLogAdapter, publicationLock, orchestrator);
-    }
-
-    /**
-     * Creates a new DocumentBatchPublisher bound to a specific target segment.
-     *
-     * <p>This factory method is used during rolling replacement reindexing to create
-     * a publisher that writes all data to a newly created segment. The returned
-     * publisher has the same configuration as this publisher but with a different
-     * target segment ID for hierarchical filter operations.</p>
-     *
-     * <p><strong>Domain Correctness:</strong></p>
-     * <ul>
-     *   <li>The target segment must be in INDEXING state or later</li>
-     *   <li>The target segment must exist in the segment catalog</li>
-     *   <li>Publications to the new segment will use its hierarchical filter</li>
-     * </ul>
-     *
-     * <p><strong>Usage Example:</strong></p>
-     * <pre>{@code
-     * // During rolling replacement:
-     * long newSegmentId = segmentCatalog.create(sourceId, volumePath).getSegmentId();
-     * DocumentBatchPublisher segmentPublisher = basePublisher.withTargetSegment(newSegmentId);
-     * // All publications via segmentPublisher go to newSegmentId
-     * }</pre>
-     *
-     * @param targetSegmentId The segment ID to bind publications to
-     * @return A new DocumentBatchPublisher bound to the target segment
-     * @throws IllegalArgumentException if targetSegmentId is negative
-     */
-    public DocumentBatchPublisher withTargetSegment(long targetSegmentId) {
-        if (targetSegmentId < 0) {
-            throw new IllegalArgumentException("targetSegmentId must be non-negative: " + targetSegmentId);
-        }
-
-        // Same configuration, bound to a different segment. The segment id is carried whichever
-        // filter flavour this publisher uses: it is also what selects the segment whose LSH index
-        // the chunks' vectors are inserted into, so dropping it here would silently unbind the
-        // copy from the segment the caller asked for.
-        return new DocumentBatchPublisher(
-            this.visibilityTracker,
-            this.documentRegistry,
-            this.visibilityRegistry,
-            this.cuckooFilter,
-            this.hierarchicalFilter,
-            String.valueOf(targetSegmentId),
-            this.writeLogAdapter,
-            this.publicationLock,
-            this.orchestrator
-        );
-    }
-
-    /**
      * Publishes a document batch atomically to the visibility epoch.
      *
      * <p>This method ensures that all chunks in the buffer become visible
@@ -382,7 +201,7 @@ public class DocumentBatchPublisher {
      * <h3>Publication Steps</h3>
      * <ol>
      *   <li>Validate buffer state (must be SEALED)</li>
-     *   <li>Insert all chunk keys into Cuckoo filter hierarchy</li>
+     *   <li>Insert all chunk terms into the Cuckoo filter, where one is configured</li>
      *   <li>Fsync write log to ensure durability</li>
      *   <li>Advance visibility epoch atomically</li>
      *   <li>Register document metadata in registry</li>
@@ -503,123 +322,54 @@ public class DocumentBatchPublisher {
     }
 
     /**
-     * Inserts terms from chunk text into the Cuckoo filter hierarchy.
+     * Inserts the terms of every chunk's text into the Cuckoo filter.
      *
-     * <p><strong>Term-Based Filtering (Hierarchical Cuckoo Filter):</strong></p>
-     * <p>For hierarchical Cuckoo filters, this method extracts significant terms
-     * from each chunk's text content and inserts each term into the filter.
-     * This allows the query pipeline to find which segments might contain
-     * documents with those terms, enabling efficient segment pruning.</p>
-     *
-     * <p><strong>Key Matching:</strong></p>
-     * <ul>
-     *   <li><strong>Ingestion:</strong> Extracts terms from chunk text, inserts each term</li>
-     *   <li><strong>Query:</strong> Extracts terms from query text, finds segments containing those terms</li>
-     * </ul>
-     *
-     * <p><strong>Segment ID Format:</strong></p>
-     * <p>The segmentId passed to this publisher must match the format used by the query pipeline.
-     * Use {@code String.valueOf(longSegmentId)} to ensure consistency.</p>
+     * <p>Term-based, like the query side: a query extracts terms from its text and asks the
+     * filter for each. Distinct terms per chunk, and inserted only if absent, because the filter
+     * answers whether a term is present at all: a term occurring forty times, or in every chunk,
+     * is one fact.</p>
      *
      * @param buffer The buffer containing chunk entries
-     * @return List of chunk IDs that failed to insert (empty if all succeeded)
+     * @return List of chunk IDs none of whose terms could be inserted (empty if all succeeded,
+     *         and always empty when no filter is configured)
      */
     private List<String> insertIntoFilters(DocumentBatchBuffer buffer) {
         List<String> failed = new ArrayList<>();
-        Set<String> allTermsInserted = new HashSet<>();
+        if (cuckooFilter == null) {
+            return failed;
+        }
 
         for (DocumentBatchBuffer.ChunkEntry entry : buffer.getEntries()) {
             String chunkId = entry.chunkId();
             TextChunk textChunk = entry.textChunk();
 
-            if (hierarchicalFilter != null) {
-                // Term-based insertion for hierarchical filter
-                if (segmentId == null) {
-                    LOGGER.warn("Cannot insert into hierarchical filter without segmentId, chunk: {}", chunkId);
-                    failed.add(chunkId);
-                    continue;
-                }
+            if (textChunk == null || textChunk.getText() == null || textChunk.getText().isEmpty()) {
+                LOGGER.debug("Skipping chunk with no text content for Cuckoo filter: {}", chunkId);
+                continue;
+            }
 
-                if (textChunk == null || textChunk.getText() == null || textChunk.getText().isEmpty()) {
-                    LOGGER.debug("Skipping chunk with no text content for hierarchical filter: {}", chunkId);
-                    continue;
-                }
+            Set<String> terms = new LinkedHashSet<>(textChunk.terms());
+            if (terms.isEmpty()) {
+                continue;
+            }
 
-                // Distinct terms: the filter answers whether a segment holds a term, so a
-                // term occurring forty times in a chunk is one fact, not forty. Inserting it
-                // once per occurrence is also what the cleanup path cannot undo - it removes
-                // each of a segment's distinct terms once.
-                Set<String> terms = TermExtractor.extractUniqueTerms(textChunk.getText());
-                if (terms.isEmpty()) {
-                    LOGGER.debug("No significant terms extracted from chunk: {}", chunkId);
-                    continue;
-                }
-
-                // Insert each term into the hierarchical filter
-                int failedTerms = 0;
-                for (String term : terms) {
-                    byte[] termBytes = term.getBytes(StandardCharsets.UTF_8);
-                    try {
-                        if (!hierarchicalFilter.insert(termBytes, segmentId)) {
-                            failedTerms++;
-                            LOGGER.trace("Failed to insert term '{}' into hierarchical filter for chunk {}",
-                                term, chunkId);
-                        } else {
-                            allTermsInserted.add(term);
-                        }
-                    } catch (Exception e) {
+            int failedTerms = 0;
+            for (String term : terms) {
+                byte[] termBytes = term.getBytes(StandardCharsets.UTF_8);
+                try {
+                    if (!cuckooFilter.insertIfAbsent(termBytes)) {
                         failedTerms++;
-                        LOGGER.warn("Exception inserting term '{}' into hierarchical filter for chunk {}: {}",
-                            term, chunkId, e.getMessage());
                     }
-                }
-
-                // Consider chunk failed if ALL terms failed to insert
-                if (failedTerms == terms.size()) {
-                    LOGGER.warn("All {} terms failed to insert for chunk {}", terms.size(), chunkId);
-                    failed.add(chunkId);
-                }
-
-            } else if (cuckooFilter != null) {
-                // For segment-level Cuckoo filter, also use term-based insertion
-                // to enable the query to find relevant segments
-                if (textChunk == null || textChunk.getText() == null || textChunk.getText().isEmpty()) {
-                    LOGGER.debug("Skipping chunk with no text content for Cuckoo filter: {}", chunkId);
-                    continue;
-                }
-
-                Set<String> terms = TermExtractor.extractUniqueTerms(textChunk.getText());
-                if (terms.isEmpty()) {
-                    continue;
-                }
-
-                int failedTerms = 0;
-                for (String term : terms) {
-                    byte[] termBytes = term.getBytes(StandardCharsets.UTF_8);
-                    try {
-                        // Chunks of one segment share terms, so the per-chunk set is not
-                        // enough on its own to keep one slot per term per segment.
-                        if (!cuckooFilter.insertIfAbsent(termBytes)) {
-                            failedTerms++;
-                        }
-                    } catch (Exception e) {
-                        failedTerms++;
-                        LOGGER.warn("Exception inserting term '{}' into Cuckoo filter: {}", term, e.getMessage());
-                    }
-                }
-
-                if (failedTerms == terms.size()) {
-                    failed.add(chunkId);
+                } catch (Exception e) {
+                    failedTerms++;
+                    LOGGER.warn("Exception inserting term '{}' into Cuckoo filter: {}", term, e.getMessage());
                 }
             }
-            // If neither filter is configured, all chunks succeed
-        }
 
-        if (!allTermsInserted.isEmpty()) {
-            LOGGER.debug("Inserted {} unique terms from {} chunks into filter for segment {}",
-                allTermsInserted.size(), buffer.getChunkCount(), segmentId);
+            if (failedTerms == terms.size()) {
+                failed.add(chunkId);
+            }
         }
-
         return failed;
     }
 

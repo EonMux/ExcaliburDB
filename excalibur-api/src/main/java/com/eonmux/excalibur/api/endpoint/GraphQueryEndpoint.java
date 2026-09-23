@@ -12,7 +12,6 @@ import com.eonmux.excalibur.core.trace.QueryTrace;
 import com.eonmux.excalibur.graph.temporal.TemporalFilter;
 import com.eonmux.excalibur.core.trace.Stage;
 import com.eonmux.excalibur.planner.ConversationContext;
-import com.eonmux.excalibur.planner.Grammar;
 import com.eonmux.excalibur.planner.QueryPlan;
 import com.eonmux.excalibur.retrieval.pipeline.Aggregation;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
@@ -51,9 +50,22 @@ import java.util.Objects;
  *       found" when the truth may be "found something and did not trust it".</li>
  * </ul>
  *
+ * <p>An optional {@code context_entities} carries the conversation the question is asked in, so
+ * a pronoun in it can be bound: either plain names, or objects that also give each entity's
+ * grammatical shape and the turn it was mentioned in. {@link GraphConversation} reads both forms
+ * and says what each field decides.
+ *
  * <p>An optional {@code direction} - {@code forward}, {@code reverse} or {@code both}, the
  * default - restricts which way the walk may step along an edge from the entities the question
  * names: forward reads the facts they assert, reverse the facts asserted about them.
+ *
+ * <p>A one-way walk needs the graph's relation vocabulary, and a pipeline embedded without one can
+ * only walk both ways. Asking it for one direction is answered {@code 422}. Not {@code 400}: the
+ * request is well formed, and the same body is answered by any node built with the vocabulary.
+ * Not {@code 500}, nor the {@code 501} beside it: nothing on this node failed, and a server-error
+ * status would page an operator over a request the caller settles by resending it without
+ * {@code direction}. {@code 422} says exactly that - understood, and not processable here as
+ * asked.</p>
  *
  * <p>Per-stage latency is returned with every response, including the ones that answered nothing —
  * a refusal that took two seconds is as much a performance question as an answer that did.
@@ -67,20 +79,6 @@ public class GraphQueryEndpoint implements HttpHandler {
 
     /** Longest question accepted, in characters, to bound the work one request can start. */
     private static final int MAX_QUESTION_LENGTH = 4096;
-
-    /**
-     * Most conversation entities accepted in one request.
-     *
-     * <p>Every mention is a candidate each pronoun in the question is compared against, and a name
-     * that can appear in the disambiguation question this endpoint answers with - so an unbounded
-     * array is both unbounded work and an unbounded response. The context window is three turns of
-     * a conversation; a hundred and twenty-eight entities inside it is already far more than a
-     * person mentions.</p>
-     */
-    private static final int MAX_CONTEXT_ENTITIES = 128;
-
-    /** Longest single conversation entity accepted, in characters. Longer than this is not a name. */
-    private static final int MAX_CONTEXT_ENTITY_LENGTH = 256;
 
     /** The one pipeline to answer from, when this node is not multi-tenant; null otherwise. */
     private final GraphRagPipeline pipeline;
@@ -124,12 +122,12 @@ public class GraphQueryEndpoint implements HttpHandler {
         // A field of the wrong JSON type is the caller's mistake, so it is answered 400 here
         // rather than escaping to the router, which can only call it a server fault.
         String question;
-        String[] mentions;
+        ConversationContext context;
         String asOfText;
         TraversalDirection direction;
         try {
             question = JsonText.string(body, "query");
-            mentions = JsonText.stringArray(body, "context_entities");
+            context = GraphConversation.from(body);
             asOfText = JsonText.string(body, "as_of");
             direction = directionFrom(JsonText.string(body, "direction"));
         } catch (IllegalArgumentException e) {
@@ -146,13 +144,6 @@ public class GraphQueryEndpoint implements HttpHandler {
             return;
         }
 
-        String violation = contextViolation(mentions);
-        if (violation != null) {
-            send(exchange, 400, "{\"error\":" + quoted(violation) + "}");
-            return;
-        }
-        ConversationContext context = contextFrom(mentions);
-
         TemporalFilter asOf;
         try {
             asOf = temporalFilterFrom(asOfText);
@@ -166,6 +157,10 @@ public class GraphQueryEndpoint implements HttpHandler {
             return;
         }
 
+        if (!pipeline.supports(direction)) {
+            sendUnsupportedDirection(exchange, direction);
+            return;
+        }
         try {
             QueryTrace trace = new QueryTrace();
             GraphRagResult result = pipeline.answer(question, context, asOf, direction, trace);
@@ -243,11 +238,19 @@ public class GraphQueryEndpoint implements HttpHandler {
             }
 
             QueryTrace trace = new QueryTrace();
-            GraphRagResult result;
+            GraphRagResult result = null;
+            boolean supported;
             // Released before the response is written: the stack is needed to answer, not to
             // send, and a slow client must not keep a replaced graph open.
             try (com.eonmux.excalibur.api.bootstrap.GraphRagHolder.Reading held = reading.get()) {
-                result = held.pipeline().answer(question, context, asOf, direction, trace);
+                supported = held.pipeline().supports(direction);
+                if (supported) {
+                    result = held.pipeline().answer(question, context, asOf, direction, trace);
+                }
+            }
+            if (!supported) {
+                sendUnsupportedDirection(exchange, direction);
+                return;
             }
             send(exchange, 200, render(result, trace, asOf));
         } catch (IllegalArgumentException e) {
@@ -256,6 +259,23 @@ public class GraphQueryEndpoint implements HttpHandler {
             LOGGER.error("graph query failed for namespace {}", namespace, e);
             send(exchange, 500, "{\"error\":\"Internal Server Error\"}");
         }
+    }
+
+    /**
+     * Refuses a one-way walk the pipeline answering this request cannot take.
+     *
+     * <p>Worded as the remedy as well as the cause: the caller can do nothing about how the node
+     * was assembled, and everything about the direction it asked for.</p>
+     *
+     * @param exchange  The exchange
+     * @param direction The direction asked for
+     * @throws IOException if the response cannot be written
+     */
+    private void sendUnsupportedDirection(HttpExchange exchange, TraversalDirection direction)
+            throws IOException {
+        send(exchange, 422, "{\"error\":" + quoted("'direction' \"" + direction.wireName()
+            + "\" needs the graph's relation vocabulary, and the graph pipeline on this node was "
+            + "built without one; omit 'direction', or send \"both\"") + "}");
     }
 
     /**
@@ -268,52 +288,6 @@ public class GraphQueryEndpoint implements HttpHandler {
         send(exchange, 503,
             "{\"error\":\"No graph is being served for this namespace; POST "
                 + "/v1/graph/build to build one from the facts ingestion has staged\"}");
-    }
-
-    /**
-     * Rebuilds the conversation from what the client sent.
-     *
-     * <p>The client owns the history; the server holds no session. That keeps the endpoint
-     * stateless and horizontally scalable, and it means a client can replay or edit the context it
-     * is being answered against — which is the only way to correct a mis-bound pronoun.
-     */
-    private ConversationContext contextFrom(String[] mentions) {
-        ConversationContext context = new ConversationContext();
-        if (mentions != null) {
-            for (String mention : mentions) {
-                if (mention != null && !mention.isBlank()) {
-                    // Shape unknown from the wire, which binds any pronoun. Refusing to bind here
-                    // would ask the user about something a person would find obvious.
-                    context.mention(mention, Grammar.UNKNOWN);
-                }
-            }
-            context.nextTurn();
-        }
-        return context;
-    }
-
-    /**
-     * Says why a conversation context is not acceptable, or null when it is.
-     *
-     * <p>Refused rather than truncated: dropping half a context silently changes which entity a
-     * pronoun binds to, and the caller would read the answer as though it had been given the whole
-     * conversation.</p>
-     */
-    private static String contextViolation(String[] mentions) {
-        if (mentions == null) {
-            return null;
-        }
-        if (mentions.length > MAX_CONTEXT_ENTITIES) {
-            return "'context_entities' holds " + mentions.length + " entries; at most "
-                + MAX_CONTEXT_ENTITIES + " are accepted";
-        }
-        for (String mention : mentions) {
-            if (mention != null && mention.length() > MAX_CONTEXT_ENTITY_LENGTH) {
-                return "'context_entities' holds an entry of " + mention.length()
-                    + " characters; at most " + MAX_CONTEXT_ENTITY_LENGTH + " are accepted";
-            }
-        }
-        return null;
     }
 
     /**

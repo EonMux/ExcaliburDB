@@ -35,6 +35,32 @@ class GraphDirectoryBuilderTest {
         return Provenance.of(SourceType.DOCUMENT, document, 0.9, 1);
     }
 
+    /**
+     * Builds the way the node does: through the one build path, publishing durably and opening
+     * the published directory before the graph it replaced is let go.
+     *
+     * <p>The opener here opens the edge store, where the node opens its whole stack over the same
+     * directory; that it opens at all is what the publish waits for.</p>
+     */
+    private static GraphDirectoryBuilder.BuildResult build(GraphStagingStore staging, Path target,
+                                                           SupersessionPolicy supersession)
+            throws IOException {
+        GraphDirectoryBuilder.Published<Long> built = GraphDirectoryBuilder.build(staging, target,
+            supersession, RAM_BUFFER_MB, null, 0, published -> {
+                try (MappedEdgeStore store = MappedEdgeStore.open(published)) {
+                    return store.edgeCount();
+                }
+            });
+        if (built.result().published()) {
+            assertThat(built.opened())
+                .as("the opener saw the graph that was published")
+                .isEqualTo(built.result().edges());
+        } else {
+            assertThat(built.opened()).as("nothing published, nothing opened").isNull();
+        }
+        return built.result();
+    }
+
     private static void stage(GraphStagingStore staging) throws IOException {
         staging.append(ExtractedTriple.alwaysValid(
             "Ada Lovelace", "collaborated_with", "Charles Babbage", from(1)));
@@ -57,8 +83,8 @@ class GraphDirectoryBuilderTest {
         try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"))) {
             stage(staging);
 
-            GraphDirectoryBuilder.BuildResult result = GraphDirectoryBuilder.build(
-                staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+            GraphDirectoryBuilder.BuildResult result = build(
+                staging, target, SupersessionPolicy.NONE);
 
             assertThat(result.published()).isTrue();
             assertThat(result.edges()).isEqualTo(3);
@@ -66,7 +92,7 @@ class GraphDirectoryBuilderTest {
             assertThat(result.relations()).isEqualTo(3);
         }
 
-        // Exactly what GraphRagFactory.open looks for.
+        // Exactly what GraphRagFactory.openAt looks for.
         assertThat(target.resolve("edgestore.meta")).exists();
         assertThat(target.resolve("edges_fwd.csr")).exists();
         assertThat(target.resolve("offsets_rev.idx")).exists();
@@ -90,7 +116,7 @@ class GraphDirectoryBuilderTest {
             ada = staging.entityIdOf("Ada Lovelace");
             babbage = staging.entityIdOf("Charles Babbage");
             collaboratedWith = staging.relationIdOf("collaborated_with");
-            GraphDirectoryBuilder.build(staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+            build(staging, target, SupersessionPolicy.NONE);
         }
 
         try (MappedEdgeStore store = MappedEdgeStore.open(target)) {
@@ -115,7 +141,7 @@ class GraphDirectoryBuilderTest {
         try (GraphStagingStore staging = GraphStagingStore.open(stagingDir)) {
             stage(staging);
             adaBefore = staging.entityIdOf("Ada Lovelace");
-            GraphDirectoryBuilder.build(staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+            build(staging, target, SupersessionPolicy.NONE);
         }
 
         // Reopened staging, a further fact, and a second build. The Lucene indexes store entity
@@ -126,8 +152,8 @@ class GraphDirectoryBuilderTest {
             staging.append(ExtractedTriple.alwaysValid(
                 "Ada Lovelace", "lived_in", "London", from(3)));
 
-            GraphDirectoryBuilder.BuildResult result = GraphDirectoryBuilder.build(
-                staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+            GraphDirectoryBuilder.BuildResult result = build(
+                staging, target, SupersessionPolicy.NONE);
 
             assertThat(result.edges()).isEqualTo(4);
             assertThat(staging.entityIdOf("Ada Lovelace")).isEqualTo(adaBefore);
@@ -141,7 +167,7 @@ class GraphDirectoryBuilderTest {
 
         try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"))) {
             stage(staging);
-            GraphDirectoryBuilder.build(staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+            build(staging, target, SupersessionPolicy.NONE);
         }
         long edgesBefore;
         try (MappedEdgeStore store = MappedEdgeStore.open(target)) {
@@ -152,7 +178,7 @@ class GraphDirectoryBuilderTest {
         // one would turn every question into a refusal.
         try (GraphStagingStore empty = GraphStagingStore.open(tempDir.resolve("empty"))) {
             GraphDirectoryBuilder.BuildResult result =
-                GraphDirectoryBuilder.build(empty, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+                build(empty, target, SupersessionPolicy.NONE);
             assertThat(result.published()).isFalse();
         }
 
@@ -168,7 +194,7 @@ class GraphDirectoryBuilderTest {
 
         try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"))) {
             stage(staging);
-            GraphDirectoryBuilder.build(staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+            build(staging, target, SupersessionPolicy.NONE);
         }
 
         assertThat(GraphBuilder.scratchFor(target)).doesNotExist();
@@ -203,14 +229,20 @@ class GraphDirectoryBuilderTest {
     void supersessionClosesThePreviousValue(@TempDir Path tempDir) throws IOException {
         Path target = tempDir.resolve("graph");
 
+        int ada;
+        int acme;
+        int beta;
         try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"))) {
             staging.append(new ExtractedTriple("Ada Lovelace", "employer", "Acme",
                 0, com.eonmux.excalibur.graph.temporal.TemporalFilter.OPEN, from(1)));
             staging.append(new ExtractedTriple("Ada Lovelace", "employer", "Beta",
                 100, com.eonmux.excalibur.graph.temporal.TemporalFilter.OPEN, from(2)));
+            ada = staging.entityIdOf("Ada Lovelace");
+            acme = staging.entityIdOf("Acme");
+            beta = staging.entityIdOf("Beta");
 
             SupersessionPolicy single = GraphBuilder.singleValued(staging, List.of("employer"));
-            GraphDirectoryBuilder.build(staging, target, single, RAM_BUFFER_MB);
+            build(staging, target, single);
         }
 
         try (MappedEdgeStore store = MappedEdgeStore.open(target)) {
@@ -218,10 +250,48 @@ class GraphDirectoryBuilderTest {
             // about the past still answers and a query about now returns one employer.
             assertThat(store.edgeCount()).isEqualTo(2);
 
-            long[] now = store.expand(new long[] { 0 }, 1, null,
+            long[] now = store.expand(new long[] { ada }, 1, null,
                 com.eonmux.excalibur.graph.temporal.TemporalFilter.asOf(
                     java.time.LocalDate.ofEpochDay(200)));
-            assertThat(now).hasSizeGreaterThanOrEqualTo(1);
+            assertThat(now)
+                .as("after the second employer began, the first is closed")
+                .contains(beta)
+                .doesNotContain(acme);
+
+            long[] before = store.expand(new long[] { ada }, 1, null,
+                com.eonmux.excalibur.graph.temporal.TemporalFilter.asOf(
+                    java.time.LocalDate.ofEpochDay(50)));
+            assertThat(before)
+                .as("before it began, the first still holds")
+                .contains(acme)
+                .doesNotContain(beta);
+        }
+    }
+
+    @Test
+    @DisplayName("a published graph that will not open is rolled back, and the previous one kept")
+    void anUnopenableBuildKeepsThePreviousGraph(@TempDir Path tempDir) throws IOException {
+        Path target = tempDir.resolve("graph");
+
+        try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"))) {
+            stage(staging);
+            build(staging, target, SupersessionPolicy.NONE);
+
+            staging.append(ExtractedTriple.alwaysValid(
+                "Ada Lovelace", "lived_in", "London", from(3)));
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> GraphDirectoryBuilder.build(
+                    staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB, null, 0,
+                    published -> {
+                        throw new IOException("will not open");
+                    }))
+                .isInstanceOf(IOException.class)
+                .hasMessage("will not open");
+        }
+
+        try (MappedEdgeStore store = MappedEdgeStore.open(target)) {
+            assertThat(store.edgeCount())
+                .as("the graph from before the failed build is still the one served")
+                .isEqualTo(3);
         }
     }
 

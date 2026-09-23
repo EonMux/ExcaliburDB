@@ -187,6 +187,31 @@ class MappedFileTest {
         }
     }
 
+    @Test
+    void testReadFloatArrayDecodesBigEndianAtAnUnalignedOffset() throws IOException {
+        try (MappedFile mf = MappedFile.create(testFile, 4096)) {
+            float[] data = new float[37];
+            for (int i = 0; i < data.length; i++) {
+                data[i] = (i - 18) * 1.25f + 1.0e-3f * i;
+            }
+            java.nio.ByteBuffer bigEndian = java.nio.ByteBuffer.allocate(data.length * 4)
+                .order(java.nio.ByteOrder.BIG_ENDIAN);
+            for (float value : data) {
+                bigEndian.putFloat(value);
+            }
+            mf.write(13, bigEndian.array());
+            long before = mf.bytesRead();
+
+            float[] read = mf.readFloatArray(13, data.length);
+
+            assertArrayEquals(data, read, 0.0f);
+            for (int i = 0; i < data.length; i++) {
+                assertEquals(mf.readFloat(13 + 4L * i), read[i], 0.0f);
+            }
+            assertEquals(before + 4L * data.length, mf.bytesRead());
+        }
+    }
+
     // ==================== String Read/Write Tests ====================
 
     @Test

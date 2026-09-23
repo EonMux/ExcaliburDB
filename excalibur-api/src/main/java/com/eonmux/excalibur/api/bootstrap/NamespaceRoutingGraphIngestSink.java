@@ -11,6 +11,7 @@ import com.eonmux.excalibur.tenancy.NamespaceRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -191,6 +192,24 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
     }
 
     /**
+     * Forces the staged facts of every resident namespace to the device.
+     *
+     * <p>Every namespace rather than the ones this sink wrote to, because the sink keeps no
+     * record of which those were, and a namespace nothing wrote to since its last sync costs a
+     * check and no device flush. One an eviction closed was forced as it closed.</p>
+     *
+     * @throws IOException if any namespace could not be forced
+     */
+    @Override
+    public void sync() throws IOException {
+        int failed = tenants.syncStaging();
+        if (failed > 0) {
+            throw new IOException(failed + " namespace(s) could not force their staged facts "
+                + "to disk");
+        }
+    }
+
+    /**
      * Finds the namespace of the source that published a document.
      *
      * <p>A document key is {@code sourceId:documentId} and a document id may itself contain
@@ -265,6 +284,18 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
      */
     public long tenantFailures() {
         return tenantFailures.get();
+    }
+
+    /**
+     * What finds the facts this sink stages.
+     *
+     * <p>So the node can report the extractor's own health - its circuit breaker - beside the
+     * counts this sink keeps of what it did with the extractor's answers.</p>
+     *
+     * @return The extractor; {@link RelationExtractor#none()} where extraction is off
+     */
+    public RelationExtractor extractor() {
+        return extractor;
     }
 
     @Override

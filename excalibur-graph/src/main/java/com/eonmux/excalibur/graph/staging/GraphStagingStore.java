@@ -74,6 +74,18 @@ import java.util.zip.CRC32;
  * scan reaches was written whole - and both the replay and the erasure rewrite refuse the log
  * rather than stopping at the damage. See {@link #forEach}.</p>
  *
+ * <h2>Buffered, flushed and forced</h2>
+ * <p>Appends go into buffers this process holds, because one write per fact would make ingestion
+ * pay a system call for every triple it stages. So three states matter, and they are not the same
+ * promise. Buffered is lost with the process. {@linkplain #flush() Flushed} reaches the operating
+ * system and survives the process dying, but not the machine. {@linkplain #sync() Forced} reaches
+ * the device and survives both. A build needs only flushed, because it reads the files; anything
+ * that goes on to record the facts' documents as handled - the document registry, which is forced
+ * to the device when it is written, and is what stops those documents being extracted again -
+ * needs forced first, or a power loss leaves the registry saying the facts were taken while the
+ * facts are gone. {@link #close()} forces for the same reason: a store nobody holds any more is
+ * one nobody will force later.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent appends, which is what ingestion does - one virtual thread per document.
  * Replay is not concurrent with appending: {@link #forEach} reads the file, so a caller that wants
@@ -150,6 +162,16 @@ public final class GraphStagingStore implements AutoCloseable {
     private DataOutputStream out;
     private long staged;
     private volatile boolean closed;
+
+    /**
+     * Whether anything has been appended or interned since the last {@link #sync()}.
+     *
+     * <p>Lets a caller force every resident namespace at the end of each ingestion run without
+     * paying a device flush per file for the namespaces that run never wrote to. Cleared before
+     * the flush it guards rather than after, so an append racing the sync marks the store again
+     * and the next sync covers it.</p>
+     */
+    private volatile boolean unsynced;
 
     private GraphStagingStore(Path directory, Path logPath, LabelInterner entities,
                               LabelInterner relations, EntityTextLog text, Clock clock,
@@ -266,6 +288,7 @@ public final class GraphStagingStore implements AutoCloseable {
             requireOpen();
             out.write(record.array());
             staged++;
+            unsynced = true;
         }
     }
 
@@ -699,7 +722,9 @@ public final class GraphStagingStore implements AutoCloseable {
      * @throws IOException if a new assignment cannot be recorded
      */
     public int entityIdOf(String label) throws IOException {
-        return entities.intern(label);
+        int id = entities.intern(label);
+        unsynced = true;
+        return id;
     }
 
     /**
@@ -710,7 +735,9 @@ public final class GraphStagingStore implements AutoCloseable {
      * @throws IOException if a new assignment cannot be recorded
      */
     public int relationIdOf(String label) throws IOException {
-        return relations.intern(label);
+        int id = relations.intern(label);
+        unsynced = true;
+        return id;
     }
 
     /**
@@ -747,6 +774,7 @@ public final class GraphStagingStore implements AutoCloseable {
             throws IOException {
         requireOpen();
         text.append(entityId, snippet, provenance);
+        unsynced = true;
     }
 
     /**
@@ -847,7 +875,10 @@ public final class GraphStagingStore implements AutoCloseable {
     }
 
     /**
-     * Forces everything staged so far to disk.
+     * Hands everything staged so far to the operating system.
+     *
+     * <p>Enough for a build, which reads the files, and for a process that dies; not enough for
+     * a machine that does. See {@link #sync()} for that.</p>
      *
      * @throws IOException if the write fails
      */
@@ -863,19 +894,118 @@ public final class GraphStagingStore implements AutoCloseable {
         text.flush();
     }
 
+    /**
+     * Flushes everything staged so far and forces it to the device.
+     *
+     * <p>What a caller needs before it records the documents these facts came from as handled;
+     * see "Buffered, flushed and forced". A store with nothing appended since its last sync
+     * returns without touching the device, so calling this for every resident namespace costs
+     * only the ones that were written to.</p>
+     *
+     * <p>Held under the append lock, which is the one an erasure rewrite holds while it swaps
+     * the logs, so the files forced are the ones the appends went into. Appends wait for the
+     * length of the force.</p>
+     *
+     * <p>The label files before the triple log: a fact that survives a power loss while the
+     * assignment naming its subject does not would have that id handed to a different label at
+     * the next open.</p>
+     *
+     * @throws IOException if a buffer cannot be written or a file cannot be forced
+     */
+    public void sync() throws IOException {
+        synchronized (appendLock) {
+            if (closed || !unsynced) {
+                return;
+            }
+            unsynced = false;
+            try {
+                entities.flush();
+                relations.flush();
+                out.flush();
+                text.flush();
+                force();
+            } catch (IOException | RuntimeException e) {
+                // Still owed: a failed force leaves the store exactly as unforced as before.
+                unsynced = true;
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Forces every staging file and the directory naming them to the device.
+     *
+     * @throws IOException if a file cannot be forced
+     */
+    private void force() throws IOException {
+        for (String name : List.of(ENTITY_LABELS, RELATION_LABELS, TRIPLE_LOG, ENTITY_TEXT_LOG)) {
+            Path file = directory.resolve(name);
+            if (Files.exists(file)) {
+                Durability.DEVICE.fsyncFile(file);
+            }
+        }
+        // The names too: a log created by this store's open is a directory entry, and a file whose
+        // contents are on the platter under a name that is not is a file the next open cannot find.
+        Durability.DEVICE.fsyncDirectory(directory);
+    }
+
+    /**
+     * Flushes, forces and closes.
+     *
+     * <p>Forced as well as flushed, because nothing forces a store after it is closed: an
+     * evicted namespace's staged facts would otherwise sit in the page cache with the registry
+     * already saying their documents were extracted. Every file is closed whether or not the
+     * force succeeds, and the first failure is what is thrown.</p>
+     *
+     * @throws IOException if a buffer cannot be written, a file cannot be closed, or the files
+     *                     cannot be forced
+     */
     @Override
     public void close() throws IOException {
+        boolean force;
         synchronized (appendLock) {
             if (closed) {
                 return;
             }
             closed = true;
+            force = unsynced;
+            unsynced = false;
             out.flush();
             out.close();
         }
-        text.close();
-        entities.close();
-        relations.close();
+        IOException failure = null;
+        for (AutoCloseable closeable : List.<AutoCloseable>of(text, entities, relations)) {
+            try {
+                closeable.close();
+            } catch (Exception e) {
+                failure = firstOf(failure, e);
+            }
+        }
+        if (force) {
+            try {
+                force();
+            } catch (IOException e) {
+                failure = firstOf(failure, e);
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    /**
+     * Keeps the first failure and suppresses the rest onto it.
+     *
+     * @param first The failure kept so far, or null
+     * @param next  Another one
+     * @return The failure to throw
+     */
+    private static IOException firstOf(IOException first, Exception next) {
+        if (first == null) {
+            return next instanceof IOException io ? io : new IOException(next);
+        }
+        first.addSuppressed(next);
+        return first;
     }
 
     private void requireOpen() {

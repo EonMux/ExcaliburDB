@@ -471,6 +471,82 @@ class CompactionWorkerTest {
         awaitCompactionCount(worker, 1);
     }
 
+    /**
+     * The loop used to be stopped by interrupting it. An interrupt that reaches a rewrite inside
+     * one of its channel operations closes that channel for every thread using it, so the stop
+     * is now a signal the loop reads between segments, and a rewrite in progress is waited for.
+     */
+    @Test
+    @DisplayName("stop() never interrupts the loop's rewrite and reports it running until it ends")
+    void stop_leavesTheLoopsRewriteUninterrupted() throws IOException, InterruptedException {
+        CountDownLatch insideTheRewrite = new CountDownLatch(1);
+        CountDownLatch releaseTheRewrite = new CountDownLatch(1);
+        AtomicBoolean interruptedInside = new AtomicBoolean();
+
+        CompactionWorker worker = new CompactionWorker(arena, (oldSeg, newSeg) -> {
+            insideTheRewrite.countDown();
+            awaitRelease(releaseTheRewrite);
+            interruptedInside.set(Thread.currentThread().isInterrupted());
+            return CompactionOutcome.INSTALLED;
+        }).withStartDelayMs(0).withStopTimeoutMs(200);
+        worker.registerSegment(compactableSegment("loop-rewrite"));
+
+        worker.start();
+        assertThat(insideTheRewrite.await(30, TimeUnit.SECONDS))
+            .as("the background loop reached the rewrite")
+            .isTrue();
+
+        assertThat(worker.stop())
+            .as("a rewrite still running when the budget expires is reported, not claimed ended")
+            .isFalse();
+
+        releaseTheRewrite.countDown();
+        awaitCompactionCount(worker, 1);
+        assertThat(interruptedInside)
+            .as("stop() must not interrupt a thread that is writing through shared channels")
+            .isFalse();
+        // Released work finishes on the loop's own thread, so an ask right after the release can
+        // still see it; each ask waits within the worker's own budget.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        boolean ended = worker.stop();
+        while (!ended && System.nanoTime() < deadline) {
+            ended = worker.stop();
+        }
+        assertThat(ended)
+            .as("once the loop has left its rewrite, stop() reports the worker ended")
+            .isTrue();
+    }
+
+    @Test
+    @DisplayName("stop() wakes the loop from its pause without waiting out the interval")
+    void stop_wakesThePausingLoop() {
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED,
+            TimeUnit.HOURS.toMillis(1), 0.2, 16L * 1024 * 1024, 1)
+            .withStartDelayMs(0)
+            .withStopTimeoutMs(TimeUnit.MINUTES.toMillis(5));
+        worker.start();
+
+        long startNanos = System.nanoTime();
+        assertThat(worker.stop()).isTrue();
+        assertThat(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - startNanos))
+            .as("returned because the pause was woken, not because a budget or interval ran out")
+            .isLessThan(60);
+    }
+
+    @Test
+    @DisplayName("stop() wakes the loop from its start delay")
+    void stop_wakesTheStartDelay() {
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED)
+            .withStartDelayMs(TimeUnit.HOURS.toMillis(1))
+            .withStopTimeoutMs(TimeUnit.MINUTES.toMillis(5));
+        worker.start();
+
+        long startNanos = System.nanoTime();
+        assertThat(worker.stop()).isTrue();
+        assertThat(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - startNanos))
+            .isLessThan(60);
+    }
+
     @Test
     @DisplayName("requestCompaction after stop() starts nothing")
     void requestCompaction_afterStop_isRefused() throws IOException {

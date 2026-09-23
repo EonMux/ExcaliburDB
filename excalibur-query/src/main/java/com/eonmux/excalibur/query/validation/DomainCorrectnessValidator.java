@@ -5,6 +5,7 @@ import com.eonmux.excalibur.query.QueryResponse;
 import com.eonmux.excalibur.query.QueryResultItem;
 
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -21,7 +22,7 @@ import java.util.Set;
  *   <li>Latency must be non-negative</li>
  *   <li>Segment counts must be non-negative</li>
  *   <li>Results must be sorted by score (descending)</li>
- *   <li>No duplicate document IDs in results</li>
+ *   <li>No result appears twice - see {@link #findDuplicateDocumentIds}</li>
  * </ul>
  *
  * <h2>Usage</h2>
@@ -333,21 +334,33 @@ public final class DomainCorrectnessValidator {
     // ==================== Duplicate Detection ====================
 
     /**
-     * Checks for duplicate document IDs in results.
+     * Finds the results that name a document, or a stored entry, another result already names.
+     *
+     * <p>A result's identity is the one the aggregator merges results on
+     * ({@code ResultAggregator}'s deduplication key): the string document identifier when the
+     * result has one, and otherwise the segment and node it came from. It is not
+     * {@link QueryResultItem#documentId()}. For every result the pipeline builds, that number is
+     * the node id, and node ids restart at 0 in every segment's graph, so two different documents
+     * that are each the first node of their own segment share it; keyed on it, an ordinary
+     * answer drawn from several segments reads as a duplicate, while one document returned from
+     * two segments under different node ids does not. A result that came from no segment carries
+     * only its numeric id, and is identified by that.</p>
      *
      * @param results The results to check
-     * @return Set of duplicate document IDs, or empty set if none found
+     * @return The identity of every result that appears more than once, as
+     *         {@link #resultIdentity} renders it; empty if none does
+     * @throws NullPointerException if results is null
      */
-    public static Set<Long> findDuplicateDocumentIds(List<QueryResultItem> results) {
+    public static Set<String> findDuplicateDocumentIds(List<QueryResultItem> results) {
         Objects.requireNonNull(results, "Results cannot be null");
 
-        Set<Long> seen = new HashSet<>();
-        Set<Long> duplicates = new HashSet<>();
+        Set<String> seen = new HashSet<>();
+        Set<String> duplicates = new LinkedHashSet<>();
 
         for (QueryResultItem item : results) {
-            long docId = item.documentId();
-            if (!seen.add(docId)) {
-                duplicates.add(docId);
+            String identity = resultIdentity(item);
+            if (!seen.add(identity)) {
+                duplicates.add(identity);
             }
         }
 
@@ -355,16 +368,38 @@ public final class DomainCorrectnessValidator {
     }
 
     /**
-     * Validates that results contain no duplicate document IDs.
+     * What distinguishes one result from another.
+     *
+     * <p>The document identifier when there is one; otherwise {@code segment S node N}, because
+     * a node id means nothing outside its segment; otherwise, for a result that came from no
+     * segment, its numeric id.</p>
+     *
+     * @param item The result
+     * @return Its identity, rendered for a report
+     */
+    static String resultIdentity(QueryResultItem item) {
+        String documentId = item.documentIdStr();
+        if (documentId != null && !documentId.isEmpty()) {
+            return documentId;
+        }
+        if (item.segmentId() >= 0) {
+            return "segment " + item.segmentId() + " node " + item.nodeId();
+        }
+        return Long.toString(item.documentId());
+    }
+
+    /**
+     * Validates that no result appears twice, by the identity
+     * {@link #findDuplicateDocumentIds} uses.
      *
      * @param results The results to validate
      * @throws IllegalArgumentException if duplicates are found
      */
     public static void validateNoDuplicates(List<QueryResultItem> results) {
-        Set<Long> duplicates = findDuplicateDocumentIds(results);
+        Set<String> duplicates = findDuplicateDocumentIds(results);
         if (!duplicates.isEmpty()) {
             throw new IllegalArgumentException(
-                "Results contain duplicate document IDs: " + duplicates);
+                "Results contain duplicates: " + duplicates);
         }
     }
 
@@ -379,7 +414,7 @@ public final class DomainCorrectnessValidator {
      *   <li>Latency is non-negative</li>
      *   <li>All result scores are in [0.0, 1.0]</li>
      *   <li>Results are sorted by score (descending)</li>
-     *   <li>No duplicate document IDs in results</li>
+     *   <li>No result appears twice - see {@link #findDuplicateDocumentIds}</li>
      * </ul>
      *
      * @param response The response to validate
@@ -489,9 +524,9 @@ public final class DomainCorrectnessValidator {
         }
 
         // Check duplicates
-        Set<Long> duplicates = findDuplicateDocumentIds(results);
+        Set<String> duplicates = findDuplicateDocumentIds(results);
         if (!duplicates.isEmpty()) {
-            builder.addError("Results contain duplicate document IDs: " + duplicates);
+            builder.addError("Results contain duplicates: " + duplicates);
         }
     }
 

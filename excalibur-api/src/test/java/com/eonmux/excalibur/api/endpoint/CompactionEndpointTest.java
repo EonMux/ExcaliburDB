@@ -85,7 +85,7 @@ class CompactionEndpointTest {
         @DisplayName("a request is accepted and the work happens behind it")
         void accepted() throws Exception {
             AtomicBoolean ran = new AtomicBoolean();
-            try (CompactionRunner runner = new CompactionRunner(force -> {
+            try (CompactionRunner runner = new CompactionRunner((force, stop) -> {
                 ran.set(true);
                 return A_RUN;
             })) {
@@ -102,7 +102,7 @@ class CompactionEndpointTest {
         @DisplayName("force reaches the compactor")
         void forceIsCarried() throws Exception {
             AtomicBoolean forced = new AtomicBoolean();
-            try (CompactionRunner runner = new CompactionRunner(force -> {
+            try (CompactionRunner runner = new CompactionRunner((force, stop) -> {
                 forced.set(force);
                 return A_RUN;
             })) {
@@ -124,7 +124,7 @@ class CompactionEndpointTest {
         @DisplayName("a second request while one is running is refused")
         void oneAtATime() throws Exception {
             CountDownLatch release = new CountDownLatch(1);
-            try (CompactionRunner runner = new CompactionRunner(force -> {
+            try (CompactionRunner runner = new CompactionRunner((force, stop) -> {
                 try {
                     release.await(5, TimeUnit.SECONDS);
                 } catch (InterruptedException e) {
@@ -147,7 +147,7 @@ class CompactionEndpointTest {
         @Test
         @DisplayName("a non-boolean force is refused rather than read as false")
         void forceMustBeABoolean() throws Exception {
-            try (CompactionRunner runner = new CompactionRunner(force -> A_RUN)) {
+            try (CompactionRunner runner = new CompactionRunner((force, stop) -> A_RUN)) {
                 Response response = call(new CompactionEndpoint(runner), "POST",
                     "{\"force\": \"yes\"}");
 
@@ -165,7 +165,7 @@ class CompactionEndpointTest {
         @Test
         @DisplayName("an oversized body is refused rather than truncated")
         void oversizedBodyIsRefused() throws Exception {
-            try (CompactionRunner runner = new CompactionRunner(force -> A_RUN)) {
+            try (CompactionRunner runner = new CompactionRunner((force, stop) -> A_RUN)) {
                 String padding = "x".repeat(2 * 1024 * 1024);
                 Response response = call(new CompactionEndpoint(runner), "POST",
                     "{\"pad\": \"" + padding + "\", \"force\": true}");
@@ -182,7 +182,7 @@ class CompactionEndpointTest {
         @Test
         @DisplayName("the accepted response describes the run it started, however fast it ends")
         void acceptedResponseAlwaysSaysRunning() throws Exception {
-            try (CompactionRunner runner = new CompactionRunner(force -> A_RUN)) {
+            try (CompactionRunner runner = new CompactionRunner((force, stop) -> A_RUN)) {
                 CompactionEndpoint endpoint = new CompactionEndpoint(runner);
                 for (int i = 0; i < 20; i++) {
                     awaitIdle(runner);
@@ -200,7 +200,7 @@ class CompactionEndpointTest {
             // Two pieces of state for one fact let them disagree: a caller polling the status
             // until it read "completed" and then posting again was answered 409 "already in
             // progress", which is a loop that fails intermittently and only under load.
-            try (CompactionRunner runner = new CompactionRunner(force -> A_RUN)) {
+            try (CompactionRunner runner = new CompactionRunner((force, stop) -> A_RUN)) {
                 CompactionEndpoint endpoint = new CompactionEndpoint(runner);
                 for (int i = 0; i < 200; i++) {
                     assertThat(call(endpoint, "POST", "{}").status()).isEqualTo(202);
@@ -220,7 +220,7 @@ class CompactionEndpointTest {
         @Test
         @DisplayName("any method but POST is refused")
         void postOnly() throws Exception {
-            try (CompactionRunner runner = new CompactionRunner(force -> A_RUN)) {
+            try (CompactionRunner runner = new CompactionRunner((force, stop) -> A_RUN)) {
                 assertThat(call(new CompactionEndpoint(runner), "GET", "").status())
                     .isEqualTo(405);
             }
@@ -234,7 +234,7 @@ class CompactionEndpointTest {
         @Test
         @DisplayName("nothing has run yet")
         void idle() throws Exception {
-            try (CompactionRunner runner = new CompactionRunner(force -> A_RUN)) {
+            try (CompactionRunner runner = new CompactionRunner((force, stop) -> A_RUN)) {
                 Response response = status(new CompactionStatusEndpoint(runner));
 
                 assertThat(response.status()).isEqualTo(200);
@@ -245,7 +245,7 @@ class CompactionEndpointTest {
         @Test
         @DisplayName("a finished run reports everything it examined, reclaimed and failed on")
         void completed() throws Exception {
-            try (CompactionRunner runner = new CompactionRunner(force -> A_RUN)) {
+            try (CompactionRunner runner = new CompactionRunner((force, stop) -> A_RUN)) {
                 call(new CompactionEndpoint(runner), "POST", "{}");
                 awaitIdle(runner);
 
@@ -273,7 +273,7 @@ class CompactionEndpointTest {
         @Test
         @DisplayName("a run that threw is reported as failed, with its reason")
         void failed() throws Exception {
-            try (CompactionRunner runner = new CompactionRunner(force -> {
+            try (CompactionRunner runner = new CompactionRunner((force, stop) -> {
                 throw new IllegalStateException("segment 3 is closed");
             })) {
                 call(new CompactionEndpoint(runner), "POST", "{}");

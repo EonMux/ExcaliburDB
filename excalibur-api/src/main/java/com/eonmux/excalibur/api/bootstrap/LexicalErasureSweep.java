@@ -7,6 +7,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -30,6 +31,16 @@ import java.util.function.Function;
  * discharged, and with none there is nothing any compaction could reclaim, so the planner is
  * never asked and no segment is touched.</p>
  *
+ * <h2>Stopping</h2>
+ * <p>A sweep can be in the middle of a rewrite of the whole index when the node shuts down, and
+ * that rewrite reads every surviving chunk's text back out of the storage engine the shutdown is
+ * about to close. It is told to stop through the cooperative signal the index reads between
+ * segment groups and between chunks, never by an interrupt: an interrupt reaching a thread inside
+ * file I/O closes the channel it was using, and the index shares its channels with every query.
+ * A stopped rewrite publishes nothing and leaves every segment as it was. {@link #drain()} says
+ * whether the sweep actually ended, because a shutdown that closed storage under one that had not
+ * would crash the process rather than fail it.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent use. {@link #sweep()} may be called by anyone; the index serialises its
  * own compactions.</p>
@@ -51,12 +62,19 @@ public final class LexicalErasureSweep implements AutoCloseable {
     /** Shortest gap between sweeps, so a small configured bound cannot turn into a spin. */
     static final long MIN_SWEEP_INTERVAL_MS = 1_000L;
 
-    /** How long {@link #close()} waits for a compaction in flight. */
-    private static final long SHUTDOWN_WAIT_SECONDS = 30L;
+    /** How long {@link #drain()} waits for a compaction in flight to act on the stop. */
+    private static final Duration SHUTDOWN_WAIT = Duration.ofSeconds(30);
 
     private final ChunkIndex index;
     private final Function<String, String> storedText;
     private final ScheduledExecutorService scheduler;
+    private final Duration shutdownWait;
+
+    /**
+     * Set once by {@link #drain()}: read by a compaction in flight at its next boundary, and by
+     * every later {@link #sweep()} before it starts one.
+     */
+    private volatile boolean stopping;
 
     /**
      * Starts sweeping.
@@ -68,19 +86,38 @@ public final class LexicalErasureSweep implements AutoCloseable {
      */
     public LexicalErasureSweep(ChunkIndex index, Function<String, String> storedText,
                                long maxLatencySeconds) {
+        this(index, storedText, sweepIntervalMillis(maxLatencySeconds),
+            sweepIntervalMillis(maxLatencySeconds), SHUTDOWN_WAIT);
+        LOGGER.info("lexical erasure deadline swept every {}ms against a bound of {}s",
+            sweepIntervalMillis(maxLatencySeconds), maxLatencySeconds);
+    }
+
+    /**
+     * Starts sweeping on a schedule and a shutdown budget of the caller's choosing.
+     *
+     * <p>Package-private so a test can have the first sweep start at once and a drain give up
+     * quickly, and observe both without waiting out the production intervals.</p>
+     *
+     * @param index          The chunk index whose obligations are being discharged
+     * @param storedText     Reads a chunk's text back, which a rewrite needs
+     * @param initialDelayMs How long before the first sweep
+     * @param intervalMs     The gap between one sweep ending and the next starting
+     * @param shutdownWait   How long {@link #drain()} waits for a sweep in flight
+     * @throws NullPointerException if index, storedText or shutdownWait is null
+     */
+    LexicalErasureSweep(ChunkIndex index, Function<String, String> storedText,
+                        long initialDelayMs, long intervalMs, Duration shutdownWait) {
         this.index = Objects.requireNonNull(index, "index must not be null");
         this.storedText = Objects.requireNonNull(storedText, "storedText must not be null");
+        this.shutdownWait = Objects.requireNonNull(shutdownWait, "shutdownWait must not be null");
 
-        long intervalMs = sweepIntervalMillis(maxLatencySeconds);
         this.scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "lexical-erasure-sweep");
             thread.setDaemon(true);
             return thread;
         });
-        this.scheduler.scheduleWithFixedDelay(this::sweep, intervalMs, intervalMs,
+        this.scheduler.scheduleWithFixedDelay(this::sweep, initialDelayMs, intervalMs,
             TimeUnit.MILLISECONDS);
-        LOGGER.info("lexical erasure deadline swept every {}ms against a bound of {}s",
-            intervalMs, maxLatencySeconds);
     }
 
     /**
@@ -105,10 +142,10 @@ public final class LexicalErasureSweep implements AutoCloseable {
      */
     public boolean sweep() {
         try {
-            if (index.stats().erasureRequests() == 0) {
+            if (stopping || index.stats().erasureRequests() == 0) {
                 return false;
             }
-            CompactionResult result = index.compactIfDue(storedText);
+            CompactionResult result = index.compactIfDue(storedText, () -> stopping);
             if (result.performed()) {
                 LOGGER.info("lexical erasure deadline reached: {} segment(s) rewritten into {}",
                     result.segmentsRewritten(), result.segmentsProduced());
@@ -122,16 +159,38 @@ public final class LexicalErasureSweep implements AutoCloseable {
         }
     }
 
-    @Override
-    public void close() {
-        scheduler.shutdownNow();
+    /**
+     * Stops sweeping, tells a compaction in flight to stop, and waits for it to end.
+     *
+     * <p>{@code shutdown}, never {@code shutdownNow}: the compaction is told through its stop
+     * signal, because an interrupt delivered inside file I/O closes a channel the index shares
+     * with every query. What a stopped compaction loses is its own work; it publishes nothing.</p>
+     *
+     * <p>The answer is the one a shutdown needs before it closes storage. False means a
+     * compaction is still running - one that had not reached a boundary within the wait, or an
+     * index that cannot stop mid-rewrite - and whatever it reads must be left open.</p>
+     *
+     * @return true if no sweep is still running
+     */
+    public boolean drain() {
+        stopping = true;
+        scheduler.shutdown();
         try {
-            if (!scheduler.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS)) {
-                LOGGER.warn("the lexical erasure sweep did not stop within {}s",
-                    SHUTDOWN_WAIT_SECONDS);
+            if (scheduler.awaitTermination(shutdownWait.toMillis(), TimeUnit.MILLISECONDS)) {
+                return true;
             }
+            LOGGER.error("the lexical erasure sweep was still compacting {}s after being asked to "
+                + "stop", shutdownWait.toSeconds());
+            return false;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            return scheduler.isTerminated();
         }
+    }
+
+    /** As {@link #drain()}, for a caller with no use for the answer. */
+    @Override
+    public void close() {
+        drain();
     }
 }

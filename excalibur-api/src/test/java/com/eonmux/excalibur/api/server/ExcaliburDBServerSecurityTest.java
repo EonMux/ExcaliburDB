@@ -4,6 +4,7 @@ import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.EpochTickScheduler;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
+import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
 import org.junit.jupiter.api.AfterEach;
@@ -52,6 +53,7 @@ class ExcaliburDBServerSecurityTest {
         SegmentCatalog segmentCatalog = new SegmentCatalog();
 
         indexOrchestrator = mock(IndexOrchestrator.class);
+        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         storageEngine = mock(StorageEngine.class);
         queryPipeline = mock(QueryPipeline.class);
 

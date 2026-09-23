@@ -1,10 +1,10 @@
 package com.eonmux.excalibur.bench.benchmark;
 
+import com.eonmux.excalibur.bench.kernel.FalsePositiveTally;
 import com.eonmux.excalibur.filter.CuckooFilter;
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
 
-import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -28,9 +28,25 @@ import java.util.concurrent.TimeUnit;
  *   <li>Load factor range: [0.0, 1.0] - represents percentage of capacity used</li>
  *   <li>Fingerprint bits: [8, 16] - 13 bits default for ≤0.1% FP rate</li>
  *   <li>Capacity: power of 2, range [16, 2^62]</li>
- *   <li>Delete returns boolean: true on success (item found), false on graceful failure (not found)</li>
- *   <li>After delete(x), contains(x) MUST return false - no false negatives</li>
- *   <li>Delete(x) removes EXACT fingerprint for x, never a different item's fingerprint</li>
+ *   <li>Delete of an inserted key always succeeds - no false negatives</li>
+ *   <li>Delete(x) removes an entry carrying x's fingerprint from one of x's two buckets</li>
+ * </ul>
+ *
+ * <h2>What a correct filter may still answer</h2>
+ * <p>A cuckoo filter stores fingerprints, not keys, so two answers about deletion are false
+ * positives by construction. Deleting a key that was never inserted succeeds when a resident
+ * entry in one of its buckets carries the same fingerprint - exactly the case in which a lookup
+ * of it would be a false positive - and a deleted key still reads as present when some other
+ * entry in one of its buckets does. Neither is a defect, so neither may be asserted away with a
+ * hard check that a long enough trial is certain to trip:</p>
+ * <ul>
+ *   <li>The absent-key benchmarks use keys the filter was verified to rule out when the trial
+ *       started. Those benchmarks never change the filter, so the verification holds for the
+ *       whole trial, and a delete that then succeeds is a real defect.</li>
+ *   <li>{@link #deleteAndVerify} tallies deleted keys that still read as present and fails the
+ *       trial only if that rate is significantly above {@link #stillVisibleRate}, the false
+ *       positive rate of a full filter. A delete that removed the wrong entry, or an alternate
+ *       index that failed to round-trip, would put it orders of magnitude above that.</li>
  * </ul>
  *
  * <h2>Expected Performance</h2>
@@ -81,11 +97,24 @@ public class CuckooFilterDeleteBenchmark {
     private static final int FINGERPRINTS_PER_BUCKET = 4;
 
     /**
-     * Number of delete operations to perform in each benchmark iteration.
-     * This batch size provides stable throughput measurements.
+     * Size of each absent-key pool. A power of two, so the cursor wraps with a mask.
      */
-    @Param({"10000"})
-    public int batchSize;
+    private static final int ABSENT_POOL_SIZE = 1 << 16;
+
+    /**
+     * First index of the absent-key sequence, far past any resident key's index.
+     */
+    private static final long ABSENT_KEY_BASE = 1L << 40;
+
+    /**
+     * Key sizes {@link #deleteVariedKeySizes} cycles through, one delete each per call.
+     */
+    private static final int[] VARIED_KEY_SIZES = {8, 16, 32, 64};
+
+    /**
+     * How far the filled load factor may sit from the target before the trial is refused.
+     */
+    private static final double LOAD_FACTOR_TOLERANCE = 0.001;
 
     /**
      * Number of bits per fingerprint.
@@ -103,17 +132,31 @@ public class CuckooFilterDeleteBenchmark {
     private CuckooFilter filter;
 
     /**
-     * Random number generator for key generation.
-     * Seeded for reproducibility.
-     */
-    private Random random;
-
-    /**
      * Pre-generated keys for delete operations.
      * These keys were inserted during setup and will be deleted during benchmark.
      * Using pre-generated keys eliminates key generation overhead from measurements.
      */
     private byte[][] deleteKeys;
+
+    /**
+     * Keys that were never inserted and that the filter rules out, for the delete-miss path.
+     */
+    private byte[][] absentKeys;
+
+    /**
+     * Never-inserted keys of 8, 16, 32 and 64 bytes that the filter rules out, in that order.
+     */
+    private byte[][] variedAbsentKeys;
+
+    /**
+     * Current index into the absent key pools.
+     */
+    private int absentIndex;
+
+    /**
+     * Deleted keys {@link #deleteAndVerify} found still reported present, over all it checked.
+     */
+    private FalsePositiveTally stillVisible;
 
     /**
      * Current index into deleteKeys array.
@@ -145,8 +188,9 @@ public class CuckooFilterDeleteBenchmark {
      *   <li>Load factor is clamped to [0.0, 1.0]</li>
      *   <li>Capacity is validated as power of 2</li>
      *   <li>Filter is pre-populated to exact target load factor</li>
-     *   <li>Actual load factor is verified to match target within 1%</li>
+     *   <li>Actual load factor is verified to match target within 0.1%</li>
      *   <li>All pre-populated items are verified to be present</li>
+     *   <li>Absent keys are screened so none is a false positive of the filled filter</li>
      * </ul>
      */
     @Setup(Level.Trial)
@@ -167,9 +211,6 @@ public class CuckooFilterDeleteBenchmark {
                 "fingerprintBits must be in [8, 16], got: " + fingerprintBits);
         }
 
-        // Initialize random with fixed seed for reproducibility
-        random = new Random(42);
-
         // Create filter with specified capacity and fingerprint bits
         filter = CuckooFilter.create(capacity, fingerprintBits);
 
@@ -181,7 +222,7 @@ public class CuckooFilterDeleteBenchmark {
 
         // Pre-populate filter to target load factor
         // Store keys for deletion during benchmark
-        deleteKeys = new byte[(int) totalEntries + batchSize * 10][];
+        deleteKeys = new byte[(int) totalEntries][];
 
         // Insert entries and store their keys
         for (long i = 0; i < totalEntries; i++) {
@@ -196,16 +237,13 @@ public class CuckooFilterDeleteBenchmark {
             }
         }
 
-        // Generate additional keys for delete operations (beyond the pre-populated set)
-        // These will be re-inserted during iteration to maintain load factor
-        for (int i = 0; i < batchSize * 10; i++) {
-            deleteKeys[(int) totalEntries + i] = generateKey(totalEntries + i + 1_000_000);
-        }
+        absentKeys = screenAbsent(ABSENT_KEY_BASE, 16);
+        variedAbsentKeys = screenAbsentVaried(ABSENT_KEY_BASE << 1);
 
-        // Verify actual load factor matches target (within 5% tolerance due to power-of-2 sizing)
+        // Verify actual load factor matches target
         double actualLoadFactor = filter.loadFactor();
         double loadFactorError = Math.abs(actualLoadFactor - targetLoadFactor);
-        if (loadFactorError > 0.05) {
+        if (loadFactorError > LOAD_FACTOR_TOLERANCE) {
             throw new IllegalStateException(
                 "Load factor mismatch. Target: " + targetLoadFactor +
                 ", Actual: " + actualLoadFactor +
@@ -222,8 +260,10 @@ public class CuckooFilterDeleteBenchmark {
 
         // Initialize indices
         keyIndex = 0;
+        absentIndex = 0;
         successCount = 0;
         failCount = 0;
+        stillVisible = new FalsePositiveTally(stillVisibleRate(fingerprintBits));
 
         // Log benchmark setup
         System.out.println("========================================");
@@ -236,12 +276,14 @@ public class CuckooFilterDeleteBenchmark {
         System.out.println("  Fingerprint bits: " + filter.fingerprintBits());
         System.out.println("  Num buckets: " + filter.numBuckets());
         System.out.println("  Filter size: " + (filter.byteSize() / 1024) + " KB");
-        System.out.println("  Batch size: " + batchSize);
         System.out.println("========================================");
     }
 
     /**
-     * Logs final statistics after each trial.
+     * Logs final statistics after each trial, and fails the trial if deleted keys stayed
+     * visible significantly more often than fingerprint collisions account for.
+     *
+     * @throws IllegalStateException if {@link #deleteAndVerify} saw such an excess
      */
     @TearDown(Level.Trial)
     public void tearDown() {
@@ -256,7 +298,47 @@ public class CuckooFilterDeleteBenchmark {
             System.out.println("  Success rate: " +
                 String.format("%.2f%%", 100.0 * successCount / (successCount + failCount)));
         }
+        if (stillVisible.queries() > 0) {
+            System.out.println("  Deleted keys still visible: " + stillVisible.falsePositives()
+                + " of " + stillVisible.queries() + String.format(" (%.4f%%, budget %.4f%%)",
+                    stillVisible.rate() * 100, stillVisible.specification() * 100));
+        }
         System.out.println("========================================");
+
+        // Each pass over the resident keys re-checks the same keys, so at most one pass is a
+        // sample, and within it collisions come in groups: two resident keys sharing a
+        // fingerprint and a bucket pair each keep the other visible. Half the resident keys is
+        // therefore the independent sample.
+        long independent = Math.min(stillVisible.queries(), totalEntries / 2);
+        if (stillVisible.significantlyExceedsSpecification(Math.max(1, independent))) {
+            throw new IllegalStateException(String.format(
+                "Domain correctness violation: %d of %d deleted keys stayed visible (%.4f%%), "
+                    + "significantly above the %.4f%% fingerprint collision rate",
+                stillVisible.falsePositives(), stillVisible.queries(),
+                stillVisible.rate() * 100, stillVisible.specification() * 100));
+        }
+    }
+
+    /**
+     * Upper bound on the expected chance that a deleted key still reads as present in a correct filter.
+     *
+     * <p>The key stays visible when another resident entry carries its fingerprint in one of its
+     * two buckets. Such an entry's alternate bucket is derived from the same bucket and the same
+     * fingerprint, so it shares the deleted key's bucket pair exactly: every resident key with
+     * that fingerprint and pair is confined to those two buckets and is found, however full they
+     * are. The rate is therefore that of a lookup false positive - about {@code 2b * load} other
+     * keys' worth of chances at {@code 1 / (2^f - 1)} each, fingerprints being non-zero - and its
+     * expectation is at most the rate of a completely full filter, which this returns. It is not the collision
+     * chance of the seven slots left beside the deleted entry: conditioning on the key's own
+     * slot does not remove the keys that share its pair, and a bound built that way is exceeded
+     * by a correct filter at 95% load.</p>
+     *
+     * @param fingerprintBits The filter's fingerprint width
+     * @return The false positive rate of a filter with every slot occupied
+     */
+    public static double stillVisibleRate(int fingerprintBits) {
+        double perSlot = 1.0 / ((1 << fingerprintBits) - 1);
+        return 1.0 - Math.pow(1.0 - perSlot, 2 * FINGERPRINTS_PER_BUCKET);
     }
 
     // ==================== Benchmark Methods ====================
@@ -298,13 +380,14 @@ public class CuckooFilterDeleteBenchmark {
 
     /**
      * Benchmark: Batch delete operations (10 deletes per call).
-     * Measures throughput when performing bulk deletes.
+     * Measures throughput when performing bulk deletes; the score is per delete.
      *
      * <h3>Rationale</h3>
      * <p>Batch operations amortize method call overhead and better reflect
      * real-world usage where multiple items are deleted together.</p>
      */
     @Benchmark
+    @OperationsPerInvocation(10)
     public int batchDelete10(Blackhole bh) {
         int successes = 0;
         for (int i = 0; i < 10; i++) {
@@ -326,9 +409,10 @@ public class CuckooFilterDeleteBenchmark {
 
     /**
      * Benchmark: Batch delete operations (100 deletes per call).
-     * Measures throughput for large bulk delete operations.
+     * Measures throughput for large bulk delete operations; the score is per delete.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int batchDelete100(Blackhole bh) {
         int successes = 0;
         for (int i = 0; i < 100; i++) {
@@ -353,8 +437,11 @@ public class CuckooFilterDeleteBenchmark {
      * Measures combined delete + verify throughput.
      *
      * <h3>Domain Correctness</h3>
-     * <p>Verifies that deleted items are immediately NOT findable.
-     * A successful delete MUST result in contains returning false.</p>
+     * <p>A delete of a resident key must succeed. Whether the key then reads as absent depends
+     * on the other entries in its buckets: another entry with the same fingerprint keeps it
+     * visible, which is a false positive rather than a defect. Each check is therefore tallied,
+     * and {@link #tearDown()} fails the trial if the rate is significantly above
+     * {@link #stillVisibleRate}.</p>
      */
     @Benchmark
     public boolean deleteAndVerify(Blackhole bh) {
@@ -365,12 +452,7 @@ public class CuckooFilterDeleteBenchmark {
         boolean deleted = filter.delete(key);
 
         if (deleted) {
-            // Domain correctness: deleted item MUST NOT be found
-            boolean found = filter.contains(key);
-            if (found) {
-                throw new IllegalStateException(
-                    "Domain correctness violation: deleted key still found in filter");
-            }
+            stillVisible.record(filter.contains(key) ? 1 : 0, 1);
             successCount++;
             // Re-insert to maintain load factor
             filter.insert(key);
@@ -413,22 +495,19 @@ public class CuckooFilterDeleteBenchmark {
      * Measures throughput when attempting to delete items that don't exist.
      *
      * <h3>Domain Correctness</h3>
-     * <p>Delete on non-existent item should return false quickly without
-     * modifying the filter state.</p>
+     * <p>Every key comes from {@link #absentKeys}, screened at setup to be neither inserted nor
+     * a false positive of the filled filter. A delete that misses leaves the filter unchanged,
+     * so the screening holds for the whole trial and a delete that succeeds is a defect.</p>
      */
     @Benchmark
     public boolean deleteNonExistent(Blackhole bh) {
-        // Use keys from beyond the pre-populated set
-        int idx = (int) totalEntries + (keyIndex % (batchSize * 10));
-        byte[] key = deleteKeys[idx];
-        keyIndex++;
+        byte[] key = absentKeys[absentIndex++ & (ABSENT_POOL_SIZE - 1)];
 
         boolean result = filter.delete(key);
 
-        // Should always return false for non-existent items
         if (result) {
             throw new IllegalStateException(
-                "Domain correctness violation: delete returned true for non-existent item");
+                "Domain correctness violation: delete succeeded for a key the filter ruled out");
         }
         failCount++;
 
@@ -436,70 +515,91 @@ public class CuckooFilterDeleteBenchmark {
     }
 
     /**
-     * Benchmark: Delete with varied key sizes.
-     * Tests delete throughput with different key sizes to measure
-     * the impact of hashing overhead.
+     * Benchmark: Delete misses with varied key sizes.
+     * Tests delete-miss throughput with 8, 16, 32 and 64 byte keys, one of each per call, to
+     * measure the impact of hashing overhead. The score is per delete.
+     *
+     * <h3>Domain Correctness</h3>
+     * <p>The keys are pre-generated and screened like {@link #deleteNonExistent}'s, so building
+     * them is not timed and none of them may be deleted.</p>
      */
     @Benchmark
+    @OperationsPerInvocation(4)
     public int deleteVariedKeySizes(Blackhole bh) {
         int successes = 0;
 
-        // Delete keys of varying sizes: 8, 16, 32, 64 bytes
-        for (int sizeMultiplier = 1; sizeMultiplier <= 4; sizeMultiplier++) {
-            int keySize = 8 * sizeMultiplier;
-            int idx = keyIndex % (int) totalEntries;
-            byte[] baseKey = deleteKeys[idx];
-            byte[] key = new byte[keySize];
-
-            // Copy from pre-generated key, repeating as needed
-            for (int i = 0; i < keySize; i++) {
-                key[i] = baseKey[i % baseKey.length];
-            }
-            keyIndex++;
-
-            // Note: This key won't be in the filter since we're modifying it
-            // So we measure delete-miss throughput
+        for (int i = 0; i < VARIED_KEY_SIZES.length; i++) {
+            byte[] key = variedAbsentKeys[absentIndex++ & (ABSENT_POOL_SIZE - 1)];
             if (filter.delete(key)) {
-                successes++;
-                successCount++;
-            } else {
-                failCount++;
+                throw new IllegalStateException("Domain correctness violation: delete succeeded "
+                    + "for a " + key.length + "-byte key the filter ruled out");
             }
+            failCount++;
         }
 
         return successes;
     }
 
-    /**
-     * Benchmark: Alternating delete and insert pattern.
-     * Simulates a workload with churn (items being deleted and new items inserted).
-     *
-     * <h3>Thread State</h3>
-     * <p>Uses thread-local state to track the alternate key set for inserts.</p>
-     */
-    @State(Scope.Thread)
-    public static class ChurnState {
-        private byte[][] insertKeys;
-        private int insertIndex;
-        private int deleteIndex;
+    // ==================== Helper Methods ====================
 
-        @Setup(Level.Iteration)
-        public void setup() {
-            // Generate keys for insert operations
-            insertKeys = new byte[10000][];
-            for (int i = 0; i < insertKeys.length; i++) {
-                byte[] key = new byte[16];
-                String prefix = "chrn" + String.format("%011d", i);
-                byte[] prefixBytes = prefix.getBytes();
-                System.arraycopy(prefixBytes, 0, key, 0, Math.min(prefixBytes.length, 16));
-                insertKeys[i] = key;
+    /**
+     * Collects never-inserted keys the filled filter rules out.
+     *
+     * @param firstIndex Index of the first candidate key
+     * @param keySize    Length of every key
+     * @return {@link #ABSENT_POOL_SIZE} keys for which {@code contains} is false
+     */
+    private byte[][] screenAbsent(long firstIndex, int keySize) {
+        byte[][] pool = new byte[ABSENT_POOL_SIZE][];
+        long candidate = firstIndex;
+        for (int i = 0; i < pool.length; candidate++) {
+            byte[] key = sizedKey(candidate, keySize);
+            if (!filter.contains(key)) {
+                pool[i++] = key;
             }
-            insertIndex = 0;
-            deleteIndex = 0;
         }
+        return pool;
     }
 
-    // ==================== Helper Methods ====================
+    /**
+     * Collects never-inserted keys of every size in {@link #VARIED_KEY_SIZES}, cycling through
+     * the sizes, that the filled filter rules out.
+     *
+     * @param firstIndex Index of the first candidate key
+     * @return {@link #ABSENT_POOL_SIZE} keys for which {@code contains} is false
+     */
+    private byte[][] screenAbsentVaried(long firstIndex) {
+        byte[][] pool = new byte[ABSENT_POOL_SIZE][];
+        long candidate = firstIndex;
+        for (int i = 0; i < pool.length; candidate++) {
+            byte[] key = sizedKey(candidate, VARIED_KEY_SIZES[i % VARIED_KEY_SIZES.length]);
+            if (!filter.contains(key)) {
+                pool[i++] = key;
+            }
+        }
+        return pool;
+    }
+
+    /**
+     * Builds a key of the given length whose last eight bytes are the big-endian index.
+     *
+     * <p>Every other byte is a fixed filler, so two keys of the same length differ exactly when
+     * their indices do, and keys of different lengths never coincide.</p>
+     *
+     * @param index   The unique index for this key
+     * @param keySize The key length, at least 8
+     * @return The key
+     */
+    private static byte[] sizedKey(long index, int keySize) {
+        byte[] key = new byte[keySize];
+        for (int i = 0; i < keySize - 8; i++) {
+            key[i] = (byte) ('A' + i % 26);
+        }
+        for (int i = 0; i < 8; i++) {
+            key[keySize - 8 + i] = (byte) (index >>> (56 - 8 * i));
+        }
+        return key;
+    }
 
     /**
      * Generates a unique key for the given index.

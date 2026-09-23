@@ -71,7 +71,7 @@ class HierarchicalCuckooFilterTest {
         }
 
         @Test
-        @DisplayName("takes a filter built elsewhere, and trusts it afresh")
+        @DisplayName("takes a filter built elsewhere, stale until a rebuild vouches for it")
         void registersAnExistingFilter() {
             CuckooFilter built =
                 CuckooFilter.create(1_000, 13, hierarchy.getCorpusFilter().seed());
@@ -80,7 +80,70 @@ class HierarchicalCuckooFilterTest {
             hierarchy.registerSegment(SEGMENT_1, built);
 
             assertThat(hierarchy.getSegmentFilter(SEGMENT_1)).isSameAs(built);
+            assertThat(hierarchy.isSegmentStale(SEGMENT_1))
+                .as("nothing says the supplied filter describes the segment")
+                .isTrue();
+            assertThat(hierarchy.coversSegment(SEGMENT_1)).isFalse();
+
+            long generation = hierarchy.beginSegmentRebuild(SEGMENT_1);
+            hierarchy.insert(toBytes("prebuilt"), SEGMENT_1);
+            hierarchy.completeSegmentRebuild(SEGMENT_1, generation);
             assertThat(hierarchy.coversSegment(SEGMENT_1)).isTrue();
+        }
+
+        @Test
+        @DisplayName("replacing a trusted level with a supplied filter withdraws the trust")
+        void replacingATrustedLevelWithdrawsTrust() {
+            trust(hierarchy, SEGMENT_1, "alpha");
+            assertThat(hierarchy.coversSegment(SEGMENT_1)).isTrue();
+
+            CuckooFilter built =
+                CuckooFilter.create(1_000, 13, hierarchy.getCorpusFilter().seed());
+            built.insert(toBytes("beta"));
+            hierarchy.registerSegment(SEGMENT_1, built);
+
+            assertThat(hierarchy.coversSegment(SEGMENT_1)).isFalse();
+        }
+
+        @Test
+        @DisplayName("a level created by the first write is born stale")
+        void aCreatedLevelIsBornStale() {
+            // The restart case: a reopened segment's level is created by the first chunk
+            // written after the restart, and knows only that chunk's terms.
+            hierarchy.registerSegment(SEGMENT_1);
+            hierarchy.insert(toBytes("alpha"), SEGMENT_1);
+
+            assertThat(hierarchy.isSegmentStale(SEGMENT_1)).isTrue();
+            assertThat(hierarchy.coversSegment(SEGMENT_1)).isFalse();
+            assertThat(hierarchy.coverageStamp(SEGMENT_1))
+                .isEqualTo(HierarchicalCuckooFilter.NOT_COVERED);
+        }
+
+        @Test
+        @DisplayName("registering an id that already has a level leaves its trust alone")
+        void reRegisteringKeepsTrust() {
+            trust(hierarchy, SEGMENT_1, "alpha");
+            long stamp = hierarchy.coverageStamp(SEGMENT_1);
+
+            CuckooFilter again = hierarchy.registerSegment(SEGMENT_1);
+
+            assertThat(again).isSameAs(hierarchy.getSegmentFilter(SEGMENT_1));
+            assertThat(hierarchy.coverageStamp(SEGMENT_1)).isEqualTo(stamp);
+        }
+
+        @Test
+        @DisplayName("unregistering an id withdraws its trust, and a rebuild of the old level "
+            + "cannot restore it")
+        void unregisteringWithdrawsTrust() {
+            long generation = hierarchy.beginSegmentRebuild(SEGMENT_1);
+            hierarchy.insert(toBytes("alpha"), SEGMENT_1);
+
+            hierarchy.unregisterSegment(SEGMENT_1);
+
+            assertThat(hierarchy.completeSegmentRebuild(SEGMENT_1, generation)).isFalse();
+            hierarchy.registerSegment(SEGMENT_1);
+            hierarchy.insert(toBytes("alpha"), SEGMENT_1);
+            assertThat(hierarchy.coversSegment(SEGMENT_1)).isFalse();
         }
 
         @Test
@@ -392,9 +455,8 @@ class HierarchicalCuckooFilterTest {
             // documents are in storage and the answer is empty, which is the one outcome a
             // pre-filter must never produce.
             HierarchicalCuckooFilter small = new HierarchicalCuckooFilter(1_000_000, 13, 8);
-            small.registerSegment(SEGMENT_1);
-            small.registerSegment(SEGMENT_2);
-            small.insert(toBytes("kept"), SEGMENT_2);
+            trust(small, SEGMENT_1);
+            trust(small, SEGMENT_2, "kept");
 
             assertThat(fillUntilRefused(small, SEGMENT_1, 4096))
                 .as("the segment level has to fill for this test to mean anything")
@@ -431,8 +493,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("a populated segment that never refused anything is authoritative")
         void aPopulatedSegmentIsAuthoritative() {
-            hierarchy.registerSegment(SEGMENT_1);
-            hierarchy.insert(toBytes("alpha"), SEGMENT_1);
+            trust(hierarchy, SEGMENT_1, "alpha");
 
             assertThat(hierarchy.coversSegment(SEGMENT_1)).isTrue();
             assertThat(hierarchy.isSaturated()).isFalse();
@@ -459,8 +520,7 @@ class HierarchicalCuckooFilterTest {
             assertThat(small.coversSegment(SEGMENT_1)).isFalse();
 
             small.unregisterSegment(SEGMENT_1);
-            small.registerSegment(SEGMENT_1);
-            small.insert(toBytes("fresh"), SEGMENT_1);
+            trust(small, SEGMENT_1, "fresh");
 
             assertThat(small.coversSegment(SEGMENT_1)).isTrue();
         }
@@ -572,6 +632,15 @@ class HierarchicalCuckooFilterTest {
             assertThat(hierarchy.toString())
                 .startsWith("HierarchicalCuckooFilter[segments=1, entries=0,");
         }
+    }
+
+    /** Refills a segment's level with these terms and has the rebuild vouch for it. */
+    private static void trust(HierarchicalCuckooFilter filter, String segment, String... terms) {
+        long generation = filter.beginSegmentRebuild(segment);
+        for (String term : terms) {
+            filter.insert(toBytes(term), segment);
+        }
+        filter.completeSegmentRebuild(segment, generation);
     }
 
     private static byte[] toBytes(String key) {

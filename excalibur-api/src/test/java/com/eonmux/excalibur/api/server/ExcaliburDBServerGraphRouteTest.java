@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.server;
 
 import com.eonmux.excalibur.api.bootstrap.GraphRagFactory;
+import com.eonmux.excalibur.api.bootstrap.GraphTenant;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.EpochTickScheduler;
@@ -85,7 +86,7 @@ class ExcaliburDBServerGraphRouteTest {
     }
 
     private void startWithGraph(Path dataDir) throws Exception {
-        Path directory = dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY);
+        Path directory = dataDir.resolve(GraphTenant.GRAPH_SUBDIRECTORY);
 
         EdgeStoreWriter edges = new EdgeStoreWriter();
         edges.add(ADA, COLLABORATED_WITH, BABBAGE, Integer.MIN_VALUE, TemporalFilter.OPEN,
@@ -109,7 +110,7 @@ class ExcaliburDBServerGraphRouteTest {
         new LabelDictionaryWriter().put(COLLABORATED_WITH, "collaboratedWith")
             .write(directory, GraphRagFactory.RELATION_DICTIONARY);
 
-        graph = GraphRagFactory.open(new Config(new HashMap<>()), dataDir);
+        graph = GraphRagFactory.openAt(new Config(new HashMap<>()), directory);
         assertThat(graph).isNotNull();
 
         server = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);

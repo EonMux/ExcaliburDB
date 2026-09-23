@@ -125,6 +125,71 @@ class BenchmarkResultTargetEvaluationTest {
     }
 
     @Test
+    @DisplayName("a scaled target counts in the unit of work it declares, not always in bytes")
+    void scaledTargetCountsInItsOwnUnitOfWork() {
+        // One op is one distance over 1536 components: 1M ops/sec is 1.536G components/sec.
+        BenchmarkResult result = BenchmarkResult.builder()
+            .benchmarkName("com.eonmux.excalibur.bench.benchmark.DemoBenchmark.distance")
+            .mode("thrpt")
+            .primaryScore(1_000_000.0)
+            .primaryScoreUnit("ops/s")
+            .higherIsBetter(true)
+            .parameter("dimension", "1536")
+            .addTarget(new BenchmarkTargetRegistry.TargetConfig(".*", PRIMARY, 1_000_000_000.0,
+                true, MetricUnits.COMPONENTS_PER_SEC, "dimension", "per-component rate"))
+            .build();
+
+        assertThat(status(result)).isEqualTo(BenchmarkResult.TargetStatus.MET);
+        assertThat(result.targetEvaluations().get(0).comparedValue()).isEqualTo(1_536_000_000.0);
+    }
+
+    @Test
+    @DisplayName("a scaled target whose unit is not a rate is not evaluated")
+    void scalingIntoANonRateUnitIsNotEvaluated() {
+        BenchmarkResult result = BenchmarkResult.builder()
+            .benchmarkName("com.eonmux.excalibur.bench.benchmark.DemoBenchmark.distance")
+            .mode("thrpt")
+            .primaryScore(1_000_000.0)
+            .primaryScoreUnit("ops/s")
+            .higherIsBetter(true)
+            .parameter("dimension", "1536")
+            .addTarget(new BenchmarkTargetRegistry.TargetConfig(".*", PRIMARY, 10.0,
+                false, "ms", "dimension", "a latency cannot be a scaled rate"))
+            .build();
+
+        assertThat(status(result)).isEqualTo(BenchmarkResult.TargetStatus.NOT_EVALUABLE);
+        assertThat(result.targetEvaluations().get(0).detail()).contains("'ms' is not a rate");
+    }
+
+    @Test
+    @DisplayName("a distance is judged per component, so one kernel is judged alike at every dimension")
+    void distanceTargetsAreDimensionIndependent() {
+        String cosine = "com.eonmux.excalibur.bench.benchmark.DistanceBenchmark.cosineSimilarity_single";
+
+        // The same 2.56G components/sec kernel at both ends of the sweep: 40M ops/sec at 64
+        // components and 1.67M ops/sec at 1536. A flat ops/sec target passed one and failed the other.
+        assertThat(status(registered(cosine, "dimension", "64", 40_000_000.0)))
+            .isEqualTo(BenchmarkResult.TargetStatus.MET);
+        assertThat(status(registered(cosine, "dimension", "1536", 1_666_667.0)))
+            .isEqualTo(BenchmarkResult.TargetStatus.MET);
+        // What the reflective "Vector API" path measured: about 0.1G components/sec.
+        assertThat(status(registered(cosine, "dimension", "1536", 68_000.0)))
+            .isEqualTo(BenchmarkResult.TargetStatus.MISSED);
+    }
+
+    @Test
+    @DisplayName("a tail scan is judged per entry scanned, not per scan")
+    void tailScanTargetsAreJudgedPerEntry() {
+        String l2 = "com.eonmux.excalibur.bench.benchmark.TailScanBenchmark.tailScan_l2";
+
+        BenchmarkResult result = registered(l2, "tailSize", "50000", 30.0);
+
+        assertThat(status(result)).isEqualTo(BenchmarkResult.TargetStatus.MET);
+        assertThat(result.targetEvaluations().get(0).comparedValue()).isEqualTo(1_500_000.0);
+        assertThat(result.targetEvaluations().get(0).target().unit()).isEqualTo(MetricUnits.ENTRIES_PER_SEC);
+    }
+
+    @Test
     @DisplayName("a scaled target whose parameter is missing is not evaluated")
     void scaledTargetWithoutItsParameterIsNotEvaluated() {
         BenchmarkResult result = withRegisteredTargets(BenchmarkResult.builder()
@@ -350,6 +415,17 @@ class BenchmarkResultTargetEvaluationTest {
             .primaryScoreUnit(unit)
             .higherIsBetter(!unit.contains("/op"))
             .parameter("keySize", keySize), HASH_BYTE_ARRAY)
+            .build();
+    }
+
+    private static BenchmarkResult registered(String name, String parameter, String value, double opsPerSec) {
+        return withRegisteredTargets(BenchmarkResult.builder()
+            .benchmarkName(name)
+            .mode("thrpt")
+            .primaryScore(opsPerSec)
+            .primaryScoreUnit("ops/s")
+            .higherIsBetter(true)
+            .parameter(parameter, value), name)
             .build();
     }
 

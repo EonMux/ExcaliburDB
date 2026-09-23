@@ -15,11 +15,16 @@ import java.lang.foreign.MemorySegment;
  * another.</p>
  *
  * <h2>Reading during a split</h2>
- * <p>Only the two locking entry points consult the split snapshot, because they are the ones
- * a router reaches during a split; the caller-locked and pre-hashed variants are used inside
- * maintenance paths that already know what they are reading. The epoch stamped on a slice
- * taken from the snapshot is the snapshot's own, so validity is judged against the state the
- * bytes actually came from.</p>
+ * <p>Only {@link #get} and {@link #getWithEpoch} consult the split snapshot, and the others
+ * read the live mapping, which gives the same answer for two reasons that hold together. The
+ * snapshot is a read-only view of the live mapping rather than a copy of it
+ * ({@link Segment.SegmentSnapshot}), so both read the same bytes. And nothing can change those
+ * bytes while the split runs: every write path, the caller-locked ones included, refuses a
+ * splitting segment inside the write lock ({@link SegmentSplitControl#requireWritable()}), and
+ * the children are separate files, so the split itself never writes the parent. The epoch
+ * {@link #getWithEpoch} stamps from the snapshot is therefore also the live one. Consulting the
+ * snapshot is what keeps {@code get} correct should the snapshot ever become a real copy;
+ * {@code SplitReadPathAgreementTest} pins both conditions, and fails if either stops holding.</p>
  *
  * <p><strong>Thread safety:</strong> the locking variants take the segment's read lock, which
  * is the same lock every writer takes for writing - one instance per segment, shared with

@@ -256,6 +256,66 @@ class CountMinSketchTest {
             assertThrows(IllegalArgumentException.class,
                 () -> CountMinSketch.fromMemorySegment(null));
         }
+
+        @Test
+        @DisplayName("The byte form round-trips every counter, the seed and the total")
+        void bytesRoundTrip() {
+            CountMinSketch seeded = new CountMinSketch(64, 3, 42L);
+            seeded.insert(ITEM_A, 7);
+            seeded.insert(ITEM_B, 3);
+
+            byte[] bytes = seeded.toBytes();
+            CountMinSketch restored = CountMinSketch.fromBytes(bytes);
+
+            assertEquals(HEADER_SIZE + 64 * 3 * 8, bytes.length);
+            assertEquals(seeded.width(), restored.width());
+            assertEquals(seeded.depth(), restored.depth());
+            assertEquals(seeded.totalCount(), restored.totalCount());
+            assertEquals(seeded.estimate(ITEM_A), restored.estimate(ITEM_A));
+            assertEquals(seeded.estimate(ITEM_B), restored.estimate(ITEM_B));
+            assertEquals(seeded.estimate(ITEM_C), restored.estimate(ITEM_C));
+
+            // The seed travels with the counters, so the restored sketch keeps counting into
+            // the same columns rather than scattering new counts over unrelated ones.
+            restored.insert(ITEM_A, 1);
+            seeded.insert(ITEM_A, 1);
+            assertEquals(seeded.estimate(ITEM_A), restored.estimate(ITEM_A));
+        }
+
+        @Test
+        @DisplayName("The byte form is the same layout as the memory-segment form")
+        void bytesMatchMemorySegmentLayout() {
+            sketch.insert(ITEM_A, 5);
+            MemorySegment segment = sketch.toMemorySegment(Arena.ofAuto());
+
+            CountMinSketch fromBytes = CountMinSketch.fromBytes(
+                segment.toArray(java.lang.foreign.ValueLayout.JAVA_BYTE));
+
+            assertArrayEquals(segment.toArray(java.lang.foreign.ValueLayout.JAVA_BYTE),
+                sketch.toBytes());
+            assertEquals(sketch.estimate(ITEM_A), fromBytes.estimate(ITEM_A));
+        }
+
+        @Test
+        @DisplayName("Bytes that are not exactly one sketch are refused")
+        void bytesOfTheWrongLengthAreRefused() {
+            byte[] bytes = new CountMinSketch(16, 2, 1L).toBytes();
+
+            assertThrows(IllegalArgumentException.class,
+                () -> CountMinSketch.fromBytes(java.util.Arrays.copyOf(bytes, bytes.length - 1)));
+            assertThrows(IllegalArgumentException.class,
+                () -> CountMinSketch.fromBytes(java.util.Arrays.copyOf(bytes, bytes.length + 8)));
+            assertThrows(IllegalArgumentException.class, () -> CountMinSketch.fromBytes(null));
+        }
+
+        @Test
+        @DisplayName("A header declaring a shape that cannot exist is refused")
+        void impossibleShapeIsRefused() {
+            byte[] bytes = new CountMinSketch(16, 2, 1L).toBytes();
+            java.nio.ByteBuffer.wrap(bytes).putInt(8, -16);
+
+            assertThrows(IllegalArgumentException.class, () -> CountMinSketch.fromBytes(bytes));
+        }
     }
 
     private static final int HEADER_SIZE = 32;
@@ -384,6 +444,156 @@ class CountMinSketchTest {
             // Heavy hitter should have significantly higher count
             long heavyCount = sketch.estimate(ITEM_A);
             assertTrue(heavyCount >= 10000);
+        }
+    }
+
+    @Nested
+    @DisplayName("Hashing once per item")
+    class HashedInsertion {
+
+        @Test
+        @DisplayName("an item handed over as its hash is counted as the item itself")
+        void hashedAndByteInsertsAgree() {
+            CountMinSketch bytes = new CountMinSketch(1024, 4, 7L);
+            CountMinSketch hashed = new CountMinSketch(1024, 4, 7L);
+            for (int i = 0; i < 500; i++) {
+                byte[] item = ("term-" + (i % 37)).getBytes(StandardCharsets.UTF_8);
+                bytes.insert(item);
+                hashed.insertHashed(CountMinSketch.itemHash(item), 1);
+            }
+
+            assertArrayEquals(bytes.toBytes(), hashed.toBytes());
+            assertEquals(bytes.estimate(ITEM_A), hashed.estimateHashed(CountMinSketch.itemHash(ITEM_A)));
+        }
+
+        @Test
+        @DisplayName("the item hash is the same for every sketch; the seed still moves the columns")
+        void itemHashIsSeedIndependent() {
+            CountMinSketch first = new CountMinSketch(1024, 4, 1L);
+            CountMinSketch second = new CountMinSketch(1024, 4, 2L);
+            long hash = CountMinSketch.itemHash(ITEM_A);
+            first.insertHashed(hash, 5);
+            second.insertHashed(hash, 5);
+
+            assertEquals(5, first.estimate(ITEM_A));
+            assertEquals(5, second.estimate(ITEM_A));
+            assertFalse(java.util.Arrays.equals(first.toBytes(), second.toBytes()),
+                "two seeds placing an item in the same columns of every row");
+            assertEquals(1L, first.seed());
+        }
+
+        @Test
+        @DisplayName("rows spread an item over different columns")
+        void rowsAreNotTheSameColumn() {
+            int alignedRows = 0;
+            for (int i = 0; i < 200; i++) {
+                CountMinSketch probe = new CountMinSketch(1 << 16, 8, 3L);
+                probe.insert(("item-" + i).getBytes(StandardCharsets.UTF_8));
+                long[] columns = columnsHolding(probe, 8, 1 << 16);
+                if (columns[0] == columns[1]) {
+                    alignedRows++;
+                }
+            }
+            assertTrue(alignedRows < 3, "rows 0 and 1 agree on " + alignedRows + " of 200 items");
+        }
+
+        /** The column each row counted the one inserted item in. */
+        private long[] columnsHolding(CountMinSketch probe, int depth, int width) {
+            java.nio.ByteBuffer counters = java.nio.ByteBuffer.wrap(probe.toBytes());
+            long[] columns = new long[depth];
+            for (int row = 0; row < depth; row++) {
+                for (int column = 0; column < width; column++) {
+                    if (counters.getLong(32 + (row * width + column) * Long.BYTES) != 0) {
+                        columns[row] = column;
+                    }
+                }
+            }
+            return columns;
+        }
+
+        @Test
+        @DisplayName("a count of zero changes nothing, and a negative count is refused")
+        void zeroAndNegativeCounts() {
+            long hash = CountMinSketch.itemHash(ITEM_B);
+            sketch.insertHashed(hash, 0);
+            assertEquals(0, sketch.totalCount());
+            assertThrows(IllegalArgumentException.class, () -> sketch.insertHashed(hash, -1));
+            assertThrows(NullPointerException.class, () -> CountMinSketch.itemHash(null));
+        }
+
+        @Test
+        @DisplayName("a sketch written under the per-row hashing reads back as unsupported")
+        void perRowHashingVersionIsRefused() {
+            assertVersionRefused(1);
+        }
+
+        @Test
+        @DisplayName("a sketch written under the raw-step double hashing reads back as unsupported")
+        void rawStepVersionIsRefused() {
+            assertVersionRefused(2);
+        }
+
+        private void assertVersionRefused(int version) {
+            byte[] bytes = new CountMinSketch(16, 2, 9L).toBytes();
+            java.nio.ByteBuffer.wrap(bytes).putInt(4, version);
+
+            IllegalArgumentException refused =
+                assertThrows(IllegalArgumentException.class, () -> CountMinSketch.fromBytes(bytes));
+            assertTrue(refused.getMessage().contains("version: " + version), refused.getMessage());
+        }
+
+        @Test
+        @DisplayName("a step that is a multiple of a power-of-two width still gives every row its own column")
+        void stepsSharingAFactorWithAPowerOfTwoWidthStayDistinct() {
+            CountMinSketch probe = new CountMinSketch(1024, 4, 5L);
+            // Upper halves the raw step used as-is: zero and the width's multiples collapsed
+            // every row into one column or its mirror, half the width paired the rows off.
+            long[] upperHalves = {0L, 1024L, 512L, 256L, 1L << 20, 0x8000_0000L, 0xFFFF_FC00L};
+            for (long upper : upperHalves) {
+                for (long lower : new long[] {0L, 7L, 0xFFFF_FFFFL, 0x8000_0000L}) {
+                    assertRowsDistinct(probe, (upper << 32) | lower, 4);
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("every row has its own column for widths that are not powers of two")
+        void stepsStayDistinctForCompositeWidths() {
+            CountMinSketch probe = new CountMinSketch(2000, 10, 5L);
+            for (long upper : new long[] {0L, 1000L, 250L, 400L, 500L, 125L, 2000L * 7}) {
+                assertRowsDistinct(probe, upper << 32 | 13L, 10);
+            }
+        }
+
+        @Test
+        @DisplayName("every row has its own column for any mixed hash while depth fits the width")
+        void rowsNeverShareAColumn() {
+            CountMinSketch probe = new CountMinSketch(1024, 16, 5L);
+            Random random = new Random(42);
+            for (int i = 0; i < 10_000; i++) {
+                assertRowsDistinct(probe, random.nextLong(), 16);
+            }
+        }
+
+        @Test
+        @DisplayName("a width of one is served by its single column")
+        void widthOfOne() {
+            CountMinSketch narrow = new CountMinSketch(1, 3, 5L);
+            narrow.insert(ITEM_A);
+            narrow.insert(ITEM_B);
+            assertEquals(2, narrow.estimate(ITEM_A));
+            assertEquals(0, narrow.column(-1L, 2));
+        }
+
+        private void assertRowsDistinct(CountMinSketch probe, long mixed, int rows) {
+            java.util.Set<Integer> columns = new java.util.HashSet<>();
+            for (int row = 0; row < rows; row++) {
+                int column = probe.column(mixed, row);
+                assertTrue(column >= 0 && column < probe.width(), "column " + column);
+                columns.add(column);
+            }
+            assertEquals(rows, columns.size(),
+                "rows share a column for mixed hash 0x" + Long.toHexString(mixed));
         }
     }
 

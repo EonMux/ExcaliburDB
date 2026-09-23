@@ -5,6 +5,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.eonmux.excalibur.query.executor.CancellationToken;
 import com.eonmux.excalibur.query.executor.QueryRegistry;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
+import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.metrics.Metrics;
 import com.eonmux.excalibur.metrics.ResponseCounters;
@@ -53,6 +54,7 @@ class MetricsEndpointTest {
         ResponseCounters.reset();
         catalog = new SegmentCatalog();
         indexOrchestrator = mock(IndexOrchestrator.class);
+        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         storageEngine = mock(StorageEngine.class);
         when(indexOrchestrator.getVisibilityTracker()).thenReturn(new VisibilityTracker(catalog));
         when(indexOrchestrator.isRunning()).thenReturn(true);
@@ -186,6 +188,23 @@ class MetricsEndpointTest {
             assertThat(body).contains("excalibur_query_cache_lookups_total{result=\"miss\"} 0");
             assertThat(body).contains("excalibur_query_cache_evictions_total 0");
             assertThat(body).contains("excalibur_query_cache_invalidations_total 0");
+        }
+
+        @Test
+        @DisplayName("exposes chunks dropped for corrupt text as a counter an alert can fire on")
+        void exposesUnreadableChunksDropped() throws IOException {
+            // Each drop takes a chunk out of keyword search until its document is reindexed, and
+            // means storage holds damage: an operator has to hear of it without reading logs.
+            com.eonmux.excalibur.ingest.lexical.ChunkIndex index =
+                mock(com.eonmux.excalibur.ingest.lexical.ChunkIndex.class);
+            when(index.stats()).thenReturn(new com.eonmux.excalibur.ingest.lexical.ChunkIndexStats(
+                "native", 10L, 1, 8L, 2L, 0, java.util.Optional.empty(), false, 3L));
+            collector.withLexicalIndex(index);
+
+            String body = send("GET").body();
+            assertThat(body)
+                .contains("# TYPE excalibur_lexical_unreadable_chunks_dropped_total counter")
+                .contains("excalibur_lexical_unreadable_chunks_dropped_total 3");
         }
 
         @Test

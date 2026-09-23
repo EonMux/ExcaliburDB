@@ -157,8 +157,17 @@ public record IngestionWiring(Config config,
 
             // Relation extraction is a chat call, so it turns on with the model rather than with
             // the embedding pass.
-            if (capabilities.chatModel()) {
-                configureGraphIngest(server, llmClientConfig);
+            GraphExtraction extraction = GraphExtraction.of(
+                config.graph().isExtractionEnabled(), capabilities.chatModel());
+            if (extraction == GraphExtraction.MISSING_API_KEY) {
+                LOGGER.warn("excalibur.graph.extraction-enabled is true but excalibur.llm.api-key "
+                    + "(EXCALIBUR_LLM_API_KEY) is not set - relation extraction is INACTIVE. "
+                    + "Documents are ingested and searchable, but no facts are staged, so "
+                    + "POST /v1/graph/build has nothing to publish. Set the key and restart to "
+                    + "extract facts.");
+                graphTenants.reportExtraction(extraction);
+            } else if (!capabilities.chatModel() || configureGraphIngest(server, llmClientConfig)) {
+                graphTenants.reportExtraction(extraction);
             }
 
         } catch (Exception e) {
@@ -431,12 +440,14 @@ public record IngestionWiring(Config config,
      *
      * @param server          The server holding the ingestion orchestrator
      * @param llmClientConfig The LLM configuration, for the extractor's client
+     * @return true if documents now reach the graph, false if there was no orchestrator to wire
      */
-    private void configureGraphIngest(ExcaliburDBServer server, LLMClientConfig llmClientConfig) {
+    private boolean configureGraphIngest(ExcaliburDBServer server,
+                                         LLMClientConfig llmClientConfig) {
         IngestionOrchestrator orchestrator = server.getIngestionOrchestrator();
         if (orchestrator == null) {
             LOGGER.warn("No ingestion orchestrator; documents will not reach the graph");
-            return;
+            return false;
         }
 
         boolean extractionEnabled = config.graph().isExtractionEnabled();
@@ -455,6 +466,7 @@ public record IngestionWiring(Config config,
         LOGGER.info("Graph ingest wired: extraction {} (extractor version {}), staged into the "
             + "namespace each source was registered in", extractionEnabled ? "enabled"
             : "disabled", config.graph().getExtractorVersion());
+        return true;
     }
 
     /**

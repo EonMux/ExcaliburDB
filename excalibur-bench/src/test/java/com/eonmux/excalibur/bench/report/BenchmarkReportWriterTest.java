@@ -3,6 +3,7 @@ package com.eonmux.excalibur.bench.report;
 import com.eonmux.excalibur.bench.metric.BenchmarkMetric;
 import com.eonmux.excalibur.bench.metric.BenchmarkResult;
 import com.eonmux.excalibur.bench.metric.BenchmarkResultSet;
+import com.eonmux.excalibur.bench.metric.ErroredBenchmark;
 import com.eonmux.excalibur.bench.metric.BenchmarkTargetRegistry;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -123,12 +124,46 @@ class BenchmarkReportWriterTest {
     }
 
     @Test
+    @DisplayName("Markdown counts errored combinations, fails the status, and explains each one")
+    void markdownReportsErroredCombinations() {
+        String markdown = BenchmarkReportWriter.generateMarkdown(withErrored(passing()));
+
+        assertThat(markdown).contains("| Total Benchmarks | 2 |");
+        assertThat(markdown).contains("| Errored | 1 |");
+        assertThat(markdown).contains("BENCHMARKS ERRORED");
+        assertThat(markdown).doesNotContain("ALL PASSED");
+        assertThat(markdown).contains("## Errored Benchmarks");
+        assertThat(markdown).contains("sequentialRead_bytes [bufferSize=131072] (thrpt)");
+        // A pipe in the message must not split the table row.
+        assertThat(markdown).contains("size \\| limit");
+        assertThat(markdown).contains("at Demo.setup(Demo.java:7)");
+    }
+
+    @Test
+    @DisplayName("CSV carries a row per errored combination, marked as errored with its message")
+    void csvCarriesErroredCombinations() {
+        String csv = BenchmarkReportWriter.generateCsv(withErrored(passing()));
+
+        assertThat(csv.lines()).hasSize(3);
+        assertThat(csv).contains("MappedFile,sequentialRead_bytes [bufferSize=131072],thrpt,,,,,errored,"
+            + "java.lang.IllegalStateException: size | limit");
+    }
+
+    @Test
+    @DisplayName("the text report carries the errored combinations")
+    void textReportCarriesErroredCombinations() {
+        assertThat(BenchmarkReportWriter.generateTextReport(withErrored(passing())))
+            .contains("Errored: 1")
+            .contains("size | limit");
+    }
+
+    @Test
     @DisplayName("CSV carries one header and one row per result")
     void csvHasAHeaderAndARowPerResult() {
         String csv = BenchmarkReportWriter.generateCsv(resultSet("r", 1, passing(), failing()));
 
         assertThat(csv.lines()).hasSize(3);
-        assertThat(csv).startsWith("category,benchmark,mode,score,error,unit,target,meets_target\n");
+        assertThat(csv).startsWith("category,benchmark,mode,score,error,unit,target,meets_target,failure\n");
         assertThat(csv).contains(",lookup,thrpt,");
         assertThat(csv).contains(",true");
         assertThat(csv).contains(",false");
@@ -238,6 +273,23 @@ class BenchmarkReportWriterTest {
             .name(name)
             .startTime(Instant.parse("2024-01-01T00:00:00Z"))
             .totalDurationMs(durationMs);
+        for (BenchmarkResult result : results) {
+            builder.addResult(result);
+        }
+        return builder.build();
+    }
+
+    private static BenchmarkResultSet withErrored(BenchmarkResult... results) {
+        BenchmarkResultSet.Builder builder = BenchmarkResultSet.builder()
+            .name("r")
+            .startTime(Instant.parse("2024-01-01T00:00:00Z"))
+            .totalDurationMs(1_000)
+            .addErrored(new ErroredBenchmark(
+                "com.eonmux.excalibur.bench.benchmark.MappedFileBenchmark.sequentialRead_bytes",
+                "thrpt",
+                java.util.Map.of("bufferSize", "131072"),
+                "java.lang.IllegalStateException: size | limit",
+                "java.lang.IllegalStateException: size | limit\n\tat Demo.setup(Demo.java:7)"));
         for (BenchmarkResult result : results) {
             builder.addResult(result);
         }

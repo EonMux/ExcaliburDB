@@ -7,6 +7,7 @@ import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.api.reindex.ReindexCoordinator;
+import com.eonmux.excalibur.core.util.StopSignal;
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.source.SourceResolver;
 import com.eonmux.excalibur.shard.allocator.VolumeManager;
@@ -21,6 +22,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -28,7 +30,7 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>ReindexEndpoint handles POST requests to /v1/reindex for forcing
  * a re-crawl and re-index of a registered source. The reindex operation
- * runs in the background with zero-downtime rolling replacement.</p>
+ * runs in the background and never takes the source out of service.</p>
  *
  * <h2>Request Format</h2>
  * <pre>{@code
@@ -47,20 +49,17 @@ import java.util.concurrent.TimeUnit;
  * }</pre>
  *
  * <h2>Zero-Downtime Reindexing</h2>
- * <p>When a reindex is triggered:</p>
- * <ol>
- *   <li>New segments are created in BOOTSTRAPPING state</li>
- *   <li>Old segments continue serving queries</li>
- *   <li>New segments progress through INDEXING → WARMING → ACTIVE</li>
- *   <li>Once new segments cover old data, old segments are TOMBSTONED</li>
- *   <li>Rolling replacement ensures data is never unavailable</li>
- * </ol>
+ * <p>Each changed document's previous version keeps serving until its replacement has been
+ * published, and a document's chunks are published together. A node with a segment catalog
+ * first asks for a segment to rebuild the source into; the storage engine never offers one,
+ * so the run rebuilds in place and retires no segment. Why a writable one would be refused
+ * rather than filled is set out on {@code RollingReplacement}.</p>
  *
  * <h2>Mutual Exclusion</h2>
  * <p>A source can also be reindexed by the scheduler. Both entry points take the same
- * per-source claim from {@link com.eonmux.excalibur.api.reindex.ReindexCoordinator}: two rolling
- * replacements of one source running concurrently each tombstone the segment the other
- * has just published. A request for a source that is already being reindexed is answered
+ * per-source claim from {@link com.eonmux.excalibur.api.reindex.ReindexCoordinator}: two runs
+ * over one source compare against the same registry entries, and each retires the version it
+ * replaced - which can be the one the other has just published. A request for a source that is already being reindexed is answered
  * with 409.</p>
  *
  * <h2>Without a Reindexer</h2>
@@ -79,14 +78,18 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger(ReindexEndpoint.class);
 
     /**
-     * How long {@link #close()} waits for in-flight reindex work to finish.
+     * How long {@link #drain()} waits for the reindexes it has asked to stop to end.
+     *
+     * <p>A stopped run finishes the document it is writing and writes out what it got through,
+     * so this bounds one document's fetch, embedding and writes plus a registry write - not the
+     * rest of the crawl.</p>
      */
-    private static final int SHUTDOWN_TIMEOUT_SECONDS = 30;
+    private static final int SHUTDOWN_TIMEOUT_SECONDS = 60;
 
     private final SourceRegistry sourceRegistry;
     private final ReindexStatusRegistry reindexStatusRegistry;
 
-    // Optional components for actual reindexing (may be null for stub behavior)
+    // Optional components for actual reindexing; null on a node where POST answers 503
     private final DocumentReindexer documentReindexer;
     private final SourceResolver sourceResolver;
     private final ExecutorService reindexExecutor;
@@ -208,16 +211,15 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
 
         boolean hasRollingReplacement = volumeManager != null && segmentCatalog != null;
         LOGGER.info("ReindexEndpoint configured with document reindexer: {}, rolling replacement: {}",
-            documentReindexer != null ? "enabled" : "disabled (stub mode)",
+            documentReindexer != null ? "enabled" : "disabled (POST answers 503)",
             hasRollingReplacement ? "enabled" : "disabled");
     }
 
     /**
-     * Creates a new ReindexEndpoint with source registry but without actual reindexing.
+     * Creates a new ReindexEndpoint on a node where reindexing is not configured.
      *
-     * <p>This constructor provides backward compatibility. Reindex requests will
-     * be accepted and tracked in the status registry, but no actual reindexing
-     * will occur.</p>
+     * <p>{@code POST /v1/reindex} answers 503 for a registered source, and nothing is recorded
+     * in the status registry; {@code DELETE} has nothing to cancel.</p>
      *
      * @param sourceRegistry The registry for looking up sources
      * @param reindexStatusRegistry The registry for tracking reindex status
@@ -248,10 +250,10 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
     }
 
     /**
-     * Creates a new ReindexEndpoint with default registries (stub mode).
+     * Creates a new ReindexEndpoint with default in-memory registries and no reindexer.
      *
-     * <p>This constructor creates an endpoint without actual reindexing capability.
-     * Use for testing or when reindexing should be handled externally.</p>
+     * <p>As with {@link #ReindexEndpoint(SourceRegistry, ReindexStatusRegistry)}, every
+     * {@code POST} for a registered source is answered 503.</p>
      */
     public ReindexEndpoint() {
         this(new InMemorySourceRegistry(), new InMemoryReindexStatusRegistry());
@@ -309,12 +311,18 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
                 // new segment.
                 final String sourceId = request.sourceId;
                 ReindexCoordinator.Lease lease = coordinator.tryAcquire(sourceId);
+                if (lease == null && !coordinator.isAccepting()) {
+                    sendError(exchange, 503, "The node is shutting down and is not reindexing");
+                    return;
+                }
                 if (lease == null) {
                     sendError(exchange, 409, "Reindex already in progress for source: " + sourceId);
                     return;
                 }
 
-                boolean submitted = false;
+                // Whether the claim is now the run's to release, or has been dealt with here;
+                // anything else that ends this block leaves it to the finally below.
+                boolean settled = false;
                 try {
                     reindexStatusRegistry.startReindex(sourceId);
                     // execute, not submit. A cancelled Future on a virtual-thread-per-task
@@ -324,10 +332,21 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
                     // endpoint's DELETE exists to clear. With execute there is no future to
                     // cancel, the body always runs, and the release is reached on every outcome.
                     reindexExecutor.execute(() -> runReindex(sourceId, lease));
-                    submitted = true;
+                    settled = true;
                     LOGGER.info("Async reindex task submitted for source");
+                } catch (RejectedExecutionException e) {
+                    // The claim was taken just before a shutdown's drain closed the executor.
+                    // That is the node going down, the same answer a claim refused a moment
+                    // later gets - not a server fault - and the run it ends was stopped by the
+                    // shutdown, not failed: nothing was attempted, and a retry against a node
+                    // that is up will do all of it.
+                    reindexStatusRegistry.cancelReindex(sourceId);
+                    lease.release();
+                    settled = true;
+                    sendError(exchange, 503, "The node is shutting down and is not reindexing");
+                    return;
                 } finally {
-                    if (!submitted) {
+                    if (!settled) {
                         reindexStatusRegistry.failReindex(sourceId, "Reindex could not be started");
                         lease.release();
                     }
@@ -428,8 +447,14 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
      *
      * <p>Cancellation is observed twice, because it can arrive on either side of this thread
      * starting. Before: the lease already says so and the run is never begun. During: the
-     * canceller interrupts this thread, and a cancellation that lands between the check and the
-     * registration is replayed by the lease onto the canceller it is given.</p>
+     * canceller requests the run's stop signal, and a cancellation that lands between the check
+     * and the registration is replayed by the lease onto the canceller it is given.</p>
+     *
+     * <p>The canceller never interrupts this thread. The run writes chunks, tombstones, the
+     * lexical index and the registry through channels other threads share, and an interrupt
+     * reaching any of those writes closes the channel for every thread for the life of the
+     * process. The signal is read between documents, and interrupts only the fetch and the
+     * embedding request, which touch nothing shared.</p>
      *
      * @param sourceId The source to reindex
      * @param lease    This run's exclusive claim on it
@@ -443,9 +468,9 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
                 reindexStatusRegistry.cancelReindex(sourceId);
                 return;
             }
-            Thread runner = Thread.currentThread();
-            lease.onCancel(runner::interrupt);
-            reindexRun.execute(sourceId);
+            StopSignal stop = new StopSignal();
+            lease.onCancel(stop::request);
+            reindexRun.execute(sourceId, stop);
         } finally {
             lease.release();
         }
@@ -501,27 +526,64 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
     }
 
     /**
-     * Stops accepting new reindex work and drains what is already running.
+     * Stops accepting new reindex work, asks what is already running to stop, and waits for it.
      *
-     * <p>In-flight reindexing writes into the storage engine. Letting those tasks run
-     * on while the engine and the shared arena are closed is a crash, not an
-     * exception, so shutdown waits for them and only then gives up and interrupts.</p>
+     * <p>In-flight reindexing writes into the storage engine. Letting those runs go on while the
+     * engine and the shared arena are closed is a crash, not an exception, so shutdown waits for
+     * them - and says whether they ended, because the caller's next step is to close what they
+     * write into. False is the answer that has to be acted on: the storage must then stay
+     * open.</p>
+     *
+     * <p>Every run is covered, whichever trigger started it: the scheduled reindex takes its
+     * claim from the same coordinator, so refusing claims there stops a timer tick starting one
+     * while this waits, and asking through the claims reaches a scheduled run as surely as one
+     * this endpoint started. The runs are asked through their stop signals and never
+     * interrupted, for the reason {@link #runReindex(String, ReindexCoordinator.Lease)} gives;
+     * each finishes the document it is on and writes out what it got through, so the next
+     * reindex picks up where it left off.</p>
+     *
+     * @return true if no reindex is still running
+     */
+    public boolean drain() {
+        coordinator.stopAccepting();
+        if (reindexExecutor != null) {
+            reindexExecutor.shutdown();
+        }
+        int asked = coordinator.cancelAll();
+        if (asked > 0) {
+            LOGGER.info("Asked {} running reindex(es) to stop for shutdown", asked);
+        }
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SHUTDOWN_TIMEOUT_SECONDS);
+        try {
+            boolean idle = coordinator.awaitIdle(remainingMillis(deadline));
+            boolean terminated = reindexExecutor == null
+                || reindexExecutor.awaitTermination(remainingMillis(deadline),
+                    TimeUnit.MILLISECONDS);
+            if (idle && terminated) {
+                return true;
+            }
+            LOGGER.error("{} reindex(es) still running {}s after being asked to stop; the "
+                    + "storage they write into must stay open", coordinator.inFlightCount(),
+                SHUTDOWN_TIMEOUT_SECONDS);
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return coordinator.inFlightCount() == 0
+                && (reindexExecutor == null || reindexExecutor.isTerminated());
+        }
+    }
+
+    /** Milliseconds left before a deadline read from {@link System#nanoTime()}, never negative. */
+    private static long remainingMillis(long deadline) {
+        return Math.max(0, TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()));
+    }
+
+    /**
+     * As {@link #drain()}, for a caller with no use for the answer.
      */
     @Override
     public void close() {
-        if (reindexExecutor == null) {
-            return;
-        }
-        reindexExecutor.shutdown();
-        try {
-            if (!reindexExecutor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                LOGGER.warn("Reindex tasks still running after {}s; cancelling", SHUTDOWN_TIMEOUT_SECONDS);
-                reindexExecutor.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            reindexExecutor.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
+        drain();
     }
 
     // ==================== Inner Classes ====================

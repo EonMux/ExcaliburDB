@@ -547,4 +547,64 @@ class BenchmarkComparisonTest {
         ).isInstanceOf(IllegalStateException.class)
          .hasMessageContaining("currentResults");
     }
+
+    @Test
+    void comparison_shouldCarryTheCurrentRunsErroredCombinations() {
+        ErroredBenchmark errored = new ErroredBenchmark(
+            "com.eonmux.excalibur.bench.benchmark.DemoBenchmark.lookup", "thrpt",
+            java.util.Map.of("size", "64"),
+            "java.lang.IllegalStateException: setup exploded", "trace");
+        BenchmarkResultSet current = BenchmarkResultSet.builder().name("cur")
+            .addErrored(errored).build();
+        BenchmarkResultSet baseline = BenchmarkResultSet.builder().name("base").build();
+
+        BenchmarkComparison comparison = BenchmarkComparison.compare(current, baseline);
+
+        assertThat(comparison.hasErrors()).isTrue();
+        assertThat(comparison.hasRegressions()).isFalse();
+        assertThat(comparison.erroredBenchmarks()).containsExactly(errored);
+        assertThat(comparison.formatSummary())
+            .contains("Errored:         1")
+            .contains("BENCHMARKS ERRORED")
+            .contains("lookup [size=64] (thrpt)")
+            .contains("setup exploded")
+            .doesNotContain("NO REGRESSIONS");
+        assertThat(comparison.toJson())
+            .contains("\"errored\": 1")
+            .contains("\"hasErrors\": true")
+            .contains("setup exploded");
+    }
+
+    @Test
+    void comparison_shouldMatchEachParameterCombinationAndModeToItsOwnBaseline() {
+        String name = "com.eonmux.excalibur.bench.benchmark.DemoBenchmark.lookup";
+        BenchmarkResultSet baseline = BenchmarkResultSet.builder().name("base")
+            .addResult(result(name, "thrpt", "64", 1_000.0))
+            .addResult(result(name, "thrpt", "4096", 100.0))
+            .addResult(result(name, "avgt", "64", 5.0))
+            .build();
+        BenchmarkResultSet current = BenchmarkResultSet.builder().name("cur")
+            .addResult(result(name, "thrpt", "4096", 100.0))
+            .addResult(result(name, "thrpt", "64", 1_000.0))
+            .addResult(result(name, "avgt", "64", 5.0))
+            .addResult(result(name, "thrpt", "65536", 10.0))
+            .build();
+
+        BenchmarkComparison comparison = BenchmarkComparison.compare(current, baseline);
+
+        assertThat(comparison.unchangedCount()).isEqualTo(3);
+        assertThat(comparison.newBenchmarksCount()).isEqualTo(1);
+        assertThat(comparison.hasRegressions()).isFalse();
+    }
+
+    private static BenchmarkResult result(String name, String mode, String size, double score) {
+        return BenchmarkResult.builder()
+            .benchmarkName(name)
+            .mode(mode)
+            .parameter("size", size)
+            .primaryScore(score)
+            .primaryScoreUnit(mode.equals("avgt") ? "ms/op" : "ops/s")
+            .higherIsBetter(!mode.equals("avgt"))
+            .build();
+    }
 }

@@ -1,6 +1,15 @@
 package com.eonmux.excalibur.backup.testing;
 
+import com.eonmux.excalibur.filter.lsh.LshConfig;
+import com.eonmux.excalibur.filter.lsh.LshIndex;
+import com.eonmux.excalibur.retrieval.lexical.native_.LexicalStore;
 import com.eonmux.excalibur.store.StorageEngine;
+import com.eonmux.excalibur.vector.distance.L2Distance;
+import com.eonmux.excalibur.vector.hnsw.HnswConfig;
+import com.eonmux.excalibur.vector.hnsw.HnswGraph;
+import com.eonmux.excalibur.vector.hnsw.NodeDocumentMapping;
+import com.eonmux.excalibur.vector.quantization.PQCodebookFile;
+import com.eonmux.excalibur.vector.quantization.ProductQuantizer;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -13,21 +22,25 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 
 /**
  * Builds data directories that look like the ones a node leaves behind.
  *
- * <p>Two shapes are offered. {@link #realEngineDirectory(Path)} starts a real
+ * <p>Three shapes are offered. {@link #realEngineDirectory(Path, int)} starts a real
  * {@link StorageEngine}, writes entries through it and stops it, so the catalog, the routing
  * directory, the segment files and their write-ahead logs are the engine's own bytes rather
  * than a guess at them. {@link #syntheticDirectory(Path)} hand-writes the same tree in
  * miniature, including the files that only the ingestion and graph modules ever create, so
  * that the tests which care about classification and refusal do not pay for a 4 GiB engine
- * start.</p>
+ * start. {@link #realIndexedDirectory(Path)} is the first with every sidecar a segment can
+ * own written beside it by the module that owns its format - a graph, its document mapping,
+ * a codebook and an LSH table - and a lexical store written by the lexical store itself, so
+ * that a deep verification is exercised against each format's genuine bytes.</p>
  *
- * <p>Both are sparse where the engine is sparse: a write-ahead log is mapped at its maximum
+ * <p>All three are sparse where the engine is sparse: a write-ahead log is mapped at its maximum
  * size and filled a block at a time, and a fixture that materialised those zeros would be
  * testing a file the engine never writes.</p>
  */
@@ -35,6 +48,30 @@ public final class DataDirectoryFixture {
 
     /** The write-ahead log size the engine maps, mostly hole. */
     public static final long WAL_APPARENT_SIZE = 64L * 1024 * 1024;
+
+    /** Width of every vector the indexed fixture writes. */
+    public static final int DIMENSIONS = 8;
+
+    /** The graph {@link #realIndexedDirectory(Path)} writes, relative to the directory. */
+    public static final String GRAPH = "segment_0.hnsw";
+
+    /** The graph's document mapping. */
+    public static final String DOCUMENT_MAPPING = "segment_0.hnsw.docmap";
+
+    /** The graph's quantiser codebook. */
+    public static final String CODEBOOK = "segment_0.hnsw.pqcb";
+
+    /**
+     * The first segment's term sketch, which the storage engine itself writes beside the
+     * segment when it closes cleanly.
+     */
+    public static final String TERM_SKETCH = "segment_0.tfs";
+
+    /** The first table of the segment's LSH index. */
+    public static final String LSH_TABLE = "segment_0.lsh/lsh_table_0.dat";
+
+    /** The in-flight ingest journal, a format that carries nothing to verify. */
+    public static final String IN_FLIGHT_JOURNAL = "document-registry.in-flight";
 
     private DataDirectoryFixture() {
     }
@@ -59,6 +96,64 @@ public final class DataDirectoryFixture {
             engine.flush();
         }
         return dataDir;
+    }
+
+    /**
+     * Writes a real engine directory with every sidecar and a lexical store beside it.
+     *
+     * <p>Each structure is produced by the class that owns its format and closed the way a
+     * node closes it, so every one carries the seal a clean shutdown writes: an image of this
+     * directory should verify to the deepest level, and any damage a test introduces is
+     * damage to the real layout rather than to a guess at it.</p>
+     *
+     * @param dataDir The directory to populate; created if absent
+     * @return The same directory
+     * @throws IOException if any structure cannot be written
+     */
+    public static Path realIndexedDirectory(Path dataDir) throws IOException {
+        realEngineDirectory(dataDir, 24);
+        List<float[]> vectors = vectors(64);
+        try (HnswGraph graph = new HnswGraph(dataDir.resolve(GRAPH),
+                HnswConfig.create(DIMENSIONS), L2Distance.getInstance(), 128)) {
+            NodeDocumentMapping mapping = new NodeDocumentMapping(
+                dataDir.resolve(DOCUMENT_MAPPING));
+            for (int i = 0; i < 16; i++) {
+                mapping.register(graph.insert(vectors.get(i)), "source:doc-" + i + ":chunk:0");
+            }
+            mapping.persist();
+        }
+        ProductQuantizer quantizer = new ProductQuantizer(DIMENSIONS, 2, 4);
+        quantizer.train(vectors.toArray(new float[0][]));
+        PQCodebookFile.write(dataDir.resolve(CODEBOOK), quantizer);
+        try (LshIndex lsh = LshIndex.open(LshConfig.createWithSeed(DIMENSIONS, 2, 4, 42L),
+                dataDir.resolve(LSH_TABLE).getParent())) {
+            for (int i = 0; i < 16; i++) {
+                lsh.insert(vectors.get(i), i);
+            }
+        }
+        try (LexicalStore lexical = LexicalStore.open(dataDir.resolve("chunk-index"))) {
+            lexical.add(Map.of("source:doc-0:chunk:0", "cold segments move to cheaper disks",
+                "source:doc-1:chunk:0", "the graph links every vector to its neighbours"), 1L);
+        }
+        Files.writeString(dataDir.resolve(IN_FLIGHT_JOURNAL), "");
+        return dataDir;
+    }
+
+    /**
+     * Returns deterministic vectors, the same on every run.
+     *
+     * @param count How many
+     * @return The vectors
+     */
+    private static List<float[]> vectors(int count) {
+        Random random = new Random(7L);
+        return java.util.stream.IntStream.range(0, count).mapToObj(i -> {
+            float[] vector = new float[DIMENSIONS];
+            for (int d = 0; d < DIMENSIONS; d++) {
+                vector[d] = random.nextFloat();
+            }
+            return vector;
+        }).toList();
     }
 
     /**
@@ -217,7 +312,13 @@ public final class DataDirectoryFixture {
     }
 
     /**
-     * Flips one bit in the middle of a file, leaving its length alone.
+     * Flips one bit in the middle of what a file holds, leaving its length alone.
+     *
+     * <p>The middle of the written extent - from the start to the last byte that is not
+     * zero - rather than of the file. A graph or an LSH table is created at its full
+     * capacity and filled from the front, so the middle of the file is a hole no checksum
+     * covers, and damage there is damage no checker should be expected to see. A file that
+     * holds nothing but zeroes is flipped in its middle.</p>
      *
      * @param file The file to damage
      * @throws IOException if the file cannot be read or written
@@ -227,7 +328,11 @@ public final class DataDirectoryFixture {
         if (content.length == 0) {
             throw new IllegalArgumentException("Cannot flip a byte in an empty file: " + file);
         }
-        int position = content.length / 2;
+        int written = content.length - 1;
+        while (written > 0 && content[written] == 0) {
+            written--;
+        }
+        int position = written == 0 ? content.length / 2 : written / 2;
         content[position] = (byte) (content[position] ^ 0x01);
         Files.write(file, content);
     }

@@ -2,6 +2,7 @@ package com.eonmux.excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import com.eonmux.excalibur.api.bootstrap.GraphExtraction;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -12,6 +13,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.RejectedExecutionException;
 
 /**
@@ -44,8 +46,15 @@ import java.util.concurrent.RejectedExecutionException;
  * HTTP/1.1 202 Accepted
  * Content-Type: application/json
  *
- * {"state": "running", "namespace": "acme", "started_at_ms": 1736899200000}
+ * {"state": "running", "namespace": "acme", "started_at_ms": 1736899200000,
+ *  "extraction": "active"}
  * }</pre>
+ *
+ * <p>{@code extraction} says whether ingestion on this node extracts the facts a build publishes:
+ * {@code active}, {@code disabled} when {@code excalibur.graph.extraction-enabled} is off, or
+ * {@code missing_api_key} when it is on and no LLM API key is configured - the one case that also
+ * carries a {@code warning}, because nobody chose it and the build it answers will publish
+ * nothing new.</p>
  *
  * <h2>Response (a build is already running)</h2>
  * <pre>{@code
@@ -123,11 +132,30 @@ public class GraphBuildEndpoint implements HttpHandler {
         // Rendered from the build that was just started rather than from a re-read of the
         // runner's state. On an empty namespace the build can finish before this line, and a
         // 202 reporting "completed" would tell a client keying on "running" not to poll.
-        ResponseBody.sendJson(exchange, 202,
-            "{"
-                + "\"state\": \"" + JsonText.escape(claim.started().state()) + "\", "
-                + "\"namespace\": \"" + JsonText.escape(namespace.value()) + "\", "
-                + "\"started_at_ms\": " + claim.started().startedAtMs()
-                + "}");
+        StringBuilder json = new StringBuilder(256)
+            .append("{\"state\": \"").append(JsonText.escape(claim.started().state()))
+            .append("\", \"namespace\": \"").append(JsonText.escape(namespace.value()))
+            .append("\", \"started_at_ms\": ").append(claim.started().startedAtMs());
+        appendExtraction(json, runner.extraction());
+        ResponseBody.sendJson(exchange, 202, json.append('}').toString());
+    }
+
+    /**
+     * Says whether ingestion on this node extracts facts, and warns when it was asked to and
+     * cannot.
+     *
+     * <p>In the answer to the request rather than only in the status a caller may never read:
+     * a build on a node whose extraction is inactive publishes nothing, and the caller that
+     * asked for it is the one who needs to know why before waiting on it.</p>
+     *
+     * @param json       The body being built
+     * @param extraction The node's extraction state, if it says
+     */
+    static void appendExtraction(StringBuilder json, Optional<GraphExtraction> extraction) {
+        extraction.ifPresent(state -> {
+            json.append(", \"extraction\": \"").append(state.wireName()).append('"');
+            state.warning().ifPresent(warning -> json.append(", \"warning\": \"")
+                .append(JsonText.escape(warning)).append('"'));
+        });
     }
 }

@@ -26,6 +26,12 @@ import java.util.concurrent.locks.Lock;
  * {@link SplitSnapshotData} does for the same reason: damage carried into a fresh file
  * arrives there with a checksum asserting it is sound.</p>
  *
+ * <h2>A damaged entry is stepped over, not a dead end</h2>
+ * <p>The slot is consumed before its entry is read, so when verification throws the cursor is
+ * already positioned after it and the next {@link #hasNext()} resumes there. A caller that
+ * copies forward stops at the exception; one rebuilding derived data can catch it and carry on
+ * without the one entry.</p>
+ *
  * <p><strong>Thread safety:</strong> not thread-safe, and holds a lock. One thread per
  * cursor, and it must be closed on every path, or the segment can never be written again.</p>
  */
@@ -156,6 +162,12 @@ final class SegmentEntryCursor implements AutoCloseable {
         long dataRegionOffset = segment.slots.readDataOffset(slotIndex);
         long entryOffset = segment.slotTableSize + dataRegionOffset;
 
+        // Before either length sizes an allocation: a damaged length is reported as the damage
+        // it is, not as whatever a negative or enormous array size happens to throw, so a
+        // caller that skips damaged entries can skip this one too.
+        segment.records.verifyEntry(segment.segment, entryOffset, slotIndex);
+        segment.slots.verifySlotAgainstEntry(segment.segment, slotIndex, entryOffset);
+
         long keyHash =
             segment.segment.get(Segment.LONG_LAYOUT, entryOffset + Segment.ENTRY_KEY_HASH_OFFSET);
         int keyLen =
@@ -166,8 +178,6 @@ final class SegmentEntryCursor implements AutoCloseable {
             entryOffset + Segment.ENTRY_DISTANCE_OFFSET) & 0xFF;
 
         byte[] key = new byte[keyLen];
-        segment.records.verifyEntry(segment.segment, entryOffset, slotIndex);
-        segment.slots.verifySlotAgainstEntry(segment.segment, slotIndex, entryOffset);
         MemorySegment.copy(segment.segment, Segment.BYTE_LAYOUT,
             entryOffset + segment.records.keyBytesOffset(), key, 0, keyLen);
 

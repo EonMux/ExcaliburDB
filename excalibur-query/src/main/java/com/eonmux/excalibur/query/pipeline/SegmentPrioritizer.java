@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.query.pipeline;
 
+import com.eonmux.excalibur.core.text.TermExtractor;
 import com.eonmux.excalibur.filter.sketch.CountMinSketch;
 import com.eonmux.excalibur.query.executor.CancellationToken;
 import com.eonmux.excalibur.query.plan.SelectivityEstimator;
@@ -8,14 +9,18 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 
 /**
  * Orders a query's candidate segments so the ones most likely to answer are searched first.
  *
  * <p>Estimates query selectivity for each segment using Count-Min Sketch term frequency data,
- * then sorts by that estimate.</p>
+ * then sorts by that estimate. The sketch is the segment's own: the store counts the chunk-text
+ * terms of every write it applies to the segment, keeps the counts beside the segment file, and
+ * reloads or rebuilds them when the segment is reopened. The estimate for a term is its share of
+ * all the term occurrences counted in that segment, and a multi-term query multiplies the
+ * shares.</p>
  *
  * <h2>Selectivity-Based Optimization</h2>
  * <ul>
@@ -149,39 +154,23 @@ final class SegmentPrioritizer {
     }
 
     /**
-     * Extracts query terms from query text for selectivity estimation.
+     * Extracts the query's terms the way the segments' sketches counted them.
      *
-     * <p>Uses whitespace tokenization to match the ingestion pipeline.</p>
+     * <p>Each segment counts {@link TermExtractor#extractTerms(String)} of every chunk written to
+     * it, so the query has to be cut the same way: lower-cased, stripped of punctuation, with
+     * stop words and single characters dropped. A query term cut differently - "retrieval," for
+     * "retrieval" - is a term no sketch has ever counted, and it estimates every segment at zero.
+     * A term repeated in the query is looked up once, since selectivity multiplies across terms
+     * and a repetition would only square the same factor for every segment.</p>
      *
      * @param queryText The query text
-     * @return List of query terms
+     * @return The distinct query terms, in the order they first appear
      */
     private static List<String> extractQueryTerms(String queryText) {
         if (queryText == null || queryText.isEmpty()) {
             return Collections.emptyList();
         }
-
-        List<String> terms = new ArrayList<>();
-        StringBuilder currentTerm = new StringBuilder();
-
-        for (int i = 0; i < queryText.length(); i++) {
-            char c = queryText.charAt(i);
-            if (Character.isWhitespace(c)) {
-                if (currentTerm.length() > 0) {
-                    terms.add(currentTerm.toString().toLowerCase(Locale.ROOT));
-                    currentTerm.setLength(0);
-                }
-            } else {
-                currentTerm.append(c);
-            }
-        }
-
-        // Add final term if any
-        if (currentTerm.length() > 0) {
-            terms.add(currentTerm.toString().toLowerCase(Locale.ROOT));
-        }
-
-        return terms;
+        return new ArrayList<>(new LinkedHashSet<>(TermExtractor.extractTerms(queryText)));
     }
 
     /**

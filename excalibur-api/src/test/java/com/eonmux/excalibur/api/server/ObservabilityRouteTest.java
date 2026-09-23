@@ -4,6 +4,7 @@ import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.EpochTickScheduler;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
+import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
 import org.junit.jupiter.api.AfterEach;
@@ -68,6 +69,7 @@ class ObservabilityRouteTest {
         segment.transitionToWarming();
         segment.transitionToActive();
         IndexOrchestrator indexOrchestrator = mock(IndexOrchestrator.class);
+        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         StorageEngine storageEngine = mock(StorageEngine.class);
         EpochTickScheduler scheduler = mock(EpochTickScheduler.class);
         when(indexOrchestrator.getVisibilityTracker())
@@ -101,6 +103,7 @@ class ObservabilityRouteTest {
         // records: a fresh node that answers nothing while reporting itself healthy.
         SegmentCatalog empty = new SegmentCatalog();
         IndexOrchestrator orchestrator = mock(IndexOrchestrator.class);
+        when(orchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         StorageEngine storage = mock(StorageEngine.class);
         EpochTickScheduler ticks = mock(EpochTickScheduler.class);
         when(orchestrator.getVisibilityTracker())
@@ -141,6 +144,7 @@ class ObservabilityRouteTest {
         segment.transitionToWarming();
         segment.transitionToActive();
         IndexOrchestrator orchestrator = mock(IndexOrchestrator.class);
+        when(orchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         StorageEngine storage = mock(StorageEngine.class);
         EpochTickScheduler ticks = mock(EpochTickScheduler.class);
         when(orchestrator.getVisibilityTracker())

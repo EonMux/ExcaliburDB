@@ -11,6 +11,7 @@ import com.eonmux.excalibur.backup.snapshot.SnapshotLayout;
 import com.eonmux.excalibur.backup.verify.Problem;
 import com.eonmux.excalibur.backup.verify.SnapshotVerifier;
 import com.eonmux.excalibur.backup.verify.VerificationReport;
+import com.eonmux.excalibur.fsck.check.FileKind;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -47,6 +48,32 @@ public final class SnapshotRestorer {
 
     /** Checks the image before anything is written. */
     private final SnapshotVerifier verifier = new SnapshotVerifier();
+
+    /** Performs the renames that swap the restored tree into place. */
+    private final DirectoryMover mover;
+
+    /**
+     * Creates a restorer that swaps with atomic renames.
+     */
+    public SnapshotRestorer() {
+        this((source, destination) ->
+            Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE));
+    }
+
+    /**
+     * Creates a restorer that swaps through the given mover.
+     *
+     * <p>The seam exists for the one failure the swap guards against and no real
+     * filesystem can be made to produce on demand: the old directory renamed aside and the
+     * new one refused its name. Tests use it to fail exactly that rename, and the rename that
+     * puts the old directory back, while every other rename stays real.</p>
+     *
+     * @param mover Performs every rename the swap makes
+     * @throws NullPointerException if mover is null
+     */
+    SnapshotRestorer(DirectoryMover mover) {
+        this.mover = Objects.requireNonNull(mover, "mover");
+    }
 
     /**
      * Restores a snapshot.
@@ -186,16 +213,16 @@ public final class SnapshotRestorer {
      * @param parent  The directory both live in
      * @throws IOException if a rename fails
      */
-    private static void swapIntoPlace(Path staging, Path target, Path parent)
+    private void swapIntoPlace(Path staging, Path target, Path parent)
         throws IOException {
         Path displaced = null;
         if (Files.exists(target)) {
             displaced = parent.resolve(target.getFileName() + SnapshotLayout.STAGING_INFIX
                 + "replaced-" + UUID.randomUUID());
-            Files.move(target, displaced, StandardCopyOption.ATOMIC_MOVE);
+            mover.move(target, displaced);
         }
         try {
-            Files.move(staging, target, StandardCopyOption.ATOMIC_MOVE);
+            mover.move(staging, target);
         } catch (IOException | RuntimeException e) {
             restoreDisplaced(displaced, target, e);
             throw e;
@@ -219,15 +246,38 @@ public final class SnapshotRestorer {
      * @param target    Where it belongs
      * @param failure   What went wrong, so a failed rollback is attached to it
      */
-    private static void restoreDisplaced(Path displaced, Path target, Exception failure) {
+    private void restoreDisplaced(Path displaced, Path target, Exception failure) {
         if (displaced == null) {
             return;
         }
         try {
-            Files.move(displaced, target, StandardCopyOption.ATOMIC_MOVE);
+            mover.move(displaced, target);
         } catch (IOException | RuntimeException e) {
-            failure.addSuppressed(e);
+            IOException rollback = new IOException("the previous contents of " + target
+                + " could not be put back and are intact at " + displaced
+                + "; rename that directory to " + target.getFileName()
+                + " to recover them: " + e.getMessage(), e);
+            failure.addSuppressed(rollback);
         }
+    }
+
+    /**
+     * Renames a directory within one parent.
+     *
+     * <p>Every rename the swap makes goes through this, so that it is one call the atomic
+     * default makes and a test can intercept.</p>
+     */
+    @FunctionalInterface
+    interface DirectoryMover {
+
+        /**
+         * Renames source to destination.
+         *
+         * @param source      What to rename
+         * @param destination Its new name, in the same directory
+         * @throws IOException if the rename fails
+         */
+        void move(Path source, Path destination) throws IOException;
     }
 
     /**
@@ -257,6 +307,14 @@ public final class SnapshotRestorer {
         if (!hasCodebooks) {
             required.add("no quantiser codebooks are in this image; they retrain on their own "
                 + "as segments warm, at a cost in early query latency");
+        }
+        boolean hasSegments = manifest.files().stream()
+            .anyMatch(entry -> FileKind.SEGMENT_DATA_NAME.matcher(entry.path()).matches());
+        boolean hasSketches = manifest.files().stream()
+            .anyMatch(entry -> FileKind.TERM_SKETCH_NAME.matcher(entry.path()).matches());
+        if (hasSegments && !hasSketches) {
+            required.add("no term sketches are in this image; the node rebuilds each from its "
+                + "segment's live entries as it opens the segment, at a cost in start-up time");
         }
         return required;
     }

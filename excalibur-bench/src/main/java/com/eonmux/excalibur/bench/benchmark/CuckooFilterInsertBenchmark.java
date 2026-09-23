@@ -4,7 +4,6 @@ import com.eonmux.excalibur.filter.CuckooFilter;
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
 
-import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -39,6 +38,22 @@ import java.util.concurrent.TimeUnit;
  *   <li>Near capacity (95%): Lower throughput, many displacement attempts</li>
  * </ul>
  *
+ * <h2>Holding the load factor</h2>
+ * <p>An insert changes what it measures: every one raises the load factor, and a time-bounded
+ * JMH iteration performs millions of them - far more than the filter has free slots. Left to
+ * run, a trial fills the filter within its first second and then times refusals, each of which
+ * walks a full displacement chain and rolls it back at around a hundred times the cost of an
+ * insert. Cycling a small key set does the same through duplicates, which fill a key's two
+ * buckets after eight copies.</p>
+ *
+ * <p>So every insert here is of a key not in the filter, and a {@link Level#Invocation}
+ * teardown deletes whatever the invocation inserted, off the clock. Every timed insert
+ * therefore sees the filter at exactly the target load factor. Invocation-level fixtures make
+ * JMH timestamp each call, which adds a few tens of nanoseconds to a call as short as one
+ * insert; {@link #batchInsert100} and {@link #batchInsert1000} spread that over many inserts,
+ * and every method reports per-insert throughput through {@link OperationsPerInvocation}, so
+ * the gap between {@link #singleInsert} and the batches is that overhead.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>This is a JMH benchmark class. JMH handles all thread safety for benchmark
  * execution. The benchmark state is managed by JMH's @State annotations which
@@ -66,58 +81,82 @@ public class CuckooFilterInsertBenchmark {
     public double targetLoadFactor;
 
     /**
-     * Capacity of the filter (number of entries).
-     * Domain constraint: must be power of 2 for efficient bucket masking.
-     * Using 1M entries provides sufficient data for meaningful throughput measurements.
+     * Capacity the filter is created for.
+     *
+     * <p>The filter rounds its bucket count up to a power of two and keeps twice the buckets
+     * the request strictly needs, so load factors are taken against
+     * {@link CuckooFilter#capacity()}, not this parameter.</p>
      */
     @Param({"1000000"})
     public int capacity;
 
     /**
-     * Number of fingerprints per bucket.
-     * Domain constraint: fixed at 4 for cache-line alignment (64 bytes).
+     * Keys in each fresh-key pool. A power of two, so the cursor wraps with a mask, and large
+     * enough that successive invocations land in different buckets rather than re-warming the
+     * same few cache lines.
      */
-    private static final int FINGERPRINTS_PER_BUCKET = 4;
+    private static final int KEY_POOL_SIZE = 1 << 16;
 
     /**
-     * Number of insert operations to perform in each benchmark iteration.
-     * This batch size provides stable throughput measurements.
+     * First index of the fresh-key sequence, far past any pre-population key's index.
      */
-    @Param({"10000"})
-    public int batchSize;
+    private static final long FRESH_KEY_BASE = 1L << 40;
+
+    /**
+     * Key sizes {@link #insertVariedKeySizes} cycles through, one insert each per call.
+     */
+    private static final int[] VARIED_KEY_SIZES = {8, 16, 32, 64};
+
+    /**
+     * Most inserts any benchmark method makes in one invocation.
+     */
+    private static final int MAX_INSERTS_PER_INVOCATION = 1000;
+
+    /**
+     * How far the filled load factor may sit from the target before the trial is refused.
+     */
+    private static final double LOAD_FACTOR_TOLERANCE = 0.001;
 
     // ==================== Benchmark State ====================
 
     /**
-     * The filter being benchmarked.
-     * Pre-populated to the target load factor before each measurement.
+     * The filter being benchmarked, held at the target load factor between invocations.
      */
     private CuckooFilter filter;
 
     /**
-     * Random number generator for key generation.
-     * Seeded for reproducibility.
+     * 16-byte keys that are not in the filter at the start of any invocation.
      */
-    private Random random;
+    private byte[][] freshKeys;
 
     /**
-     * Pre-generated keys for insert operations.
-     * Using pre-generated keys eliminates key generation overhead from measurements.
+     * Keys of 8, 16, 32 and 64 bytes, in that order, not in the filter at the start of any
+     * invocation.
      */
-    private byte[][] insertKeys;
+    private byte[][] variedKeys;
 
     /**
-     * Current index into insertKeys array.
+     * Next position in the fresh-key pools.
      */
-    private int keyIndex;
+    private int keyCursor;
 
     /**
-     * Count of successful inserts in the current batch.
+     * Keys the current invocation inserted, for {@link #restoreLoadFactor()} to delete.
+     */
+    private final byte[][] insertedThisInvocation = new byte[MAX_INSERTS_PER_INVOCATION][];
+
+    /**
+     * How many entries of {@link #insertedThisInvocation} are in use.
+     */
+    private int insertedCount;
+
+    /**
+     * Count of successful inserts over the trial.
      */
     private long successCount;
 
     /**
-     * Count of failed inserts (graceful failure) in the current batch.
+     * Count of refused inserts (graceful failure) over the trial.
      */
     private long failCount;
 
@@ -128,73 +167,55 @@ public class CuckooFilterInsertBenchmark {
      *
      * <h3>Domain Correctness Verification</h3>
      * <ul>
-     *   <li>Load factor is clamped to [0.0, 1.0]</li>
-     *   <li>Capacity is validated as power of 2</li>
-     *   <li>Filter is pre-populated to exact target load factor</li>
-     *   <li>Actual load factor is verified to match target within 1%</li>
+     *   <li>Load factor is validated to lie in [0.0, 1.0]</li>
+     *   <li>Filter is pre-populated to the target load factor of its real capacity</li>
+     *   <li>Actual load factor is verified to match target within 0.1%</li>
      * </ul>
      */
     @Setup(Level.Trial)
     public void setup() {
-        // Validate domain constraints
         if (targetLoadFactor < 0.0 || targetLoadFactor > 1.0) {
             throw new IllegalArgumentException(
                 "Load factor must be in [0.0, 1.0], got: " + targetLoadFactor);
         }
-
         if (capacity <= 0) {
             throw new IllegalArgumentException(
                 "Capacity must be positive, got: " + capacity);
         }
 
-        // Initialize random with fixed seed for reproducibility
-        random = new Random(42);
-
-        // Create filter with specified capacity
-        // Using default 13-bit fingerprints for ≤0.1% FP rate
+        // Using default 13-bit fingerprints for <=0.1% FP rate
         filter = CuckooFilter.create(capacity);
 
-        // Calculate number of entries for target load factor
-        // Domain: entries = actual_capacity × load_factor
-        // Note: filter.capacity() may differ from requested capacity due to power-of-2 sizing
-        long actualCapacity = filter.capacity();
-        long targetEntries = (long) (actualCapacity * targetLoadFactor);
-
-        // Pre-populate filter to target load factor
-        // This ensures we measure insert performance at the specified load
+        long targetEntries = (long) (filter.capacity() * targetLoadFactor);
         for (long i = 0; i < targetEntries; i++) {
-            byte[] key = generateKey(i);
-            boolean inserted = filter.insert(key);
-            if (!inserted) {
-                // This shouldn't happen at reasonable load factors
+            if (!filter.insert(generateKey(i, 16))) {
                 throw new IllegalStateException(
                     "Failed to insert during pre-population at load factor " + targetLoadFactor +
                     ". Inserted " + i + " of " + targetEntries + " entries.");
             }
         }
 
-        // Verify actual load factor matches target (within 1% tolerance)
         double actualLoadFactor = filter.loadFactor();
         double loadFactorError = Math.abs(actualLoadFactor - targetLoadFactor);
-        if (loadFactorError > 0.01) {
+        if (loadFactorError > LOAD_FACTOR_TOLERANCE) {
             throw new IllegalStateException(
                 "Load factor mismatch. Target: " + targetLoadFactor +
                 ", Actual: " + actualLoadFactor +
                 ", Error: " + loadFactorError);
         }
 
-        // Pre-generate keys for benchmark iterations
-        // These keys are distinct from pre-population keys
-        int keyCount = batchSize * 10; // 10x buffer to avoid wrap-around issues
-        insertKeys = new byte[keyCount][];
-        for (int i = 0; i < keyCount; i++) {
-            insertKeys[i] = generateKey(targetEntries + i);
+        freshKeys = new byte[KEY_POOL_SIZE][];
+        variedKeys = new byte[KEY_POOL_SIZE][];
+        for (int i = 0; i < KEY_POOL_SIZE; i++) {
+            freshKeys[i] = generateKey(FRESH_KEY_BASE + i, 16);
+            variedKeys[i] = generateKey(FRESH_KEY_BASE + KEY_POOL_SIZE + i,
+                VARIED_KEY_SIZES[i % VARIED_KEY_SIZES.length]);
         }
-        keyIndex = 0;
+        keyCursor = 0;
+        insertedCount = 0;
         successCount = 0;
         failCount = 0;
 
-        // Log benchmark setup
         System.out.println("CuckooFilter Insert Benchmark Setup:");
         System.out.println("  Target load factor: " + targetLoadFactor);
         System.out.println("  Actual load factor: " + String.format("%.4f", actualLoadFactor));
@@ -203,7 +224,29 @@ public class CuckooFilterInsertBenchmark {
         System.out.println("  Fingerprint bits: " + filter.fingerprintBits());
         System.out.println("  Num buckets: " + filter.numBuckets());
         System.out.println("  Filter size: " + (filter.byteSize() / 1024) + " KB");
-        System.out.println("  Batch size: " + batchSize);
+    }
+
+    /**
+     * Deletes every key the invocation inserted, returning the filter to the target load
+     * factor before the next timed call.
+     *
+     * <p>Only keys whose insert succeeded are deleted: deleting one that was refused could
+     * remove another resident entry that happens to share its fingerprint and bucket pair.</p>
+     *
+     * @throws IllegalStateException if a key inserted moments ago cannot be deleted, which
+     *         would be a false negative
+     */
+    @TearDown(Level.Invocation)
+    public void restoreLoadFactor() {
+        for (int i = 0; i < insertedCount; i++) {
+            if (!filter.delete(insertedThisInvocation[i])) {
+                throw new IllegalStateException(
+                    "Domain correctness violation: a key inserted by this invocation could not "
+                        + "be deleted");
+            }
+            insertedThisInvocation[i] = null;
+        }
+        insertedCount = 0;
     }
 
     /**
@@ -226,76 +269,42 @@ public class CuckooFilterInsertBenchmark {
 
     /**
      * Benchmark: Single insert operation.
-     * Measures throughput of individual insert calls.
+     * Measures throughput of individual insert calls at the target load factor.
      *
      * <h3>Domain Correctness</h3>
      * <ul>
-     *   <li>Keys are 16-byte arrays (reasonable key size)</li>
+     *   <li>Keys are 16-byte arrays not already in the filter</li>
      *   <li>Insert returns boolean (never throws on full filter)</li>
      *   <li>Tracks success/fail rates for validation</li>
      * </ul>
      */
     @Benchmark
     public boolean singleInsert(Blackhole bh) {
-        byte[] key = insertKeys[keyIndex % insertKeys.length];
-        keyIndex++;
-
-        boolean result = filter.insert(key);
-
-        // Track success/fail rates
-        if (result) {
-            successCount++;
-        } else {
-            failCount++;
-        }
-
-        return result;
+        return insertFresh(nextFreshKey());
     }
 
     /**
      * Benchmark: Batch insert operations (100 inserts per call).
-     * Measures throughput when performing bulk inserts.
+     * Measures throughput when performing bulk inserts; the score is per insert.
      *
      * <h3>Rationale</h3>
      * <p>Batch operations amortize method call overhead and better reflect
      * real-world usage where multiple items are inserted together.</p>
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int batchInsert100(Blackhole bh) {
-        int successes = 0;
-        for (int i = 0; i < 100; i++) {
-            byte[] key = insertKeys[keyIndex % insertKeys.length];
-            keyIndex++;
-
-            if (filter.insert(key)) {
-                successes++;
-                successCount++;
-            } else {
-                failCount++;
-            }
-        }
-        return successes;
+        return insertBatch(100);
     }
 
     /**
      * Benchmark: Batch insert operations (1000 inserts per call).
-     * Measures throughput for large bulk insert operations.
+     * Measures throughput for large bulk insert operations; the score is per insert.
      */
     @Benchmark
+    @OperationsPerInvocation(1000)
     public int batchInsert1000(Blackhole bh) {
-        int successes = 0;
-        for (int i = 0; i < 1000; i++) {
-            byte[] key = insertKeys[keyIndex % insertKeys.length];
-            keyIndex++;
-
-            if (filter.insert(key)) {
-                successes++;
-                successCount++;
-            } else {
-                failCount++;
-            }
-        }
-        return successes;
+        return insertBatch(1000);
     }
 
     /**
@@ -308,97 +317,100 @@ public class CuckooFilterInsertBenchmark {
      */
     @Benchmark
     public boolean insertAndVerify(Blackhole bh) {
-        byte[] key = insertKeys[keyIndex % insertKeys.length];
-        keyIndex++;
-
-        boolean inserted = filter.insert(key);
-
-        if (inserted) {
-            // Domain correctness: inserted item MUST be findable
-            boolean found = filter.contains(key);
-            if (!found) {
-                throw new IllegalStateException(
-                    "Domain correctness violation: inserted key not found in filter");
-            }
-            successCount++;
-        } else {
-            failCount++;
+        byte[] key = nextFreshKey();
+        boolean inserted = insertFresh(key);
+        if (inserted && !filter.contains(key)) {
+            throw new IllegalStateException(
+                "Domain correctness violation: inserted key not found in filter");
         }
-
         return inserted;
     }
 
     /**
      * Benchmark: Insert with varied key sizes.
-     * Tests insert throughput with different key sizes to measure
-     * the impact of hashing overhead.
+     * Tests insert throughput with 8, 16, 32 and 64 byte keys, one of each per call, to
+     * measure the impact of hashing overhead. The score is per insert.
+     *
+     * <p>The keys are pre-generated and distinct, so building them is not timed and none of
+     * them is a duplicate insert.</p>
      */
     @Benchmark
+    @OperationsPerInvocation(4)
     public int insertVariedKeySizes(Blackhole bh) {
         int successes = 0;
-
-        // Insert keys of varying sizes: 8, 16, 32, 64 bytes
-        for (int sizeMultiplier = 1; sizeMultiplier <= 4; sizeMultiplier++) {
-            int keySize = 8 * sizeMultiplier;
-            byte[] key = new byte[keySize];
-            int baseIdx = keyIndex % insertKeys.length;
-
-            // Copy from pre-generated key, repeating as needed
-            byte[] baseKey = insertKeys[baseIdx];
-            for (int i = 0; i < keySize; i++) {
-                key[i] = baseKey[i % baseKey.length];
-            }
-            keyIndex++;
-
-            if (filter.insert(key)) {
+        for (int i = 0; i < VARIED_KEY_SIZES.length; i++) {
+            if (insertFresh(variedKeys[keyCursor++ & (KEY_POOL_SIZE - 1)])) {
                 successes++;
-                successCount++;
-            } else {
-                failCount++;
             }
         }
-
         return successes;
     }
 
     // ==================== Helper Methods ====================
 
     /**
+     * Takes the next key from the fresh-key pool.
+     *
+     * @return A 16-byte key not in the filter
+     */
+    private byte[] nextFreshKey() {
+        return freshKeys[keyCursor++ & (KEY_POOL_SIZE - 1)];
+    }
+
+    /**
+     * Inserts {@code count} fresh keys.
+     *
+     * @param count How many keys to insert
+     * @return How many inserts succeeded
+     */
+    private int insertBatch(int count) {
+        int successes = 0;
+        for (int i = 0; i < count; i++) {
+            if (insertFresh(nextFreshKey())) {
+                successes++;
+            }
+        }
+        return successes;
+    }
+
+    /**
+     * Inserts one key, recording it for {@link #restoreLoadFactor()} if the filter took it.
+     *
+     * @param key A key not in the filter
+     * @return Whether the insert succeeded
+     */
+    private boolean insertFresh(byte[] key) {
+        if (filter.insert(key)) {
+            insertedThisInvocation[insertedCount++] = key;
+            successCount++;
+            return true;
+        }
+        failCount++;
+        return false;
+    }
+
+    /**
      * Generates a unique key for the given index.
      *
      * <h3>Domain Correctness</h3>
      * <ul>
-     *   <li>Keys are 16 bytes (128 bits) - reasonable size for hash distribution</li>
-     *   <li>Keys are unique across pre-population and benchmark phases</li>
-     *   <li>Key format: [prefix(8B)][index(8B)] for deterministic generation</li>
+     *   <li>Keys of one length differ exactly when their indices do</li>
+     *   <li>Key format: [prefix][index(8B)], the prefix "CUCKBKEY" repeated to fill</li>
      * </ul>
      *
-     * @param index The unique index for this key
-     * @return A 16-byte array containing the key
+     * @param index   The unique index for this key
+     * @param keySize The key length, at least 8
+     * @return The key
      */
-    private byte[] generateKey(long index) {
-        byte[] key = new byte[16];
-
-        // First 8 bytes: fixed prefix "CUCKBKEY"
-        key[0] = 'C';
-        key[1] = 'U';
-        key[2] = 'C';
-        key[3] = 'K';
-        key[4] = 'B';
-        key[5] = 'K';
-        key[6] = 'E';
-        key[7] = 'Y';
-
-        // Last 8 bytes: big-endian index
-        key[8] = (byte) (index >>> 56);
-        key[9] = (byte) (index >>> 48);
-        key[10] = (byte) (index >>> 40);
-        key[11] = (byte) (index >>> 32);
-        key[12] = (byte) (index >>> 24);
-        key[13] = (byte) (index >>> 16);
-        key[14] = (byte) (index >>> 8);
-        key[15] = (byte) index;
-
+    private static byte[] generateKey(long index, int keySize) {
+        byte[] prefix = {'C', 'U', 'C', 'K', 'B', 'K', 'E', 'Y'};
+        byte[] key = new byte[keySize];
+        for (int i = 0; i < keySize - 8; i++) {
+            key[i] = prefix[i % prefix.length];
+        }
+        for (int i = 0; i < 8; i++) {
+            key[keySize - 8 + i] = (byte) (index >>> (56 - 8 * i));
+        }
         return key;
     }
 }

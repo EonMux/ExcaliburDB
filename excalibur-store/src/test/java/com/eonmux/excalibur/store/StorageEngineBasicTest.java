@@ -126,9 +126,16 @@ class StorageEngineBasicTest {
 
             long segmentId = engine.putReportingSegment(key, "value".getBytes());
 
-            assertThat(engine.getSegments().values())
-                .as("the reported id must name a segment this engine holds")
-                .anyMatch(segment -> segment.segmentId() == segmentId);
+            Segment landed = engine.getSegments().get(segmentId);
+            assertThat(landed)
+                .as("the reported id must be a directory index this engine holds")
+                .isNotNull();
+            assertThat(landed.get(key))
+                .as("and the segment at that index must hold the key")
+                .isNotNull();
+            assertThat(engine.getCatalog().get(segmentId))
+                .as("the id is the catalog index everything keyed per segment uses")
+                .isNotNull();
             assertThat(engine.putReportingSegment(key, "value2".getBytes()))
                 .as("the same key routes to the same segment")
                 .isEqualTo(segmentId);

@@ -283,11 +283,6 @@ class TailScanHandoffIntegrationTest {
         }
 
         @Override
-        public boolean hasChanged(java.time.Instant since) {
-            return true;
-        }
-
-        @Override
         public FetchedDocument fetch(String documentId) throws SourceException {
             String text = documents.get(documentId);
             if (text == null) {

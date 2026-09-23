@@ -69,7 +69,7 @@ public interface ServedArtifactEraser {
      *
      * <p>Every name claimed must exist in {@code replacement} afterwards if it existed in
      * {@code served}, because the replacement directory replaces the served one whole and
-     * anything missing from it is deleted with the retired copy.
+     * anything missing from it is deleted with the displaced copy.
      *
      * @param served         The directory being served, which must not be modified
      * @param replacement    The directory being assembled, which the swap will move into place

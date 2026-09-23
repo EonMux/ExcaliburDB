@@ -19,12 +19,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  * corpus that is minutes of saturated I/O, and the operator who started it during business
  * hours by mistake had no way to end it: the runner's only stop was process shutdown. The
  * mechanism was already safe - a rewrite builds the replacement beside the original and swaps
- * it in at the end, so an interrupted run loses its own work and never data, and
+ * it in at the end, so a stopped run loses its own work and never data, and
  * {@code compactNow} stops at the next segment boundary and returns what it had done - it was
  * simply not reachable.</p>
  *
- * <p>Stopping is a request, as it is for a reindex: the run ends at the next boundary rather
- * than the instant the call returns.</p>
+ * <p>Stopping is a request, as it is for a reindex: the run reads it at its next boundary rather
+ * than ending the instant the call returns, and is never interrupted - a rewrite forces write
+ * logs and reopens graphs through channels queries share, and an interrupt reaching one of those
+ * operations closes the channel for all of them.</p>
  */
 @DisplayName("Cancelling an on-demand compaction")
 class CompactionCancellationTest {
@@ -41,16 +43,15 @@ class CompactionCancellationTest {
         void aRunInProgressIsAskedToStop() throws Exception {
             CountDownLatch started = new CountDownLatch(1);
             CountDownLatch finished = new CountDownLatch(1);
+            AtomicBoolean sawStop = new AtomicBoolean();
             AtomicBoolean interrupted = new AtomicBoolean();
-            CompactionRunner runner = new CompactionRunner(force -> {
+            CompactionRunner runner = new CompactionRunner((force, stop) -> {
                 started.countDown();
                 try {
-                    // Stands in for the next segment boundary: real compaction checks the
-                    // interrupt flag between segments and returns what it had done by then.
-                    Thread.sleep(30_000);
-                } catch (InterruptedException e) {
-                    interrupted.set(true);
-                    Thread.currentThread().interrupt();
+                    // Stands in for the segment boundaries: real compaction reads the stop
+                    // before each segment and returns what it had done by then.
+                    sawStop.set(awaitStop(stop));
+                    interrupted.set(Thread.currentThread().isInterrupted());
                 } finally {
                     finished.countDown();
                 }
@@ -65,7 +66,10 @@ class CompactionCancellationTest {
                     .isTrue();
 
                 assertThat(finished.await(5, TimeUnit.SECONDS)).isTrue();
-                assertThat(interrupted).isTrue();
+                assertThat(sawStop).as("the run read the stop at its boundary").isTrue();
+                assertThat(interrupted)
+                    .as("a rewrite in progress is never interrupted")
+                    .isFalse();
                 await(() -> CompactionRunner.STATE_CANCELLED.equals(runner.snapshot().state()));
                 assertThat(runner.snapshot().state())
                     .isEqualTo(CompactionRunner.STATE_CANCELLED);
@@ -77,7 +81,7 @@ class CompactionCancellationTest {
         @Test
         @DisplayName("cancelling when nothing is running says so rather than failing")
         void cancellingNothingIsNotAnError() {
-            CompactionRunner runner = new CompactionRunner(force -> NOTHING);
+            CompactionRunner runner = new CompactionRunner((force, stop) -> NOTHING);
             try {
                 assertThat(runner.cancel()).isFalse();
                 assertThat(runner.snapshot().state()).isEqualTo(CompactionRunner.STATE_IDLE);
@@ -94,14 +98,10 @@ class CompactionCancellationTest {
             // which reads as a compaction that failed for no reason anyone can see.
             CountDownLatch started = new CountDownLatch(1);
             AtomicBoolean secondSawInterrupt = new AtomicBoolean();
-            CompactionRunner runner = new CompactionRunner(force -> {
+            CompactionRunner runner = new CompactionRunner((force, stop) -> {
                 if (started.getCount() > 0) {
                     started.countDown();
-                    try {
-                        Thread.sleep(30_000);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
+                    awaitStop(stop);
                     return NOTHING;
                 }
                 secondSawInterrupt.set(Thread.currentThread().isInterrupted());
@@ -124,6 +124,23 @@ class CompactionCancellationTest {
         }
     }
 
+    /**
+     * Waits the way a compaction between two segments does: until it reads the stop.
+     *
+     * @param stop The run's stop request
+     * @return true once it was seen, false if it never came within the bound
+     */
+    private static boolean awaitStop(java.util.function.BooleanSupplier stop) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (!stop.getAsBoolean()) {
+            if (System.nanoTime() > deadline) {
+                return false;
+            }
+            java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(5));
+        }
+        return true;
+    }
+
     @Nested
     @DisplayName("the route")
     class TheRoute {
@@ -131,7 +148,7 @@ class CompactionCancellationTest {
         @Test
         @DisplayName("DELETE says whether there was anything to stop")
         void deleteSaysWhetherAnythingWasRunning() throws Exception {
-            CompactionRunner runner = new CompactionRunner(force -> NOTHING);
+            CompactionRunner runner = new CompactionRunner((force, stop) -> NOTHING);
             try {
                 Response response = call(new CompactionCancelEndpoint(runner), "DELETE");
 
@@ -145,7 +162,7 @@ class CompactionCancellationTest {
         @Test
         @DisplayName("any other method is refused")
         void otherMethodsAreRefused() throws Exception {
-            CompactionRunner runner = new CompactionRunner(force -> NOTHING);
+            CompactionRunner runner = new CompactionRunner((force, stop) -> NOTHING);
             try {
                 assertThat(call(new CompactionCancelEndpoint(runner), "GET").status())
                     .isEqualTo(405);

@@ -15,6 +15,11 @@ import java.util.stream.Collectors;
  * <p>Immutable data class holding all benchmark results, summary statistics,
  * and pass/fail information.</p>
  *
+ * <p>Besides the measured results it carries the {@link ErroredBenchmark combinations
+ * that errored}: those JMH started but could not measure. They count against the run
+ * exactly as a missed target does, because a combination that threw has demonstrated
+ * nothing about the target it was meant to meet.</p>
+ *
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Results are organized by benchmark category</li>
@@ -31,6 +36,7 @@ public final class BenchmarkResultSet {
     private final Instant endTime;
     private final long totalDurationMs;
     private final List<BenchmarkResult> results;
+    private final List<ErroredBenchmark> errored;
     private final Map<String, List<BenchmarkResult>> resultsByCategory;
     private final int passCount;
     private final int failCount;
@@ -45,6 +51,7 @@ public final class BenchmarkResultSet {
         this.totalDurationMs = builder.totalDurationMs > 0 ? builder.totalDurationMs :
             java.time.Duration.between(startTime, endTime).toMillis();
         this.results = Collections.unmodifiableList(new ArrayList<>(builder.results));
+        this.errored = List.copyOf(builder.errored);
         this.resultsByCategory = categorizeResults(builder.results);
 
         // Compute pass/fail counts. A target that could not be compared against a
@@ -70,13 +77,13 @@ public final class BenchmarkResultSet {
         this.skipCount = skips;
         this.unevaluatedCount = unevaluated;
         // An empty run proves nothing, so it is a failure rather than a vacuous pass.
-        this.allPassed = !results.isEmpty() && fails == 0 && unevaluated == 0;
+        this.allPassed = !results.isEmpty() && fails == 0 && unevaluated == 0 && errored.isEmpty();
     }
 
     private Map<String, List<BenchmarkResult>> categorizeResults(List<BenchmarkResult> results) {
         Map<String, List<BenchmarkResult>> categories = new HashMap<>();
         for (BenchmarkResult result : results) {
-            String category = extractCategory(result.benchmarkName());
+            String category = categoryOf(result.benchmarkName());
             categories.computeIfAbsent(category, k -> new ArrayList<>()).add(result);
         }
         // Make immutable
@@ -87,10 +94,16 @@ public final class BenchmarkResultSet {
         return Collections.unmodifiableMap(immutable);
     }
 
-    private String extractCategory(String benchmarkName) {
-        // Extract category from benchmark class name
-        // e.g., "com.eonmux.excalibur.bench.benchmark.PointLookupBenchmark.sequentialLookupFast"
-        //       -> "PointLookup"
+    /**
+     * The report category of a benchmark: its class's simple name without the
+     * {@code Benchmark} suffix.
+     *
+     * @param benchmarkName the fully qualified benchmark method, e.g.
+     *        {@code com.eonmux.excalibur.bench.benchmark.PointLookupBenchmark.lookup}
+     * @return the category, e.g. {@code PointLookup}, or {@code Other} when the name
+     *         has no class part
+     */
+    public static String categoryOf(String benchmarkName) {
         String className = benchmarkName;
         int lastDot = benchmarkName.lastIndexOf('.');
         if (lastDot > 0) {
@@ -159,6 +172,34 @@ public final class BenchmarkResultSet {
     }
 
     /**
+     * Gets the combinations that were started but produced no measurement.
+     *
+     * @return the errored combinations, in the order JMH ran them
+     */
+    public List<ErroredBenchmark> erroredBenchmarks() {
+        return errored;
+    }
+
+    /**
+     * Gets the number of combinations that errored.
+     *
+     * @return the number of errored combinations
+     */
+    public int erroredCount() {
+        return errored.size();
+    }
+
+    /**
+     * Gets the number of combinations the run covered: those measured plus those that
+     * errored.
+     *
+     * @return the total number of combinations
+     */
+    public int totalCount() {
+        return results.size() + errored.size();
+    }
+
+    /**
      * Gets results grouped by category.
      */
     public Map<String, List<BenchmarkResult>> resultsByCategory() {
@@ -204,8 +245,8 @@ public final class BenchmarkResultSet {
     }
 
     /**
-     * Checks if the run produced at least one result and every target was compared
-     * and met.
+     * Checks if the run produced at least one result, no combination errored, and every
+     * target was compared and met.
      *
      * <p>An empty result set returns false: a run that measured nothing cannot have
      * demonstrated that any target was met.</p>
@@ -217,12 +258,13 @@ public final class BenchmarkResultSet {
     }
 
     /**
-     * Gets the pass rate as a percentage of targets that were compared and met.
+     * Gets the pass rate: targets compared and met, as a percentage of every targeted
+     * result plus every errored combination.
      *
      * @return the pass rate, or 0.0 when nothing was evaluated
      */
     public double passRate() {
-        int total = passCount + failCount + unevaluatedCount;
+        int total = passCount + failCount + unevaluatedCount + errored.size();
         if (total == 0) return 0.0;
         return (passCount * 100.0) / total;
     }
@@ -273,10 +315,11 @@ public final class BenchmarkResultSet {
         sb.append("───────────────────────────────────────────────────────────────────────────\n");
         sb.append("OVERVIEW\n");
         sb.append("───────────────────────────────────────────────────────────────────────────\n");
-        sb.append(String.format("  Total Benchmarks: %d\n", results.size()));
+        sb.append(String.format("  Total Benchmarks: %d\n", totalCount()));
         sb.append(String.format("  Passed: %d (%.1f%%)\n", passCount, passRate()));
         sb.append(String.format("  Failed: %d\n", failCount));
         sb.append(String.format("  Not Evaluated: %d\n", unevaluatedCount));
+        sb.append(String.format("  Errored: %d\n", errored.size()));
         sb.append(String.format("  No Target: %d\n", skipCount));
         sb.append(String.format("  Status: %s\n\n", statusLabel()));
 
@@ -329,6 +372,22 @@ public final class BenchmarkResultSet {
             }
         }
 
+        if (!errored.isEmpty()) {
+            sb.append("\n──────────────────────────────────────────────────────────────────────────\n");
+            sb.append("ERRORED BENCHMARKS (threw before producing a measurement)\n");
+            sb.append("──────────────────────────────────────────────────────────────────────────\n");
+            for (ErroredBenchmark entry : errored) {
+                sb.append("\n  [").append(entry.category()).append("] ")
+                    .append(entry.label()).append(":\n");
+                sb.append("    ").append(entry.message()).append("\n");
+                if (!entry.detail().isBlank()) {
+                    entry.detail().lines()
+                        .filter(line -> !line.isBlank())
+                        .forEach(line -> sb.append("      ").append(line.strip()).append("\n"));
+                }
+            }
+        }
+
         List<BenchmarkResult> unevaluatedResults = getUnevaluatedResults();
         if (!unevaluatedResults.isEmpty()) {
             sb.append("\n──────────────────────────────────────────────────────────────────────────\n");
@@ -348,10 +407,10 @@ public final class BenchmarkResultSet {
         return sb.toString();
     }
 
-    /**
-     * Converts the result set to JSON format.
-     */
     private String statusLabel() {
+        if (!errored.isEmpty()) {
+            return "✗ BENCHMARKS ERRORED";
+        }
         if (results.isEmpty()) {
             return "✗ NO RESULTS CAPTURED";
         }
@@ -364,6 +423,14 @@ public final class BenchmarkResultSet {
         return "✗ SOME FAILED";
     }
 
+    /**
+     * Converts the result set to JSON format.
+     *
+     * <p>Errored combinations are listed under a top-level {@code errored} array, which
+     * {@link ErroredBenchmark#parseReport(String)} reads back.</p>
+     *
+     * @return the JSON document
+     */
     public String toJson() {
         StringBuilder sb = new StringBuilder();
         sb.append("{\n");
@@ -376,10 +443,11 @@ public final class BenchmarkResultSet {
 
         // Summary
         sb.append("  \"summary\": {\n");
-        sb.append("    \"total\": ").append(results.size()).append(",\n");
+        sb.append("    \"total\": ").append(totalCount()).append(",\n");
         sb.append("    \"passed\": ").append(passCount).append(",\n");
         sb.append("    \"failed\": ").append(failCount).append(",\n");
         sb.append("    \"unevaluated\": ").append(unevaluatedCount).append(",\n");
+        sb.append("    \"errored\": ").append(errored.size()).append(",\n");
         sb.append("    \"skipped\": ").append(skipCount).append(",\n");
         sb.append("    \"passRate\": ").append(String.format("%.2f", passRate())).append(",\n");
         sb.append("    \"allPassed\": ").append(allPassed).append("\n");
@@ -413,6 +481,16 @@ public final class BenchmarkResultSet {
         for (int i = 0; i < results.size(); i++) {
             sb.append(results.get(i).toJson());
             if (i < results.size() - 1) {
+                sb.append(",");
+            }
+            sb.append("\n");
+        }
+        sb.append("  ],\n");
+
+        sb.append("  \"errored\": [\n");
+        for (int i = 0; i < errored.size(); i++) {
+            sb.append(errored.get(i).toJson());
+            if (i < errored.size() - 1) {
                 sb.append(",");
             }
             sb.append("\n");
@@ -456,6 +534,7 @@ public final class BenchmarkResultSet {
         private Instant endTime;
         private long totalDurationMs;
         private List<BenchmarkResult> results = new ArrayList<>();
+        private List<ErroredBenchmark> errored = new ArrayList<>();
 
         public Builder name(String name) {
             this.name = name;
@@ -484,6 +563,28 @@ public final class BenchmarkResultSet {
 
         public Builder results(List<BenchmarkResult> results) {
             this.results.addAll(results);
+            return this;
+        }
+
+        /**
+         * Adds a combination that was started but produced no measurement.
+         *
+         * @param entry the errored combination
+         * @return this builder
+         */
+        public Builder addErrored(ErroredBenchmark entry) {
+            this.errored.add(java.util.Objects.requireNonNull(entry, "entry"));
+            return this;
+        }
+
+        /**
+         * Adds combinations that were started but produced no measurement.
+         *
+         * @param entries the errored combinations
+         * @return this builder
+         */
+        public Builder errored(List<ErroredBenchmark> entries) {
+            entries.forEach(this::addErrored);
             return this;
         }
 

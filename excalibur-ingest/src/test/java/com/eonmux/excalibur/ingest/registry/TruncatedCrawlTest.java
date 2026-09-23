@@ -9,7 +9,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -55,11 +54,6 @@ class TruncatedCrawlTest {
                         + "not the full contents of the source and must not be read as one.");
             }).limit(1);
             return Stream.concat(listed.stream(), truncated);
-        }
-
-        @Override
-        public boolean hasChanged(Instant since) {
-            return true;
         }
 
         @Override

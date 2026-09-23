@@ -103,6 +103,52 @@ final class EngineLifecycle {
         // segments over indices it did not find.
         refuseIfAnyVolumeIsMissing(discoveredSegments);
 
+        // Every segment this start opens, so that a start that fails part-way releases them
+        // rather than leaving their descriptors, write logs and graphs open behind an engine
+        // that never started - and that a caller has no reason to close.
+        List<Segment> opened = new ArrayList<>();
+        try {
+            int maxSegmentIndex = openDiscovered(discoveredSegments, opened);
+
+            engine.routingTable.rebuildRoutingDirectory(maxSegmentIndex);
+
+            // After the rebuild, because only the directory says which segment each index
+            // routes to, and before anything can query or split.
+            returnRoutingIndicesHeldBySources();
+        } catch (RuntimeException | Error e) {
+            releaseAfterFailedStart(opened, e);
+            throw e;
+        }
+
+        // Start the background split worker for automatic capacity management
+        if (engine.splitWorker != null) {
+            engine.splitWorker.start();
+
+            // Register each distinct segment once for load factor monitoring
+            for (Segment segment : engine.routingTable.distinctSegments().values()) {
+                engine.splitWorker.registerSegment(segment);
+            }
+        }
+
+        engine.started = true;
+        engine.statistics.incrementStartOperations();
+
+        // Log startup summary
+        java.util.logging.Logger.getLogger(StorageEngine.class.getName()).info(
+            String.format("StorageEngine started: discovered=%d, total=%d segments, ready for operations",
+                discoveredSegments.size(), engine.segments.size()));
+    }
+
+    /**
+     * Opens every discovered segment, replays its log and registers it with the engine.
+     *
+     * @param discoveredSegments What the scan found
+     * @param opened             Receives each segment as soon as it is open, so the caller can
+     *                           release it if a later step fails
+     * @return The highest segment index opened, or -1 if none was
+     */
+    private int openDiscovered(List<SegmentDiscovery.DiscoveredSegment> discoveredSegments,
+                               List<Segment> opened) {
         // Track the highest segment index found for proper routing
         int maxSegmentIndex = -1;
 
@@ -116,6 +162,7 @@ final class EngineLifecycle {
                 // time from then on.
                 Segment segment =
                     Segment.openExisting(discovered.path(), engine.arena, engine.loadFactorThreshold);
+                opened.add(segment);
 
                 long segmentIndex = discovered.segmentIndex();
                 // Where this segment is, not where the volume set would now put it: every
@@ -166,6 +213,14 @@ final class EngineLifecycle {
                         new Object[] { segmentIndex, walPath });
                 }
 
+                // After the replay, so the watermark it is judged by - the log's sequence number
+                // and the entry counts - is the state the segment will serve from.
+                if (!segment.terms.loadOrRebuild()) {
+                    StorageEngine.LOGGER.log(Level.FINE,
+                        "Rebuilt the term sketch of segment {0} from its live entries",
+                        segmentIndex);
+                }
+
                 // Update last integrated offset from catalog if available
                 SegmentCatalog.SegmentMetadata walMetadata = engine.catalog.get(segmentIndex);
                 if (walMetadata != null) {
@@ -204,30 +259,36 @@ final class EngineLifecycle {
                 throw new RuntimeException("Failed to open discovered segment: " + discovered.path(), e);
             }
         }
+        return maxSegmentIndex;
+    }
 
-        engine.routingTable.rebuildRoutingDirectory(maxSegmentIndex);
-
-        // After the rebuild, because only the directory says which segment each index routes
-        // to, and before anything can query or split.
-        returnRoutingIndicesHeldBySources();
-
-        // Start the background split worker for automatic capacity management
-        if (engine.splitWorker != null) {
-            engine.splitWorker.start();
-
-            // Register each distinct segment once for load factor monitoring
-            for (Segment segment : engine.routingTable.distinctSegments().values()) {
-                engine.splitWorker.registerSegment(segment);
+    /**
+     * Closes every segment a failed start opened or created, and forgets them, keeping the
+     * failure's cause.
+     *
+     * <p>That is the segments opened from disk - including one that failed before it was
+     * registered - and any the routing rebuild created for indices it did not find. A failure
+     * here is added to the start's own as suppressed rather than thrown: the reason the start
+     * failed is what the operator needs, and every remaining segment still has to be closed.</p>
+     *
+     * @param opened The segments this start opened from disk
+     * @param cause  Why the start failed
+     */
+    private void releaseAfterFailedStart(List<Segment> opened, Throwable cause) {
+        Set<Segment> toClose = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        toClose.addAll(opened);
+        toClose.addAll(engine.segments.values());
+        engine.segments.clear();
+        engine.canonicalIndex.clear();
+        engine.routingTable.publishRouting();
+        engine.locations.forgetAll();
+        for (Segment segment : toClose) {
+            try {
+                segment.close();
+            } catch (RuntimeException e) {
+                cause.addSuppressed(e);
             }
         }
-
-        engine.started = true;
-        engine.statistics.incrementStartOperations();
-
-        // Log startup summary
-        java.util.logging.Logger.getLogger(StorageEngine.class.getName()).info(
-            String.format("StorageEngine started: discovered=%d, total=%d segments, ready for operations",
-                discoveredSegments.size(), engine.segments.size()));
     }
 
     /**

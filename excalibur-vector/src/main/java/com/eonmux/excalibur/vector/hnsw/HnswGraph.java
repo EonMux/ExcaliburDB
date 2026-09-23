@@ -167,6 +167,9 @@ public class HnswGraph implements AutoCloseable {
     /** The product quantizer and its codes, if this graph has any. */
     final HnswQuantization quantization = new HnswQuantization(this);
 
+    /** Visited sets for graph walks, reused across walks instead of allocated per walk. */
+    final HnswVisitedPool visitedPool = new HnswVisitedPool();
+
     /** Flushing, sealing and closing. */
     final HnswGraphLifecycle lifecycle = new HnswGraphLifecycle(this);
 

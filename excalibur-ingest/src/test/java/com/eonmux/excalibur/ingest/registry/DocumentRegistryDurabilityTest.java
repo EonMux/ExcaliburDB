@@ -121,8 +121,113 @@ class DocumentRegistryDurabilityTest {
         assertThat(Files.readAllLines(file, StandardCharsets.UTF_8))
             .containsExactly(
                 "\\#document-registry|1",
-                "src|old.md|1000|4242|128|2000|src:old.md:chunk:0",
+                "src|old.md|1000|4242|128|2000|src:old.md:chunk:0|",
                 "\\#end|1");
+    }
+
+    @Test
+    @DisplayName("an entity tag survives a save and a reload, escaped like any other field")
+    void anEntityTagSurvivesARestart(@TempDir Path tempDir) throws IOException {
+        // The tag is what a re-crawl sends back as If-None-Match. Forgotten at a restart, every
+        // unchanged page is transferred again on the first re-crawl after it.
+        Path file = tempDir.resolve("document-registry");
+        DocumentRegistry registry = new DocumentRegistry(file);
+        registry.register(metadata("src", "tagged.md").toBuilder()
+            .entityTag("W/\"a|b,c\\d\"").build());
+        registry.register(metadata("src", "untagged.md"));
+        registry.persist();
+
+        DocumentRegistry reloaded = new DocumentRegistry(file);
+
+        assertThat(reloaded.get("src", "tagged.md").getEntityTag())
+            .isEqualTo("W/\"a|b,c\\d\"");
+        assertThat(reloaded.get("src", "tagged.md").getChunkIds())
+            .isEqualTo(registry.get("src", "tagged.md").getChunkIds());
+        assertThat(reloaded.get("src", "untagged.md").getEntityTag()).isNull();
+    }
+
+    @Test
+    @DisplayName("a registry holding entity tags is still version 1, which the previous build reads")
+    void entityTagsDoNotChangeTheVersion(@TempDir Path tempDir) throws IOException {
+        // The build before entity tags accepted version 1 only and read the first seven fields
+        // of a record, ignoring the rest. Written as version 1, with the tag after the chunk
+        // ids, a registry from this build is one a rollback still opens.
+        Path file = tempDir.resolve("document-registry");
+        DocumentRegistry registry = new DocumentRegistry(file);
+        registry.register(DocumentMetadata.builder()
+            .sourceId("src").documentId("tagged.md")
+            .lastModifiedMillis(1000).contentHash(4242).contentLength(128)
+            .indexTimeMillis(2000).chunkIds(List.of("src:tagged.md:chunk:0"))
+            .entityTag("\"v1\"")
+            .build());
+        registry.persist();
+
+        assertThat(Files.readAllLines(file, StandardCharsets.UTF_8))
+            .containsExactly(
+                "\\#document-registry|1",
+                "src|tagged.md|1000|4242|128|2000|src:tagged.md:chunk:0|\"v1\"",
+                "\\#end|1");
+    }
+
+    @Test
+    @DisplayName("a version 1 record with a trailing tag reads the tag, and one without reads none")
+    void aVersionOneRecordMayCarryATag(@TempDir Path tempDir) throws IOException {
+        Path file = tempDir.resolve("document-registry");
+        Files.write(file, List.of(
+                "\\#document-registry|1",
+                "src|tagged.md|1000|4242|128|2000|src:tagged.md:chunk:0|W/\"t\"",
+                "src|plain.md|1000|4242|128|2000|src:plain.md:chunk:0",
+                "\\#end|2"),
+            StandardCharsets.UTF_8);
+
+        DocumentRegistry registry = new DocumentRegistry(file);
+
+        assertThat(registry.get("src", "tagged.md").getEntityTag()).isEqualTo("W/\"t\"");
+        assertThat(registry.get("src", "plain.md").getEntityTag()).isNull();
+        assertThat(registry.get("src", "plain.md").getChunkIds())
+            .containsExactly("src:plain.md:chunk:0");
+    }
+
+    @Test
+    @DisplayName("a conditional replace never overwrites a registration made since the read")
+    void aReplaceLosesToANewerRegistration() {
+        DocumentRegistry registry = new DocumentRegistry();
+        DocumentMetadata read = metadata("src", "doc.md");
+        registry.register(read);
+        DocumentMetadata tagged = read.toBuilder().entityTag("\"t\"").build();
+
+        DocumentMetadata reindexed = read.toBuilder()
+            .chunkIds(List.of("src:doc.md:chunk:9")).build();
+        registry.register(reindexed);
+
+        assertThat(registry.replace(read, tagged)).isFalse();
+        assertThat(registry.get("src", "doc.md")).isEqualTo(reindexed);
+
+        assertThat(registry.replace(reindexed, reindexed.toBuilder().entityTag("\"t\"").build()))
+            .isTrue();
+        assertThat(registry.get("src", "doc.md").getEntityTag()).isEqualTo("\"t\"");
+        assertThat(registry.isModified()).isTrue();
+        assertThatThrownBy(() -> registry.replace(reindexed, metadata("src", "other.md")))
+            .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    @DisplayName("a version 1 registry, from before entity tags, still opens")
+    void aVersionOneRegistryStillOpens(@TempDir Path tempDir) throws IOException {
+        Path file = tempDir.resolve("document-registry");
+        Files.write(file, List.of(
+                "\\#document-registry|1",
+                "src|old.md|1000|4242|128|2000|src:old.md:chunk:0",
+                "\\#end|1"),
+            StandardCharsets.UTF_8);
+
+        DocumentRegistry registry = new DocumentRegistry(file);
+
+        DocumentMetadata old = registry.get("src", "old.md");
+        assertThat(old).isNotNull();
+        assertThat(old.getChunkIds()).containsExactly("src:old.md:chunk:0");
+        assertThat(old.getEntityTag()).isNull();
+        assertThat(old.validators().lastModifiedMillis()).isEqualTo(1000L);
     }
 
     @Test

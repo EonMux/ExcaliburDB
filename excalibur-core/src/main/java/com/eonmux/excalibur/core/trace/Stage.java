@@ -7,6 +7,11 @@ package com.eonmux.excalibur.core.trace;
  * same stage everywhere, and so a stage cannot be silently misspelled into a second series that
  * looks empty. When a query is slow the first question is which of these spent the time, and that
  * question is unanswerable if the boundaries are not fixed in advance.
+ *
+ * <p>Only stages something records belong here. Every value is a name a response can be documented
+ * as reporting, and a client written against that documentation waits for a number the node never
+ * produces. The node retrieves and serialises; generating an answer from that context is the
+ * caller's model's work, and is timed where it runs.
  */
 public enum Stage {
 
@@ -23,11 +28,5 @@ public enum Stage {
     RANK,
 
     /** Turning the selected subgraph into text for the model. */
-    SERIALIZE,
-
-    /** The model reading the prompt. */
-    PREFILL,
-
-    /** The model producing tokens. */
-    DECODE
+    SERIALIZE
 }

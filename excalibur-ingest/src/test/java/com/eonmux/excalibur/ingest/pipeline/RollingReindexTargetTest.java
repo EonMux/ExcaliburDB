@@ -26,6 +26,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * What a rolling re-index does when the segment it was told to fill cannot be written to.
@@ -99,26 +100,51 @@ class RollingReindexTargetTest {
             .isEqualTo(1);
     }
 
-    /** Reports its target unwritable, exactly as a catalog-created segment is. */
+    @Test
+    @DisplayName("a writable target is refused before anything is fetched, and nothing is retired")
+    void aWritableTargetIsRefused() {
+        // A pass fills its segment from change detection: only what is new or changed is
+        // fetched and written, and a document the source still lists unchanged - a 304 above
+        // all - is never read again. Retiring the old segments behind such a fill would take
+        // every unchanged document out of service. No storage engine offers a created segment
+        // as a write target; a writer that claims to is refused rather than trusted.
+        writer.writable = true;
+        SegmentCatalog.SegmentMetadata serving = catalog.create("docs", tempDir);
+        catalog.beginIndexing(serving.getSegmentId());
+        catalog.completeIndexing(serving.getSegmentId());
+        OneDocumentSource source = new OneDocumentSource();
+
+        assertThatThrownBy(() -> reindexer.reindexWithRollingReplacement(source, tempDir))
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("unchanged");
+
+        assertThat(catalog.get(serving.getSegmentId()).getLifecycleState())
+            .as("the segment serving the source is left serving it")
+            .isEqualTo(LifecycleState.WARMING);
+        assertThat(catalog.getSegmentsBySource("docs"))
+            .filteredOn(segment -> segment.getSegmentId() != serving.getSegmentId())
+            .as("the segment created for the run is retired, not left for a worker to advance")
+            .singleElement()
+            .satisfies(segment -> assertThat(segment.getLifecycleState())
+                .isEqualTo(LifecycleState.TOMBSTONED));
+        assertThat(source.fetches).as("refused before the first fetch").hasValue(0);
+        assertThat(llmClient.embeddings).hasValue(0);
+    }
+
+    /** Reports its target unwritable, exactly as a catalog-created segment is, unless told not to. */
     private static final class RecordingWriter
             implements OffsetAwareStorageWriter, UpsertHandler.StorageAdapter {
         private final AtomicInteger writes = new AtomicInteger();
+        private volatile boolean writable;
 
         @Override
         public boolean canWriteTo(long segmentId) {
-            return false;
+            return writable;
         }
 
         @Override
         public long writeChunkWithOffset(String chunkId, String content, float[] embedding) {
             return writes.getAndIncrement();
-        }
-
-        @Override
-        public long writeChunkWithOffset(long segmentId, String chunkId, String content,
-                                         float[] embedding) {
-            // What the storage engine does with an ID that names no segment.
-            return -1L;
         }
 
         @Override
@@ -147,6 +173,8 @@ class RollingReindexTargetTest {
     }
 
     private static final class OneDocumentSource implements Source {
+        private final AtomicInteger fetches = new AtomicInteger();
+
         @Override
         public String getSourceId() {
             return "docs";
@@ -163,12 +191,8 @@ class RollingReindexTargetTest {
         }
 
         @Override
-        public boolean hasChanged(java.time.Instant since) {
-            return true;
-        }
-
-        @Override
         public FetchedDocument fetch(String documentId) {
+            fetches.incrementAndGet();
             byte[] content = "some text to index".getBytes(StandardCharsets.UTF_8);
             return new FetchedDocument(documentId, content, "text/plain", System.currentTimeMillis());
         }

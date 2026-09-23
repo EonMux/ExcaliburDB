@@ -20,14 +20,16 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -169,11 +171,6 @@ class IngestionPipelineTest {
             }
             return new FetchedDocument(documentId,
                 text.getBytes(StandardCharsets.UTF_8), "text/plain");
-        }
-
-        @Override
-        public boolean hasChanged(Instant since) {
-            return true;
         }
 
         @Override
@@ -383,7 +380,7 @@ class IngestionPipelineTest {
         }
 
         @Test
-        @DisplayName("a crawled chunk's terms reach the membership filter, under the segment it landed in")
+        @DisplayName("a crawled chunk's terms reach the membership filter, which prunes only once rebuilt")
         void crawledTermsPopulateTheMembershipFilter() {
             // Stage 1 of the query pipeline prunes segments that cannot hold a query's terms.
             // It was fed only by the reindex path, which targets a segment it chose itself, so
@@ -400,14 +397,75 @@ class IngestionPipelineTest {
                 "lovelace".getBytes(StandardCharsets.UTF_8));
             assertThat(segments)
                 .as("a term of an ingested chunk must be findable in the filter")
-                .isNotEmpty();
-            assertThat(membership.coversSegment(segments.get(0)))
-                .as("the segment the chunk landed in must now be prunable")
-                .isTrue();
+                .hasSize(1);
+            String segment = segments.get(0);
             assertThat(membership.findCandidateSegments(
                 "babbage".getBytes(StandardCharsets.UTF_8)))
                 .as("a term no ingested chunk holds must not be reported")
                 .isEmpty();
+
+            // Present is not the same as trusted. A level is born stale: it holds the terms of
+            // the writes recorded into it, and nothing says those are all the segment holds -
+            // a split, a restart or a compaction puts entries in a segment without passing
+            // through here. Only a rebuild that refills the level from the segment may vouch
+            // for it, so until one has, the segment is searched for every query.
+            assertThat(membership.isSegmentStale(segment)).isTrue();
+            assertThat(membership.coversSegment(segment))
+                .as("ingest alone must not make the segment prunable")
+                .isFalse();
+
+            // The refill a rebuild performs: every entry the segment holds, read back from
+            // storage and tokenised as the write was.
+            long generation = membership.beginSegmentRebuild(segment);
+            String stored = com.eonmux.excalibur.core.codec.ChunkPayloadCodec.textOf(
+                storedChunk("docs", "a.txt", 0));
+            for (String term : com.eonmux.excalibur.core.text.TermExtractor
+                    .extractUniqueTerms(stored)) {
+                membership.insert(term.getBytes(StandardCharsets.UTF_8), segment);
+            }
+            assertThat(membership.completeSegmentRebuild(segment, generation)).isTrue();
+
+            assertThat(membership.coversSegment(segment))
+                .as("a completed rebuild is what makes the segment prunable")
+                .isTrue();
+            assertThat(membership.findCandidateSegments(
+                "lovelace".getBytes(StandardCharsets.UTF_8))).containsExactly(segment);
+        }
+
+        @Test
+        @DisplayName("the frequency sketch and the membership filter are given the same terms")
+        void theSketchAndTheFilterSeeTheSameTerms() {
+            // Both are fed from the one tokenisation of each chunk. Were they tokenised apart,
+            // a change to either would let pruning and query ordering disagree about what a
+            // segment holds.
+            com.eonmux.excalibur.filter.HierarchicalCuckooFilter membership =
+                new com.eonmux.excalibur.filter.HierarchicalCuckooFilter(1_000_000);
+            IngestionOrchestrator orchestrator = orchestrator();
+            orchestrator.setMembershipFilter(membership);
+            String text = "Lovelace annotated the engine; Lovelace published the engine notes.";
+
+            ingest(orchestrator, new FakeSource("docs", Map.of("a.txt", text)));
+
+            java.util.List<String> terms =
+                com.eonmux.excalibur.core.text.TermExtractor.extractTerms(text);
+            assertThat(terms).contains("lovelace", "engine");
+            java.util.List<String> segments = membership.findCandidateSegments(
+                "lovelace".getBytes(StandardCharsets.UTF_8));
+            assertThat(segments).hasSize(1);
+            com.eonmux.excalibur.filter.sketch.CountMinSketch sketch =
+                storage.getSegment(Long.parseLong(segments.get(0))).termFrequencySketch();
+            assertThat(sketch).isNotNull();
+
+            for (String term : new java.util.LinkedHashSet<>(terms)) {
+                byte[] bytes = term.getBytes(StandardCharsets.UTF_8);
+                assertThat(membership.findCandidateSegments(bytes))
+                    .as("the filter holds %s under the segment the chunk landed in", term)
+                    .containsExactlyElementsOf(segments);
+                long occurrences = terms.stream().filter(term::equals).count();
+                assertThat(sketch.estimate(bytes))
+                    .as("the sketch counted every occurrence of %s", term)
+                    .isGreaterThanOrEqualTo(occurrences);
+            }
         }
 
         @Test
@@ -892,8 +950,8 @@ class IngestionPipelineTest {
         @Test
         @DisplayName("a synchronous run is reachable by shutdown before it does any work")
         void publishesItselfBeforeWorking() {
-            java.util.concurrent.atomic.AtomicReference<IngestionOrchestrator> holder =
-                new java.util.concurrent.atomic.AtomicReference<>();
+            AtomicReference<IngestionOrchestrator> holder =
+                new AtomicReference<>();
             AtomicInteger reachable = new AtomicInteger(-1);
             IngestionOrchestrator orchestrator = new IngestionOrchestrator(new TextChunker(),
                 embeddings, storage, index,
@@ -939,10 +997,10 @@ class IngestionPipelineTest {
             // the two orders the only two outcomes.
             IngestionOrchestrator orchestrator = orchestrator();
             FakeSource source = new FakeSource("docs", Map.of("a.txt", "some text to ingest"));
-            java.util.concurrent.CountDownLatch held =
-                new java.util.concurrent.CountDownLatch(1);
-            java.util.concurrent.CountDownLatch release =
-                new java.util.concurrent.CountDownLatch(1);
+            CountDownLatch held =
+                new CountDownLatch(1);
+            CountDownLatch release =
+                new CountDownLatch(1);
 
             Thread holder = new Thread(() -> com.eonmux.excalibur.ingest.registry.DocumentLocks.shared()
                 .inDocument("docs:a.txt", () -> {
@@ -973,6 +1031,58 @@ class IngestionPipelineTest {
             assertThat(storedChunkExists("docs", "a.txt", 0))
                 .as("and it goes through as soon as the lock is free")
                 .isTrue();
+        }
+    }
+
+    @Nested
+    @DisplayName("the graph's staged facts")
+    class GraphDurability {
+
+        /** Records what the registry file held each time the graph was asked to force. */
+        private static final class RegistryWatchingSink
+                implements com.eonmux.excalibur.ingest.graph.GraphIngestSink {
+            final Path registryFile;
+            final List<String> published = new CopyOnWriteArrayList<>();
+            final List<Boolean> registryOnDiskAtSync = new CopyOnWriteArrayList<>();
+
+            RegistryWatchingSink(Path registryFile) {
+                this.registryFile = registryFile;
+            }
+
+            @Override
+            public void onDocumentPublished(String documentKey, String text,
+                                            long lastModifiedMillis) {
+                published.add(documentKey);
+            }
+
+            @Override
+            public void sync() {
+                registryOnDiskAtSync.add(java.nio.file.Files.exists(registryFile));
+            }
+        }
+
+        @Test
+        @DisplayName("are forced before the registry that records their documents is written")
+        void areForcedBeforeTheRegistry() {
+            // The registry is what stops a document being extracted again, and it is forced to
+            // the device as it is written. Written first, a crash in between leaves it saying
+            // the facts were taken while they were still in this process's buffers.
+            Path registryFile = tempDir.resolve("registry.dat");
+            com.eonmux.excalibur.ingest.registry.DocumentRegistry documents =
+                new com.eonmux.excalibur.ingest.registry.DocumentRegistry(registryFile);
+            IngestionOrchestrator orchestrator = new IngestionOrchestrator(new TextChunker(),
+                embeddings, storage, index, registry,
+                new com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker(documents));
+            RegistryWatchingSink sink = new RegistryWatchingSink(registryFile);
+            orchestrator.setGraphSink(sink);
+
+            orchestrator.ingestNow(new FakeSource("docs", Map.of("a.txt", "some text")));
+
+            assertThat(sink.published).containsExactly("docs:a.txt");
+            assertThat(sink.registryOnDiskAtSync)
+                .as("forced once, before the registry file existed")
+                .containsExactly(false);
+            assertThat(registryFile).exists();
         }
     }
 
@@ -1284,12 +1394,12 @@ class IngestionPipelineTest {
 
             private final java.util.concurrent.Semaphore gate =
                 new java.util.concurrent.Semaphore(0);
-            private final java.util.concurrent.CountDownLatch fetched;
+            private final CountDownLatch fetched;
             private final int documents;
 
             GatedSource(int documents) {
                 this.documents = documents;
-                this.fetched = new java.util.concurrent.CountDownLatch(1);
+                this.fetched = new CountDownLatch(1);
             }
 
             @Override
@@ -1306,11 +1416,6 @@ class IngestionPipelineTest {
             public Stream<String> crawl() {
                 return java.util.stream.IntStream.range(0, documents)
                     .mapToObj(i -> "doc" + i);
-            }
-
-            @Override
-            public boolean hasChanged(java.time.Instant since) {
-                return true;
             }
 
             @Override
@@ -1388,6 +1493,111 @@ class IngestionPipelineTest {
         }
 
         @Test
+        @DisplayName("a stop that lands while a document is in flight leaves storage writable")
+        void aStopDoesNotCloseTheWriteLog() throws Exception {
+            // The run's thread goes on from the fetch to storage writes, and every append to a
+            // segment's write log forces a channel that every writer of that segment shares.
+            // An interrupt still set when it gets there closes that channel for the life of the
+            // process, so stopping one source broke ingestion, reindexing and erasure of every
+            // document that hashes to the same segment.
+            IngestionOrchestrator orchestrator = orchestrator();
+            CountDownLatch inFetch = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            AtomicReference<String> inFlight =
+                new AtomicReference<>();
+            FakeSource source = new FakeSource("held", Map.of(
+                "a.txt", "the document in flight when the stop arrives",
+                "b.txt", "the document after it")) {
+                @Override
+                public FetchedDocument fetch(String documentId)
+                        throws SourceException, DocumentNotFoundException {
+                    if (inFlight.compareAndSet(null, documentId)) {
+                        inFetch.countDown();
+                        awaitIgnoringInterrupts(release);
+                    }
+                    return super.fetch(documentId);
+                }
+            };
+
+            orchestrator.startIngestion(source);
+            assertThat(inFetch.await(30, TimeUnit.SECONDS)).isTrue();
+            assertThat(orchestrator.stopIngestion("held")).isTrue();
+            release.countDown();
+            awaitIdle(orchestrator, "held");
+
+            String document = inFlight.get();
+            assertThat(storedChunkExists("held", document, 0))
+                .as("the document already under way is finished, as a stop between documents "
+                    + "promises")
+                .isTrue();
+            // The same document again lands in the same segment, so this write goes through the
+            // write log the stopped run was appending to.
+            IngestionOrchestrator.IngestionOutcome again = orchestrator().ingestNow(
+                new FakeSource("held", Map.of(document, "the same document, written again")));
+            assertThat(again.documentsFailed())
+                .as("a later write to the segment the stopped run was writing")
+                .isZero();
+            assertThat(again.documentsIngested()).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("shutdown waits for the document in flight, which is written whole")
+        void shutdownWaitsForTheDocumentInFlight() throws Exception {
+            IngestionOrchestrator orchestrator = orchestrator();
+            CountDownLatch inFetch = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            AtomicReference<String> inFlight = new AtomicReference<>();
+            FakeSource source = new FakeSource("closing", Map.of(
+                "a.txt", "the document in flight when the node shuts down",
+                "b.txt", "the document after it")) {
+                @Override
+                public FetchedDocument fetch(String documentId)
+                        throws SourceException, DocumentNotFoundException {
+                    if (inFlight.compareAndSet(null, documentId)) {
+                        inFetch.countDown();
+                        awaitIgnoringInterrupts(release);
+                    }
+                    return super.fetch(documentId);
+                }
+            };
+
+            orchestrator.startIngestion(source);
+            assertThat(inFetch.await(30, TimeUnit.SECONDS)).isTrue();
+            CompletableFuture<Boolean> shutdown = CompletableFuture.supplyAsync(orchestrator::shutdown);
+            release.countDown();
+
+            assertThat(shutdown.get(30, TimeUnit.SECONDS))
+                .as("the run reached its next document boundary within the budget")
+                .isTrue();
+            assertThat(storedChunkExists("closing", inFlight.get(), 0))
+                .as("the document the shutdown found under way")
+                .isTrue();
+            String other = "a.txt".equals(inFlight.get()) ? "b.txt" : "a.txt";
+            assertThat(storedChunkExists("closing", other, 0))
+                .as("the document the shutdown kept the run from starting")
+                .isFalse();
+        }
+
+        /**
+         * Waits the way a source blocked in a call that ignores interrupts does: it finishes,
+         * and hands the interrupt back to the caller by restoring the flag.
+         */
+        private static void awaitIgnoringInterrupts(CountDownLatch latch) {
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    latch.await();
+                    break;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        @Test
         @DisplayName("stopping a source that is not running is not an error")
         void stoppingAnIdleSource() {
             assertThat(orchestrator().stopIngestion("never-started")).isFalse();
@@ -1437,10 +1647,10 @@ class IngestionPipelineTest {
         @DisplayName("refuses to run while the same source is already being ingested")
         void refusesAConcurrentRunOfTheSameSource() throws Exception {
             IngestionOrchestrator orchestrator = orchestrator();
-            java.util.concurrent.CountDownLatch inFlight =
-                new java.util.concurrent.CountDownLatch(1);
-            java.util.concurrent.CountDownLatch release =
-                new java.util.concurrent.CountDownLatch(1);
+            CountDownLatch inFlight =
+                new CountDownLatch(1);
+            CountDownLatch release =
+                new CountDownLatch(1);
             FakeSource blocking = new FakeSource("notes", Map.of("a.md", "text")) {
                 @Override
                 public FetchedDocument fetch(String documentId) throws SourceException {
@@ -1483,8 +1693,8 @@ class IngestionPipelineTest {
         @DisplayName("shutdown does not return while a synchronous run is still writing")
         void shutdownWaitsForASynchronousRun() throws Exception {
             IngestionOrchestrator orchestrator = orchestrator();
-            java.util.concurrent.CountDownLatch inFlight =
-                new java.util.concurrent.CountDownLatch(1);
+            CountDownLatch inFlight =
+                new CountDownLatch(1);
             java.util.concurrent.atomic.AtomicBoolean runFinished =
                 new java.util.concurrent.atomic.AtomicBoolean();
             // Deliberately does not stop on an interrupt: it stands in for a write that is
@@ -1529,10 +1739,10 @@ class IngestionPipelineTest {
         @DisplayName("stopIngestion reaches a synchronous run of that source")
         void stopIngestionReachesASynchronousRun() throws Exception {
             IngestionOrchestrator orchestrator = orchestrator();
-            java.util.concurrent.CountDownLatch inFlight =
-                new java.util.concurrent.CountDownLatch(1);
-            java.util.concurrent.CountDownLatch release =
-                new java.util.concurrent.CountDownLatch(1);
+            CountDownLatch inFlight =
+                new CountDownLatch(1);
+            CountDownLatch release =
+                new CountDownLatch(1);
             FakeSource blocking = new FakeSource("notes", Map.of("a.md", "text")) {
                 @Override
                 public FetchedDocument fetch(String documentId) throws SourceException {
@@ -1595,7 +1805,7 @@ class IngestionPipelineTest {
             // index into an ingestion that silently indexes nothing.
             IngestionOrchestrator withZero = new IngestionOrchestrator(
                 new TextChunker(), embeddings, storage, index, registry,
-                null, null, 0);
+                null, 0);
 
             FakeSource source = new FakeSource("docs", Map.of("a.txt", "text"));
             RecordingStatus status = ingest(withZero, source);
@@ -1609,7 +1819,7 @@ class IngestionPipelineTest {
         void optionalCollaboratorsMayBeNull() {
             IngestionOrchestrator minimal = new IngestionOrchestrator(
                 new TextChunker(), embeddings, storage, index, registry,
-                null, null, 2000);
+                null, 2000);
             minimal.setGraphSink(null);
 
             RecordingStatus status = ingest(minimal,

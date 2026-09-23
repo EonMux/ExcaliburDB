@@ -22,7 +22,7 @@ import static org.assertj.core.api.Assertions.*;
  * <p>These tests verify that HNSW graph invariants are maintained:</p>
  * <ul>
  *   <li>Hierarchical layers structure</li>
- *   <li>Bidirectional edges</li>
+ *   <li>Adjacency lists that name only existing nodes at their level</li>
  *   <li>Entry point at highest layer</li>
  *   <li>Connection limits</li>
  * </ul>
@@ -76,10 +76,10 @@ class HnswInvariantVerifierTest {
         }
     }
 
-    // ==================== Bidirectional Edge Tests ====================
+    // ==================== Edge Tests ====================
 
     @Test
-    void shouldVerifyBidirectionalEdgesAfterInsertion() throws IOException {
+    void shouldSatisfyEdgeInvariantsAfterInsertion() throws IOException {
         try (HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 1000)) {
             // Insert enough nodes to ensure connections
             for (int i = 0; i < 50; i++) {
@@ -90,16 +90,13 @@ class HnswInvariantVerifierTest {
                 HnswInvariantVerifier.verifyAllInvariants(graph);
 
             assertThat(result.isValid())
-                .as("All edges should be bidirectional after insertion")
+                .as("Edge invariants after insertion: %s", result.violations())
                 .isTrue();
-            if (!result.isValid()) {
-                result.violations().forEach(System.err::println);
-            }
         }
     }
 
     @Test
-    void shouldVerifyBidirectionalEdgesAtAllLevels() throws IOException {
+    void shouldSatisfyEdgeInvariantsAtAllLevels() throws IOException {
         // Use config that encourages multi-level graph
         HnswConfig multiLevelConfig = new HnswConfig(
             16, 32, 200, 100, 0.5, 64); // Higher mL for more levels
@@ -115,14 +112,9 @@ class HnswInvariantVerifierTest {
                 .as("Should have multiple levels for invariant testing")
                 .isGreaterThanOrEqualTo(1);
 
-            // Verify invariants at all levels
-            for (int level = 0; level <= graph.maxLevel(); level++) {
-                long edgeCount = HnswInvariantVerifier.countBidirectionalEdges(graph, level);
-                // All counted edges should be bidirectional by definition
-                assertThat(edgeCount)
-                    .as("Level %d should have non-negative bidirectional edges", level)
-                    .isGreaterThanOrEqualTo(0);
-            }
+            assertThat(HnswInvariantVerifier.countBidirectionalEdges(graph, 0))
+                .as("Layer 0 should hold mutual edges")
+                .isPositive();
 
             // Full invariant check
             HnswInvariantVerifier.VerificationResult result =
@@ -142,27 +134,22 @@ class HnswInvariantVerifierTest {
     }
 
     @Test
-    void shouldCheckSpecificBidirectionalEdge() throws IOException {
+    void shouldLinkTwoNodesBothWays() throws IOException {
         try (HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 1000)) {
             // Insert two nodes
             long node0 = graph.insert(randomVector(64));
             long node1 = graph.insert(randomVector(64));
 
-            // After insertion, if there's an edge between them, it should be bidirectional
+            // The second node chooses the first, and the first has room for the link back
             HnswGraph.NodeView n0 = graph.readNode(node0);
             HnswGraph.NodeView n1 = graph.readNode(node1);
 
             assertThat(n0).isNotNull();
             assertThat(n1).isNotNull();
 
-            // Check if they are connected at level 0
-            List<Long> n0Neighbors = n0.getNeighbors(0);
-            if (n0Neighbors.contains(node1)) {
-                // If n0 -> n1 exists, n1 -> n0 should also exist
-                assertThat(HnswInvariantVerifier.isEdgeBidirectional(graph, node0, node1, 0))
-                    .as("Edge between node %d and %d should be bidirectional", node0, node1)
-                    .isTrue();
-            }
+            assertThat(HnswInvariantVerifier.isEdgeBidirectional(graph, node0, node1, 0))
+                .as("Edge between node %d and %d should be mutual", node0, node1)
+                .isTrue();
         }
     }
 

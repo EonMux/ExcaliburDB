@@ -203,14 +203,8 @@ class BenchmarkComparisonReportTest {
     @DisplayName("a zero baseline yields no percent change rather than an infinity")
     void zeroBaselineDoesNotDivideByZero() {
         BenchmarkComparison comparison = BenchmarkComparison.compare(
-            set("current", throughput("lookup", 1_000_000.0)),
-            set("baseline", BenchmarkResult.builder()
-                .benchmarkName("com.eonmux.excalibur.bench.benchmark.DemoBenchmark.lookup")
-                .mode("avgt")
-                .primaryScore(0.0)
-                .primaryScoreUnit("ms/op")
-                .higherIsBetter(false)
-                .build()));
+            set("current", latency("lookup", 2.0)),
+            set("baseline", latency("lookup", 0.0)));
 
         assertThat(comparison.comparisons().get(0).percentChange()).isZero();
         assertThat(comparison.unchangedCount()).isEqualTo(1);

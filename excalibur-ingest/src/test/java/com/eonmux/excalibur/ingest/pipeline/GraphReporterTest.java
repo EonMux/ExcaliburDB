@@ -1,10 +1,12 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
+import com.eonmux.excalibur.ingest.graph.GraphIngestSink;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -58,5 +60,55 @@ class GraphReporterTest {
         });
         assertThatCode(() -> reporter.report("docs:ada.md", document(1L)))
             .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("counts every document the graph refused, since nothing else records them")
+    void countsRefusals() {
+        GraphReporter reporter = new GraphReporter();
+        reporter.setSink((key, text, lastModified) -> {
+            throw new IllegalStateException("graph staging store is closed");
+        });
+
+        reporter.report("docs:ada.md", document(1L));
+        reporter.report("docs:babbage.md", document(1L));
+
+        assertThat(reporter.failures()).isEqualTo(2);
+    }
+
+    /** A sink that records the calls it gets, and fails its sync when told to. */
+    private static final class SyncingSink implements GraphIngestSink {
+        final List<String> calls = new ArrayList<>();
+        IOException syncFailure;
+
+        @Override
+        public void onDocumentPublished(String documentKey, String text,
+                                        long lastModifiedMillis) {
+            calls.add("publish " + documentKey);
+        }
+
+        @Override
+        public void sync() throws IOException {
+            calls.add("sync");
+            if (syncFailure != null) {
+                throw syncFailure;
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("forces what the sink staged, and a sink that cannot be forced does not throw")
+    void syncsTheSink() {
+        GraphReporter reporter = new GraphReporter();
+        assertThat(reporter.sync()).as("nothing to force without a sink").isTrue();
+
+        SyncingSink sink = new SyncingSink();
+        reporter.setSink(sink);
+        reporter.report("docs:ada.md", document(1L));
+        assertThat(reporter.sync()).isTrue();
+        assertThat(sink.calls).containsExactly("publish docs:ada.md", "sync");
+
+        sink.syncFailure = new IOException("device gone");
+        assertThat(reporter.sync()).isFalse();
     }
 }

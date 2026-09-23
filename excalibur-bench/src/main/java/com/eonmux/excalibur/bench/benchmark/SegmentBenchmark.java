@@ -18,7 +18,10 @@ import java.util.concurrent.TimeUnit;
  * requirement for high-performance point lookups using Robin Hood hashing.</p>
  *
  * <h2>Performance Target</h2>
- * <p>Target: ≥1 billion lookups/sec (page cache hot)</p>
+ * <p>{@code sequentialLookup} and {@code randomLookup} are held to 10 million lookups per
+ * second, single-threaded and page cache hot, by {@code BenchmarkTargetRegistry}. Every score
+ * is per lookup: the methods that make several lookups per invocation declare
+ * {@link OperationsPerInvocation}, so a batch and a single lookup read on the same scale.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
@@ -63,12 +66,35 @@ public class SegmentBenchmark {
     @Param({"64"})
     public int valueSize;
 
+    /**
+     * Lookups per invocation of {@link #batchLookup}.
+     */
+    static final int BATCH = 100;
+
+    /**
+     * Lookups per invocation of {@link #lookupWithManualLock}.
+     */
+    static final int LOCKED_BATCH = 10;
+
+    /**
+     * Length of the random index stream, a power of two so that a cursor wraps with a mask.
+     */
+    static final int LOOKUP_INDEX_COUNT = 1 << 14;
+
+    /**
+     * Number of distinct absent keys the miss benchmark cycles through, a power of two.
+     */
+    static final int MISS_KEY_COUNT = 1 << 12;
+
     private Arena arena;
     private Path tempFile;
     private Segment segment;
     private byte[][] keys;
     private int[] lookupIndices;
-    private int lookupIndex;
+    private int sequentialIndex;
+    private int lookupCursor;
+    private byte[][] missKeys;
+    private int missCursor;
 
     @Setup(Level.Trial)
     public void setup() throws IOException {
@@ -115,12 +141,25 @@ public class SegmentBenchmark {
         }
 
         // Generate random lookup indices (for non-sequential access pattern)
-        int numLookups = 10000;
-        lookupIndices = new int[numLookups];
-        for (int i = 0; i < numLookups; i++) {
+        lookupIndices = new int[LOOKUP_INDEX_COUNT];
+        for (int i = 0; i < LOOKUP_INDEX_COUNT; i++) {
             lookupIndices[i] = random.nextInt(entryCount);
         }
-        lookupIndex = 0;
+        sequentialIndex = 0;
+        lookupCursor = 0;
+
+        // Absent keys of the same length as the stored ones, each confirmed absent
+        missKeys = new byte[MISS_KEY_COUNT][];
+        for (int i = 0; i < MISS_KEY_COUNT; i++) {
+            byte[] missKey = new byte[keySize];
+            byte[] missBytes = ("nonexistent-" + i).getBytes();
+            System.arraycopy(missBytes, 0, missKey, 0, Math.min(missBytes.length, keySize));
+            missKeys[i] = missKey;
+            if (segment.get(missKey) != null) {
+                throw new IllegalStateException("Miss key " + i + " is present in the segment");
+            }
+        }
+        missCursor = 0;
 
         // Verify segment is properly populated
         if (segment.entryCount() != entryCount) {
@@ -156,8 +195,8 @@ public class SegmentBenchmark {
      */
     @Benchmark
     public Object sequentialLookup(Blackhole bh) {
-        int idx = lookupIndex % entryCount;
-        lookupIndex++;
+        int idx = sequentialIndex;
+        sequentialIndex = idx + 1 == entryCount ? 0 : idx + 1;
         return segment.get(keys[idx]);
     }
 
@@ -167,20 +206,24 @@ public class SegmentBenchmark {
      */
     @Benchmark
     public Object randomLookup(Blackhole bh) {
-        int idx = lookupIndices[lookupIndex % lookupIndices.length];
-        lookupIndex++;
+        int idx = lookupIndices[nextLookupPosition(1)];
         return segment.get(keys[idx]);
     }
 
     /**
-     * Benchmark batch lookups.
-     * Tests throughput when performing multiple lookups in a tight loop.
+     * Benchmark lookups in a tight loop of 100 independent calls.
+     *
+     * <p>Reported per lookup. Each call takes and releases the read lock itself, so nothing is
+     * amortised: this is {@link #randomLookup} without the per-invocation harness cost, and
+     * {@link #lookupWithManualLock} is the variant that shares one lock acquisition.</p>
      */
     @Benchmark
+    @OperationsPerInvocation(BATCH)
     public int batchLookup(Blackhole bh) {
+        int start = nextLookupPosition(BATCH);
         int found = 0;
-        for (int i = 0; i < 100; i++) {
-            int idx = lookupIndices[i % lookupIndices.length];
+        for (int i = 0; i < BATCH; i++) {
+            int idx = lookupIndices[(start + i) & (LOOKUP_INDEX_COUNT - 1)];
             if (segment.get(keys[idx]) != null) {
                 found++;
             }
@@ -194,22 +237,25 @@ public class SegmentBenchmark {
      */
     @Benchmark
     public Object lookupWithEpoch(Blackhole bh) {
-        int idx = lookupIndices[lookupIndex % lookupIndices.length];
-        lookupIndex++;
+        int idx = lookupIndices[nextLookupPosition(1)];
         return segment.getWithEpoch(keys[idx]);
     }
 
     /**
-     * Benchmark lookups after acquiring read lock manually.
-     * Tests the overhead of explicit lock acquisition for bulk reads.
+     * Benchmark ten lookups under one manually acquired read lock.
+     *
+     * <p>Reported per lookup, so that it compares directly with {@link #randomLookup}: the
+     * difference is what sharing one lock acquisition between ten lookups saves.</p>
      */
     @Benchmark
+    @OperationsPerInvocation(LOCKED_BATCH)
     public int lookupWithManualLock(Blackhole bh) {
+        int start = nextLookupPosition(LOCKED_BATCH);
         segment.readLock().lock();
         try {
             int found = 0;
-            for (int i = 0; i < 10; i++) {
-                int idx = lookupIndices[i % lookupIndices.length];
+            for (int i = 0; i < LOCKED_BATCH; i++) {
+                int idx = lookupIndices[(start + i) & (LOOKUP_INDEX_COUNT - 1)];
                 if (segment.getWithoutLock(keys[idx]) != null) {
                     found++;
                 }
@@ -222,13 +268,27 @@ public class SegmentBenchmark {
 
     /**
      * Benchmark lookup of non-existent keys (miss path).
-     * Tests the performance when keys are not found.
+     *
+     * <p>Cycles through keys generated and confirmed absent at setup, so the timed call is
+     * the lookup and not the construction of a new key.</p>
      */
     @Benchmark
     public Object lookupMiss(Blackhole bh) {
-        // Generate a key that doesn't exist
-        byte[] nonExistentKey = ("nonexistent-" + (lookupIndex++)).getBytes();
-        return segment.get(nonExistentKey);
+        int i = missCursor;
+        missCursor = (i + 1) & (MISS_KEY_COUNT - 1);
+        return segment.get(missKeys[i]);
+    }
+
+    /**
+     * Claims the next positions of the random index stream.
+     *
+     * @param count Number of positions claimed
+     * @return The first claimed position; the rest follow it, wrapping with the stream mask
+     */
+    private int nextLookupPosition(int count) {
+        int start = lookupCursor;
+        lookupCursor = (start + count) & (LOOKUP_INDEX_COUNT - 1);
+        return start;
     }
 
     /**

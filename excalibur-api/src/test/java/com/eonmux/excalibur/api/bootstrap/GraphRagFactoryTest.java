@@ -42,6 +42,11 @@ class GraphRagFactoryTest {
         return new Config(new HashMap<>(overrides));
     }
 
+    /** Where a namespace rooted at {@code root} keeps its graph, as the node lays it out. */
+    private static Path graphOf(Path root) {
+        return root.resolve(GraphTenant.GRAPH_SUBDIRECTORY);
+    }
+
     /** Writes a complete, minimal graph store into {@code directory}. */
     private static void buildGraph(Path directory) throws IOException {
         EdgeStoreWriter edges = new EdgeStoreWriter();
@@ -75,15 +80,16 @@ class GraphRagFactoryTest {
     @DisplayName("no graph directory means no pipeline, not a failure")
     void absentGraphIsAbsent(@TempDir Path dataDir) throws IOException {
         // A deployment doing only vector search has no graph. It must start.
-        assertThat(GraphRagFactory.open(config(Map.of()), dataDir)).isNull();
+        assertThat(GraphRagFactory.openAt(config(Map.of()), graphOf(dataDir))).isNull();
     }
 
     @Test
     @DisplayName("a graph on disk answers a question with real names")
     void answersFromTheGraph(@TempDir Path dataDir) throws Exception {
-        buildGraph(dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY));
+        buildGraph(graphOf(dataDir));
 
-        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(config(Map.of()), dataDir)) {
+        try (GraphRagFactory.GraphRag graph =
+                 GraphRagFactory.openAt(config(Map.of()), graphOf(dataDir))) {
             assertThat(graph).isNotNull();
 
             GraphRagResult result =
@@ -98,6 +104,32 @@ class GraphRagFactoryTest {
                 .doesNotContain("E2")
                 .doesNotContain("R0");
         }
+    }
+
+    @Test
+    @DisplayName("opening a just-published graph leaves the graph it replaced beside it")
+    void openingAPublishedGraphKeepsTheFallback(@TempDir Path dataDir) throws Exception {
+        Path target = graphOf(dataDir);
+        Path previous = com.eonmux.excalibur.graph.staging.GraphBuilder.previousFor(target);
+        buildGraph(target);
+        buildGraph(previous);
+
+        // Mid-publish: the new graph renamed in, the old one kept for a rollback. Recovery
+        // would read this as a completed publish and delete the fallback.
+        try (GraphRagFactory.GraphRag graph = GraphRagFactory.openPublished(
+                config(Map.of()), target, GraphModelClients.forConfig(config(Map.of())))) {
+            assertThat(graph.directory()).isEqualTo(target);
+        }
+        assertThat(previous).isDirectory();
+    }
+
+    @Test
+    @DisplayName("a published graph that is not there is a failure, not an absent graph")
+    void anAbsentPublishedGraphFails(@TempDir Path dataDir) {
+        assertThatThrownBy(() -> GraphRagFactory.openPublished(config(Map.of()),
+                graphOf(dataDir), GraphModelClients.forConfig(config(Map.of()))))
+            .isInstanceOf(IOException.class)
+            .hasMessageContaining("not at");
     }
 
     @Test
@@ -118,7 +150,7 @@ class GraphRagFactoryTest {
         buildGraph(dataDir.resolve("graph"));
         Config config = config(Map.of("excalibur.graph.path", elsewhere.toString()));
 
-        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(config, dataDir)) {
+        try (GraphRagFactory.GraphRag graph = GraphRagFactory.openAt(config, graphOf(dataDir))) {
             assertThat(graph.directory()).isEqualTo(dataDir.resolve("graph"));
         }
     }
@@ -129,11 +161,11 @@ class GraphRagFactoryTest {
         // Opening what is present and dropping the rest would give a pipeline with no entity
         // linking: every question resolves to nothing, and every refusal reads as "I don't know"
         // rather than "this node is misconfigured".
-        Path directory = dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY);
+        Path directory = graphOf(dataDir);
         buildGraph(directory);
         Files.delete(directory.resolve(GraphRagFactory.ENTITY_DICTIONARY + ".idx"));
 
-        assertThatThrownBy(() -> GraphRagFactory.open(config(Map.of()), dataDir))
+        assertThatThrownBy(() -> GraphRagFactory.openAt(config(Map.of()), graphOf(dataDir)))
             .isInstanceOf(IOException.class)
             .hasMessageContaining(GraphRagFactory.ENTITY_DICTIONARY);
     }
@@ -141,18 +173,19 @@ class GraphRagFactoryTest {
     @Test
     @DisplayName("a failed open leaves nothing mapped behind")
     void failedOpenReleasesWhatItOpened(@TempDir Path dataDir) throws IOException {
-        Path directory = dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY);
+        Path directory = graphOf(dataDir);
         buildGraph(directory);
         Files.delete(directory.resolve(GraphRagFactory.RELATION_DICTIONARY + ".idx"));
 
-        assertThatThrownBy(() -> GraphRagFactory.open(config(Map.of()), dataDir))
+        assertThatThrownBy(() -> GraphRagFactory.openAt(config(Map.of()), graphOf(dataDir)))
             .isInstanceOf(IOException.class);
 
         // The edge store, both Lucene indexes and the entity dictionary were opened before the
         // failure. If any were still held, this rebuild-and-reopen would fail on Windows and
         // leak mappings everywhere else; that it succeeds is the observable form of "released".
         buildGraph(directory);
-        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(config(Map.of()), dataDir)) {
+        try (GraphRagFactory.GraphRag graph =
+                 GraphRagFactory.openAt(config(Map.of()), graphOf(dataDir))) {
             assertThat(graph).isNotNull();
         }
     }
@@ -160,9 +193,9 @@ class GraphRagFactoryTest {
     @Test
     @DisplayName("closing is idempotent and does not throw")
     void closeIsSafe(@TempDir Path dataDir) throws Exception {
-        buildGraph(dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY));
+        buildGraph(graphOf(dataDir));
 
-        GraphRagFactory.GraphRag graph = GraphRagFactory.open(config(Map.of()), dataDir);
+        GraphRagFactory.GraphRag graph = GraphRagFactory.openAt(config(Map.of()), graphOf(dataDir));
         graph.close();
         // A second close must not throw: the shutdown sequence runs regardless of what already
         // ran, and a throwing close would strand the steps after it.
@@ -172,12 +205,12 @@ class GraphRagFactoryTest {
     @Test
     @DisplayName("abstention thresholds come from configuration")
     void thresholdsAreConfigured(@TempDir Path dataDir) throws Exception {
-        buildGraph(dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY));
+        buildGraph(graphOf(dataDir));
 
         // A score floor nothing can clear turns every answer into a refusal, which is the
         // observable proof that the configured value reached the policy.
         Config strict = config(Map.of("excalibur.graph.min-score", "1.0"));
-        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(strict, dataDir)) {
+        try (GraphRagFactory.GraphRag graph = GraphRagFactory.openAt(strict, graphOf(dataDir))) {
             GraphRagResult result =
                 graph.pipeline().answer("Who did Ada Lovelace collaborate with?");
             assertThat(result.hasAnswer()).isFalse();
@@ -188,12 +221,13 @@ class GraphRagFactoryTest {
     @Test
     @DisplayName("a configured confidence temperature reaches the answer a client is given")
     void confidenceTemperatureIsApplied(@TempDir Path dataDir) throws Exception {
-        buildGraph(dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY));
+        buildGraph(graphOf(dataDir));
 
         String question = "Who did Ada Lovelace collaborate with?";
 
         double uncalibrated;
-        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(config(Map.of()), dataDir)) {
+        try (GraphRagFactory.GraphRag graph =
+                 GraphRagFactory.openAt(config(Map.of()), graphOf(dataDir))) {
             GraphRagResult result = graph.pipeline().answer(question);
             assertThat(result.hasAnswer()).isTrue();
             uncalibrated = result.confidence();
@@ -201,7 +235,7 @@ class GraphRagFactoryTest {
 
         Config softened =
             config(Map.of("excalibur.graph.confidence-temperature", "8.0"));
-        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(softened, dataDir)) {
+        try (GraphRagFactory.GraphRag graph = GraphRagFactory.openAt(softened, graphOf(dataDir))) {
             GraphRagResult result = graph.pipeline().answer(question);
 
             assertThat(result.hasAnswer())
@@ -217,17 +251,18 @@ class GraphRagFactoryTest {
     @Test
     @DisplayName("the neutral temperature leaves the reported confidence exactly as it was")
     void neutralTemperatureChangesNothing(@TempDir Path dataDir) throws Exception {
-        buildGraph(dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY));
+        buildGraph(graphOf(dataDir));
 
         String question = "Who did Ada Lovelace collaborate with?";
 
         double byDefault;
-        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(config(Map.of()), dataDir)) {
+        try (GraphRagFactory.GraphRag graph =
+                 GraphRagFactory.openAt(config(Map.of()), graphOf(dataDir))) {
             byDefault = graph.pipeline().answer(question).confidence();
         }
 
         Config neutral = config(Map.of("excalibur.graph.confidence-temperature", "1.0"));
-        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(neutral, dataDir)) {
+        try (GraphRagFactory.GraphRag graph = GraphRagFactory.openAt(neutral, graphOf(dataDir))) {
             assertThat(graph.pipeline().answer(question).confidence())
                 .as("a node that has not calibrated its confidences must not report that it has")
                 .isEqualTo(byDefault);
@@ -275,9 +310,10 @@ class GraphRagFactoryTest {
     @Test
     @DisplayName("the relation dictionary on disk is what narrows a traversal")
     void relationHintsAreWiredFromTheDictionary(@TempDir Path dataDir) throws Exception {
-        buildTwoRelationGraph(dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY));
+        buildTwoRelationGraph(graphOf(dataDir));
 
-        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(config(Map.of()), dataDir)) {
+        try (GraphRagFactory.GraphRag graph =
+                 GraphRagFactory.openAt(config(Map.of()), graphOf(dataDir))) {
             GraphRagResult narrowed =
                 graph.pipeline().answer("Who collaborated with Ada Lovelace?");
 
@@ -292,9 +328,10 @@ class GraphRagFactoryTest {
     @Test
     @DisplayName("a hint the graph cannot honour does not cost the answer")
     void unhonourableHintStillAnswers(@TempDir Path dataDir) throws Exception {
-        buildTwoRelationGraph(dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY));
+        buildTwoRelationGraph(graphOf(dataDir));
 
-        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(config(Map.of()), dataDir)) {
+        try (GraphRagFactory.GraphRag graph =
+                 GraphRagFactory.openAt(config(Map.of()), graphOf(dataDir))) {
             // Note G was authored, never collaborated on.
             GraphRagResult result = graph.pipeline().answer("Who collaborated with Note G?");
 

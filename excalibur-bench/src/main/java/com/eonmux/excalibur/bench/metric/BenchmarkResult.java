@@ -136,8 +136,14 @@ public final class BenchmarkResult {
                 return notEvaluable(target,
                     "scaling requires a throughput measurement but unit was '" + unit + "'");
             }
+            MetricUnits.Dimension scaled = MetricUnits.dimensionOf(target.unit());
+            if (scaled != MetricUnits.Dimension.THROUGHPUT && scaled != MetricUnits.Dimension.BYTES_PER_SEC) {
+                return notEvaluable(target,
+                    "target unit '" + target.unit() + "' is not a rate an operation count can scale into");
+            }
+            // The parameter says how many units of the target's work one operation performs.
             value = MetricUnits.convert(value, unit, MetricUnits.OPS_PER_SEC) * scale;
-            unit = MetricUnits.BYTES_PER_SEC;
+            unit = MetricUnits.canonicalUnit(scaled);
         }
 
         if (!MetricUnits.isCompatible(unit, target.unit())) {

@@ -53,8 +53,8 @@ public final class QueryTrace {
     /**
      * Adds an already-measured duration.
      *
-     * <p>For work whose timing is produced elsewhere — a model call that reports its own prefill
-     * and decode split, for instance.
+     * <p>For work whose timing is produced elsewhere - a stage measured on another thread, or by
+     * a component that reports its own duration.
      */
     public void record(Stage stage, long nanos) {
         if (nanos < 0) {

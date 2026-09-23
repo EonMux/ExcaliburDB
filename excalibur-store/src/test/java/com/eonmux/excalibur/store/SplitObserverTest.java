@@ -170,6 +170,91 @@ class SplitObserverTest {
     }
 
     @Test
+    @DisplayName("an observer is told the children's indices before any key can route to them")
+    void observerHearsOfTheSplitBeforeItIsReachable() throws Exception {
+        // State a child's inherited entries never reach through writes - a membership filter
+        // filled by them - has to be marked before the first write lands in the child, and
+        // onSplitComplete comes only after the children are routed to.
+        List<String> events = new CopyOnWriteArrayList<>();
+        List<long[]> announced = new CopyOnWriteArrayList<>();
+        AtomicInteger routingAtAnnouncement = new AtomicInteger();
+        engine.addSplitObserver(new SplitWorker.SplitListener() {
+            @Override
+            public void onSplitPublishing(Segment parent, long leftIndex, long rightIndex) {
+                events.add("publishing");
+                announced.add(new long[] {leftIndex, rightIndex});
+                routingAtAnnouncement.set(engine.getSegmentCount());
+            }
+
+            @Override
+            public void onSplitComplete(Segment parent, Segment left, Segment right) {
+                events.add("complete");
+            }
+        });
+
+        int routingBefore = engine.getSegmentCount();
+        fill();
+        Segment parent = findPopulatedSegment(routingBefore);
+        long parentIndex = indexOf(parent);
+        split(parent, routingBefore);
+
+        assertThat(events).containsExactly("publishing", "complete");
+        assertThat(routingAtAnnouncement.get())
+            .as("the routing table is not yet widened when the advance notice is given")
+            .isEqualTo(routingBefore);
+        assertThat(announced.get(0)).containsExactly(parentIndex, parentIndex + routingBefore);
+        assertThat(engine.getSegment(parentIndex + routingBefore))
+            .as("the right child is published at the announced index")
+            .isNotNull()
+            .isNotSameAs(engine.getSegment(parentIndex));
+    }
+
+    @Test
+    @DisplayName("an observer told a split was coming is told when it is abandoned")
+    void observerHearsOfAnAbandonedSplit() throws Exception {
+        List<String> events = new CopyOnWriteArrayList<>();
+        List<long[]> abandoned = new CopyOnWriteArrayList<>();
+        engine.addSplitObserver(new SplitWorker.SplitListener() {
+            @Override
+            public void onSplitPublishing(Segment parent, long leftIndex, long rightIndex) {
+                events.add("publishing");
+                throw new IllegalStateException("a failing advance notice does not stop a split");
+            }
+
+            @Override
+            public void onSplitAbandoned(Segment parent, long leftIndex, long rightIndex) {
+                events.add("abandoned");
+                abandoned.add(new long[] {leftIndex, rightIndex});
+            }
+
+            @Override
+            public void onSplitComplete(Segment parent, Segment left, Segment right) {
+                events.add("complete");
+            }
+        });
+
+        int routingBefore = engine.getSegmentCount();
+        fill();
+        Segment parent = findPopulatedSegment(routingBefore);
+        long parentIndex = indexOf(parent);
+        // A non-empty directory where the right child is to be renamed makes the rename fail
+        // after the advance notice has been given.
+        Path blocker = dataDir.resolve("segment_" + (parentIndex + routingBefore) + ".dat");
+        Files.createDirectories(blocker.resolve("occupied"));
+
+        engine.getSplitWorker().requestSplit(parent, Integer.numberOfTrailingZeros(routingBefore));
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(10);
+        while (abandoned.isEmpty() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+
+        assertThat(events).containsExactly("publishing", "abandoned");
+        assertThat(abandoned.get(0)).containsExactly(parentIndex, parentIndex + routingBefore);
+        assertThat(engine.getSegmentCount()).isEqualTo(routingBefore);
+        assertThat(engine.getSegment(parentIndex)).isSameAs(parent);
+    }
+
+    @Test
     @DisplayName("a null observer is refused")
     void nullObserverRefused() {
         assertThatThrownBy(() -> engine.addSplitObserver(null))
@@ -178,15 +263,32 @@ class SplitObserverTest {
 
     /** Fills a segment and splits it, returning the parent. */
     private Segment splitSomething() throws Exception {
+        fill();
+        int routingBefore = engine.getSegmentCount();
+        Segment parent = findPopulatedSegment(routingBefore);
+        split(parent, routingBefore);
+        return parent;
+    }
+
+    private void fill() {
         for (int i = 0; i < KEY_COUNT; i++) {
             engine.put(("key-" + i).getBytes(), ("value-" + i).getBytes());
         }
-        int routingBefore = engine.getSegmentCount();
-        Segment parent = findPopulatedSegment(routingBefore);
+    }
+
+    private void split(Segment parent, int routingBefore) throws InterruptedException {
         engine.getSplitWorker().requestSplit(
             parent, Integer.numberOfTrailingZeros(routingBefore));
         awaitSplit(parent);
-        return parent;
+    }
+
+    private long indexOf(Segment segment) {
+        for (java.util.Map.Entry<Long, Segment> entry : engine.getSegments().entrySet()) {
+            if (entry.getValue() == segment) {
+                return entry.getKey();
+            }
+        }
+        throw new AssertionError("segment is not in the directory");
     }
 
     private Segment findPopulatedSegment(int routingCount) {

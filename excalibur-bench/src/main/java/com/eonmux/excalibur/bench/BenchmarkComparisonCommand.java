@@ -4,6 +4,7 @@ import com.eonmux.excalibur.bench.metric.BenchmarkComparison;
 import com.eonmux.excalibur.bench.metric.BenchmarkResult;
 import com.eonmux.excalibur.bench.metric.BenchmarkResultCapture;
 import com.eonmux.excalibur.bench.metric.BenchmarkResultSet;
+import com.eonmux.excalibur.bench.metric.ErroredBenchmark;
 import com.eonmux.excalibur.bench.report.BenchmarkReportWriter;
 
 import java.io.IOException;
@@ -26,7 +27,9 @@ import java.util.Objects;
  * <h2>Exit codes</h2>
  * <p>Only {@link #EXIT_OK} means "measured, compared and fine". Every other outcome,
  * including one this command could not evaluate, is non-zero: a gate that cannot tell
- * "nothing ran" from "nothing regressed" is not a gate.</p>
+ * "nothing ran" from "nothing regressed" is not a gate. A combination that errored is
+ * such an outcome - JMH leaves it out of its results rather than reporting it - so it
+ * exits {@link #EXIT_ERRORED} even when everything that did run held its baseline.</p>
  *
  * <h2>Thread safety</h2>
  * <p>One instance per invocation; not thread-safe.</p>
@@ -41,6 +44,13 @@ public final class BenchmarkComparisonCommand {
 
     /** The command could not be carried out: bad arguments, or a missing input. */
     public static final int EXIT_USAGE = 2;
+
+    /**
+     * A benchmark combination errored, so part of the run was never measured or
+     * compared. Takes precedence over {@link #EXIT_REGRESSION}: the comparison is
+     * incomplete either way.
+     */
+    public static final int EXIT_ERRORED = 3;
 
     private static final String DEFAULT_OUTPUT_DIR = "build/benchmark-results";
     private static final String DEFAULT_PATTERN = ".*Benchmark.*";
@@ -130,6 +140,12 @@ public final class BenchmarkComparisonCommand {
         out.println();
 
         BenchmarkResultSet results = measure(options.pattern());
+        if (results.erroredCount() > 0) {
+            // Written anyway: the reports are where the failure detail is read.
+            writeResults(results, Paths.get(options.outputDir()));
+            reportErrored(results);
+            return EXIT_ERRORED;
+        }
         if (results.resultCount() == 0) {
             err.println("FAILED: the run produced no results for pattern '" + options.pattern()
                 + "'. Nothing was measured, so nothing can be reported as captured.");
@@ -159,7 +175,7 @@ public final class BenchmarkComparisonCommand {
 
         out.println("\nRunning current benchmarks...");
         BenchmarkResultSet current = measure(options.pattern());
-        if (current.resultCount() == 0) {
+        if (current.resultCount() == 0 && current.erroredCount() == 0) {
             err.println("FAILED: the run produced no results for pattern '" + options.pattern()
                 + "'. There is nothing to compare against the baseline.");
             return EXIT_USAGE;
@@ -202,12 +218,28 @@ public final class BenchmarkComparisonCommand {
         writeComparison(comparison, outputDir);
         out.println(comparison.formatSummary());
 
+        if (comparison.hasErrors()) {
+            reportErrored(comparison.currentResults());
+            return EXIT_ERRORED;
+        }
         if (comparison.hasRegressions()) {
             out.println("\nRegressions detected. See the comparison report for details.");
             return EXIT_REGRESSION;
         }
         out.println("\nNo regressions detected. All benchmarks maintained or improved.");
         return EXIT_OK;
+    }
+
+    /**
+     * Names every errored combination and its failure on the error stream.
+     */
+    private void reportErrored(BenchmarkResultSet results) {
+        err.println("FAILED: " + results.erroredCount()
+            + " benchmark combination(s) errored and produced no measurement:");
+        for (ErroredBenchmark entry : results.erroredBenchmarks()) {
+            err.println("  [" + entry.category() + "] " + entry.label());
+            err.println("    " + entry.message());
+        }
     }
 
     private BenchmarkResultSet measure(String pattern) throws Exception {
@@ -223,7 +255,8 @@ public final class BenchmarkComparisonCommand {
     }
 
     /**
-     * Reads a result set back out of a report this tool wrote.
+     * Reads a result set back out of a report this tool wrote, errored combinations
+     * included: a saved run that errored must fail a later {@code --diff} too.
      */
     private static BenchmarkResultSet loadResults(Path jsonPath) throws IOException {
         String content = Files.readString(jsonPath);
@@ -232,6 +265,7 @@ public final class BenchmarkComparisonCommand {
         return BenchmarkResultSet.builder()
             .name(name == null ? "Loaded Results" : name)
             .results(results)
+            .errored(ErroredBenchmark.parseReport(content))
             .build();
     }
 
@@ -319,7 +353,9 @@ public final class BenchmarkComparisonCommand {
               0 - measured, compared, no regressions
               1 - regressions detected
               2 - the command could not be carried out (bad arguments, missing input,
-                  or a run that measured nothing); never read this as a pass""");
+                  or a run that measured nothing); never read this as a pass
+              3 - a benchmark combination errored (threw in setup or an iteration),
+                  so it was never measured or compared""");
     }
 
     /**

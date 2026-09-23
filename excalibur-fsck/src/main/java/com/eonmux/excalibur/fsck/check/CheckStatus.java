@@ -41,7 +41,18 @@ public enum CheckStatus {
     UNREADABLE,
 
     /** Something names this file and it is not on disk. */
-    MISSING;
+    MISSING,
+
+    /**
+     * The file is not engine state: a JVM diagnostic dump the process wrote into the
+     * directory.
+     *
+     * <p>Reported, with its size, and never read. It is neither damage nor unverified data -
+     * nothing in the engine reads it, so there is nothing about it to verify - and counting
+     * it as unverified would fail {@code --strict} on every node that has ever run out of
+     * heap, for as long as the evidence of why is kept.</p>
+     */
+    NOT_DATA;
 
     /**
      * Reports whether this verdict is damage that must fail a deploy gate.

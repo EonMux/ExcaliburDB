@@ -118,6 +118,67 @@ class HnswCompactionWorkerTest {
         }
     }
 
+    // ==================== Stopping Tests ====================
+
+    @Test
+    void stopReportsTheLoopEnded() {
+        worker.start();
+        assertThat(worker.stop()).isTrue();
+        assertThat(worker.stop()).as("a second stop answers from the same state").isTrue();
+    }
+
+    @Test
+    void stopOfAWorkerNeverStartedReportsEnded() {
+        assertThat(worker.stop()).isTrue();
+    }
+
+    @Test
+    void stopWakesThePausingLoopWithoutWaitingOutTheInterval() {
+        // The default interval is minutes; a stop that had to wait it out would outlast the
+        // join bound and report the loop still running.
+        worker.start();
+        long startNanos = System.nanoTime();
+        assertThat(worker.stop()).isTrue();
+        assertThat(java.util.concurrent.TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - startNanos))
+            .isLessThan(5);
+    }
+
+    @Test
+    void onDemandRunAskedToStopFirstExaminesNothing() throws IOException {
+        try (HnswGraph first = new HnswGraph(tempDir.resolve("a.hnsw"), config, distanceFunction, 1000);
+             HnswGraph second = new HnswGraph(tempDir.resolve("b.hnsw"), config, distanceFunction, 1000)) {
+            worker.registerGraph(first);
+            worker.registerGraph(second);
+
+            HnswCompactionWorker.GraphCompactionSummary summary = worker.compactNow(true, () -> true);
+
+            assertThat(summary.graphsConsidered()).isZero();
+            assertThat(summary.graphsCompacted()).isZero();
+            assertThat(summary.graphsFailed()).isZero();
+        }
+    }
+
+    @Test
+    void onDemandRunStopsBetweenGraphs() throws IOException {
+        try (HnswGraph first = new HnswGraph(tempDir.resolve("a.hnsw"), config, distanceFunction, 1000);
+             HnswGraph second = new HnswGraph(tempDir.resolve("b.hnsw"), config, distanceFunction, 1000)) {
+            worker.registerGraph(first);
+            worker.registerGraph(second);
+            java.util.concurrent.atomic.AtomicInteger reads = new java.util.concurrent.atomic.AtomicInteger();
+
+            // False before the first graph, true before the second.
+            HnswCompactionWorker.GraphCompactionSummary summary =
+                worker.compactNow(true, () -> reads.getAndIncrement() > 0);
+
+            assertThat(summary.graphsConsidered())
+                .as("the graph not reached is not counted as considered")
+                .isEqualTo(1);
+            assertThat(reads).hasValue(2);
+            assertThat(first.isClosed()).isFalse();
+            assertThat(second.isClosed()).isFalse();
+        }
+    }
+
     // ==================== Configuration Tests ====================
 
     @Test

@@ -65,6 +65,7 @@ import java.util.stream.Collectors;
 @Fork(value = 1, jvmArgsAppend = {
     "--enable-preview",
     "--enable-native-access=ALL-UNNAMED",
+    "--add-modules=jdk.incubator.vector",
     "-Xms2g",
     "-Xmx2g"
 })
@@ -406,6 +407,7 @@ public class EndToEndQueryBenchmark {
      * Isolates the distance computation cost.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int distanceComputationOnly(Blackhole bh) {
         int idx = queryIndex++ % queryVectors.length;
         float[] query = queryVectors[idx];

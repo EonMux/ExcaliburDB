@@ -73,6 +73,49 @@ import org.slf4j.LoggerFactory;
  * segment, and pruning costs latency instead of answers. The mark is sticky until the filter is
  * rebuilt, because freeing space elsewhere does not record the term that was refused.</p>
  *
+ * <h2>When a level stops describing its segment</h2>
+ * <p>A level is filled by the writes that reach its segment, so it describes the segment only
+ * while every entry the segment holds arrived that way. Entries also arrive wholesale: a split
+ * hands each child a share of its parent's entries, a restart reopens segments whose levels this
+ * process never filled, a compaction rewrites a segment without the entries its level still
+ * counts. The first write to land afterwards makes the level non-empty and it would read as
+ * covering the segment while missing everything the segment held before, so a reader pruning on
+ * it drops documents that are in storage. The owner of the segment therefore declares the level
+ * {@linkplain #markSegmentStale(String) stale} before the segment can take such a write, refills
+ * it from the segment's entries between {@link #beginSegmentRebuild(String)} and
+ * {@link #completeSegmentRebuild(String, long)}, and {@link #coversSegment(String)} answers
+ * false for the whole of that time. Each mark carries a generation, so a rebuild that started
+ * before a later mark cannot clear it: only the rebuild that began after the last mark vouches
+ * for the segment again.</p>
+ *
+ * <h2>A level is trusted only once a rebuild has vouched for it</h2>
+ * <p>Nothing about a newly created level says what its segment already holds: the id may name a
+ * segment reopened from disk, a split child, or one a compaction rewrote, and the write that
+ * created the level is not evidence of the entries before it. So every level - whether
+ * {@linkplain #registerSegment(String) created here} or {@linkplain #registerSegment(String,
+ * CuckooFilter) supplied by a caller} - is born stale, and only a
+ * {@linkplain #completeSegmentRebuild(String, long) completed rebuild} makes it trusted. A
+ * segment whose owner never schedules one is searched in full on every query: slower, never
+ * wrong. Failing open instead would let the first ingested write turn a reopened segment's
+ * empty level into a verdict against everything the segment held before the restart.</p>
+ *
+ * <h2>Asking "may this segment be pruned" across several lookups</h2>
+ * <p>A reader decides to prune a segment from two answers taken at different moments: whether
+ * the level covers the segment, and whether the level holds any of the query's terms. A rebuild
+ * can complete between them - a lookup that ran against the half-refilled level misses a term
+ * the segment holds, and the coverage asked afterwards says trusted. So coverage is also
+ * offered as a {@linkplain #coverageStamp(String) stamp} that changes on every transition into
+ * or out of trust: a reader takes it before its lookups and again after, and prunes only when
+ * both are the same covering stamp, which means the level was trusted, and was the same level,
+ * for the whole of every lookup in between.</p>
+ *
+ * <p>The alternative - one read section under the hierarchy lock around the coverage read and
+ * the lookups, with marks and completions taking the write lock - was rejected on cost:
+ * {@link #markSegmentStale(String)} is called while a split is being published and must not wait
+ * for every in-flight query, and a query would have to hold the read lock across all its terms
+ * rather than one lookup at a time. The stamp costs a reader two map reads per candidate and
+ * costs the writers nothing.</p>
+ *
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Segment IDs are non-null, non-empty strings</li>
@@ -101,6 +144,17 @@ public class HierarchicalCuckooFilter {
     // filter is rebuilt: freeing space elsewhere does not record the term that was refused.
     private final Set<String> saturatedSegments;
     private volatile boolean corpusSaturated;
+
+    // Where each level stands on trust, keyed by segment id. A negative value is a stale level
+    // and holds the negated generation of the latest mark; a positive value is a trusted level
+    // and holds the generation it became trusted at, which is the coverage stamp readers
+    // compare. An id with no entry has no level or has never been marked, and is trusted by
+    // nothing. One map, rather than a stale set beside a trust record, so that the transition
+    // from stale to trusted is a single compare-and-set a reader cannot see half-done. See "When a
+    // level stops describing its segment" and "A level is trusted only once a rebuild has
+    // vouched for it".
+    private final Map<String, Long> levelStates;
+    private final AtomicLong generations;
 
     private final int fingerprintBits;
     private final int segmentCapacity;
@@ -160,6 +214,8 @@ public class HierarchicalCuckooFilter {
         this.hierarchyLock = new ReentrantReadWriteLock();
         this.totalEntries = new AtomicLong(0);
         this.saturatedSegments = ConcurrentHashMap.newKeySet();
+        this.levelStates = new ConcurrentHashMap<>();
+        this.generations = new AtomicLong();
     }
 
     /**
@@ -178,7 +234,16 @@ public class HierarchicalCuckooFilter {
     }
 
     /**
-     * Registers a new segment filter in the hierarchy.
+     * Registers a new segment filter in the hierarchy, or returns the one already registered.
+     *
+     * <p>A level created here is born {@linkplain #markSegmentStale(String) stale}: it covers its
+     * segment only once a rebuild has refilled it from the segment and
+     * {@linkplain #completeSegmentRebuild(String, long) completed}. See "A level is trusted only
+     * once a rebuild has vouched for it". Returning an existing level changes nothing about it.</p>
+     *
+     * <p>Ingestion calls this before every chunk it files, so the common case - the level exists
+     * - is answered without the hierarchy lock, whose write side would otherwise make every
+     * chunk written wait for every lookup in flight.</p>
      *
      * @param segmentId Unique segment identifier
      * @return The created or existing segment filter
@@ -191,22 +256,39 @@ public class HierarchicalCuckooFilter {
             throw new IllegalArgumentException("segmentId must not be empty");
         }
 
+        CuckooFilter known = segmentFilters.get(segmentId);
+        if (known != null) {
+            return known;
+        }
         hierarchyLock.writeLock().lock();
         try {
-            CuckooFilter existing = segmentFilters.get(segmentId);
-            if (existing != null) {
-                return existing;
-            }
-            // A segment id can come back after a split or a reindex, holding a filter that has
-            // refused nothing. Carrying the old mark would disable pruning for that id forever.
-            saturatedSegments.remove(segmentId);
-            CuckooFilter created =
-                CuckooFilter.create(segmentCapacity, fingerprintBits, corpusFilter.seed());
-            segmentFilters.put(segmentId, created);
-            return created;
+            return levelOf(segmentId);
         } finally {
             hierarchyLock.writeLock().unlock();
         }
+    }
+
+    /**
+     * Returns a segment's level, creating it stale when there is none.
+     *
+     * <p>The caller holds the hierarchy write lock.</p>
+     *
+     * @param segmentId The segment's id
+     * @return The level
+     */
+    private CuckooFilter levelOf(String segmentId) {
+        CuckooFilter existing = segmentFilters.get(segmentId);
+        if (existing != null) {
+            return existing;
+        }
+        // A segment id can come back after a split or a reindex, holding a filter that has
+        // refused nothing. Carrying the old mark would disable pruning for that id forever.
+        saturatedSegments.remove(segmentId);
+        CuckooFilter created =
+            CuckooFilter.create(segmentCapacity, fingerprintBits, corpusFilter.seed());
+        markSegmentStale(segmentId);
+        segmentFilters.put(segmentId, created);
+        return created;
     }
 
     /**
@@ -215,6 +297,10 @@ public class HierarchicalCuckooFilter {
      * <p>The filter must hash as the corpus level does - the same seed and fingerprint width -
      * and have no more buckets than it, or a delete could strip a corpus entry another segment's
      * term still depends on. See the class documentation.</p>
+     *
+     * <p>The level is installed stale, whatever it holds: nothing here can say that the filter
+     * describes the segment registered under the id, so it covers the segment only once a
+     * rebuild has refilled it and completed.</p>
      *
      * @param segmentId Unique segment identifier
      * @param filter The Cuckoo filter for this segment
@@ -238,6 +324,7 @@ public class HierarchicalCuckooFilter {
         hierarchyLock.writeLock().lock();
         try {
             saturatedSegments.remove(segmentId);
+            markSegmentStale(segmentId);
             segmentFilters.put(segmentId, filter);
         } finally {
             hierarchyLock.writeLock().unlock();
@@ -251,6 +338,9 @@ public class HierarchicalCuckooFilter {
      * the corpus filter. Use {@link #deleteFromHierarchy(byte[])}
      * for proper cleanup of deleted entries.</p>
      *
+     * <p>The id's trust goes with its level, so a rebuild still running against the removed
+     * level cannot complete, and a level registered under the id later starts stale.</p>
+     *
      * @param segmentId The segment ID to unregister
      * @return true if the segment was removed
      */
@@ -261,6 +351,7 @@ public class HierarchicalCuckooFilter {
         try {
             CuckooFilter removed = segmentFilters.remove(segmentId);
             saturatedSegments.remove(segmentId);
+            levelStates.remove(segmentId);
             return removed != null;
         } finally {
             hierarchyLock.writeLock().unlock();
@@ -658,25 +749,165 @@ public class HierarchicalCuckooFilter {
      * Whether this filter may be used to rule a segment out.
      *
      * <p>A pre-filter earns the right to exclude a segment only by holding everything that
-     * segment holds. Three things take that right away, and all three are silent: the segment
-     * may hold nothing yet, so the filter has looked at nothing rather than looked and found
-     * nothing; a level may have refused a term for want of room, so the term is absent from a
-     * filter whose absences a reader would otherwise trust; and the corpus level - the first one
-     * consulted - may be full, which makes every segment's verdict worthless at once.</p>
+     * segment holds. Five things take that right away, and all five are silent: no rebuild may
+     * have vouched for the level yet, so it holds whatever writes happened to reach it; the
+     * segment may hold nothing yet, so the filter has looked at nothing rather than looked and
+     * found nothing; a level may have refused a term for want of room, so the term is absent from
+     * a filter whose absences a reader would otherwise trust; the level may be
+     * {@linkplain #markSegmentStale(String) stale}, holding the terms of writes but not of the
+     * entries a split, a restart or a compaction put in the segment; and the corpus level - the
+     * first one consulted - may be full, which makes every segment's verdict worthless at
+     * once.</p>
      *
      * <p>When this returns false the caller must search the segment. Pruning is an optimisation;
      * answering a query with nothing while the documents sit in storage is not a slow answer but
      * a wrong one.</p>
      *
+     * <p>A reader that combines this with lookups made at other moments wants
+     * {@link #coverageStamp(String)} instead; see "Asking "may this segment be pruned" across
+     * several lookups".</p>
+     *
      * @param segmentId The segment's id
      * @return true when the filter's silence about a term genuinely means the segment lacks it
      */
     public boolean coversSegment(String segmentId) {
-        if (segmentId == null || corpusSaturated || saturatedSegments.contains(segmentId)) {
-            return false;
+        return coverageStamp(segmentId) != NOT_COVERED;
+    }
+
+    /**
+     * The stamp {@link #coverageStamp(String)} returns for a segment the filter does not cover.
+     */
+    public static final long NOT_COVERED = 0L;
+
+    /**
+     * Whether this filter may be used to rule a segment out, as a stamp that changes whenever
+     * the answer could have.
+     *
+     * <p>{@link #NOT_COVERED} when {@link #coversSegment(String)} would say false. Otherwise a
+     * positive value that stays the same for as long as the level stays trusted, and that no
+     * later period of trust for the id will repeat: every mark, every completed rebuild and every
+     * replacement of the level moves it. A reader that takes the stamp before its lookups and
+     * again after, and finds the same covering value both times, knows the level was trusted for
+     * the whole of every lookup in between - so a term those lookups did not find in it is a
+     * term the segment does not hold.</p>
+     *
+     * <p>Lock-free: two map reads and a counter read.</p>
+     *
+     * @param segmentId The segment's id, which may be null
+     * @return The stamp, or {@link #NOT_COVERED}
+     */
+    public long coverageStamp(String segmentId) {
+        if (segmentId == null || corpusSaturated) {
+            return NOT_COVERED;
+        }
+        Long state = levelStates.get(segmentId);
+        if (state == null || state <= 0 || saturatedSegments.contains(segmentId)) {
+            return NOT_COVERED;
         }
         CuckooFilter segmentFilter = segmentFilters.get(segmentId);
-        return segmentFilter != null && segmentFilter.count() > 0;
+        return segmentFilter != null && segmentFilter.count() > 0 ? state : NOT_COVERED;
+    }
+
+    /**
+     * Declares that a segment's level no longer describes the segment.
+     *
+     * <p>From this call until a rebuild that begins after it completes,
+     * {@link #coversSegment(String)} answers false and the segment is searched for every query.
+     * The level itself is left as it is and keeps taking inserts, so nothing recorded meanwhile
+     * is lost; the rebuild that follows empties and refills it. The segment need not have a
+     * level yet: the mark is kept by id, and a level created for the id afterwards is born stale
+     * in any case.</p>
+     *
+     * <p>Lock-free and cheap, so it can be called on a path that must not block, such as the
+     * one that publishes a split.</p>
+     *
+     * @param segmentId The segment's id
+     * @return The generation of this mark
+     * @throws NullPointerException if segmentId is null
+     */
+    public long markSegmentStale(String segmentId) {
+        Objects.requireNonNull(segmentId, "segmentId must not be null");
+        long generation = generations.incrementAndGet();
+        levelStates.put(segmentId, -generation);
+        return generation;
+    }
+
+    /**
+     * Marks a segment's level stale and empties it, ready to be refilled from the segment.
+     *
+     * <p>The caller then {@linkplain #insert(byte[], String) inserts} the terms of every entry
+     * the segment holds and passes the returned generation to
+     * {@link #completeSegmentRebuild(String, long)}. Writes that reach the segment meanwhile keep
+     * inserting into the same level, which is what makes the refill safe against them: a write
+     * recorded before the level was emptied was stored before the caller's scan of the segment
+     * began, so the scan sees it, and one recorded after lands in the emptied level directly.</p>
+     *
+     * <p>The level is emptied in place, so every holder of it keeps holding the live one. A
+     * segment with no level gets a new, empty one. A refusal recorded against the old contents
+     * is dropped with them: the refill will record its own.</p>
+     *
+     * @param segmentId The segment's id
+     * @return The generation to complete the rebuild with
+     * @throws NullPointerException if segmentId is null
+     * @throws IllegalArgumentException if segmentId is empty
+     */
+    public long beginSegmentRebuild(String segmentId) {
+        Objects.requireNonNull(segmentId, "segmentId must not be null");
+        if (segmentId.isEmpty()) {
+            throw new IllegalArgumentException("segmentId must not be empty");
+        }
+        // One step under the write lock, so no lookup sees the level emptied while it still
+        // reads as covering, and so creating a missing level does not mark it a second time
+        // after the generation this rebuild is to complete with.
+        hierarchyLock.writeLock().lock();
+        try {
+            CuckooFilter level = levelOf(segmentId);
+            long generation = markSegmentStale(segmentId);
+            totalEntries.addAndGet(-level.count());
+            level.clear();
+            saturatedSegments.remove(segmentId);
+            return generation;
+        } finally {
+            hierarchyLock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Declares a segment's level refilled, so it may rule the segment out again.
+     *
+     * <p>Only the rebuild that began after the latest mark may do this. A mark made while this
+     * rebuild was running - a split or a compaction that changed the segment under it - means
+     * the refill describes a segment that no longer exists, and the rebuild that the mark was
+     * made for is the one that will vouch for the segment. So does an unregistration: the level
+     * this rebuild filled is no longer the segment's.</p>
+     *
+     * <p>The transition is one compare-and-set from the mark this rebuild made to a coverage
+     * stamp no earlier period of trust used, so a reader comparing stamps sees either the stale
+     * level or the new stamp, never the old stamp over the refilled level.</p>
+     *
+     * @param segmentId  The segment's id
+     * @param generation The generation {@link #beginSegmentRebuild(String)} returned
+     * @return true if the level covers the segment again, false if a later mark superseded it
+     * @throws NullPointerException if segmentId is null
+     */
+    public boolean completeSegmentRebuild(String segmentId, long generation) {
+        Objects.requireNonNull(segmentId, "segmentId must not be null");
+        return levelStates.replace(segmentId, -generation, generations.incrementAndGet());
+    }
+
+    /**
+     * Whether a segment's level is waiting to be refilled from the segment.
+     *
+     * @param segmentId The segment's id
+     * @return true between a {@link #markSegmentStale(String)} - or the creation of the level,
+     *         which marks it - and the rebuild that clears it
+     */
+    public boolean isSegmentStale(String segmentId) {
+        if (segmentId == null) {
+            return false;
+        }
+        Long state = levelStates.get(segmentId);
+        return state != null && state < 0;
     }
 
     /**

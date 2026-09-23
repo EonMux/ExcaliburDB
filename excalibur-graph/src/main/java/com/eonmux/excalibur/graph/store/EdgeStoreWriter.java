@@ -36,10 +36,19 @@ import org.slf4j.LoggerFactory;
  * phase be a straight walk in permutation order.
  *
  * <h2>Size</h2>
- * This implementation buffers in memory and therefore tops out at {@link Integer#MAX_VALUE} edges.
- * That is a property of the buffering, not the format — the on-disk offsets are 64-bit and the
- * reader has no such limit — so a larger corpus needs an external merge sort feeding the same
- * column writers, not a format change.
+ * This implementation buffers in memory and therefore tops out at {@link #MAX_EDGES} edges
+ * (2<sup>31</sup> - 9). That is a property of the buffering, not the format — the on-disk offsets
+ * are 64-bit and the reader has no such limit — so a larger corpus needs an external merge sort
+ * feeding the same column writers, not a format change.
+ *
+ * <p>The heap a build needs follows from the columns. Buffered, an edge costs 36 bytes: six
+ * {@code int} columns (subject, relation, object, valid-from, valid-to, stated-on) at 24, the
+ * source id at 8, the extractor version at 2, and the source type and confidence at 1 each. The
+ * write phase adds three {@code int} permutations over every edge at once - forward order, reverse
+ * order, and either the merge sort's scratch or the forward position of each reverse slot - for
+ * 12 more, so 48 bytes per edge at the peak. The buffer grows by half again, so up to a third of
+ * its capacity can be slack: about 66 bytes per edge in the worst case, or 4.8 to 6.6 GB for a
+ * hundred million edges.</p>
  *
  * <p>Not thread-safe. One writer per store being built.
  */
@@ -48,6 +57,15 @@ public final class EdgeStoreWriter {
     private static final Logger LOGGER = LoggerFactory.getLogger(EdgeStoreWriter.class);
 
     private static final int INITIAL_CAPACITY = 1024;
+
+    /**
+     * Most edges one build can buffer.
+     *
+     * <p>Every column is one Java array indexed by edge, and the largest array length every JVM
+     * will allocate is a few elements short of {@link Integer#MAX_VALUE} - asking for more fails
+     * with an {@link OutOfMemoryError} however much heap is free.</p>
+     */
+    static final int MAX_EDGES = Integer.MAX_VALUE - 8;
 
     private int[] subjects = new int[INITIAL_CAPACITY];
     private int[] relations = new int[INITIAL_CAPACITY];
@@ -167,10 +185,8 @@ public final class EdgeStoreWriter {
             throw new IllegalArgumentException(
                 "provenance must not be null; use Provenance.UNKNOWN to record that it is unknown");
         }
-        if (count == Integer.MAX_VALUE) {
-            throw new IllegalStateException(
-                "in-memory edge buffer is full at " + count
-                    + " edges; a larger store needs an external merge sort feeding ColumnFileWriter");
+        if (count == MAX_EDGES) {
+            throw new IllegalStateException(fullMessage());
         }
 
         ensureCapacity(count + 1);
@@ -195,11 +211,37 @@ public final class EdgeStoreWriter {
         return count;
     }
 
+    /**
+     * The capacity the buffer grows to when it has to hold {@code required} edges.
+     *
+     * <p>Half again, so the copying amortises to a constant per edge, and computed in
+     * {@code long}: half again of anything past about 1.43 billion is past the {@code int} range,
+     * and a sum that wrapped negative would lose to {@code required} and grow the buffer one
+     * slot per edge, copying every column each time. Clamped to {@link #MAX_EDGES}.</p>
+     *
+     * @param current  The capacity now
+     * @param required How many edges it has to hold
+     * @return The new capacity, at least {@code required}
+     * @throws IllegalStateException if {@code required} is past {@link #MAX_EDGES}
+     */
+    static int grownCapacity(int current, int required) {
+        if (required > MAX_EDGES || required < 0) {
+            throw new IllegalStateException(fullMessage());
+        }
+        long grown = Math.max((long) required, (long) current + (current >> 1));
+        return (int) Math.min(grown, MAX_EDGES);
+    }
+
+    private static String fullMessage() {
+        return "in-memory edge buffer is full at " + MAX_EDGES + " edges; a larger store needs an "
+            + "external merge sort feeding ColumnFileWriter";
+    }
+
     private void ensureCapacity(int required) {
         if (required <= subjects.length) {
             return;
         }
-        int grown = Math.max(required, subjects.length + (subjects.length >> 1));
+        int grown = grownCapacity(subjects.length, required);
         subjects = Arrays.copyOf(subjects, grown);
         relations = Arrays.copyOf(relations, grown);
         objects = Arrays.copyOf(objects, grown);

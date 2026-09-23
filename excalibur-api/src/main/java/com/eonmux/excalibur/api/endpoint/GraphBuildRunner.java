@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.endpoint;
 
 import com.eonmux.excalibur.api.bootstrap.GraphBuildService;
+import com.eonmux.excalibur.api.bootstrap.GraphExtraction;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 
 import com.eonmux.excalibur.graph.build.BuildCancelledException;
@@ -13,10 +14,12 @@ import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 
 /**
  * Runs one graph build at a time, behind the route that asked for it, and remembers what it did.
@@ -56,15 +59,13 @@ public final class GraphBuildRunner implements AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger(GraphBuildRunner.class);
 
     /**
-     * How long {@link #close()} waits for a build in progress after asking it to stop.
+     * How long {@link #drain()} waits for a build in progress after asking it to stop.
      *
-     * <p>The same budget the compaction and reindex drains use, because it is the same class of
-     * work: a rewrite of what the node serves, which cannot be abandoned cheaply.</p>
+     * <p>The same budget the reindex drain uses, because it is the same class of work: a
+     * rewrite of what the node serves, which cannot be abandoned cheaply. A build reads the stop
+     * at its own boundaries, and the longest stretch between two is one model request.</p>
      */
-    private static final long SHUTDOWN_TIMEOUT_SECONDS = 30;
-
-    /** How long {@link #close()} waits after interrupting, before it gives up and says so. */
-    private static final long INTERRUPTED_TIMEOUT_SECONDS = 30;
+    private static final long SHUTDOWN_TIMEOUT_SECONDS = 60;
 
     /**
      * How many namespaces' last builds are remembered.
@@ -169,6 +170,7 @@ public final class GraphBuildRunner implements AutoCloseable {
     }
 
     private final Build build;
+    private final Supplier<Optional<GraphExtraction>> extraction;
     private final ExecutorService executor;
     private final Object lock = new Object();
 
@@ -215,17 +217,31 @@ public final class GraphBuildRunner implements AutoCloseable {
      * @throws NullPointerException if tenants is null
      */
     public GraphBuildRunner(GraphTenants tenants) {
-        this(over(tenants));
+        this(over(tenants), tenants::extraction);
     }
 
     /**
-     * Creates a runner over the given build work.
+     * Creates a runner over the given build work, on a node that does not say whether its
+     * ingestion extracts facts.
      *
      * @param build What building one namespace's graph does
      * @throws NullPointerException if build is null
      */
     public GraphBuildRunner(Build build) {
+        this(build, Optional::empty);
+    }
+
+    /**
+     * Creates a runner over the given build work.
+     *
+     * @param build      What building one namespace's graph does
+     * @param extraction Whether ingestion on this node extracts facts, read on every request
+     *                   because ingestion is wired after the routes are
+     * @throws NullPointerException if either is null
+     */
+    public GraphBuildRunner(Build build, Supplier<Optional<GraphExtraction>> extraction) {
         this.build = Objects.requireNonNull(build, "build cannot be null");
+        this.extraction = Objects.requireNonNull(extraction, "extraction cannot be null");
         this.executor = Executors.newSingleThreadExecutor(task -> {
             Thread thread = new Thread(task, "graph-build");
             thread.setDaemon(true);
@@ -293,6 +309,18 @@ public final class GraphBuildRunner implements AutoCloseable {
                 ? snapshot
                 : new Snapshot(STATE_IDLE, namespace, 0L, 0L, null, null);
         }
+    }
+
+    /**
+     * Whether ingestion on this node extracts the facts a build publishes.
+     *
+     * <p>Beside the builds because it is the first thing to read when one published nothing:
+     * a node that ingests without extracting stages no facts, and every build of it is empty.</p>
+     *
+     * @return The state, or empty when this node does not say
+     */
+    public Optional<GraphExtraction> extraction() {
+        return extraction.get();
     }
 
     /**
@@ -382,9 +410,10 @@ public final class GraphBuildRunner implements AutoCloseable {
         } catch (IOException | RuntimeException | Error e) {
             finish(endOf(e, namespace, startedAtMs));
         } finally {
-            // This pool has one thread and every later build uses it. A drain that interrupted
-            // this one would otherwise leave the flag set, and the next build would die on its
-            // first blocking call for a reason nothing in its own request explains.
+            // This pool has one thread and every later build uses it. Nothing here interrupts a
+            // build, but a flag left set by anything else would kill the next build at its
+            // first channel operation - closing that channel - for a reason nothing in its own
+            // request explains.
             Thread.interrupted();
         }
     }
@@ -456,13 +485,16 @@ public final class GraphBuildRunner implements AutoCloseable {
     /**
      * Stops accepting builds, asks one in progress to stop, and waits for it.
      *
-     * <p>Asked rather than interrupted, and then waited for. The caller closes the graph
-     * tenants next, and closing a tenant unmaps files a build is still writing through and
-     * closes the Lucene directories it is indexing into - so an interrupt the build has not yet
-     * noticed is not a drain, and reporting one would be a lie of the same kind as reporting a
-     * build that did not happen.</p>
+     * <p>Asked, then waited for, and never interrupted. A build reads the staging store through
+     * the channels ingestion appends to, and opens and maps the directory it publishes for
+     * queries to be served from, and an interrupt reaching any of those channel operations
+     * closes the channel for every thread using it. It publishes by renaming a directory over
+     * the served one, and an interrupt inside that window leaves a namespace serving nothing.
+     * The caller closes the graph tenants next - unmapping the files a build writes through and
+     * closing the Lucene directories it indexes into - so false is the answer it has to act on,
+     * by leaving them open.</p>
      *
-     * @return true if no build is still in progress, false if one outlived both waits
+     * @return true if no build is still in progress, false if one outlived the wait
      */
     public boolean drain() {
         cancelRequested.set(true);
@@ -471,27 +503,23 @@ public final class GraphBuildRunner implements AutoCloseable {
             if (executor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                 return true;
             }
-            LOGGER.warn("a graph build did not stop within {}s of shutdown; interrupting it",
-                SHUTDOWN_TIMEOUT_SECONDS);
-            executor.shutdownNow();
-            return executor.awaitTermination(INTERRUPTED_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            executor.shutdownNow();
-            return false;
+            if (executor.isTerminated()) {
+                return true;
+            }
         }
+        LOGGER.error("a graph build is still running {}s after being asked to stop; the graph "
+            + "tenants it writes into must stay open", SHUTDOWN_TIMEOUT_SECONDS);
+        return false;
     }
 
     /**
-     * Stops accepting builds and waits for one in progress, logging if it outlives the wait.
+     * As {@link #drain()}, for a caller with no use for the answer; one that outlives the wait
+     * is logged there.
      */
     @Override
     public void close() {
-        if (!drain()) {
-            LOGGER.error("a graph build is still running {}s after being asked to stop. Closing "
-                + "the graph tenants underneath it unmaps files it is still writing through; "
-                + "the build itself loses only its own work, never data.",
-                SHUTDOWN_TIMEOUT_SECONDS + INTERRUPTED_TIMEOUT_SECONDS);
-        }
+        drain();
     }
 }

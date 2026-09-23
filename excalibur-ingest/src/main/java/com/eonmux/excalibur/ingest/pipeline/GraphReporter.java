@@ -5,6 +5,9 @@ import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicLong;
+
 /**
  * Tells the graph about documents ingestion has published, so facts can be extracted from them.
  *
@@ -22,6 +25,15 @@ final class GraphReporter {
      * after the orchestrator that owns this reporter.</p>
      */
     private volatile GraphIngestSink graphSink;
+
+    /**
+     * Published documents whose report to the graph threw.
+     *
+     * <p>Counted because the document is published regardless and nothing else records that
+     * its facts are missing: a sink refusing every report - a graph closed under an ingestion
+     * run that outlived its drain - is otherwise a graph that quietly stops growing.</p>
+     */
+    private final AtomicLong failures = new AtomicLong();
 
     /**
      * Sets where published documents are reported so a graph can be built from them.
@@ -58,7 +70,46 @@ final class GraphReporter {
             // document gives a single-valued relation a different value.
             sink.onDocumentPublished(documentKey, doc.getText(), doc.getLastModifiedMillis());
         } catch (RuntimeException e) {
-            LOGGER.warn("Graph sink failed for {}: {}", documentKey, e.toString());
+            long failed = failures.incrementAndGet();
+            LOGGER.error("The graph did not take the facts of {}, which is published and will not "
+                + "be extracted again unless it changes ({} such document(s) so far): {}",
+                documentKey, failed, e.toString(), e);
+        }
+    }
+
+    /**
+     * How many published documents the graph refused.
+     *
+     * @return The count since this reporter was created
+     */
+    long failures() {
+        return failures.get();
+    }
+
+    /**
+     * Forces what the sink has staged to the device, before the caller records the documents
+     * it came from as ingested.
+     *
+     * <p>Never throws, for the same reason {@link #report} does not: the registry write this
+     * precedes has to happen regardless, since skipping it would make every document of the run
+     * look new to the next crawl. A failure is logged, and the facts are then only as durable as
+     * the page cache.</p>
+     *
+     * @return true when there was nothing to force or it was forced
+     */
+    boolean sync() {
+        GraphIngestSink sink = this.graphSink;
+        if (sink == null) {
+            return true;
+        }
+        try {
+            sink.sync();
+            return true;
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("Staged graph facts could not be forced to disk before the document "
+                + "registry was written; a crash or power loss before they are loses them, and "
+                + "their documents will not be extracted again: {}", e.toString(), e);
+            return false;
         }
     }
 }

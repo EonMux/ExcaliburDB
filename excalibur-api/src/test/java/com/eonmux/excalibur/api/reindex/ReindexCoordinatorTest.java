@@ -188,4 +188,76 @@ class ReindexCoordinatorTest {
             assertThat(lease.isCancelled()).isTrue();
         }
     }
+    @Nested
+    @DisplayName("draining for shutdown")
+    class Draining {
+
+        @Test
+        @DisplayName("refuses every claim once it stops accepting, and says why")
+        void refusesClaimsAfterStopAccepting() {
+            ReindexCoordinator coordinator = new ReindexCoordinator();
+            assertThat(coordinator.isAccepting()).isTrue();
+
+            coordinator.stopAccepting();
+
+            assertThat(coordinator.isAccepting()).isFalse();
+            assertThat(coordinator.tryAcquire("docs"))
+                .as("a reindex starting after the drain looked would write into closed storage")
+                .isNull();
+            assertThat(coordinator.inFlightCount()).isZero();
+        }
+
+        @Test
+        @DisplayName("asks every run in flight to stop, through the canceller each registered")
+        void cancelAllAsksEveryRun() {
+            ReindexCoordinator coordinator = new ReindexCoordinator();
+            AtomicInteger asked = new AtomicInteger();
+            coordinator.tryAcquire("a").onCancel(asked::incrementAndGet);
+            ReindexCoordinator.Lease b = coordinator.tryAcquire("b");
+            b.onCancel(asked::incrementAndGet);
+
+            assertThat(coordinator.cancelAll()).isEqualTo(2);
+            assertThat(asked).hasValue(2);
+            assertThat(b.isCancelled()).isTrue();
+            assertThat(coordinator.inFlightCount())
+                .as("asking a run to stop is not the run ending")
+                .isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("an idle coordinator is idle at once")
+        void idleAtOnce() throws Exception {
+            assertThat(new ReindexCoordinator().awaitIdle(0)).isTrue();
+        }
+
+        @Test
+        @DisplayName("reports a run that outlives the wait")
+        void reportsARunThatOutlivesTheWait() throws Exception {
+            ReindexCoordinator coordinator = new ReindexCoordinator();
+            coordinator.tryAcquire("docs");
+
+            assertThat(coordinator.awaitIdle(20)).isFalse();
+        }
+
+        @Test
+        @DisplayName("wakes as soon as the last run releases its claim")
+        void wakesOnTheLastRelease() throws Exception {
+            ReindexCoordinator coordinator = new ReindexCoordinator();
+            ReindexCoordinator.Lease lease = coordinator.tryAcquire("docs");
+            CountDownLatch waiting = new CountDownLatch(1);
+            Thread releaser = new Thread(() -> {
+                try {
+                    waiting.await(5, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                lease.release();
+            });
+            releaser.start();
+
+            waiting.countDown();
+            assertThat(coordinator.awaitIdle(TimeUnit.SECONDS.toMillis(10))).isTrue();
+            releaser.join();
+        }
+    }
 }

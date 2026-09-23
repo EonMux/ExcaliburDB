@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
-import com.eonmux.excalibur.ingest.processor.TermFrequencyTracker;
 import com.eonmux.excalibur.ingest.processor.TextChunk;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.processor.TextContent;
@@ -15,10 +14,9 @@ import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
 import com.eonmux.excalibur.core.codec.ChunkPayloadCodec;
 import com.eonmux.excalibur.core.text.ChunkIdentifiers;
+import com.eonmux.excalibur.core.util.StopSignal;
 import com.eonmux.excalibur.llm.LLMException;
-import com.eonmux.excalibur.store.Segment;
 import com.eonmux.excalibur.store.StorageEngine;
-import com.eonmux.excalibur.store.hash.XxHash64;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -87,13 +85,6 @@ final class DocumentIngestor {
      */
     private final DocumentRegistry documentRegistry;
 
-    /**
-     * Term frequency tracker for selectivity estimation during queries.
-     * Tracks term frequencies in segment Count-Min Sketches for query optimization.
-     * May be null if selectivity-based optimization is not needed.
-     */
-    private final TermFrequencyTracker termFrequencyTracker;
-
     private final LexicalSideIndex lexicalSideIndex;
     private final SegmentTermRecorder termRecorder;
     private final GraphReporter graphReporter;
@@ -104,7 +95,6 @@ final class DocumentIngestor {
      * @param storageEngine       Where chunks are written
      * @param visibilityTracker   Publishes documents at an epoch, or null for no atomicity
      * @param documentRegistry    Records what was ingested, or null when nothing is recorded
-     * @param termFrequencyTracker Records term frequencies for selectivity, or null
      * @param lexicalSideIndex    The BM25 index kept beside storage
      * @param termRecorder        Files written terms under their segment
      * @param graphReporter       Reports published documents onwards
@@ -114,7 +104,6 @@ final class DocumentIngestor {
                      StorageEngine storageEngine,
                      DocumentVisibilityTracker visibilityTracker,
                      DocumentRegistry documentRegistry,
-                     TermFrequencyTracker termFrequencyTracker,
                      LexicalSideIndex lexicalSideIndex,
                      SegmentTermRecorder termRecorder,
                      GraphReporter graphReporter) {
@@ -127,7 +116,6 @@ final class DocumentIngestor {
         this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
         this.visibilityTracker = visibilityTracker; // may be null
         this.documentRegistry = documentRegistry; // may be null
-        this.termFrequencyTracker = termFrequencyTracker; // may be null
         this.lexicalSideIndex = Objects.requireNonNull(lexicalSideIndex);
         this.termRecorder = Objects.requireNonNull(termRecorder);
         this.graphReporter = Objects.requireNonNull(graphReporter);
@@ -159,15 +147,24 @@ final class DocumentIngestor {
      * step rolls back the chunks already written and leaves the document unregistered, so no
      * query can observe a fragment of it.</p>
      *
+     * <p>A stop of the run may interrupt the fetch and the embedding requests, and nothing else:
+     * those wait on the source and the embedding endpoint and touch no file this node shares.
+     * The writes that follow run with the thread's interrupt flag clear, because an interrupt
+     * reaching a write closes the storage channel it was writing through - for every writer of
+     * that segment, for the life of the process. A stop that lands after the fetch and the
+     * embedding have finished lets the document be written whole; the run reads the stop
+     * before its next document.</p>
+     *
      * @param source     The source to fetch the document from
      * @param sourceId    The source's id, which qualifies the document key
      * @param documentId The document to fetch
+     * @param stop       The run's stop signal
      * @return What the document produced, and whether it was dropped rather than simply empty
      * @throws SourceException if the document could not be fetched
      */
-    DocumentOutcome ingest(Source source, String sourceId, String documentId)
+    DocumentOutcome ingest(Source source, String sourceId, String documentId, StopSignal stop)
             throws SourceException {
-        FetchedDocument doc = source.fetch(documentId);
+        FetchedDocument doc = stop.interruptibly(() -> source.fetch(documentId));
 
         if (doc.getContentLength() > MAX_DOCUMENT_CONTENT_BYTES) {
             LOGGER.warn("Skipping document {}: {} bytes exceeds the {} byte ingest limit",
@@ -205,7 +202,8 @@ final class DocumentIngestor {
         // Null means this node embeds nothing at all; a null return from embedAll means this
         // document could not be embedded and must not be published in part.
         Map<Integer, float[]> embeddings =
-            embeddingClient == null ? null : embedAll(chunks, documentId);
+            embeddingClient == null ? null
+                : stop.interruptibly(() -> embedAll(chunks, documentId));
         if (embeddingClient != null && embeddings == null) {
             return DocumentOutcome.DROPPED;
         }
@@ -222,9 +220,8 @@ final class DocumentIngestor {
             return outcome;
         }
 
-        // Outside the lock: neither reads or writes the registry, the visibility entry or the
-        // chunks, and the graph sink may be slow.
-        trackTermFrequencies(documentKey, chunks);
+        // Outside the lock: it neither reads nor writes the registry, the visibility entry or
+        // the chunks, and the graph sink may be slow.
         graphReporter.report(documentKey, doc);
         return outcome;
     }
@@ -385,6 +382,9 @@ final class DocumentIngestor {
     /**
      * Writes every chunk to the storage engine, recording the keys written so a later failure
      * can undo them.
+     *
+     * <p>Each chunk's terms are worked out once and handed both to the engine, which counts
+     * them into the segment's frequency sketch, and to the membership filter.</p>
      */
     private void writeChunks(String documentKey, List<TextChunk> chunks,
                              Map<Integer, float[]> embeddings, List<String> writtenKeys) {
@@ -394,9 +394,10 @@ final class DocumentIngestor {
             byte[] value = vector == null
                 ? ChunkPayloadCodec.encodeTextOnly(chunk.getText())
                 : ChunkPayloadCodec.encode(chunk.getText(), vector);
+            List<String> terms = chunk.terms();
             long segmentId = storageEngine.putReportingSegment(
-                chunkId.getBytes(StandardCharsets.UTF_8), value);
-            termRecorder.record(segmentId, chunkId, chunk.getText());
+                chunkId.getBytes(StandardCharsets.UTF_8), value, terms);
+            termRecorder.record(segmentId, chunkId, terms);
             writtenKeys.add(chunkId);
         }
     }
@@ -431,6 +432,9 @@ final class DocumentIngestor {
             .sourceId(sourceId)
             .documentId(documentId)
             .lastModifiedMillis(doc.getLastModifiedMillis())
+            // Kept so the next re-crawl can ask the source whether this version is still
+            // current instead of transferring it again to find out.
+            .entityTag(doc.getEntityTag())
             .contentHash(DocumentRegistry.computeContentHash(content))
             .contentLength(content.length)
             .chunkIds(chunkIds)
@@ -500,41 +504,5 @@ final class DocumentIngestor {
             LOGGER.warn("Rolled back document {} stays rankable by vector search: {}",
                 documentKey, e.getMessage());
         }
-    }
-
-    /**
-     * Records the document's terms in the Count-Min Sketch of each chunk's segment, so the query
-     * planner can estimate selectivity.
-     */
-    private void trackTermFrequencies(String documentKey, List<TextChunk> chunks) {
-        if (termFrequencyTracker == null) {
-            return;
-        }
-
-        for (TextChunk chunk : chunks) {
-            String chunkId = ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex());
-            try {
-                Segment segment = segmentFor(chunkId);
-                if (segment != null) {
-                    termFrequencyTracker.trackText(segment, chunk.getText());
-                }
-            } catch (Exception e) {
-                LOGGER.warn("Failed to track term frequencies for chunk {}: {}", chunkId, e.getMessage());
-            }
-        }
-    }
-
-    /**
-     * Resolves the segment a key routes to, using the same arithmetic as
-     * {@code StorageEngine.put} so the LSH index and the sketch land on the segment that
-     * actually holds the entry.
-     */
-    private Segment segmentFor(String chunkId) {
-        int segmentCount = storageEngine.getSegmentCount();
-        if (segmentCount <= 0) {
-            return null;
-        }
-        long keyHash = XxHash64.hash(chunkId.getBytes(StandardCharsets.UTF_8));
-        return storageEngine.getSegment(keyHash & (segmentCount - 1));
     }
 }

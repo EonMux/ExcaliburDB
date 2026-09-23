@@ -12,6 +12,7 @@ import java.util.Set;
 
 import com.eonmux.excalibur.graph.file.Durability;
 import com.eonmux.excalibur.graph.provenance.Provenance;
+import com.eonmux.excalibur.graph.staging.GraphBuilder;
 import com.eonmux.excalibur.graph.store.EdgeStoreWriter;
 import com.eonmux.excalibur.graph.store.MappedEdgeStore;
 
@@ -30,16 +31,25 @@ import org.slf4j.LoggerFactory;
  * means rewriting the store.
  *
  * <h2>How the swap works</h2>
- * The compacted store is built in a sibling directory and moved into place atomically, so the store
- * is never partially replaced. The old mapping is unmapped only after the swap, because a reader
- * mid-query still holds it — closing first would turn every in-flight read into an error, and
- * unmapping while a reader is inside would be worse.
+ * The compacted store is built in a sibling directory and put in place by
+ * {@link GraphBuilder#publish(Path, Path, Durability)}, the move a build publishes by: the served
+ * directory is renamed aside to {@link GraphBuilder#previousFor(Path)}, the replacement is renamed
+ * onto the served name, and the copy set aside is deleted once that name is durable. The old
+ * mapping is unmapped only after the swap, because a reader mid-query still holds it — closing
+ * first would turn every in-flight read into an error, and unmapping while a reader is inside
+ * would be worse.
  *
- * <p>A crash before the move leaves the original untouched and a stray temporary directory, which
- * the next compaction clears before it starts; a crash after it leaves the compacted store, which
- * is the intended outcome. There is no window in which the store is neither. A <em>failure</em>,
- * as opposed to a crash, clears the temporary itself, so an erasure that could not be carried out
- * leaves nothing of itself behind at all.
+ * <p>Sharing the build's protocol is what makes a crash here recoverable. A crash before the first
+ * rename leaves the original untouched and a stray scratch directory, which the next compaction
+ * clears before it starts. A crash between the two renames leaves nothing at the served name and
+ * the whole original beside it, which is the layout
+ * {@link GraphBuilder#recoverInterruptedPublish(Path)} restores at startup - the original, still
+ * holding what was being erased. Obligations are marked discharged only after this returns, so
+ * they are still outstanding, and a node that finds a graph restored applies them again before
+ * serving it. A crash after both renames leaves the compacted store served and the original
+ * beside it, which recovery deletes. A <em>failure</em>, as opposed to a crash, clears the scratch
+ * directory itself, so an erasure that could not be carried out leaves nothing of itself behind
+ * at all.
  *
  * <h2>The directory holds more than the edges</h2>
  * <p>An erasure is not discharged by removing edges. The graph is served out of a directory that
@@ -59,8 +69,8 @@ import org.slf4j.LoggerFactory;
  * <p>Nothing else in this module fsyncs, and rightly: a build whose bytes were still in the page
  * cache when the power failed is a build to run again from the staging log that outlived it. This
  * method has no such fallback, because its last act is to delete the original it replaced. So the
- * replacement is forced to the device, and its name after that, before the retired copy goes — see
- * {@link com.eonmux.excalibur.graph.file.Durability}.
+ * replacement is forced to the device, and its name after that, before the displaced copy goes —
+ * see {@link com.eonmux.excalibur.graph.file.Durability}.
  */
 public final class EdgeStoreCompactor {
 
@@ -69,6 +79,21 @@ public final class EdgeStoreCompactor {
     private static final String TEMP_SUFFIX = ".compacting";
 
     private EdgeStoreCompactor() {
+    }
+
+    /**
+     * The directory a compaction of {@code directory} assembles its replacement in.
+     *
+     * <p>A compaction that completes renames it onto the served name and one that fails deletes
+     * it, so finding it is finding a compaction the process died in the middle of - one whose
+     * obligations are outstanding and whose staging erasure may already have run while the
+     * served graph still holds what it was removing.</p>
+     *
+     * @param directory Where the graph is served from
+     * @return The scratch directory, which exists only while a compaction is assembling
+     */
+    public static Path scratchFor(Path directory) {
+        return directory.resolveSibling(directory.getFileName() + TEMP_SUFFIX);
     }
 
     /**
@@ -231,7 +256,7 @@ public final class EdgeStoreCompactor {
                                 Durability durability) throws IOException {
         long entityCount = store.entityCount();
         long before = store.edgeCount();
-        Path temp = directory.resolveSibling(directory.getFileName() + TEMP_SUFFIX);
+        Path temp = scratchFor(directory);
         deleteRecursively(temp);
         Files.createDirectories(temp);
         try {
@@ -286,19 +311,20 @@ public final class EdgeStoreCompactor {
         Set<String> rebuilt = served.erase(directory, temp, erased);
 
         // Whatever is left. The swap replaces the directory whole, so anything not carried across
-        // here is deleted with the retired copy - and a compaction is the one operation that must
+        // here is deleted with the displaced copy - and a compaction is the one operation that must
         // not lose data, being the one an erasure obligation is discharged by.
         carryOverTree(directory, temp, rebuilt);
 
-        // Forced to the device before anything is renamed, and therefore while the original is
-        // still the store being served. Nothing else this module writes needs it - a build whose
-        // bytes were lost is a build to run again from the staging log - but this method deletes
-        // the retired original at the end, so from that point the replacement is the only copy
-        // there is. A rename that outran its own contents would leave a present descriptor over
-        // short or empty columns, which MappedColumns.open refuses: a graph that will not open,
-        // with nothing to fall back to. A failure here costs the erasure a retry and no data.
-        durability.fsyncTree(temp);
-        swap(directory, temp, durability);
+        // The publish forces the replacement to the device before anything is renamed, and
+        // therefore while the original is still the store being served. It deletes the original
+        // at the end, so from that point the replacement is the only copy there is; a rename
+        // that outran its own contents would leave a present descriptor over short or empty
+        // columns, which MappedColumns.open refuses - a graph that will not open, with nothing
+        // to fall back to. A failure in the forcing costs the erasure a retry and no data.
+        //
+        // The old mapping stays live until the directories have swapped, so a reader mid-query
+        // is reading a store that still exists.
+        GraphBuilder.publish(temp, directory, durability);
 
         store.close();
 
@@ -323,38 +349,6 @@ public final class EdgeStoreCompactor {
         } catch (IOException | RuntimeException e) {
             failure.addSuppressed(e);
         }
-    }
-
-    /**
-     * Moves the replacement onto the served name and destroys the copy it replaced.
-     *
-     * @param directory  where the graph is served from
-     * @param temp       the assembled replacement
-     * @param durability how the published name is forced before the fallback is deleted
-     * @throws IOException if either rename or the sync fails
-     */
-    private static void swap(Path directory, Path temp, Durability durability) throws IOException {
-        // The old mapping stays live until the directories have swapped, so a reader mid-query is
-        // reading a store that still exists.
-        Path retired = directory.resolveSibling(directory.getFileName() + ".retired");
-        deleteRecursively(retired);
-        Files.move(directory, retired, StandardCopyOption.ATOMIC_MOVE);
-        try {
-            Files.move(temp, directory, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException e) {
-            // Put the original back rather than leaving no store at all.
-            Files.move(retired, directory, StandardCopyOption.ATOMIC_MOVE);
-            throw e;
-        }
-
-        // Both renames happened in the parent, and a synced file whose name is not yet durable
-        // can come back with no directory entry pointing at it. Forced before the retired copy is
-        // deleted, so the replacement is reachable by name before the fallback stops existing.
-        Path parent = directory.getParent();
-        if (parent != null) {
-            durability.fsyncDirectory(parent);
-        }
-        deleteRecursively(retired);
     }
 
     /**
@@ -479,7 +473,7 @@ public final class EdgeStoreCompactor {
      *
      * <p>By hard link rather than by move, which is what keeps the crash guarantee the class
      * javadoc makes: the original directory stays complete and readable right up to the atomic
-     * swap, and deleting the retired copy afterwards removes only that copy's names. A filesystem
+     * swap, and deleting the displaced copy afterwards removes only that copy's names. A filesystem
      * that cannot link is copied instead, which costs the bytes and keeps the guarantee.</p>
      *
      * @param source Where the entry lives now

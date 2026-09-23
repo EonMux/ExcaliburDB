@@ -4,6 +4,7 @@ import com.eonmux.excalibur.ingest.graph.LlmRelationExtractor;
 import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.graph.erasure.ErasureScope;
 import com.eonmux.excalibur.graph.erasure.GraphErasureCoordinator;
+import com.eonmux.excalibur.graph.file.Durability;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.staging.GraphBuilder;
 
@@ -11,6 +12,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
@@ -27,6 +30,21 @@ import java.util.concurrent.locks.ReentrantLock;
  * for the whole JVM, and the mappings the old stack holds describe files the compaction has
  * replaced.</p>
  *
+ * <h2>A graph an erasure was interrupted on</h2>
+ * <p>A compaction erases staging first and then publishes the rewritten graph, and a process that
+ * dies in between leaves a graph on disk that still holds what the erasure removes: the original,
+ * untouched or restored by crash recovery, with the obligation still outstanding. Serving it
+ * would answer queries from erased facts for as long as the policy took to call the obligation
+ * due. So a tenant that finds one opens it withheld and calls {@link #finishInterruptedErasure()},
+ * and the graph is served only once a compaction has run over it - on that call, or on the first
+ * later one that succeeds.</p>
+ *
+ * <p>The marker that says so is written before staging loses anything, not when the failure is
+ * noticed, because a crash notices nothing: until the compaction creates its scratch directory
+ * there is otherwise no sign on disk that one was under way. And a compaction that fails, rather
+ * than dies, after staging was erased leaves the graph withheld for the same reason instead of
+ * putting it back in service.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent use. Compactions are serialised against each other; a caller that submits
  * while one is running is not blocked, because recording the obligation is what must not wait.</p>
@@ -40,6 +58,21 @@ public final class GraphErasureService {
     private final GraphErasureCoordinator coordinator;
     private final GraphRagHolder holder;
     private final Config config;
+    private final GraphModelClients models;
+
+    /**
+     * Records on disk that the graph is withheld, or null for a service with nowhere to record
+     * it. See {@link #GraphErasureService(GraphErasureCoordinator, GraphRagHolder, Config,
+     * GraphModelClients, Path)}.
+     */
+    private final Path withheldMarker;
+
+    /**
+     * Whether the graph on disk is deliberately not being served until a compaction has run over
+     * it. Written under the replacement lock; volatile so {@link #servingWithheld()} reads it
+     * without taking that lock.
+     */
+    private volatile boolean withheldForErasure;
 
     /**
      * Creates the service.
@@ -47,12 +80,39 @@ public final class GraphErasureService {
      * @param coordinator Records requests and rewrites the store
      * @param holder      The stack being served, withdrawn around a compaction and reopened after
      * @param config      Read when reopening the stack
+     * @param models      The node's model clients, which the reopened stack reranks and embeds
+     *                    through
      */
     public GraphErasureService(GraphErasureCoordinator coordinator, GraphRagHolder holder,
-                               Config config) {
+                               Config config, GraphModelClients models) {
+        this(coordinator, holder, config, models, null);
+    }
+
+    /**
+     * Creates the service, recording on disk while a graph is withheld for an interrupted erasure.
+     *
+     * <h3>Why the withholding has to outlive the process</h3>
+     * <p>What tells a tenant that an erasure was interrupted - a displaced graph recovery
+     * restores, a compaction's leftover scratch directory - is gone once the first attempt to
+     * finish it has run: recovery has restored the graph, and a failed compaction clears its own
+     * scratch. If that attempt fails and the tenant is then evicted or the node restarts, the
+     * next open would find an ordinary-looking graph and serve it, erased facts and all. So the
+     * withholding is written down before the attempt, beside the obligations it concerns, and
+     * removed only once a compaction has applied them; a tenant that finds it withholds again.</p>
+     *
+     * @param coordinator    Records requests and rewrites the store
+     * @param holder         The stack being served, withdrawn around a compaction and reopened
+     * @param config         Read when reopening the stack
+     * @param models         The node's model clients
+     * @param withheldMarker Where to record that the graph is withheld, or null for nowhere
+     */
+    public GraphErasureService(GraphErasureCoordinator coordinator, GraphRagHolder holder,
+                               Config config, GraphModelClients models, Path withheldMarker) {
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator must not be null");
         this.holder = Objects.requireNonNull(holder, "holder must not be null");
         this.config = Objects.requireNonNull(config, "config must not be null");
+        this.models = Objects.requireNonNull(models, "models must not be null");
+        this.withheldMarker = withheldMarker;
     }
 
     /**
@@ -234,6 +294,102 @@ public final class GraphErasureService {
     }
 
     /**
+     * Applies what is outstanding to a graph an erasure was interrupted on, and then serves it.
+     *
+     * <p>For a tenant that has opened a graph without serving it because a compaction died
+     * part-way through: crash recovery restored the graph the compaction was replacing, or the
+     * compaction's scratch directory was left beside it. Either way the graph may still hold
+     * what an outstanding obligation erases, so it is compacted now, whatever the policy says,
+     * and put in the holder only once that has succeeded.</p>
+     *
+     * <p>A failure leaves the graph unserved and this service remembering so: every later
+     * compaction, the scheduled sweep's included, runs regardless of the policy until one gets
+     * through, and that one serves the graph. Unserved is the right state to fail in - a query
+     * told there is no graph is answered wrongly for a while; one answered from erased facts is
+     * the obligation broken.</p>
+     *
+     * @return What the compaction did
+     * @throws IOException if the compaction fails; the graph stays unserved
+     */
+    public ErasureOutcome finishInterruptedErasure() throws IOException {
+        ReentrantLock lock = holder.replacementLock();
+        lock.lock();
+        try {
+            withheldForErasure = true;
+            recordWithheld();
+            return compact(true);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Records the withholding before a compaction erases staging, and remembers that it did.
+     *
+     * <p>See {@link GraphErasureCoordinator.StagingErasureGuard}. Called with the replacement
+     * lock held, on the compaction's own thread.</p>
+     */
+    private final class StagingGuard implements GraphErasureCoordinator.StagingErasureGuard {
+
+        /** Whether the coordinator reached staging: set once the marker is on disk, just before. */
+        private boolean stagingErased;
+
+        @Override
+        public void beforeStagingErased() throws IOException {
+            recordWithheld();
+            stagingErased = true;
+        }
+    }
+
+    /**
+     * Writes the marker saying the graph is withheld, and makes its name durable.
+     *
+     * @throws IOException if the marker cannot be written; the graph stays withheld regardless
+     */
+    private void recordWithheld() throws IOException {
+        if (withheldMarker == null || Files.exists(withheldMarker)) {
+            return;
+        }
+        Path parent = withheldMarker.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        Files.createFile(withheldMarker);
+        if (parent != null) {
+            Durability.DEVICE.fsyncDirectory(parent);
+        }
+    }
+
+    /**
+     * Removes the marker once the erasure it guarded has been applied.
+     *
+     * <p>A marker that will not go costs the next open an early compaction and nothing else, so
+     * the failure is logged rather than raised over a compaction that succeeded.</p>
+     */
+    private void clearWithheld() {
+        if (withheldMarker == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(withheldMarker);
+        } catch (IOException e) {
+            LOGGER.warn("could not remove {}; the next open of this graph will apply its "
+                + "outstanding erasures again before serving it: {}", withheldMarker,
+                e.toString());
+        }
+    }
+
+    /**
+     * Whether a graph is on disk and deliberately not served until an interrupted erasure has
+     * been applied to it.
+     *
+     * @return true while {@link #finishInterruptedErasure()} has not yet succeeded
+     */
+    public boolean servingWithheld() {
+        return withheldForErasure;
+    }
+
+    /**
      * How many obligations are recorded and not yet discharged.
      *
      * @return The count
@@ -254,16 +410,21 @@ public final class GraphErasureService {
     /**
      * Runs a compaction, closing and reopening the served stack around it.
      *
-     * @param force Whether to skip the policy
+     * <p>A graph withheld for an interrupted erasure is compacted whatever {@code force} says and
+     * is served once the compaction has returned; see {@link #finishInterruptedErasure()}.</p>
+     *
+     * @param requested Whether the caller asked to skip the policy
      * @return What it did
      * @throws IOException if the compaction fails
      */
-    private ErasureOutcome compact(boolean force) throws IOException {
+    private ErasureOutcome compact(boolean requested) throws IOException {
         // The build's lock too: a build publishing while this rewrites the directory, or reading
         // staging while this erases from it, would serve what this is removing.
         ReentrantLock compactionLock = holder.replacementLock();
         compactionLock.lock();
         try {
+            boolean withheld = withheldForErasure;
+            boolean force = requested || withheld;
             java.nio.file.Path directory = holder.directory();
             // A graph an interrupted publish displaced is still a graph holding the facts being
             // erased, and its leftover copy beside a completed one would outlive the erasure.
@@ -276,6 +437,11 @@ public final class GraphErasureService {
                 // that is not. The staging pass is the whole of what this namespace holds.
                 GraphErasureCoordinator.CompactionOutcome outcome =
                     coordinator.eraseStagedOnly(!force);
+                // Nothing on disk is left to withhold.
+                if (withheld) {
+                    withheldForErasure = false;
+                    clearWithheld();
+                }
                 return new ErasureOutcome(outcome.ran(), outcome.edgesRemoved(),
                     outcome.requestsSatisfied(), outcome.requestsWithheld(), outcome.reason());
             }
@@ -294,17 +460,39 @@ public final class GraphErasureService {
             // The compaction rewrites files the served stack maps, so the stack is withdrawn and
             // the queries reading it are let finish before anything is touched.
             boolean wasServing = holder.withdraw();
+            StagingGuard guard = new StagingGuard();
+            boolean completed = false;
             try {
                 GraphErasureCoordinator.CompactionOutcome outcome = force
-                    ? coordinator.compactNow(directory)
-                    : coordinator.compactIfDue(directory);
+                    ? coordinator.compactNow(directory, guard)
+                    : coordinator.compactIfDue(directory, guard);
+                completed = true;
 
                 return new ErasureOutcome(outcome.ran(), outcome.edgesRemoved(),
                     outcome.requestsSatisfied(), outcome.requestsWithheld(), outcome.reason());
             } finally {
-                if (wasServing) {
-                    // Reopened whether the compaction ran or not, and whether it failed or not:
-                    // the node was serving a graph before this and must be serving one after.
+                if (completed && (withheldForErasure || guard.stagingErased)) {
+                    // The erasure that was interrupted, or the one this pass began, has now been
+                    // applied, so what is on disk is what an uninterrupted one would have left.
+                    withheldForErasure = false;
+                    clearWithheld();
+                } else if (!completed && guard.stagingErased) {
+                    // Failed after staging lost what the requests cover and before the served
+                    // graph was rewritten without it - or at least before this could tell that
+                    // it was. The graph on disk may be the last copy of the erased data, so it
+                    // is not reopened: it stays withheld, as the marker the guard wrote says it
+                    // is, until a compaction gets through.
+                    withheldForErasure = true;
+                    LOGGER.error("an erasure compaction of {} failed after erasing staging; the "
+                        + "graph is withheld until a later compaction applies what is still "
+                        + "outstanding", directory);
+                }
+                // Reopened whether the compaction ran or not, and whether it failed or not, when
+                // the node was serving a graph before this and nothing has made it untrustworthy
+                // since: it must be serving one after. A graph withheld for the erasure is
+                // served once it has been applied.
+                boolean servable = completed || !withheldForErasure;
+                if ((wasServing && servable) || (withheld && completed)) {
                     reopen(directory);
                 }
             }
@@ -320,7 +508,7 @@ public final class GraphErasureService {
      */
     private void reopen(java.nio.file.Path directory) {
         try {
-            holder.install(GraphRagFactory.openAt(config, directory));
+            holder.install(GraphRagFactory.openAt(config, directory, models));
         } catch (IOException | RuntimeException e) {
             // The graph is on disk and intact; this node just cannot serve it any more. Saying so
             // is better than leaving a stack mapped over files a compaction replaced.

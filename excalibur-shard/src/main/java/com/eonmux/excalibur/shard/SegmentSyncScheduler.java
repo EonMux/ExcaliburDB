@@ -45,6 +45,9 @@ final class SegmentSyncScheduler {
      */
     static final long MIN_INTERVAL_MS = 250;
 
+    /** How long {@link #shutdown()} waits for a sweep in progress. */
+    private static final long SHUTDOWN_WAIT_MS = 5_000;
+
     private final StorageEngine engine;
     private final SplitWorker.SplitListener observer;
     private final Runnable sweep;
@@ -149,13 +152,35 @@ final class SegmentSyncScheduler {
     }
 
     /**
-     * Shuts the sweep's executor down for good.
+     * Shuts the sweep's executor down for good, waiting for a sweep in progress to finish.
+     *
+     * <p>Waited for, never interrupted. A sweep registers index structures for segments it has
+     * found, which opens their HNSW graphs and maps their files through channels every query of
+     * those graphs then reads; an interrupt landing inside that closes the channel it lands on
+     * and leaves the graph unusable by anyone. A sweep that outlives the wait is reported,
+     * because the caller closes the arena those graphs are mapped from next.</p>
+     *
+     * @return true if no sweep is still running
      */
-    void shutdown() {
+    boolean shutdown() {
         ScheduledExecutorService current = executor;
-        if (current != null) {
-            current.shutdownNow();
+        if (current == null) {
+            return true;
         }
+        current.shutdown();
+        try {
+            if (current.awaitTermination(SHUTDOWN_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                return true;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            if (current.isTerminated()) {
+                return true;
+            }
+        }
+        LOGGER.warn("A segment reconciliation sweep was still registering index structures "
+            + "{}ms after shutdown", SHUTDOWN_WAIT_MS);
+        return false;
     }
 
     /**

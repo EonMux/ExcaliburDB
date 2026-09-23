@@ -92,6 +92,61 @@ final class ToolSchema {
     }
 
     /**
+     * A whole-number property the model may supply, with the least value it may take.
+     *
+     * @param name        The field name
+     * @param description What it is for
+     * @param minimum     The least value accepted
+     * @return The property
+     */
+    static Property optionalInteger(String name, String description, int minimum) {
+        Map<String, Object> schema = propertySchema("integer", description, null);
+        schema.put("minimum", minimum);
+        return new Property(name, schema, false);
+    }
+
+    /**
+     * An array property the model may supply, whose elements are described by a schema of their
+     * own rather than by a bare type.
+     *
+     * @param name        The field name
+     * @param description What the array is for
+     * @param items       The schema one element must satisfy
+     * @return The property
+     */
+    static Property optionalArray(String name, String description, Map<String, Object> items) {
+        Map<String, Object> schema = Json.object();
+        schema.put("type", "array");
+        schema.put("description", description);
+        schema.put("items", items);
+        return new Property(name, schema, false);
+    }
+
+    /**
+     * A schema satisfied by a value of any one of several shapes.
+     *
+     * @param alternatives The shapes, in the order a model should read them
+     * @return The schema
+     */
+    @SafeVarargs
+    static Map<String, Object> anyOf(Map<String, Object>... alternatives) {
+        Map<String, Object> schema = Json.object();
+        schema.put("anyOf", new ArrayList<Object>(List.of(alternatives)));
+        return schema;
+    }
+
+    /**
+     * The schema of a bare value of one JSON type.
+     *
+     * @param type        The JSON type
+     * @param description What the value is
+     * @return The schema
+     */
+    static Map<String, Object> scalar(String type, String description) {
+        return propertySchema(type, description, null);
+    }
+
+    /**
      * An array-of-objects property, with the shape of one element spelled out.
      *
      * <p>A model given a bare {@code array} guesses the field names of what goes in it, and the

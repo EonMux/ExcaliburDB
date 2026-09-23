@@ -16,10 +16,12 @@ import java.util.TreeMap;
  * endpoints only render.</p>
  *
  * <h2>What is optional, and what an absent block means</h2>
- * <p>Six blocks are nullable, and in each case absent is a different statement from zero.
+ * <p>Eleven blocks are nullable, and in each case absent is a different statement from zero.
  * A node with no lexical index is not a node whose index holds nothing; a node with no
  * embedding client has no circuit breaker rather than a closed one; a node that does no
- * relevancy scoring has no relevancy breaker rather than a healthy one; a storage engine
+ * relevancy scoring, no query expansion or no relation extraction has no breaker for it
+ * rather than a healthy one, and neither does one that serves no graph reranked or embedded
+ * through a model, or has built none whose entities were embedded; a storage engine
  * that could not be asked about its vector indexes has not reported that every segment has
  * one; a node running without a query result cache is not one whose cache has never been
  * hit; and a node that serves no graph of its own is not one whose tenants are all idle.</p>
@@ -41,6 +43,19 @@ import java.util.TreeMap;
  *                          runs without one
  * @param graph             The graph tenants, their budget, builds, erasure backlog and what
  *                          ingestion stages into them, or null where this node builds no graph
+ * @param queryExpansionBreaker  The query-expansion breaker's state, or null where this node
+ *                               does not expand queries with a chat model
+ * @param graphExtractionBreaker The relation-extraction breaker's state, or null where this
+ *                               node does not extract facts with a chat model
+ * @param graphRerankBreaker     The state of the breaker every graph on this node reranks
+ *                               through, or null where no graph it has served reranks with a
+ *                               chat model
+ * @param graphQueryEmbeddingBreaker The state of the breaker every graph on this node embeds
+ *                               questions through, or null where no graph it has served has
+ *                               entity vectors to compare a question against
+ * @param graphBuildEmbeddingBreaker The state of the breaker every graph build on this node
+ *                               embeds entities through, or null where no build it has run has
+ *                               embedded an entity
  * @author ExcaliburDB
  */
 public record NodeStats(
@@ -57,8 +72,84 @@ public record NodeStats(
     String embeddingBreaker,
     String llmRelevancyBreaker,
     com.eonmux.excalibur.query.cache.QueryCacheStats queryCache,
-    GraphStats graph
+    GraphStats graph,
+    String queryExpansionBreaker,
+    String graphExtractionBreaker,
+    String graphRerankBreaker,
+    String graphQueryEmbeddingBreaker,
+    String graphBuildEmbeddingBreaker
 ) {
+
+    /**
+     * A snapshot of a node whose graphs rerank and embed through no model.
+     *
+     * <p>Such a node has none of the three graph model breakers, and says so by omission - the same statement
+     * {@code collect()} makes for it.</p>
+     *
+     * @param segments            Segment counts by lifecycle state
+     * @param entries             How much the corpus holds
+     * @param volumes             Disk, as the volume manager or the catalog sees it
+     * @param hnsw                The vector integration queue
+     * @param cuckoo              The membership filters
+     * @param visibility          The epoch and what is visible in it
+     * @param coverage            Share of live segments a query reads, in [0, 1]
+     * @param lexical             The chunk lexical index, or null where this node keeps none
+     * @param vectorIndex         Segments serving without a vector index, or null if unreadable
+     * @param indexerRunning      Whether the worker that drains the HNSW queue is alive
+     * @param embeddingBreaker    The embedding breaker's state, or null where there is none
+     * @param llmRelevancyBreaker The relevancy breaker's state, or null where there is none
+     * @param queryCache          What the query cache has done, or null where there is none
+     * @param graph               The graph half of the node, or null where it builds none
+     * @param queryExpansionBreaker  The query-expansion breaker's state, or null where there is
+     *                               none
+     * @param graphExtractionBreaker The relation-extraction breaker's state, or null where there
+     *                               is none
+     */
+    public NodeStats(SegmentStats segments, EntryStats entries, VolumeStats volumes,
+                     HnswStats hnsw, CuckooStats cuckoo, VisibilityStats visibility,
+                     double coverage, ChunkIndexStats lexical, VectorIndexStats vectorIndex,
+                     boolean indexerRunning, String embeddingBreaker,
+                     String llmRelevancyBreaker,
+                     com.eonmux.excalibur.query.cache.QueryCacheStats queryCache,
+                     GraphStats graph, String queryExpansionBreaker,
+                     String graphExtractionBreaker) {
+        this(segments, entries, volumes, hnsw, cuckoo, visibility, coverage, lexical,
+            vectorIndex, indexerRunning, embeddingBreaker, llmRelevancyBreaker, queryCache, graph,
+            queryExpansionBreaker, graphExtractionBreaker, null, null, null);
+    }
+
+    /**
+     * A snapshot of a node with no chat model behind query expansion or relation extraction.
+     *
+     * <p>Such a node has neither breaker, and says so by omission - the same statement
+     * {@code collect()} makes for it.</p>
+     *
+     * @param segments            Segment counts by lifecycle state
+     * @param entries             How much the corpus holds
+     * @param volumes             Disk, as the volume manager or the catalog sees it
+     * @param hnsw                The vector integration queue
+     * @param cuckoo              The membership filters
+     * @param visibility          The epoch and what is visible in it
+     * @param coverage            Share of live segments a query reads, in [0, 1]
+     * @param lexical             The chunk lexical index, or null where this node keeps none
+     * @param vectorIndex         Segments serving without a vector index, or null if unreadable
+     * @param indexerRunning      Whether the worker that drains the HNSW queue is alive
+     * @param embeddingBreaker    The embedding breaker's state, or null where there is none
+     * @param llmRelevancyBreaker The relevancy breaker's state, or null where there is none
+     * @param queryCache          What the query cache has done, or null where there is none
+     * @param graph               The graph half of the node, or null where it builds none
+     */
+    public NodeStats(SegmentStats segments, EntryStats entries, VolumeStats volumes,
+                     HnswStats hnsw, CuckooStats cuckoo, VisibilityStats visibility,
+                     double coverage, ChunkIndexStats lexical, VectorIndexStats vectorIndex,
+                     boolean indexerRunning, String embeddingBreaker,
+                     String llmRelevancyBreaker,
+                     com.eonmux.excalibur.query.cache.QueryCacheStats queryCache,
+                     GraphStats graph) {
+        this(segments, entries, volumes, hnsw, cuckoo, visibility, coverage, lexical,
+            vectorIndex, indexerRunning, embeddingBreaker, llmRelevancyBreaker, queryCache, graph,
+            null, null);
+    }
 
     /**
      * A snapshot of a node that serves no graph of its own.
@@ -289,10 +380,16 @@ public record NodeStats(
     /**
      * Cuckoo filter statistics.
      *
-     * @param pendingDeletions  Deletions not yet applied to the filters
-     * @param totalDeletions    Deletions applied since startup
-     * @param avgFpRate         Mean false-positive rate across segments
-     * @param maxFpRate         Worst false-positive rate of any segment
+     * <p>Deletions are counted in filter entries - distinct terms, since a filter holds each
+     * term once. A segment's entries become pending when it is tombstoned and are removed by
+     * the maintenance worker's next sweep, which moves them from one count to the other. The
+     * false-positive rates are estimated from each segment filter's load at the time of the
+     * request, over the segments whose filters hold anything; both are 0 when none do.</p>
+     *
+     * @param pendingDeletions  Entries of tombstoned segments not yet removed from the filters
+     * @param totalDeletions    Entries removed since startup
+     * @param avgFpRate         Mean estimated false-positive rate across non-empty segment filters
+     * @param maxFpRate         Worst estimated false-positive rate of any segment filter
      * @param saturated         Whether any filter can take no more
      * @param saturatedSegments How many are in that state
      */

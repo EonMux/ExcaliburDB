@@ -9,6 +9,10 @@
  * <ul>
  *   <li>{@link Source} - Main interface for document sources</li>
  *   <li>{@link FetchedDocument} - Represents a fetched document with content and metadata</li>
+ *   <li>{@link DocumentValidators} - What a source reported about a version, which a re-crawl
+ *       asks {@link Source#fetchIfChanged} about</li>
+ *   <li>{@link TextEncoding} - Settles the encoding of a document's bytes, the same way for
+ *       every source</li>
  *   <li>{@link SourceException} - Base exception for source operations</li>
  *   <li>{@link DocumentNotFoundException} - Exception for missing documents</li>
  * </ul>

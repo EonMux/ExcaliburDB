@@ -74,7 +74,11 @@ final class ResponseAssembler {
             if (error != null) {
                 // Stop the abandoned pipeline: cancelling with an interrupt unblocks
                 // the stage that is running and stops the segment searches and tail
-                // scans it dispatched, which all check the interrupt flag.
+                // scans it dispatched, which all check the interrupt flag. Safe to
+                // interrupt, unlike the storage workers: those threads read graphs, write
+                // logs and segments through memory mappings, which an interrupt cannot
+                // close, and block only on the scoring model's network call - no channel
+                // another thread writes through is ever in their hands.
                 run.task().cancel(true);
                 return handlePipelineError(
                     error, request, durationMs, token, run.partialContext().get());

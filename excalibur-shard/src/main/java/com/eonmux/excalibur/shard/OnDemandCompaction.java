@@ -12,6 +12,7 @@ import java.time.Duration;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 
 /**
  * Compaction an operator asked for, run on the calling thread.
@@ -28,10 +29,19 @@ import java.util.Set;
  * the background loop blocks, then finds the work already done and skips it. Neither caller
  * has to know the other exists.</p>
  *
- * <p>Interruption is the one thing it must observe. The shutdown drain interrupts a run that
- * has outstayed its grace period and then closes the arena every segment is mapped out of, so
- * a run that carried on would be copying entries out of memory being unmapped underneath it -
- * which ends the process rather than raising anything anyone can be told about.</p>
+ * <h2>Stopping</h2>
+ * <p>A run is stopped by the signal its caller hands in, read between segments and before and
+ * between graphs - never by interrupting it. Each rewrite creates, maps, grows and forces files
+ * through channels that the queries and writers after it go on to share, and an interrupt that
+ * reached the run inside one of those operations would close the channel for all of them. So
+ * the shutdown drain asks, waits for the run to reach the next of those points, and closes the
+ * arena every segment is mapped out of only once the run has returned; a run that carried on
+ * past a stop would be copying entries out of memory being unmapped underneath it, which ends
+ * the process rather than raising anything anyone can be told about.</p>
+ *
+ * <p>An interrupt that reaches the thread anyway, from a caller that still sends one, is read
+ * the same way as the signal, so the run leaves at the next safe point rather than starting
+ * more channel work on a thread whose next blocking channel call would close its channel.</p>
  */
 final class OnDemandCompaction {
 
@@ -54,14 +64,18 @@ final class OnDemandCompaction {
     /**
      * Runs one on-demand compaction and reports what it did.
      *
-     * @param force true to compact every live segment and graph regardless of the thresholds
+     * @param force         true to compact every live segment and graph regardless of the
+     *                      thresholds
+     * @param stopRequested Read between segments and before and between graphs; once true the
+     *                      run examines nothing more and reports what it had done
      * @return What the run examined, reclaimed and failed on
      */
-    CompactionReport run(boolean force) {
+    CompactionReport run(boolean force, BooleanSupplier stopRequested) {
+        BooleanSupplier stop = stopOrInterrupt(stopRequested);
         long startNanos = System.nanoTime();
 
-        SegmentCompactionTally segments = compactLiveSegments(force);
-        HnswCompactionWorker.GraphCompactionSummary graphs = compactLiveGraphs(force);
+        SegmentCompactionTally segments = compactLiveSegments(force, stop);
+        HnswCompactionWorker.GraphCompactionSummary graphs = compactLiveGraphs(force, stop);
 
         CompactionReport report = new CompactionReport(
             segments.considered(), segments.compacted(), segments.failed(),
@@ -73,6 +87,16 @@ final class OnDemandCompaction {
     }
 
     /**
+     * The caller's stop signal, or an interrupt of the thread the run is on.
+     *
+     * @param stopRequested The caller's signal
+     * @return A supplier that is true once either has happened
+     */
+    private static BooleanSupplier stopOrInterrupt(BooleanSupplier stopRequested) {
+        return () -> stopRequested.getAsBoolean() || Thread.currentThread().isInterrupted();
+    }
+
+    /**
      * Compacts every distinct live segment the storage engine holds.
      *
      * <p>The engine's directory maps several indices onto one segment after a split, so the
@@ -81,9 +105,10 @@ final class OnDemandCompaction {
      * already closed.</p>
      *
      * @param force true to rewrite regardless of the thresholds
+     * @param stop  Read before each segment
      * @return The counts for the segment half of the run
      */
-    private SegmentCompactionTally compactLiveSegments(boolean force) {
+    private SegmentCompactionTally compactLiveSegments(boolean force, BooleanSupplier stop) {
         CompactionWorker worker = workers.segmentCompaction();
         Set<Segment> live = Collections.newSetFromMap(new IdentityHashMap<>());
         live.addAll(engine.getSegments().values());
@@ -95,13 +120,13 @@ final class OnDemandCompaction {
         int compacted = 0;
         int failed = 0;
         for (Segment segment : live) {
-            if (Thread.currentThread().isInterrupted()) {
-                // The thread a forced run is on is interrupted by the shutdown path, which then
-                // closes the arena every segment is mapped out of. Carrying on past that point
-                // copies entries out of memory that is being unmapped, which ends the process
-                // rather than raising anything a caller could be told about.
-                LOGGER.warn("On-demand compaction was interrupted after {} of {} segment(s); the "
-                    + "rest are left to the background worker", compacted + failed, live.size());
+            if (stop.getAsBoolean()) {
+                // Between two rewrites is where stopping is safe: the last one has published or
+                // failed, and the next has not opened a file. The shutdown path waits for this
+                // return before closing the arena every segment is mapped out of.
+                LOGGER.warn("On-demand compaction was asked to stop after {} of {} segment(s); "
+                    + "the rest are left to the background worker", compacted + failed,
+                    live.size());
                 break;
             }
             try {
@@ -140,23 +165,25 @@ final class OnDemandCompaction {
     }
 
     /**
-     * Rebuilds the registered HNSW graphs, unless the run has already been interrupted.
+     * Rebuilds the registered HNSW graphs, unless the run has already been asked to stop.
      *
      * <p>A graph rebuild is as long-running as a segment rewrite and maps out of the same
-     * arena, so an interrupt has to be observed before the second half of a run starts and not
-     * only between the segments of the first. Nothing is examined after an interrupt, which is
-     * why this reports none considered rather than a count of graphs it skipped.</p>
+     * arena, so a stop has to be observed before the second half of a run starts and between
+     * its graphs, not only between the segments of the first. Nothing is examined after a stop,
+     * which is why graphs not reached are not counted as considered.</p>
      *
      * @param force true to rebuild every registered graph regardless of its tombstone ratio
+     * @param stop  Read before the first graph and between graphs
      * @return The counts for the graph half of the run
      */
-    private HnswCompactionWorker.GraphCompactionSummary compactLiveGraphs(boolean force) {
-        if (Thread.currentThread().isInterrupted()) {
-            LOGGER.warn("On-demand compaction was interrupted before the HNSW graphs were "
+    private HnswCompactionWorker.GraphCompactionSummary compactLiveGraphs(boolean force,
+                                                                        BooleanSupplier stop) {
+        if (stop.getAsBoolean()) {
+            LOGGER.warn("On-demand compaction was asked to stop before the HNSW graphs were "
                 + "examined; none were rebuilt");
             return new HnswCompactionWorker.GraphCompactionSummary(0, 0, 0);
         }
-        return workers.graphCompaction().compactNow(force);
+        return workers.graphCompaction().compactNow(force, stop);
     }
 
     /**

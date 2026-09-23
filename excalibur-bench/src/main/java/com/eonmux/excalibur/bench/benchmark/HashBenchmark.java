@@ -302,6 +302,7 @@ public class HashBenchmark {
      * Measures throughput when hashing multiple keys.
      */
     @Benchmark
+    @OperationsPerInvocation(10)
     public int batchHash10(Blackhole bh) {
         int startIdx = nextBatchStartIndex(10);
         int count = 0;
@@ -318,6 +319,7 @@ public class HashBenchmark {
      * Measures throughput when hashing many keys.
      */
     @Benchmark
+    @OperationsPerInvocation(100)
     public int batchHash100(Blackhole bh) {
         int startIdx = nextBatchStartIndex(100);
         int count = 0;
@@ -333,6 +335,7 @@ public class HashBenchmark {
      * Measures throughput for large batch operations.
      */
     @Benchmark
+    @OperationsPerInvocation(1000)
     public int batchHash1000(Blackhole bh) {
         int startIdx = nextBatchStartIndex(1000);
         int count = 0;

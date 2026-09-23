@@ -244,21 +244,31 @@ public class SegmentLifecycleManager implements AutoCloseable {
     }
 
     /**
-     * Stops the lifecycle manager.
+     * Stops the lifecycle manager and says whether a check in progress ended.
+     *
+     * <p>A check is waited for and never interrupted. It moves segments through the catalog,
+     * which writes the catalog to disk, and purges reclaimable segments, which closes their
+     * files and deletes them; an interrupt landing inside one of those writes fails it with the
+     * transition half-recorded, and gains nothing, because a check holds no wait an interrupt
+     * could cut short. A check that outlives the wait is reported, since the caller closes the
+     * storage the check is working on next.</p>
+     *
+     * @return true if no lifecycle check is still running
      */
-    public void stop() {
+    public boolean stop() {
         if (running.compareAndSet(true, false)) {
             scheduler.shutdown();
             try {
                 if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                    scheduler.shutdownNow();
+                    logger.warn("A segment lifecycle check was still running 5s after the "
+                        + "manager was asked to stop");
                 }
             } catch (InterruptedException e) {
-                scheduler.shutdownNow();
                 Thread.currentThread().interrupt();
             }
             logger.info("SegmentLifecycleManager stopped");
         }
+        return !scheduler.isShutdown() || scheduler.isTerminated();
     }
 
     @Override

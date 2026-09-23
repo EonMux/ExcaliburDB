@@ -27,7 +27,9 @@ import java.util.concurrent.TimeUnit;
  *
  * <h2>Performance Target</h2>
  * <p>Tail scan should process entries at high throughput (millions/sec) since
- * it's a simple linear scan with distance computation.</p>
+ * it's a simple linear scan with distance computation. One operation is one scan of the
+ * whole tail, so the per-entry rate is the score times {@code tailSize}; the target registry
+ * gates it in entries/sec on that basis.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
@@ -52,6 +54,7 @@ import java.util.concurrent.TimeUnit;
 @Fork(value = 1, jvmArgsAppend = {
     "--enable-preview",
     "--enable-native-access=ALL-UNNAMED",
+    "--add-modules=jdk.incubator.vector",
     "-Xms2g",
     "-Xmx2g"
 })
@@ -235,34 +238,6 @@ public class TailScanBenchmark {
             totalResults += results.size();
         }
         return totalResults;
-    }
-
-    /**
-     * Benchmark: Tail scan throughput per entry.
-     * Reports throughput normalized to entries scanned.
-     */
-    @Benchmark
-    @OperationsPerInvocation(100)
-    public int tailScan_entryThroughput(Blackhole bh) {
-        // Scan 100 entries at a time (simulated)
-        int entriesProcessed = 0;
-        long chunkSize = (endOffset - startOffset) / 100;
-
-        for (int i = 0; i < 100; i++) {
-            long chunkStart = startOffset + i * chunkSize;
-            long chunkEnd = Math.min(chunkStart + chunkSize, endOffset);
-
-            List<HnswSearchResult> results = tailScanner.performTailScan(
-                queryVector,
-                writeLog,
-                chunkStart,
-                chunkEnd,
-                k,
-                distanceFunction
-            );
-            entriesProcessed += results.size();
-        }
-        return entriesProcessed;
     }
 
     // ==================== Helper Methods ====================

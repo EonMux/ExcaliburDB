@@ -7,6 +7,7 @@ import com.eonmux.excalibur.query.QueryRequest;
 import com.eonmux.excalibur.query.QueryResponse;
 import com.eonmux.excalibur.query.QueryResultItem;
 import com.eonmux.excalibur.query.executor.CancellationToken;
+import com.eonmux.excalibur.query.executor.ExecutorDrain;
 import com.eonmux.excalibur.query.executor.ParallelQueryDispatcher;
 import com.eonmux.excalibur.query.executor.PqSearchSettings;
 import com.eonmux.excalibur.query.payload.ResultPayloadResolver;
@@ -129,12 +130,11 @@ public class QueryPipeline {
     private final CorpusFingerprint corpusFingerprint;
 
     /**
-     * How long {@link #shutdown()} lets in-flight queries finish, and then how long it waits
-     * after interrupting them.
+     * How long {@link #shutdown()} lets in-flight queries finish.
      *
-     * <p>Short, because a node that is stopping has to stop. Long enough that a query already
-     * assembling its response returns it rather than being turned into a failure a fraction of
-     * a second before it would have succeeded.</p>
+     * <p>Short, because a node that is stopping has to stop, and the queries have deadlines of
+     * their own. Past it the queries are not interrupted but reported: {@code shutdown()}
+     * answers false and the caller keeps the storage they read through open.</p>
      */
     private static final long SHUTDOWN_GRACE_MILLIS = 5_000;
 
@@ -393,6 +393,13 @@ public class QueryPipeline {
     private ParallelQueryDispatcher getDispatcher() {
         if (dispatcher == null) {
             synchronized (this) {
+                // Under the lock shutdown() sets its flag in, so a query still running when the
+                // pipeline is shut down cannot create a dispatcher - and threads - after shutdown()
+                // has looked for one to stop.
+                if (shutdown.get()) {
+                    throw new java.util.concurrent.RejectedExecutionException(
+                        "QueryPipeline has been shut down");
+                }
                 if (dispatcher == null) {
                     dispatcher = new ParallelQueryDispatcher(
                         storageEngine.getCatalog(),
@@ -504,71 +511,61 @@ public class QueryPipeline {
     }
 
     /**
-     * Shuts down the query pipeline and releases resources.
+     * Stops taking queries and waits for the ones already running.
      *
-     * <p>This method shuts down the internal parallel query dispatcher,
-     * which terminates the virtual thread executor used for parallel
-     * segment searches.</p>
+     * <p>Queries are refused from the moment this is called. The pipeline's own threads and the
+     * dispatcher's segment searches are then each given {@link #SHUTDOWN_GRACE_MILLIS} to
+     * finish. Neither is interrupted: a query most of the way through has a partial answer worth
+     * returning, and interrupting every query at once cannot make a thread that is inside a
+     * mapped read leave any sooner - {@link ExecutorDrain} has the whole argument. What an
+     * interrupt is still used for is abandoning one query that failed or timed out, which
+     * {@code ResponseAssembler} does.</p>
      *
-     * <p>After calling shutdown(), the pipeline should not be used for
-     * query execution.</p>
+     * <p>Whoever calls this goes on to close the storage engine these threads read through, so
+     * the answer is the point: false means a query is still reading and the engine must stay
+     * open.</p>
+     *
+     * <p>Idempotent. A second call waits again for anything the first left running.</p>
+     *
+     * @return true if every query thread this pipeline started has stopped
      */
-    public void shutdown() {
+    public boolean shutdown() {
         // Set first, and under the same lock the lazy creation takes, so a query racing this
         // either creates its executor before the stop below finds it or is refused outright.
         synchronized (this) {
             shutdown.set(true);
         }
+        boolean searchesStopped = true;
         try {
             if (dispatcher != null) {
-                dispatcher.shutdown();
+                searchesStopped = dispatcher.shutdown();
             }
         } finally {
             // In a finally, because the executor is the half that owns threads. Shutting the
             // dispatcher down first is the right order - it is what submits the work - but with
             // this outside a finally a dispatcher that failed on the way down left a pool of
             // pipeline threads running for the life of the process.
-            stopPipelineExecutor();
+            boolean pipelineStopped = stopPipelineExecutor();
+            searchesStopped = searchesStopped && pipelineStopped;
         }
+        return searchesStopped;
     }
 
     /**
      * Stops the executor queries run on, and waits for them.
      *
-     * <p>Asked first and insisted on second. A query that is most of the way through has a
-     * partial answer worth returning, and interrupting it outright turns an answer the caller
-     * was about to receive into a failure - which is the wrong trade for the fraction of a
-     * second it saves. The grace is small and bounded, because a node that is stopping has to
-     * stop; past it the threads are interrupted.</p>
-     *
-     * <p>Both waits are awaited rather than assumed. Whoever calls {@code shutdown()} goes on to
-     * close the storage engine these threads read through, so returning before they have stopped
-     * is what turns an orderly shutdown into reads against a closed engine.</p>
+     * @return true if the executor was never created or has terminated
      */
-    private void stopPipelineExecutor() {
+    private boolean stopPipelineExecutor() {
         ExecutorService executor = pipelineExecutor;
         if (executor == null) {
-            return;
+            return true;
         }
-        executor.shutdown();
-        try {
-            if (executor.awaitTermination(SHUTDOWN_GRACE_MILLIS, TimeUnit.MILLISECONDS)) {
-                LOGGER.debug("QueryPipeline shutdown complete");
-                return;
-            }
-            executor.shutdownNow();
-            if (!executor.awaitTermination(SHUTDOWN_GRACE_MILLIS, TimeUnit.MILLISECONDS)) {
-                // Said out loud: the caller is about to close resources these threads are still
-                // reading through, and silence here is what makes that look like a storage bug.
-                LOGGER.warn("QueryPipeline threads did not stop within {}ms of being interrupted",
-                    SHUTDOWN_GRACE_MILLIS);
-            }
-        } catch (InterruptedException e) {
-            // Restore the flag: swallowing it leaves the thread that is shutting the node down
-            // unable to observe that it was itself interrupted.
-            executor.shutdownNow();
-            Thread.currentThread().interrupt();
+        boolean stopped = ExecutorDrain.drain(executor, SHUTDOWN_GRACE_MILLIS, "Query pipeline threads");
+        if (stopped) {
+            LOGGER.debug("QueryPipeline shutdown complete");
         }
+        return stopped;
     }
 
     /**

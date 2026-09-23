@@ -31,15 +31,22 @@ public final class RestoreCommand {
      * @param arguments The parsed command line
      * @param out       Where to report
      * @return Always {@link ExitCode#OK}; every refusal is thrown
-     * @throws UsageException if a required option is missing
+     * @throws UsageException if a required option is missing, or --target is inside
+     *                        --snapshot
      * @throws IOException    if the image does not verify, the target is occupied, or a
      *                        file cannot be read or written
      */
     public static ExitCode execute(Arguments arguments, PrintStream out)
         throws UsageException, IOException {
-        RestoreOptions options = new RestoreOptions(arguments.requiredPath("snapshot"),
-            arguments.requiredPath("target"), arguments.flag("force"),
-            arguments.flag("deep") ? VerifyDepth.DEEP : VerifyDepth.CHECKSUM);
+        RestoreOptions options;
+        try {
+            options = new RestoreOptions(arguments.requiredPath("snapshot"),
+                arguments.requiredPath("target"), arguments.flag("force"),
+                arguments.flag("deep") ? VerifyDepth.DEEP : VerifyDepth.CHECKSUM);
+        } catch (IllegalArgumentException e) {
+            // The two paths contradict each other: a line to correct, not a failure.
+            throw new UsageException(e.getMessage());
+        }
         RestoreResult result = new SnapshotRestorer().restore(options);
         out.printf("restored   %s%n", result.target());
         out.printf("  from     %s (%s)%n", options.snapshotDir(),

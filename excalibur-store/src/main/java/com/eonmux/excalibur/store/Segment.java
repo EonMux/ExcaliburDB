@@ -206,9 +206,9 @@ public class Segment implements AutoCloseable {
     volatile com.eonmux.excalibur.filter.lsh.LshIndex lshIndex;
 
     /**
-     * Approximate term frequencies, populated during ingestion. Answers a selectivity question
-     * in constant time with bounded error, which is what lets the planner order filters and
-     * prioritise segments without exact counts.
+     * Approximate term frequencies of the chunk text written here, counted on every applied put
+     * and kept on disk beside the segment; see {@link SegmentTermSketch}. The query pipeline
+     * orders a query's candidate segments by it.
      */
     volatile com.eonmux.excalibur.filter.sketch.CountMinSketch termFrequencySketch;
 
@@ -256,6 +256,9 @@ public class Segment implements AutoCloseable {
 
     /** Opening, recovering and closing the backing file. */
     final SegmentFile file = new SegmentFile(this);
+
+    /** The term-frequency sketch's counting and its sidecar file. */
+    final SegmentTermSketch terms = new SegmentTermSketch(this);
 
     // ==================== Constructors ====================
 
@@ -319,6 +322,11 @@ public class Segment implements AutoCloseable {
         this.dataOffset = format.firstEntryOffset();
 
         slots.clearSlotTable();
+
+        // The file was just created empty, so any sidecar at its name describes a file that no
+        // longer exists; the sketch starts empty with it and counts every write from here.
+        TermSketchFile.deleteFor(path);
+        this.termFrequencySketch = SegmentTermSketch.newSketch();
     }
 
     /**
@@ -426,6 +434,21 @@ public class Segment implements AutoCloseable {
      */
     public void put(byte[] key, byte[] value) {
         mutations.put(key, value);
+    }
+
+    /**
+     * Inserts or updates a key-value pair whose chunk-text terms are already hashed.
+     *
+     * <p>{@link #put(byte[], byte[])} for a caller that hashed the terms once for several
+     * attempts, so that neither the tokenising nor the hashing is repeated or done under the
+     * write lock. See {@link SegmentTermSketch}.</p>
+     *
+     * @param key        The key (must not be null)
+     * @param value      The value (must not be null)
+     * @param termHashes {@link SegmentTermSketch#termHashes(byte[])} of the value
+     */
+    void put(byte[] key, byte[] value, long[] termHashes) {
+        mutations.put(key, value, termHashes);
     }
 
     /**
@@ -607,11 +630,16 @@ public class Segment implements AutoCloseable {
     }
 
     /**
-     * Flushes all changes to disk.
+     * Flushes all changes to disk, and writes the term-frequency sketch beside them.
+     *
+     * <p>The sketch goes to its sidecar only for a segment that owns its name - one with a write
+     * log attached - and only if it has changed since it was last written; see
+     * {@link SegmentTermSketch}.</p>
      */
     public void flush() {
         validateNotClosed();
         segment.force();
+        terms.persist();
     }
 
     /**
@@ -700,6 +728,10 @@ public class Segment implements AutoCloseable {
      * <p>For throughput paths that cache hashes; the caller is responsible for the hash
      * matching the key, and {@link #hashKey(byte[])} is what produces it.</p>
      *
+     * <p>Reads the live mapping even while the segment is splitting, and finds what
+     * {@link #get(byte[])} finds: the split snapshot is a view of these same bytes, and no
+     * write can reach a splitting segment.</p>
+     *
      * @param key     The key to look up (must not be null)
      * @param keyHash Pre-computed hash of the key
      * @return A slice holding the value, or null if absent
@@ -715,6 +747,10 @@ public class Segment implements AutoCloseable {
      * <p><strong>The caller must already hold {@link #readLock()}.</strong> The shortest
      * lookup path there is, for benchmarks and batch work that manage concurrency
      * themselves.</p>
+     *
+     * <p>Reads the live mapping even while the segment is splitting, and finds what
+     * {@link #get(byte[])} finds: the split snapshot is a view of these same bytes, and no
+     * write can reach a splitting segment.</p>
      *
      * @param key     The key to look up (must not be null)
      * @param keyHash Pre-computed hash of the key
@@ -742,6 +778,10 @@ public class Segment implements AutoCloseable {
     /**
      * Looks up many keys under one acquisition of the read lock.
      *
+     * <p>Reads the live mapping even while the segment is splitting, and finds what
+     * {@link #get(byte[])} finds: the split snapshot is a view of these same bytes, and no
+     * write can reach a splitting segment.</p>
+     *
      * @param keys   Keys to look up
      * @param hashes Their pre-computed hashes, positionally matched to {@code keys}
      * @return One slice per key, null where the key is absent
@@ -760,6 +800,7 @@ public class Segment implements AutoCloseable {
      *
      * @param key   The key (must not be null)
      * @param value The value (must not be null)
+     * @throws SegmentRetiredException  if the segment was replaced by its split children
      * @throws IllegalStateException    if the segment is closed, splitting, or full
      * @throws IllegalArgumentException if key or value is null, or too large
      * @see #writeLock()
@@ -775,7 +816,8 @@ public class Segment implements AutoCloseable {
      *
      * @param key The key to delete
      * @return true if the key was found and deleted, false if not found
-     * @throws IllegalStateException if segment is closed
+     * @throws SegmentRetiredException  if the segment was replaced by its split children
+     * @throws IllegalStateException    if the segment is closed or splitting
      * @throws IllegalArgumentException if key is null
      * @see #writeLock()
      */
@@ -974,10 +1016,12 @@ public class Segment implements AutoCloseable {
     }
 
     /**
-     * Attaches the term-frequency sketch the query planner estimates selectivity from.
+     * Replaces the term-frequency sketch the query pipeline orders segments by.
      *
-     * <p>It is what lets the planner prioritise or skip a segment and order its filters
-     * without exact counts.</p>
+     * <p>A segment created by this build starts with an empty sketch and a reopened one is given
+     * its sketch by the engine once its log has been replayed, so this is for a caller that has
+     * built the counts some other way. Every write applied after it is counted into the sketch
+     * attached here.</p>
      *
      * @param sketch The Count-Min Sketch to attach (must not be null)
      * @throws NullPointerException if sketch is null
@@ -990,13 +1034,35 @@ public class Segment implements AutoCloseable {
         lock.writeLock().lock();
         try {
             this.termFrequencySketch = sketch;
+            terms.sketchReplaced();
         } finally {
             lock.writeLock().unlock();
         }
     }
 
     /**
-     * Returns the approximate term frequencies of what has been ingested here.
+     * Gives up the term-frequency sketch, so this segment neither counts into it nor writes it.
+     *
+     * <p>For a segment another one has replaced under the same name - a compacted original, a
+     * split parent. Its {@link #close()} would otherwise write its sketch over the sidecar the
+     * replacement owns.</p>
+     *
+     * @return The sketch that was attached, or null if there was none
+     */
+    public com.eonmux.excalibur.filter.sketch.CountMinSketch detachTermFrequencySketch() {
+        lock.writeLock().lock();
+        try {
+            com.eonmux.excalibur.filter.sketch.CountMinSketch detached = this.termFrequencySketch;
+            this.termFrequencySketch = null;
+            terms.sketchReplaced();
+            return detached;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Returns the approximate term frequencies of what this segment holds.
      *
      * @return The Count-Min Sketch, or null if none is attached
      */
@@ -1435,6 +1501,12 @@ public class Segment implements AutoCloseable {
      * why a caller should iterate promptly and close on every path. Each entry is returned
      * exactly once, and tombstoned ones are included only if the factory method asked for
      * them.</p>
+     *
+     * <p>An entry that fails verification is reported by {@link #hasNext()} or {@link #next()}
+     * throwing {@link CorruptSegmentEntryException}, and the walk has already moved past it
+     * when they do. A caller that must not copy damage forward stops there; one that can do
+     * without the entry - a derived index being rebuilt - catches it and carries on, and the
+     * next call resumes at the slot after the damaged one.</p>
      *
      * <p><strong>Thread safety:</strong> one thread per iterator.</p>
      *

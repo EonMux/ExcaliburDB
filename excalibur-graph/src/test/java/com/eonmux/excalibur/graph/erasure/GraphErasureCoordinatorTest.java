@@ -740,6 +740,74 @@ class GraphErasureCoordinatorTest {
                 .doesNotContain("Jane Doe");
         }
 
+        @Test
+        @DisplayName("the guard hears of it before staging is erased, and a refusal leaves "
+            + "staging whole")
+        void theGuardComesFirst(@TempDir Path dir) throws IOException {
+            // Staging is erased ahead of the served graph, so between the two the graph is the
+            // only copy of what is being erased. Whoever serves it has to be able to say so on
+            // disk before that gap opens - and, when it cannot, to keep the gap from opening.
+            Path graphDir = dir.resolve("graph");
+            try (com.eonmux.excalibur.graph.staging.GraphStagingStore staging =
+                     com.eonmux.excalibur.graph.staging.GraphStagingStore.open(dir.resolve("staging"));
+                 ErasureLog log = ErasureLog.open(dir.resolve("requests.log"))) {
+                int alice = staging.entityIdOf("alice");
+                staging.entityIdOf("bob");
+                staging.append(new com.eonmux.excalibur.graph.staging.ExtractedTriple(
+                    "alice", "knows", "bob", Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    new Provenance(SourceType.DOCUMENT, 555, 90, 1)));
+                staging.flush();
+                writeStore(graphDir, staging);
+
+                GraphErasureCoordinator coordinator =
+                    new GraphErasureCoordinator(log, ALWAYS, CLOCK, staging);
+                coordinator.submit(new ErasureScope.Entity(alice));
+
+                org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                        coordinator.compactNow(graphDir, () -> {
+                            throw new IOException("marker directory is read-only");
+                        }))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("read-only");
+                assertThat(staging.stagedCount())
+                    .as("a guard that cannot record the gap keeps it from opening")
+                    .isEqualTo(1);
+                assertThat(coordinator.outstandingCount()).isEqualTo(1);
+
+                List<Long> stagedWhenTold = new ArrayList<>();
+                coordinator.compactNow(graphDir, () -> stagedWhenTold.add(staging.stagedCount()));
+
+                assertThat(stagedWhenTold)
+                    .as("told once, while staging still held the fact")
+                    .containsExactly(1L);
+                assertThat(staging.stagedCount()).isZero();
+                assertThat(coordinator.outstandingCount()).isZero();
+            }
+        }
+
+        @Test
+        @DisplayName("the guard is not told when nothing is outstanding")
+        void noGuardWithNothingOwed(@TempDir Path dir) throws IOException {
+            Path graphDir = dir.resolve("graph");
+            try (com.eonmux.excalibur.graph.staging.GraphStagingStore staging =
+                     com.eonmux.excalibur.graph.staging.GraphStagingStore.open(dir.resolve("staging"));
+                 ErasureLog log = ErasureLog.open(dir.resolve("requests.log"))) {
+                staging.append(new com.eonmux.excalibur.graph.staging.ExtractedTriple(
+                    "alice", "knows", "bob", Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    new Provenance(SourceType.DOCUMENT, 555, 90, 1)));
+                staging.flush();
+                writeStore(graphDir, staging);
+                GraphErasureCoordinator coordinator =
+                    new GraphErasureCoordinator(log, ALWAYS, CLOCK, staging);
+
+                coordinator.compactIfDue(graphDir, () -> {
+                    throw new AssertionError("staging is not about to be erased");
+                });
+
+                assertThat(staging.stagedCount()).isEqualTo(1);
+            }
+        }
+
         private void writeStore(Path graphDir, com.eonmux.excalibur.graph.staging.GraphStagingStore staging)
                 throws IOException {
             EdgeStoreWriter writer = new EdgeStoreWriter();

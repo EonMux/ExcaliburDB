@@ -1,7 +1,7 @@
 package com.eonmux.excalibur.bench.benchmark;
 
+import com.eonmux.excalibur.bench.kernel.EmbeddingCorpus;
 import com.eonmux.excalibur.bench.kernel.RecallComputation;
-import com.eonmux.excalibur.bench.kernel.Vectors;
 import com.eonmux.excalibur.bench.metric.RecallValidator;
 import com.eonmux.excalibur.vector.distance.DistanceFunction;
 import com.eonmux.excalibur.vector.distance.L2Distance;
@@ -32,6 +32,15 @@ import java.util.concurrent.TimeUnit;
  * <h2>Performance Target</h2>
  * <p>Target: ≥99% recall@10 with default configuration (M=16, efConstruction=200, efSearch=200)</p>
  *
+ * <h2>Corpus</h2>
+ * <p>Corpus and queries are drawn from one {@link EmbeddingCorpus} - a clustered mixture with
+ * a few dozen directions of variance, the shape learned embeddings have and the data the
+ * guarantee is stated for. Isotropic random vectors are not used: their intrinsic dimension
+ * equals the ambient one, and on them a textbook HNSW at this configuration misses the target
+ * at 128 dimensions whatever its implementation, so the gate would measure the data. The
+ * clustering matters too: it is what fails a graph whose edges never leave a cluster, which
+ * isotropic data cannot detect.</p>
+ *
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Recall values in range [0.0, 1.0]</li>
@@ -39,6 +48,12 @@ import java.util.concurrent.TimeUnit;
  *   <li>Dataset sizes: 1K, 10K, 100K vectors</li>
  *   <li>Distance values non-negative for L2</li>
  * </ul>
+ *
+ * <h2>Units</h2>
+ * <p>Every score is milliseconds per <em>search</em>. {@link #searchLatency} runs one search
+ * per invocation; {@link #searchThroughput} and {@link #recallAndThroughput} run a hundred and
+ * declare it with {@code @OperationsPerInvocation}; {@link #measureRecall} is the exception,
+ * one invocation being the whole query set, and carries no target.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>JMH handles thread safety for benchmark execution. The HnswGraph being tested
@@ -96,6 +111,9 @@ public class HnswRecallBenchmark {
     private float[][] queries;
     private int queryCount = 100;
 
+    // Next query searchLatency issues, cycling through the query set
+    private int nextLatencyQuery;
+
     // Pre-computed ground truth for recall calculation
     // Indexed by query index, contains the true top-K node IDs
     private List<List<Long>> groundTruth;
@@ -127,18 +145,10 @@ public class HnswRecallBenchmark {
         // Create graph
         graph = new HnswGraph(tempFile, config, distanceFunction, datasetSize * 2);
 
-        // Generate random dataset with fixed seed for reproducibility
-        Random random = new Random(42);
-        dataset = new float[datasetSize][dimension];
-
+        // One mixture for corpus and queries; distinct draws, so no query is a corpus point
+        EmbeddingCorpus corpus = EmbeddingCorpus.create(7L, dimension);
         System.out.println("Generating " + datasetSize + " vectors with dimension " + dimension + "...");
-        for (int i = 0; i < datasetSize; i++) {
-            for (int d = 0; d < dimension; d++) {
-                dataset[i][d] = (float) random.nextGaussian();
-            }
-            // Normalize vectors for more meaningful distances
-            dataset[i] = Vectors.normalized(dataset[i]);
-        }
+        dataset = corpus.sample(new Random(42), datasetSize);
 
         // Insert vectors into graph
         System.out.println("Inserting vectors into HNSW graph (efConstruction=" +
@@ -147,16 +157,8 @@ public class HnswRecallBenchmark {
             graph.insert(dataset[i]);
         }
 
-        // Generate query vectors (different from dataset)
         System.out.println("Generating " + queryCount + " query vectors...");
-        random = new Random(123); // Different seed for queries
-        queries = new float[queryCount][dimension];
-        for (int i = 0; i < queryCount; i++) {
-            for (int d = 0; d < dimension; d++) {
-                queries[i][d] = (float) random.nextGaussian();
-            }
-            queries[i] = Vectors.normalized(queries[i]);
-        }
+        queries = corpus.sample(new Random(123), queryCount);
 
         // Compute ground truth via brute force
         System.out.println("Computing ground truth via brute force...");
@@ -297,12 +299,13 @@ public class HnswRecallBenchmark {
     }
 
     /**
-     * Benchmark: Measure search latency (time per query).
+     * Benchmark: Measure search latency - one search per operation, so the score is the time
+     * of a single query, the unit the registered latency target is stated in.
      */
     @Benchmark
     public List<HnswSearchResult> searchLatency(Blackhole bh) {
-        // Use round-robin through queries
-        int queryIdx = (int) (System.nanoTime() % queryCount);
+        int queryIdx = nextLatencyQuery;
+        nextLatencyQuery = (queryIdx + 1) % queryCount;
         return graph.search(queries[queryIdx], K);
     }
 

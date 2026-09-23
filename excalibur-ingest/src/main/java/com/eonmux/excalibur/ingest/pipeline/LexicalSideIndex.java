@@ -12,6 +12,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.BooleanSupplier;
 
 /**
  * The BM25 index kept alongside the chunks ingestion writes.
@@ -131,15 +132,25 @@ final class LexicalSideIndex {
      * the index has just changed, and a node that is not ingesting is not accumulating anything to
      * reclaim. The usual outcome is that nothing is due, which costs a comparison of four
      * numbers.</p>
+     *
+     * <p>A compaction that is due can rewrite many segments, and the run it belongs to may be
+     * stopped - or the node shut down - while it does. It reads {@code stopRequested} where it
+     * can end without publishing anything half-done, and is never interrupted instead: the
+     * index's files are channels every query shares, and an interrupt reaching the rewrite would
+     * close them.</p>
+     *
+     * @param stopRequested Answers true once the compaction should end without publishing
      */
-    void compactIfDue() {
+    void compactIfDue(BooleanSupplier stopRequested) {
+        Objects.requireNonNull(stopRequested, "stopRequested cannot be null");
         ChunkIndex target = this.index;
         if (target == null) {
             return;
         }
         try {
             long started = System.currentTimeMillis();
-            CompactionResult result = target.compactIfDue(StoredChunkText.of(storageEngine));
+            CompactionResult result =
+                target.compactIfDue(StoredChunkText.of(storageEngine), stopRequested);
             if (result.performed()) {
                 // The elapsed time is reported because queries wait on it: a compaction holds the
                 // index exclusively while it rewrites. Merges pick the smallest segments and stay

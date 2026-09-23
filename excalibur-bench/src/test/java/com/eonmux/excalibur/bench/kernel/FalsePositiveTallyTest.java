@@ -103,4 +103,55 @@ class FalsePositiveTallyTest {
         assertThatThrownBy(() -> new FalsePositiveTally(1.5))
             .isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    @DisplayName("a rate at the specification is never a significant excess")
+    void rateAtTheSpecificationIsNotSignificant() {
+        FalsePositiveTally tally = new FalsePositiveTally(SPEC);
+        tally.record(1_000, 1_000_000);
+
+        assertThat(tally.significantlyExceedsSpecification(1_000_000)).isFalse();
+    }
+
+    @Test
+    @DisplayName("a doubled rate over a large independent sample is a significant excess")
+    void doubledRateOverALargeSampleIsSignificant() {
+        FalsePositiveTally tally = new FalsePositiveTally(SPEC);
+        tally.record(2_000, 1_000_000);
+
+        assertThat(tally.significantlyExceedsSpecification(1_000_000)).isTrue();
+    }
+
+    @Test
+    @DisplayName("a handful of collisions in a small sample is sampling noise, not an excess")
+    void smallSampleNoiseIsNotSignificant() {
+        FalsePositiveTally tally = new FalsePositiveTally(SPEC);
+        tally.record(2, 100);
+
+        assertThat(tally.meetsSpecification()).isFalse();
+        assertThat(tally.significantlyExceedsSpecification(100)).isFalse();
+    }
+
+    @Test
+    @DisplayName("repeated probes of the same keys count as the draws they are, not as new ones")
+    void repeatedProbesDoNotNarrowTheMargin() {
+        // One pass over 10,000 keys, repeated a hundred times: the same collisions recur, so
+        // the rate is known only as well as 10,000 draws know it.
+        FalsePositiveTally tally = new FalsePositiveTally(SPEC);
+        tally.record(1_500, 1_000_000);
+
+        assertThat(tally.significantlyExceedsSpecification(1_000_000)).isTrue();
+        assertThat(tally.significantlyExceedsSpecification(10_000)).isFalse();
+    }
+
+    @Test
+    @DisplayName("an empty tally has shown no excess, and a sample needs at least one draw")
+    void emptyTallyAndInvalidSampleSize() {
+        FalsePositiveTally tally = new FalsePositiveTally(SPEC);
+        assertThat(tally.significantlyExceedsSpecification(1)).isFalse();
+
+        tally.record(1, 10);
+        assertThatThrownBy(() -> tally.significantlyExceedsSpecification(0))
+            .isInstanceOf(IllegalArgumentException.class);
+    }
 }

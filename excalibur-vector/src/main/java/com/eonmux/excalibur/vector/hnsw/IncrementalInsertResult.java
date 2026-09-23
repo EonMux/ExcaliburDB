@@ -14,7 +14,7 @@ import java.util.List;
  *   <li>{@code nodeId} - The ID assigned to the inserted node</li>
  *   <li>{@code level} - The randomly generated level for this node</li>
  *   <li>{@code dataOffset} - The offset in the data region where node is stored</li>
- *   <li>{@code connectionsMade} - Number of bidirectional connections established</li>
+ *   <li>{@code connectionsMade} - Number of distinct nodes the new node links to</li>
  *   <li>{@code writeLogOffset} - The write log offset this insertion corresponds to (for recovery)</li>
  *   <li>{@code documentId} - The document ID this vector belongs to</li>
  * </ul>
@@ -111,7 +111,7 @@ public final class IncrementalInsertResult {
     }
 
     /**
-     * Returns the number of bidirectional connections made during insertion.
+     * Returns how many distinct nodes the inserted node links to, across every layer it occupies.
      *
      * @return Number of connections established
      */

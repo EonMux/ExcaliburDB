@@ -5,7 +5,7 @@ import com.eonmux.excalibur.ingest.lexical.ChunkIndexStats;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.shard.allocator.VolumeManager;
-import com.eonmux.excalibur.metrics.FixedBucketHistogram;
+import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
@@ -29,9 +29,9 @@ import java.util.function.Supplier;
  * moves moves in both at once.</p>
  *
  * <h2>A subsystem that cannot answer is absent, not zero</h2>
- * <p>Six of these blocks come from components that can fail independently of the node's
+ * <p>Eleven of these blocks come from components that can fail independently of the node's
  * ability to serve a request - a lexical index, a storage engine's record of its vector
- * indexes, a query result cache, the graph tenants, and the two circuit breakers, each behind a
+ * indexes, a query result cache, the graph tenants, and the seven circuit breakers, each behind a
  * client that may not exist. Each is
  * caught here and reported as absent. Letting one of them fail the whole response would lose
  * the segment counts and the queue depths an operator came for, and reporting a zero the
@@ -73,6 +73,32 @@ public final class NodeStatsCollector {
      * closed.</p>
      */
     private volatile Supplier<String> llmRelevancyBreaker;
+
+    /** Reads the query-expansion breaker's state, or null on a node that expands no queries. */
+    private volatile Supplier<String> queryExpansionBreaker;
+
+    /** Reads the relation-extraction breaker's state, or null on a node that extracts none. */
+    private volatile Supplier<String> graphExtractionBreaker;
+
+    /**
+     * Reads the graph rerank breaker's state, or null on a node that serves no graph of its own.
+     *
+     * <p>The supplier itself may answer null: the node's graphs share one rerank client, and it
+     * exists only once a graph that reranks through it has been opened.</p>
+     */
+    private volatile Supplier<String> graphRerankBreaker;
+
+    /**
+     * Reads the graph question-embedding breaker's state, or null on a node that serves no graph
+     * of its own. Answers null until a graph with entity vectors has been opened.
+     */
+    private volatile Supplier<String> graphQueryEmbeddingBreaker;
+
+    /**
+     * Reads the graph build's entity-embedding breaker's state, or null on a node that serves no
+     * graph of its own. Answers null until a build has embedded an entity.
+     */
+    private volatile Supplier<String> graphBuildEmbeddingBreaker;
 
     /**
      * The query result cache, when this node runs one.
@@ -168,6 +194,80 @@ public final class NodeStatsCollector {
     }
 
     /**
+     * Reports the query-expansion circuit breaker's state.
+     *
+     * <p>The breaker in front of the chat call that rewrites a query into the formulations the
+     * lexical half searches. When it opens, every query is searched as typed and the node goes
+     * on answering 200, so recall narrows with nothing in the response saying so. Its own
+     * breaker rather than the relevancy one: the expander holds its own client, and either can
+     * trip while the other is closed.</p>
+     *
+     * @param breaker Reads the breaker's state, or null on a node that expands no queries
+     */
+    public void withQueryExpansionBreaker(Supplier<String> breaker) {
+        this.queryExpansionBreaker = breaker;
+    }
+
+    /**
+     * Reports the relation-extraction circuit breaker's state.
+     *
+     * <p>The breaker in front of the chat call that finds the facts ingestion stages into the
+     * graph. When it opens, documents are still indexed and none of them adds to the graph;
+     * ingestion reports success throughout, so a graph that has stopped growing is otherwise
+     * visible only as a count of extraction failures.</p>
+     *
+     * @param breaker Reads the breaker's state, or null on a node that extracts no facts
+     */
+    public void withGraphExtractionBreaker(Supplier<String> breaker) {
+        this.graphExtractionBreaker = breaker;
+    }
+
+    /**
+     * Reports the graph route's rerank breaker's state.
+     *
+     * <p>The breaker in front of the chat call {@code POST /v1/graph/query} reranks its
+     * candidates with. One for the node rather than one per namespace: every tenant's graph
+     * reranks through the same client, because every tenant calls the same endpoint. When it
+     * opens the route keeps the order the stage before gave it and answers 200.</p>
+     *
+     * @param breaker Reads the breaker's state - null from the supplier while no graph has
+     *                reranked through a model - or null on a node that serves no graph
+     */
+    public void withGraphRerankBreaker(Supplier<String> breaker) {
+        this.graphRerankBreaker = breaker;
+    }
+
+    /**
+     * Reports the graph route's question-embedding breaker's state.
+     *
+     * <p>The breaker in front of the embedding call that lets a graph built with entity vectors
+     * rerank its candidates exactly. Shared by every tenant for the same reason the rerank
+     * breaker is; when it opens the route skips the vector rerank and answers 200.</p>
+     *
+     * @param breaker Reads the breaker's state - null from the supplier while no graph with
+     *                entity vectors has been opened - or null on a node that serves no graph
+     */
+    public void withGraphQueryEmbeddingBreaker(Supplier<String> breaker) {
+        this.graphQueryEmbeddingBreaker = breaker;
+    }
+
+    /**
+     * Reports the graph build's entity-embedding breaker's state.
+     *
+     * <p>The breaker in front of the embedding call a build makes for each batch of entity
+     * documents, producing the vectors the question-embedding breaker's calls are compared
+     * against. Shared by every tenant for the same reason the other two graph breakers are, and
+     * separate from the question's because it fails differently: when it opens, a build still
+     * publishes, but the entities it could not embed carry no vector until the next build.</p>
+     *
+     * @param breaker Reads the breaker's state - null from the supplier while no build has
+     *                embedded an entity - or null on a node that serves no graph
+     */
+    public void withGraphBuildEmbeddingBreaker(Supplier<String> breaker) {
+        this.graphBuildEmbeddingBreaker = breaker;
+    }
+
+    /**
      * Reports the query result cache alongside the rest of the node's state.
      *
      * <p>Nothing else in this snapshot would show a cache that is not working. One that never
@@ -229,7 +329,12 @@ public final class NodeStatsCollector {
             breakerState(this.embeddingBreaker, "Embedding"),
             breakerState(this.llmRelevancyBreaker, "LLM relevancy"),
             queryCacheStats(),
-            graphStats());
+            graphStats(),
+            breakerState(this.queryExpansionBreaker, "Query expansion"),
+            breakerState(this.graphExtractionBreaker, "Graph extraction"),
+            breakerState(this.graphRerankBreaker, "Graph rerank"),
+            breakerState(this.graphQueryEmbeddingBreaker, "Graph query embedding"),
+            breakerState(this.graphBuildEmbeddingBreaker, "Graph build embedding"));
     }
 
     /**
@@ -268,15 +373,23 @@ public final class NodeStatsCollector {
         }
     }
 
-    /** The membership filters, which report saturation only when one is attached. */
+    /**
+     * The membership filters, which report saturation only when one is attached.
+     *
+     * <p>The false-positive rates are read from the segments' filters at the time of the
+     * request. The process-wide histogram the metrics worker also feeds is a lifetime record
+     * of past samples, averaged over the whole run, so a node whose filters had just filled
+     * would go on reporting the rates of when they were empty.</p>
+     */
     private NodeStats.CuckooStats cuckooStats() {
         com.eonmux.excalibur.filter.HierarchicalCuckooFilter membership =
             indexOrchestrator.getHierarchicalCuckooFilter();
+        CuckooMetricsWorker.FpRates rates = indexOrchestrator.getCuckooFpRates();
         return new NodeStats.CuckooStats(
             indexOrchestrator.getPendingCuckooDeletions(),
             indexOrchestrator.getTotalCuckooDeletions(),
-            FixedBucketHistogram.getInstance().getAverageFpRate(),
-            FixedBucketHistogram.getInstance().getMaxFpRate(),
+            rates.average(),
+            rates.max(),
             membership != null && membership.isSaturated(),
             membership == null ? 0 : membership.saturatedSegmentCount());
     }

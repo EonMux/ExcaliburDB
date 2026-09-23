@@ -73,8 +73,25 @@ public final class EntryChecksum {
                     + ", value=" + valueLen);
         }
         CRC32 crc = new CRC32();
-        update(crc, mapped, entryOffset, SegmentLayout.ENTRY_CHECKSUMMED_HEADER_PREFIX);
-        update(crc, mapped, entryOffset + format.keyBytesOffset(), (long) keyLen + valueLen);
+        int keyBytesOffset = format.keyBytesOffset();
+        long payload = (long) keyLen + valueLen;
+        int header = SegmentLayout.ENTRY_CHECKSUMMED_HEADER_PREFIX;
+        if (header + payload <= CHUNK_SIZE) {
+            // The common case, and the one on every point lookup. The two covered runs are
+            // laid end to end in the scratch buffer and checksummed in a single call: a CRC
+            // over a concatenation is the CRC of its parts fed in order, and each call into
+            // the checksum carries a fixed cost comparable to checksumming the whole of a
+            // small record, so a second call nearly doubled the price of a verified read.
+            byte[] scratch = SCRATCH.get();
+            MemorySegment.copy(mapped, SegmentLayout.BYTE_LAYOUT, entryOffset, scratch, 0,
+                header);
+            MemorySegment.copy(mapped, SegmentLayout.BYTE_LAYOUT, entryOffset + keyBytesOffset,
+                scratch, header, (int) payload);
+            crc.update(scratch, 0, header + (int) payload);
+            return (int) crc.getValue();
+        }
+        update(crc, mapped, entryOffset, header);
+        update(crc, mapped, entryOffset + keyBytesOffset, payload);
         return (int) crc.getValue();
     }
 

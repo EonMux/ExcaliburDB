@@ -23,6 +23,12 @@ dependencies {
     // For SegmentManifest: the lexical index stamps the epoch a batch was published at, and
     // that stamp is half of what a node recomputes its epoch counter from on open.
     implementation(project(":excalibur-retrieval"))
+    // For every format the engine keeps no verifier of its own beside - the write-ahead logs,
+    // the routing directory, the registries, the graph staging logs, the lexical store and the
+    // term sketches - and for a compaction's staged pair, whose verdict depends on which of
+    // the two is present rather than on either file's format. verify --deep hands those to the same per-file dispatch excalibur-fsck surveys a live
+    // directory with, so the two tools agree on which checker a file belongs to.
+    implementation(project(":excalibur-fsck"))
 
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
@@ -33,11 +39,15 @@ dependencies {
 // incubating Vector API, which excalibur-vector's classes reference and which is not
 // resolvable at runtime unless the module is added. --enable-native-access silences the
 // restricted-method warning the memory-mapped engine would otherwise print on every run,
-// which would otherwise be interleaved with this command's own output.
+// which would otherwise be interleaved with this command's own output. The logging
+// configuration is named rather than discovered: excalibur-fsck's jar carries a logback.xml too,
+// and logback answers two of the default name by printing its status report to stdout, where
+// this command's report goes (see src/main/resources/excalibur-backup-logback.xml).
 val runtimeJvmFlags = listOf(
     "--enable-preview",
     "--enable-native-access=ALL-UNNAMED",
-    "--add-modules=jdk.incubator.vector"
+    "--add-modules=jdk.incubator.vector",
+    "-Dlogback.configurationFile=excalibur-backup-logback.xml"
 )
 
 application {

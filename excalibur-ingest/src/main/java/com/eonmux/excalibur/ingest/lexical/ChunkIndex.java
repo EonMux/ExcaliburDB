@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 
 /**
@@ -64,6 +65,46 @@ public interface ChunkIndex extends AutoCloseable {
     void refresh() throws IOException;
 
     /**
+     * Makes durable and searchable everything added so far, as the half of closing that must
+     * always happen.
+     *
+     * <h3>Why closing is two steps</h3>
+     * <p>Every chunk reaches storage before it reaches this index, and nothing reindexes a chunk
+     * that storage holds and this index lacks: the document registry already lists its document,
+     * so a later crawl reads it as unchanged. Whatever this index still buffers when the node
+     * stops is therefore lost to lexical search unless it is published first - which is the
+     * invariant a shutdown keeps, and the reason publishing cannot be tied to releasing the
+     * index's files. A shutdown that finds a compaction still running must leave the files open
+     * underneath it, and if publishing went with them the buffered chunks would go unindexed for
+     * good. So a shutdown calls this unconditionally and {@link #close()} only when nothing is
+     * still using the index. A crash, as opposed to a shutdown, still loses the buffer; reindexing
+     * the source is what recovers it.</p>
+     *
+     * <p>Safe alongside a compaction in progress: it takes the same exclusion an ingestion run's
+     * {@link #refresh()} takes, and a compaction is built to have runs publish around it.</p>
+     *
+     * @throws IOException if what is buffered cannot be published
+     */
+    default void publishBuffered() throws IOException {
+        refresh();
+    }
+
+    /**
+     * Whether this index's compactions read chunk text back out of the storage engine.
+     *
+     * <p>What a shutdown asks about a compaction that did not stop when drained: one that reads
+     * storage makes closing the storage engine and its arena unsafe, and one that does not only
+     * makes closing this index unsafe. Answering true when it is not so leaves storage open at
+     * exit for nothing; answering false when it is so closes storage under a running read, so
+     * true is the default.</p>
+     *
+     * @return true if a compaction of this index reads the text supplier it is given
+     */
+    default boolean compactionReadsStorage() {
+        return true;
+    }
+
+    /**
      * Removes chunks from the index.
      *
      * @param chunkIds The chunks to remove
@@ -88,11 +129,41 @@ public interface ChunkIndex extends AutoCloseable {
      * <p>A supplier returning null means storage no longer holds that chunk, and the rewrite drops
      * it. That is opportunistic rather than a sweep: finding every such chunk would mean asking
      * storage about all of them, so what gets dropped is what happened to be in a segment being
-     * rewritten anyway.</p>
+     * rewritten anyway. A supplier that could not read the chunk throws
+     * {@link java.io.UncheckedIOException} rather than answering null, and the rewrite leaves the
+     * segments it was reading as they are: dropping postings is permanent, and a read that
+     * failed is not evidence the text is gone. A supplier that knows the text can never be read -
+     * the stored entry is damaged - throws
+     * {@link com.eonmux.excalibur.retrieval.lexical.native_.UnrecoverableTextException}, and the
+     * rewrite drops the chunk, logs it and counts it in
+     * {@link ChunkIndexStats#unreadableChunksDropped()} rather than abandoning the segments on
+     * every attempt.</p>
      *
      * @param textOf Supplies a surviving chunk's text by its identifier
      */
     CompactionResult compactIfDue(Function<String, String> textOf) throws IOException;
+
+    /**
+     * As {@link #compactIfDue(Function)}, ending early and publishing nothing once asked to.
+     *
+     * <p>For a caller that may have to take away what {@code textOf} reads while the compaction
+     * runs - a shutdown about to close the storage engine - or that lets an operator cancel. The
+     * signal is cooperative, never an interrupt: an interrupt reaching a thread in the middle of
+     * file I/O closes the channel it was using, and an index shares its channels with every
+     * query. An index honours it where it can stop without leaving anything half-done; by
+     * default that is only before the compaction starts.</p>
+     *
+     * @param textOf        Supplies a surviving chunk's text by its identifier
+     * @param stopRequested Answers true once the compaction should end without publishing
+     * @return What the compaction did, or why it did nothing
+     */
+    default CompactionResult compactIfDue(Function<String, String> textOf,
+                                          BooleanSupplier stopRequested) throws IOException {
+        if (stopRequested.getAsBoolean()) {
+            return CompactionResult.stopped("asked to stop before the compaction started");
+        }
+        return compactIfDue(textOf);
+    }
 
     /**
      * Physically removes erased chunks now, whatever the policy would have decided.
@@ -105,6 +176,65 @@ public interface ChunkIndex extends AutoCloseable {
      * @param textOf Supplies a surviving chunk's text by its identifier
      */
     CompactionResult compactNow(Function<String, String> textOf) throws IOException;
+
+    /**
+     * As {@link #compactNow(Function)}, ending early and publishing nothing once asked to.
+     *
+     * <p>The same cooperative signal as {@link #compactIfDue(Function, BooleanSupplier)}. A
+     * forced compaction is what an erasure request made under a deadline runs on the request's
+     * own thread, and a shutdown has to be able to end it before closing the storage it reads -
+     * the erasure stays owed and is discharged by a later compaction.</p>
+     *
+     * @param textOf        Supplies a surviving chunk's text by its identifier
+     * @param stopRequested Answers true once the compaction should end without publishing
+     * @return What the compaction did, or why it did nothing
+     */
+    default CompactionResult compactNow(Function<String, String> textOf,
+                                        BooleanSupplier stopRequested) throws IOException {
+        if (stopRequested.getAsBoolean()) {
+            return CompactionResult.stopped("asked to stop before the compaction started");
+        }
+        return compactNow(textOf);
+    }
+
+    /**
+     * Rewrites every segment of the index now, dropping every chunk whose text is gone.
+     *
+     * <p>What an operator's forced compaction asks for. {@link #compactNow} discharges erasures
+     * and leaves alone a segment with nothing erased in it; the chunks such a segment holds whose
+     * text storage no longer has - a document re-crawled or erased in storage without this index
+     * being told - are found only by rewriting it, since a rewrite is given the surviving text by
+     * {@code textOf} and drops what that no longer supplies.</p>
+     *
+     * <p>An index that keeps its own copy of each chunk's text has nothing to learn from
+     * {@code textOf} and no layout of its own to impose, so by default this is
+     * {@link #compactNow}.</p>
+     *
+     * @param textOf Supplies a surviving chunk's text by its identifier
+     */
+    default CompactionResult rewriteAll(Function<String, String> textOf) throws IOException {
+        return compactNow(textOf);
+    }
+
+    /**
+     * As {@link #rewriteAll(Function)}, ending early and publishing nothing once asked to.
+     *
+     * <p>The same cooperative signal as {@link #compactIfDue(Function, BooleanSupplier)}, and
+     * the call it matters most for: a rewrite of every segment is the longest thing an index
+     * does, and without a way to stop it a shutdown could only wait or close storage under
+     * it.</p>
+     *
+     * @param textOf        Supplies a surviving chunk's text by its identifier
+     * @param stopRequested Answers true once the rewrite should end without publishing
+     * @return What the rewrite did, or why it did nothing
+     */
+    default CompactionResult rewriteAll(Function<String, String> textOf,
+                                        BooleanSupplier stopRequested) throws IOException {
+        if (stopRequested.getAsBoolean()) {
+            return CompactionResult.stopped("asked to stop before the rewrite started");
+        }
+        return rewriteAll(textOf);
+    }
 
     /** This index's retrieval signal, using {@code expander} for the semantic work. */
     Ranker ranker(QueryExpander expander);

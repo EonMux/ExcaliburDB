@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.retrieval.expand;
 
+import com.eonmux.excalibur.llm.client.CircuitBreaker;
 import com.eonmux.excalibur.llm.client.LLMHttpClient;
 
 import org.slf4j.Logger;
@@ -158,6 +159,19 @@ public final class LlmQueryExpander implements QueryExpander {
         }
         this.maxFormulations = maxFormulations;
         this.timeoutMs = timeoutMs;
+    }
+
+    /**
+     * The circuit breaker this expander's calls are made through.
+     *
+     * <p>Exposed so the node can report it. When it opens, every query is searched as typed,
+     * with none of the formulations that widen its recall, and the node goes on answering 200 -
+     * so without this the only evidence that recall has narrowed is a debug log line.</p>
+     *
+     * @return The breaker guarding query expansion
+     */
+    public CircuitBreaker getCircuitBreaker() {
+        return client.getCircuitBreaker();
     }
 
     @Override

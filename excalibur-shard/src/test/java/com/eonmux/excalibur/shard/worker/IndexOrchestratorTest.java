@@ -296,38 +296,12 @@ class IndexOrchestratorTest {
     }
 
     @Test
-    @DisplayName("CuckooMaintenanceWorker should support deletion queueing")
-    void testCuckooWorkerDeletionQueueing() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {});
-
-        assertEquals(0, worker.getPendingDeletionCount());
-
-        worker.queueDeletion(1L, new byte[]{1, 2, 3});
-        assertEquals(1, worker.getPendingDeletionCount());
-
-        // Null key should be ignored
-        worker.queueDeletion(1L, null);
-        assertEquals(1, worker.getPendingDeletionCount());
-
-        // Queue multiple
-        java.util.List<byte[]> keys = new java.util.ArrayList<>();
-        keys.add(new byte[]{4, 5, 6});
-        keys.add(new byte[]{7, 8, 9});
-        worker.queueDeletions(2L, keys);
-        assertEquals(3, worker.getPendingDeletionCount());
-
-        catalog.close();
-    }
-
-    @Test
     @DisplayName("CuckooMaintenanceWorker should track statistics")
     void testCuckooWorkerStatistics() {
         SegmentCatalog catalog = new SegmentCatalog();
         CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {});
 
         assertEquals(0L, worker.getTotalDeletions());
-        assertEquals(0L, worker.getTotalFailedDeletions());
         assertEquals(0L, worker.getLastMaintenanceTime());
         assertEquals(0L, worker.getTombstonedSegmentsProcessed());
 

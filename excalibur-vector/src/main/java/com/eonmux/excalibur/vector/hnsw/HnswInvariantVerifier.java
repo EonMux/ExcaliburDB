@@ -14,12 +14,18 @@ import java.util.Set;
  * <h2>Core Invariants</h2>
  * <ul>
  *   <li><strong>Hierarchical Layers:</strong> Each node exists at all levels from 0 to its assigned level</li>
- *   <li><strong>Bidirectional Edges:</strong> If node A connects to B at level L, then B connects to A at level L</li>
  *   <li><strong>Entry Point at Highest Layer:</strong> The entry point node has the highest level in the graph</li>
  *   <li><strong>Connection Limits:</strong> Nodes respect maxConnections and maxConnectionsLayer0 limits</li>
  *   <li><strong>No Self-Loops:</strong> A node cannot have itself as a neighbor</li>
  *   <li><strong>Level Consistency:</strong> A node's neighbors at level L must have level >= L</li>
  * </ul>
+ *
+ * <h2>What is deliberately not an invariant</h2>
+ * <p>Edges are directed. HNSW offers every chosen neighbour a link back, but a neighbour whose
+ * list is full re-chooses by the selection heuristic and may decline it, and the node that
+ * chose it keeps its own link regardless (Malkov &amp; Yashunin, Algorithm 1). A one-way edge is
+ * therefore a normal part of a healthy graph, not a defect; {@link #countBidirectionalEdges}
+ * reports how many edges are mutual without treating the rest as violations.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is thread-safe for verification operations. It acquires read locks
@@ -93,7 +99,7 @@ public final class HnswInvariantVerifier {
      * <p>This method checks:</p>
      * <ul>
      *   <li>Entry point is at the highest level</li>
-     *   <li>All edges are bidirectional</li>
+     *   <li>Every neighbour named in an adjacency list exists</li>
      *   <li>Connection limits are respected</li>
      *   <li>No self-loops exist</li>
      *   <li>Level consistency (neighbors have sufficient levels)</li>
@@ -129,7 +135,7 @@ public final class HnswInvariantVerifier {
                 continue;
             }
 
-            // Check connection limits and bidirectionality at each level
+            // Check connection limits and neighbour validity at each level
             for (int level = 0; level <= node.level(); level++) {
                 List<Long> neighbors = node.getNeighbors(level);
                 edgesChecked += neighbors.size();
@@ -150,7 +156,7 @@ public final class HnswInvariantVerifier {
                         nodeId, level, neighbors.size(), maxConn));
                 }
 
-                // Check 2c: Bidirectional edges and level consistency
+                // Check 2c: Neighbours exist and reach this level
                 for (Long neighborId : neighbors) {
                     if (graph.isTombstoned(neighborId)) {
                         continue; // Skip tombstoned neighbors
@@ -169,14 +175,6 @@ public final class HnswInvariantVerifier {
                         violations.add(String.format(
                             "Node %d at level %d: neighbor %d has insufficient level %d",
                             nodeId, level, neighborId, neighbor.level()));
-                    }
-
-                    // Bidirectional edge: neighbor must have nodeId in its list
-                    List<Long> neighborNeighbors = neighbor.getNeighbors(level);
-                    if (!neighborNeighbors.contains(nodeId)) {
-                        violations.add(String.format(
-                            "Node %d at level %d: unidirectional edge to %d (missing back-edge)",
-                            nodeId, level, neighborId));
                     }
                 }
             }
@@ -350,13 +348,13 @@ public final class HnswInvariantVerifier {
     }
 
     /**
-     * Verifies that bidirectional edges are maintained for a specific edge.
+     * Reports whether two nodes link to each other at a level.
      *
      * @param graph The graph to verify
      * @param nodeIdA First node ID
      * @param nodeIdB Second node ID
      * @param level The level to check
-     * @return true if edge is bidirectional, false otherwise
+     * @return true if each node lists the other at that level
      */
     public static boolean isEdgeBidirectional(HnswGraph graph, long nodeIdA, long nodeIdB, int level) {
         if (graph == null) {
@@ -381,11 +379,11 @@ public final class HnswInvariantVerifier {
     }
 
     /**
-     * Counts the number of bidirectional edges at a specific level.
+     * Counts the mutual edges at a specific level: unordered pairs of nodes that list each other.
      *
      * @param graph The graph to analyze
      * @param level The level to count edges at
-     * @return The number of bidirectional edges
+     * @return The number of mutual edges
      */
     public static long countBidirectionalEdges(HnswGraph graph, int level) {
         if (graph == null) {
@@ -420,6 +418,40 @@ public final class HnswInvariantVerifier {
             }
         }
 
+        return edgeCount;
+    }
+
+    /**
+     * Counts the directed edges at a level between active nodes.
+     *
+     * <p>This is the measure of how densely a layer is linked. Edges are directed (see the
+     * class notes), so counting only mutual ones understates a healthy graph and counts a graph
+     * whose edges are all one-way as having none.</p>
+     *
+     * @param graph The graph to analyze
+     * @param level The level to count edges at
+     * @return The number of out-edges from an active node to an active node at that level
+     */
+    public static long countDirectedEdges(HnswGraph graph, int level) {
+        if (graph == null) {
+            throw new IllegalArgumentException("Graph cannot be null");
+        }
+
+        long edgeCount = 0;
+        for (long nodeId = 0; nodeId < graph.nodeCount(); nodeId++) {
+            if (graph.isTombstoned(nodeId)) {
+                continue;
+            }
+            HnswGraph.NodeView node = graph.readNode(nodeId);
+            if (node == null || node.level() < level) {
+                continue;
+            }
+            for (long neighborId : node.getNeighbors(level)) {
+                if (!graph.isTombstoned(neighborId)) {
+                    edgeCount++;
+                }
+            }
+        }
         return edgeCount;
     }
 
@@ -461,7 +493,7 @@ public final class HnswInvariantVerifier {
 
         // Count edges at level 0
         long edgesAtLevel0 = countBidirectionalEdges(graph, 0);
-        sb.append(String.format("  Bidirectional edges at level 0: %d\n", edgesAtLevel0));
+        sb.append(String.format("  Mutual edges at level 0: %d\n", edgesAtLevel0));
 
         return sb.toString();
     }

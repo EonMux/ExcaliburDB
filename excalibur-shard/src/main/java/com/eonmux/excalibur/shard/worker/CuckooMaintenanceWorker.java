@@ -18,7 +18,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -31,12 +30,11 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Virtual thread worker for hierarchical Cuckoo filter maintenance.
  *
- * <p>This worker performs background maintenance on Cuckoo filters associated
- * segments, including:</p>
- * <ul>
- *   <li>Deleting filter entries for tombstoned segments</li>
- *   <li>Propagating removals up the filter hierarchy</li>
- * </ul>
+ * <p>This worker removes a tombstoned segment's entries from the Cuckoo filters, the segment's
+ * own level and - where no other segment still holds the term - the corpus level above it.
+ * Tombstoning the segment in the {@link SegmentCatalog} is what schedules the work; there is no
+ * separate queue to feed, and {@link #getPendingDeletionCount()} reads the backlog from the
+ * catalog.</p>
  *
  * <p>False positive rates are not measured here: {@link CuckooMetricsWorker} samples them, and
  * two workers reporting the same number on different schedules is how they come to disagree.</p>
@@ -59,7 +57,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * <h2>Domain Constraints</h2>
  * <ul>
  *   <li>Maintenance interval: 1 second to 1 minute (default 5 seconds)</li>
- *   <li>Max deletions per cycle: 1000 to 10000 (default 1000)</li>
+ *   <li>Max deletions per cycle: 100 to 10000 (default 1000); bounds when a cycle stops
+ *       starting segments, see {@link #processTombstonedSegments(int)}</li>
  *   <li>False positive rate threshold for warnings: 0.1% (default)</li>
  * </ul>
  *
@@ -114,11 +113,6 @@ public class CuckooMaintenanceWorker {
     public static final double DEFAULT_FP_RATE_THRESHOLD = 0.001; // 0.1%
 
     /**
-     * Default batch size for hierarchy propagation.
-     */
-    private static final int DEFAULT_HIERARCHY_BATCH_SIZE = 100;
-
-    /**
      * Largest embedding dimension accepted when decoding a stored chunk value.
      * Guards against treating an unrelated value's leading bytes as a length.
      */
@@ -129,7 +123,6 @@ public class CuckooMaintenanceWorker {
     private final SegmentCatalog catalog;
     private final StorageEngine storageEngine;
     private final MaintenanceListener listener;
-    private final CopyOnWriteArrayList<FilterEntry> pendingDeletions;
     private final CopyOnWriteArrayList<SegmentFilter> segmentFilters;
 
     /**
@@ -156,7 +149,6 @@ public class CuckooMaintenanceWorker {
     private final AtomicBoolean stopped;
 
     private final AtomicLong totalDeletions;
-    private final AtomicLong totalFailedDeletions;
     private final AtomicLong lastMaintenanceTime;
     private final AtomicLong tombstonedSegmentsProcessed;
 
@@ -215,13 +207,11 @@ public class CuckooMaintenanceWorker {
         this.catalog = catalog;
         this.storageEngine = storageEngine;
         this.listener = listener;
-        this.pendingDeletions = new CopyOnWriteArrayList<>();
         this.segmentFilters = new CopyOnWriteArrayList<>();
         this.cleanedTombstonedSegments = ConcurrentHashMap.newKeySet();
         this.running = new AtomicBoolean(false);
         this.stopped = new AtomicBoolean(false);
         this.totalDeletions = new AtomicLong(0);
-        this.totalFailedDeletions = new AtomicLong(0);
         this.lastMaintenanceTime = new AtomicLong(0);
         this.tombstonedSegmentsProcessed = new AtomicLong(0);
 
@@ -291,11 +281,8 @@ public class CuckooMaintenanceWorker {
     /**
      * Starts the background maintenance worker.
      *
-     * <p>After starting, the worker will periodically check for:
-     * <ul>
-     *   <li>Tombstoned segments that need filter cleanup</li>
-     *   <li>Pending deletions from the queue</li>
-     * </ul>
+     * <p>After starting, the worker periodically cleans tombstoned segments out of the
+     * filters.</p>
      *
      * <p>If the worker is already running, this method does nothing.</p>
      *
@@ -327,27 +314,34 @@ public class CuckooMaintenanceWorker {
     }
 
     /**
-     * Stops the background maintenance worker.
+     * Stops the background maintenance worker and says whether it actually ended.
      *
-     * <p>This method signals the worker to stop and waits for it to complete
-     * any in-progress maintenance operations.</p>
+     * <p>A cycle in progress is waited for and never interrupted. It reads the entries of
+     * tombstoned segments through their mappings, so the answer matters to the caller, which
+     * closes the arena those mappings live in next; and it cleans a segment whole or not at all,
+     * so there is no point inside one at which it could honour an interrupt anyway. A cycle
+     * that outlives the wait is reported rather than abandoned to a closing arena.</p>
+     *
+     * @return true if no maintenance cycle is still running
      */
-    public void stop() {
+    public boolean stop() {
         if (stopped.compareAndSet(false, true)) {
             running.set(false);
 
             scheduler.shutdown();
             try {
                 if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                    scheduler.shutdownNow();
+                    LOGGER.warn("A Cuckoo maintenance cycle was still cleaning tombstoned "
+                        + "segments 5s after being asked to stop");
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
 
-            LOGGER.info("Cuckoo maintenance worker stopped. Total deletions: {}, failed: {}",
-                totalDeletions.get(), totalFailedDeletions.get());
+            LOGGER.info("Cuckoo maintenance worker stopped. Total deletions: {}",
+                totalDeletions.get());
         }
+        return scheduler.isTerminated();
     }
 
     /**
@@ -396,44 +390,57 @@ public class CuckooMaintenanceWorker {
     }
 
     /**
-     * Queues a deletion for the next maintenance cycle.
+     * Returns how many filter entries are waiting to be removed.
      *
-     * <p>This is typically called when a segment is tombstoned.
-     * All keys in the segment should be deleted from the filter.</p>
+     * <p>Tombstoning a segment in the catalog is what schedules its removal, so the backlog is
+     * read from there: every entry still held by a tombstoned segment this worker has not yet
+     * cleaned. That is the same unit {@link #getTotalDeletions()} counts once they are gone -
+     * distinct terms, since each filter level holds a term at most once - so the two figures
+     * move against each other as a sweep runs.</p>
      *
-     * @param segmentId The segment ID
-     * @param keys      The keys to delete from the filter
-     */
-    public void queueDeletions(long segmentId, Iterable<byte[]> keys) {
-        int count = 0;
-        for (byte[] key : keys) {
-            pendingDeletions.add(new FilterEntry(segmentId, key));
-            count++;
-        }
-        if (count > 0) {
-            LOGGER.debug("Queued {} deletions for segment {}", count, segmentId);
-        }
-    }
-
-    /**
-     * Queues a single deletion for the next maintenance cycle.
+     * <p>There is deliberately no way to queue an individual deletion. A document can be
+     * deleted or replaced without its segment being tombstoned, but the terms it contributed
+     * are usually shared with other documents in the same segment, and nothing counts how many
+     * of them still hold each one. Deleting a term on that basis would make the filter deny a
+     * segment that still contains it, and Stage 1 of the query pipeline takes a denial as
+     * final. A whole tombstoned segment has no such problem: nothing in it is live.</p>
      *
-     * @param segmentId The segment ID
-     * @param key       The key to delete from the filter
-     */
-    public void queueDeletion(long segmentId, byte[] key) {
-        if (key != null) {
-            pendingDeletions.add(new FilterEntry(segmentId, key));
-        }
-    }
-
-    /**
-     * Returns the number of pending deletions in the queue.
-     *
-     * @return Pending deletion count
+     * @return Entries held by tombstoned segments awaiting cleanup; 0 when none are waiting
      */
     public int getPendingDeletionCount() {
-        return pendingDeletions.size();
+        long pending = 0;
+        for (Long segmentId : catalog.getSegmentsByState(LifecycleState.TOMBSTONED)) {
+            if (cleanedTombstonedSegments.contains(segmentId)) {
+                continue;
+            }
+            CuckooFilter filter = filterOf(segmentId);
+            if (filter != null) {
+                pending += filter.count();
+            }
+        }
+        return (int) Math.min(Integer.MAX_VALUE, pending);
+    }
+
+    /**
+     * Resolves the filter holding a segment's entries.
+     *
+     * <p>The hierarchy level when a hierarchy is configured, because that is where ingestion
+     * records terms and where {@link #processTombstonedSegments()} deletes them; otherwise the
+     * standalone filter registered for the segment.</p>
+     *
+     * @param segmentId The segment ID
+     * @return The filter, or null if the segment has none
+     */
+    private CuckooFilter filterOf(long segmentId) {
+        HierarchicalCuckooFilter hierarchy = hierarchicalFilter;
+        if (hierarchy != null) {
+            CuckooFilter level = hierarchy.getSegmentFilter(String.valueOf(segmentId));
+            if (level != null) {
+                return level;
+            }
+        }
+        SegmentFilter registered = findSegmentFilter(segmentId);
+        return registered == null ? null : registered.filter;
     }
 
     /**
@@ -450,12 +457,9 @@ public class CuckooMaintenanceWorker {
     /**
      * Performs a maintenance cycle.
      *
-     * <p>This method is called periodically by the scheduler and:</p>
-     * <ol>
-     *   <li>Processes tombstoned segments</li>
-     *   <li>Executes pending deletions</li>
-     *   <li>Propagates deletions up the hierarchy</li>
-     * </ol>
+     * <p>Called periodically by the scheduler: cleans tombstoned segments out of the filters,
+     * up to {@link #getMaxDeletionsPerCycle()} entries' worth, and leaves the rest for the next
+     * cycle.</p>
      */
     private void performMaintenanceCycle() {
         if (!running.get() || stopped.get()) {
@@ -463,33 +467,29 @@ public class CuckooMaintenanceWorker {
         }
 
         long startTime = System.currentTimeMillis();
-        int deletionsThisCycle = 0;
-        int failedThisCycle = 0;
-
         try {
-            // Step 1: Process tombstoned segments
-            deletionsThisCycle += processTombstonedSegments();
-
-            // Step 2: Process pending deletions queue
-            int processed = processPendingDeletions(maxDeletionsPerCycle - deletionsThisCycle);
-            deletionsThisCycle += processed;
-
-            // Step 3: Propagate deletions up the hierarchy
-            propagateDeletionsUpHierarchy();
-
-            // Update statistics
-            totalDeletions.addAndGet(deletionsThisCycle);
+            int deletionsThisCycle = processTombstonedSegments(maxDeletionsPerCycle);
             lastMaintenanceTime.set(System.currentTimeMillis());
 
-            long duration = System.currentTimeMillis() - startTime;
-            if (deletionsThisCycle > 0 || LOGGER.isDebugEnabled()) {
+            if (deletionsThisCycle > 0) {
                 LOGGER.debug("Maintenance cycle complete: {} deletions in {}ms",
-                    deletionsThisCycle, duration);
+                    deletionsThisCycle, System.currentTimeMillis() - startTime);
             }
-
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             LOGGER.error("Error during maintenance cycle", e);
         }
+    }
+
+    /**
+     * Cleans every tombstoned segment not yet cleaned, however many entries that removes.
+     *
+     * <p>Package-visible so one sweep can be driven directly, without a scheduler.</p>
+     *
+     * @return Number of deletions performed
+     * @see #processTombstonedSegments(int)
+     */
+    int processTombstonedSegments() {
+        return processTombstonedSegments(Integer.MAX_VALUE);
     }
 
     /**
@@ -514,15 +514,25 @@ public class CuckooMaintenanceWorker {
      * the same terms up), not with storage keys, so the terms are re-derived from each
      * live entry's chunk text.</p>
      *
-     * <p>Package-visible so one sweep can be driven directly, without a scheduler.</p>
+     * <h3>The per-cycle budget</h3>
+     * <p>A segment is cleaned whole or not at all within a sweep, because a Cuckoo delete is not
+     * idempotent and a segment left half-cleaned could not safely be resumed. So the budget
+     * bounds when a sweep stops <em>starting</em> segments: once the entries removed reach it,
+     * the remaining segments wait for the next sweep. One large segment can take a sweep past
+     * the budget; what the budget prevents is a sweep that walks every tombstoned segment on
+     * the node while holding the hierarchy's write lock over and over.</p>
      *
+     * @param maxDeletions Entries after which no further segment is started
      * @return Number of deletions performed
      */
-    int processTombstonedSegments() {
-        int totalDeletions = 0;
+    int processTombstonedSegments(int maxDeletions) {
+        int deleted = 0;
 
         List<Long> tombstoned = catalog.getSegmentsByState(LifecycleState.TOMBSTONED);
         for (Long segmentId : tombstoned) {
+            if (deleted >= maxDeletions) {
+                break;
+            }
             if (cleanedTombstonedSegments.contains(segmentId)) {
                 continue; // Already cleaned; a Cuckoo delete is not idempotent.
             }
@@ -547,7 +557,7 @@ public class CuckooMaintenanceWorker {
             // Unregister the filter after cleanup
             unregisterFilter(segmentId);
             tombstonedSegmentsProcessed.incrementAndGet();
-            totalDeletions += Math.max(0, segmentDeletions);
+            deleted += Math.max(0, segmentDeletions);
 
             if (segmentDeletions < 0) {
                 LOGGER.error("Cleaning tombstoned segment {} failed partway. Its remaining terms "
@@ -560,7 +570,8 @@ public class CuckooMaintenanceWorker {
             listener.onSegmentFilterCleaned(segmentId);
         }
 
-        return totalDeletions;
+        totalDeletions.addAndGet(deleted);
+        return deleted;
     }
 
     /**
@@ -676,91 +687,6 @@ public class CuckooMaintenanceWorker {
     }
 
     /**
-     * Processes pending deletions from the queue.
-     *
-     * @param maxDeletions Maximum deletions to process
-     * @return Number of deletions performed
-     */
-    private int processPendingDeletions(int maxDeletions) {
-        if (maxDeletions <= 0 || pendingDeletions.isEmpty()) {
-            return 0;
-        }
-
-        int processed = 0;
-        int failed = 0;
-
-        // Process up to maxDeletions entries
-        while (processed < maxDeletions && !pendingDeletions.isEmpty()) {
-            FilterEntry entry = pendingDeletions.remove(0);
-            if (entry == null) {
-                break;
-            }
-
-            SegmentFilter segmentFilter = findSegmentFilter(entry.segmentId);
-            if (segmentFilter == null) {
-                // Filter no longer exists, skip
-                continue;
-            }
-
-            boolean deleted = segmentFilter.filter.delete(entry.key);
-            if (deleted) {
-                processed++;
-            } else {
-                failed++;
-                LOGGER.trace("Failed to delete entry from filter for segment {}", entry.segmentId);
-            }
-        }
-
-        if (failed > 0) {
-            totalFailedDeletions.addAndGet(failed);
-        }
-
-        return processed;
-    }
-
-    /**
-     * Propagates deletions up the filter hierarchy.
-     *
-     * <p>This method processes pending deletions through the hierarchical Cuckoo filter,
-     * propagating from segment level to corpus level.</p>
-     *
-     * <p>If no hierarchical filter is configured, this method does nothing.</p>
-     */
-    private void propagateDeletionsUpHierarchy() {
-        if (hierarchicalFilter == null) {
-            // No hierarchy configured, nothing to propagate
-            return;
-        }
-
-        if (pendingDeletions.isEmpty()) {
-            return;
-        }
-
-        // Process pending deletions through hierarchy
-        int remaining = pendingDeletions.size();
-        int batchSize = Math.min(DEFAULT_HIERARCHY_BATCH_SIZE, remaining);
-        int processed = 0;
-
-        for (int i = 0; i < batchSize && !pendingDeletions.isEmpty(); i++) {
-            FilterEntry entry = pendingDeletions.remove(0);
-            if (entry == null || entry.key == null) {
-                continue;
-            }
-
-            boolean deleted = hierarchicalFilter.deleteFromHierarchy(
-                entry.key, String.valueOf(entry.segmentId));
-            if (deleted) {
-                processed++;
-            }
-        }
-
-        if (processed > 0) {
-            LOGGER.debug("Propagated {} deletions through hierarchy, {} pending",
-                processed, pendingDeletions.size());
-        }
-    }
-
-    /**
      * Finds a segment filter by segment ID.
      */
     private SegmentFilter findSegmentFilter(long segmentId) {
@@ -781,15 +707,6 @@ public class CuckooMaintenanceWorker {
      */
     public long getTotalDeletions() {
         return totalDeletions.get();
-    }
-
-    /**
-     * Returns the total number of failed deletions.
-     *
-     * @return Total failed deletions
-     */
-    public long getTotalFailedDeletions() {
-        return totalFailedDeletions.get();
     }
 
     /**
@@ -891,20 +808,6 @@ public class CuckooMaintenanceWorker {
     // ==================== Internal Classes ====================
 
     /**
-     * Holder for a filter entry in the deletion queue.
-     */
-    private static class FilterEntry {
-
-        final long segmentId;
-        final byte[] key;
-
-        FilterEntry(long segmentId, byte[] key) {
-            this.segmentId = segmentId;
-            this.key = key;
-        }
-    }
-
-    /**
      * Holder for a segment's Cuckoo filter.
      */
     private static class SegmentFilter {
@@ -923,9 +826,9 @@ public class CuckooMaintenanceWorker {
     @Override
     public String toString() {
         return String.format(
-            "CuckooMaintenanceWorker{running=%s, filters=%d, pendingDeletions=%d, " +
-            "totalDeletions=%d, failedDeletions=%d}",
-            running.get(), segmentFilters.size(), pendingDeletions.size(),
-            totalDeletions.get(), totalFailedDeletions.get());
+            "CuckooMaintenanceWorker{running=%s, filters=%d, tombstonedSegmentsProcessed=%d, " +
+            "totalDeletions=%d}",
+            running.get(), segmentFilters.size(), tombstonedSegmentsProcessed.get(),
+            totalDeletions.get());
     }
 }

@@ -133,6 +133,36 @@ class DurablePublishTest {
         }
 
         @Test
+        @DisplayName("a rollback with no previous graph left to restore keeps the new one served")
+        void aRollbackNeverLeavesTheTargetEmpty(@TempDir Path parent) throws IOException {
+            Path target = parent.resolve("graph");
+            Path previous = parent.resolve("graph" + GraphBuilder.PREVIOUS_SUFFIX);
+            Files.createDirectories(target);
+            Files.writeString(target.resolve("marker"), "previous");
+            Path scratch = GraphBuilder.scratchFor(target);
+            Files.createDirectories(scratch);
+            Files.writeString(scratch.resolve("marker"), "new");
+
+            // An opener that removes the fallback before failing - as one that ran crash
+            // recovery inside the publish did. Moving the new graph back to scratch then would
+            // leave nothing at the served path and nothing to put there.
+            org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                    GraphBuilder.publish(scratch, target, new RecordingDurability(), published -> {
+                        GraphBuilder.recoverInterruptedPublish(published);
+                        throw new IOException("does not open");
+                    }))
+                .isInstanceOf(IOException.class)
+                .hasMessage("does not open")
+                .satisfies(e -> assertThat(e.getSuppressed())
+                    .anySatisfy(s -> assertThat(s).hasMessageContaining(previous.toString())));
+
+            assertThat(target.resolve("marker"))
+                .as("the only graph left stays where it is served from")
+                .hasContent("new");
+            assertThat(previous).doesNotExist();
+        }
+
+        @Test
         @DisplayName("the previous graph is deleted only once the new one has opened")
         void thePreviousGraphOutlivesTheOpen(@TempDir Path parent) throws IOException {
             Path target = parent.resolve("graph");
@@ -181,6 +211,98 @@ class DurablePublishTest {
             assertThat(previous)
                 .as("the displaced graph may hold erased facts and nothing reads it")
                 .doesNotExist();
+        }
+
+        @Test
+        @DisplayName("a publish finding only the displaced graph restores it before replacing it")
+        void aPublishRecoversTheOnlyCopyFirst(@TempDir Path parent) throws IOException {
+            // A rollback that could not move the previous graph back leaves it as the only copy,
+            // beside an empty target. Deleting it as a stale leftover before the next publish
+            // meant that publish had nothing to roll back to either.
+            Path target = parent.resolve("graph");
+            Path previous = GraphBuilder.previousFor(target);
+            Files.createDirectories(previous);
+            Files.writeString(previous.resolve("marker"), "only copy");
+            Path scratch = GraphBuilder.scratchFor(target);
+            Files.createDirectories(scratch);
+            Files.writeString(scratch.resolve("marker"), "new");
+
+            org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                    GraphBuilder.publish(scratch, target, new RecordingDurability(), published -> {
+                        throw new IOException("does not open");
+                    }))
+                .isInstanceOf(IOException.class);
+
+            assertThat(target.resolve("marker"))
+                .as("the only copy there was is served again")
+                .hasContent("only copy");
+            assertThat(previous).doesNotExist();
+        }
+
+        @Test
+        @DisplayName("a publish over only the displaced graph completes and leaves one graph")
+        void aPublishOverTheOnlyCopyCompletes(@TempDir Path parent) throws IOException {
+            Path target = parent.resolve("graph");
+            Path previous = GraphBuilder.previousFor(target);
+            Files.createDirectories(previous);
+            Files.writeString(previous.resolve("marker"), "only copy");
+            Path scratch = GraphBuilder.scratchFor(target);
+            Files.createDirectories(scratch);
+            Files.writeString(scratch.resolve("marker"), "new");
+
+            GraphBuilder.publish(scratch, target, new RecordingDurability());
+
+            assertThat(target.resolve("marker")).hasContent("new");
+            assertThat(previous).doesNotExist();
+        }
+
+        @Test
+        @DisplayName("a graph a compaction left under .retired is restored like a displaced one")
+        void aRetiredGraphIsRestored(@TempDir Path parent) throws IOException {
+            Path target = parent.resolve("graph");
+            Path retired = parent.resolve("graph" + GraphBuilder.RETIRED_SUFFIX);
+            Files.createDirectories(retired);
+            Files.writeString(retired.resolve("marker"), "retired");
+
+            assertThat(GraphBuilder.hasDisplacedGraph(target)).isTrue();
+            assertThat(GraphBuilder.recoverInterruptedPublish(target)).isTrue();
+
+            assertThat(target.resolve("marker")).hasContent("retired");
+            assertThat(retired).doesNotExist();
+            assertThat(GraphBuilder.previousFor(target)).doesNotExist();
+            assertThat(GraphBuilder.hasDisplacedGraph(target)).isFalse();
+        }
+
+        @Test
+        @DisplayName("a .retired copy beside a served graph is deleted, since it holds erased facts")
+        void aRetiredCopyBesideTheGraphIsDeleted(@TempDir Path parent) throws IOException {
+            Path target = parent.resolve("graph");
+            Path retired = parent.resolve("graph" + GraphBuilder.RETIRED_SUFFIX);
+            Files.createDirectories(target);
+            Files.writeString(target.resolve("marker"), "compacted");
+            Files.createDirectories(retired);
+            Files.writeString(retired.resolve("marker"), "pre-erasure");
+
+            assertThat(GraphBuilder.recoverInterruptedPublish(target)).isFalse();
+
+            assertThat(target.resolve("marker")).hasContent("compacted");
+            assertThat(retired).doesNotExist();
+        }
+
+        @Test
+        @DisplayName("a .retired copy beside a displaced graph gives way to it")
+        void aRetiredCopyGivesWayToADisplacedGraph(@TempDir Path parent) throws IOException {
+            Path target = parent.resolve("graph");
+            Path previous = GraphBuilder.previousFor(target);
+            Path retired = parent.resolve("graph" + GraphBuilder.RETIRED_SUFFIX);
+            Files.createDirectories(previous);
+            Files.writeString(previous.resolve("marker"), "previous");
+            Files.createDirectories(retired);
+
+            assertThat(GraphBuilder.recoverInterruptedPublish(target)).isTrue();
+
+            assertThat(target.resolve("marker")).hasContent("previous");
+            assertThat(retired).doesNotExist();
         }
     }
 }

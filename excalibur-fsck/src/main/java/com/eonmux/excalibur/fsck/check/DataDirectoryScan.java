@@ -63,10 +63,13 @@ public record DataDirectoryScan(
     /**
      * Reports whether anything found is damage.
      *
+     * <p>A corrupt file the node rebuilds by itself on open is reported and does not count;
+     * see {@link FileCheck#isDamage()}.</p>
+     *
      * @return true if any file is corrupt, unreadable or missing, or any finding is damage
      */
     public boolean hasDamage() {
-        return files.stream().anyMatch(file -> file.status().isDamage())
+        return files.stream().anyMatch(FileCheck::isDamage)
             || findings.stream().anyMatch(f -> f.severity() == FindingSeverity.DAMAGE);
     }
 
@@ -88,6 +91,17 @@ public record DataDirectoryScan(
                 || file.status() == CheckStatus.LEGACY_UNPROTECTED
                 || file.status() == CheckStatus.UNCHECKED
                 || file.unverifiedContent());
+    }
+
+    /**
+     * Counts corrupt files the node rebuilds by itself on open, which are not damage.
+     *
+     * @return How many corrupt verdicts {@link FileCheck#isDamage()} exempts
+     */
+    public long rebuiltOnOpenCount() {
+        return files.stream()
+            .filter(file -> file.status() == CheckStatus.CORRUPT && !file.isDamage())
+            .count();
     }
 
     /**

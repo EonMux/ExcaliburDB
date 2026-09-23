@@ -1,18 +1,10 @@
 package com.eonmux.excalibur.bench;
 
-import com.eonmux.excalibur.bench.metric.BenchmarkResult;
-import com.eonmux.excalibur.bench.metric.BenchmarkResultCapture;
 import com.eonmux.excalibur.bench.metric.BenchmarkResultSet;
-import org.openjdk.jmh.results.RunResult;
-import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.RunnerException;
 import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
 import org.openjdk.jmh.runner.options.TimeValue;
-
-import java.time.Instant;
-import java.util.Collection;
-import java.util.List;
 
 /**
  * Entry point for running benchmarks with structured result capture.
@@ -54,10 +46,13 @@ public final class BenchmarkResultsCaptureRunner {
     /**
      * Runs the benchmarks matching a pattern.
      *
-     * <p>Results come from JMH's own {@link Runner#run()} return value rather than
-     * from scraped console output: the benchmarks execute in a forked JVM whose stdout
-     * this process never sees, so no amount of stream redirection here could have
-     * captured them.</p>
+     * <p>Results come from JMH's own {@link org.openjdk.jmh.runner.Runner#run()} return
+     * value rather than from scraped console output: the benchmarks execute in a forked
+     * JVM whose stdout this process never sees. The combinations that value omits
+     * because they threw are recovered by {@link JmhRun} and reported as errored.</p>
+     *
+     * <p>A standard run is gated on errors too, so the full set is built whether or not
+     * the caller writes reports from it.</p>
      *
      * @param pattern the JMH include pattern
      * @param capture whether the caller will report on the results
@@ -66,27 +61,7 @@ public final class BenchmarkResultsCaptureRunner {
      */
     private static BenchmarkResultSet runBenchmarks(String pattern, boolean capture)
             throws RunnerException {
-        Instant startTime = Instant.now();
-        Collection<RunResult> runResults = new Runner(buildOptions(pattern)).run();
-        Instant endTime = Instant.now();
-
-        if (!capture) {
-            // A standard run reports through JMH's own console output; nothing here
-            // reads the structured form, so it is not worth building.
-            return BenchmarkResultSet.builder()
-                .name("ExcaliburDB Benchmark Run")
-                .startTime(startTime)
-                .endTime(endTime)
-                .build();
-        }
-
-        List<BenchmarkResult> results = BenchmarkResultCapture.fromRunResults(runResults);
-        return BenchmarkResultSet.builder()
-            .name("ExcaliburDB Benchmark Run")
-            .startTime(startTime)
-            .endTime(endTime)
-            .results(results)
-            .build();
+        return JmhRun.execute(buildOptions(pattern), "ExcaliburDB Benchmark Run");
     }
 
     /**

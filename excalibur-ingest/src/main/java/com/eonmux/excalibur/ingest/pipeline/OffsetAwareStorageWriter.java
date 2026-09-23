@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
+import java.util.List;
+
 /**
  * Storage writer that returns write log offsets for atomic batch publication.
  *
@@ -55,94 +57,46 @@ public interface OffsetAwareStorageWriter {
     long writeChunkWithOffset(String chunkId, String content, float[] embedding);
 
     /**
-     * Writes a chunk with its embedding to a specific segment and returns the write log offset.
+     * Writes a chunk the caller has already tokenised, and reports where it landed.
      *
-     * <p>This method is used during rolling replacement reindexing to write data
-     * to a newly created segment. The segmentId parameter allows routing writes
-     * to the correct segment during reindexing operations.</p>
+     * <p>The storage engine counts a chunk's terms into its segment's frequency sketch, and the
+     * caller files the same terms in the membership filter under the segment the write landed
+     * in. Handing them over here is what lets the text be tokenised once per chunk rather than
+     * once for each, and reporting the segment is what lets the caller file them where the chunk
+     * is: a hash-routed engine picks the segment, and nothing outside it can say afterwards which
+     * one it picked.</p>
      *
-     * <p><strong>Domain Correctness:</strong></p>
-     * <ul>
-     *   <li>segmentId must be a valid, existing segment ID</li>
-     *   <li>Returned offset must be non-negative</li>
-     *   <li>Offsets must be monotonically increasing within a segment</li>
-     * </ul>
+     * <p>The default is for writers that route by no segment: the terms are ignored and the
+     * placement carries no segment, so nothing is filed for pruning.</p>
      *
-     * @param segmentId The target segment ID for this write
-     * @param chunkId Unique chunk identifier (format: "{documentId}:chunk:{index}")
-     * @param content Chunk text content (UTF-8 encoded)
-     * @param embedding Embedding vector (dimension matches configured model)
-     * @return The write log offset where this chunk was written, or -1 if write failed
-     * @throws NullPointerException if chunkId or content is null
-     * @throws IllegalArgumentException if segmentId is invalid or embedding dimension doesn't match
+     * @param chunkId   Unique chunk identifier
+     * @param content   Chunk text content
+     * @param terms     {@link com.eonmux.excalibur.core.text.TermExtractor#extractTerms(String)}
+     *                  of {@code content}, with repetition
+     * @param embedding Embedding vector, or null on a node that embeds nothing
+     * @return Where the chunk landed, or {@link ChunkPlacement#FAILED}
      */
-    default long writeChunkWithOffset(long segmentId, String chunkId, String content, float[] embedding) {
-        // Default implementation delegates to the segment-agnostic method
-        // Implementations that support segment targeting should override this
-        return writeChunkWithOffset(chunkId, content, embedding);
+    default ChunkPlacement writeChunk(String chunkId, String content, List<String> terms,
+                                      float[] embedding) {
+        return ChunkPlacement.unrouted(writeChunkWithOffset(chunkId, content, embedding));
     }
 
     /**
-     * Creates a segment-targeted view of this writer.
-     *
-     * <p>This method returns a new OffsetAwareStorageWriter that routes all writes
-     * to the specified segment. This is used during rolling replacement reindexing
-     * to ensure data is written to the newly created segment.</p>
-     *
-     * <p><strong>Usage Example:</strong></p>
-     * <pre>{@code
-     * OffsetAwareStorageWriter segmentWriter = baseWriter.forSegment(newSegmentId);
-     * // All writes via segmentWriter go to newSegmentId
-     * }</pre>
-     *
-     * @param segmentId The target segment ID for all writes
-     * @return A new OffsetAwareStorageWriter that writes to the specified segment
-     */
-    /**
-     * Whether writes targeted at a segment can actually reach it.
+     * Whether a segment ID names a segment of the storage engine's own, one writes could land in.
      *
      * <p>A segment ID is not on its own a promise that a segment exists to receive writes: the
-     * catalog can mint metadata for one the storage engine has no routing slot for, and every
-     * write aimed at it then fails one chunk at a time. Callers that are about to do expensive
-     * work per chunk - fetching, chunking and embedding - should ask first, so the answer costs
-     * one lookup rather than one embedding call per chunk of every document in the source.</p>
+     * catalog can mint metadata for one the storage engine has no routing slot for. A rolling
+     * replacement asks this of the segment it created before fetching, chunking and embedding
+     * anything, so the answer costs one lookup rather than a crawl; {@link RollingReplacement}
+     * sets out what it does with the answer.</p>
      *
      * <p>The default is {@code true}, for writers that do not route by segment at all.</p>
      *
-     * @param segmentId The segment writes would be targeted at
-     * @return true if a write to that segment can succeed
+     * @param segmentId The segment ID
+     * @return true if the storage engine holds a segment of its own under that ID
      */
     default boolean canWriteTo(long segmentId) {
         return true;
-    }
-
-    default OffsetAwareStorageWriter forSegment(long segmentId) {
-        final OffsetAwareStorageWriter delegate = this;
-        return new OffsetAwareStorageWriter() {
-            @Override
-            public long writeChunkWithOffset(String chunkId, String content, float[] embedding) {
-                return delegate.writeChunkWithOffset(segmentId, chunkId, content, embedding);
-            }
-
-            @Override
-            public long writeChunkWithOffset(long segId, String chunkId, String content, float[] embedding) {
-                // Ignore the provided segId and always use the bound segmentId
-                return delegate.writeChunkWithOffset(segmentId, chunkId, content, embedding);
-            }
-
-            @Override
-            public OffsetAwareStorageWriter forSegment(long newSegmentId) {
-                // Create a new binding for the new segment
-                return delegate.forSegment(newSegmentId);
-            }
-
-            @Override
-            public boolean canWriteTo(long ignoredSegmentId) {
-                // Every write through this view goes to the bound segment, whatever it is asked
-                // about, so that is the only segment whose reachability means anything here.
-                return delegate.canWriteTo(segmentId);
-            }
-        };
     }
 
     /**

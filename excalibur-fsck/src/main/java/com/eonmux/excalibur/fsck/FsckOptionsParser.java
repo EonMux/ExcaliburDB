@@ -130,7 +130,10 @@ public final class FsckOptionsParser {
                                        touched. Every repair is stated before it is made, and
                                        no repair ever deletes anything.
               --quarantine-dir=<path>  Where damaged files are moved to. Defaults to a
-                                       timestamped directory beside the data directory.
+                                       timestamped directory beside the data directory,
+                                       whose parent must then be writable. On another
+                                       filesystem a file is copied, compared, and only
+                                       then removed from the data directory.
               --json                   Emit the report as JSON instead of text.
               --strict                 Exit non-zero when any file could not be verified, not
                                        only when one is damaged.
@@ -141,6 +144,9 @@ public final class FsckOptionsParser {
               1  damage, or an inconsistency between files, was found
               2  the command line was wrong, or the directory is not there
               3  the check could not be performed
+
+            A corrupt segment_N.tfs term sketch is reported and does not exit 1: the node
+            rebuilds it from its segment's live entries the next time it opens the segment.
             """;
     }
 }

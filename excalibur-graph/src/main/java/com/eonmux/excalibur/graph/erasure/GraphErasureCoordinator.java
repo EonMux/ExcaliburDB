@@ -54,7 +54,7 @@ import org.slf4j.LoggerFactory;
  *
  * <h2>Thread Safety</h2>
  * <p>{@link #submit} is safe from any thread; the log serialises it. Compaction is serialised on
- * this instance, because two rewrites of one directory would share the same temporary and retired
+ * this instance, because two rewrites of one directory would share the same scratch and displaced
  * directories and delete each other's work. That lock cannot reach another coordinator or another
  * process, so a graph directory must be compacted through one coordinator only.
  *
@@ -438,7 +438,22 @@ public final class GraphErasureCoordinator {
      * @throws NullPointerException if {@code graphDirectory} is null
      */
     public CompactionOutcome compactIfDue(Path graphDirectory) throws IOException {
-        return compact(graphDirectory, true);
+        return compact(graphDirectory, true, StagingErasureGuard.NONE);
+    }
+
+    /**
+     * As {@link #compactIfDue(Path)}, telling {@code guard} before staging is erased.
+     *
+     * @param graphDirectory Where the edge store's column files live
+     * @param guard          Told, and allowed to refuse, before staging loses anything
+     * @return What happened, including why nothing happened
+     * @throws IOException if the guard refuses, or the store cannot be opened, rewritten, or the
+     *                     completion recorded
+     * @throws NullPointerException if an argument is null
+     */
+    public CompactionOutcome compactIfDue(Path graphDirectory, StagingErasureGuard guard)
+            throws IOException {
+        return compact(graphDirectory, true, guard);
     }
 
     /**
@@ -454,7 +469,57 @@ public final class GraphErasureCoordinator {
      * @throws NullPointerException if {@code graphDirectory} is null
      */
     public CompactionOutcome compactNow(Path graphDirectory) throws IOException {
-        return compact(graphDirectory, false);
+        return compact(graphDirectory, false, StagingErasureGuard.NONE);
+    }
+
+    /**
+     * As {@link #compactNow(Path)}, telling {@code guard} before staging is erased.
+     *
+     * @param graphDirectory Where the edge store's column files live
+     * @param guard          Told, and allowed to refuse, before staging loses anything
+     * @return What happened
+     * @throws IOException if the guard refuses, or the store cannot be opened, rewritten, or the
+     *                     completion recorded
+     * @throws NullPointerException if an argument is null
+     */
+    public CompactionOutcome compactNow(Path graphDirectory, StagingErasureGuard guard)
+            throws IOException {
+        return compact(graphDirectory, false, guard);
+    }
+
+    /**
+     * Told that a compaction is about to erase staging ahead of the served graph.
+     *
+     * <h2>Why the served graph's owner has to know first</h2>
+     * <p>A compaction erases staging and only then rewrites the served directory, because a
+     * served artifact derived from staging can only be rebuilt without the withdrawn data once
+     * staging no longer holds it. From the moment staging is erased until the rewritten graph
+     * is published, the graph on disk is the one place the erased data is still readable - and
+     * nothing on disk says so until the compaction creates its scratch directory. A process that
+     * dies in that gap, or a compaction that fails in it, leaves a graph that opens like any
+     * other and would be served with the erased facts in it.</p>
+     *
+     * <p>So whoever serves the graph is told before staging is touched, and records that the
+     * graph must be withheld until a compaction has applied what is outstanding. The record has
+     * to be durable when this returns: it is what the next open reads after a crash. A guard
+     * that throws stops the compaction with staging untouched, which leaves the served graph
+     * exactly as trustworthy as it was.</p>
+     *
+     * <p>Not called when nothing is outstanding, when the policy declines, or by a coordinator
+     * with no staging behind it: staging is not erased on any of those paths.</p>
+     */
+    @FunctionalInterface
+    public interface StagingErasureGuard {
+
+        /** A guard for a caller that serves nothing from the graph directory. */
+        StagingErasureGuard NONE = () -> { };
+
+        /**
+         * Records, durably, that staging is about to be erased ahead of the served graph.
+         *
+         * @throws IOException if that cannot be recorded; the compaction then does not proceed
+         */
+        void beforeStagingErased() throws IOException;
     }
 
     /**
@@ -513,9 +578,10 @@ public final class GraphErasureCoordinator {
         }
     }
 
-    private CompactionOutcome compact(Path graphDirectory, boolean consultPolicy)
-            throws IOException {
+    private CompactionOutcome compact(Path graphDirectory, boolean consultPolicy,
+                                      StagingErasureGuard guard) throws IOException {
         Objects.requireNonNull(graphDirectory, "graphDirectory must not be null");
+        Objects.requireNonNull(guard, "guard must not be null");
 
         synchronized (compactionLock) {
             List<ErasureRequest> requests = log.outstanding();
@@ -548,8 +614,13 @@ public final class GraphErasureCoordinator {
                 // and the vectors computed from them - cannot be edited in place to remove one
                 // source's prose; the only way to reach it is to rebuild it from staging, and a
                 // ServedArtifactEraser can only do that once staging no longer holds what was
-                // withdrawn. A crash in the gap costs nothing: the request is still outstanding,
-                // and the retry finds staging already clean and removes zero.
+                // withdrawn. A crash in the gap leaves the request outstanding, and the retry
+                // finds staging already clean and removes zero - but it also leaves the served
+                // graph as the only copy of what staging lost, with nothing on disk yet to say
+                // so. The guard is what says so, before the first byte of staging goes.
+                if (staging != null && !requests.isEmpty()) {
+                    guard.beforeStagingErased();
+                }
                 GraphStagingStore.EraseResult staged = eraseStaged(requests);
 
                 CompactionResult compaction = EdgeStoreCompactor.compact(

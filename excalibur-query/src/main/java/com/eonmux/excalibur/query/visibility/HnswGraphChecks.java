@@ -7,7 +7,6 @@ import com.eonmux.excalibur.vector.hnsw.HnswSearchResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -19,6 +18,9 @@ import java.util.List;
  * out through its edges to whether it can answer a query at all.</p>
  */
 final class HnswGraphChecks {
+
+    /** The fewest out-edges per node below which a graph is reported as sparsely linked. */
+    private static final double MIN_OUT_EDGES_PER_NODE = 2.0;
 
     /**
      * Named for the diagnostic rather than for this class, so that moving the checks out of it
@@ -145,37 +147,12 @@ final class HnswGraphChecks {
         HnswInvariantVerifier.VerificationResult invariantResult =
             HnswInvariantVerifier.verifyAllInvariants(graph);
 
-        if (!invariantResult.isValid()) {
-            // Count the violations first, then report each kind once. Reporting inside the
-            // loop emitted one issue per violation, each quoting the running count, so a
-            // graph with N unidirectional edges produced N issues claiming 1, 2, ... N.
-            int unidirectionalEdges = 0;
-            List<String> otherViolations = new ArrayList<>();
-
-            for (String violation : invariantResult.violations()) {
-                if (violation.contains("unidirectional")) {
-                    unidirectionalEdges++;
-                } else {
-                    otherViolations.add(violation);
-                }
-            }
-
-            // Only a warning: some unidirectional edges can occur during concurrent updates
-            if (unidirectionalEdges > 0) {
-                issues.add(GraphDiagnosticIssue.warning(
-                    "UNIDIRECTIONAL_EDGES",
-                    "Found " + unidirectionalEdges + " unidirectional edges",
-                    "This may be temporary during concurrent updates. If persistent, check edge management."
-                ));
-            }
-
-            for (String violation : otherViolations) {
-                issues.add(GraphDiagnosticIssue.warning(
-                    "INVARIANT_VIOLATION",
-                    "Graph invariant violated: " + violation,
-                    "Inspect the graph's insertion and pruning paths."
-                ));
-            }
+        for (String violation : invariantResult.violations()) {
+            issues.add(GraphDiagnosticIssue.warning(
+                "INVARIANT_VIOLATION",
+                "Graph invariant violated: " + violation,
+                "Inspect the graph's insertion and pruning paths."
+            ));
         }
     }
 
@@ -242,20 +219,29 @@ final class HnswGraphChecks {
      * <p>Only a warning, and only about recall: a thinly connected graph still answers, it
      * just misses neighbours a denser one would have reached.</p>
      *
+     * <p>Density is read from directed out-edges. HNSW edges are directed - a neighbour whose
+     * list is full may decline the link back - so a count of mutual edges understates a healthy
+     * graph and reads a graph whose edges are all one-way as having none. A node is expected to
+     * hold at least two out-edges, or, in a graph too small for that, an edge to every other
+     * node; a graph with nodes and no edges at all is the sparsest case, not one to skip.</p>
+     *
      * @param activeNodeCount Active (non-tombstoned) nodes
-     * @param edgeCount Bidirectional edges at level 0
+     * @param directedEdgeCount Out-edges between active nodes at level 0
      * @param issues The list collecting this diagnostic's findings
      */
-    static void reportEdgeDensity(long activeNodeCount, long edgeCount, List<GraphDiagnosticIssue> issues) {
-        if (activeNodeCount > 0 && edgeCount > 0) {
-            double avgEdgesPerNode = (double) edgeCount * 2 / activeNodeCount;
-            if (avgEdgesPerNode < 2.0) {
-                issues.add(GraphDiagnosticIssue.warning(
-                    "LOW_EDGE_DENSITY",
-                    "Average edges per node is low: " + String.format("%.1f", avgEdgesPerNode),
-                    "Graph may have poor recall. Consider increasing efConstruction."
-                ));
-            }
+    static void reportEdgeDensity(long activeNodeCount, long directedEdgeCount,
+                                  List<GraphDiagnosticIssue> issues) {
+        if (activeNodeCount < 2) {
+            return;
+        }
+        double expected = Math.min(MIN_OUT_EDGES_PER_NODE, activeNodeCount - 1);
+        double avgEdgesPerNode = (double) directedEdgeCount / activeNodeCount;
+        if (avgEdgesPerNode < expected) {
+            issues.add(GraphDiagnosticIssue.warning(
+                "LOW_EDGE_DENSITY",
+                "Average out-edges per node is low: " + String.format("%.1f", avgEdgesPerNode),
+                "Graph may have poor recall. Consider increasing efConstruction."
+            ));
         }
     }
 

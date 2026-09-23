@@ -80,6 +80,10 @@ tasks.test {
         showStandardStreams = true
     }
     jvmArgs(benchmarkJvmFlags)
+    // JmhRunErrorCaptureTest drives a real, few-hundred-millisecond JMH run. JMH otherwise
+    // takes a machine-wide lock and refuses to start while any other JMH run holds it, which
+    // would fail the build whenever a benchmark is running elsewhere on the host.
+    systemProperty("jmh.ignoreLock", "true")
 }
 
 // Every benchmark in the module, or the ones one selector names (see BenchmarkSelection)
@@ -218,11 +222,28 @@ tasks.register<JavaExec>("runBenchmarksWithCapture") {
     }
 }
 
-// Scores the retrieval strategies over a real corpus. Deliberately not JMH: the thing being
-// measured is retrieval quality against judged queries, with latency beside it, not a microbenchmark.
+// The regression gate: measures, or reads two saved runs, and compares against a baseline. The
+// exit code is the verdict - 0 no regression, 1 a regression, 2 nothing could be compared - so
+// the task fails whenever a CI step reading it should. Its mode and inputs come through --args,
+// exactly as BenchmarkComparisonCommand parses them, because every mode takes a different set:
 //
-// Measures the engine a node ships with unless the last argument says otherwise:
-//   -PevalArgs="<corpusDir> <indexDir> <qrels> 10 - - both"   ('-' skips a positional)
+//   --args='--run --output build/benchmark-results/baseline'
+//   --args='--compare --baseline build/benchmark-results/baseline/benchmark_results.json'
+//   --args='--diff old/benchmark_results.json new/benchmark_results.json'
+//
+// Relative paths resolve against this module's directory, which is the task's working
+// directory. Without --args the command prints its usage and exits 2, which fails the task
+// rather than running every benchmark in the module unasked.
+tasks.register<JavaExec>("runBenchmarkComparison") {
+    group = "benchmark"
+    description = "Runs benchmarks and compares them against a saved baseline, or diffs two saved runs (--args='--run|--compare|--diff ...')"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.eonmux.excalibur.bench.BenchmarkComparisonRunner")
+    // The heap of the coordinating JVM only: every measurement runs in a fork JMH starts with
+    // its own, from BenchmarkComparisonRunner.
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms1g", "-Xmx1g")
+}
+
 // Fits the graph route's abstention thresholds and confidence temperature against judged
 // questions, and prints the configuration lines a node needs. Deliberately not JMH, and
 // deliberately not a server route: the labels have to come from a query set whose answers are
@@ -240,6 +261,11 @@ tasks.register<JavaExec>("runGraphCalibration") {
     }
 }
 
+// Scores the retrieval strategies over a real corpus. Deliberately not JMH: the thing being
+// measured is retrieval quality against judged queries, with latency beside it, not a microbenchmark.
+//
+// Measures the engine a node ships with unless the last argument says otherwise:
+//   -PevalArgs="<corpusDir> <indexDir> <qrels> 10 - - both"   ('-' skips a positional)
 tasks.register<JavaExec>("runRetrievalEvaluation") {
     group = "verification"
     description = "Indexes a corpus on the native (or lucene, or both) engine and scores the retrieval strategies over it, with the index size beside the quality"

@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.ingest.registry;
 
+import com.eonmux.excalibur.ingest.source.DocumentValidators;
+
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -18,6 +20,7 @@ import java.util.Objects;
  *   <li>Chunk IDs - identifiers of the chunks this document was split into</li>
  *   <li>Content length - size of the original document in bytes</li>
  *   <li>Index time - when this document was indexed</li>
+ *   <li>Entity tag - the validator the source's server named this version by, if any</li>
  * </ul>
  *
  * <h2>Change Detection</h2>
@@ -27,6 +30,10 @@ import java.util.Objects;
  *   <li>Content hash differs (for sources that support hashing)</li>
  *   <li>Content length differs</li>
  * </ul>
+ *
+ * <p>The timestamp and the entity tag have a second use: they are what a re-crawl sends back to
+ * the source as {@link #validators()}, so a source that can ask its origin conditionally learns
+ * the document is unchanged without transferring it again.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is immutable and thread-safe. Once constructed, the metadata
@@ -40,6 +47,7 @@ import java.util.Objects;
  *   <li>contentHash: non-negative hash value (0 = not computed)</li>
  *   <li>contentLength: non-negative byte count</li>
  *   <li>chunkIds: immutable list of non-null strings</li>
+ *   <li>entityTag: the tag exactly as the source reported it, or null for none</li>
  * </ul>
  */
 public final class DocumentMetadata {
@@ -51,6 +59,7 @@ public final class DocumentMetadata {
     private final long contentLength;
     private final List<String> chunkIds;
     private final long indexTimeMillis;
+    private final String entityTag;
 
     private DocumentMetadata(Builder builder) {
         this.documentId = Objects.requireNonNull(builder.documentId, "documentId must not be null");
@@ -68,6 +77,8 @@ public final class DocumentMetadata {
         this.indexTimeMillis = builder.indexTimeMillis > 0 
             ? builder.indexTimeMillis 
             : System.currentTimeMillis();
+        this.entityTag = builder.entityTag == null || builder.entityTag.isBlank()
+            ? null : builder.entityTag;
     }
 
     public String getDocumentId() {
@@ -104,6 +115,24 @@ public final class DocumentMetadata {
 
     public Instant getIndexTime() {
         return Instant.ofEpochMilli(indexTimeMillis);
+    }
+
+    /**
+     * The entity tag the source's server named the indexed version by.
+     *
+     * @return The tag exactly as it was reported, or null when there was none
+     */
+    public String getEntityTag() {
+        return entityTag;
+    }
+
+    /**
+     * What the source reported about the indexed version, in the form it can be asked about again.
+     *
+     * @return The timestamp and entity tag this entry recorded
+     */
+    public DocumentValidators validators() {
+        return new DocumentValidators(lastModifiedMillis, entityTag);
     }
 
     public int getChunkCount() {
@@ -150,7 +179,8 @@ public final class DocumentMetadata {
             .contentHash(contentHash)
             .contentLength(contentLength)
             .chunkIds(chunkIds)
-            .indexTimeMillis(indexTimeMillis);
+            .indexTimeMillis(indexTimeMillis)
+            .entityTag(entityTag);
     }
 
     @Override
@@ -164,13 +194,14 @@ public final class DocumentMetadata {
                indexTimeMillis == that.indexTimeMillis &&
                Objects.equals(documentId, that.documentId) &&
                Objects.equals(sourceId, that.sourceId) &&
-               Objects.equals(chunkIds, that.chunkIds);
+               Objects.equals(chunkIds, that.chunkIds) &&
+               Objects.equals(entityTag, that.entityTag);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(documentId, sourceId, lastModifiedMillis, contentHash, 
-                           contentLength, chunkIds, indexTimeMillis);
+        return Objects.hash(documentId, sourceId, lastModifiedMillis, contentHash,
+                           contentLength, chunkIds, indexTimeMillis, entityTag);
     }
 
     @Override
@@ -183,6 +214,7 @@ public final class DocumentMetadata {
                ", contentLength=" + contentLength +
                ", chunkCount=" + chunkIds.size() +
                ", indexTime=" + Instant.ofEpochMilli(indexTimeMillis) +
+               ", entityTag=" + entityTag +
                '}';
     }
 
@@ -194,6 +226,7 @@ public final class DocumentMetadata {
         private long contentLength;
         private List<String> chunkIds = new ArrayList<>();
         private long indexTimeMillis;
+        private String entityTag;
 
         public Builder documentId(String documentId) {
             this.documentId = documentId;
@@ -244,6 +277,17 @@ public final class DocumentMetadata {
 
         public Builder indexTime(Instant indexTime) {
             this.indexTimeMillis = indexTime != null ? indexTime.toEpochMilli() : System.currentTimeMillis();
+            return this;
+        }
+
+        /**
+         * Records the entity tag the source's server named this version by.
+         *
+         * @param entityTag The tag exactly as it was reported, or null for none
+         * @return This builder
+         */
+        public Builder entityTag(String entityTag) {
+            this.entityTag = entityTag;
             return this;
         }
 

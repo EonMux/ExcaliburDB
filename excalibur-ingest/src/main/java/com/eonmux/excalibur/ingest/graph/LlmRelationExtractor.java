@@ -5,6 +5,7 @@ import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.staging.ExtractedTriple;
 import com.eonmux.excalibur.graph.temporal.TemporalFilter;
 import com.eonmux.excalibur.llm.LLMException;
+import com.eonmux.excalibur.llm.client.CircuitBreaker;
 import com.eonmux.excalibur.llm.client.LLMHttpClient;
 
 import org.slf4j.Logger;
@@ -156,6 +157,20 @@ public final class LlmRelationExtractor implements RelationExtractor {
         this.extractorVersion = extractorVersion;
         this.maxInputChars = maxInputChars;
         this.maxTriples = maxTriples;
+    }
+
+    /**
+     * The circuit breaker this extractor's calls are made through.
+     *
+     * <p>Exposed so the node can report it. When it opens, every document is still chunked,
+     * embedded and indexed, and none of them contributes a fact to the graph - ingestion
+     * reports success throughout, so without this a graph that has stopped growing looks the
+     * same as a corpus with nothing more to say.</p>
+     *
+     * @return The breaker guarding relation extraction
+     */
+    public CircuitBreaker getCircuitBreaker() {
+        return llmClient.getCircuitBreaker();
     }
 
     @Override

@@ -603,6 +603,39 @@ class SegmentSlotChecksumTest {
         }
 
         @Test
+        @DisplayName("a legacy v2 slot sent to a record whose key runs off the file reports damage")
+        void legacyV2OffsetToATruncatedRecordIsReported() throws IOException {
+            Path file = tempDir.resolve("segment_0.dat");
+            writeV2Segment(file, KEY, VALUE);
+            long slotTableSize = (long) SLOTS * SegmentLayout.SLOT_SIZE;
+            long fileSize = slotTableSize + MIN_DATA_SIZE;
+
+            // A header that fits in the file and claims this key's length, so that the key
+            // comparison is reached and its bytes would run past the end of the mapping.
+            long strayEntry = fileSize - V2_ENTRY_HEADER_SIZE - 4;
+            ByteBuffer header = ByteBuffer.allocate(Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN)
+                .putInt(0, KEY.length);
+            try (FileChannel channel = FileChannel.open(file, StandardOpenOption.WRITE)) {
+                channel.write(header, strayEntry + SegmentLayout.ENTRY_KEY_LEN_OFFSET);
+            }
+            long strayOffset = strayEntry - slotTableSize;
+            int slot = slotOf(file, KEY);
+            for (int i = 0; i < SegmentLayout.SLOT_DATA_OFFSET_LENGTH; i++) {
+                writeByteAt(file, (long) slot * SegmentLayout.SLOT_SIZE
+                        + SegmentLayout.SLOT_DATA_OFFSET_OFFSET + i,
+                    (byte) (strayOffset >>> (8 * i)));
+            }
+
+            try (Arena arena = Arena.ofShared();
+                 Segment segment = Segment.openExisting(file, arena)) {
+                CorruptSegmentEntryException damage =
+                    assertThrows(CorruptSegmentEntryException.class, () -> segment.get(KEY),
+                        "a record that runs off the file is damage, not an out-of-bounds read");
+                assertTrue(damage.isStructural());
+            }
+        }
+
+        @Test
         @DisplayName("rewriting a legacy file produces one whose slots verify")
         void aRewriteUpgradesTheFile() throws IOException {
             Path source = tempDir.resolve("segment_0.dat");

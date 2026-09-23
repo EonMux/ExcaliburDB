@@ -48,6 +48,35 @@ public final class ArgumentParser {
     }
 
     /**
+     * Reports whether a subcommand's line asks for help.
+     *
+     * <p>{@code --help} or {@code -h} anywhere an option could stand, and nowhere else: the
+     * value of an option that takes one is skipped, so {@code --out -h} names a directory
+     * called {@code -h} rather than asking for help. It never throws, and it is asked before
+     * the line is parsed, so help is answered for a line that would not parse - which is
+     * the line most likely to have prompted someone to ask.</p>
+     *
+     * @param args         What was typed, the subcommand first
+     * @param validOptions Options this subcommand takes a value for
+     * @return true if help was asked for
+     * @throws NullPointerException if either argument is null
+     */
+    public static boolean wantsHelp(String[] args, Set<String> validOptions) {
+        Objects.requireNonNull(args, "args");
+        Objects.requireNonNull(validOptions, "validOptions");
+        for (int i = 1; i < args.length; i++) {
+            String argument = args[i];
+            if (argument.equals("--help") || argument.equals("-h")) {
+                return true;
+            }
+            if (argument.startsWith("--") && validOptions.contains(argument.substring(2))) {
+                i++;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Consumes one option or flag, and its value if it takes one.
      *
      * @param args         The whole line

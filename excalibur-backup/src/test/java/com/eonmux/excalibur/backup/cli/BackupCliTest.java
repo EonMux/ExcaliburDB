@@ -10,8 +10,14 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -33,12 +39,25 @@ class BackupCliTest {
     }
 
     private Run run(String... args) {
+        return runWith(null, args);
+    }
+
+    /**
+     * Runs the command, through a stand-in for the subcommands when one is given.
+     *
+     * @param command What stands in for the subcommands, or null for the real ones
+     * @param args    What was typed
+     * @return The outcome
+     */
+    private static Run runWith(BackupCli.Command command, String... args) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         ByteArrayOutputStream err = new ByteArrayOutputStream();
         int code;
         try (PrintStream outStream = new PrintStream(out, true, StandardCharsets.UTF_8);
              PrintStream errStream = new PrintStream(err, true, StandardCharsets.UTF_8)) {
-            code = BackupCli.run(args, outStream, errStream).code();
+            code = (command == null
+                ? BackupCli.run(args, outStream, errStream)
+                : BackupCli.run(args, outStream, errStream, command)).code();
         }
         return new Run(code, out.toString(StandardCharsets.UTF_8),
             err.toString(StandardCharsets.UTF_8));
@@ -204,5 +223,282 @@ class BackupCliTest {
     void exitCodesAreDistinct() {
         assertThat(java.util.Arrays.stream(ExitCode.values()).map(ExitCode::code).distinct()
             .count()).isEqualTo(ExitCode.values().length);
+    }
+
+    @Test
+    @DisplayName("--help after a subcommand prints that subcommand's usage and succeeds")
+    void helpAfterASubcommandIsAnswered() {
+        Run snapshot = run("snapshot", "--help");
+        Run verify = run("verify", "--snapshot", tempDir.toString(), "-h");
+        Run restore = run("restore", "--target", tempDir.toString(), "--help");
+
+        assertThat(snapshot.code()).isEqualTo(ExitCode.OK.code());
+        assertThat(snapshot.err()).isEmpty();
+        assertThat(snapshot.out()).contains("--data-dir", "--exclude-derived", "--allow-live",
+            "EXIT CODES").doesNotContain("--target");
+        assertThat(verify.code()).isEqualTo(ExitCode.OK.code());
+        assertThat(verify.out()).contains("verify", "--deep").doesNotContain("--data-dir");
+        assertThat(restore.code()).isEqualTo(ExitCode.OK.code());
+        assertThat(restore.out()).contains("--target", "--force").doesNotContain("--data-dir");
+    }
+
+    @Test
+    @DisplayName("--help is answered even after an option the subcommand does not take")
+    void helpWinsOverAnUnknownOption() {
+        Run run = run("verify", "--frobnicate", "--help");
+
+        assertThat(run.code()).isEqualTo(ExitCode.OK.code());
+        assertThat(run.out()).contains("--deep");
+    }
+
+    @Test
+    @DisplayName("a value that happens to read -h is a value, not a request for help")
+    void anOptionValueIsNotHelp() {
+        Run run = run("verify", "--snapshot", "-h");
+
+        assertThat(run.code()).as("-h is the snapshot directory, which does not exist")
+            .isEqualTo(ExitCode.VERIFICATION_FAILED.code());
+        assertThat(run.err()).contains("-h");
+        assertThat(run.out()).doesNotContain("USAGE");
+    }
+
+    @Test
+    @DisplayName("--help after a subcommand does nothing but print")
+    void helpAfterASubcommandTouchesNothing() {
+        Path out = tempDir.resolve("snap");
+
+        Run run = run("snapshot", "--data-dir", tempDir.resolve("data").toString(),
+            "--out", out.toString(), "--help");
+
+        assertThat(run.code()).isEqualTo(ExitCode.OK.code());
+        assertThat(out).doesNotExist();
+    }
+
+    @Test
+    @DisplayName("--help after a command this build does not know is still a usage error")
+    void helpAfterAnUnknownCommandIsAUsageError() {
+        Run run = run("snapshto", "--help");
+
+        assertThat(run.code()).isEqualTo(ExitCode.USAGE.code());
+        assertThat(run.err()).contains("unknown command: snapshto")
+            .contains("snapshot", "verify", "restore");
+    }
+
+    @Test
+    @DisplayName("a usage error in a subcommand prints that subcommand's usage")
+    void aUsageErrorPrintsTheSubcommandsUsage() {
+        Run run = run("restore", "--snapshot", tempDir.toString());
+
+        assertThat(run.code()).isEqualTo(ExitCode.USAGE.code());
+        assertThat(run.err()).contains("--target is required").contains("--force")
+            .doesNotContain("--data-dir");
+    }
+
+    @Test
+    @DisplayName("a path the platform cannot represent is a usage error, not a crash")
+    void anUnrepresentablePathIsAUsageError() {
+        Run run = run("verify", "--snapshot", "snap\0shot");
+
+        assertThat(run.code()).isEqualTo(ExitCode.USAGE.code());
+        assertThat(run.err()).contains("--snapshot").doesNotContain("unanticipated failure:");
+    }
+
+    @Test
+    @DisplayName("a snapshot into its own data directory is a usage error, not a crash")
+    void aSnapshotInsideItsSourceIsAUsageError() throws IOException {
+        Path dataDir = DataDirectoryFixture.syntheticDirectory(tempDir.resolve("data"));
+
+        Run run = run("snapshot", "--data-dir", dataDir.toString(),
+            "--out", dataDir.resolve("backup").toString());
+
+        assertThat(run.code()).isEqualTo(ExitCode.USAGE.code());
+        assertThat(run.err()).contains("inside the data directory")
+            .doesNotContain("unanticipated failure:");
+        assertThat(dataDir.resolve("backup")).doesNotExist();
+    }
+
+    @Test
+    @DisplayName("a restore into the snapshot it reads is a usage error, not a crash")
+    void aRestoreInsideItsSnapshotIsAUsageError() {
+        Run run = run("restore", "--snapshot", tempDir.toString(),
+            "--target", tempDir.resolve("inside").toString());
+
+        assertThat(run.code()).isEqualTo(ExitCode.USAGE.code());
+        assertThat(run.err()).contains("cannot write into the snapshot")
+            .doesNotContain("unanticipated failure:");
+    }
+
+    @Test
+    @DisplayName("a data directory written to during the copy exits 5, and --allow-live 0")
+    void aRunningNodeIsRefusedWithItsOwnCode() throws Exception {
+        Path dataDir = DataDirectoryFixture.syntheticDirectory(tempDir.resolve("data"));
+
+        Run refused = whileSomethingWrites(dataDir, () -> run("snapshot",
+            "--data-dir", dataDir.toString(), "--out", tempDir.resolve("snap").toString()));
+        assertThat(refused.code()).as(refused.err()).isEqualTo(ExitCode.NOT_QUIESCED.code());
+        assertThat(refused.err()).contains("--allow-live");
+        assertThat(tempDir.resolve("snap")).doesNotExist();
+
+        Run allowed = whileSomethingWrites(dataDir, () -> run("snapshot",
+            "--data-dir", dataDir.toString(), "--out", tempDir.resolve("live").toString(),
+            "--allow-live"));
+        assertThat(allowed.code()).as(allowed.err()).isEqualTo(ExitCode.OK.code());
+        assertThat(allowed.out()).contains("LIVE_UNSAFE");
+    }
+
+    @Test
+    @DisplayName("an unanticipated failure exits 70 and says where it came from")
+    void anUnanticipatedFailureHasItsOwnCode() {
+        Run run = runWith((args, out, err) -> {
+            throw new IllegalStateException("a defect in this build");
+        }, "verify", "--snapshot", tempDir.toString());
+
+        assertThat(run.code()).isEqualTo(ExitCode.INTERNAL_ERROR.code());
+        assertThat(run.err()).contains("unanticipated failure")
+            .contains("a defect in this build")
+            .contains("at com.eonmux.excalibur.backup.cli");
+    }
+
+    @Test
+    @DisplayName("verify --deep walks every format and says how much of it was proven")
+    void deepVerifyReportsWhatItProved() throws IOException {
+        Path dataDir = DataDirectoryFixture.realIndexedDirectory(tempDir.resolve("data"));
+        Path snapshotDir = tempDir.resolve("snap");
+        assertThat(run("snapshot", "--data-dir", dataDir.toString(),
+            "--out", snapshotDir.toString()).code()).isEqualTo(ExitCode.OK.code());
+
+        Run verify = run("verify", "--snapshot", snapshotDir.toString(), "--deep");
+
+        assertThat(verify.code()).as(verify.err()).isEqualTo(ExitCode.OK.code());
+        assertThat(verify.out()).contains("DEEP")
+            .containsPattern("formats  \\d+ checked: \\d+ proven against their own checksums")
+            .contains("unproven")
+            .contains(DataDirectoryFixture.IN_FLIGHT_JOURNAL);
+    }
+
+    @Test
+    @DisplayName("verify --deep fails an image whose damage was copied faithfully")
+    void deepVerifyFailsWhatAChecksumCannotSee() throws IOException {
+        Path dataDir = DataDirectoryFixture.realIndexedDirectory(tempDir.resolve("data"));
+        DataDirectoryFixture.flipAByte(dataDir.resolve(DataDirectoryFixture.GRAPH));
+        Path snapshotDir = tempDir.resolve("snap");
+        run("snapshot", "--data-dir", dataDir.toString(), "--out", snapshotDir.toString());
+
+        Run shallow = run("verify", "--snapshot", snapshotDir.toString());
+        Run deep = run("verify", "--snapshot", snapshotDir.toString(), "--deep");
+
+        assertThat(shallow.code()).isEqualTo(ExitCode.OK.code());
+        assertThat(deep.code()).isEqualTo(ExitCode.VERIFICATION_FAILED.code());
+        assertThat(deep.err()).contains(DataDirectoryFixture.GRAPH).contains("integrity");
+    }
+
+    @Test
+    @DisplayName("restore --deep restores a sound image and refuses a damaged one")
+    void deepRestoreFollowsTheDeepVerdict() throws IOException {
+        Path dataDir = DataDirectoryFixture.realIndexedDirectory(tempDir.resolve("data"));
+        Path snapshotDir = tempDir.resolve("snap");
+        run("snapshot", "--data-dir", dataDir.toString(), "--out", snapshotDir.toString());
+
+        Run restored = run("restore", "--snapshot", snapshotDir.toString(),
+            "--target", tempDir.resolve("restored").toString(), "--deep");
+        assertThat(restored.code()).as(restored.err()).isEqualTo(ExitCode.OK.code());
+        assertThat(restored.out()).contains("restored");
+
+        DataDirectoryFixture.flipAByte(dataDir.resolve(DataDirectoryFixture.CODEBOOK));
+        Path damagedSnapshot = tempDir.resolve("snap-damaged");
+        run("snapshot", "--data-dir", dataDir.toString(), "--out", damagedSnapshot.toString());
+        Path target = tempDir.resolve("refused");
+
+        Run refused = run("restore", "--snapshot", damagedSnapshot.toString(),
+            "--target", target.toString(), "--deep");
+        assertThat(refused.code()).isEqualTo(ExitCode.VERIFICATION_FAILED.code());
+        assertThat(refused.err()).contains(DataDirectoryFixture.CODEBOOK);
+        assertThat(target).doesNotExist();
+    }
+
+    @Test
+    @DisplayName("verify --deep and restore --deep accept an image holding a torn compaction")
+    void aTornCompactionPairPassesTheDeepChecks() throws IOException {
+        Path dataDir = DataDirectoryFixture.realIndexedDirectory(tempDir.resolve("data"));
+        byte[] graph = Files.readAllBytes(dataDir.resolve(DataDirectoryFixture.GRAPH));
+        byte[] mapping =
+            Files.readAllBytes(dataDir.resolve(DataDirectoryFixture.DOCUMENT_MAPPING));
+        Files.write(dataDir.resolve("segment_0.hnsw.compact"),
+            java.util.Arrays.copyOf(graph, graph.length / 2));
+        Files.write(dataDir.resolve("segment_0.hnsw.compact.docmap"),
+            java.util.Arrays.copyOf(mapping, mapping.length / 2));
+        Path snapshotDir = tempDir.resolve("snap");
+        assertThat(run("snapshot", "--data-dir", dataDir.toString(),
+            "--out", snapshotDir.toString()).code()).isEqualTo(ExitCode.OK.code());
+
+        Run verify = run("verify", "--snapshot", snapshotDir.toString(), "--deep");
+        Path target = tempDir.resolve("restored");
+        Run restore = run("restore", "--snapshot", snapshotDir.toString(),
+            "--target", target.toString(), "--deep");
+
+        assertThat(verify.code()).as(verify.out() + verify.err()).isEqualTo(ExitCode.OK.code());
+        assertThat(restore.code()).as(restore.out() + restore.err())
+            .isEqualTo(ExitCode.OK.code());
+        assertThat(target.resolve("segment_0.hnsw.compact.docmap")).exists();
+    }
+
+    @Test
+    @DisplayName("a heap dump in the data directory is left out of the image, and says so")
+    void aHeapDumpIsOmittedAndReported() throws IOException {
+        Path dataDir = DataDirectoryFixture.syntheticDirectory(tempDir.resolve("data"));
+        DataDirectoryFixture.writeRandom(dataDir.resolve("java_pid4242.hprof"), 8192, 77L);
+        Path snapshotDir = tempDir.resolve("snap");
+
+        Run snapshot = run("snapshot", "--data-dir", dataDir.toString(),
+            "--out", snapshotDir.toString());
+
+        assertThat(snapshot.code()).isEqualTo(ExitCode.OK.code());
+        assertThat(snapshot.out()).contains("omitted  1 file(s) classed DIAGNOSTIC");
+        assertThat(snapshotDir.resolve(SnapshotLayout.PAYLOAD_DIRECTORY)
+            .resolve("java_pid4242.hprof")).doesNotExist();
+        assertThat(run("verify", "--snapshot", snapshotDir.toString()).code())
+            .isEqualTo(ExitCode.OK.code());
+    }
+
+    /**
+     * Runs a command while another thread keeps appending to a file in the data directory.
+     *
+     * <p>Standing in for a running node. The file written is a staged name, which a snapshot
+     * never copies, so the copy itself cannot trip over it; what does see it is the
+     * fingerprint taken before and after the copy, which is the check a running node is
+     * caught by. The writer is confirmed to be running before the command starts and
+     * appends without pausing, so its file is certain to have grown across a copy that
+     * digests a 64 MiB write-ahead log.</p>
+     *
+     * @param dataDir The directory to write into
+     * @param command The command to run meanwhile
+     * @return What the command did
+     * @throws Exception if the writer failed or the command threw
+     */
+    private static Run whileSomethingWrites(Path dataDir, Callable<Run> command)
+        throws Exception {
+        Path scratch = dataDir.resolve("segment_0.dat.tmp");
+        AtomicBoolean running = new AtomicBoolean(true);
+        CountDownLatch started = new CountDownLatch(1);
+        Thread writer = Thread.ofPlatform().start(() -> {
+            try (FileChannel channel = FileChannel.open(scratch, StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
+                while (running.get()) {
+                    channel.write(ByteBuffer.wrap(new byte[] { 1 }));
+                    started.countDown();
+                }
+            } catch (IOException e) {
+                started.countDown();
+                throw new java.io.UncheckedIOException(e);
+            }
+        });
+        try {
+            started.await();
+            return command.call();
+        } finally {
+            running.set(false);
+            writer.join();
+            Files.deleteIfExists(scratch);
+        }
     }
 }

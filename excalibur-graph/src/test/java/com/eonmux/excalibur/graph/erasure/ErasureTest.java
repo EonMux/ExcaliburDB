@@ -480,4 +480,160 @@ class ErasureTest {
             }
         }
     }
+
+    /**
+     * A compaction killed part-way through putting its replacement in place.
+     *
+     * <p>A process that dies cannot be simulated by an exception the code under test catches, so
+     * these stop it with an {@link Error} nothing in the compaction handles: whatever was on disk
+     * at that instant is what the next start finds, exactly as after a power cut.</p>
+     */
+    @Nested
+    @DisplayName("a crash during the swap")
+    class CrashDuringSwap {
+
+        /** Stands in for the process dying: nothing between here and the test catches it. */
+        private static final class Crash extends Error {
+            Crash(String where) {
+                super("simulated crash " + where);
+            }
+        }
+
+        private MappedEdgeStore twoEdges(Path dir) throws IOException {
+            return build(dir, 3, w -> w
+                .add(0, KNOWS, 1, Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    from(SourceType.DOCUMENT, 555, 1))
+                .add(0, KNOWS, 2, Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    from(SourceType.DOCUMENT, 777, 1)));
+        }
+
+        private RoaringBitmap eraseDocument777(MappedEdgeStore store) {
+            return EdgeStoreCompactor.resolve(store, List.of(new ErasureRequest(1,
+                new ErasureScope.Source(SourceType.DOCUMENT, 777), Instant.now())));
+        }
+
+        private long edgesAt(Path dir) throws IOException {
+            try (MappedEdgeStore reopened = MappedEdgeStore.open(dir)) {
+                return reopened.edgeCount();
+            }
+        }
+
+        private List<String> namesIn(Path parent) throws IOException {
+            try (var entries = Files.list(parent)) {
+                return entries.map(path -> path.getFileName().toString()).sorted().toList();
+            }
+        }
+
+        @Test
+        @DisplayName("between the renames, the served graph is recovered from where a publish "
+            + "sets it aside")
+        void betweenTheRenames(@TempDir Path parent) throws IOException {
+            // The window the compaction's own swap left unrecoverable: the served name gone and
+            // the whole graph under a name startup recovery never looked at, so the tenant
+            // served nothing - and the copy holding the erased facts stayed on disk for good.
+            Path dir = parent.resolve("store");
+            MappedEdgeStore store = twoEdges(dir);
+            Durability firstRenameThenDie = new Durability() {
+                @Override
+                public void fsyncTree(Path root) throws IOException {
+                    Durability.super.fsyncTree(root);
+                    if (!root.equals(EdgeStoreCompactor.scratchFor(dir))) {
+                        return;
+                    }
+                    // The replacement is forced; the publish's first rename is the next thing
+                    // it does. Doing it here and dying is the state a crash between the two
+                    // renames leaves, reached through the compaction's own scratch directory.
+                    Files.move(dir, com.eonmux.excalibur.graph.staging.GraphBuilder
+                        .previousFor(dir), java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+                    throw new Crash("between the renames");
+                }
+            };
+
+            try {
+                assertThatThrownBy(() -> EdgeStoreCompactor.compact(store, dir,
+                    eraseDocument777(store), List.of(), List.of(), firstRenameThenDie))
+                    .isInstanceOf(Crash.class);
+                assertThat(dir).doesNotExist();
+
+                assertThat(com.eonmux.excalibur.graph.staging.GraphBuilder
+                    .recoverInterruptedPublish(dir))
+                    .as("recovery knows where the graph went")
+                    .isTrue();
+            } finally {
+                store.close();
+            }
+
+            assertThat(edgesAt(dir))
+                .as("the graph from before the erasure is back, for the obligation to be "
+                    + "applied to again; nothing marked it discharged")
+                .isEqualTo(2);
+            assertThat(namesIn(parent))
+                .as("no displaced copy is left behind for anything to find")
+                .doesNotContain("store.previous", "store.retired");
+            assertThat(EdgeStoreCompactor.scratchFor(dir))
+                .as("the interrupted compaction is visible to whoever opens the graph next")
+                .isDirectory();
+        }
+
+        @Test
+        @DisplayName("after both renames, the replacement stands and the displaced copy goes")
+        void afterBothRenames(@TempDir Path parent) throws IOException {
+            Path dir = parent.resolve("store");
+            MappedEdgeStore store = twoEdges(dir);
+            Durability dieOnTheParentSync = new Durability() {
+                @Override
+                public void fsyncDirectory(Path directory) throws IOException {
+                    if (directory.equals(parent)) {
+                        throw new Crash("after both renames");
+                    }
+                    Durability.super.fsyncDirectory(directory);
+                }
+            };
+
+            try {
+                assertThatThrownBy(() -> EdgeStoreCompactor.compact(store, dir,
+                    eraseDocument777(store), List.of(), List.of(), dieOnTheParentSync))
+                    .isInstanceOf(Crash.class);
+                assertThat(com.eonmux.excalibur.graph.staging.GraphBuilder.previousFor(dir))
+                    .as("the pre-erasure graph sits where recovery looks")
+                    .isDirectory();
+
+                assertThat(com.eonmux.excalibur.graph.staging.GraphBuilder
+                    .recoverInterruptedPublish(dir)).isFalse();
+            } finally {
+                store.close();
+            }
+
+            assertThat(edgesAt(dir)).as("the erased edge stays erased").isEqualTo(1);
+            assertThat(namesIn(parent))
+                .as("the copy still holding the erased edge is deleted, not kept")
+                .containsExactly("store");
+        }
+
+        @Test
+        @DisplayName("the graph is set aside under the name a build's publish uses")
+        void sharesThePublishLayout(@TempDir Path parent) throws IOException {
+            Path dir = parent.resolve("store");
+            MappedEdgeStore store = twoEdges(dir);
+            List<List<String>> seen = new ArrayList<>();
+            Durability watching = new Durability() {
+                @Override
+                public void fsyncDirectory(Path directory) throws IOException {
+                    if (directory.equals(parent)) {
+                        seen.add(namesIn(parent));
+                    }
+                    Durability.super.fsyncDirectory(directory);
+                }
+            };
+
+            EdgeStoreCompactor.compact(store, dir, eraseDocument777(store), List.of(), List.of(),
+                watching);
+
+            assertThat(seen).first().asInstanceOf(
+                    org.assertj.core.api.InstanceOfAssertFactories.list(String.class))
+                .contains("store", "store.previous")
+                .doesNotContain("store.retired", "store.compacting");
+            assertThat(namesIn(parent)).containsExactly("store");
+        }
+    }
 }

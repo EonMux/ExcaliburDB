@@ -163,21 +163,33 @@ final class ShardWorkers {
      * <p>Epoch ticks stop last. {@link EpochTickScheduler#stop()} fences a tick that has
      * already been dispatched, so after it returns the epoch cannot advance - a promise that
      * only holds if every worker that makes new work visible has already stopped.</p>
+     *
+     * <p>Every worker is asked, and waited for within its own bound, even after one has
+     * reported that it outlasted its wait: stopping the rest is still worth doing, and the
+     * answer is the conjunction. Workers are stopped by a signal they read at safe points,
+     * never by an interrupt, so a false here means work is still running against the storage
+     * and the arena it is mapped out of must stay open.</p>
+     *
+     * @return true if every worker has ended
      */
-    void stop() {
+    boolean stop() {
+        boolean ended = true;
         // Stop workers in reverse order
         if (segmentCompaction != null) {
-            segmentCompaction.stop();
+            ended &= segmentCompaction.stop();
         }
-        reindex.stop();
-        graphCompaction.stop();
-        warming.stop();
-        hnsw.stop();
+        ended &= reindex.stop();
+        ended &= graphCompaction.stop();
+        ended &= warming.stop();
+        ended &= hnsw.stop();
+        // Sampling and JMX only: nothing it runs touches storage, so it cannot hold the arena.
         cuckooMetrics.stop();
-        cuckoo.stop();
+        ended &= cuckoo.stop();
 
-        // Stop epoch tick scheduler last
+        // Stop epoch tick scheduler last. Its stop fences any dispatched tick under its own
+        // lock, so it has always ended when it returns.
         epochTicks.stop();
+        return ended;
     }
 
     /**

@@ -5,6 +5,7 @@ import com.eonmux.excalibur.api.endpoint.StatsEndpoint;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.EpochTickScheduler;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
+import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
 import org.junit.jupiter.api.AfterEach;
@@ -48,6 +49,7 @@ class ExcaliburDBServerTest {
         segmentCatalog = new SegmentCatalog();
 
         indexOrchestrator = mock(IndexOrchestrator.class);
+        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         storageEngine = mock(StorageEngine.class);
         queryPipeline = mock(QueryPipeline.class);
 
@@ -63,6 +65,8 @@ class ExcaliburDBServerTest {
         when(indexOrchestrator.getTotalVectorsIntegrated()).thenReturn(0L);
         when(indexOrchestrator.getPendingCuckooDeletions()).thenReturn(0);
         when(indexOrchestrator.getTotalCuckooDeletions()).thenReturn(0L);
+        when(indexOrchestrator.shutdown()).thenReturn(true);
+        when(queryPipeline.shutdown()).thenReturn(true);
 
         server = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
         server.start();
@@ -109,6 +113,135 @@ class ExcaliburDBServerTest {
             // Verify that indexOrchestrator.close() was called during server shutdown
             // This ensures the epoch tick scheduler is stopped cleanly
             verify(indexOrchestrator).close();
+        }
+
+        @Test
+        @DisplayName("a clean stop releases storage and the chunk index")
+        void aCleanStopReleasesEverything() {
+            server.stop(0);
+
+            assertThat(server.isStorageStillInUse()).isFalse();
+            assertThat(server.isChunkIndexStillInUse()).isFalse();
+            assertThat(server.isGraphsStillInUse()).isFalse();
+        }
+
+        @Test
+        @DisplayName("segment workers that did not stop hold storage and nothing else")
+        void workersStillRunningHoldStorage() {
+            when(indexOrchestrator.shutdown()).thenReturn(false);
+
+            server.stop(0);
+
+            assertThat(server.isStorageStillInUse()).isTrue();
+            assertThat(server.isChunkIndexStillInUse()).isFalse();
+            assertThat(server.isGraphsStillInUse()).isFalse();
+        }
+
+        @Test
+        @DisplayName("a drain step that throws leaves storage and the chunk index held")
+        void aFailedDrainHoldsEverything() {
+            // Whatever that step was meant to stop may still be running; closing storage
+            // underneath it would crash the process, where leaving it open costs a log replay.
+            doThrow(new IllegalStateException("workers refused to stop"))
+                .when(indexOrchestrator).shutdown();
+
+            assertThatThrownBy(() -> server.stop(0))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("workers refused to stop");
+            assertThat(server.isRunning()).isFalse();
+            assertThat(server.isStorageStillInUse()).isTrue();
+            assertThat(server.isChunkIndexStillInUse()).isTrue();
+            assertThat(server.isGraphsStillInUse()).isTrue();
+        }
+
+        /**
+         * An orchestrator stubbed as the one this class starts over, for a server that is to
+         * fail its own start.
+         */
+        private IndexOrchestrator orchestratorFor() {
+            IndexOrchestrator orchestrator = mock(IndexOrchestrator.class);
+            when(orchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
+            when(orchestrator.getVisibilityTracker())
+                .thenReturn(new com.eonmux.excalibur.shard.VisibilityTracker(segmentCatalog));
+            return orchestrator;
+        }
+
+        @Test
+        @DisplayName("a failed start whose workers did not stop leaves storage held")
+        void aFailedStartHoldsStorageForWorkersStillRunning() {
+            // A failed start never sets running, so the stop that follows drains nothing and
+            // would leave the flags at their defaults - storage free - with workers the start
+            // brought up still reading segments mapped out of the arena about to close.
+            IndexOrchestrator orchestrator = orchestratorFor();
+            when(orchestrator.getEpochTickScheduler())
+                .thenThrow(new IllegalStateException("scheduler missing"));
+            when(orchestrator.shutdown()).thenReturn(false);
+            ExcaliburDBServer failing =
+                new ExcaliburDBServer(0, orchestrator, storageEngine, queryPipeline);
+
+            assertThatThrownBy(failing::start)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("scheduler missing");
+            failing.stop(0);
+
+            assertThat(failing.isRunning()).isFalse();
+            assertThat(failing.isStorageStillInUse()).isTrue();
+            verify(orchestrator).shutdown();
+            verify(orchestrator).close();
+        }
+
+        @Test
+        @DisplayName("a failed start whose workers stopped leaves storage free")
+        void aFailedStartReleasesStorageOnceTheWorkersEnd() {
+            IndexOrchestrator orchestrator = orchestratorFor();
+            when(orchestrator.getEpochTickScheduler())
+                .thenThrow(new IllegalStateException("scheduler missing"));
+            when(orchestrator.shutdown()).thenReturn(true);
+            ExcaliburDBServer failing =
+                new ExcaliburDBServer(0, orchestrator, storageEngine, queryPipeline);
+
+            assertThatThrownBy(failing::start).isInstanceOf(IllegalStateException.class);
+
+            assertThat(failing.isStorageStillInUse()).isFalse();
+            verify(orchestrator).close();
+        }
+
+        @Test
+        @DisplayName("an orchestrator whose own start threw part-way is still stopped")
+        void aPartialOrchestratorStartIsStopped() {
+            // Workers ahead of the one that failed are already running.
+            IndexOrchestrator orchestrator = orchestratorFor();
+            when(orchestrator.start()).thenThrow(new IllegalStateException("worker failed"));
+            when(orchestrator.shutdown()).thenReturn(false);
+            ExcaliburDBServer failing =
+                new ExcaliburDBServer(0, orchestrator, storageEngine, queryPipeline);
+
+            assertThatThrownBy(failing::start).hasMessageContaining("worker failed");
+
+            verify(orchestrator).shutdown();
+            verify(orchestrator).close();
+            assertThat(failing.isStorageStillInUse()).isTrue();
+        }
+
+        @Test
+        @DisplayName("a stop that throws after a failed start is attached, not substituted")
+        void aThrowingStopIsSuppressed() {
+            IndexOrchestrator orchestrator = orchestratorFor();
+            when(orchestrator.getEpochTickScheduler())
+                .thenThrow(new IllegalStateException("scheduler missing"));
+            when(orchestrator.shutdown()).thenThrow(new IllegalStateException("stop failed"));
+            doThrow(new IllegalStateException("close failed")).when(orchestrator).close();
+            ExcaliburDBServer failing =
+                new ExcaliburDBServer(0, orchestrator, storageEngine, queryPipeline);
+
+            assertThatThrownBy(failing::start)
+                .hasMessageContaining("scheduler missing")
+                .satisfies(e -> assertThat(e.getSuppressed())
+                    .extracting(Throwable::getMessage)
+                    .containsExactly("stop failed", "close failed"));
+            assertThat(failing.isStorageStillInUse())
+                .as("nothing said the workers ended")
+                .isTrue();
         }
 
         @Test
@@ -404,7 +537,7 @@ class ExcaliburDBServerTest {
         void acceptsNullReindexer() throws IOException {
             ExcaliburDBServer testServer = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
 
-            // Should accept null to disable reindexing (stub mode)
+            // Null disables reindexing; POST /v1/reindex then answers 503
             assertThatCode(() -> testServer.withReindexer(null, null))
                 .doesNotThrowAnyException();
 

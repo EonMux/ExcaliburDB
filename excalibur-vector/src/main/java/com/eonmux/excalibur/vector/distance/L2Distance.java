@@ -114,8 +114,8 @@ public final class L2Distance implements DistanceFunction {
      */
     @Override
     public float compute(float[] v1, float[] v2) {
-        // Validate inputs using DistanceValidator for consistent error handling
-        DistanceValidator.validateVectorPair(v1, v2, "v1", "v2");
+        // Components are checked only if a sum comes back non-finite; see validateVectorShapes.
+        DistanceValidator.validateVectorShapes(v1, v2, "v1", "v2");
 
         final int length = v1.length;
 
@@ -157,13 +157,17 @@ public final class L2Distance implements DistanceFunction {
             sum = t;
         }
 
+        if (!(Double.isFinite(sum))) {
+            DistanceValidator.validateVectorPair(v1, v2, "v1", "v2");
+        }
+
         // Ensure non-negative result (numerical stability)
         // Math.max handles potential tiny negative values from floating-point errors
         return (float) Math.sqrt(Math.max(0.0, sum));
     }
 
     /**
-     * Vectorized implementation using Vector API via reflection.
+     * Vectorized implementation on the Vector API kernels in {@link SimdVectorOperations}.
      *
      * <p>Processes vectors in chunks of the preferred SIMD width, then
      * handles the tail with scalar operations.</p>
@@ -198,6 +202,10 @@ public final class L2Distance implements DistanceFunction {
         for (int i = upperBound; i < length; i++) {
             final double diff = (double) v1[i] - (double) v2[i];
             sum += diff * diff;
+        }
+
+        if (!(Double.isFinite(sum))) {
+            DistanceValidator.validateVectorPair(v1, v2, "v1", "v2");
         }
 
         // Ensure non-negative result

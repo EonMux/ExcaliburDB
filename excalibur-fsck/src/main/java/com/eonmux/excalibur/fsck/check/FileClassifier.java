@@ -25,6 +25,11 @@ public final class FileClassifier {
      */
     public static FileKind classify(String relative) {
         String name = nameOf(relative);
+        // First, and wherever it sits: a heap dump is the JVM's, not any format's, so the
+        // directory it landed in says nothing about what it is.
+        if (FileKind.isDiagnosticDump(name)) {
+            return FileKind.DIAGNOSTIC_DUMP;
+        }
         if (FileKind.isLeftover(name)) {
             return FileKind.STAGING_LEFTOVER;
         }
@@ -58,6 +63,12 @@ public final class FileClassifier {
         }
         if (LshTableCheck.matches(name)) {
             return FileKind.LSH_TABLE;
+        }
+        if (FileKind.TERM_SKETCH_NAME.matcher(name).matches()) {
+            return FileKind.TERM_SKETCH;
+        }
+        if (FileKind.SEGMENT_STAGED_MAPPING_NAME.matcher(name).matches()) {
+            return FileKind.HNSW_STAGED_DOCUMENT_MAP;
         }
         return bySegmentIndexName(name);
     }
@@ -96,6 +107,36 @@ public final class FileClassifier {
     }
 
     /**
+     * Returns the path of the compacted graph a staged mapping was written beside.
+     *
+     * <p>Whether that graph is still on disk is what decides whether the staged mapping is
+     * scratch or state; see {@link FileKind#HNSW_STAGED_DOCUMENT_MAP}.</p>
+     *
+     * @param stagedMapping A {@code segment_N.hnsw.compact.docmap} path, relative or absolute
+     * @return The {@code segment_N.hnsw.compact} path in the same form
+     * @throws IllegalArgumentException if the name is not a staged mapping's
+     */
+    public static String compactedGraphOf(String stagedMapping) {
+        String suffix = ".docmap";
+        if (!FileKind.SEGMENT_STAGED_MAPPING_NAME.matcher(nameOf(stagedMapping)).matches()) {
+            throw new IllegalArgumentException("Not a staged document mapping: " + stagedMapping);
+        }
+        return stagedMapping.substring(0, stagedMapping.length() - suffix.length());
+    }
+
+    /**
+     * Returns the name of the live mapping a staged one is installed over.
+     *
+     * @param stagedMapping A {@code segment_N.hnsw.compact.docmap} name
+     * @return The {@code segment_N.hnsw.docmap} name
+     * @throws IllegalArgumentException if the name is not a staged mapping's
+     */
+    public static String liveMappingOf(String stagedMapping) {
+        String graph = compactedGraphOf(stagedMapping);
+        return graph.substring(0, graph.length() - ".compact".length()) + ".docmap";
+    }
+
+    /**
      * Returns the segment number a file's name carries.
      *
      * @param name The file's name
@@ -104,7 +145,8 @@ public final class FileClassifier {
     public static long segmentNumber(String name) {
         for (java.util.regex.Pattern pattern : new java.util.regex.Pattern[] {
                 FileKind.SEGMENT_DATA_NAME, FileKind.SEGMENT_LOG_NAME,
-                FileKind.SEGMENT_INDEX_NAME }) {
+                FileKind.SEGMENT_INDEX_NAME, FileKind.SEGMENT_STAGED_MAPPING_NAME,
+                FileKind.TERM_SKETCH_NAME }) {
             var matcher = pattern.matcher(name);
             if (matcher.matches()) {
                 return Long.parseLong(matcher.group(1));

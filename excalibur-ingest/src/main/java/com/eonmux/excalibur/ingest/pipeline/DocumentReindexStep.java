@@ -7,11 +7,13 @@ import com.eonmux.excalibur.ingest.registry.DocumentLocks;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
+import com.eonmux.excalibur.ingest.source.DocumentValidators;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer.DocumentResult;
 
 import com.eonmux.excalibur.core.text.ChunkIdentifiers;
+import com.eonmux.excalibur.core.util.StopSignal;
 import com.eonmux.excalibur.llm.LLMException;
 import com.eonmux.excalibur.llm.client.LLMHttpClient;
 
@@ -43,6 +45,15 @@ import java.util.Objects;
  * an erasure of the same document cannot interleave with it and leave a chunk in storage that
  * nothing names.</p>
  *
+ * <h2>Where a chunk's terms are filed</h2>
+ * <p>Under the segment its write landed in, as each chunk is written, through the same
+ * {@link SegmentTermRecorder} a first ingest files through. The storage engine routes a chunk by
+ * its key and reports the segment it chose; stage 1 of the query pipeline rules a segment out
+ * for any term its trusted level does not name, so a term filed anywhere else - or nowhere -
+ * hides the chunk from every query for it until the segment is next rebuilt. Filing before
+ * publication costs nothing in correctness: a term filed for a chunk that is then rolled back
+ * only costs its segment a search it did not need.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>An instance is a plain holder of collaborators and carries no mutable state, so it is safe
  * to share; the collaborators carry their own guarantees. It is built per call, which is also
@@ -59,8 +70,8 @@ final class DocumentReindexStep {
      * Stores one chunk, wherever this step's target happens to be.
      *
      * <p>The loop that drives it is the same for every target, and the only thing that varies is
-     * where the bytes land and whether an offset comes back, so the difference is expressed here
-     * rather than by a second copy of the loop.</p>
+     * where the bytes land and what comes back, so the difference is expressed here rather than
+     * by a second copy of the loop.</p>
      */
     @FunctionalInterface
     private interface ChunkSink {
@@ -69,9 +80,9 @@ final class DocumentReindexStep {
          * @param chunkId   The chunk's deterministic identifier
          * @param chunk     The chunk itself
          * @param embedding Its vector, or null on a node that keeps none
-         * @return The write log offset, or a negative value if the write failed
+         * @return Where the chunk landed, or {@link ChunkPlacement#FAILED}
          */
-        long store(String chunkId, TextChunk chunk, float[] embedding);
+        ChunkPlacement store(String chunkId, TextChunk chunk, float[] embedding);
     }
 
     /** What the write loop got through, before anything is published. */
@@ -88,6 +99,9 @@ final class DocumentReindexStep {
     private final UpsertHandler upsertHandler;
     private final ReindexLexicalIndex lexical;
 
+    /** Files each written chunk's terms under the segment it landed in. */
+    private final SegmentTermRecorder termRecorder;
+
     /** The atomic target, or null on a node that writes straight to storage. */
     private final AtomicTarget atomic;
 
@@ -95,19 +109,12 @@ final class DocumentReindexStep {
     private final DocumentReindexer.StorageWriter storageWriter;
 
     /**
-     * Where an atomically published document goes, and how the run says so.
+     * Where an atomically published document goes.
      *
-     * <p>Rolling replacement writes into a segment it created and the ordinary path writes
-     * wherever the routing directory sends it. The mechanism is identical; only the operator
-     * facing wording distinguishes them, and it is carried here so the two paths cannot drift
-     * apart in anything else.</p>
-     *
-     * @param writer          Returns the write log offset of each chunk
-     * @param publisher       Makes the document's chunks visible together
-     * @param segmentTargeted Whether this is a replacement segment rather than the default target
+     * @param writer    Returns the write log offset of each chunk
+     * @param publisher Makes the document's chunks visible together
      */
-    record AtomicTarget(OffsetAwareStorageWriter writer, DocumentBatchPublisher publisher,
-                        boolean segmentTargeted) {
+    record AtomicTarget(OffsetAwareStorageWriter writer, DocumentBatchPublisher publisher) {
 
         /**
          * @throws NullPointerException if the writer or publisher is null
@@ -115,11 +122,6 @@ final class DocumentReindexStep {
         AtomicTarget {
             Objects.requireNonNull(writer, "writer must not be null");
             Objects.requireNonNull(publisher, "publisher must not be null");
-        }
-
-        /** The phrase that names this target in a log line or an error message. */
-        String where() {
-            return segmentTargeted ? " to target segment" : "";
         }
     }
 
@@ -131,13 +133,15 @@ final class DocumentReindexStep {
      * @param registry      Records what the document's new version consists of
      * @param upsertHandler Removes chunks an abandoned attempt left behind
      * @param lexical       The lexical index to keep in step with storage
+     * @param termRecorder  Files each written chunk's terms under the segment it landed in
      * @param target        Where the chunks go and how they are made visible
      */
     static DocumentReindexStep publishing(TextChunker chunker, LLMHttpClient llmClient,
                                           DocumentRegistry registry, UpsertHandler upsertHandler,
-                                          ReindexLexicalIndex lexical, AtomicTarget target) {
+                                          ReindexLexicalIndex lexical,
+                                          SegmentTermRecorder termRecorder, AtomicTarget target) {
         return new DocumentReindexStep(chunker, llmClient, registry, upsertHandler, lexical,
-            Objects.requireNonNull(target, "target must not be null"), null);
+            termRecorder, Objects.requireNonNull(target, "target must not be null"), null);
     }
 
     /**
@@ -148,26 +152,31 @@ final class DocumentReindexStep {
      * @param registry      Records what the document's new version consists of
      * @param upsertHandler Removes chunks an abandoned attempt left behind
      * @param lexical       The lexical index to keep in step with storage
+     * @param termRecorder  Files each written chunk's terms under the segment it landed in
      * @param storageWriter Persists one chunk
      */
     static DocumentReindexStep writingDirectly(TextChunker chunker, LLMHttpClient llmClient,
                                                DocumentRegistry registry,
                                                UpsertHandler upsertHandler,
                                                ReindexLexicalIndex lexical,
+                                               SegmentTermRecorder termRecorder,
                                                DocumentReindexer.StorageWriter storageWriter) {
-        return new DocumentReindexStep(chunker, llmClient, registry, upsertHandler, lexical, null,
+        return new DocumentReindexStep(chunker, llmClient, registry, upsertHandler, lexical,
+            termRecorder, null,
             Objects.requireNonNull(storageWriter, "storageWriter must not be null"));
     }
 
     private DocumentReindexStep(TextChunker chunker, LLMHttpClient llmClient,
                                 DocumentRegistry registry, UpsertHandler upsertHandler,
-                                ReindexLexicalIndex lexical, AtomicTarget atomic,
+                                ReindexLexicalIndex lexical, SegmentTermRecorder termRecorder,
+                                AtomicTarget atomic,
                                 DocumentReindexer.StorageWriter storageWriter) {
         this.chunker = chunker;
         this.llmClient = llmClient;
         this.registry = registry;
         this.upsertHandler = upsertHandler;
         this.lexical = lexical;
+        this.termRecorder = Objects.requireNonNull(termRecorder, "termRecorder must not be null");
         this.atomic = atomic;
         this.storageWriter = storageWriter;
     }
@@ -176,19 +185,28 @@ final class DocumentReindexStep {
      * Re-indexes the document: chunks it, embeds where this node embeds at all, writes every
      * chunk, and publishes the lot or none of it.
      *
+     * <p>The stop is not a checkpoint here - a document is written whole or not at all - but it
+     * may interrupt the embedding requests, which wait on the endpoint and touch nothing this
+     * node shares. A chunk whose embedding a stop cut short fails like any other unembeddable
+     * chunk, so the document is left on its previous version and its writes are rolled back,
+     * with the thread's interrupt flag clear for every write, rollback included.</p>
+     *
      * @param sourceId   The source the document belongs to
      * @param documentId The document
      * @param fetched    What the source handed back
+     * @param stop       The run's stop signal
      * @return The outcome, carrying the chunk ids the new version consists of
      * @throws IllegalArgumentException if content exceeds maximum length
      */
-    DocumentResult reindex(String sourceId, String documentId, FetchedDocument fetched) {
+    DocumentResult reindex(String sourceId, String documentId, FetchedDocument fetched,
+                           StopSignal stop) {
+        Objects.requireNonNull(stop, "stop must not be null");
         long startTime = System.currentTimeMillis();
 
         byte[] content = fetched.getContent();
         if (content == null || content.length == 0) {
-            return new DocumentResult(documentId, 0, 0, 0,
-                System.currentTimeMillis() - startTime, "Empty content");
+            return DocumentResult.skipped(documentId, DocumentResult.SkipReason.EMPTY_CONTENT,
+                System.currentTimeMillis() - startTime);
         }
 
         if (content.length > MAX_CONTENT_LENGTH) {
@@ -203,22 +221,22 @@ final class DocumentReindexStep {
         if (text == null) {
             LOG.info("Skipping document {}: its {} bytes are not text in {}",
                 documentId, content.length, fetched.getCharset());
-            return new DocumentResult(documentId, 0, 0, 0,
-                System.currentTimeMillis() - startTime, "Not text");
+            return DocumentResult.skipped(documentId, DocumentResult.SkipReason.NOT_TEXT,
+                System.currentTimeMillis() - startTime);
         }
 
         List<TextChunk> chunks = chunker.chunk(documentId, text);
         if (chunks.isEmpty()) {
-            return new DocumentResult(documentId, 0, 0, 0,
-                System.currentTimeMillis() - startTime, "No chunks produced");
+            return DocumentResult.skipped(documentId, DocumentResult.SkipReason.NO_CHUNKS,
+                System.currentTimeMillis() - startTime);
         }
 
         if (atomic != null) {
             return publishAtomically(sourceId, documentId, content, chunks,
-                fetched.getLastModifiedMillis(), startTime);
+                fetched.validators(), startTime, stop);
         }
         return writeDirectly(sourceId, documentId, content, chunks,
-            fetched.getLastModifiedMillis(), startTime);
+            fetched.validators(), startTime, stop);
     }
 
     /**
@@ -230,19 +248,19 @@ final class DocumentReindexStep {
      * by anything.</p>
      */
     private DocumentResult publishAtomically(String sourceId, String documentId, byte[] content,
-                                             List<TextChunk> chunks, long lastModifiedMillis,
-                                             long startTime) {
+                                             List<TextChunk> chunks, DocumentValidators version,
+                                             long startTime, StopSignal stop) {
 
         DocumentBatchBuffer batchBuffer = new DocumentBatchBuffer(documentId, sourceId);
 
-        ChunkWrites writes = writeChunks(sourceId, documentId, chunks,
+        ChunkWrites writes = writeChunks(sourceId, documentId, chunks, stop,
             (chunkId, chunk, embedding) -> {
-                long writeLogOffset =
-                    atomic.writer().writeChunkWithOffset(chunkId, chunk.getText(), embedding);
-                if (writeLogOffset >= 0) {
-                    batchBuffer.addChunk(chunkId, chunk, writeLogOffset, embedding);
+                ChunkPlacement placement = atomic.writer().writeChunk(chunkId,
+                    chunk.getText(), chunk.terms(), embedding);
+                if (placement.written()) {
+                    batchBuffer.addChunk(chunkId, chunk, placement.writeLogOffset(), embedding);
                 }
-                return writeLogOffset;
+                return placement;
             });
 
         // A document is indexed whole or not at all. Publishing the chunks that survived would
@@ -262,7 +280,7 @@ final class DocumentReindexStep {
 
         batchBuffer.seal();
 
-        DocumentMetadata metadata = metadataOf(sourceId, documentId, content, lastModifiedMillis,
+        DocumentMetadata metadata = metadataOf(sourceId, documentId, content, version,
             writes.chunkIds());
 
         try {
@@ -274,8 +292,8 @@ final class DocumentReindexStep {
             String errorMsg = writes.errors().isEmpty() ? null
                 : String.join("; ", writes.errors());
 
-            LOG.info("Document {} published atomically{} at epoch {}: {} chunks ({} successful, "
-                    + "{} failed) in {}ms", documentId, atomic.where(), result.epoch(),
+            LOG.info("Document {} published atomically at epoch {}: {} chunks ({} successful, "
+                    + "{} failed) in {}ms", documentId, result.epoch(),
                 chunks.size(), writes.successes(), writes.failures(), elapsed);
 
             lexical.index(writes.chunkIds(), chunks);
@@ -284,14 +302,14 @@ final class DocumentReindexStep {
 
         } catch (DocumentBatchPublisher.PublicationException e) {
             // Publication failed - document should not be visible
-            String errorMsg = "Atomic publication" + atomic.where() + " failed: " + e.getMessage();
+            String errorMsg = "Atomic publication failed: " + e.getMessage();
             if (!writes.errors().isEmpty()) {
                 errorMsg += "; " + String.join("; ", writes.errors());
             }
 
             long elapsed = System.currentTimeMillis() - startTime;
-            LOG.error("Atomic publication{} failed for document {}: {}", atomic.where(),
-                documentId, e.getMessage());
+            LOG.error("Atomic publication failed for document {}: {}", documentId,
+                e.getMessage());
 
             rollback().undo(sourceId, documentId, writes.chunkIds());
             // The failed chunk count is the chunks that could not be written, and here every
@@ -309,12 +327,12 @@ final class DocumentReindexStep {
      * epoch-based visibility management.
      */
     private DocumentResult writeDirectly(String sourceId, String documentId, byte[] content,
-                                         List<TextChunk> chunks, long lastModifiedMillis,
-                                         long startTime) {
+                                         List<TextChunk> chunks, DocumentValidators version,
+                                         long startTime, StopSignal stop) {
 
-        ChunkWrites writes = writeChunks(sourceId, documentId, chunks,
+        ChunkWrites writes = writeChunks(sourceId, documentId, chunks, stop,
             (chunkId, chunk, embedding) ->
-                storageWriter.writeChunk(chunkId, chunk.getText(), embedding) ? 0L : -1L);
+                storageWriter.writeChunk(chunkId, chunk.getText(), chunk.terms(), embedding));
 
         // As in the atomic paths: the registry entry is what change detection reads, so recording
         // the new hash for anything less than a complete document retires it from ever being
@@ -332,7 +350,7 @@ final class DocumentReindexStep {
                 failedElapsed, leftUnchanged(writes, chunks.size()));
         }
 
-        DocumentMetadata metadata = metadataOf(sourceId, documentId, content, lastModifiedMillis,
+        DocumentMetadata metadata = metadataOf(sourceId, documentId, content, version,
             writes.chunkIds());
 
         // Under the document's lock, for the reason publishAtomically holds it.
@@ -351,15 +369,20 @@ final class DocumentReindexStep {
     }
 
     /**
-     * Embeds and stores every chunk, collecting what failed rather than stopping at the first
-     * failure.
+     * Embeds and stores every chunk, filing each written chunk's terms under the segment it
+     * landed in, and collecting what failed rather than stopping at the first failure.
      *
      * <p>Every chunk is attempted because the decision this feeds is about the document as a
      * whole: a caller that stopped early would report one failure where there were ten, and an
      * operator reading the result would retry against an endpoint that is still down.</p>
+     *
+     * <p>The terms are filed from the same list the write handed the storage engine, so the
+     * membership filter and the segment's frequency sketch come from one tokenisation. A writer
+     * that reports no segment has none to file them under; see
+     * {@link OffsetAwareStorageWriter#writeChunk(String, String, List, float[])}.</p>
      */
     private ChunkWrites writeChunks(String sourceId, String documentId, List<TextChunk> chunks,
-                                    ChunkSink sink) {
+                                    StopSignal stop, ChunkSink sink) {
         List<String> chunkIds = new ArrayList<>(chunks.size());
         List<String> errors = new ArrayList<>();
         int successes = 0;
@@ -370,17 +393,21 @@ final class DocumentReindexStep {
             String chunkId = generateChunkId(sourceId, documentId, i);
 
             try {
-                float[] embedding = embed(chunk.getText(), sourceId, documentId);
+                float[] embedding =
+                    stop.interruptibly(() -> embed(chunk.getText(), sourceId, documentId));
 
-                long writeLogOffset = sink.store(chunkId, chunk, embedding);
+                ChunkPlacement placement = sink.store(chunkId, chunk, embedding);
 
-                if (writeLogOffset >= 0) {
+                if (placement.written()) {
+                    if (placement.segmentKnown()) {
+                        termRecorder.record(placement.segmentId(), chunkId, chunk.terms());
+                    }
                     chunkIds.add(chunkId);
                     successes++;
                 } else {
                     failures++;
                     errors.add("Storage write failed for chunk " + i);
-                    LOG.warn("Failed to write chunk {} for document {}{}", i, documentId, where());
+                    LOG.warn("Failed to write chunk {} for document {}", i, documentId);
                 }
             } catch (LLMException e) {
                 failures++;
@@ -391,11 +418,6 @@ final class DocumentReindexStep {
         }
 
         return new ChunkWrites(chunkIds, successes, failures, errors);
-    }
-
-    /** The phrase naming this step's target, empty where there is nothing to distinguish. */
-    private String where() {
-        return atomic == null ? "" : atomic.where();
     }
 
     /** The reason a document was left on its previous version, as the caller will read it. */
@@ -409,14 +431,17 @@ final class DocumentReindexStep {
      *
      * <p>Built only once every chunk has landed: the content hash recorded here is what change
      * detection compares on the next run, so it must never describe a document storage does not
-     * hold in full.</p>
+     * hold in full. The same goes for the validators: the next run hands them back to the source,
+     * and a source that answers "not modified" to them is never asked for the body again.</p>
      */
     private static DocumentMetadata metadataOf(String sourceId, String documentId, byte[] content,
-                                               long lastModifiedMillis, List<String> chunkIds) {
+                                               DocumentValidators version,
+                                               List<String> chunkIds) {
         return DocumentMetadata.builder()
             .sourceId(sourceId)
             .documentId(documentId)
-            .lastModifiedMillis(lastModifiedMillis)
+            .lastModifiedMillis(version.lastModifiedMillis())
+            .entityTag(version.entityTag())
             .contentHash(DocumentRegistry.computeContentHash(content))
             .contentLength(content.length)
             .chunkIds(chunkIds)

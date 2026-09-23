@@ -175,6 +175,26 @@ public final class GraphRagPipeline {
         this.topK = topK;
     }
 
+    /**
+     * Whether this pipeline can walk in {@code direction}.
+     *
+     * <p>Both ways always. One way only when it was built with the relation vocabulary a one-way
+     * walk names its relations in: an embedded pipeline assembled without one can follow every
+     * edge, and has no way to say which of them point the direction asked for. Asked before
+     * answering, so a caller serving requests can refuse one it cannot carry out as that, rather
+     * than as the failure {@link #answer} would otherwise raise.</p>
+     *
+     * @param direction the direction a caller wants to walk in
+     * @return true if {@link #answer} will honour it
+     * @throws IllegalArgumentException if direction is null
+     */
+    public boolean supports(TraversalDirection direction) {
+        if (direction == null) {
+            throw new IllegalArgumentException("direction must not be null");
+        }
+        return direction == TraversalDirection.BOTH || walker.canRestrictDirection();
+    }
+
     /** Answers a question with no conversation behind it. */
     public GraphRagResult answer(String question) {
         return answer(question, new ConversationContext(), new QueryTrace());
@@ -219,6 +239,8 @@ public final class GraphRagPipeline {
      * @param asOf      the valid-time instant to answer at, or null to use the question's own
      * @param direction which way along an edge the traversal may step
      * @param trace     receives per-stage latency
+     * @throws IllegalStateException if asked to walk in a direction this pipeline does not
+     *                               {@link #supports support}
      */
     public GraphRagResult answer(String question, ConversationContext context,
                                  TemporalFilter asOf, TraversalDirection direction,
@@ -265,8 +287,8 @@ public final class GraphRagPipeline {
      * @param direction which way along an edge the traversal may step
      * @param trace     receives per-stage latency
      * @return the evidence, or the reason the question never reached retrieval
-     * @throws IllegalStateException if a one-way walk is asked of a pipeline with no relation
-     *                               vocabulary to name the relations with
+     * @throws IllegalStateException if asked to walk in a direction this pipeline does not
+     *                               {@link #supports support}
      */
     public Evidence gather(String question, ConversationContext context, TemporalFilter asOf,
                            TraversalDirection direction, QueryTrace trace) {
@@ -276,7 +298,7 @@ public final class GraphRagPipeline {
         if (context == null || trace == null || direction == null) {
             throw new IllegalArgumentException("context, direction and trace must not be null");
         }
-        if (direction != TraversalDirection.BOTH && !walker.canRestrictDirection()) {
+        if (!supports(direction)) {
             throw new IllegalStateException("a " + direction.wireName() + " traversal needs the "
                 + "graph's relation vocabulary, and this pipeline was built without one");
         }

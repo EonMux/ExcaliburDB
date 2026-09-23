@@ -48,10 +48,10 @@ import java.util.function.Supplier;
  *     "vectorsIntegrated": 14000000
  *   },
  *   "cuckoo": {
- *     "pendingDeletions": 100,
- *     "totalDeletions": 5000,
- *     "avgFpRate": 0.000500,
- *     "maxFpRate": 0.001000,
+ *     "pendingDeletions": 0,
+ *     "totalDeletions": 212,
+ *     "avgFpRate": 0.0000070547,
+ *     "maxFpRate": 0.0000137324,
  *     "saturated": false,
  *     "saturatedSegments": 0
  *   },
@@ -63,7 +63,15 @@ import java.util.function.Supplier;
  *   "coverage": 1.0000,
  *   "workers": { "indexOrchestratorRunning": true },
  *   "vectorIndex": { "segmentsWithoutIndex": 0 },
- *   "breakers": { "embedding": "CLOSED" },
+ *   "breakers": {
+ *     "embedding": "CLOSED",
+ *     "llmRelevancy": "CLOSED",
+ *     "queryExpansion": "CLOSED",
+ *     "graphExtraction": "OPEN",
+ *     "graphRerank": "CLOSED",
+ *     "graphQueryEmbedding": "CLOSED",
+ *     "graphBuildEmbedding": "CLOSED"
+ *   },
  *   "lexical": {
  *     "engine": "native",
  *     "indexed": 15000000,
@@ -73,7 +81,8 @@ import java.util.function.Supplier;
  *     "erasedRatio": 0.0013,
  *     "erasureRequests": 3,
  *     "oldestErasureAgeMs": 412000,
- *     "compactionDue": false
+ *     "compactionDue": false,
+ *     "unreadableChunksDropped": 0
  *   },
  *   "queryCache": {
  *     "hits": 1204,
@@ -99,7 +108,7 @@ import java.util.function.Supplier;
  *     },
  *     "ingest": {
  *       "documentsSeen": 1200, "factsStaged": 5400, "unresolvedDocuments": 0,
- *       "extractionFailures": 2, "tenantFailures": 0
+ *       "extractionFailures": 2, "tenantFailures": 0, "sinkRefusals": 0
  *     }
  *   }
  * }
@@ -110,7 +119,10 @@ import java.util.function.Supplier;
  * namespaces, never a row per namespace. {@code budget} carries both the graphs' share of the
  * mapping and descriptor limits and the whole process's, because the limits are the process's
  * and eviction can only give back the graphs' share. {@code erasure} is absent when the graph
- * root could not be listed, and {@code ingest} on a node whose ingestion stages no facts.</p>
+ * root could not be listed, and {@code ingest} on a node whose ingestion stages no facts.
+ * {@code ingest.sinkRefusals} counts documents the sink threw on instead of counting them under
+ * one of its own reasons; like the other failures there, those documents are published and are
+ * not offered to the graph again unless they change.</p>
  *
  * <h2>The query cache, when there is one</h2>
  * <p>Absent unless {@code excalibur.query.cache.enabled} is on, and absent is a different
@@ -118,6 +130,16 @@ import java.util.function.Supplier;
  * earning its place; {@code invalidations} says why it is not, when it is not. Entries
  * discarded because the corpus moved are not a capacity problem and raising the capacity
  * will not help - that figure is the node ingesting faster than its queries repeat.</p>
+ *
+ * <h2>Chunks the lexical index gave up on</h2>
+ * <p>{@code lexical.unreadableChunksDropped} counts chunks a compaction of the native index
+ * dropped because their stored text failed its checksum or could not be decoded - damage that
+ * no retry repairs. Dropping them is what lets the rest of their group be rewritten and any
+ * erasure owed there be met; the cost is that each one stops being found by keyword search
+ * while still being served by vector search. Anything above zero means storage holds damaged
+ * segments: the chunks' documents want reindexing from their source, and the disk under them
+ * wants looking at. A read that failed for any other reason is not counted - its group is
+ * abandoned whole and retried by the next compaction.</p>
  *
  * <h2>The three blocks that report a partial failure</h2>
  * <p>{@code workers}, {@code vectorIndex} and {@code breakers} describe states this node keeps
@@ -413,7 +435,8 @@ public class StatsEndpoint implements HttpHandler {
             .append("\"unresolvedDocuments\": ").append(ingest.unresolvedDocuments())
             .append(", ")
             .append("\"extractionFailures\": ").append(ingest.extractionFailures()).append(", ")
-            .append("\"tenantFailures\": ").append(ingest.tenantFailures())
+            .append("\"tenantFailures\": ").append(ingest.tenantFailures()).append(", ")
+            .append("\"sinkRefusals\": ").append(ingest.sinkRefusals())
             .append("}");
     }
 
@@ -468,8 +491,8 @@ public class StatsEndpoint implements HttpHandler {
             .append("\"cuckoo\": {")
             .append("\"pendingDeletions\": ").append(cuckoo.pendingDeletions()).append(", ")
             .append("\"totalDeletions\": ").append(cuckoo.totalDeletions()).append(", ")
-            .append("\"avgFpRate\": ").append(JsonText.number(cuckoo.avgFpRate(), 6)).append(", ")
-            .append("\"maxFpRate\": ").append(JsonText.number(cuckoo.maxFpRate(), 6)).append(", ")
+            .append("\"avgFpRate\": ").append(JsonText.exact(cuckoo.avgFpRate())).append(", ")
+            .append("\"maxFpRate\": ").append(JsonText.exact(cuckoo.maxFpRate())).append(", ")
             .append("\"saturated\": ").append(cuckoo.saturated()).append(", ")
             .append("\"saturatedSegments\": ").append(cuckoo.saturatedSegments())
             .append("}, ");
@@ -502,30 +525,53 @@ public class StatsEndpoint implements HttpHandler {
     /**
      * The circuit breakers this node has, each omitted where there is none.
      *
-     * <p>Two breakers and two different degradations: an open embedding breaker drops
-     * retrieval to lexical-only, an open relevancy breaker bypasses stage-5 re-ranking. Either
-     * can be open while the other is closed, and an omitted one means there is no such
+     * <p>Seven breakers and seven different degradations: an open embedding breaker drops
+     * retrieval to lexical-only, an open relevancy breaker bypasses stage-5 re-ranking, an open
+     * query-expansion breaker searches every query as typed, an open graph-extraction breaker
+     * indexes documents without adding their facts to the graph, an open graph-rerank breaker
+     * leaves graph answers in the order the stage before the model gave them, an open
+     * graph-query-embedding breaker skips the exact vector rerank of graph candidates, and an
+     * open graph-build-embedding breaker publishes a build's entities without the vectors that
+     * rerank compares against. Any of
+     * them can be open while the others are closed, and an omitted one means there is no such
      * component rather than a healthy one.</p>
+     *
+     * <p>The three graph breakers are one each for the node, not one per namespace: every
+     * tenant's graph reranks, embeds and builds through the same clients, because every tenant calls
+     * the same endpoint, so one state is the truth for all of them and the block does not grow
+     * with the number of tenants.</p>
      *
      * @param sb    The body being built
      * @param stats The snapshot
      */
     private static void appendBreakers(StringBuilder sb, NodeStats stats) {
-        if (stats.embeddingBreaker() == null && stats.llmRelevancyBreaker() == null) {
+        java.util.Map<String, String> present = new java.util.LinkedHashMap<>();
+        putIfPresent(present, "embedding", stats.embeddingBreaker());
+        putIfPresent(present, "llmRelevancy", stats.llmRelevancyBreaker());
+        putIfPresent(present, "queryExpansion", stats.queryExpansionBreaker());
+        putIfPresent(present, "graphExtraction", stats.graphExtractionBreaker());
+        putIfPresent(present, "graphRerank", stats.graphRerankBreaker());
+        putIfPresent(present, "graphQueryEmbedding", stats.graphQueryEmbeddingBreaker());
+        putIfPresent(present, "graphBuildEmbedding", stats.graphBuildEmbeddingBreaker());
+        if (present.isEmpty()) {
             return;
         }
         sb.append(", \"breakers\": {");
         String separator = "";
-        if (stats.embeddingBreaker() != null) {
-            sb.append("\"embedding\": \"")
-                .append(JsonText.escape(stats.embeddingBreaker())).append("\"");
+        for (java.util.Map.Entry<String, String> breaker : present.entrySet()) {
+            sb.append(separator).append('"').append(breaker.getKey()).append("\": \"")
+                .append(JsonText.escape(breaker.getValue())).append('"');
             separator = ", ";
         }
-        if (stats.llmRelevancyBreaker() != null) {
-            sb.append(separator).append("\"llmRelevancy\": \"")
-                .append(JsonText.escape(stats.llmRelevancyBreaker())).append("\"");
-        }
         sb.append("}");
+    }
+
+    /** Adds a breaker's state under its name, leaving out one this node does not have. */
+    private static void putIfPresent(java.util.Map<String, String> breakers, String name,
+                                     String state) {
+        if (state != null) {
+            breakers.put(name, state);
+        }
     }
 
     /**
@@ -618,7 +664,8 @@ public class StatsEndpoint implements HttpHandler {
             .append("\"oldestErasureAgeMs\": ").append(lexical.oldestErasureRequest()
                 .map(at -> String.valueOf(Math.max(0, System.currentTimeMillis() - at.toEpochMilli())))
                 .orElse("null")).append(", ")
-            .append("\"compactionDue\": ").append(lexical.compactionDue())
+            .append("\"compactionDue\": ").append(lexical.compactionDue()).append(", ")
+            .append("\"unreadableChunksDropped\": ").append(lexical.unreadableChunksDropped())
             .append("}");
     }
 }

@@ -66,9 +66,12 @@ public class CuckooFilterBenchmark {
     public double targetLoadFactor;
 
     /**
-     * Capacity of the filter (number of entries at load factor 1.0).
-     * Using 1M entries provides sufficient statistical significance
-     * while keeping benchmark runtime reasonable.
+     * Capacity the filter is created for.
+     *
+     * <p>This is the capacity requested from {@link CuckooFilter#create(long, int)}, not the
+     * one the filter ends up with: the filter rounds its bucket count up to a power of two and
+     * keeps twice the buckets the request strictly needs, so 1M requested entries become
+     * 2,097,152 slots. Load factors are always taken against {@link CuckooFilter#capacity()}.</p>
      */
     @Param({"1000000"})
     public long capacity;
@@ -100,14 +103,18 @@ public class CuckooFilterBenchmark {
     // Random number generator with fixed seed for reproducibility
     private static final Random RANDOM = new Random(42);
 
+    // How far the filled load factor may sit from the target before the trial is refused.
+    private static final double LOAD_FACTOR_TOLERANCE = 0.001;
+
     @Setup(Level.Trial)
     public void setup() {
         // Create the filter with specified capacity and fingerprint bits
         filter = CuckooFilter.create(capacity, fingerprintBits);
 
-        // Calculate how many entries to insert for target load factor
-        // Domain constraint: load factor = count / capacity, so count = loadFactor * capacity
-        insertedCount = (long) (capacity * targetLoadFactor);
+        // Load factor is count over the filter's real capacity, which is larger than the
+        // requested one (see the capacity parameter). Sizing the fill from the request left
+        // every trial at under half its named load factor.
+        insertedCount = (long) (filter.capacity() * targetLoadFactor);
 
         // Pre-generate keys for insertion
         // Keys are 16 bytes (128 bits) to represent realistic hash keys
@@ -116,11 +123,11 @@ public class CuckooFilterBenchmark {
             insertedKeys[i] = generateKey(i);
         }
 
-        // Pre-generate keys for miss lookups (distinct from inserted keys)
-        // Start from a different seed to ensure no overlap
+        // Miss keys continue the index sequence past the last inserted key, so the two sets
+        // cannot overlap however the fill is sized.
         nonInsertedKeys = new byte[(int) insertedCount][];
         for (int i = 0; i < insertedCount; i++) {
-            nonInsertedKeys[i] = generateKey(i + (int) capacity);
+            nonInsertedKeys[i] = generateKey((int) insertedCount + i);
         }
 
         // Insert all keys into the filter
@@ -131,19 +138,19 @@ public class CuckooFilterBenchmark {
             } else {
                 // This shouldn't happen at these load factors with proper sizing
                 System.err.println("Warning: Insert failed at index " + i +
-                    " (load factor would be " + ((double) i / capacity) + ")");
+                    " (load factor would be " + ((double) i / filter.capacity()) + ")");
                 break;
             }
         }
 
-        // Verify actual load factor is close to target (domain correctness check)
-        // Note: CuckooFilter uses power-of-2 bucket sizing, so actual capacity
-        // may differ from requested capacity. Allow 10% tolerance.
+        // The fill is sized from the filter's own capacity, so the only gap left is the
+        // truncation of one entry; anything wider means inserts were refused.
         double actualLoadFactor = filter.loadFactor();
-        if (Math.abs(actualLoadFactor - targetLoadFactor) > 0.10) {
+        if (Math.abs(actualLoadFactor - targetLoadFactor) > LOAD_FACTOR_TOLERANCE) {
             throw new IllegalStateException(
                 "Actual load factor " + actualLoadFactor +
-                " differs from target " + targetLoadFactor + " by more than 10%");
+                " differs from target " + targetLoadFactor + " by more than "
+                + LOAD_FACTOR_TOLERANCE);
         }
 
         // Verify no false negatives (all inserted items must be found)
@@ -171,7 +178,8 @@ public class CuckooFilterBenchmark {
         System.out.println("========================================");
         System.out.println("  Target load factor: " + targetLoadFactor);
         System.out.println("  Actual load factor: " + String.format("%.4f", actualLoadFactor));
-        System.out.println("  Capacity: " + capacity);
+        System.out.println("  Requested capacity: " + capacity);
+        System.out.println("  Filter capacity: " + filter.capacity());
         System.out.println("  Inserted entries: " + successfulInserts);
         System.out.println("  Fingerprint bits: " + fingerprintBits);
         System.out.println("  Filter size: " + (filter.byteSize() / 1024) + " KB");
@@ -246,8 +254,10 @@ public class CuckooFilterBenchmark {
     /**
      * Benchmark: Mixed lookup pattern (50% hit, 50% miss).
      * Represents realistic query patterns where some items exist and some don't.
+     * Each call makes two lookups, and the score is per lookup.
      */
     @Benchmark
+    @OperationsPerInvocation(2)
     public int lookupMixed(Blackhole bh) {
         int found = 0;
         // Alternate between hit and miss lookups
@@ -266,11 +276,12 @@ public class CuckooFilterBenchmark {
     }
 
     /**
-     * Benchmark: Batch lookup (10 lookups per operation).
+     * Benchmark: Batch lookup (10 lookups per call).
      * Measures throughput when performing multiple lookups in a tight loop.
-     * Useful for understanding batch query performance.
+     * The score is per lookup, so it compares directly with {@link #lookupHit}.
      */
     @Benchmark
+    @OperationsPerInvocation(10)
     public int batchLookupHit(Blackhole bh) {
         int found = 0;
         for (int i = 0; i < 10; i++) {
@@ -315,6 +326,12 @@ public class CuckooFilterBenchmark {
      * Benchmark: Combined insert + contains operations.
      * Measures the overhead of mixed read-write workload.
      * Note: This creates a separate filter to avoid polluting the main benchmark.
+     *
+     * <p>The workload cycles through its keys many times per iteration, so it records each key
+     * with {@link CuckooFilter#insertIfAbsent} - the membership insert production code uses.
+     * A plain insert would add another copy of every key on every pass; a key's two buckets
+     * hold eight copies at most, after which every insert of it walks a full displacement
+     * chain and fails, and the benchmark would be timing that instead.</p>
      */
     @State(Scope.Thread)
     public static class MixedWorkloadState {
@@ -349,7 +366,7 @@ public class CuckooFilterBenchmark {
 
         // Alternate between insert and contains
         if (idx % 10 == 0) {
-            state.mixedFilter.insert(state.keys[idx]);
+            state.mixedFilter.insertIfAbsent(state.keys[idx]);
         }
         return state.mixedFilter.contains(state.keys[idx % (state.keys.length / 2)]);
     }

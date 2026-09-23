@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
+import com.eonmux.excalibur.core.util.StopSignal;
 import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
@@ -15,7 +16,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -29,17 +29,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * What {@code DELETE /v1/reindex} actually stops.
+ * What {@code DELETE /v1/reindex} actually stops, and what it must never break.
  *
- * <p>The endpoint interrupts the thread running the reindex and tells the caller the run will
- * stop at its next checkpoint. There were no checkpoints: the interrupt surfaced as an exception
- * out of a fetch or a write, the per-document {@code catch (Exception e)} filed it as an ordinary
- * error for that document, and the loop went on to the next one. A cancelled reindex of a large
- * source therefore walked the whole remaining crawl, writing as it went, and was only
- * <em>classified</em> as cancelled if the interrupt flag happened to survive to the end.</p>
+ * <p>Two properties. The documents after the cancellation point are not processed: a stop that
+ * was filed as one document's error let a cancelled reindex of a large source walk the whole
+ * remaining crawl. And no write the run makes is carried out with its thread interrupted: an
+ * interrupt reaching a storage write closes the channel it writes through for every writer of
+ * that segment, so a cancel that interrupted the run broke storage for the rest of the
+ * process.</p>
  *
- * <p>These tests assert the property an operator cares about - that the documents after the
- * cancellation point are not processed - rather than the flag, which was already right.</p>
+ * <p>The stop is asked for through the run's {@link StopSignal}. An interrupt from elsewhere is
+ * still honoured as a stop, which several tests here use to stand in for one.</p>
  */
 @DisplayName("Reindex cancellation")
 class ReindexCancellationTest {
@@ -108,22 +108,69 @@ class ReindexCancellationTest {
     }
 
     @Test
-    @DisplayName("the interrupt flag is restored, so the caller classifies the run as cancelled")
-    void restoresTheInterruptFlag() {
+    @DisplayName("a stopped run hands its thread back uninterrupted, with the stop recorded")
+    void leavesTheInterruptFlagClear() throws Exception {
         StubSource source = new StubSource();
         source.add("doc-1", "First. ".repeat(60));
         source.add("doc-2", "Second. ".repeat(60));
         source.failOn("doc-1", new SourceException("Read interrupted",
             new InterruptedException("interrupted")));
+        StopSignal stop = new StopSignal();
 
-        assertThatThrownBy(() -> reindexer.reindexAll(source))
+        assertThatThrownBy(() -> reindex(source, stop))
             .isInstanceOf(ReindexCancelledException.class);
 
         assertThat(Thread.currentThread().isInterrupted())
-            .as("ReindexRun reads the flag and the cause chain to tell a stop from a failure; "
-                + "an InterruptedException cleared the flag on its way out, so a run that did "
-                + "not put it back would have its stop filed as an outage")
+            .as("a scheduled or pooled thread carries the flag into the next run it serves, "
+                + "whose first channel write it would close")
+            .isFalse();
+        assertThat(stop.isRequested())
+            .as("the caller classifies the run from the signal and the exception type")
             .isTrue();
+    }
+
+    @Test
+    @DisplayName("a stop requested during a fetch never reaches the writes after it")
+    void aStopDuringAFetchLeavesTheWritesUninterrupted() {
+        StubSource source = new StubSource();
+        source.add("doc-1", "A document long enough to chunk several times. ".repeat(200));
+        source.add("doc-2", "Never reached. ".repeat(60));
+        StopSignal stop = new StopSignal();
+        // What the endpoint's DELETE does when it lands while the source is being read: the
+        // fetch is inside the signal's window, so the request interrupts it there.
+        source.requestWhileFetching("doc-1", stop);
+
+        assertThatThrownBy(() -> reindex(source, stop))
+            .isInstanceOf(ReindexCancelledException.class);
+
+        assertThat(writer.written())
+            .as("the fetched document is finished whole")
+            .isNotEmpty();
+        assertThat(writer.writesUnderInterrupt())
+            .as("an interrupt reaching a storage write closes the channel every writer of that "
+                + "segment shares")
+            .isZero();
+        assertThat(source.fetched()).containsExactly("doc-1");
+    }
+
+    @Test
+    @DisplayName("a stop requested between two chunks lets the document finish, uninterrupted")
+    void aStopMidDocumentFinishesTheDocument() {
+        StubSource source = new StubSource();
+        source.add("doc-1", "A document long enough to chunk many times over. ".repeat(400));
+        source.add("doc-2", "Never reached. ".repeat(60));
+        StopSignal stop = new StopSignal();
+        writer.requestOnChunk("doc-1", 2, stop);
+
+        assertThatThrownBy(() -> reindex(source, stop))
+            .isInstanceOf(ReindexCancelledException.class);
+
+        DocumentMetadata published = registry.get(SOURCE, "doc-1");
+        assertThat(published).isNotNull();
+        assertThat(published.getChunkIds()).hasSizeGreaterThan(2);
+        assertThat(writer.written()).containsAll(published.getChunkIds());
+        assertThat(writer.writesUnderInterrupt()).isZero();
+        assertThat(source.fetched()).containsExactly("doc-1");
     }
 
     @Test
@@ -199,6 +246,16 @@ class ReindexCancellationTest {
             .as("the work already committed must survive the stop, or a cancelled run leaves "
                 + "chunks in storage that no registry entry names")
             .isNotNull();
+        assertThat(writer.writesUnderInterrupt())
+            .as("the interrupt that landed during the fetch is taken as the stop there, not "
+                + "carried into the document's writes, where it would close the channel")
+            .isZero();
+    }
+
+    /** Runs the reindex with a stop signal the test holds. */
+    private DocumentReindexer.ReindexResult reindex(StubSource source, StopSignal stop)
+            throws SourceException {
+        return reindexer.reindexAll(source, DocumentReindexer.ReindexProgress.NONE, stop);
     }
 
     /** A storage writer that accepts everything, and can interrupt the run mid-document. */
@@ -207,8 +264,10 @@ class ReindexCancellationTest {
 
         private final Map<String, String> text = new ConcurrentHashMap<>();
         private final List<String> order = new CopyOnWriteArrayList<>();
+        private final AtomicInteger writesUnderInterrupt = new AtomicInteger();
         private String interruptDocument;
         private int interruptOnChunk;
+        private StopSignal stopOnChunk;
         private int chunksSeen;
 
         void interruptOnChunk(String documentId, int chunkNumber) {
@@ -216,16 +275,33 @@ class ReindexCancellationTest {
             this.interruptOnChunk = chunkNumber;
         }
 
+        void requestOnChunk(String documentId, int chunkNumber, StopSignal stop) {
+            interruptOnChunk(documentId, chunkNumber);
+            this.stopOnChunk = stop;
+        }
+
         List<String> written() {
             return List.copyOf(order);
         }
 
+        /** Writes made while the writing thread's interrupt flag was set. */
+        int writesUnderInterrupt() {
+            return writesUnderInterrupt.get();
+        }
+
         @Override
         public boolean writeChunk(String chunkId, String content, float[] embedding) {
+            if (Thread.currentThread().isInterrupted()) {
+                writesUnderInterrupt.incrementAndGet();
+            }
             if (interruptDocument != null && chunkId.contains(":" + interruptDocument + ":")) {
                 chunksSeen++;
                 if (chunksSeen == interruptOnChunk) {
-                    Thread.currentThread().interrupt();
+                    if (stopOnChunk != null) {
+                        stopOnChunk.request();
+                    } else {
+                        Thread.currentThread().interrupt();
+                    }
                 }
             }
             text.put(chunkId, content);
@@ -271,6 +347,7 @@ class ReindexCancellationTest {
         private final Map<String, String> documents = new LinkedHashMap<>();
         private final Map<String, SourceException> failures = new LinkedHashMap<>();
         private final Set<String> interruptOn = ConcurrentHashMap.newKeySet();
+        private final Map<String, StopSignal> requestOn = new ConcurrentHashMap<>();
         private final List<String> fetched = new CopyOnWriteArrayList<>();
 
         void add(String documentId, String content) {
@@ -284,6 +361,11 @@ class ReindexCancellationTest {
         /** Interrupts the run while this document is being read, as the endpoint's DELETE does. */
         void interruptWhileFetching(String documentId) {
             interruptOn.add(documentId);
+        }
+
+        /** Requests the stop while this document is being read, as the endpoint's DELETE does. */
+        void requestWhileFetching(String documentId, StopSignal stop) {
+            requestOn.put(documentId, stop);
         }
 
         List<String> fetched() {
@@ -306,11 +388,6 @@ class ReindexCancellationTest {
         }
 
         @Override
-        public boolean hasChanged(Instant since) {
-            return true;
-        }
-
-        @Override
         public FetchedDocument fetch(String documentId) throws SourceException {
             fetched.add(documentId);
             SourceException failure = failures.get(documentId);
@@ -319,6 +396,10 @@ class ReindexCancellationTest {
             }
             if (interruptOn.contains(documentId)) {
                 Thread.currentThread().interrupt();
+            }
+            StopSignal stop = requestOn.get(documentId);
+            if (stop != null) {
+                stop.request();
             }
             String content = documents.get(documentId);
             if (content == null) {

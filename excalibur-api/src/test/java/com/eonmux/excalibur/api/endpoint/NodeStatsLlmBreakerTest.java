@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.endpoint;
 
 import com.eonmux.excalibur.shard.IndexOrchestrator;
+import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
@@ -35,6 +36,7 @@ class NodeStatsLlmBreakerTest {
     void setUp() {
         segmentCatalog = new SegmentCatalog();
         indexOrchestrator = mock(IndexOrchestrator.class);
+        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         storageEngine = mock(StorageEngine.class);
         when(indexOrchestrator.getVisibilityTracker())
             .thenReturn(new VisibilityTracker(segmentCatalog));
@@ -90,6 +92,63 @@ class NodeStatsLlmBreakerTest {
         NodeStatsCollector collector = collector();
         collector.withLlmRelevancyBreaker(() -> null);
         assertThat(collector.collect().llmRelevancyBreaker()).isNull();
+    }
+
+    @Test
+    @DisplayName("reports the query-expansion and graph-extraction breakers apart from the rest")
+    void reportsTheOtherChatBreakers() {
+        NodeStatsCollector collector = collector();
+        collector.withLlmRelevancyBreaker(() -> "CLOSED");
+        collector.withQueryExpansionBreaker(() -> "HALF_OPEN");
+        collector.withGraphExtractionBreaker(() -> "OPEN");
+
+        NodeStats stats = collector.collect();
+        assertThat(stats.llmRelevancyBreaker()).isEqualTo("CLOSED");
+        assertThat(stats.queryExpansionBreaker()).isEqualTo("HALF_OPEN");
+        assertThat(stats.graphExtractionBreaker()).isEqualTo("OPEN");
+    }
+
+    @Test
+    @DisplayName("the expansion and extraction breakers are absent on a node without them")
+    void theOtherChatBreakersAreAbsentWithoutAClient() {
+        NodeStatsCollector collector = collector();
+        collector.withGraphExtractionBreaker(() -> {
+            throw new IllegalStateException("extractor closed");
+        });
+
+        NodeStats stats = collector.collect();
+        assertThat(stats.queryExpansionBreaker()).isNull();
+        assertThat(stats.graphExtractionBreaker())
+            .as("unreadable reads as absent, not as closed")
+            .isNull();
+    }
+
+    @Test
+    @DisplayName("reports the three graph model breakers apart from one another")
+    void reportsTheGraphModelBreakers() {
+        NodeStatsCollector collector = collector();
+        collector.withGraphRerankBreaker(() -> "CLOSED");
+        collector.withGraphQueryEmbeddingBreaker(() -> "HALF_OPEN");
+        collector.withGraphBuildEmbeddingBreaker(() -> "OPEN");
+
+        NodeStats stats = collector.collect();
+        assertThat(stats.graphRerankBreaker()).isEqualTo("CLOSED");
+        assertThat(stats.graphQueryEmbeddingBreaker()).isEqualTo("HALF_OPEN");
+        assertThat(stats.graphBuildEmbeddingBreaker()).isEqualTo("OPEN");
+    }
+
+    @Test
+    @DisplayName("the build embedding breaker is absent until a build has embedded")
+    void theBuildEmbeddingBreakerIsAbsentUntilCreated() {
+        NodeStatsCollector collector = collector();
+        assertThat(collector.collect().graphBuildEmbeddingBreaker())
+            .as("a node that serves no graph of its own")
+            .isNull();
+
+        collector.withGraphBuildEmbeddingBreaker(() -> null);
+        assertThat(collector.collect().graphBuildEmbeddingBreaker())
+            .as("tenants, but no build has embedded anything yet")
+            .isNull();
     }
 
     private NodeStatsCollector collector() {

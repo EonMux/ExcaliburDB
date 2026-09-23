@@ -491,12 +491,13 @@ public class IngestEndpoint implements HttpHandler {
      * Settings only a filesystem walk can apply.
      *
      * <p>A crawl has a URL and a host policy: no file extension, no directory name, no
-     * symbolic link and no local file to size.</p>
+     * symbolic link and no local file to size. Nor does it need to be told an encoding: every
+     * response names its own in its {@code Content-Type}.</p>
      */
     private static final List<String> FILESYSTEM_ONLY_FIELDS = List.of(
         SourceFactory.INCLUDED_EXTENSIONS, SourceFactory.EXCLUDED_DIRECTORIES,
         SourceFactory.FOLLOW_SYMLINKS, SourceFactory.INCLUDE_HIDDEN,
-        SourceFactory.MAX_FILE_BYTES);
+        SourceFactory.MAX_FILE_BYTES, SourceFactory.CHARSET);
 
     /** Settings only an HTTP crawl can apply. A directory walk fetches nothing over a wire. */
     private static final List<String> HTTP_ONLY_FIELDS = List.of(
@@ -519,6 +520,24 @@ public class IngestEndpoint implements HttpHandler {
         putFlag(configJson, config, SourceFactory.INCLUDE_HIDDEN);
         putBounded(configJson, config, SourceFactory.MAX_FILE_BYTES, 1,
             SourceFactory.FILE_BYTES_LIMIT);
+        putCharset(configJson, config);
+    }
+
+    /**
+     * Copies the declared encoding across under its canonical name, refusing one this node
+     * cannot decode.
+     *
+     * <p>Refused here, as a 400 naming the field, rather than when the source is built: an
+     * unknown name that reached the catalog would fail every later restore of the
+     * registration. The canonical name is what is recorded, so the source's config view shows
+     * the encoding the node will actually use rather than whichever alias was sent.</p>
+     */
+    private static void putCharset(String configJson, Map<String, String> config) {
+        if (!JsonText.has(configJson, SourceFactory.CHARSET)) {
+            return;
+        }
+        String name = JsonText.string(configJson, SourceFactory.CHARSET);
+        config.put(SourceFactory.CHARSET, SourceFactory.charset(name).name());
     }
 
     /**

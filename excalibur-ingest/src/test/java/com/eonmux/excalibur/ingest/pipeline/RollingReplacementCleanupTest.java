@@ -16,7 +16,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
@@ -123,12 +122,6 @@ class RollingReplacementCleanupTest {
         }
 
         @Override
-        public long writeChunkWithOffset(long segmentId, String chunkId, String content,
-                                         float[] embedding) {
-            return -1L;
-        }
-
-        @Override
         public boolean delete(byte[] key) {
             return true;
         }
@@ -150,11 +143,6 @@ class RollingReplacementCleanupTest {
         @Override
         public Stream<String> crawl() throws SourceException {
             throw new SourceException("The source cannot be listed");
-        }
-
-        @Override
-        public boolean hasChanged(Instant since) {
-            return true;
         }
 
         @Override

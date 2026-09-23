@@ -83,12 +83,17 @@ final class SegmentMutations {
      * consumes no new slot and a segment at the boundary would otherwise reject updates it can
      * trivially satisfy.</p>
      *
-     * @param key   The key (already validated)
-     * @param value The value (already validated)
+     * <p>The value's terms arrive already hashed, so that the tokenising and hashing that
+     * counting them costs is paid before the lock rather than under it; see
+     * {@link SegmentTermSketch}.</p>
+     *
+     * @param key        The key (already validated)
+     * @param value      The value (already validated)
+     * @param termHashes The value's {@linkplain SegmentTermSketch#termHashes(byte[]) term hashes}
      * @throws SegmentCapacityExceededException if the segment cannot admit the write
      * @throws IllegalStateException            if the log cannot record it
      */
-    void putInternal(byte[] key, byte[] value) {
+    void putInternal(byte[] key, byte[] value, long[] termHashes) {
         long keyHash = owner.records.computeHash(key);
         int existingSlot = owner.slots.findSlot(keyHash, key);
 
@@ -97,6 +102,8 @@ final class SegmentMutations {
         } else {
             insert(keyHash, key, value);
         }
+        // Only once the write has been applied: a refused write must not be counted.
+        owner.terms.record(termHashes);
     }
 
     /**
@@ -323,13 +330,41 @@ final class SegmentMutations {
      * lands in a segment whose contents have already been copied into the children. The
      * caller is told it succeeded and the entry is gone.</p>
      *
+     * <p>The value's terms are hashed here, before the lock is taken.</p>
+     *
      * @param key   The key
      * @param value The value
      */
     void put(byte[] key, byte[] value) {
         owner.records.validateKey(key);
         owner.records.validateValue(value);
+        putValidated(key, value, SegmentTermSketch.termHashes(value));
+    }
 
+    /**
+     * Applies a put under the segment's write lock, with the value's terms already hashed.
+     *
+     * <p>For a caller that hashed them once for several attempts - the engine retries a write
+     * on the child a split produced - or from terms it had already extracted.</p>
+     *
+     * @param key        The key
+     * @param value      The value
+     * @param termHashes The value's {@linkplain SegmentTermSketch#termHashes(byte[]) term hashes}
+     */
+    void put(byte[] key, byte[] value, long[] termHashes) {
+        owner.records.validateKey(key);
+        owner.records.validateValue(value);
+        putValidated(key, value, java.util.Objects.requireNonNull(termHashes, "termHashes"));
+    }
+
+    /**
+     * The locked half of a put whose key and value have been validated.
+     *
+     * @param key        The key
+     * @param value      The value
+     * @param termHashes The value's term hashes
+     */
+    private void putValidated(byte[] key, byte[] value, long[] termHashes) {
         owner.lock.writeLock().lock();
         try {
             // Inside the lock, not before it. beginSplit() and close() both take this same
@@ -338,7 +373,7 @@ final class SegmentMutations {
             // waits, and the write then lands in a segment whose contents have already been
             // copied into the children. The caller is told it succeeded and the entry is gone.
             owner.split.requireWritable();
-            putInternal(key, value);
+            putInternal(key, value, termHashes);
         } finally {
             owner.lock.writeLock().unlock();
         }
@@ -407,12 +442,16 @@ final class SegmentMutations {
      * @param value The value
      */
     void putWithoutLock(byte[] key, byte[] value) {
-        owner.validateNotClosed();
+        // The caller holds the write lock, so this is the same in-lock check put() makes:
+        // a write to a splitting parent would be acknowledged and then missing from both
+        // children, and one to a retired parent would land in an inode nothing reaches.
+        owner.split.requireWritable();
         owner.records.validateKey(key);
         owner.records.validateValue(value);
 
-        // Caller must hold write lock - no lock acquisition here
-        putInternal(key, value);
+        // Caller must hold write lock - no lock acquisition here. The terms are hashed under
+        // it: the callers are bulk copies into a segment nothing else can reach yet.
+        putInternal(key, value, SegmentTermSketch.termHashes(value));
     }
 
     /**
@@ -422,7 +461,8 @@ final class SegmentMutations {
      * @return true if the key was found and tombstoned
      */
     boolean deleteWithoutLock(byte[] key) {
-        owner.validateNotClosed();
+        // In-lock, for the reason putWithoutLock gives.
+        owner.split.requireWritable();
         owner.records.validateKey(key);
 
         // Caller must hold write lock - no lock acquisition here

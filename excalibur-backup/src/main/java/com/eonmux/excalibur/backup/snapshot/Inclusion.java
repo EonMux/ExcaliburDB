@@ -39,8 +39,9 @@ public enum Inclusion {
     /**
      * Derived, with a rebuild path. Copied unless the operator asks for a smaller image.
      *
-     * <p>The lexical chunk index, a tenant's built edge store and the quantiser codebooks.
-     * Each can be regenerated - by a reindex, by a graph build, by retraining - at a cost
+     * <p>The lexical chunk index, a tenant's built edge store, the quantiser codebooks and
+     * each segment's term sketch. Each can be regenerated - by a reindex, by a graph build,
+     * by retraining, or for a sketch by the node itself as it opens the segment - at a cost
      * in time rather than in data. Excluding them makes a much smaller backup whose restore
      * is followed by work; including them makes a backup that can serve immediately.</p>
      */
@@ -54,7 +55,20 @@ public enum Inclusion {
      * these names and nothing reads them; copying one puts a file in the backup that looks
      * like state and is not.</p>
      */
-    TRANSIENT(false, false);
+    TRANSIENT(false, false),
+
+    /**
+     * A JVM heap dump. Never copied.
+     *
+     * <p>{@code -XX:+HeapDumpOnOutOfMemoryError} writes one wherever {@code -XX:HeapDumpPath}
+     * points, and a node pointed at its data directory leaves it beside the segments. It is
+     * a record of a process, not state: nothing in the engine reads it, a restored node has
+     * no use for it, and it is roughly the size of the heap that ran out - so copying it
+     * would most often make the image several times the size of the data it protects. The
+     * snapshot reports it as omitted, so the dump is seen rather than silently left
+     * behind.</p>
+     */
+    DIAGNOSTIC(false, false);
 
     /** Whether a snapshot that keeps derived state copies this. */
     private final boolean withDerived;

@@ -18,8 +18,9 @@ import com.eonmux.excalibur.config.ShardConfig;
  * </ul>
  *
  * <h2>Default Configuration</h2>
- * <p>The default configuration targets ≥99% recall@10 for typical use cases.
- * These values are based on the original HNSW paper recommendations.</p>
+ * <p>The default configuration targets ≥99% recall@10 on embedding-shaped data; see
+ * {@link #DEFAULT_EF_SEARCH} for what that does and does not cover. These values are based on
+ * the original HNSW paper recommendations.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is immutable and thread-safe.</p>
@@ -54,18 +55,18 @@ public final class HnswConfig {
 
     /**
      * Default size of dynamic candidate list during search.
-     * Value: 200 (guarantees ≥99% recall@10)
+     * Value: 200 (≥99% recall@10 on embedding-shaped data)
      *
-     * <p><strong>Rationale:</strong> Based on HNSW paper benchmarks and empirical testing:</p>
-     * <ul>
-     *   <li>efSearch=100 achieves ~90-95% recall@10</li>
-     *   <li>efSearch=150 achieves ~98-99% recall@10</li>
-     *   <li>efSearch=200 achieves ≥99% recall@10 (guaranteed)</li>
-     * </ul>
+     * <p><strong>Rationale:</strong> recall at a given efSearch is a property of the data as
+     * much as of the graph. On data with the shape of learned embeddings - clustered, with a
+     * few dozen directions of variance - efSearch=200 recovers at least 99% of the true top
+     * ten at every corpus size and dimension the recall benchmark covers. It does not on
+     * isotropic random vectors in high dimension, whose intrinsic dimension equals their
+     * ambient one: over 10,000 such vectors in 128 dimensions this graph and a textbook HNSW
+     * alike reach about 96% at efSearch=200 and need 300-400 for 99%.</p>
      *
-     * <p>We use efSearch=200 as the default to guarantee ≥99% recall@10 as required
-     * by the project specification. For applications willing to trade recall for
-     * lower latency, use {@link #withEfSearch(int)} to reduce efSearch.</p>
+     * <p>For applications willing to trade recall for lower latency, use
+     * {@link #withEfSearch(int)} to reduce efSearch.</p>
      */
     public static final int DEFAULT_EF_SEARCH = 200;
 

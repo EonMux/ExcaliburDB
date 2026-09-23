@@ -48,6 +48,9 @@ final class SegmentRegistry {
      */
     private volatile HierarchicalCuckooFilter hierarchicalFilter;
 
+    /** Refills a segment's level in {@link #hierarchicalFilter} from the segment itself. */
+    private final TermFilterRebuilds termFilterRebuilds;
+
     /**
      * Creates a registry over the engine whose directory it converges on.
      *
@@ -62,6 +65,8 @@ final class SegmentRegistry {
         this.workers = workers;
         this.visibility = visibility;
         this.epochIsolation = epochIsolation;
+        this.termFilterRebuilds = new TermFilterRebuilds(() -> hierarchicalFilter,
+            this::registeredSegment, engine == null ? null : engine.getCatalog());
     }
 
     /**
@@ -77,11 +82,23 @@ final class SegmentRegistry {
      *   <li>Hierarchical Cuckoo filter (for corpus → segment membership)</li>
      * </ul>
      *
+     * <p>Which filter the segment is registered with is resolved by {@link #resolveFilter}:
+     * with a hierarchy configured it is the segment's level in it, whatever the caller
+     * passed, because that level is where ingestion records the segment's terms.</p>
+     *
+     * <p>A segment instance new to its id - one opened at startup, a split child, the instance
+     * a reconciliation sweep found behind an index - holds entries that never passed through
+     * ingestion here, so its level is marked stale and queued to be refilled from it; see
+     * {@link TermFilterRebuilds}. Registering the instance an id already holds changes
+     * nothing.</p>
+     *
      * @param segmentId The segment ID
      * @param segment   The segment
      * @param graph     The HNSW graph (can be null)
      * @param filter    The Cuckoo filter (can be null)
      * @param tracker   The tail offset tracker (can be null)
+     * @throws IllegalArgumentException if a filter is supplied for an id the hierarchy has no
+     *                                  level for, and it does not hash as the hierarchy does
      */
     void register(long segmentId, Segment segment, HnswGraph graph,
                   CuckooFilter filter, TailOffsetTracker tracker) {
@@ -89,8 +106,13 @@ final class SegmentRegistry {
             return;
         }
 
+        // Resolved first: installing a supplied filter as a hierarchy level is the one step
+        // here that can refuse, and it must refuse before anything else has been told.
+        CuckooFilter resolved = resolveFilter(segmentId, filter);
+        SegmentIndexInfo previous = byId.get(segmentId);
+
         // Store segment index info
-        byId.put(segmentId, new SegmentIndexInfo(segment, graph, filter, tracker));
+        byId.put(segmentId, new SegmentIndexInfo(segment, graph, resolved, tracker));
 
         // Register with visibility tracker for epoch-based visibility
         visibility.registerSegment(segmentId, visibility.currentEpoch());
@@ -104,23 +126,55 @@ final class SegmentRegistry {
             workers.graphCompaction().registerGraph(graph);
         }
 
-        // Register with Cuckoo worker if filter exists
-        if (filter != null) {
-            workers.cuckoo().registerFilter(segmentId, filter);
-            // Register with Cuckoo metrics worker for FP rate monitoring
-            workers.cuckooMetrics().registerFilter(segmentId, filter);
+        if (resolved != null) {
+            workers.cuckoo().registerFilter(segmentId, resolved);
+            workers.cuckooMetrics().registerFilter(segmentId, resolved);
         }
 
         workers.registerForCompaction(segment);
 
-        // Register with hierarchical Cuckoo filter for corpus → segment membership
-        // This enables efficient query pruning via Stage 1 Cuckoo filter cascade
-        if (hierarchicalFilter != null) {
-            hierarchicalFilter.registerSegment(String.valueOf(segmentId));
-            LOGGER.debug("Registered segment {} in hierarchical Cuckoo filter", segmentId);
+        if (previous == null || previous.segment() != segment) {
+            termFilterRebuilds.schedule(segmentId);
         }
 
         LOGGER.debug("Registered segment {} with index orchestrator", segmentId);
+    }
+
+    /**
+     * Resolves the Cuckoo filter a segment is registered with.
+     *
+     * <p>With a hierarchy configured, the answer is the segment's level in it. Ingestion
+     * records a segment's terms there - {@code HierarchicalCuckooFilter.insert(term, id)} -
+     * and nowhere else, so a registration holding any other filter would have the maintenance
+     * worker delete from, and the metrics worker sample, a filter nothing writes to: the
+     * false-positive rates on {@code /v1/stats} would stay at zero on a node whose filters are
+     * filling up. The level is the existing one when the id already has one, which is what
+     * keeps a compacted replacement or a split's left child answering for the terms its
+     * predecessor recorded; a supplied filter is installed as the level only when there is
+     * none; otherwise an empty level is created.</p>
+     *
+     * <p>Without a hierarchy the supplied filter, if any, is used as it is.</p>
+     *
+     * @param segmentId The segment ID
+     * @param supplied  The filter the caller supplied, or null
+     * @return The filter to register, or null when there is neither a hierarchy nor a
+     *         supplied filter
+     */
+    private CuckooFilter resolveFilter(long segmentId, CuckooFilter supplied) {
+        HierarchicalCuckooFilter hierarchy = hierarchicalFilter;
+        if (hierarchy == null) {
+            return supplied;
+        }
+        String key = String.valueOf(segmentId);
+        CuckooFilter level = hierarchy.getSegmentFilter(key);
+        if (level != null) {
+            return level;
+        }
+        if (supplied != null) {
+            hierarchy.registerSegment(key, supplied);
+            return supplied;
+        }
+        return hierarchy.registerSegment(key);
     }
 
     /**
@@ -368,24 +422,41 @@ final class SegmentRegistry {
      * arrived - which is every segment on a node that configures the filter after boot - would
      * be pruned out of every query it should have answered.</p>
      *
+     * <p>Each back-filled segment is re-pointed at its level, in the registration and in the
+     * maintenance and metrics workers, for the reason {@link #resolveFilter} gives: the level
+     * is the filter ingestion writes to from now on. And each is queued to have its level
+     * refilled from what it already holds: a level is created empty, and one that the next
+     * write makes non-empty would otherwise speak for the segment while knowing only that
+     * write.</p>
+     *
      * @param filter The hierarchical Cuckoo filter (may be null)
      */
     void setHierarchicalFilter(HierarchicalCuckooFilter filter) {
         this.hierarchicalFilter = filter;
         this.workers.cuckoo().setHierarchicalFilter(filter);
 
-        // Register all existing segments with the new hierarchical filter
-        // This is CRITICAL for Stage 1 Cuckoo filter cascade to function correctly
-        if (filter != null) {
-            int registeredCount = 0;
-            for (Map.Entry<Long, SegmentIndexInfo> entry : byId.entrySet()) {
-                long segmentId = entry.getKey();
-                filter.registerSegment(String.valueOf(segmentId));
-                registeredCount++;
+        if (filter == null) {
+            return;
+        }
+        int registeredCount = 0;
+        for (Map.Entry<Long, SegmentIndexInfo> entry : byId.entrySet()) {
+            long segmentId = entry.getKey();
+            SegmentIndexInfo info = entry.getValue();
+            CuckooFilter level = filter.registerSegment(String.valueOf(segmentId));
+            if (info.filter() != level) {
+                byId.replace(segmentId, info, new SegmentIndexInfo(
+                    info.segment(), info.graph(), level, info.tracker()));
+                workers.cuckoo().unregisterFilter(segmentId);
+                workers.cuckoo().registerFilter(segmentId, level);
+                workers.cuckooMetrics().registerFilter(segmentId, level);
             }
-            if (registeredCount > 0) {
-                LOGGER.info("Registered {} existing segments with hierarchical Cuckoo filter", registeredCount);
-            }
+            // Everything this segment already holds was written before there was a level to
+            // file it under.
+            termFilterRebuilds.schedule(segmentId);
+            registeredCount++;
+        }
+        if (registeredCount > 0) {
+            LOGGER.info("Registered {} existing segments with hierarchical Cuckoo filter", registeredCount);
         }
     }
 
@@ -396,5 +467,59 @@ final class SegmentRegistry {
      */
     HierarchicalCuckooFilter hierarchicalFilter() {
         return hierarchicalFilter;
+    }
+
+    /**
+     * Declares an id's level stale ahead of a change the caller will report later.
+     *
+     * @param segmentId The segment ID
+     */
+    void markTermFilterStale(long segmentId) {
+        termFilterRebuilds.markStale(segmentId);
+    }
+
+    /**
+     * Declares an id's level stale and queues its refill from the segment registered there.
+     *
+     * <p>For a change that keeps the id but alters what the segment holds without going
+     * through ingestion, such as a compaction swapping in its replacement.</p>
+     *
+     * @param segmentId The segment ID
+     */
+    void rebuildTermFilter(long segmentId) {
+        termFilterRebuilds.schedule(segmentId);
+    }
+
+    /**
+     * Waits for every queued term filter rebuild to finish.
+     *
+     * @param timeout How long to wait
+     * @param unit    The unit of the timeout
+     * @return true if the queue drained in time
+     * @throws InterruptedException if the wait is interrupted
+     */
+    boolean awaitTermFilterRebuilds(long timeout, java.util.concurrent.TimeUnit unit)
+            throws InterruptedException {
+        return termFilterRebuilds.awaitIdle(timeout, unit);
+    }
+
+    /**
+     * Stops the term filter rebuild queue.
+     *
+     * @return true if no rebuild is still reading a segment
+     */
+    boolean close() {
+        return termFilterRebuilds.drain();
+    }
+
+    /**
+     * The segment registered under an id now.
+     *
+     * @param segmentId The segment ID
+     * @return The segment, or null if the id is not registered
+     */
+    private Segment registeredSegment(long segmentId) {
+        SegmentIndexInfo info = byId.get(segmentId);
+        return info == null ? null : info.segment();
     }
 }

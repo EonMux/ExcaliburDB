@@ -73,12 +73,18 @@ final class EngineWrites {
      * retry. Classifying them by message would silently miss the data-region case, which is
      * the one vector payloads hit first.</p>
      *
-     * @param key   The key
-     * @param value The value
-     * @return The id of the segment the key was written to
+     * <h2>Why the terms are hashed here</h2>
+     * <p>The value's chunk-text terms are counted into the sketch of whichever segment accepts
+     * the write, under that segment's write lock. Hashing them here, once and before any lock,
+     * keeps the tokenising out of the lock and out of every retry.</p>
+     *
+     * @param key        The key
+     * @param value      The value
+     * @param termHashes The value's {@linkplain SegmentTermSketch#termHashes(byte[]) term hashes}
+     * @return The catalog index of the segment the key was written to
      * @see StorageEngine#putReportingSegment(byte[], byte[])
      */
-    long putReportingSegment(byte[] key, byte[] value) {
+    long putReportingSegment(byte[] key, byte[] value, long[] termHashes) {
         if (key == null || value == null) {
             throw new NullPointerException("Key and value cannot be null");
         }
@@ -107,23 +113,25 @@ final class EngineWrites {
             }
 
             try {
-                segment.put(key, value);
+                segment.put(key, value, termHashes);
 
                 // Update catalog entry count only - don't change lifecycle state
                 // Segments remain in INDEXING state during writes
-                engine.catalog.updateEntryCount(engine.routingTable.catalogIndexOf(segment, segmentIndex), 1);
+                long catalogIndex = engine.routingTable.catalogIndexOf(segment, segmentIndex);
+                engine.catalog.updateEntryCount(catalogIndex, 1);
 
                 // Increment visibility epoch for consistent reads
                 engine.visibilityTracker.advanceEpoch();
 
                 engine.statistics.incrementWriteOperations();
-                return segment.segmentId();
+                return catalogIndex;
             } catch (SegmentCapacityExceededException e) {
                 // Every capacity signal - load factor, exhausted data region, or an
                 // unsatisfiable probe chain - is handled the same way: split and retry.
                 // Classifying these by exception message would silently miss the data
                 // region case, which is the one vector payloads hit first.
-                return putWithSplitHandling(key, value, keyHash, segment, segmentIndex);
+                return putWithSplitHandling(key, value, termHashes, keyHash, segment,
+                    segmentIndex);
             } catch (SegmentRetiredException e) {
                 // The split published while this write was in flight. The key belongs to one of
                 // the children now; writing it here would land in a file nothing can reach.
@@ -153,12 +161,13 @@ final class EngineWrites {
      *
      * @param key The key to insert
      * @param value The value to insert
+     * @param termHashes The value's term hashes
      * @param keyHash The pre-computed key hash
      * @param segment The segment that is at capacity
      * @param segmentIndex The segment index
      * @throws SegmentAtCapacityException if split cannot complete in time
      */
-    private long putWithSplitHandling(byte[] key, byte[] value, long keyHash,
+    private long putWithSplitHandling(byte[] key, byte[] value, long[] termHashes, long keyHash,
                                        Segment segment, int segmentIndex) {
         if (engine.splitWorker == null || !engine.splitWorker.isRunning()) {
             // No split worker available - cannot handle capacity automatically
@@ -185,13 +194,14 @@ final class EngineWrites {
         }
 
         // Insert into child segment
-        child.put(key, value);
+        child.put(key, value, termHashes);
 
-        engine.catalog.updateEntryCount(engine.routingTable.catalogIndexOf(child, segmentIndex), 1);
+        long catalogIndex = engine.routingTable.catalogIndexOf(child, segmentIndex);
+        engine.catalog.updateEntryCount(catalogIndex, 1);
 
         engine.visibilityTracker.advanceEpoch();
         engine.statistics.incrementWriteOperations();
-        return child.segmentId();
+        return catalogIndex;
     }
 
     /**

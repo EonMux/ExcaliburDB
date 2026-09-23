@@ -29,8 +29,9 @@ application {
 dependencies {
     implementation("org.slf4j:slf4j-api:2.0.16")
 
-    // The four format owners. api rather than implementation for none of them: nothing depends
-    // on this module, it is a leaf that runs and exits.
+    // The format owners, as implementation rather than api. excalibur-backup depends on this
+    // module for its per-file dispatch, and declares its own dependency on each format module
+    // whose classes it names, so none of these is part of what this module exports.
     implementation(project(":excalibur-core"))
     implementation(project(":excalibur-store"))
     implementation(project(":excalibur-vector"))
@@ -68,8 +69,11 @@ tasks.withType<Javadoc> {
         .addStringOption("-add-modules", "jdk.incubator.vector")
 }
 
-// Runs the checker against a directory without installing anything:
-//   ./gradlew :excalibur-fsck:fsck --args="check /var/lib/excalibur"
+// Runs the checker against a directory without installing anything. The arguments are the
+// command line the installed excalibur-fsck takes - the data directory, then any options - and
+// a relative directory resolves against this module, the task's working directory:
+//   ./gradlew :excalibur-fsck:fsck --args="/var/lib/excalibur"
+//   ./gradlew :excalibur-fsck:fsck --args="/var/lib/excalibur --strict --json"
 tasks.register<JavaExec>("fsck") {
     group = "verification"
     description = "Runs the offline data directory integrity checker"

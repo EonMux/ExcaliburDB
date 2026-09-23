@@ -93,6 +93,12 @@ tasks.test {
         events("passed", "skipped", "failed")
         showStandardStreams = true
     }
+    // The node runs with the Vector API resolved - applicationDefaultJvmArgs above, and the
+    // container's entrypoint - so its tests do too. Without the module VectorApiSupport falls
+    // back to scalar arithmetic without a word, and every search these tests drive through the
+    // real engine would exercise a distance kernel production never calls. The sources here do
+    // not import the incubator package themselves, so compilation needs no matching flag.
+    jvmArgs("--add-modules=jdk.incubator.vector")
     // ConfigKeyInventoryTest holds the README's settings table and the shipped properties
     // template against the keys and defaults the node actually reads. Gradle cannot see a file a
     // test opens for itself, so without these the task stays up to date when one of them changes

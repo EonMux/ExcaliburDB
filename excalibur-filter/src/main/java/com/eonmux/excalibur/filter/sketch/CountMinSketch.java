@@ -25,10 +25,35 @@ import java.util.concurrent.locks.ReentrantLock;
  * <h2>Algorithm</h2>
  * <ul>
  *   <li>Uses d rows of w counters each</li>
- *   <li>Each row has an independent hash function</li>
+ *   <li>Each row has its own hash function, derived from one hash of the item</li>
  *   <li><strong>Insert:</strong> Increment counters at hash_i(item) % w for all rows</li>
  *   <li><strong>Estimate:</strong> Return minimum of all counters at hash positions</li>
  * </ul>
+ *
+ * <h2>One hash per item</h2>
+ * <p>The item's bytes are hashed once, by {@link #itemHash(byte[])}, and every row's column is
+ * derived from that one value by double hashing (Kirsch and Mitzenmacher): the value is mixed
+ * with this sketch's seed into two 32-bit halves {@code h1} and {@code h2}, and row {@code i}
+ * uses column {@code (start + i * step) mod w}, where {@code start} is {@code h1 mod w} and
+ * {@code step} is drawn by {@code h2} from the residues coprime to the width. That keeps the
+ * error bounds below while hashing the bytes once rather than once per row - which matters
+ * because the sketch is fed on the storage write path. It also lets a caller hash an item where
+ * it is cheap to - outside a lock, say - and hand the sketch the value through
+ * {@link #insertHashed(long, long)}. The item hash is seed-independent, so one value serves every
+ * sketch; the seed still gives each sketch its own columns.</p>
+ *
+ * <h2>Why the step is coprime to the width</h2>
+ * <p>The error bound assumes the rows are independent chances to escape a collision, and double
+ * hashing only delivers that when every row lands in a column of its own. A step sharing a factor
+ * {@code g} with the width revisits a column every {@code w / g} rows: with a power-of-two width,
+ * which is what segments keep, a raw {@code h2} divisible by the width put every row of roughly
+ * one item in a thousand in the same column (or its mirror), so its estimate was one counter read
+ * several times, and a half-width {@code h2} paired the rows off. A step coprime to the width is
+ * a unit modulo it, so rows {@code 0 .. w - 1} visit {@code w} distinct columns: an item's first
+ * {@code min(depth, width)} rows never share one. Drawing the step from a table of those residues
+ * gives the guarantee for every width - forcing {@code h2} odd would give it only for powers of
+ * two - at a cost of one table read per item. The table holds at most one int per column, which
+ * is at most half the space of a single row of counters.</p>
  *
  * <h2>Error Bounds</h2>
  * <p>With probability at least (1 - δ), the error is at most ε * N where:</p>
@@ -61,8 +86,20 @@ public class CountMinSketch {
     /** Magic number for serialization validation. */
     private static final int MAGIC = 0x434D534B; // "CMSK" in ASCII
 
-    /** Current serialization version. */
-    private static final int VERSION = 1;
+    /**
+     * Current serialization version.
+     *
+     * <p>The counters are only meaningful under the column mapping that filled them, so the
+     * version names that mapping as well as the layout. Version 1 hashed each row separately,
+     * and version 2 stepped through the rows by the raw upper half of the mixed hash, which
+     * could share a factor with the width; see "Why the step is coprime to the width". A sketch
+     * written under either reads back as unsupported rather than as counters for other
+     * terms.</p>
+     */
+    private static final int VERSION = 3;
+
+    /** Seed of {@link #itemHash(byte[])}, fixed so every sketch agrees on an item's hash. */
+    private static final long ITEM_HASH_SEED = 0x2545F4914F6CDD1DL;
 
     /** Header size in bytes. */
     private static final int HEADER_SIZE = 32;
@@ -95,6 +132,12 @@ public class CountMinSketch {
 
     /** Total count of all items inserted. */
     private final AtomicLong totalCount;
+
+    /**
+     * The residues modulo {@link #width} that are coprime to it, in ascending order: the steps a
+     * row sequence may take. See "Why the step is coprime to the width".
+     */
+    private final int[] steps;
 
     /** Striped locks for write operations. */
     private final ReentrantLock[] locks;
@@ -141,6 +184,7 @@ public class CountMinSketch {
         this.depth = depth;
         this.seed = seed;
         this.totalCount = new AtomicLong(0);
+        this.steps = unitsModulo(width);
 
         // Initialize counter arrays
         this.counters = new AtomicLongArray[depth];
@@ -199,6 +243,37 @@ public class CountMinSketch {
         if (item == null) {
             throw new NullPointerException("item cannot be null");
         }
+        insertHashed(itemHash(item), count);
+    }
+
+    /**
+     * Returns the hash an item is counted and estimated under.
+     *
+     * <p>The same for every sketch, whatever its seed, so an item can be hashed once - where it
+     * is cheap to - and the value handed to {@link #insertHashed(long, long)} or
+     * {@link #estimateHashed(long)} of any sketch.</p>
+     *
+     * @param item The item
+     * @return Its hash
+     * @throws NullPointerException if item is null
+     */
+    public static long itemHash(byte[] item) {
+        if (item == null) {
+            throw new NullPointerException("item cannot be null");
+        }
+        return XxHash64.hash(item, ITEM_HASH_SEED);
+    }
+
+    /**
+     * Inserts an item, given as its {@link #itemHash(byte[])}, with the specified count.
+     *
+     * <p>Exactly what {@link #insert(byte[], long)} does with the item's bytes.</p>
+     *
+     * @param itemHash The item's hash
+     * @param count    The count to add (must be non-negative)
+     * @throws IllegalArgumentException if count is negative
+     */
+    public void insertHashed(long itemHash, long count) {
         if (count < 0) {
             throw new IllegalArgumentException("count must be non-negative: " + count);
         }
@@ -206,13 +281,12 @@ public class CountMinSketch {
             return;
         }
 
-        // Use striped locking based on first hash (bitmask for guaranteed non-negative)
-        int lockIndex = (int) ((hashItem(item, 0) & 0x7FFFFFFFFFFFFFFFL) % NUM_LOCKS);
+        long mixed = mix(itemHash);
+        int lockIndex = (int) ((mixed >>> 1) % NUM_LOCKS);
         locks[lockIndex].lock();
         try {
             for (int row = 0; row < depth; row++) {
-                int column = hashToColumn(item, row);
-                counters[row].addAndGet(column, count);
+                counters[row].addAndGet(column(mixed, row), count);
             }
             totalCount.addAndGet(count);
         } finally {
@@ -234,12 +308,20 @@ public class CountMinSketch {
         if (item == null) {
             throw new NullPointerException("item cannot be null");
         }
+        return estimateHashed(itemHash(item));
+    }
 
+    /**
+     * Estimates the count of an item given as its {@link #itemHash(byte[])}.
+     *
+     * @param itemHash The item's hash
+     * @return The estimated count (≥ true count with high probability)
+     */
+    public long estimateHashed(long itemHash) {
+        long mixed = mix(itemHash);
         long min = Long.MAX_VALUE;
         for (int row = 0; row < depth; row++) {
-            int column = hashToColumn(item, row);
-            long count = counters[row].get(column);
-            min = Math.min(min, count);
+            min = Math.min(min, counters[row].get(column(mixed, row)));
         }
         return min;
     }
@@ -265,6 +347,15 @@ public class CountMinSketch {
      */
     public long totalCount() {
         return totalCount.get();
+    }
+
+    /**
+     * Returns the seed that places items in this sketch's columns.
+     *
+     * @return The seed
+     */
+    public long seed() {
+        return seed;
     }
 
     /**
@@ -372,7 +463,9 @@ public class CountMinSketch {
 
         int version = segment.get(ValueLayout.JAVA_INT.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_VERSION);
         if (version != VERSION) {
-            throw new IllegalArgumentException("Unsupported version: " + version);
+            throw new IllegalArgumentException("Unsupported version: " + version + " (this build "
+                + "reads version " + VERSION + "; the counters of another version sit in columns "
+                + "this build does not look in)");
         }
 
         int width = segment.get(ValueLayout.JAVA_INT.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_WIDTH);
@@ -404,31 +497,136 @@ public class CountMinSketch {
     }
 
     /**
-     * Computes the hash for an item at a specific row.
-     * Uses double hashing: hash1 + row * hash2
+     * Returns this sketch in the layout {@link #toMemorySegment(Arena)} writes, as a heap array.
      *
-     * @param item The item to hash
-     * @param row  The row index
-     * @return The hash value
+     * <p>The counters and the total are read with every write stripe held, so the result is a
+     * state the sketch was actually in: a concurrent insert lands entirely before or entirely
+     * after it. {@link #toMemorySegment(Arena)} reads without the stripes, which is fine for a
+     * sketch nothing is writing to and not for one that is persisted while it is live.</p>
+     *
+     * @return The serialized sketch, header included
      */
-    private long hashItem(byte[] item, int row) {
-        // Use different seeds for each row to get independent hash functions
-        long hash1 = XxHash64.hash(item, seed);
-        long hash2 = XxHash64.hash(item, seed ^ (row * 0x9E3779B97F4A7C15L));
-        return hash1 + row * hash2;
+    public byte[] toBytes() {
+        for (ReentrantLock stripe : locks) {
+            stripe.lock();
+        }
+        try (Arena scratch = Arena.ofConfined()) {
+            return toMemorySegment(scratch).toArray(ValueLayout.JAVA_BYTE);
+        } finally {
+            for (ReentrantLock stripe : locks) {
+                stripe.unlock();
+            }
+        }
     }
 
     /**
-     * Maps an item to a column index for a specific row.
+     * Rebuilds a sketch from the bytes {@link #toBytes()} produced.
      *
-     * @param item The item to hash
-     * @param row  The row index
+     * <p>Stricter than {@link #fromMemorySegment(MemorySegment)} about the length: the bytes must
+     * hold exactly one sketch of the shape the header declares. A caller reading them back from a
+     * file has nothing else to tell it where the sketch ends, and bytes left over mean the header
+     * is describing something other than what follows it.</p>
+     *
+     * @param bytes The serialized sketch
+     * @return A new sketch with the stored shape, seed, counters and total
+     * @throws IllegalArgumentException if the bytes are null, are not a sketch this build
+     *         writes, or are not exactly as long as the declared shape requires
+     */
+    public static CountMinSketch fromBytes(byte[] bytes) {
+        if (bytes == null) {
+            throw new IllegalArgumentException("bytes cannot be null");
+        }
+        if (bytes.length < HEADER_SIZE) {
+            throw new IllegalArgumentException(
+                "Sketch bytes too short: " + bytes.length + " < " + HEADER_SIZE);
+        }
+        MemorySegment segment = MemorySegment.ofArray(bytes);
+        int width = segment.get(ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_WIDTH);
+        int depth = segment.get(ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_DEPTH);
+        if (width <= 0 || depth <= 0) {
+            throw new IllegalArgumentException(
+                "Sketch declares an impossible shape: width " + width + ", depth " + depth);
+        }
+        long expected = HEADER_SIZE + (long) width * depth * Long.BYTES;
+        if (bytes.length != expected) {
+            throw new IllegalArgumentException("Sketch of width " + width + " and depth " + depth
+                + " occupies " + expected + " bytes, not " + bytes.length);
+        }
+        // The layout's accessors are aligned, which a byte[]-backed segment cannot satisfy, so
+        // the bytes are read out of an aligned native copy.
+        try (Arena scratch = Arena.ofConfined()) {
+            MemorySegment aligned = scratch.allocate(bytes.length, Long.BYTES);
+            aligned.copyFrom(segment);
+            return fromMemorySegment(aligned);
+        }
+    }
+
+    /**
+     * Mixes an item hash with this sketch's seed, giving the value its columns are derived from.
+     *
+     * <p>The SplitMix64 finaliser, so that every bit of the seed and of the item hash reaches
+     * both halves the rows are derived from.</p>
+     *
+     * @param itemHash The item's hash
+     * @return The mixed value
+     */
+    private long mix(long itemHash) {
+        long z = itemHash ^ seed;
+        z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
+        z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
+        return z ^ (z >>> 31);
+    }
+
+    /**
+     * The column a row counts an item in: {@code (start + row * step) mod width}, with
+     * {@code start} taken from the lower half of the mixed hash and {@code step} drawn by the
+     * upper half from the residues coprime to the width.
+     *
+     * <p>Worked in {@code long} over residues already reduced below the width, so nothing wraps
+     * and the sequence is an exact arithmetic progression modulo the width: distinct for the
+     * first {@code width} rows because the step is a unit. Package-private so a test can hand it
+     * a mixed value with a chosen upper half.</p>
+     *
+     * @param mixed The item's mixed hash
+     * @param row   The row index
      * @return The column index (0 to width-1)
      */
-    private int hashToColumn(byte[] item, int row) {
-        long hash = hashItem(item, row);
-        // Use bitmask to guarantee non-negative value (Math.abs fails for Long.MIN_VALUE)
-        return (int) ((hash & 0x7FFFFFFFFFFFFFFFL) % width);
+    int column(long mixed, int row) {
+        long start = Integer.toUnsignedLong((int) mixed) % width;
+        long step = steps[(int) ((mixed >>> 32) % steps.length)];
+        return (int) ((start + row * step) % width);
+    }
+
+    /**
+     * The residues modulo {@code width} that are coprime to it.
+     *
+     * <p>A width of one has the single residue zero, which is coprime to one; every larger width
+     * has at least the residue one.</p>
+     *
+     * @param width The sketch width, positive
+     * @return The units modulo {@code width}, in ascending order
+     */
+    private static int[] unitsModulo(int width) {
+        if (width == 1) {
+            return new int[] {0};
+        }
+        int[] units = new int[width];
+        int count = 0;
+        for (int residue = 1; residue < width; residue++) {
+            if (gcd(residue, width) == 1) {
+                units[count++] = residue;
+            }
+        }
+        return java.util.Arrays.copyOf(units, count);
+    }
+
+    private static int gcd(int a, int b) {
+        while (b != 0) {
+            int remainder = a % b;
+            a = b;
+            b = remainder;
+        }
+        return a;
     }
 
     @Override

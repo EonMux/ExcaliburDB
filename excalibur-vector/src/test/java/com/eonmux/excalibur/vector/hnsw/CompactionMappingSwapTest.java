@@ -13,6 +13,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Compaction replaces two files, and a crash can land between them.
@@ -128,6 +129,60 @@ class CompactionMappingSwapTest {
             .as("a staged mapping left beside no staged graph would be replayed as a "
                 + "completed swap by the next open")
             .doesNotExist();
+    }
+
+    /**
+     * Puts a non-empty directory where a staged pair's mapping belongs, so deleting it fails.
+     *
+     * <p>A failed delete and a crash between two deletes leave the same thing on disk: whatever
+     * was removed first is gone and the rest is not. Making the mapping's removal fail is how
+     * these tests reach that window deterministically.</p>
+     */
+    private static void makeStagedMappingUndeletable(Path staged) throws IOException {
+        Path stagedMapping = mappingOf(staged);
+        Files.deleteIfExists(stagedMapping);
+        Files.createDirectory(stagedMapping);
+        Files.createFile(stagedMapping.resolve("in-the-way"));
+    }
+
+    @Test
+    @DisplayName("discarding an abandoned pair never leaves the staged mapping on its own")
+    void discardingAnAbandonedPairNeverStrandsTheMapping() throws IOException {
+        Path graph = graphPath();
+        Path staged = stagedGraphOf(graph);
+
+        try (HnswGraph live = buildGraphWithTombstones()) {
+            live.compactTo(staged);
+        }
+        makeStagedMappingUndeletable(staged);
+
+        try (HnswGraph reopened = HnswGraph.open(graph, distanceFunction)) {
+            assertSurvivorsKeepTheirDocuments(reopened);
+        }
+
+        assertThat(staged)
+            .as("with the staged mapping still present, removing the staged graph would turn a "
+                + "compaction that never happened into one the next open completes")
+            .exists();
+    }
+
+    @Test
+    @DisplayName("clearing an abandoned pair before compacting never leaves the mapping alone")
+    void clearingAnAbandonedPairBeforeCompactingNeverStrandsTheMapping() throws IOException {
+        Path graph = graphPath();
+        Path staged = stagedGraphOf(graph);
+
+        try (HnswGraph live = buildGraphWithTombstones()) {
+            live.compactTo(staged);
+            makeStagedMappingUndeletable(staged);
+
+            assertThatThrownBy(() -> live.compact(tempDir))
+                .isInstanceOf(IOException.class);
+        }
+
+        assertThat(staged)
+            .as("the staged graph must outlive a staged mapping that could not be removed")
+            .exists();
     }
 
     @Test

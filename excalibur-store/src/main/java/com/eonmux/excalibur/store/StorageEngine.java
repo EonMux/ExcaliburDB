@@ -573,15 +573,50 @@ public class StorageEngine implements AutoCloseable {
      * per-segment index - cannot work that out for itself, and guessing would file the fact
      * under a segment that does not hold the key.</p>
      *
+     * <p>The id is the segment's catalog index: the smallest directory index that points at it,
+     * under which the catalog, the visibility tracker, the term-filter hierarchy and the query
+     * pipeline's candidate list all know it. It is not {@link Segment#segmentId()}, which
+     * counts segment instances in this process and stops matching the directory the first time
+     * a compaction or a split constructs one out of order - after which a fact filed under it
+     * describes some other segment, or none.</p>
+     *
      * @param key The key (must not be null)
      * @param value The value (must not be null)
-     * @return The id of the segment the key was written to
+     * @return The catalog index of the segment the key was written to
      * @throws NullPointerException if key or value is null
      * @throws IllegalStateException if engine is not started
      * @throws SegmentAtCapacityException if segment is at capacity and split cannot complete
      */
     public long putReportingSegment(byte[] key, byte[] value) {
-        return writes.putReportingSegment(key, value);
+        long[] termHashes = value == null ? SegmentTermSketch.NO_TERMS
+            : SegmentTermSketch.termHashes(value);
+        return writes.putReportingSegment(key, value, termHashes);
+    }
+
+    /**
+     * Writes a key whose chunk text the caller has already tokenised, and says which segment it
+     * landed in.
+     *
+     * <p>Identical to {@link #putReportingSegment(byte[], byte[])} in every effect. The segment
+     * counts a value's terms into the term-frequency sketch it orders queries by, which means
+     * decoding the chunk text and tokenising it; a caller that has tokenised the same text for a
+     * purpose of its own - filing the terms in the membership filter, say - hands them over
+     * here so the text is tokenised once per write rather than twice.</p>
+     *
+     * @param key   The key (must not be null)
+     * @param value The value (must not be null)
+     * @param terms {@link com.eonmux.excalibur.core.text.TermExtractor#extractTerms(String)} of
+     *              the value's chunk text, with repetition; empty when it carries none. Terms
+     *              that do not match the value skew the segment's place in query order, never
+     *              what a query finds
+     * @return The catalog index of the segment the key was written to
+     * @throws NullPointerException if key, value or terms is null
+     * @throws IllegalStateException if engine is not started
+     * @throws SegmentAtCapacityException if segment is at capacity and split cannot complete
+     */
+    public long putReportingSegment(byte[] key, byte[] value, List<String> terms) {
+        java.util.Objects.requireNonNull(terms, "terms cannot be null");
+        return writes.putReportingSegment(key, value, SegmentTermSketch.termHashes(terms));
     }
 
     /**

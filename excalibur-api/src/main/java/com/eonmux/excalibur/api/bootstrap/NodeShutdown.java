@@ -35,6 +35,20 @@ import java.util.Objects;
  *
  * @param server                    The HTTP surface, stopped first so nothing new arrives
  * @param indexOrchestrator         Background indexing, drained before storage closes
+ * <h2>What a refusal leaves behind</h2>
+ * <p>A drain that could not stop something - a compaction past its last boundary, an ingestion
+ * run that did not reach its next document in time, a graph build between two of its own
+ * boundaries - is reported rather than waited out, and the steps that would close what it is
+ * using refuse. Nothing is interrupted to make it stop sooner, because an interrupt reaching a
+ * thread inside a shared channel operation closes that channel for every thread. Storage and the
+ * arena stay open under anything still reading them, the chunk index's files stay open under
+ * anything still compacting or writing it, and the graph tenants stay open under a build still
+ * writing into them.
+ * The chunk index's buffer is published regardless, in a step of its own: chunks reach storage
+ * before the index, and nothing afterwards would index ones storage holds and the index was
+ * never told about. The graph tenants' staged facts are forced to disk regardless too, for the
+ * same reason: the registry already records the documents they were extracted from.</p>
+ *
  * @param lexicalErasureSweep       The chunk index's compaction timer, or null if none runs
  * @param chunkIndex                The BM25 index, or null if none opened
  * @param documentVisibilityTracker Holds the registry that says which documents this node has
@@ -81,35 +95,161 @@ public record NodeShutdown(ExcaliburDBServer server,
      * leave the arena open with the process still holding mappings.</p>
      */
     public void run() {
-        ShutdownSequence sequence = sequence();
+        SweepState sweep = new SweepState(lexicalErasureSweep != null);
+        ShutdownSequence sequence = sequence(sweep);
         int failedSteps = sequence.stepNames().size() - sequence.run().size();
         reportOutcome(failedSteps, storageEngine.getCatalog().closeFailure());
     }
 
     /**
+     * Whether the lexical erasure sweep is still compacting, as far as this shutdown knows.
+     *
+     * <p>Running until its drain says otherwise, so a drain that threw - or never ran - is read
+     * the safe way: as a compaction still inside the index and, for an index that reads text
+     * back, still inside storage.</p>
+     */
+    private static final class SweepState {
+
+        private volatile boolean running;
+
+        SweepState(boolean running) {
+            this.running = running;
+        }
+    }
+
+    /**
      * Lists the teardown steps in the only order that is safe.
      *
+     * @param sweep What the sweep's drain reported, filled in by its step
      * @return The sequence, built but not yet run
      */
-    private ShutdownSequence sequence() {
+    private ShutdownSequence sequence(SweepState sweep) {
         return new ShutdownSequence()
             .add("stop HTTP server and drain in-flight requests",
                 () -> server.stop(timeoutSeconds))
             .add("stop index orchestrator", indexOrchestrator::close)
-            // After ingestion has stopped and before storage closes: closing it publishes what
-            // was still buffered, and it is storage that those chunks were written to first.
-            // Before the index: a sweep in flight is inside a compaction of it.
+            // Before the index: a sweep in flight is inside a compaction of it. Told to stop,
+            // never interrupted, and what it answers decides whether what it reads may close.
             .addIfPresent("stop lexical erasure sweep", lexicalErasureSweep,
-                LexicalErasureSweep::close)
-            .addIfPresent("close chunk lexical index", chunkIndex, ChunkIndex::close)
+                running -> sweep.running = !running.drain())
+            // Always, whatever is still running: every chunk reached storage before it reached
+            // the index, and nothing reindexes one storage holds and the index lacks, so a buffer
+            // left unpublished here is lost to lexical search for good. Publishing takes the
+            // same exclusion an ingestion run's refresh does, which a compaction runs alongside.
+            .addIfPresent("publish chunk lexical index", chunkIndex, ChunkIndex::publishBuffered)
+            .addIfPresent("close chunk lexical index", chunkIndex,
+                index -> {
+                    requireChunkIndexReleased(sweep);
+                    index.close();
+                })
+            // Always, and before the registry: see syncGraphStaging.
+            .addIfPresent("force staged graph facts to disk", graphTenants,
+                NodeShutdown::syncGraphStaging)
             // After ingestion has stopped, so what is written is the final state rather than a
             // snapshot something was still adding to. Every operation that changes the registry
             // writes it too; this is what catches a node stopped between them.
             .add("persist document registry",
                 () -> documentVisibilityTracker.getRegistry().persist())
-            .addIfPresent("close graph tenants", graphTenants, GraphTenants::close)
-            .add("close storage engine", storageEngine::close)
-            .addIfPresent("release memory-mapped segments", arena, Arena::close);
+            .addIfPresent("close graph tenants", graphTenants, tenants -> {
+                requireGraphsReleased();
+                tenants.close();
+            })
+            .add("close storage engine", () -> {
+                requireStorageReleased(sweep, "the storage engine");
+                storageEngine.close();
+            })
+            .addIfPresent("release memory-mapped segments", arena, mappings -> {
+                requireStorageReleased(sweep, "the memory-mapped segments");
+                mappings.close();
+            });
+    }
+
+    /**
+     * Forces every open namespace's staged facts to disk, whether or not the tenants may close.
+     *
+     * <p>A step of its own, ahead of the gated close, because staging buffers its appends in
+     * this process and closing the tenants is what would otherwise write them out - and the
+     * close is refused when a build or the erasure sweep is still inside them. A process that
+     * exits then loses the buffers, and the documents the facts came from are already in the
+     * registry, so nothing extracts them again. The same pattern as the chunk index's buffer
+     * above: publish always, release only when nothing is using it.</p>
+     *
+     * <p>Before the registry is persisted, because the registry is forced to the device when it
+     * is written. The other order leaves a window - and after a power loss, a result - in which
+     * the registry records documents whose staged facts never reached the disk.</p>
+     *
+     * @param tenants Every open namespace graph
+     * @throws IllegalStateException if any namespace could not be forced, so the outcome line
+     *                               says the shutdown was not clean
+     */
+    private static void syncGraphStaging(GraphTenants tenants) {
+        int failed = tenants.syncStaging();
+        if (failed > 0) {
+            throw new IllegalStateException(failed + " namespace(s) could not force their staged "
+                + "graph facts to disk; see the errors logged above");
+        }
+    }
+
+    /**
+     * Refuses to release the chunk index's files while something is still compacting or writing
+     * it.
+     *
+     * <p>The buffer has already been published by then, so what a refusal costs is an index
+     * whose files are not closed at exit - which the next open recovers from - rather than
+     * chunks that were stored and never indexed.</p>
+     *
+     * @param sweep What the sweep's drain reported
+     * @throws IllegalStateException if the index is still in use
+     */
+    private void requireChunkIndexReleased(SweepState sweep) {
+        if (sweep.running || server.isChunkIndexStillInUse()) {
+            throw new IllegalStateException("left the chunk lexical index open: a compaction or "
+                + "a writer still running after the drain is using it; its buffered chunks were "
+                + "published first");
+        }
+    }
+
+    /**
+     * Refuses to close the graph tenants while a graph build the drain could not stop is still
+     * writing into them.
+     *
+     * <p>Closing a tenant unmaps the files the build writes through and closes the Lucene
+     * directories it indexes into, which can end the process rather than fail the build. Left
+     * open, they are released when the process exits; the refusal is a failed step, so the
+     * outcome line says the shutdown was not clean.</p>
+     *
+     * @throws IllegalStateException if the tenants are still in use
+     */
+    private void requireGraphsReleased() {
+        if (server.isGraphsStillInUse()) {
+            throw new IllegalStateException("left the graph tenants open: a graph build still "
+                + "running after the drain is writing into them");
+        }
+    }
+
+    /**
+     * Refuses a step that would close storage while the server reports something still using it.
+     *
+     * <p>A compaction whose rewrite did not stop when drained is still reading chunk text and
+     * segment mappings, and closing what it reads crashes the JVM rather than throwing. Leaving
+     * storage open at exit costs a replay of the write log on the next start; the refusal is a
+     * failed step, so the outcome line says the shutdown was not clean.</p>
+     *
+     * <p>The sweep counts only for an index whose compactions read text back out of storage;
+     * one still force-merging its own segments reads nothing of the storage engine's.</p>
+     *
+     * @param sweep What the sweep's drain reported
+     * @param what  What the step would have closed
+     * @throws IllegalStateException if storage is still in use
+     */
+    private void requireStorageReleased(SweepState sweep, String what) {
+        boolean sweepReadsStorage = sweep.running
+            && (chunkIndex == null || chunkIndex.compactionReadsStorage());
+        if (sweepReadsStorage || server.isStorageStillInUse()) {
+            throw new IllegalStateException("left " + what + " open: a compaction still running "
+                + "after the drain is reading it, and closing it underneath the run could crash "
+                + "the process");
+        }
     }
 
     /**

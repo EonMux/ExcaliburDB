@@ -62,6 +62,80 @@ class BenchmarkResultSetSummaryTest {
     }
 
     @Test
+    @DisplayName("an errored combination blocks allPassed even when every measured target was met")
+    void erroredCombinationIsNeverAPass() {
+        BenchmarkResultSet results = BenchmarkResultSet.builder()
+            .name("run")
+            .addResult(passing())
+            .addErrored(errored())
+            .build();
+
+        assertThat(results.erroredCount()).isEqualTo(1);
+        assertThat(results.passCount()).isEqualTo(1);
+        assertThat(results.allPassed()).isFalse();
+        assertThat(results.passRate()).isEqualTo(50.0);
+    }
+
+    @Test
+    @DisplayName("the summary counts, labels and explains errored combinations")
+    void summaryReportsErroredCombinations() {
+        String summary = BenchmarkResultSet.builder()
+            .name("run")
+            .addResult(passing())
+            .addErrored(errored())
+            .build()
+            .formatSummary();
+
+        assertThat(summary).contains("Errored: 1");
+        assertThat(summary).contains("Total Benchmarks: 2");
+        assertThat(summary).contains("BENCHMARKS ERRORED");
+        assertThat(summary).doesNotContain("ALL PASSED");
+        assertThat(summary).contains("sequentialRead_bytes [bufferSize=131072] (thrpt)");
+        assertThat(summary).contains("java.lang.IllegalStateException: bufferSize too large");
+        assertThat(summary).contains("at Demo.setup(Demo.java:7)");
+    }
+
+    @Test
+    @DisplayName("a run in which every combination errored reports the errors, not 'no results'")
+    void allErroredRunNamesTheErrors() {
+        BenchmarkResultSet results = BenchmarkResultSet.builder()
+            .name("run")
+            .addErrored(errored())
+            .build();
+
+        assertThat(results.allPassed()).isFalse();
+        assertThat(results.formatSummary())
+            .contains("BENCHMARKS ERRORED")
+            .doesNotContain("NO RESULTS CAPTURED");
+    }
+
+    @Test
+    @DisplayName("JSON counts errored combinations and lists them")
+    void jsonCarriesErroredCombinations() {
+        String json = BenchmarkResultSet.builder()
+            .name("run")
+            .addResult(passing())
+            .addErrored(errored())
+            .build()
+            .toJson();
+
+        assertThat(json).contains("\"errored\": 1");
+        assertThat(json).contains("\"total\": 2");
+        assertThat(json).contains("\"allPassed\": false");
+        assertThat(json).contains("\"errored\": [");
+        assertThat(json).contains("bufferSize too large");
+    }
+
+    @Test
+    @DisplayName("category grouping is shared with errored combinations")
+    void categoryOfMatchesResultGrouping() {
+        assertThat(BenchmarkResultSet.categoryOf(
+            "com.eonmux.excalibur.bench.benchmark.PointLookupBenchmark.lookup"))
+            .isEqualTo("PointLookup");
+        assertThat(BenchmarkResultSet.categoryOf("Benchmark")).isEqualTo("Other");
+    }
+
+    @Test
     @DisplayName("results are grouped by class with the Benchmark suffix stripped")
     void categoriesComeFromTheClassName() {
         BenchmarkResultSet results = setOf(passing(), latencyResult());
@@ -218,6 +292,15 @@ class BenchmarkResultSetSummaryTest {
             .totalDurationMs(ms)
             .addResult(passing())
             .build();
+    }
+
+    private static ErroredBenchmark errored() {
+        return new ErroredBenchmark(
+            "com.eonmux.excalibur.bench.benchmark.MappedFileBenchmark.sequentialRead_bytes",
+            "thrpt",
+            java.util.Map.of("bufferSize", "131072"),
+            "java.lang.IllegalStateException: bufferSize too large",
+            "java.lang.IllegalStateException: bufferSize too large\n\tat Demo.setup(Demo.java:7)");
     }
 
     private static BenchmarkResult passing() {

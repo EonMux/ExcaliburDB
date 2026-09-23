@@ -80,8 +80,8 @@ class DocumentReindexerResultTest {
         @Test
         @DisplayName("isSuccess returns false when total chunks is zero")
         void isSuccessReturnsFalseWhenZeroChunks() {
-            DocumentReindexer.DocumentResult result = new DocumentReindexer.DocumentResult(
-                "doc-1", 0, 0, 0, 100L, "No chunks produced");
+            DocumentReindexer.DocumentResult result = DocumentReindexer.DocumentResult.skipped(
+                "doc-1", DocumentReindexer.DocumentResult.SkipReason.NO_CHUNKS, 100L);
 
             assertThat(result.isSuccess()).isFalse();
         }
@@ -204,10 +204,10 @@ class DocumentReindexerResultTest {
             // reported with a reason so the run can account for it, and counting that reason
             // as an error turns a run that indexed everything it could into a failed run.
             DocumentReindexer.ReindexResult result = DocumentReindexer.ReindexResult.builder("source-1")
-                .addDocumentResult(new DocumentReindexer.DocumentResult(
-                    "doc-1", 0, 0, 0, 100L, "Empty content"))
-                .addDocumentResult(new DocumentReindexer.DocumentResult(
-                    "doc-2", 0, 0, 0, 100L, "No chunks produced"))
+                .addDocumentResult(DocumentReindexer.DocumentResult.skipped(
+                    "doc-1", DocumentReindexer.DocumentResult.SkipReason.EMPTY_CONTENT, 100L))
+                .addDocumentResult(DocumentReindexer.DocumentResult.skipped(
+                    "doc-2", DocumentReindexer.DocumentResult.SkipReason.NO_CHUNKS, 100L))
                 .addDocumentResult(new DocumentReindexer.DocumentResult(
                     "doc-3", 5, 5, 0, 100L, null))
                 .build();
@@ -217,6 +217,55 @@ class DocumentReindexerResultTest {
                 .as("nothing failed, so the run did not fail")
                 .isFalse();
             assertThat(result.getDocumentsIndexed()).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("only documents that are not text are counted as not text")
+        void onlyNotTextDocumentsAreCountedAsNotText() {
+            // entries_skipped reports this count. An empty file and one the chunker found
+            // nothing in are skipped too, but the first crawl never reported them, so a
+            // re-crawl of the same unchanged source must not either.
+            DocumentReindexer.ReindexResult result = DocumentReindexer.ReindexResult.builder("source-1")
+                .addDocumentResult(DocumentReindexer.DocumentResult.skipped(
+                    "photo.jpg", DocumentReindexer.DocumentResult.SkipReason.NOT_TEXT, 1L))
+                .addDocumentResult(DocumentReindexer.DocumentResult.skipped(
+                    "empty.txt", DocumentReindexer.DocumentResult.SkipReason.EMPTY_CONTENT, 1L))
+                .addDocumentResult(DocumentReindexer.DocumentResult.skipped(
+                    "blank.txt", DocumentReindexer.DocumentResult.SkipReason.NO_CHUNKS, 1L))
+                .build();
+
+            assertThat(result.getDocumentsSkipped()).isEqualTo(3);
+            assertThat(result.getDocumentsNotText()).isEqualTo(1);
+            assertThat(result.hasErrors()).isFalse();
+        }
+
+        @Test
+        @DisplayName("a reason is read from its type, never from the message")
+        void aReasonIsReadFromItsTypeNotItsMessage() {
+            // A failure whose message happens to read like a skip reason is still a failure.
+            DocumentReindexer.ReindexResult result = DocumentReindexer.ReindexResult.builder("source-1")
+                .addDocumentResult(new DocumentReindexer.DocumentResult(
+                    "doc-1", 0, 0, 0, 1L, "Not text"))
+                .build();
+
+            assertThat(result.getDocumentsNotText()).isZero();
+            assertThat(result.getDocumentsSkipped()).isZero();
+            assertThat(result.hasErrors()).isTrue();
+        }
+
+        @Test
+        @DisplayName("a skipped result carries its reason and describes it")
+        void aSkippedResultCarriesItsReason() {
+            DocumentReindexer.DocumentResult result = DocumentReindexer.DocumentResult.skipped(
+                "photo.jpg", DocumentReindexer.DocumentResult.SkipReason.NOT_TEXT, 7L);
+
+            assertThat(result.wasSkipped()).isTrue();
+            assertThat(result.getSkipReason())
+                .isEqualTo(DocumentReindexer.DocumentResult.SkipReason.NOT_TEXT);
+            assertThat(result.getError()).isEqualTo("Not text");
+            assertThat(result.getElapsedMillis()).isEqualTo(7L);
+            assertThat(new DocumentReindexer.DocumentResult("doc", 1, 1, 0, 1L, null)
+                .getSkipReason()).isNull();
         }
 
         @Test

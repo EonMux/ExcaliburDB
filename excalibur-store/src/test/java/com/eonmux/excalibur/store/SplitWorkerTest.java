@@ -382,6 +382,63 @@ class SplitWorkerTest {
         }
 
         /**
+         * The loop is stopped by a signal it reads between segments, never by an interrupt: a
+         * split writes its children through channels an interrupt would close for every thread
+         * using them.
+         */
+        @Test
+        @DisplayName("stop() never interrupts the loop's split and reports it running until it ends")
+        void stopLeavesTheLoopsSplitUninterrupted() throws Exception {
+            CountDownLatch insideTheSplit = new CountDownLatch(1);
+            CountDownLatch releaseTheSplit = new CountDownLatch(1);
+            AtomicBoolean interruptedInside = new AtomicBoolean();
+            AtomicReference<Segment> leftChildRef = new AtomicReference<>();
+            AtomicReference<Segment> rightChildRef = new AtomicReference<>();
+
+            splitWorker = new SplitWorker(arena, (parent, left, right) -> {
+                leftChildRef.set(left);
+                rightChildRef.set(right);
+                insideTheSplit.countDown();
+                awaitRelease(releaseTheSplit);
+                interruptedInside.set(Thread.currentThread().isInterrupted());
+            }, () -> 0).withStopTimeoutMs(200);
+            fillToThreshold(segment);
+            assertTrue(segment.shouldSplit(), "the loop needs a segment over its threshold");
+            splitWorker.registerSegment(segment);
+
+            splitWorker.start();
+            assertTrue(insideTheSplit.await(SPLIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                "the background loop must reach the listener");
+
+            boolean endedWhileHeld = splitWorker.stop();
+
+            releaseTheSplit.countDown();
+            boolean finished = awaitSplitComplete(segment);
+            closeChildren(leftChildRef, rightChildRef);
+
+            assertFalse(endedWhileHeld,
+                "a split still running when the budget expires is reported, not claimed ended");
+            assertTrue(finished, "the split finished once it was released");
+            assertFalse(interruptedInside.get(),
+                "stop() must not interrupt a thread that is writing through shared channels");
+            assertTrue(awaitStopped(splitWorker),
+                "once the loop has left its split, stop() reports the worker ended");
+        }
+
+        @Test
+        @DisplayName("stop() wakes the loop from its pause without waiting out the interval")
+        void stopWakesThePausingLoop() {
+            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, () -> 0,
+                TimeUnit.HOURS.toMillis(1), 1).withStopTimeoutMs(TimeUnit.MINUTES.toMillis(5));
+            splitWorker.start();
+
+            long startNanos = System.nanoTime();
+            assertTrue(splitWorker.stop());
+            assertTrue(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - startNanos) < 60,
+                "returned because the pause was woken, not because a budget or interval ran out");
+        }
+
+        /**
          * The budget covers the whole drain, not each split in it.
          *
          * <p>Splits are serialised, so three requests are one split in the listener and two
@@ -544,6 +601,22 @@ class SplitWorkerTest {
      * @param target The segment to fill
      * @param prefix Key prefix, so two segments in one test do not share keys
      */
+    /**
+     * Fills a segment up to the load factor at which it asks to be split; puts are refused at
+     * the threshold, so the last one may be rejected.
+     */
+    private static void fillToThreshold(Segment target) {
+        int entries = (int) Math.ceil(target.slotCount() * Segment.LOAD_FACTOR_THRESHOLD) - 1;
+        for (int i = 0; i < entries; i++) {
+            try {
+                target.put(("threshold-key-" + String.format("%04d", i)).getBytes(),
+                    ("threshold-value-" + i).getBytes());
+            } catch (IllegalStateException atThreshold) {
+                break;
+            }
+        }
+    }
+
     private static void fill(Segment target, String prefix) {
         for (int i = 0; i < 100; i++) {
             target.put((prefix + i).getBytes(), ("value-" + i).getBytes());
@@ -768,5 +841,21 @@ class SplitWorkerTest {
             assertTrue(str.contains("running"), "toString should contain running state");
             assertTrue(str.contains("registeredSegments"), "toString should contain segment count");
         }
+    }
+
+    /**
+     * Asks a stopped worker again until it reports that its loop has ended.
+     *
+     * <p>Released work finishes on its own thread, so the first ask after the release can still
+     * see it running; each ask waits within the worker's own budget.</p>
+     */
+    private static boolean awaitStopped(SplitWorker worker) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SPLIT_TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadline) {
+            if (worker.stop()) {
+                return true;
+            }
+        }
+        return worker.stop();
     }
 }

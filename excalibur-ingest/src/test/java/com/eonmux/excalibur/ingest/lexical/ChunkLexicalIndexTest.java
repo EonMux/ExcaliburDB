@@ -82,6 +82,38 @@ class ChunkLexicalIndexTest {
     }
 
     @Nested
+    @DisplayName("Shutdown")
+    class Shutdown {
+
+        @Test
+        @DisplayName("publishing the buffer commits it, so it survives an index left unclosed")
+        void publishBufferedCommits(@TempDir Path dir) throws Exception {
+            try (ChunkLexicalIndex index = open(dir)) {
+                index.add("kb:a.txt:chunk:0", "buffered when the node stopped");
+
+                index.publishBuffered();
+
+                // Read from the directory, as the next process would, while this writer is
+                // still open: only a commit is visible there.
+                try (org.apache.lucene.store.Directory directory =
+                         org.apache.lucene.store.FSDirectory.open(dir);
+                     org.apache.lucene.index.DirectoryReader reader =
+                         org.apache.lucene.index.DirectoryReader.open(directory)) {
+                    assertThat(reader.numDocs()).isEqualTo(1);
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("its compaction never reads storage, so a running one leaves storage free")
+        void compactionDoesNotReadStorage(@TempDir Path dir) throws Exception {
+            try (ChunkLexicalIndex index = open(dir)) {
+                assertThat(index.compactionReadsStorage()).isFalse();
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("Reingestion")
     class Reingestion {
 
@@ -411,6 +443,28 @@ class ChunkLexicalIndexTest {
                 assertThat(index.stats().erasureRequests()).isEqualTo(1);
                 index.compactNow(key -> null);
                 assertThat(index.stats().erasureRequests()).isZero();
+            }
+        }
+
+        @Test
+        @DisplayName("a full rewrite reclaims every deletion and keeps the chunks Lucene holds")
+        void rewriteAllIsAForcedCompaction(@TempDir Path dir) throws Exception {
+            // Lucene keeps each chunk's text itself, so there is nothing storage could tell a
+            // rewrite that the index does not already know: a full rewrite is the forced one.
+            try (ChunkLexicalIndex index = open(dir)) {
+                index.add("kb:a.txt:chunk:0", "zzconfidentialmarker");
+                fill(index, 20);
+                index.refresh();
+                index.erase(Set.of("kb:a.txt:chunk:0"));
+                index.refresh();
+
+                assertThat(index.rewriteAll(key -> null).performed()).isTrue();
+
+                assertThat(index.stats().erasureRequests()).isZero();
+                assertThat(index.stats().erasedDocuments()).isZero();
+                assertThat(hits(index, "note"))
+                    .as("text the storage supplier does not return is not dropped from Lucene")
+                    .isEqualTo(20);
             }
         }
 

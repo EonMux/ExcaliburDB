@@ -57,7 +57,7 @@ class DocumentAtomicityConfigTest {
         ExcaliburDBServer server = serverWith(config(null));
 
         server.withIngestionPipeline(mock(TextChunker.class), mock(EmbeddingClient.class),
-            tracker());
+            null, tracker());
 
         assertThat(server.isDocumentAtomicityEnabled()).isTrue();
         org.mockito.Mockito.verify(queryPipeline)
@@ -70,7 +70,7 @@ class DocumentAtomicityConfigTest {
         ExcaliburDBServer server = serverWith(config("false"));
 
         server.withIngestionPipeline(mock(TextChunker.class), mock(EmbeddingClient.class),
-            tracker());
+            null, tracker());
 
         assertThat(server.isDocumentAtomicityEnabled()).isFalse();
         org.mockito.Mockito.verify(queryPipeline, org.mockito.Mockito.never())

@@ -52,6 +52,15 @@ public final class MetricUnits {
     /** Canonical throughput unit. */
     public static final String OPS_PER_SEC = "ops/sec";
 
+    /**
+     * Vector components processed per second: a distance over {@code D}-dimensional vectors
+     * processes {@code D} of them. A throughput, so it converts one-for-one with ops/sec.
+     */
+    public static final String COMPONENTS_PER_SEC = "components/sec";
+
+    /** Log entries processed per second. A throughput, so it converts one-for-one with ops/sec. */
+    public static final String ENTRIES_PER_SEC = "entries/sec";
+
     /** Canonical latency unit. */
     public static final String MS_PER_OP = "ms/op";
 
@@ -72,6 +81,9 @@ public final class MetricUnits {
         Map.entry("vectors/sec", 1.0),
         Map.entry("vectors/s", 1.0),
         Map.entry("entries/sec", 1.0),
+        Map.entry("entries/s", 1.0),
+        Map.entry("components/sec", 1.0),
+        Map.entry("components/s", 1.0),
         Map.entry("ops/ms", 1_000.0),
         Map.entry("ops/us", 1_000_000.0),
         Map.entry("ops/ns", 1_000_000_000.0),

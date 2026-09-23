@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
+import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
@@ -64,6 +65,7 @@ class StatsEndpointTest {
         when(indexOrchestrator.getTotalVectorsIntegrated()).thenReturn(0L);
         when(indexOrchestrator.getPendingCuckooDeletions()).thenReturn(0);
         when(indexOrchestrator.getTotalCuckooDeletions()).thenReturn(0L);
+        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
     }
 
     @Nested
@@ -219,6 +221,18 @@ class StatsEndpointTest {
             assertThat(response).contains("\"erasedChunks\": 20000");
             assertThat(response).contains("\"erasureRequests\": 3");
             assertThat(response).contains("\"compactionDue\": false");
+            assertThat(response).contains("\"unreadableChunksDropped\": 0");
+        }
+
+        @Test
+        @DisplayName("chunks dropped because their stored text was corrupt are reported")
+        void unreadableChunksAreReported() throws IOException {
+            // Each one is out of keyword search until its document is reindexed, and says
+            // storage holds a damaged segment - neither is visible in any other count.
+            String response = responseOf(new ReportingIndex(new ChunkIndexStats(
+                "native", 10L, 1, 8L, 2L, 0, Optional.empty(), false, 2L)));
+
+            assertThat(response).contains("\"unreadableChunksDropped\": 2");
         }
 
         @Test
@@ -359,6 +373,8 @@ class StatsEndpointTest {
         void returnsCuckooStats() throws IOException {
             when(indexOrchestrator.getPendingCuckooDeletions()).thenReturn(50);
             when(indexOrchestrator.getTotalCuckooDeletions()).thenReturn(500L);
+            when(indexOrchestrator.getCuckooFpRates())
+                .thenReturn(new CuckooMetricsWorker.FpRates(2, 2.4414e-6, 3.6621e-6));
 
             StatsEndpoint endpoint = new StatsEndpoint(indexOrchestrator, storageEngine);
             HttpExchange exchange = createMockExchange("GET");
@@ -371,8 +387,10 @@ class StatsEndpointTest {
             assertThat(response).contains("\"cuckoo\":");
             assertThat(response).contains("\"pendingDeletions\": 50");
             assertThat(response).contains("\"totalDeletions\": 500");
-            assertThat(response).contains("\"avgFpRate\":");
-            assertThat(response).contains("\"maxFpRate\":");
+            assertThat(response)
+                .as("rates this small are the normal case and must not round to zero")
+                .contains("\"avgFpRate\": 0.0000024414")
+                .contains("\"maxFpRate\": 0.0000036621");
         }
 
         @Test

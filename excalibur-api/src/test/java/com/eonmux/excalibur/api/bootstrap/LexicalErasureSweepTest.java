@@ -9,8 +9,11 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -91,6 +94,56 @@ class LexicalErasureSweepTest {
         }
     }
 
+    @Nested
+    @DisplayName("Draining")
+    class Draining {
+
+        @Test
+        @DisplayName("tells a compaction in flight to stop, without interrupting it")
+        void signalsTheCompactionInFlight() throws Exception {
+            StoppableIndex index = new StoppableIndex(true);
+            LexicalErasureSweep sweep = new LexicalErasureSweep(index, key -> null, 0, 60_000,
+                Duration.ofSeconds(30));
+            index.entered.await();
+
+            assertThat(sweep.drain()).as("the compaction acted on the stop and ended").isTrue();
+            assertThat(index.sawStop.get()).isTrue();
+            assertThat(index.interrupted.get())
+                .as("an interrupt would close the channels the index shares with queries")
+                .isFalse();
+            assertThat(sweep.sweep()).as("nothing is started once draining").isFalse();
+            assertThat(index.calls.get()).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("reports a compaction that outlives the wait, so storage is left open")
+        void reportsACompactionStillRunning() throws Exception {
+            StoppableIndex index = new StoppableIndex(false);
+            LexicalErasureSweep sweep = new LexicalErasureSweep(index, key -> null, 0, 60_000,
+                Duration.ofMillis(1));
+            index.entered.await();
+
+            try {
+                assertThat(sweep.drain()).isFalse();
+            } finally {
+                index.release.countDown();
+            }
+            // An interrupt is delivered before a drain returns, so a compaction that got one
+            // would have left its wait by now rather than waiting to be released.
+            index.finished.await();
+            assertThat(index.interrupted.get()).isFalse();
+        }
+
+        @Test
+        @DisplayName("an idle sweep drains at once")
+        void idleSweepDrains() {
+            LexicalErasureSweep sweep = new LexicalErasureSweep(new RecordingIndex(0),
+                key -> null, 60_000, 60_000, Duration.ofSeconds(30));
+
+            assertThat(sweep.drain()).isTrue();
+        }
+    }
+
     @Test
     @DisplayName("refuses to be built without the pieces it needs")
     void refusesIncompleteConstruction() {
@@ -102,6 +155,111 @@ class LexicalErasureSweepTest {
 
     private static LexicalErasureSweep sweepOver(ChunkIndex index) {
         return new LexicalErasureSweep(index, key -> null, 3600);
+    }
+
+    /**
+     * A chunk index whose compaction holds until it is told to stop, or until released.
+     *
+     * <p>{@code honoursStop} decides which: an index that reads the signal at its boundaries, or
+     * one inside a step it cannot leave - the case a drain has to report rather than wait out.</p>
+     */
+    private static final class StoppableIndex implements ChunkIndex {
+
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final CountDownLatch finished =
+            new CountDownLatch(1);
+        final AtomicBoolean sawStop =
+            new AtomicBoolean();
+        final AtomicBoolean interrupted =
+            new AtomicBoolean();
+        final AtomicInteger calls = new AtomicInteger();
+        private final boolean honoursStop;
+
+        StoppableIndex(boolean honoursStop) {
+            this.honoursStop = honoursStop;
+        }
+
+        @Override
+        public CompactionResult compactIfDue(java.util.function.Function<String, String> textOf,
+                                             java.util.function.BooleanSupplier stopRequested) {
+            calls.incrementAndGet();
+            entered.countDown();
+            if (honoursStop) {
+                while (!stopRequested.getAsBoolean()) {
+                    Thread.onSpinWait();
+                }
+                sawStop.set(true);
+                interrupted.set(Thread.currentThread().isInterrupted());
+                return CompactionResult.stopped("asked to");
+            }
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                interrupted.set(true);
+            } finally {
+                finished.countDown();
+            }
+            return CompactionResult.declined("released");
+        }
+
+        @Override
+        public CompactionResult compactIfDue(java.util.function.Function<String, String> textOf) {
+            throw new AssertionError("the sweep must pass its stop signal");
+        }
+
+        @Override
+        public ChunkIndexStats stats() {
+            return new ChunkIndexStats("stoppable", 0, 0, 0, 0, 1,
+                Optional.of(Instant.EPOCH), true);
+        }
+
+        @Override
+        public void add(String chunkId, String text) {
+        }
+
+        @Override
+        public void addDocument(java.util.Map<String, String> chunks) {
+        }
+
+        @Override
+        public void refresh() {
+        }
+
+        @Override
+        public int erase(java.util.Set<String> chunkIds) {
+            return 0;
+        }
+
+        @Override
+        public String chunkIdOf(long id) {
+            return null;
+        }
+
+        @Override
+        public long indexedCount() {
+            return 0;
+        }
+
+        @Override
+        public CompactionResult compactNow(java.util.function.Function<String, String> textOf) {
+            return CompactionResult.declined("not used");
+        }
+
+        @Override
+        public com.eonmux.excalibur.retrieval.rank.Ranker ranker(
+                com.eonmux.excalibur.retrieval.expand.QueryExpander expander) {
+            return null;
+        }
+
+        @Override
+        public String engine() {
+            return "stoppable";
+        }
+
+        @Override
+        public void close() {
+        }
     }
 
     /** A chunk index that counts compactions and can be told to fail one. */

@@ -281,11 +281,9 @@ class DocumentBatchPublisherIntegrationTest {
         // A document is published whole or not at all, so the chunks of one that was refused
         // are not in the index. Counting them into the total reports a corpus larger than the
         // one that exists, and pairs a document count of 1 with the chunk count of 2.
-        com.eonmux.excalibur.filter.HierarchicalCuckooFilter refusingFilter =
-            org.mockito.Mockito.mock(com.eonmux.excalibur.filter.HierarchicalCuckooFilter.class);
-        org.mockito.Mockito.when(refusingFilter.insert(
-                org.mockito.ArgumentMatchers.any(byte[].class),
-                org.mockito.ArgumentMatchers.eq("segment-1")))
+        CuckooFilter refusingFilter = org.mockito.Mockito.mock(CuckooFilter.class);
+        org.mockito.Mockito.when(refusingFilter.insertIfAbsent(
+                org.mockito.ArgumentMatchers.any(byte[].class)))
             .thenAnswer(invocation -> {
                 String term = new String((byte[]) invocation.getArgument(0),
                     java.nio.charset.StandardCharsets.UTF_8);
@@ -293,7 +291,7 @@ class DocumentBatchPublisherIntegrationTest {
             });
 
         DocumentBatchPublisher filteredPublisher = new DocumentBatchPublisher(
-            tracker, docRegistry, refusingFilter, "segment-1", () -> { }, null);
+            tracker, docRegistry, refusingFilter, () -> { }, null);
 
         DocumentBatchBuffer accepted = new DocumentBatchBuffer("kept", "source1");
         accepted.addChunk("kept:0", new TextChunk("kept", "acceptedterm", 12, 0, 12, 0), 100);

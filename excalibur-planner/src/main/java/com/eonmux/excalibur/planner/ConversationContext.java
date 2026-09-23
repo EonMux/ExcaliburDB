@@ -48,6 +48,31 @@ public final class ConversationContext {
         return this;
     }
 
+    /**
+     * Moves forward to a turn a caller numbered, so the mentions recorded next belong to it.
+     *
+     * <p>For a conversation rebuilt from a record rather than lived through: the caller knows
+     * which turn each entity was mentioned in and replays them oldest first. Turns it skips are
+     * turns in which nothing bindable was said, and they count against the window like any
+     * other - an entity mentioned before a long run of such turns has been left behind.</p>
+     *
+     * <p>Only forward. A mention recorded after moving back would sit among later ones as though
+     * it were the more recent, and recency is exactly what decides between two candidates of the
+     * same shape.</p>
+     *
+     * @param turn the turn to move to; not earlier than the current one
+     * @return this context
+     * @throws IllegalArgumentException if {@code turn} is before the current turn
+     */
+    public ConversationContext advanceTo(int turn) {
+        if (turn < currentTurn) {
+            throw new IllegalArgumentException("cannot move back to turn " + turn
+                + " from turn " + currentTurn + "; record mentions oldest turn first");
+        }
+        currentTurn = turn;
+        return this;
+    }
+
     /** The current turn number. */
     public int currentTurn() {
         return currentTurn;

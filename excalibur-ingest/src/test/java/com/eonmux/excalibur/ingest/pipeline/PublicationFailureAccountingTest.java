@@ -17,7 +17,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -149,12 +148,6 @@ class PublicationFailureAccountingTest {
         }
 
         @Override
-        public long writeChunkWithOffset(long segmentId, String chunkId, String content,
-                                         float[] embedding) {
-            return writeChunkWithOffset(chunkId, content, embedding);
-        }
-
-        @Override
         public boolean canWriteTo(long segmentId) {
             return true;
         }
@@ -187,11 +180,6 @@ class PublicationFailureAccountingTest {
         @Override
         public Stream<String> crawl() {
             return List.copyOf(documents.keySet()).stream();
-        }
-
-        @Override
-        public boolean hasChanged(Instant since) {
-            return true;
         }
 
         @Override

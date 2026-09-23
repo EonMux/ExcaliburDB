@@ -3,6 +3,7 @@ package com.eonmux.excalibur.shard.worker;
 import com.eonmux.excalibur.shard.visibility.EpochIsolationValidator;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.core.text.ChunkIdentifiers;
+import com.eonmux.excalibur.core.util.StopSignal;
 import com.eonmux.excalibur.store.LifecycleState;
 import com.eonmux.excalibur.store.Segment;
 import com.eonmux.excalibur.store.SegmentCatalog;
@@ -181,6 +182,20 @@ public class HnswIntegrationWorker {
     private volatile Thread workerThread;
 
     /**
+     * How the running loop is told to stop, replaced on every {@link #start()}.
+     *
+     * <p>Never an interrupt. The loop inserts into HNSW graphs, and an insert grows the graph's
+     * mapped file through the channel every search of that graph is served from, and appends
+     * to the node-to-document mapping; an interrupt landing there closes that channel for
+     * every other user of the graph. The signal is read between segments and wakes the pause
+     * between cycles, which is all the interrupt was needed for.</p>
+     */
+    private volatile StopSignal stopSignal = new StopSignal();
+
+    /** How long {@link #stop()} waits for an integration batch in progress to finish. */
+    private static final long STOP_JOIN_TIMEOUT_MS = 5_000;
+
+    /**
      * The offset each stalled segment's tail is stuck at, keyed by segment file.
      *
      * <p>Only ever holds segments the worker cannot read past. An entry is removed the moment
@@ -330,9 +345,11 @@ public class HnswIntegrationWorker {
         if (running.compareAndSet(false, true)) {
             stopped.set(false);
 
+            StopSignal signal = new StopSignal();
+            stopSignal = signal;
             workerThread = Thread.ofVirtual()
                 .name("excalibur-hnsw-integration-worker")
-                .start(this::runIntegrationLoop);
+                .start(() -> runIntegrationLoop(signal));
 
             LOGGER.info("HnswIntegrationWorker started");
             return true;
@@ -341,27 +358,38 @@ public class HnswIntegrationWorker {
     }
 
     /**
-     * Stops the background integration worker.
+     * Stops the background integration worker and says whether it actually ended.
      *
-     * <p>This method signals the worker to stop and waits for it to complete
-     * any in-progress integration operations.</p>
+     * <p>The worker is asked through its stop signal and waited for, never interrupted: a
+     * batch in progress is growing a graph's mapped file and appending to its document
+     * mapping, and an interrupt there closes channels the graph's searches share. A worker
+     * still inside a batch when the wait runs out is reported, because the caller closes the
+     * arena that batch is writing into next.</p>
+     *
+     * @return true if the worker thread has ended, or was never started
      */
-    public void stop() {
+    public boolean stop() {
+        Thread worker = workerThread;
         if (stopped.compareAndSet(false, true)) {
             running.set(false);
+            stopSignal.request();
 
-            if (workerThread != null) {
-                workerThread.interrupt();
+            if (worker != null) {
                 try {
-                    workerThread.join(5000);
+                    worker.join(STOP_JOIN_TIMEOUT_MS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                }
+                if (worker.isAlive()) {
+                    LOGGER.warn("HnswIntegrationWorker did not finish its batch within {}ms of "
+                        + "being asked to stop", STOP_JOIN_TIMEOUT_MS);
                 }
             }
 
             LOGGER.info("HnswIntegrationWorker stopped. Total integrated: {}, batches: {}",
                 totalIntegrated.get(), totalBatches.get());
         }
+        return worker == null || !worker.isAlive();
     }
 
     /**
@@ -438,8 +466,8 @@ public class HnswIntegrationWorker {
     /**
      * Main integration loop that runs in the background virtual thread.
      */
-    private void runIntegrationLoop() {
-        while (running.get() && !stopped.get()) {
+    private void runIntegrationLoop(StopSignal signal) {
+        while (running.get() && !stopped.get() && !signal.isRequested()) {
             try {
                 // Maintain the backpressure flag and the depth metric. The flag throttles
                 // PRODUCERS; this worker never parks on it, because it is the thread that
@@ -450,7 +478,7 @@ public class HnswIntegrationWorker {
                 // Integrate entries from all registered segments
                 int totalIntegratedThisCycle = 0;
                 for (IndexableSegment indexable : registeredSegments) {
-                    if (!running.get() || stopped.get()) {
+                    if (!running.get() || stopped.get() || signal.isRequested()) {
                         break;
                     }
 
@@ -470,8 +498,10 @@ public class HnswIntegrationWorker {
                     lastIntegrationTime.set(System.currentTimeMillis());
                 }
 
-                // Sleep until next cycle
-                Thread.sleep(integrationIntervalMs);
+                // Until the next cycle, or until stop() asks the loop to end.
+                if (signal.pause(integrationIntervalMs)) {
+                    break;
+                }
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();

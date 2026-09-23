@@ -112,7 +112,14 @@ public final class DocumentErasureService {
      *                            chunk can be in both states at once and one number for the two
      *                            reports twice as much content left behind as there is
      * @param vectorsHidden       Graph nodes retired, so no search ranks the document again
-     * @param compacted           Whether the index was rewritten, so the chunks are off disk
+     * @param compacted           Whether the chunks are off disk: true exactly when the index
+     *                            owes no erasure at all and every chunk this request reached
+     *                            has left it, whether or not this request's compaction was the
+     *                            one that reclaimed them; a compaction that ran and abandoned
+     *                            the group holding them is not this, and nor is an index that
+     *                            refused the erasure outright, which leaves nothing owed because
+     *                            it recorded nothing. Always false on a node with no lexical
+     *                            index
      * @param chunksReclaimed     Chunks physically removed by that rewrite
      * @param outstanding         Erasure requests this node still owes, including this one
      * @param detail              Why the compaction ran, or why it did not
@@ -170,6 +177,12 @@ public final class DocumentErasureService {
     private final UpsertHandler.StorageAdapter storage;
     private final ChunkIndex lexicalIndex;
     private final Function<String, String> storedText;
+
+    /**
+     * Set by {@link #requestStop()}, and read by a compaction this service is running at each of
+     * its boundaries.
+     */
+    private volatile boolean stopRequested;
 
     /**
      * Where a document's publication epoch is remembered, or null when this node tracks none.
@@ -350,11 +363,19 @@ public final class DocumentErasureService {
 
         CompactionResult compaction = reclaim(compactNow);
         report(sourceId, removed, notFound, remaining);
+        // Whether the chunks are off disk is what the index still owes, not whether a compaction
+        // ran: one can run and publish a rewrite that abandoned the very group holding these
+        // chunks, and one can decline because an earlier pass already reclaimed everything.
+        // Nor is nothing owed on its own enough. An index whose erase threw recorded no
+        // obligation for those chunks, so it owes nothing for them and still matches every one:
+        // reporting them compacted would tell the caller the one thing that is not true.
+        int outstanding = outstanding();
+        boolean compacted = lexicalIndex != null && outstanding == 0
+            && removed.stillSearchable() == 0;
         return new Outcome(removed.erasedIds(), removed.incomplete(),
             notFound + removed.notFound(), remaining, removed.tombstoned(), removed.unindexed(),
             removed.notRemoved(), removed.stillSearchable(), removed.vectorsHidden(),
-            compaction.performed(), compaction.documentsRemoved(), outstanding(),
-            compaction.reason());
+            compacted, compaction.documentsRemoved(), outstanding, compaction.reason());
     }
 
     /**
@@ -588,8 +609,8 @@ public final class DocumentErasureService {
         }
         try {
             return now
-                ? lexicalIndex.compactNow(storedText)
-                : lexicalIndex.compactIfDue(storedText);
+                ? lexicalIndex.compactNow(storedText, () -> stopRequested)
+                : lexicalIndex.compactIfDue(storedText, () -> stopRequested);
         } catch (IOException e) {
             // Logged with the cause, reported without it. This text is the erasure response's
             // "detail" field, and an IOException from the index is usually an absolute path -
@@ -599,6 +620,26 @@ public final class DocumentErasureService {
             return CompactionResult.declined(
                 "compaction failed; see the node's log for the reason");
         }
+    }
+
+    /**
+     * Asks a compaction this service is running, and every one it would start, to end early.
+     *
+     * <h3>Why a shutdown needs this</h3>
+     * <p>An erasure made with {@code compact: true} rewrites the lexical index on the request's
+     * own thread, reading every surviving chunk's text back out of the storage engine, and on a
+     * large index that outlasts any grace period a listener gives its requests. A shutdown that
+     * closed storage underneath it would crash the process. So the shutdown asks first: the
+     * rewrite ends at its next segment group or chunk, publishes nothing, and the request answers
+     * with its erasure still owed - which a later compaction discharges. Hiding and removing the
+     * documents is unaffected; only the reclaim is cut short.</p>
+     *
+     * <p>Cooperative rather than an interrupt, because an interrupt delivered inside file I/O
+     * closes a channel the index shares with every query. Permanent: a service asked to stop is
+     * one whose node is going away.</p>
+     */
+    public void requestStop() {
+        stopRequested = true;
     }
 
     /** Erasure requests accepted and not yet discharged. */

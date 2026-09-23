@@ -10,9 +10,10 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.Charset;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -22,8 +23,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -46,8 +47,8 @@ import java.util.stream.Stream;
  *
  * <h2>Thread Safety</h2>
  * <p>This class is thread-safe. The configuration is immutable after construction.
- * Multiple threads may call {@link #crawl()}, {@link #hasChanged(Instant)}, and
- * {@link #fetch(String)} concurrently.</p>
+ * Multiple threads may call {@link #crawl()}, {@link #fetch(String)} and
+ * {@link #fetchIfChanged} concurrently.</p>
  *
  * <h2>Fetch Policy</h2>
  * <p>Every URL this source contacts - the base URL, each link followed during a crawl, and
@@ -81,12 +82,20 @@ import java.util.stream.Stream;
  * pins the virtual thread it runs on, and a deployment that wants none sets the delay to zero.</p>
  *
  * <h2>Change Detection</h2>
- * <p>Uses HTTP HEAD request with If-Modified-Since header for efficient
- * change detection. Falls back to Last-Modified header comparison.</p>
+ * <p>Per document, with a conditional GET. Every fetch records the {@code ETag} and
+ * {@code Last-Modified} the server sent, the document registry keeps them beside the content
+ * hash, and a re-crawl hands them back through {@link #fetchIfChanged}, which sends them as
+ * {@code If-None-Match} and {@code If-Modified-Since}. A {@code 304 Not Modified} is taken as
+ * the server's word that the indexed version is current and the body is never transferred; any
+ * other answer is fetched and compared by content as before, so a server that ignores the
+ * conditions costs a full fetch and nothing worse. A 304 is only an answer to a question: to a
+ * request that went out with no condition - no validators, or only a tag a header cannot carry -
+ * it is a {@link SourceException}, never "unchanged". The link walk of a crawl still reads every
+ * HTML page it follows links from, because a page's links cannot be read from a 304.</p>
  *
  * <h2>Resource Management</h2>
- * <p>The internal HttpClient is shared and does not need explicit closing.
- * Call {@link #close()} to clear internal caches.</p>
+ * <p>The internal HttpClient is shared and does not need explicit closing. Call
+ * {@link #close()} to stop the body-read watchdog thread.</p>
  *
  * @see Source
  * @see FetchedDocument
@@ -118,6 +127,14 @@ public class HttpSource implements Source {
      * Maximum number of redirect hops followed for a single request.
      */
     private static final int MAX_REDIRECTS = 5;
+
+    /** The answer to a conditional request whose version the server still holds. */
+    private static final int NOT_MODIFIED = 304;
+
+    /** IMF-fixdate, the one form of HTTP date a sender may produce. */
+    private static final DateTimeFormatter HTTP_DATE = DateTimeFormatter
+        .ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.ENGLISH)
+        .withZone(ZoneOffset.UTC);
 
     private static final Set<String> ALLOWED_SCHEMES = Set.of("http", "https");
 
@@ -169,7 +186,6 @@ public class HttpSource implements Source {
     private final HttpClient httpClient;
     private final Map<String, String> requestHeaders;
 
-    private final Map<String, Long> lastModifiedCache = new ConcurrentHashMap<>();
     private volatile boolean closed = false;
 
     /**
@@ -336,7 +352,8 @@ public class HttpSource implements Source {
         Set<String> links = new HashSet<>();
 
         try {
-            HttpResponse<InputStream> response = get(url, "text/html,application/xhtml+xml");
+            HttpResponse<InputStream> response =
+                get(url, "text/html,application/xhtml+xml", DocumentValidators.NONE).response();
 
             String contentType = getHeader(response, "Content-Type", "");
             boolean html = contentType.contains("text/html")
@@ -419,12 +436,19 @@ public class HttpSource implements Source {
      * ingester at an address the source's filters would have rejected. The returned response's
      * body stream is owned by the caller.</p>
      *
-     * @param url    The in-policy URL to request
-     * @param accept The {@code Accept} header value
-     * @return The first non-redirect response
+     * <p>The conditions travel with every hop. A redirect is the server saying the document
+     * lives elsewhere, and it is the server at the end of the chain that holds the version the
+     * validators describe.</p>
+     *
+     * @param url        The in-policy URL to request
+     * @param accept     The {@code Accept} header value
+     * @param conditions The validators to ask conditionally with; {@link DocumentValidators#NONE}
+     *                   for an unconditional request
+     * @return The first non-redirect response, and whether the request it answers carried a
+     *         condition
      * @throws SourceException if a redirect leaves the policy or the hop limit is exceeded
      */
-    private HttpResponse<InputStream> get(String url, String accept)
+    private Reply get(String url, String accept, DocumentValidators conditions)
             throws SourceException, IOException, InterruptedException {
         String target = url;
 
@@ -439,12 +463,13 @@ public class HttpSource implements Source {
                 .timeout(timeout)
                 .GET();
             requestHeaders.forEach(builder::header);
+            boolean conditional = addConditions(builder, conditions, url);
 
             HttpResponse<InputStream> response =
                 httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream());
 
             if (!isRedirect(response.statusCode())) {
-                return response;
+                return new Reply(response, conditional);
             }
 
             closeQuietly(response.body());
@@ -453,6 +478,69 @@ public class HttpSource implements Source {
 
         throw new SourceException(
             "Too many redirects (max " + MAX_REDIRECTS + ") starting at: " + url, sourceId, false);
+    }
+
+    /**
+     * Makes a request conditional on the version the validators describe.
+     *
+     * <p>Both are sent when both are known. RFC 9110 has a server that understands
+     * {@code If-None-Match} ignore {@code If-Modified-Since}, so the exact tag decides where the
+     * server keeps one, and the timestamp still decides for a server that tracks only
+     * modification times. The timestamp is sent in the form the server issued it in, which is
+     * the form it compares against.</p>
+     *
+     * <p>A stored tag that could not travel in a header is left off rather than allowed to fail
+     * the request. It came from a registry file on disk, and a request that asks with only the
+     * timestamp, or unconditionally, still gets a correct answer - only a costlier one.</p>
+     *
+     * <p>What was actually sent is reported, not what the validators held: a {@code 304} is
+     * an answer about the version a request asked after, and a request whose only condition was
+     * left off asked after none.</p>
+     *
+     * @param builder    The request being built
+     * @param conditions The validators to ask with
+     * @param url        The document, for the log line a dropped tag leaves
+     * @return true when the request now carries at least one condition
+     */
+    private boolean addConditions(HttpRequest.Builder builder, DocumentValidators conditions,
+                                  String url) {
+        boolean conditional = false;
+        if (conditions.hasEntityTag()) {
+            if (isHeaderSafe(conditions.entityTag())) {
+                builder.header("If-None-Match", conditions.entityTag());
+                conditional = true;
+            } else {
+                LOG.warn("Not sending the stored entity tag for {}: it holds characters a "
+                    + "header cannot carry", url);
+            }
+        }
+        if (conditions.hasLastModified()) {
+            builder.header("If-Modified-Since",
+                formatHttpDate(Instant.ofEpochMilli(conditions.lastModifiedMillis())));
+            conditional = true;
+        }
+        return conditional;
+    }
+
+    /**
+     * A response, with whether the request it answers carried a condition.
+     *
+     * @param response    The first non-redirect response; its body is owned by the caller
+     * @param conditional Whether that request carried {@code If-None-Match} or
+     *                    {@code If-Modified-Since}
+     */
+    private record Reply(HttpResponse<InputStream> response, boolean conditional) {
+    }
+
+    /** Whether a value can be sent as a header without ending it or being refused. */
+    private static boolean isHeaderSafe(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c < 0x20 || c >= 0x7F) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -589,63 +677,42 @@ public class HttpSource implements Source {
     }
 
     @Override
-    public boolean hasChanged(Instant since) throws SourceException {
-        ensureOpen();
-        Objects.requireNonNull(since, "since must not be null");
-
-        if (since.isAfter(Instant.now())) {
-            LOG.warn("hasChanged called with future timestamp: {}", since);
-            return true;
-        }
-
-        try {
-            pace();
-            HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
-                .uri(baseUri)
-                .header("User-Agent", userAgent)
-                .header("If-Modified-Since", formatHttpDate(since))
-                .timeout(timeout)
-                .method("HEAD", HttpRequest.BodyPublishers.noBody());
-            requestHeaders.forEach(requestBuilder::header);
-
-            HttpResponse<Void> response = httpClient.send(requestBuilder.build(),
-                HttpResponse.BodyHandlers.discarding());
-
-            if (response.statusCode() == 304) {
-                LOG.debug("Source {} not modified since {}", sourceId, since);
-                return false;
-            }
-
-            if (response.statusCode() == 200) {
-                String lastModified = getHeader(response, "Last-Modified", null);
-                if (lastModified != null) {
-                    try {
-                        Instant lastModifiedInstant = parseHttpDate(lastModified);
-                        if (!lastModifiedInstant.isAfter(since)) {
-                            LOG.debug("Source {} Last-Modified ({}) not after {}", 
-                                sourceId, lastModifiedInstant, since);
-                            return false;
-                        }
-                    } catch (Exception e) {
-                        LOG.debug("Could not parse Last-Modified header: {}", lastModified);
-                    }
-                }
-            }
-
-            LOG.debug("Source {} may have changed since {}", sourceId, since);
-            return true;
-
-        } catch (IOException e) {
-            LOG.warn("Could not check modification time for source {}: {}", sourceId, e.getMessage());
-            return true;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new SourceException("Change check interrupted", sourceId, true, e);
-        }
+    public FetchedDocument fetch(String documentId) throws SourceException, DocumentNotFoundException {
+        // Never null: the request is unconditional, and a 304 to it is an error rather than an
+        // answer.
+        return fetchConditionally(documentId, DocumentValidators.NONE);
     }
 
+    /**
+     * Fetches a document with a conditional GET, answering empty on {@code 304 Not Modified}.
+     *
+     * <p>See the class documentation. With validators that carry nothing to ask with, this is
+     * an ordinary fetch.</p>
+     */
     @Override
-    public FetchedDocument fetch(String documentId) throws SourceException, DocumentNotFoundException {
+    public Optional<FetchedDocument> fetchIfChanged(String documentId, DocumentValidators previous)
+            throws SourceException, DocumentNotFoundException {
+        Objects.requireNonNull(previous, "previous must not be null");
+        FetchedDocument fetched = fetchConditionally(documentId, previous);
+        if (fetched == null) {
+            LOG.debug("Document {} not modified since the indexed version", documentId);
+        }
+        return Optional.ofNullable(fetched);
+    }
+
+    /**
+     * The one fetch path, conditional or not.
+     *
+     * @param documentId The document to fetch
+     * @param conditions The validators to ask with; {@link DocumentValidators#NONE} for none
+     * @return The document, or null when the server answered {@code 304 Not Modified} to a
+     *         request that carried a condition
+     * @throws SourceException also when the server answered {@code 304} to a request that
+     *         carried none - with no stored tag it could be sent, or no validators at all - since
+     *         that names no version this crawl holds and gives it no body to index
+     */
+    private FetchedDocument fetchConditionally(String documentId, DocumentValidators conditions)
+            throws SourceException, DocumentNotFoundException {
         ensureOpen();
         Objects.requireNonNull(documentId, "documentId must not be null");
         if (documentId.isEmpty()) {
@@ -661,7 +728,19 @@ public class HttpSource implements Source {
         }
 
         try {
-            HttpResponse<InputStream> response = get(documentId, "*/*");
+            Reply reply = get(documentId, "*/*", conditions);
+            HttpResponse<InputStream> response = reply.response();
+
+            if (response.statusCode() == NOT_MODIFIED) {
+                closeQuietly(response.body());
+                if (!reply.conditional()) {
+                    throw new SourceException(
+                        "Server answered 304 Not Modified to an unconditional request: "
+                            + documentId,
+                        sourceId, false);
+                }
+                return null;
+            }
 
             if (response.statusCode() == 404) {
                 closeQuietly(response.body());
@@ -683,11 +762,13 @@ public class HttpSource implements Source {
             requireIncludedContentType(contentType, documentId);
             Charset charset = detectCharset(response, content);
             long lastModifiedMillis = extractLastModified(response);
+            String entityTag = getHeader(response, "ETag", null);
 
             LOG.debug("Fetched document: {} ({} bytes, {}, {})",
                 documentId, content.length, contentType, charset);
 
-            return new FetchedDocument(documentId, content, contentType, charset, lastModifiedMillis);
+            return new FetchedDocument(documentId, content, contentType, charset,
+                lastModifiedMillis, entityTag);
 
         } catch (DocumentNotFoundException e) {
             throw e;
@@ -722,7 +803,6 @@ public class HttpSource implements Source {
     @Override
     public void close() {
         closed = true;
-        lastModifiedCache.clear();
         bodyReadWatchdog.shutdownNow();
         LOG.debug("HttpSource closed: {}", sourceId);
     }
@@ -997,23 +1077,19 @@ public class HttpSource implements Source {
     /**
      * The encoding a response's bytes are in.
      *
-     * <p>The {@code charset} parameter of {@code Content-Type} when the server sent one and the
-     * JVM knows it, a byte-order mark when it did not, and UTF-8 otherwise. Guessing UTF-8 for a
-     * windows-1252 page does not fail: it turns every non-ASCII byte into U+FFFD, so the words
-     * the document is indexed under are not the words it contains.</p>
+     * <p>A byte-order mark when the body opens with one, the {@code charset} parameter of
+     * {@code Content-Type} when the server sent one the JVM knows, and UTF-8 otherwise - the
+     * order {@link TextEncoding#resolve} sets for every source, and the one the WHATWG encoding
+     * standard sets for the web. Guessing UTF-8 for a windows-1252 page does not fail: it turns
+     * every non-ASCII byte into U+FFFD, so the words the document is indexed under are not the
+     * words it contains.</p>
      *
      * @param response The response
      * @param content The body bytes, for the byte-order mark
      * @return The charset, never null
      */
     private Charset detectCharset(HttpResponse<?> response, byte[] content) {
-        String header = getHeader(response, "Content-Type", null);
-        Charset declared = charsetOf(header);
-        if (declared != null) {
-            return declared;
-        }
-        Charset marked = charsetOfByteOrderMark(content);
-        return marked != null ? marked : StandardCharsets.UTF_8;
+        return TextEncoding.resolve(content, charsetOf(getHeader(response, "Content-Type", null)));
     }
 
     /**
@@ -1042,31 +1118,6 @@ public class HttpSource implements Source {
             LOG.debug("Ignoring unsupported charset '{}' in Content-Type", name);
             return null;
         }
-    }
-
-    /**
-     * The charset a byte-order mark declares, or null when the content carries none.
-     *
-     * @param content The body bytes
-     * @return The charset, or null
-     */
-    private static Charset charsetOfByteOrderMark(byte[] content) {
-        if (content.length >= 3
-            && (content[0] & 0xFF) == 0xEF && (content[1] & 0xFF) == 0xBB
-            && (content[2] & 0xFF) == 0xBF) {
-            return StandardCharsets.UTF_8;
-        }
-        if (content.length >= 2) {
-            int first = content[0] & 0xFF;
-            int second = content[1] & 0xFF;
-            if (first == 0xFE && second == 0xFF) {
-                return StandardCharsets.UTF_16BE;
-            }
-            if (first == 0xFF && second == 0xFE) {
-                return StandardCharsets.UTF_16LE;
-            }
-        }
-        return null;
     }
 
     private String detectContentType(HttpResponse<?> response, String url) {
@@ -1121,18 +1172,20 @@ public class HttpSource implements Source {
             .orElse(defaultValue);
     }
 
-    private String formatHttpDate(Instant instant) {
-        java.time.format.DateTimeFormatter formatter = 
-            java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME
-                .withZone(java.time.ZoneOffset.UTC);
-        return formatter.format(instant);
+    /**
+     * Writes a timestamp as an HTTP date, in the IMF-fixdate form RFC 9110 requires a sender to
+     * use: a two-digit day and {@code GMT}. The looser RFC 1123 form writes the first nine days
+     * of a month with one digit, which a strict server fails to parse and then ignores the
+     * condition it was carried in.
+     */
+    private static String formatHttpDate(Instant instant) {
+        return HTTP_DATE.format(instant);
     }
 
-    private Instant parseHttpDate(String date) {
-        java.time.format.DateTimeFormatter formatter = 
-            java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME
-                .withZone(java.time.ZoneOffset.UTC);
-        return formatter.parse(date, Instant::from);
+    /** Reads an HTTP date. Lenient where formatting is strict, as RFC 9110 asks a recipient to be. */
+    private static Instant parseHttpDate(String date) {
+        return DateTimeFormatter.RFC_1123_DATE_TIME.withZone(ZoneOffset.UTC)
+            .parse(date, Instant::from);
     }
 
     private static Set<String> normalizeDomains(Set<String> domains) {

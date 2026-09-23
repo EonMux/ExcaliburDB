@@ -8,6 +8,7 @@ import com.eonmux.excalibur.backup.verify.VerifyDepth;
 
 import java.io.IOException;
 import java.io.PrintStream;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -46,7 +47,7 @@ public final class VerifyCommand {
             return ExitCode.OK;
         }
         err.printf("NOT VERIFIED  %s%n", report.snapshotDir());
-        err.printf("  %d of %d file(s) are not what the manifest says they are:%n",
+        err.printf("  %d problem(s) across the %d file(s) checked:%n",
             report.problems().size(), report.filesChecked());
         for (Problem problem : report.problems()) {
             err.printf("  %s: %s%n", problem.path(), problem.detail());
@@ -69,10 +70,23 @@ public final class VerifyCommand {
         out.printf("  state    %s%n", report.manifest().consistency());
         out.printf("  checked  %d file(s), %d bytes, %s%n", report.filesChecked(),
             report.bytesChecked(), depth);
-        long healthy = report.contentChecks().stream().filter(ContentCheck::healthy).count();
-        if (!report.contentChecks().isEmpty()) {
-            out.printf("  formats  %d of %d structure(s) opened and walked cleanly%n",
-                healthy, report.contentChecks().size());
+        if (report.contentChecks().isEmpty()) {
+            return;
+        }
+        List<ContentCheck> unproven = report.contentChecks().stream()
+            .filter(check -> !check.proven()).toList();
+        out.printf("  formats  %d checked: %d proven against their own checksums, "
+                + "%d sound as far as their format can show%n",
+            report.contentChecks().size(), report.contentChecks().size() - unproven.size(),
+            unproven.size());
+        if (!unproven.isEmpty()) {
+            out.printf("  unproven %d structure(s) showed no damage and carry nothing that "
+                + "could prove them sound - no checksum, no seal, or a version older than "
+                + "its seal:%n",
+                unproven.size());
+            for (ContentCheck check : unproven) {
+                out.printf("    %s (%s): %s%n", check.path(), check.format(), check.detail());
+            }
         }
     }
 }

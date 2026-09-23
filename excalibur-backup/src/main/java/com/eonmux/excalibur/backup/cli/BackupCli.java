@@ -45,6 +45,25 @@ public final class BackupCli {
      * @return What the process should exit with
      */
     public static ExitCode run(String[] args, PrintStream out, PrintStream err) {
+        return run(args, out, err, BackupCli::dispatch);
+    }
+
+    /**
+     * Runs the command through the given subcommands.
+     *
+     * <p>Everything this class decides - usage, help, and which exit code each failure maps
+     * to - happens around {@code command}, so a test can stand a failure in for the real
+     * subcommands and see how it is reported. The one it needs this for is a defect: nothing
+     * a real subcommand can be made to do from outside throws what this build did not
+     * anticipate, and that is the case whose exit code most needs to be pinned.</p>
+     *
+     * @param args    What was typed
+     * @param out     Where results go
+     * @param err     Where refusals and faults go
+     * @param command What runs a line that is not a request for usage
+     * @return What the process should exit with
+     */
+    static ExitCode run(String[] args, PrintStream out, PrintStream err, Command command) {
         if (args.length == 0) {
             err.println("excalibur-backup: no command given");
             Usage.print(err);
@@ -54,11 +73,16 @@ public final class BackupCli {
             Usage.print(out);
             return ExitCode.OK;
         }
+        Set<String> options = optionsOf(args[0]);
+        if (options != null && ArgumentParser.wantsHelp(args, options)) {
+            Usage.print(out, args[0]);
+            return ExitCode.OK;
+        }
         try {
-            return dispatch(args, out, err);
+            return command.run(args, out, err);
         } catch (UsageException e) {
             err.println("excalibur-backup: " + e.getMessage());
-            Usage.print(err);
+            Usage.print(err, args[0]);
             return ExitCode.USAGE;
         } catch (IOException e) {
             err.println("excalibur-backup: " + e.getMessage());
@@ -94,6 +118,21 @@ public final class BackupCli {
     }
 
     /**
+     * Names the options a subcommand takes a value for.
+     *
+     * @param command The subcommand, as typed
+     * @return Its options, or null if this build has no such subcommand
+     */
+    private static Set<String> optionsOf(String command) {
+        return switch (command) {
+            case "snapshot" -> SnapshotCommand.OPTIONS;
+            case "verify" -> VerifyCommand.OPTIONS;
+            case "restore" -> RestoreCommand.OPTIONS;
+            default -> null;
+        };
+    }
+
+    /**
      * Parses a command line against one subcommand's options.
      *
      * @param args         What was typed
@@ -105,6 +144,26 @@ public final class BackupCli {
     private static Arguments parse(String[] args, Set<String> validOptions,
                                    Set<String> validFlags) throws UsageException {
         return ArgumentParser.parse(args, validOptions, validFlags);
+    }
+
+    /**
+     * Runs a command line that is not a request for usage.
+     */
+    @FunctionalInterface
+    interface Command {
+
+        /**
+         * Runs the line.
+         *
+         * @param args What was typed, the subcommand first
+         * @param out  Where results go
+         * @param err  Where refusals and faults go
+         * @return What the subcommand decided
+         * @throws UsageException if the command or its options are not understood
+         * @throws IOException    if the subcommand fails or refuses
+         */
+        ExitCode run(String[] args, PrintStream out, PrintStream err)
+            throws UsageException, IOException;
     }
 
     /**

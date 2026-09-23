@@ -25,5 +25,38 @@ public enum Grammar {
      * <p>Binds any pronoun. Being permissive here is deliberate: refusing to bind an unclassified
      * mention would send the user a question about something a person would find obvious.
      */
-    UNKNOWN
+    UNKNOWN;
+
+    /** The wire name, as a request spells it. */
+    public String wireName() {
+        return name().toLowerCase(java.util.Locale.ROOT);
+    }
+
+    /**
+     * Reads a shape a request named.
+     *
+     * <p>Refused rather than read as {@link #UNKNOWN} when it is not one of these: a caller that
+     * sent a shape did so to rule a binding out, and one silently treated as having sent nothing
+     * gets back the ambiguity it was trying to avoid, with nothing to say why.</p>
+     *
+     * @param text the value as sent, in any case
+     * @return the shape
+     * @throws IllegalArgumentException if it is null or not one of the wire names
+     */
+    public static Grammar parse(String text) {
+        if (text != null) {
+            String wanted = text.trim().toLowerCase(java.util.Locale.ROOT);
+            for (Grammar grammar : values()) {
+                if (grammar.wireName().equals(wanted)) {
+                    return grammar;
+                }
+            }
+        }
+        java.util.List<String> accepted = new java.util.ArrayList<>();
+        for (Grammar grammar : values()) {
+            accepted.add("\"" + grammar.wireName() + "\"");
+        }
+        throw new IllegalArgumentException("a grammatical shape must be one of "
+            + String.join(", ", accepted) + ", got: " + text);
+    }
 }

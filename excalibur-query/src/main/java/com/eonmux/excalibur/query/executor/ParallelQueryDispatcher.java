@@ -58,6 +58,9 @@ public class ParallelQueryDispatcher {
      */
     public static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30);
 
+    /** How long {@link #shutdown()} waits for segment searches already running. */
+    private static final long SHUTDOWN_WAIT_MILLIS = 5_000;
+
     private final SegmentCatalog catalog;
     private final Map<Long, Segment> segments;
     private final HnswGraphProvider graphProvider;
@@ -113,18 +116,16 @@ public class ParallelQueryDispatcher {
     }
 
     /**
-     * Shuts down the dispatcher.
+     * Stops taking segment searches and waits for the ones running.
+     *
+     * <p>The running searches are not interrupted; {@link ExecutorDrain} says why. A search
+     * that outlives the wait is reported, not abandoned.</p>
+     *
+     * @return true if no segment search is still running, false if one outlasted the wait and
+     *         the storage it reads through must stay open
      */
-    public void shutdown() {
-        executor.shutdown();
-        try {
-            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
-                executor.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            executor.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
+    public boolean shutdown() {
+        return ExecutorDrain.drain(executor, SHUTDOWN_WAIT_MILLIS, "Segment searches");
     }
 
     /**
@@ -329,6 +330,8 @@ public class ParallelQueryDispatcher {
                         false,
                         "Timeout"
                     ));
+                    // Interrupting one segment search is safe: it reads through memory
+                    // mappings, which an interrupt cannot close. See ExecutorDrain.
                     future.cancel(true);
                 }
             } catch (ExecutionException e) {

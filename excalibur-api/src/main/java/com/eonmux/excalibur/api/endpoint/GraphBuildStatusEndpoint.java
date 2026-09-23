@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphBuildService;
+import com.eonmux.excalibur.api.bootstrap.GraphExtraction;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -10,6 +11,7 @@ import com.eonmux.excalibur.tenancy.NamespaceId;
 
 import java.io.IOException;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * {@code GET /v1/graph/build/status} - what a namespace's current or last graph build did.
@@ -53,7 +55,11 @@ import java.util.Objects;
  *
  * <p>A completed build with {@code "published": false} is not a failure and not an empty graph:
  * nothing was staged, so the namespace goes on serving whatever graph it already had. Replacing
- * it with an empty one would turn every question into a refusal.</p>
+ * it with an empty one would turn every question into a refusal. Such a build carries a
+ * {@code message} saying why nothing was staged, read from {@code extraction} - the same field
+ * {@code POST /v1/graph/build} answers with, present on every status once ingestion is wired:
+ * {@code active}, {@code disabled}, or {@code missing_api_key} with a {@code warning} when
+ * extraction was asked for and no LLM API key is configured.</p>
  *
  * <p>A cancelled build reports {@code "published": false} for a different reason: it stopped
  * before the rename that would have published it. There is no partial graph to describe,
@@ -98,22 +104,32 @@ public final class GraphBuildStatusEndpoint implements HttpHandler {
             return;
         }
 
-        ResponseBody.sendJson(exchange, 200, render(runner.snapshot(namespace)));
+        ResponseBody.sendJson(exchange, 200,
+            render(runner.snapshot(namespace), runner.extraction()));
     }
 
     /**
      * Renders a snapshot as the response body.
      *
-     * @param snapshot What the runner has to say about the namespace
+     * @param snapshot   What the runner has to say about the namespace
+     * @param extraction Whether ingestion on this node extracts facts, if it says
      * @return The JSON body
      */
-    private static String render(GraphBuildRunner.Snapshot snapshot) {
+    private static String render(GraphBuildRunner.Snapshot snapshot,
+                                 Optional<GraphExtraction> extraction) {
         StringBuilder json = new StringBuilder(320);
         json.append("{\"state\": \"").append(JsonText.escape(snapshot.state()))
             .append("\", \"namespace\": \"")
             .append(JsonText.escape(snapshot.namespace().value())).append('"');
+        GraphBuildEndpoint.appendExtraction(json, extraction);
         if (GraphBuildRunner.STATE_IDLE.equals(snapshot.state())) {
             return json.append('}').toString();
+        }
+        GraphBuildService.BuildOutcome outcome = snapshot.outcome();
+        if (outcome != null && !outcome.published() && outcome.staged() == 0) {
+            // The outcome a caller most needs explained: a completed build that changed nothing.
+            json.append(", \"message\": \"").append(JsonText.escape(nothingStaged(extraction)))
+                .append('"');
         }
         json.append(", \"started_at_ms\": ").append(snapshot.startedAtMs());
         if (snapshot.finishedAtMs() > 0) {
@@ -128,6 +144,19 @@ public final class GraphBuildStatusEndpoint implements HttpHandler {
         }
         appendCounts(json, snapshot.outcome());
         return json.append('}').toString();
+    }
+
+    /**
+     * Why a build found nothing staged.
+     *
+     * @param extraction Whether ingestion on this node extracts facts, if it says
+     * @return A sentence an operator can act on
+     */
+    private static String nothingStaged(Optional<GraphExtraction> extraction) {
+        return "Nothing was staged, so nothing was published and this namespace is still "
+            + "serving the graph it had. " + extraction.map(GraphExtraction::whyNothingStaged)
+                .orElse("Ingestion stages facts only when relation extraction is enabled and an "
+                    + "LLM API key is configured.");
     }
 
     /**

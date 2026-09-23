@@ -9,7 +9,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -104,11 +103,6 @@ class ChangeDetectorFetchFailureTest {
             }
 
             @Override
-            public boolean hasChanged(Instant since) {
-                return true;
-            }
-
-            @Override
             public FetchedDocument fetch(String documentId) {
                 return null;
             }
@@ -152,11 +146,6 @@ class ChangeDetectorFetchFailureTest {
         @Override
         public Stream<String> crawl() {
             return List.of(DOCUMENT_ID).stream();
-        }
-
-        @Override
-        public boolean hasChanged(Instant since) {
-            return true;
         }
 
         @Override

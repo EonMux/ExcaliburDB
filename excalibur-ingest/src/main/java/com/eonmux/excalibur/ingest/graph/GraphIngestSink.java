@@ -3,6 +3,7 @@ package com.eonmux.excalibur.ingest.graph;
 import com.eonmux.excalibur.graph.staging.ExtractedTriple;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 
+import java.io.IOException;
 import java.util.List;
 
 /**
@@ -50,6 +51,21 @@ public interface GraphIngestSink {
      */
     default void onDocumentPublished(String documentKey, String text) {
         onDocumentPublished(documentKey, text, 0L);
+    }
+
+    /**
+     * Forces what this sink has staged so far to the device.
+     *
+     * <p>Called before ingestion writes the document registry, which is what stops a document
+     * being extracted again: a registry that reaches the disk ahead of the facts extracted from
+     * the documents it lists records those facts as taken when a crash or a power loss has lost
+     * them. Unlike {@link #onDocumentPublished} this may throw - the caller decides what a
+     * failure costs - and a sink that holds nothing in memory does nothing, which is the
+     * default.</p>
+     *
+     * @throws IOException if what was staged could not be forced
+     */
+    default void sync() throws IOException {
     }
 
     /** A sink for a deployment that indexes text and does not build a graph. */

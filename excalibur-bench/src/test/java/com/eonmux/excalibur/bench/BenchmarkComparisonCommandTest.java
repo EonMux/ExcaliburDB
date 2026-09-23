@@ -2,6 +2,7 @@ package com.eonmux.excalibur.bench;
 
 import com.eonmux.excalibur.bench.metric.BenchmarkResult;
 import com.eonmux.excalibur.bench.metric.BenchmarkResultSet;
+import com.eonmux.excalibur.bench.metric.ErroredBenchmark;
 import com.eonmux.excalibur.bench.report.BenchmarkReportWriter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -98,6 +99,76 @@ class BenchmarkComparisonCommandTest {
 
         assertThat(exit).isNotZero();
         assertThat(stderr()).containsIgnoringCase("no results");
+    }
+
+    @Test
+    @DisplayName("--run with an errored combination still writes the reports but exits non-zero")
+    void runWithAnErrorFails(@TempDir Path dir) throws Exception {
+        int exit = command(withErrored(resultSet("captured", 1_000_000.0)))
+            .execute(new String[]{"--run", "--output", dir.toString()});
+
+        assertThat(exit).isEqualTo(BenchmarkComparisonCommand.EXIT_ERRORED);
+        assertThat(stderr()).contains("lookup [size=64] (thrpt)").contains("setup exploded");
+        assertThat(Files.readString(dir.resolve("benchmark_results.json"))).contains("setup exploded");
+    }
+
+    @Test
+    @DisplayName("--compare fails when a combination errored, even with no regression")
+    void compareFailsOnAnErroredCombination(@TempDir Path dir) throws Exception {
+        Path baseline = writeResults(dir.resolve("base.json"), resultSet("base", 1_000_000.0));
+
+        int exit = command(withErrored(resultSet("cur", 1_000_000.0))).execute(new String[]{
+            "--compare", "--baseline", baseline.toString(), "--output", dir.toString()});
+
+        assertThat(exit).isEqualTo(BenchmarkComparisonCommand.EXIT_ERRORED);
+        assertThat(stdout()).contains("BENCHMARKS ERRORED").doesNotContain("No regressions detected");
+        assertThat(stderr()).contains("setup exploded");
+        assertThat(Files.readString(dir.resolve("benchmark_comparison.json")))
+            .contains("\"errored\": 1")
+            .contains("setup exploded");
+    }
+
+    @Test
+    @DisplayName("--compare fails when every combination errored")
+    void compareFailsWhenEverythingErrored(@TempDir Path dir) throws Exception {
+        Path baseline = writeResults(dir.resolve("base.json"), resultSet("base", 1_000_000.0));
+
+        int exit = command(withErrored(emptyResultSet())).execute(new String[]{
+            "--compare", "--baseline", baseline.toString(), "--output", dir.toString()});
+
+        assertThat(exit).isEqualTo(BenchmarkComparisonCommand.EXIT_ERRORED);
+        assertThat(stderr()).contains("setup exploded");
+    }
+
+    @Test
+    @DisplayName("--diff reads errored combinations back out of the current report and fails")
+    void diffFailsOnAnErroredCombination(@TempDir Path dir) throws Exception {
+        Path baseline = writeResults(dir.resolve("base.json"), resultSet("base", 1_000_000.0));
+        Path current = writeResults(dir.resolve("cur.json"), withErrored(resultSet("cur", 1_000_000.0)));
+
+        int exit = command(emptyResultSet()).execute(new String[]{
+            "--diff", baseline.toString(), current.toString(), "--output", dir.toString()});
+
+        assertThat(exit).isEqualTo(BenchmarkComparisonCommand.EXIT_ERRORED);
+        assertThat(stdout()).contains("setup exploded");
+    }
+
+    @Test
+    @DisplayName("--diff compares each parameter combination against its own baseline")
+    void diffComparesPerParameterCombination(@TempDir Path dir) throws Exception {
+        Path baseline = writeResults(dir.resolve("base.json"),
+            parameterised("base", 1_000_000.0, 1_000_000.0));
+        // Only size=4096 regressed. Keyed by method name alone, both rows collapse onto
+        // one baseline and the drop can be hidden behind its neighbour.
+        Path current = writeResults(dir.resolve("cur.json"),
+            parameterised("cur", 1_000_000.0, 400_000.0));
+
+        int exit = command(emptyResultSet()).execute(new String[]{
+            "--diff", baseline.toString(), current.toString(), "--output", dir.toString()});
+
+        assertThat(exit).isEqualTo(BenchmarkComparisonCommand.EXIT_REGRESSION);
+        String comparison = Files.readString(dir.resolve("benchmark_comparison.json"));
+        assertThat(comparison).contains("\"regressed\": 1").contains("\"unchanged\": 1");
     }
 
     @Test
@@ -230,6 +301,40 @@ class BenchmarkComparisonCommandTest {
                 .primaryScoreUnit("ops/s")
                 .higherIsBetter(true)
                 .build())
+            .build();
+    }
+
+    private static BenchmarkResultSet parameterised(String name, double small, double large) {
+        return BenchmarkResultSet.builder()
+            .name(name)
+            .addResult(demoResult(small, "64"))
+            .addResult(demoResult(large, "4096"))
+            .build();
+    }
+
+    private static BenchmarkResult demoResult(double opsPerSec, String size) {
+        return BenchmarkResult.builder()
+            .benchmarkName("com.eonmux.excalibur.bench.benchmark.DemoBenchmark.lookup")
+            .mode("thrpt")
+            .parameter("size", size)
+            .primaryScore(opsPerSec)
+            .primaryScoreUnit("ops/s")
+            .higherIsBetter(true)
+            .build();
+    }
+
+    private static BenchmarkResultSet withErrored(BenchmarkResultSet run) {
+        return BenchmarkResultSet.builder()
+            .name(run.name())
+            .startTime(run.startTime())
+            .endTime(run.endTime())
+            .results(run.results())
+            .addErrored(new ErroredBenchmark(
+                "com.eonmux.excalibur.bench.benchmark.DemoBenchmark.lookup",
+                "thrpt",
+                java.util.Map.of("size", "64"),
+                "java.lang.IllegalStateException: setup exploded",
+                "java.lang.IllegalStateException: setup exploded\n\tat Demo.setup(Demo.java:1)"))
             .build();
     }
 

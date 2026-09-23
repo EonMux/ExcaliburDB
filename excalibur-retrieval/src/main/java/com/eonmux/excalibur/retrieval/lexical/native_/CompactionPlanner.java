@@ -190,6 +190,41 @@ public final class CompactionPlanner {
         return new CompactionPlan(groups, "forced");
     }
 
+    /**
+     * Plans a rewrite of every segment, clean ones included.
+     *
+     * <p>For an operator who has asked for the whole index to be rewritten rather than for the
+     * erasures in it to be discharged. {@link #forcedPlan} skips a segment with nothing
+     * tombstoned that it cannot merge, because rewriting it from its own postings would produce
+     * the same bytes; a compaction is given the surviving text by the caller, though, and a key
+     * whose text the caller no longer holds is dropped. Only a rewrite of every segment finds
+     * all of those - the chunks of documents re-crawled or erased in storage without the index
+     * being told - rather than whichever happened to share a segment with a tombstone.</p>
+     *
+     * <p>The epoch floor still decides the grouping: segments at or below it are merged
+     * {@code mergeFanIn} at a time, and one left over is rewritten alone; each segment above it
+     * is rewritten alone, which keeps its epoch and so changes no reader's view.</p>
+     *
+     * @param segments   The segments the store holds
+     * @param floorEpoch The epoch below which segments may be merged with each other
+     */
+    public CompactionPlan fullPlan(List<SegmentManifest.Entry> segments, long floorEpoch) {
+        Objects.requireNonNull(segments, "segments must not be null");
+        List<List<String>> groups = new ArrayList<>();
+        List<SegmentManifest.Entry> mergeable = new ArrayList<>();
+        for (SegmentManifest.Entry entry : segments) {
+            if (entry.epoch() <= floorEpoch) {
+                mergeable.add(entry);
+            } else {
+                groups.add(List.of(entry.name()));
+            }
+        }
+        for (int i = 0; i < mergeable.size(); i += mergeFanIn) {
+            groups.add(names(mergeable.subList(i, Math.min(mergeable.size(), i + mergeFanIn))));
+        }
+        return new CompactionPlan(groups, "full rewrite");
+    }
+
     private CompactionPlan select(List<SegmentManifest.Entry> segments, long floorEpoch,
                                   boolean overdue, String reason) {
         List<List<String>> groups = new ArrayList<>();
