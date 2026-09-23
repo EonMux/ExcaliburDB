@@ -403,11 +403,16 @@ final class ServerWiring {
             indexOrchestrator.setReindexOperationHandler(null);
             return;
         }
+        SourceResolver resolver = sourceResolver;
         indexOrchestrator.setReindexOperationHandler(new ScheduledReindexRunner(
             reindexCoordinator,
-            new ReindexRun(documentReindexer, sourceResolver, volumeManager,
+            new ReindexRun(documentReindexer, resolver, volumeManager,
                 storageEngine.getCatalog(), reindexStatusRegistry, ingestionStatusRegistry),
-            reindexStatusRegistry));
+            reindexStatusRegistry,
+            // Whether the source still resolves, asked through the same resolver the run reads it
+            // with: the default one reads the ingest registry, so a removed source is gone here
+            // the moment it is gone there.
+            sourceId -> resolver.resolve(sourceId) != null));
     }
 
     /**

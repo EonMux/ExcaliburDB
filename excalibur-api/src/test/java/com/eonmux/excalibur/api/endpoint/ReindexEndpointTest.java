@@ -460,6 +460,66 @@ class ReindexEndpointTest {
             assertThat(drained).as("the drain had nothing left to wait for").isTrue();
         }
 
+        /**
+         * Removing a source - which erasing one does first - stops the reindex that is running
+         * over it and waits for it to end, so nothing the run writes lands after the removal
+         * and nothing it records survives it.
+         */
+        @Test
+        @DisplayName("removing the source stops its running reindex and waits for it to end")
+        void removingTheSourceStopsItsReindex() throws Exception {
+            BlockingRun run = new BlockingRun();
+            ReindexEndpoint endpoint = run.endpoint();
+            sourceRegistry.setReindexStatusRegistry(statusRegistry);
+            sourceRegistry.setReindexCoordinator(run.coordinator);
+            endpoint.handle(exchange("POST", "{\"source_id\": \"docs\"}",
+                new java.io.ByteArrayOutputStream()));
+            assertThat(run.started.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+            assertThat(sourceRegistry.remove("docs")).isTrue();
+
+            assertThat(run.finished.getCount())
+                .as("the removal returned only after the run had ended")
+                .isZero();
+            assertThat(run.sawStop).isTrue();
+            assertThat(run.interrupted).isFalse();
+            assertThat(run.coordinator.isRunning("docs")).isFalse();
+            assertThat(statusRegistry.getStatus("docs"))
+                .as("the stopped run's status went with its source")
+                .isNull();
+            assertThat(endpoint.drain()).isTrue();
+        }
+
+        /**
+         * The claim is what a removal waits on, so registration is checked again once it is held:
+         * a request that saw the source registered and claimed it only after a removal had
+         * finished waiting must not open a status the removal has already cleared.
+         */
+        @Test
+        @DisplayName("a source removed before its claim was taken is answered 404 and opens nothing")
+        void aSourceRemovedBeforeTheClaim() throws Exception {
+            SourceRegistry vanishing = mock(SourceRegistry.class);
+            when(vanishing.isRegistered("docs")).thenReturn(true, false);
+            com.eonmux.excalibur.api.reindex.ReindexCoordinator coordinator =
+                new com.eonmux.excalibur.api.reindex.ReindexCoordinator();
+            com.eonmux.excalibur.ingest.pipeline.DocumentReindexer reindexer =
+                mock(com.eonmux.excalibur.ingest.pipeline.DocumentReindexer.class);
+            ReindexEndpoint endpoint = new ReindexEndpoint(vanishing, statusRegistry, reindexer,
+                mock(com.eonmux.excalibur.ingest.source.SourceResolver.class),
+                null, null, coordinator, null);
+
+            endpoint.handle(exchange("POST", "{\"source_id\": \"docs\"}",
+                new java.io.ByteArrayOutputStream()));
+
+            org.mockito.Mockito.verify(lastExchange)
+                .sendResponseHeaders(org.mockito.ArgumentMatchers.eq(404),
+                    org.mockito.ArgumentMatchers.anyLong());
+            assertThat(statusRegistry.getStatus("docs")).isNull();
+            assertThat(coordinator.isRunning("docs")).as("the claim was given back").isFalse();
+            org.mockito.Mockito.verifyNoInteractions(reindexer);
+            endpoint.close();
+        }
+
         @Test
         @DisplayName("refuses a method that is neither POST nor DELETE")
         void refusesOtherMethods() throws IOException {

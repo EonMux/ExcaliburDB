@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Objects;
+import java.util.function.Predicate;
 
 /**
  * Executes one scheduled reindex under the shared reindex claim.
@@ -29,6 +30,13 @@ import java.util.Objects;
  * and never by interrupting the scheduler's thread, which would close whatever shared channel
  * the run was writing through at that moment.</p>
  *
+ * <h2>A source removed since the tick was scheduled</h2>
+ * <p>A tick can be dispatched a moment before its source is removed, and take its claim after the
+ * removal has stopped and waited for every run that held one. Registration is therefore checked
+ * again once the claim is held, before anything is opened: a run started then would record a
+ * status for a source no request can name, put back the entry the removal cleared, and crawl a
+ * source that has been closed.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Thread-safe. Every field is final and the mutual exclusion that matters - one reindex per
  * source - is the coordinator's, which the scheduler may call this from any thread against.</p>
@@ -42,6 +50,7 @@ final class ScheduledReindexRunner implements ReindexOperationHandler {
     private final ReindexCoordinator coordinator;
     private final ReindexRun run;
     private final ReindexEndpoint.ReindexStatusRegistry statusRegistry;
+    private final Predicate<String> registered;
 
     /**
      * Creates a runner for the scheduler to call.
@@ -50,15 +59,19 @@ final class ScheduledReindexRunner implements ReindexOperationHandler {
      * @param run            The reindex itself, shared with {@code POST /v1/reindex}
      * @param statusRegistry Where a run is opened, so the readback reports a scheduled re-crawl
      *                       from its first moment rather than only once it has ended
+     * @param registered     Whether a source is still one this node reindexes - still resolves
+     *                       to a crawler - asked once the claim is held
      * @throws NullPointerException if any parameter is null
      */
     ScheduledReindexRunner(ReindexCoordinator coordinator,
                            ReindexRun run,
-                           ReindexEndpoint.ReindexStatusRegistry statusRegistry) {
+                           ReindexEndpoint.ReindexStatusRegistry statusRegistry,
+                           Predicate<String> registered) {
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator cannot be null");
         this.run = Objects.requireNonNull(run, "run cannot be null");
         this.statusRegistry =
             Objects.requireNonNull(statusRegistry, "statusRegistry cannot be null");
+        this.registered = Objects.requireNonNull(registered, "registered cannot be null");
     }
 
     @Override
@@ -71,6 +84,11 @@ final class ScheduledReindexRunner implements ReindexOperationHandler {
             return false;
         }
         try {
+            if (!registered.test(sourceId)) {
+                LOGGER.info("Scheduled reindex skipped: source {} is no longer registered",
+                    sourceId);
+                return false;
+            }
             StopSignal stop = new StopSignal();
             lease.onCancel(stop::request);
             statusRegistry.startReindex(sourceId);

@@ -29,8 +29,9 @@ import java.util.Objects;
  * operator reach for under time pressure.</p>
  *
  * <h3>What it stops</h3>
- * <p>Everything registering the source started: an ingestion run in flight, its
- * {@code /v1/ingest/status} entry, and its place in the re-crawl schedule. The documents it already
+ * <p>Everything registering the source started: an ingestion run in flight, a re-crawl in
+ * flight - which is waited for, within a bound - its {@code /v1/ingest/status} and
+ * {@code /v1/reindex/status} entries, and its place in the re-crawl schedule. The documents it already
  * indexed stay, and stay queryable. A run is stopped at its next document boundary, so a document
  * already being written is finished rather than abandoned half-way.</p>
  *

@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.reindex.ReindexCoordinator;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
@@ -56,6 +57,16 @@ public class InMemorySourceRegistry implements SourceRegistry {
      * catalog stages where it staged before the restart.</p>
      */
     private final ConcurrentHashMap<String, NamespaceId> namespaces = new ConcurrentHashMap<>();
+
+    /**
+     * How long a removal waits, by default, for a reindex of the source to stop.
+     *
+     * <p>A stopped reindex finishes the document it is writing, so this bounds one document's
+     * fetch, embedding and writes rather than the rest of the crawl - and a removal arrives on a
+     * request thread whose caller is waiting for the answer.</p>
+     */
+    public static final long DEFAULT_REINDEX_STOP_WAIT_MS = 30_000;
+
     private final int maxSources;
     private volatile IngestionOrchestrator ingestionOrchestrator;
     private volatile IngestStatusEndpoint.IngestionStatusRegistry statusRegistry;
@@ -63,6 +74,8 @@ public class InMemorySourceRegistry implements SourceRegistry {
     private volatile SegmentReindexScheduler reindexScheduler;
     private volatile long reindexIntervalMs = SegmentReindexScheduler.DEFAULT_REINDEX_INTERVAL_MS;
     private volatile SourceCatalog sourceCatalog;
+    private volatile ReindexCoordinator reindexCoordinator;
+    private volatile long reindexStopWaitMs = DEFAULT_REINDEX_STOP_WAIT_MS;
 
     /**
      * Creates a registry bounded by the default source limit.
@@ -135,6 +148,40 @@ public class InMemorySourceRegistry implements SourceRegistry {
     public void setReindexStatusRegistry(
             ReindexEndpoint.ReindexStatusRegistry reindexStatusRegistry) {
         this.reindexStatusRegistry = reindexStatusRegistry;
+    }
+
+    /**
+     * Sets the claim every reindex of a source holds while it runs, so a removal can stop one.
+     *
+     * <p>Removing a source stops everything registering it started, and a reindex is one of
+     * them. It is not enough to take the source off the schedule: a re-crawl already running
+     * goes on writing the source's documents - which, when the removal is the first step of
+     * erasing the source, puts back what the erasure is about to remove - reads through a source
+     * that removal closes, and records a status for a source that no longer exists. The
+     * coordinator is the one place that sees every running reindex, whichever trigger started it,
+     * and so the one place a removal can stop it through.</p>
+     *
+     * @param coordinator The coordinator both reindex triggers take their claim from, or null
+     *                    on a node that does not reindex
+     */
+    public void setReindexCoordinator(ReindexCoordinator coordinator) {
+        setReindexCoordinator(coordinator, DEFAULT_REINDEX_STOP_WAIT_MS);
+    }
+
+    /**
+     * As {@link #setReindexCoordinator(ReindexCoordinator)}, with an explicit bound on how long
+     * a removal waits for a reindex to stop.
+     *
+     * @param coordinator  The coordinator, or null on a node that does not reindex
+     * @param stopWaitMs   How long a removal waits for the source's reindex to end
+     * @throws IllegalArgumentException if the wait is negative
+     */
+    public void setReindexCoordinator(ReindexCoordinator coordinator, long stopWaitMs) {
+        if (stopWaitMs < 0) {
+            throw new IllegalArgumentException("stopWaitMs must not be negative: " + stopWaitMs);
+        }
+        this.reindexCoordinator = coordinator;
+        this.reindexStopWaitMs = stopWaitMs;
     }
 
     /**
@@ -427,12 +474,22 @@ public class InMemorySourceRegistry implements SourceRegistry {
      * besides the registry entry - an ingestion run, a status entry and a place in the reindex
      * schedule - and a removal that left them behind would leave the node crawling a source no
      * request can name, reporting it on {@code /v1/ingest/status} forever, and logging a
-     * source-not-found warning every scheduling interval for the life of the process.</p>
+     * source-not-found warning every scheduling interval for the life of the process. The
+     * schedule is also how a re-crawl gets started, so a re-crawl already running is stopped
+     * too.</p>
      *
-     * <p>The order matters twice. The catalog record goes first, because a crawl stopped in
-     * memory and still recorded on disk restarts itself at the next boot. And ingestion is
-     * stopped before the source is closed, because a run still inside {@code source.fetch} holds
-     * the very thing being closed.</p>
+     * <p>The order matters three times. The catalog record goes first, because a crawl stopped
+     * in memory and still recorded on disk restarts itself at the next boot. A running reindex is
+     * stopped and waited for before the status entries are cleared, because until it has ended
+     * it is still recording what it did. And both runs are stopped before the source is closed,
+     * because a run still inside {@code source.fetch} holds the very thing being closed.</p>
+     *
+     * <p>The reindex is waited for, within a bound, where the ingestion run is only asked: a
+     * caller erasing the source goes on to remove its documents the moment this returns, and a
+     * reindex that finished the document it was on after that would put it back. A reindex that
+     * outlives the bound is logged and left to stop on its own; it can no longer open a status
+     * for the source, because both reindex triggers check that the source is still registered
+     * once they hold their claim.</p>
      *
      * @param sourceId The source ID to remove
      * @return true if the source was registered, in this process or in the catalog
@@ -459,6 +516,7 @@ public class InMemorySourceRegistry implements SourceRegistry {
         if (reindexScheduler != null) {
             reindexScheduler.unregisterSource(sourceId);
         }
+        stopReindex(sourceId);
         if (statusRegistry != null) {
             statusRegistry.remove(sourceId);
         }
@@ -467,9 +525,37 @@ public class InMemorySourceRegistry implements SourceRegistry {
         }
 
         closeSource(sourceId, removed);
-        LOGGER.info("Removed source {}: ingestion stopped, status cleared, reindexing cancelled",
-            sourceId);
+        LOGGER.info("Removed source {}: ingestion stopped, reindexing stopped and unscheduled, "
+            + "status cleared", sourceId);
         return true;
+    }
+
+    /**
+     * Stops a reindex of a source being removed, and waits for it within the configured bound.
+     *
+     * <p>An interrupt ends the wait but not the removal: the source is already out of the
+     * registry and the catalog, and leaving the rest of it half-undone would be worse than not
+     * waiting. The interrupt is kept on the thread for its owner to act on.</p>
+     *
+     * @param sourceId The source being removed
+     */
+    private void stopReindex(String sourceId) {
+        ReindexCoordinator coordinator = this.reindexCoordinator;
+        if (coordinator == null || !coordinator.isRunning(sourceId)) {
+            return;
+        }
+        LOGGER.info("Stopping the reindex of source {} before removing it", sourceId);
+        try {
+            if (!coordinator.cancelAndAwait(sourceId, reindexStopWaitMs)) {
+                LOGGER.warn("The reindex of source {} had not stopped {}ms after being asked; "
+                    + "removing the source anyway. It stops at its next document and records "
+                    + "nothing further for the source", sourceId, reindexStopWaitMs);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOGGER.warn("Interrupted while waiting for the reindex of source {} to stop; "
+                + "removing the source anyway", sourceId);
+        }
     }
 
     /**

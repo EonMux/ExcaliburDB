@@ -189,6 +189,72 @@ class ReindexCoordinatorTest {
         }
     }
     @Nested
+    @DisplayName("stopping one source's reindex and waiting for it")
+    class StoppingOneSource {
+
+        @Test
+        @DisplayName("a source nothing is reindexing has already stopped")
+        void nothingRunning() throws Exception {
+            assertThat(new ReindexCoordinator().cancelAndAwait("docs", 0)).isTrue();
+        }
+
+        /**
+         * Deregistering a source - and erasing one - must not return while a reindex of it is
+         * still writing: the run would put back documents the erasure had just removed. So the
+         * stop is asked for and then waited on, which a bare {@code cancel} does not do.
+         */
+        @Test
+        @DisplayName("asks the run to stop and returns once it has released its claim")
+        void waitsForTheRunToEnd() throws Exception {
+            ReindexCoordinator coordinator = new ReindexCoordinator();
+            ReindexCoordinator.Lease lease = coordinator.tryAcquire("docs");
+            CountDownLatch asked = new CountDownLatch(1);
+            lease.onCancel(asked::countDown);
+            java.util.concurrent.atomic.AtomicBoolean releasedFirst =
+                new java.util.concurrent.atomic.AtomicBoolean();
+            Thread run = Thread.ofVirtual().start(() -> {
+                try {
+                    if (asked.await(5, TimeUnit.SECONDS)) {
+                        releasedFirst.set(true);
+                        lease.release();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+
+            assertThat(coordinator.cancelAndAwait("docs", TimeUnit.SECONDS.toMillis(10)))
+                .isTrue();
+            assertThat(releasedFirst).as("it returned because the run ended").isTrue();
+            assertThat(coordinator.isRunning("docs")).isFalse();
+            run.join();
+        }
+
+        @Test
+        @DisplayName("reports a run that does not stop within the bound")
+        void reportsARunThatOutlivesTheBound() throws Exception {
+            ReindexCoordinator coordinator = new ReindexCoordinator();
+            ReindexCoordinator.Lease lease = coordinator.tryAcquire("docs");
+
+            assertThat(coordinator.cancelAndAwait("docs", 20)).isFalse();
+            assertThat(lease.isCancelled()).isTrue();
+            assertThat(coordinator.isRunning("docs"))
+                .as("the claim is still the run's to release")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("waits on the one source, not on every reindex in flight")
+        void ignoresOtherSources() throws Exception {
+            ReindexCoordinator coordinator = new ReindexCoordinator();
+            ReindexCoordinator.Lease other = coordinator.tryAcquire("other");
+
+            assertThat(coordinator.cancelAndAwait("docs", 0)).isTrue();
+            assertThat(other.isCancelled()).isFalse();
+        }
+    }
+
+    @Nested
     @DisplayName("draining for shutdown")
     class Draining {
 

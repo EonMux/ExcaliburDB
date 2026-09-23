@@ -44,7 +44,7 @@ class ScheduledReindexRunnerTest {
         ReindexEndpoint.ReindexStatusRegistry statuses =
             new ReindexEndpoint.InMemoryReindexStatusRegistry();
         ScheduledReindexRunner runner = new ScheduledReindexRunner(coordinator,
-            runEndingIn(new OutOfMemoryError("simulated"), statuses), statuses);
+            runEndingIn(new OutOfMemoryError("simulated"), statuses), statuses, id -> true);
 
         assertThatThrownBy(() -> runner.executeReindex(SOURCE_ID))
             .isInstanceOf(OutOfMemoryError.class);
@@ -68,7 +68,8 @@ class ScheduledReindexRunnerTest {
                 }
             };
         ScheduledReindexRunner runner = new ScheduledReindexRunner(coordinator,
-            runEndingIn(new AssertionError("the run is never reached"), statuses), statuses);
+            runEndingIn(new AssertionError("the run is never reached"), statuses), statuses,
+            id -> true);
 
         assertThatThrownBy(() -> runner.executeReindex(SOURCE_ID))
             .isInstanceOf(LinkageError.class);
@@ -77,6 +78,26 @@ class ScheduledReindexRunnerTest {
             .isEqualTo(ReindexEndpoint.ReindexStatus.STATE_FAILED);
         assertThat(statuses.getStatus(SOURCE_ID).lastError())
             .isEqualTo("Reindex failed (LinkageError)");
+        assertThat(coordinator.isRunning(SOURCE_ID)).isFalse();
+    }
+
+    @Test
+    @DisplayName("a tick for a source removed since it was scheduled opens nothing and runs nothing")
+    void aRemovedSourceIsNotReindexed() {
+        // A tick dispatched just before the source was removed takes its claim after the removal
+        // has stopped and waited for everything that held one. Opening a run then would put back
+        // the status entry the removal cleared, for a source no request can name.
+        ReindexEndpoint.ReindexStatusRegistry statuses =
+            new ReindexEndpoint.InMemoryReindexStatusRegistry();
+        DocumentReindexer reindexer = mock(DocumentReindexer.class);
+        ScheduledReindexRunner runner = new ScheduledReindexRunner(coordinator,
+            new ReindexRun(reindexer, id -> mock(Source.class), null, null, statuses, null),
+            statuses, id -> false);
+
+        assertThat(runner.executeReindex(SOURCE_ID)).isFalse();
+
+        assertThat(statuses.getStatus(SOURCE_ID)).isNull();
+        org.mockito.Mockito.verifyNoInteractions(reindexer);
         assertThat(coordinator.isRunning(SOURCE_ID)).isFalse();
     }
 }

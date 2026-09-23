@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.reindex.ReindexCoordinator;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.shard.worker.SegmentReindexScheduler;
 
@@ -7,7 +8,12 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -123,5 +129,131 @@ class SourceRemovalTest {
         registry.remove("42");
 
         verify(source).close();
+    }
+
+    /**
+     * A reindex of the source, in flight on its own thread, that runs until it is asked to stop
+     * and then does what a stopped run does: finishes the document it is on, records that it
+     * was cancelled, and releases its claim.
+     */
+    private static final class InFlightReindex {
+        final CountDownLatch asked = new CountDownLatch(1);
+        final AtomicBoolean sourceClosedWhileRunning = new AtomicBoolean();
+        final Thread thread;
+
+        InFlightReindex(ReindexCoordinator coordinator,
+                        ReindexEndpoint.ReindexStatusRegistry statuses,
+                        AtomicBoolean sourceClosed, String sourceId, long holdMillis) {
+            ReindexCoordinator.Lease lease = coordinator.tryAcquire(sourceId);
+            statuses.startReindex(sourceId);
+            lease.onCancel(asked::countDown);
+            thread = Thread.ofVirtual().start(() -> {
+                try {
+                    asked.await(10, TimeUnit.SECONDS);
+                    Thread.sleep(holdMillis);
+                    sourceClosedWhileRunning.set(sourceClosed.get());
+                    statuses.cancelReindex(sourceId);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    lease.release();
+                }
+            });
+        }
+    }
+
+    private Source closeRecording(String sourceId, AtomicBoolean closed) throws Exception {
+        Source source = source(sourceId);
+        doAnswer(invocation -> {
+            closed.set(true);
+            return null;
+        }).when(source).close();
+        return source;
+    }
+
+    @Test
+    @DisplayName("a reindex in flight is stopped, and waited for, before the source is gone")
+    void stopsAndAwaitsAnInFlightReindex() throws Exception {
+        // Erasure deregisters first so that nothing restores what it removes. A re-crawl left
+        // running would go on writing the source's documents back after the erasure, read
+        // through a source that has been closed underneath it, and put back the status entry
+        // this removal clears.
+        ReindexCoordinator coordinator = new ReindexCoordinator();
+        ReindexEndpoint.InMemoryReindexStatusRegistry reindexes =
+            new ReindexEndpoint.InMemoryReindexStatusRegistry();
+        registry.setReindexStatusRegistry(reindexes);
+        registry.setReindexCoordinator(coordinator);
+        AtomicBoolean closed = new AtomicBoolean();
+        registry.register(closeRecording("42", closed));
+        InFlightReindex run = new InFlightReindex(coordinator, reindexes, closed, "42", 50);
+
+        registry.remove("42");
+
+        assertThat(coordinator.isRunning("42"))
+            .as("removal returned only once the reindex had ended")
+            .isFalse();
+        assertThat(run.sourceClosedWhileRunning)
+            .as("the source was closed only after the run stopped reading it")
+            .isFalse();
+        assertThat(closed).isTrue();
+        assertThat(reindexes.getStatus("42"))
+            .as("what the stopped run recorded is cleared with the source")
+            .isNull();
+        run.thread.join();
+    }
+
+    @Test
+    @DisplayName("a reindex that outlives the bound does not hold the removal, nor come back")
+    void aReindexThatWillNotStopIsNotWaitedOnForever() throws Exception {
+        ReindexCoordinator coordinator = new ReindexCoordinator();
+        ReindexEndpoint.InMemoryReindexStatusRegistry reindexes =
+            new ReindexEndpoint.InMemoryReindexStatusRegistry();
+        registry.setReindexStatusRegistry(reindexes);
+        registry.setReindexCoordinator(coordinator, 20);
+        AtomicBoolean closed = new AtomicBoolean();
+        registry.register(closeRecording("42", closed));
+        InFlightReindex run = new InFlightReindex(coordinator, reindexes, closed, "42", 300);
+
+        assertThat(registry.remove("42")).isTrue();
+        assertThat(registry.isRegistered("42")).isFalse();
+        run.thread.join();
+
+        assertThat(reindexes.getStatus("42"))
+            .as("a run that ends after its source was removed cannot recreate its status")
+            .isNull();
+    }
+
+    @Test
+    @DisplayName("a source with no reindex running is removed without waiting")
+    void nothingToWaitFor() {
+        ReindexCoordinator coordinator = new ReindexCoordinator();
+        registry.setReindexCoordinator(coordinator);
+        registry.register(source("42"));
+
+        assertThat(registry.remove("42")).isTrue();
+    }
+
+    @Test
+    @DisplayName("an interrupted removal still removes, and keeps the interrupt")
+    void anInterruptedRemoval() {
+        ReindexCoordinator coordinator = new ReindexCoordinator();
+        ReindexEndpoint.InMemoryReindexStatusRegistry reindexes =
+            new ReindexEndpoint.InMemoryReindexStatusRegistry();
+        registry.setReindexStatusRegistry(reindexes);
+        registry.setReindexCoordinator(coordinator);
+        registry.register(source("42"));
+        ReindexCoordinator.Lease lease = coordinator.tryAcquire("42");
+        reindexes.startReindex("42");
+
+        Thread.currentThread().interrupt();
+        try {
+            assertThat(registry.remove("42")).isTrue();
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();
+            lease.release();
+        }
+        assertThat(reindexes.getStatus("42")).isNull();
+        assertThat(lease.isCancelled()).isTrue();
     }
 }

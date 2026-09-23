@@ -247,9 +247,10 @@ public class DocumentErasureEndpoint implements HttpHandler {
             if (SCOPE_SOURCE.equals(scope)) {
                 // Before erasing, not after: a crawl that ran in between would reingest the
                 // documents this request is in the middle of removing. Removing the source also
-                // stops a run of it that is in flight, though only at its next document
-                // boundary - so one more document may land, and documents_remaining is what
-                // shows it.
+                // stops a re-crawl of it that is in flight and waits for that to end, and stops an
+                // ingestion run - though that only at its next document boundary and without
+                // waiting, so one more document may land, and documents_remaining is what shows
+                // it.
                 deregistered = sourceRegistry != null && sourceRegistry.remove(sourceId);
                 outcome = erasureService.eraseSource(sourceId, MAX_DOCUMENTS, compactNow);
                 // After the erasure, not before it: until the documents are gone, a crawl

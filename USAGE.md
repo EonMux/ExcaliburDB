@@ -1179,8 +1179,10 @@ not a legal source id. **`413 Payload Too Large`** — the body is over the requ
 
 ### Stop crawling a source
 
-Takes a source out of the crawl: any ingestion run in flight is stopped, its `/v1/ingest/status`
-entry is cleared, and it is removed from the re-crawl schedule. **The documents it already indexed
+Takes a source out of the crawl: any ingestion run in flight is stopped, a re-crawl in flight is
+stopped and waited for (up to thirty seconds — it finishes the document it is on), its
+`/v1/ingest/status` and `/v1/reindex/status` entries are cleared, and it is removed from the
+re-crawl schedule. **The documents it already indexed
 are kept** and stay queryable — this is the routine case of a source that moved, went stale or
 finished, and it is deliberately not the same route as erasing them.
 
@@ -1240,12 +1242,14 @@ curl -X POST http://localhost:8080/v1/erasure \
 
 `scope` is a separate word rather than an omission: a request naming no document is a `400`, so
 "everything" cannot be reached by a client that forgot a field. It cannot be combined with
-`document_id` or `document_ids` either. A source-scoped erasure also **deregisters the source** —
-stopping any ingestion run in flight, clearing its `/v1/ingest/status` entry and cancelling its
-re-crawl schedule — so nothing restores what was just erased, and reports `source_deregistered`.
-Each request erases up to 1000 documents and reports `documents_remaining`; repeat until it reaches
-zero. A run stopped mid-flight finishes the document it was on, so one more may land between two
-calls, which is what the remaining count is for.
+`document_id` or `document_ids` either. A source-scoped erasure first **deregisters the source**
+— stopping any ingestion run in flight, stopping any re-crawl in flight and waiting for it to end,
+clearing its status entries and cancelling its re-crawl schedule — so nothing restores what was
+just erased, and reports `source_deregistered`. Each request erases up to 1000 documents and
+reports `documents_remaining`; repeat until it reaches zero. An ingestion run stopped mid-flight
+finishes the document it was on without being waited for, so one more may land between two calls,
+which is what the remaining count is for. A re-crawl is waited for before anything is erased, up
+to thirty seconds; one that outlives that is logged and may likewise land one more document.
 
 **Response — `200 OK`, or `202 Accepted` while the graph half is still queued**
 
