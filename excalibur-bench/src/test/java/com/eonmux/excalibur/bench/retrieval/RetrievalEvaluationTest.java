@@ -142,6 +142,51 @@ class RetrievalEvaluationTest {
         }
 
         @Test
+        @DisplayName("a hit is credited to its document, whether it names a chunk or the document")
+        void hitsAreCreditedByDocument() {
+            // The graph can only cite documents, and vector search has named documents rather
+            // than chunks; scoring by document is what keeps every strategy's row comparable.
+            List<StrategyEvaluator.Judged> byChunk = List.of(
+                new StrategyEvaluator.Judged("oom", Set.of("corpus:oom.txt:chunk:3")),
+                new StrategyEvaluator.Judged("tls", Set.of("corpus:tls.txt")));
+            StrategyEvaluator evaluator = new StrategyEvaluator(byChunk, 2);
+
+            StrategyResult result = evaluator.evaluate(RetrievalStrategy.BM25, (q, k) ->
+                q.equals("oom")
+                    ? List.of("corpus:oom.txt:chunk:0", "corpus:oom.txt:chunk:3")
+                    : List.of("corpus:disk.txt", "corpus:tls.txt:chunk:1"));
+
+            assertThat(result.recallAtK()).isEqualTo(1.0);
+            assertThat(result.mrr()).as("tls is the second document named").isEqualTo(0.75);
+            assertThat(result.precisionAtK())
+                .as("two chunks of one document are one result, not two: 1/1 and 1/2")
+                .isEqualTo(0.75);
+        }
+
+        @Test
+        @DisplayName("strategies evaluated in phases assemble into one table, in declaration order")
+        void phasesAssemble() {
+            StrategyEvaluator evaluator = new StrategyEvaluator(judged, 5);
+            Map<RetrievalStrategy, StrategyResult> first = evaluator.evaluateEach(
+                Map.of(RetrievalStrategy.BM25_VECTOR, (q, k) -> List.of("oom")));
+            Map<RetrievalStrategy, StrategyResult> second = evaluator.evaluateEach(
+                Map.of(RetrievalStrategy.BM25, (q, k) -> List.of("tls")));
+            Map<RetrievalStrategy, StrategyResult> ran = new EnumMap<>(RetrievalStrategy.class);
+            ran.putAll(first);
+            ran.putAll(second);
+
+            List<StrategyResult> table = StrategyEvaluator.inOrder(ran,
+                Map.of(RetrievalStrategy.BM25_GRAPH, "no graph: named reason"));
+
+            assertThat(table).extracting(StrategyResult::strategy)
+                .containsExactly(RetrievalStrategy.values());
+            assertThat(table.get(RetrievalStrategy.BM25.ordinal()).ran()).isTrue();
+            assertThat(table.get(RetrievalStrategy.BM25_VECTOR.ordinal()).ran()).isTrue();
+            assertThat(table.get(RetrievalStrategy.BM25_GRAPH.ordinal()).skippedReason())
+                .isEqualTo("no graph: named reason");
+        }
+
+        @Test
         @DisplayName("a strategy that throws is recorded, not allowed to abort the comparison")
         void failuresAreRecorded() {
             StrategyResult result = new StrategyEvaluator(judged, 5)

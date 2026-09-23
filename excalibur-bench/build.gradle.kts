@@ -264,11 +264,14 @@ tasks.register<JavaExec>("runGraphCalibration") {
 // Scores the retrieval strategies over a real corpus. Deliberately not JMH: the thing being
 // measured is retrieval quality against judged queries, with latency beside it, not a microbenchmark.
 //
-// Measures the engine a node ships with unless the last argument says otherwise:
-//   -PevalArgs="<corpusDir> <indexDir> <qrels> 10 - - both"   ('-' skips a positional)
+// The arguments are positional; '-' skips one. BM25 alone needs only the first three. A base URL
+// and a chat model add expansion and the graph strategies; a base URL, an embedding model and its
+// width add the hybrid ones. The endpoint's key is read from EXCALIBUR_LLM_API_KEY:
+//   -PevalArgs="<corpusDir> <indexDir> <qrels> 10 - - both"
+//   -PevalArgs="<corpusDir> <indexDir> <qrels> 10 http://127.0.0.1:11434 <chatModel> native <embeddingModel> 768"
 tasks.register<JavaExec>("runRetrievalEvaluation") {
     group = "verification"
-    description = "Indexes a corpus on the native (or lucene, or both) engine and scores the retrieval strategies over it, with the index size beside the quality"
+    description = "Scores every retrieval strategy over a corpus on the native (or lucene, or both) engine - BM25 and expansion on a harness index, the hybrid and graph strategies on an in-process node - with the index size beside the quality"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.retrieval.CorpusEvaluationRunner")
     jvmArgs = benchmarkJvmFlags + listOf("-Xmx6g")

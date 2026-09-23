@@ -1,10 +1,11 @@
 package com.eonmux.excalibur.bench.retrieval;
 
+import com.eonmux.excalibur.core.text.ChunkIdentifiers;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.EnumMap;
 import java.util.List;
@@ -27,6 +28,15 @@ import java.util.Objects;
  * cannot measure traversal. Those are reported as skipped with the reason rather than as zero: a
  * zero would average into a comparison and quietly make the available strategies look better than
  * they are.</p>
+ *
+ * <h2>What a hit is credited to</h2>
+ * <p>Its document. A judged identifier and a retrieved one are both reduced to the document they
+ * name - {@code source:document} from {@code source:document:chunk:N}, and a document key as it
+ * is - before anything is compared. The graph cannot cite anything finer than a document, since
+ * a fact is extracted from a whole one, and vector search has at times named documents rather
+ * than chunks; scored at chunk granularity those strategies would lose hits to a naming
+ * difference rather than to retrieval. Two chunks of one document among the results are one
+ * result, at the rank of the first.</p>
  */
 public final class StrategyEvaluator {
 
@@ -82,22 +92,62 @@ public final class StrategyEvaluator {
      */
     public List<StrategyResult> evaluateAll(Map<RetrievalStrategy, Retrieval> retrievals,
                                             Map<RetrievalStrategy, String> reasons) {
-        Objects.requireNonNull(retrievals, "retrievals must not be null");
         Objects.requireNonNull(reasons, "reasons must not be null");
+        return inOrder(evaluateEach(retrievals), reasons);
+    }
+
+    /**
+     * Evaluates the strategies for which a retrieval function is supplied, and only those.
+     *
+     * <p>For a comparison that cannot run every strategy at once: one whose strategies need a
+     * node configured two different ways evaluates each configuration's strategies while that
+     * configuration is up, and assembles the table with {@link #inOrder} at the end.</p>
+     *
+     * @param retrievals Strategy to its retrieval function; a null entry is left out
+     * @return A result for each supplied strategy
+     */
+    public Map<RetrievalStrategy, StrategyResult> evaluateEach(
+            Map<RetrievalStrategy, Retrieval> retrievals) {
+        Objects.requireNonNull(retrievals, "retrievals must not be null");
         Map<RetrievalStrategy, StrategyResult> out = new EnumMap<>(RetrievalStrategy.class);
         for (RetrievalStrategy strategy : RetrievalStrategy.values()) {
             Retrieval retrieval = retrievals.get(strategy);
-            if (retrieval == null) {
-                String reason = reasons.get(strategy);
-                out.put(strategy, StrategyResult.skipped(strategy, reason != null ? reason
-                    : strategy.usesVector()
-                        ? "no embedded corpus on this deployment"
-                        : "no retrieval function supplied"));
+            if (retrieval != null) {
+                out.put(strategy, evaluate(strategy, retrieval));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * One row per strategy, in declaration order: its result where it ran, otherwise skipped.
+     *
+     * <p>The default reason is that nothing supplied a retrieval function, which is true and
+     * rarely the useful answer - hence {@code reasons}, for the strategies whose absence has a
+     * known cause.</p>
+     *
+     * @param ran     The strategies that were evaluated
+     * @param reasons Why a particular strategy was not, where that is known
+     * @return Every strategy's row
+     */
+    public static List<StrategyResult> inOrder(Map<RetrievalStrategy, StrategyResult> ran,
+                                               Map<RetrievalStrategy, String> reasons) {
+        Objects.requireNonNull(ran, "ran must not be null");
+        Objects.requireNonNull(reasons, "reasons must not be null");
+        List<StrategyResult> out = new ArrayList<>(RetrievalStrategy.values().length);
+        for (RetrievalStrategy strategy : RetrievalStrategy.values()) {
+            StrategyResult result = ran.get(strategy);
+            if (result != null) {
+                out.add(result);
                 continue;
             }
-            out.put(strategy, evaluate(strategy, retrieval));
+            String reason = reasons.get(strategy);
+            out.add(StrategyResult.skipped(strategy, reason != null ? reason
+                : strategy.usesVector()
+                    ? "no embedded corpus on this deployment"
+                    : "no retrieval function supplied"));
         }
-        return Arrays.stream(RetrievalStrategy.values()).map(out::get).toList();
+        return List.copyOf(out);
     }
 
     /** Evaluates one strategy. */
@@ -125,12 +175,13 @@ public final class StrategyEvaluator {
                 hits = List.of();
             }
             latencies.add((System.nanoTime() - start) / 1_000_000.0);
-            hits = hits == null ? List.of() : hits;
+            List<String> documents = documentsOf(hits == null ? List.of() : hits);
+            List<String> relevant = documentsOf(judged.relevant());
 
-            recall += RetrievalMetrics.recallAt(hits, judged.relevant(), k);
-            precision += RetrievalMetrics.precisionAt(hits, judged.relevant(), k);
-            mrr += RetrievalMetrics.reciprocalRank(hits, judged.relevant());
-            ndcg += RetrievalMetrics.ndcgAt(hits, judged.relevant(), k);
+            recall += RetrievalMetrics.recallAt(documents, relevant, k);
+            precision += RetrievalMetrics.precisionAt(documents, relevant, k);
+            mrr += RetrievalMetrics.reciprocalRank(documents, relevant);
+            ndcg += RetrievalMetrics.ndcgAt(documents, relevant, k);
         }
 
         int n = queries.size();
@@ -166,6 +217,15 @@ public final class StrategyEvaluator {
         }
         sb.append("\n  Strategies without a vector signal need no corpus-wide embedding pass.\n");
         return sb.toString();
+    }
+
+    /** The documents a list of identifiers names, each once, in first-named order. */
+    private static List<String> documentsOf(Collection<String> identifiers) {
+        return identifiers.stream()
+            .filter(Objects::nonNull)
+            .map(ChunkIdentifiers::documentKeyOfChunk)
+            .distinct()
+            .toList();
     }
 
     private static double percentile(List<Double> values, int percentile) {

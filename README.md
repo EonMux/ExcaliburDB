@@ -964,7 +964,8 @@ A node that does embed its corpus leaves expansion off, because the vector signa
 the meaning of the question there. That makes the BM25 half of a hybrid query plain BM25 — weaker
 than the same node would run with no embeddings at all — and whether the trade pays depends on the
 corpus, so `excalibur.query.expand-hybrid-queries=true` turns expansion on for the hybrid case as
-well, at one extra chat call per query. `excalibur-bench` scores both.
+well, at one extra chat call per query. `excalibur-bench` scores both — `BM25_VECTOR` and
+`BM25_EXPANSION_VECTOR` — on the same ingested corpus; see [Evaluating it](#evaluating-it).
 
 ### Answering the same question twice
 
@@ -1025,13 +1026,54 @@ as well, which starts its BM25 search once the vector half has failed. See
 BM25 + expansion, with and without a vocabulary gate; BM25 + graph; BM25 + vector; and the
 combinations — on recall@k, precision@k, MRR, nDCG@k and latency. Strategies a deployment cannot run
 are reported as skipped rather than scored zero, so an unavailable signal cannot flatter the ones
-that are present, and the reason names the engine when the engine is why.
+that are present, and the reason names what is missing: the engine, the model argument, an
+ingestion that did not complete, or a graph build that published no facts.
 
 The question it exists to answer is whether query-side expansion over a lexical index reaches the
 same documents as embedding the corpus, at a fraction of the indexing cost — and that comparison is
 only meaningful with the indexing cost reported beside the quality number. So the harness reports
 the index it built as well as the quality it reached: chunks per second, and the bytes on disk as a
-multiple of the text indexed.
+multiple of the text indexed. For the model-backed strategies it reports the ingestion instead —
+chunks ingested, seconds, whether they were embedded and had facts extracted — and the graph build's
+facts, entities and seconds. A node's disk size is not reported, because a node preallocates its
+storage and the number would describe the preallocation, not the corpus.
+
+```
+./gradlew :excalibur-bench:runRetrievalEvaluation \
+    -PevalArgs="<corpusDir> <indexDir> <qrels.tsv> [k] [baseUrl] [chatModel] [native|lucene|both] [embeddingModel] [dimensions]"
+```
+
+The optional arguments are positional, so `-` stands in for one being skipped. `k` defaults to 10,
+the engine to `native`, and the dimensions to 1536. `baseUrl` is one OpenAI-compatible endpoint
+serving both models; its key is read from `EXCALIBUR_LLM_API_KEY`, and a placeholder is sent when it
+is unset, since a local server accepts any key. Naming a model without a base URL is refused.
+
+| Strategy | Needs | How it runs |
+|---|---|---|
+| `BM25`, `BM25_EXPANSION*` | nothing; expansion needs `chatModel` | the harness's own index of the corpus, chunked by the production chunker |
+| `BM25_VECTOR` | `embeddingModel` | `/v1/query` on an evaluation node that ingested the corpus with embeddings: the node's own hybrid fusion |
+| `BM25_GRAPH` | `chatModel` | BM25 fused with the graph's answer, from a graph the node extracted during ingestion and built through `/v1/graph/build` |
+| `BM25_EXPANSION_GRAPH` | `chatModel` | the same, over BM25 + expansion |
+| `BM25_EXPANSION_VECTOR` | both models | `/v1/query` after the node restarts with `excalibur.query.expand-hybrid-queries=true` |
+| `FULL_HYBRID` | both models | that expanded hybrid, fused with the graph |
+
+The evaluation node is a real node composed in-process under `<indexDir>/node-<engine>`, with the
+chosen engine, the query cache and LLM relevance scoring off, and its rate, `top_k` and timeout
+limits raised so the harness measures retrieval rather than admission. The directory must be empty
+— an earlier run's node would be evaluated with its old corpus in it — so the harness refuses one
+that is not. The node ingests once; the expanded hybrid reuses that ingestion across a restart. With
+`both`, each engine gets its own node, so the model cost of ingestion is paid twice.
+
+A graph answer is a set of facts, not a ranked list of documents, so the harness credits it with the
+documents its facts were extracted from, in the order the answer first cites them, and fuses that
+list with the base ranking by reciprocal rank fusion — the node's `rrf-k`, with the base ranking
+fetched at `k` times the node's per-signal over-fetch. A question the graph has no answer for leaves
+the base ranking as it was. Every strategy is scored by document: a hit naming a chunk and a hit
+naming the document count as the same document, and a qrels line may name either.
+
+The hybrid route says which signals found each result, and the harness adds a note under the table
+for any answer the vector signal found nothing for, or that the route answered from one signal
+only; those answers are BM25's under the hybrid's name.
 
 It measures the engine a node ships with. `native` is the default because a benchmark of an engine
 the product does not use is a number about nothing; `both` indexes the same corpus with the same
@@ -1040,9 +1082,10 @@ chunking on each in turn, which is the only way to read the two side by side:
 ```
 ./gradlew :excalibur-bench:runRetrievalEvaluation \
     -PevalArgs="<corpusDir> <indexDir> <qrels.tsv> 10 - - both"
-```
 
-The optional arguments are positional, so `-` stands in for one being skipped.
+EXCALIBUR_LLM_API_KEY=... ./gradlew :excalibur-bench:runRetrievalEvaluation \
+    -PevalArgs="<corpusDir> <indexDir> <qrels.tsv> 10 http://localhost:11434 <chatModel> native <embeddingModel> 768"
+```
 
 ## HTTP API
 
