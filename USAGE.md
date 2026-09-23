@@ -573,12 +573,13 @@ curl -X POST http://localhost:8080/v1/ingest \
 | `max_depth` | integer | 100 | Directory levels below the root to descend, 1 to 1000 |
 | `follow_symlinks` | bool | `false` | Whether the walk descends through symbolic links. A link whose real target lies outside the root is skipped whatever this is set to, so a link cannot be used to read a directory the allow-list does not permit |
 | `include_hidden` | bool | `false` | Whether dot-files are indexed |
-| `max_file_bytes` | integer | 2147483648 | Largest single file read, 1 byte to 2 GiB. A larger file is skipped, not truncated |
+| `max_file_bytes` | integer | 104857600 | Largest single file read, 1 byte to 100 MiB — the [largest document the node indexes](#document-size-limits). A larger file is never listed or read, so it is neither indexed nor truncated |
 | `charset` | string | UTF-8 | The encoding a file is read in when it carries no byte-order mark, by any name or alias the JVM knows (`windows-1252`, `latin1`, `UTF-16LE`). A file that does carry a mark is read in the encoding the mark names, whatever is declared here: the mark was written by the program that encoded that file, the declaration by someone describing the whole directory. An unknown name is a `400`, never a quiet fall-back to UTF-8, and the name is stored and read back in its canonical form |
 
 A value outside its range is answered `400` rather than clamped: clamping would register the
 source and then crawl to a depth or a size the caller did not ask for, which reads back as a
-crawl that stopped early for no stated reason.
+crawl that stopped early for no stated reason. An explicit `null` is the same as leaving the field
+out, on this route and the HTTP one below: the default applies.
 
 **Response — `200 OK`**
 
@@ -614,7 +615,7 @@ curl -X POST http://localhost:8080/v1/ingest \
 |-------|------|---------|---------|
 | `max_depth` | integer | 3 | Link hops followed from the base URL, 0 to 1000 |
 | `max_documents` | integer | 10000 | Pages fetched before the crawl stops, 1 to 10000000 |
-| `max_response_bytes` | integer | 10485760 | Largest response body held, 1 byte to 256 MiB |
+| `max_response_bytes` | integer | 10485760 | Largest response body held, 1 byte to 100 MiB — the [largest document the node indexes](#document-size-limits). A larger body fails that page's document; it is never truncated |
 | `timeout_seconds` | integer | 30 | Budget for one request, 1 to 600 |
 | `included_path_patterns` | array of string | _(all)_ | A URL path must contain one of these substrings to be crawled. Plain substrings, not globs or regexes |
 | `excluded_path_patterns` | array of string | `/api`, `/admin`, `/login`, `/logout` | A URL path containing one of these is skipped. Supplying this **replaces** the default list, and `[]` clears it |
@@ -646,6 +647,29 @@ setting both understand.
   "status": "registered"
 }
 ```
+
+### Document size limits
+
+A document is held whole while it is decoded, chunked and embedded, and is published only once
+every chunk is written, so the node bounds a single document two ways, whichever way it arrives —
+a crawled file, a fetched page, or one supplied to `POST /v1/documents`:
+
+| Limit | Value | What happens past it |
+|-------|-------|----------------------|
+| Bytes | 104857600 (100 MiB) | The document is not indexed |
+| Chunks | 10000 | The document is not indexed |
+
+At the default chunk size (512 tokens, 64 overlapping) the chunk limit is the one a text document
+meets first, at roughly 18 MB. A document over either limit is counted in `documents_failed` on the
+first crawl and on every re-crawl alike, and nothing of it is searchable; a larger document has to
+be split before it is ingested.
+
+`max_file_bytes` and `max_response_bytes` cannot be set past the byte limit, since a larger file or
+body could only be read to be discarded. A filesystem walk never lists a file over its
+`max_file_bytes`, so such a file is not read, not counted as failed and not counted in
+`entries_skipped`; an HTTP response over `max_response_bytes` is stopped as soon as it passes the
+bound and counts as a failed document. A registration recorded by an earlier version with a larger
+value is restored at the limit, with a warning in the log, rather than refused.
 
 ### Error responses
 
@@ -854,7 +878,8 @@ fewer documents than the directory holds, with `last_error` null, is answered by
 Narrow `included_extensions` if you want those files never read in the first place.
 
 Every run rewrites it, including a re-crawl — the scheduled one and `POST /v1/reindex` alike — so
-it describes what the root holds now and not what it held the first time the node walked it.
+it describes what the root holds now and not what it held the first time the node walked it. A
+run that lists no documents at all sets it back to zero too.
 Every run also counts the same thing: an empty file, or one that decodes to nothing the chunker
 can index, is passed over without being counted, on the first crawl and on every re-crawl, so an
 unchanged root reads the same number after either. The
@@ -918,12 +943,24 @@ registration to record a namespace in. `POST /v1/erasure` withdraws them from th
 
 | Field | Type | Required | Meaning |
 |-------|------|----------|---------|
-| `source_id` | string | yes | What the documents are recorded as belonging to, so `/v1/erasure` and `/v1/reindex` can name them later. At most 256 characters |
+| `source_id` | string | yes | What the documents are recorded as belonging to, so `/v1/erasure` can name them later. It is not a crawl registration: there is nothing behind it for `/v1/reindex` to re-read, which answers `404` for it. At most 256 characters |
 | `documents` | array | yes | 1 to 256 documents |
-| `documents[].document_id` | string | yes | Names the document within its source. Posting the same id again replaces what the node holds under it |
+| `documents[].document_id` | string | yes | Names the document within its source. Posting the same id again replaces what the node holds under it; see below |
 | `documents[].text` | string | yes | The document's text. Empty is refused rather than indexed, because it would produce no chunks and be reported as ingested while being unfindable. Text that is not text — one carrying U+0000, which a crawl treats as the mark of a binary file — is refused for the same reason |
 | `documents[].content_type` | string | no | Defaults to `text/plain` |
 | `documents[].last_modified_millis` | int | no | Epoch millis; `0` when unknown |
+
+Re-posting a `document_id` is how a supplied document is updated. The new version is written and
+published first; only then is whatever the previous version held past the new one's last chunk
+removed from storage and from the lexical index, so a query sees one version or the other and never
+neither, and a later `/v1/erasure` of the document removes all of it. A replacement that fails is
+counted in `documents_failed` and the previous version stays registered and searchable: one that
+could not be embedded wrote nothing, and one that failed while being written has what it wrote
+past the previous version removed — the chunk positions the two share may already hold the new
+text, so post the document again to finish the replacement. The same holds for the first crawl of
+a source registered again after `DELETE /v1/ingest`, whose documents the node kept. Graph facts
+extracted from the previous version are not withdrawn by a replacement; `/v1/erasure` withdraws
+them.
 
 **Error — `400 Bad Request`** — no `source_id`, no `documents`, more than 256 of them, a document
 with no `document_id`, no `text` or text that is not text, or the same `document_id` twice in one
@@ -992,10 +1029,12 @@ curl -X POST http://localhost:8080/v1/reindex \
 }
 ```
 
-**Error — `404 Not Found`**
+**Error — `404 Not Found`** — no crawl is registered under that id. That includes a `source_id`
+used only with `POST /v1/documents`: supplied documents have no target to re-read, and are updated
+by posting them again.
 
 ```json
-{"error": "Source not found: unknown-source"}
+{"error": "Source not found: unknown-source. Only a source registered with POST /v1/ingest can be reindexed; documents supplied with POST /v1/documents are replaced by posting them again"}
 ```
 
 **Error — `409 Conflict` (reindex already running for that source)**

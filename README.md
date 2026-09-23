@@ -1501,16 +1501,25 @@ rather than a silent clamp:
 | `excluded_directories` | filesystem | — | Directory names the walk does not descend into |
 | `follow_symlinks` | filesystem | — | Whether the walk descends through symbolic links. A link out of the allowed root is still refused: the real path is what is checked |
 | `include_hidden` | filesystem | — | Whether dot-files are read |
-| `max_file_bytes` | filesystem | 1 – 2 GiB | Largest single file the walk will read |
+| `max_file_bytes` | filesystem | 1 – 100 MiB | Largest single file the walk will read; 100 MiB when absent. A larger file is never listed. The ceiling is the largest document the node indexes (see below) |
 | `charset` | filesystem | any encoding the JVM supports | The encoding a file without a byte-order mark is read in; UTF-8 when absent. A name the node cannot decode is a 400, not a silent fall-back to UTF-8. Recorded under its canonical name, which is what `GET /v1/ingest` shows. Refused on an HTTP crawl, whose responses each name their own encoding — see [What gets indexed](#what-gets-indexed) |
 | `included_path_patterns` | http | — | Substrings a URL path must contain to be crawled |
 | `excluded_path_patterns` | http | — | Substrings that keep a URL path out of the crawl |
 | `max_documents` | http | 1 – 10000000 | How many pages one crawl fetches |
-| `max_response_bytes` | http | 1 – 256 MiB | Largest single response body held |
+| `max_response_bytes` | http | 1 – 100 MiB | Largest single response body held; 10 MiB when absent. A larger body fails that document. The ceiling is the largest document the node indexes (see below) |
 | `timeout_seconds` | http | 1 – 600 | How long one request may take |
 | `user_agent` | http | ≤ 200 chars | What the crawl identifies itself as. Screened for header injection |
 | `crawl_delay_ms` | http | 0 – 60000 | The gap this crawl leaves between requests to its host. The node takes the larger of this and `excalibur.ingest.crawl-delay-ms`, so it can ask to be gentler than the deployment requires and never quicker |
 | `max_depth` | both | 1 – 1000 filesystem, 0 – 1000 http | How far the crawl descends. Zero is a meaningful HTTP crawl — the one page named by `base_url` — and not a meaningful directory walk |
+
+An explicit `null` is the same as leaving the field out: the default applies.
+
+Whatever these say, one document is indexed only up to 100 MiB and 10,000 chunks — at the default
+chunking (512 tokens, 64 overlapping) the chunk bound is met first, at about 18 MB. A document past
+either is counted in `documents_failed`, on the first crawl and every re-crawl alike, including one
+supplied to `POST /v1/documents`. The byte limit is why `max_file_bytes` and `max_response_bytes`
+stop at 100 MiB: a larger file or body could only be read to be discarded. A registration recorded
+with a larger value by an earlier version is restored at the limit, with a warning, not refused.
 
 `source_id` is bounded at 256 characters. A copy of it is kept in every document's registry record
 and printed with every log line about the source, so its length is multiplied by the size of the
@@ -1619,8 +1628,8 @@ is wrong with it where a crawl can only pass a file over and count it.
 `entries_skipped` is rewritten by every run, including a re-crawl, so it describes the state of
 the source's root now rather than the state it was in the first time the node walked it. Every
 run counts the same thing - documents that are not text, and nothing else - so an unchanged root
-reads the same after a re-crawl as after the crawl that first registered it. A re-crawl that
-passes over nothing sets it back to zero; the rest of `/v1/ingest/status` is left
+reads the same after a re-crawl as after the crawl that first registered it. A run that passes
+over nothing, including one whose root lists no documents at all, sets it back to zero; the rest of `/v1/ingest/status` is left
 to the run that wrote it, because a reindex reports how far it got through
 `/v1/reindex/status`.
 
