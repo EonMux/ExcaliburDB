@@ -4,7 +4,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
