@@ -53,29 +53,14 @@ class QueryLatencyHistogramIdentityTest {
     }
 
     @Test
-    @DisplayName("advancing the epoch advances it on the histogram latencies are recorded into")
-    void recordEpochAdvancesTheRecordingHistogram() {
-        long epoch = Metrics.getCurrentEpoch() + 1_000L;
-
-        Metrics.recordEpoch(epoch);
-
-        assertEquals(epoch, Metrics.QueryLatency().getCurrentEpoch(),
-            "recordEpoch must stamp the histogram that production latencies go into");
-    }
-
-    @Test
-    @DisplayName("one epoch is published, whatever else stamps the histogram")
+    @DisplayName("the visibility epoch bean publishes the epoch recordEpoch was given")
     void oneEpochIsPublished() throws Exception {
         long epoch = Metrics.getCurrentEpoch() + 2_000L;
         Metrics.recordEpoch(epoch);
 
-        // A query recording the epoch it read at must not move the node's published epoch:
-        // the visibility tracker owns that number, and a bean reporting a different one sends
-        // an operator looking for a visibility problem that is not there.
-        Metrics.recordQueryLatency(11L, epoch + 77L);
-
         Object published = Metrics.getVisibilityEpochMBean().getAttribute("epoch");
 
         assertEquals(epoch, published, "the visibility epoch bean publishes the recorded epoch");
+        assertEquals(epoch, Metrics.getCurrentEpoch(), "the facade reports the same epoch");
     }
 }

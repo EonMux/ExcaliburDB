@@ -107,8 +107,7 @@ public final class Metrics {
      * to be two: latencies were recorded here while {@code FixedBucketHistogram}'s own static
      * percentile accessors read the singleton, which nothing ever recorded a latency into - so
      * {@code FixedBucketHistogram.getP50()} was a permanent zero published under the same name
-     * as a real measurement, and {@link #recordEpoch(long)} advanced an epoch on a histogram
-     * that held no latencies. One object means "p50" is one number however it is reached.</p>
+     * as a real measurement. One object means "p50" is one number however it is reached.</p>
      */
     private static final FixedBucketHistogram queryLatencyHistogram =
         FixedBucketHistogram.getInstance();
@@ -174,22 +173,6 @@ public final class Metrics {
         queryLatencyMBeanInstance.getBroadcaster().sendNotification(
             MBeanNotificationBroadcaster.NotificationTypes.QUERY_LATENCY,
             "Query latency recorded: " + latencyMs + "ms",
-            latencyMs
-        );
-    }
-
-    /**
-     * Records a query latency measurement with epoch.
-     *
-     * @param latencyMs Latency in milliseconds
-     * @param epoch Current visibility epoch
-     */
-    public static void recordQueryLatency(long latencyMs, long epoch) {
-        queryLatencyHistogram.record(latencyMs, epoch);
-        // Emit notification
-        queryLatencyMBeanInstance.getBroadcaster().sendNotification(
-            MBeanNotificationBroadcaster.NotificationTypes.QUERY_LATENCY,
-            "Query latency recorded: " + latencyMs + "ms (epoch: " + epoch + ")",
             latencyMs
         );
     }
@@ -483,8 +466,6 @@ public final class Metrics {
      */
     public static void recordEpoch(long epoch) {
         currentEpoch.set(epoch);
-        // Keep the latency histogram's epoch in step with the node's
-        queryLatencyHistogram.setEpoch(epoch);
         // Emit notification
         visibilityEpochMBeanInstance.getBroadcaster().sendNotification(
             MBeanNotificationBroadcaster.NotificationTypes.VISIBILITY_EPOCH,
