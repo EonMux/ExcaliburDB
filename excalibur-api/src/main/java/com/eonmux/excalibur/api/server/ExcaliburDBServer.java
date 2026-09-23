@@ -5,7 +5,6 @@ import com.sun.net.httpserver.HttpsServer;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.bootstrap.NamespaceRoutingGraphIngestSink;
 import com.eonmux.excalibur.api.endpoint.BuildInfo;
-import com.eonmux.excalibur.api.endpoint.CompactionRunner;
 import com.eonmux.excalibur.api.endpoint.InMemorySourceRegistry;
 import com.eonmux.excalibur.api.endpoint.SourceNamespaceLookup;
 import com.eonmux.excalibur.api.endpoint.SourceRegistry;

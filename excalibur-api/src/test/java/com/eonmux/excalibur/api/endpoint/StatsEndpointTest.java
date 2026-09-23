@@ -19,7 +19,6 @@ import com.eonmux.excalibur.retrieval.rank.Ranker;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;

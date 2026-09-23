@@ -1,7 +1,5 @@
 package com.eonmux.excalibur.api.server;
 
-import com.eonmux.excalibur.api.endpoint.HealthEndpoint;
-import com.eonmux.excalibur.api.endpoint.StatsEndpoint;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.EpochTickScheduler;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
@@ -614,13 +612,6 @@ class ExcaliburDBServerTest {
 
     private String readResponse(HttpURLConnection conn) throws IOException {
         try (var is = conn.getInputStream()) {
-            return new String(is.readAllBytes(), StandardCharsets.UTF_8);
-        }
-    }
-
-    private String readError(HttpURLConnection conn) throws IOException {
-        try (var is = conn.getErrorStream()) {
-            if (is == null) return "";
             return new String(is.readAllBytes(), StandardCharsets.UTF_8);
         }
     }

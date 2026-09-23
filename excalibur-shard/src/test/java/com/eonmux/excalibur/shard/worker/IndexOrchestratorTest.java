@@ -9,8 +9,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.io.TempDir;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -31,7 +29,6 @@ class IndexOrchestratorTest {
     /** Far longer than any work here takes to stop once asked. */
     private static final Duration STOP_WAIT = Duration.ofSeconds(10);
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(IndexOrchestratorTest.class);
 
     @TempDir
     Path tempDir;

@@ -10,7 +10,6 @@ import com.eonmux.excalibur.llm.client.LLMClientConfig;
 import com.eonmux.excalibur.query.IndexCoverage;
 import com.eonmux.excalibur.query.QueryRequest;
 import com.eonmux.excalibur.query.QueryResponse;
-import com.eonmux.excalibur.query.QueryResultItem;
 import com.eonmux.excalibur.query.executor.CancellationToken;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.query.scorer.LlmRelevancyScorer;
@@ -57,7 +56,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
@@ -119,7 +117,6 @@ class LLMUnavailabilityIntegrationTest {
      */
     private static final int MAX_FAILURE_THRESHOLD = 100;
     private static final Duration COOLDOWN_PERIOD = Duration.ofMillis(500); // Short for testing
-    private static final Duration TIMEOUT = Duration.ofSeconds(5);
 
     @BeforeEach
     void setUp() {
@@ -1260,13 +1257,6 @@ class LLMUnavailabilityIntegrationTest {
         void addVisibleSegment(long segmentId) {
             creationEpochs.put(segmentId, epoch.get());
             tombstoneEpochs.putIfAbsent(segmentId, Long.MAX_VALUE);
-        }
-
-        /**
-         * Removes a segment from the visible set.
-         */
-        void removeVisibleSegment(long segmentId) {
-            tombstoneEpochs.put(segmentId, epoch.get());
         }
     }
 }

@@ -13,9 +13,7 @@ import com.eonmux.excalibur.query.IndexCoverage;
 import com.eonmux.excalibur.query.QueryResponse;
 import com.eonmux.excalibur.query.QueryResultItem;
 
-import java.util.Collection;
 import java.util.List;
-import java.util.Set;
 
 /**
  * Utility class for creating specific, domain-aware assertion messages that clearly
