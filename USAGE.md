@@ -2164,7 +2164,8 @@ curl http://localhost:8080/v1/stats
     "engine": "native", "indexed": 15000000, "segments": 12,
     "liveChunks": 14980000, "erasedChunks": 20000, "erasedRatio": 0.0013,
     "erasureRequests": 3, "oldestErasureAgeMs": 412000, "compactionDue": false,
-    "unreadableChunksDropped": 0
+    "unreadableChunksDropped": 0, "unsearchableChunks": 0, "unreadableSegments": 0,
+    "outdatedSegments": 0
   },
   "graph": {
     "namespaces": {"open": 3, "maxOpen": 16, "evictions": 41},
@@ -2268,8 +2269,10 @@ reporting zeroes are different states. Within it:
 - `engine` is which implementation is answering, `native` or `lucene`. `segments` is how many the index holds, which is what a query has to visit — compaction is what keeps it bounded.
 - `indexed` counts the chunks handed to this index since the process opened it, which is what to watch during an ingestion run. It is not the size of the corpus: a node restarted over a populated store reports `0` here and a non-zero `liveChunks` until something ingests again.
 - `liveChunks` is what a query can match. `erasedChunks` is hidden from queries but still on disk — erased chunks and replaced versions of re-crawled ones both count here, and a compaction is what removes them.
+- `unsearchableChunks` is on disk and matched by no query, because the segment holding it could not be opened: a column failed its checksum or its files are missing. `unreadableSegments` counts those segments, and `unreadable` — present only when there is one, capped at 32 entries with `unreadableTruncated: true` past that — names each: `segment`, its `chunks`, whether it is `rebuildable`, and the `reason`. A rebuildable segment is rebuilt by the next compaction from its key table and the chunk text in storage, and the node asks for that compaction itself; one that is not rebuildable needs its documents reindexed. Neither makes the node unready — it keeps answering from the other segments.
+- `outdatedSegments` counts segments written in an older format. They answer exactly, but carry no checksums, so damage to them cannot be detected. Compaction upgrades them a few at a time on its own.
 - `erasureRequests` and `oldestErasureAgeMs` are the erasure backlog: what was promised and not yet discharged, and how long the oldest has waited. Compare the age against `excalibur.ingest.lexical-max-latency-seconds`. Nothing else in this response would show that deadline going unmet.
-- `compactionDue` is what the index's policy would decide if asked right now. Compaction runs at the end of an ingestion or reindex run, and on the sweep that enforces `excalibur.ingest.lexical-max-latency-seconds`, so a node reporting `true` settles within a tenth of that bound even when nothing ingests.
+- `compactionDue` is whether the index would compact if asked right now — because its policy says so, or because a segment is waiting to be rebuilt or upgraded. Compaction runs at the end of an ingestion or reindex run, and on the sweep that enforces `excalibur.ingest.lexical-max-latency-seconds`, so a node reporting `true` settles within a tenth of that bound even when nothing ingests.
 - `unreadableChunksDropped` counts chunks a native-index compaction dropped because their stored text failed its checksum or could not be decoded — damage no retry repairs, and waiting on it would keep every erasure owed in those segments on disk. Each one stops matching keyword queries while still being served by vector search. Above zero means a storage segment is damaged: check the disk, and reindex the affected documents from their source. It stays `0` on the Lucene engine, which keeps its own copy of the text.
 - Both engines answer these the same way. Lucene's own merges reclaim deleted documents on a schedule of their own, which never fires for one erased chunk in a large index, so the Lucene engine records the same durable obligation the native one does and is held to the same `excalibur.ingest.lexical-max-latency-seconds`. What differs is only what a compaction rewrites: the native engine rewrites the segments it selected, Lucene force-merges every segment holding a deletion.
 
@@ -2381,6 +2384,8 @@ curl http://localhost:8080/v1/compact/status
     "segments_produced": 0,
     "chunks_removed": 0,
     "groups_abandoned": 0,
+    "segments_rebuilt": 0,
+    "segments_upgraded": 0,
     "reason": "not due: 12 of 7200 document(s) tombstoned across 4 segment(s)"
   }
 }
@@ -2415,7 +2420,11 @@ curl http://localhost:8080/v1/compact/status
   and the `reason` begins `nothing published:`. When only some were, `performed` is `true` and the
   `reason` begins `partial:`. A `DELETE /v1/compact` arriving while
   the index is being rewritten lets that rewrite finish rather than interrupt I/O the index's
-  queries share.
+  queries share. **`segments_rebuilt`** and **`segments_upgraded`** are the rewritten segments
+  chosen for what they were: damaged ones, searchable again, and ones in an older format, now in
+  the current one. Every compaction takes these on whatever the policy says — every rebuildable
+  damaged segment, and up to the merge fan-in of older-format ones, oldest first; a forced run
+  upgrades all of them.
 
 Only the most recent run is kept; the next one replaces it.
 
@@ -2453,6 +2462,8 @@ Everything exported is a figure the node already measures; nothing here is estim
 | `excalibur_volume_bytes_total`, `_used`, `_available`, `excalibur_volume_count` | gauge | Disk |
 | `excalibur_index_orchestrator_running`, `excalibur_segments_without_vector_index`, `excalibur_circuit_breaker_state{breaker="embedding"\|"llm_relevancy"\|"query_expansion"\|"graph_extraction"\|"graph_rerank"\|"graph_query_embedding"\|"graph_build_embedding"}` | gauge | The three partial failures described under Stats. Each breaker is `0` closed, `1` half-open, `2` open, so `> 0` is "this node is not using that part of its provider". A label is present only where the node has that component: `query_expansion` with a chat model behind query expansion, `graph_extraction` with a chat model behind relation extraction, `graph_rerank` once a graph that reranks with the chat model has been opened, `graph_query_embedding` once a graph built with entity vectors has, `graph_build_embedding` once a graph build has embedded an entity. The graph three carry no namespace label - every namespace shares them - so the series count stays at seven however many tenants the node serves |
 | `excalibur_lexical_*` | gauge | Chunk index size and the erasure backlog, including `_oldest_erasure_age_seconds` |
+| `excalibur_lexical_chunks{state="live"\|"erased"\|"unsearchable"}` | gauge | Chunks by state; the three sum to everything the index holds. `unsearchable` is held in a segment that could not be opened and matched by no query |
+| `excalibur_lexical_unreadable_segments`, `excalibur_lexical_outdated_segments` | gauge | Lexical segments that could not be opened, and segments in an older format awaiting rewrite. Above zero on the first is damage: alert on it |
 | `excalibur_lexical_unreadable_chunks_dropped_total` | counter | Chunks a compaction dropped from the native index because their stored text was corrupt. Any increase means a damaged storage segment; alert on it |
 | `excalibur_query_cache_lookups_total{result="hit"\|"miss"}`, `_evictions_total`, `_invalidations_total`, `excalibur_query_cache_entries`, `_capacity` | counter, gauge | Present only on a node with `excalibur.query.cache.enabled=true`. Hits and misses share one family so a hit ratio cannot be computed from a stale pairing. Evictions and invalidations are separate because they call for different actions: evictions mean the cache is too small for the traffic and `max-entries` is the answer, invalidations mean the corpus moved and no size would have helped |
 | `excalibur_graph_namespaces_open`, `_open_limit`, `excalibur_graph_namespace_evictions_total` | gauge, counter | Graph tenants open, the open bound, and evictions |
@@ -2732,6 +2743,7 @@ to attempt matters as much:
 | A damaged `routing.dir`, or a slot pointing at a missing segment | Which hash slot belongs to which segment after a split is not derivable from file names. That is why the directory is written down |
 | A write-ahead log damaged in the middle | The records behind the damage were fsynced and acknowledged. Trimming past them would destroy committed writes, and so would moving the file aside — nothing rebuilds a log the way a reindex rebuilds an index |
 | A damaged `segment_<N>.hnsw.compact.docmap` with no `.hnsw.compact` beside it | The graph already holds the compacted numbering, and without this mapping it would be served through the pre-compaction one — wrong documents rather than an error. Restore the graph and both mappings together, or reindex the segment |
+| A damaged lexical store `manifest` | A store without its manifest opens as a new, empty index and deletes every segment the empty manifest does not name. Restore the manifest from a backup, or remove the whole `chunk-index` directory and reindex |
 | Anything `UNREADABLE` | A device or permission problem, where nothing is known about the contents |
 
 Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself failed — which says nothing about the directory and must not be read as `0`.
@@ -2763,12 +2775,13 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 | A `WARN` at startup naming documents that "were being ingested when this node last stopped" | Those documents were half written when the node died, and their chunks are hidden until the ingest is redone. Not an error: it is the crash being cleaned up after | Nothing — the next crawl of that source re-ingests them and they become visible again. `POST /v1/erasure` removes them instead |
 | `lexical.oldestErasureAgeMs` exceeds `lexical-max-latency-seconds` | The sweep that enforces the bound runs every tenth of it, so a reading just past the bound is ordinary; one far past it means the sweep is failing, and the node's log says why | Read the log for a failed compaction. Ingesting or reindexing anything also settles the backlog before the run finishes |
 | `lexical.unreadableChunksDropped` is above zero, or `excalibur_lexical_unreadable_chunks_dropped_total` rose | A compaction found chunks whose stored text fails its checksum or cannot be decoded, and dropped them from keyword search so the rest of their segments could be rewritten. The node's log names each chunk at ERROR | Check the disk under the data directory, run `excalibur-fsck` with the node stopped, and reindex the named chunks' documents from their source |
+| `lexical.unreadableSegments` is above zero, or `excalibur_lexical_unreadable_segments` is | A lexical segment failed its checksum or lost a file, so its chunks (`unsearchableChunks`) match no keyword query. The node's log names it at `ERROR` as it opens, with the reason | If `lexical.unreadable` says `rebuildable: true`, nothing: the next compaction rebuilds it, and `segments_rebuilt` on `/v1/compact/status` reports it. Otherwise its key table is damaged too — check the disk, and reindex the documents of the sources it served |
 | A re-crawled document appears twice in results | Not the chunk index — it replaces a chunk identifier rather than appending. Check whether the source is listing one document under two ids | Compare the `document_id` values on the two hits — that is the chunk identifier, `source:document:chunk:N`: identical means a bug, different means the source |
 | Queries slow down on a large corpus, and `/v1/stats` reports `cuckoo.saturated: true` | The membership filter is full. A level that cannot record a term is no longer trusted to rule a segment out, so pruning is off and every query scans every segment | Raise `excalibur.filter.corpus-capacity` past your term count and restart |
 | Node refuses to start: `Refusing to create segment N in <dir>: <other dir> already holds segment_N.dat` | Two volumes hold a file for the same segment index, usually from a volume set that changed between runs on an older build | Move or delete the stale copy — the one whose directory the catalog does not name — then restart |
 | Node refuses to start naming two `excalibur.shard.volumes` entries that resolve to one directory | A symlink, a relative path or a `..` in the list makes two entries the same directory, which would give it two shares of the ring | Drop one of the two spellings |
 | Node fails to start with `CatalogLoadException` | `<data dir>/source-catalog` was written by a build older than the end marker, or was cut short by a crash | [Upgrading a data directory](#upgrading-a-data-directory-written-by-an-older-build) — append the marker, or delete the file and re-register the sources |
-| A `WARN` at every start naming a lexical segment and an old index format | The segment predates `index.meta` version 2, so block pruning is disabled on it. Results are correct; the segment is read more slowly | Nothing, or force a compaction with `POST /v1/compact` to rewrite it into the new format |
+| A `WARN` at start counting lexical segments written in an older format | They predate `index.meta` version 3, so they carry no column checksums; one older than version 2 also prunes against a looser bound and is read more slowly. Results are exact | Nothing: compaction upgrades a few on each pass, and the warning stops when none are left. `POST /v1/compact` with `{"force": true}` upgrades all of them at once |
 | `--enable-preview` error | Wrong Java version | Java 21 exactly — a preview class file is refused by any other JDK |
 | `--enable-native-access=ALL-UNNAMED` warning | Missing flag | Required for Panama FFM API |
 | Port already in use | Another process on 8080 | `EXCALIBUR_PORT=9090 java ...` |
@@ -2802,24 +2815,31 @@ version.
 end marker, for the same reason: without them a registry cut short by a crash is a file of whole
 records that quietly omits documents, leaving their chunks in storage where no erasure or reindex
 can name them. A registry from an older build has neither line, is read as the older format, and is
-rewritten with a version and a count at the next save — which the node performs on its own, without
-waiting for something to be ingested. From then on a short registry fails the start instead of
-loading, and the message names the count it expected.
+rewritten with a version and a count as the node starts, without waiting for something to be
+ingested; if that save fails, the start continues with a `WARN` and the next save retries it. From
+then on a short registry fails the start instead of loading, and the message names the count it
+expected.
 
 The `ETag` a record keeps for an HTTP document is an optional last field, and the format stays
 version 1 with it: the previous build reads the first seven fields of a record and ignores the rest,
 so rolling back to it keeps the registry and loses only the tags. A document whose record has no
 tag gains one the first time a re-crawl finds it unchanged.
 
-**The native lexical index — no step required.** `index.meta` is version 2, and a segment
-written by an older build keeps opening and keeps returning exactly the same results. The old
-format stored each postings block's score bound computed against that segment's own mean document
-length, which is not the mean a query across several segments scores with, so such a bound could
-be exceeded and a document that belonged in the top-k silently dropped. A version 2 segment stores
-the ingredients instead and computes the bound at query time, against the statistics actually in
-use. An older segment is read with block pruning disabled — correct, and slower — and logs a
-`WARN` naming itself at open. Expect that warning after the upgrade; it is not data loss. A
-compaction rewrites the segment into the new format and the warning stops.
+**The native lexical index — no step required.** `index.meta` is version 3, which adds a length
+and a CRC32C for every column; a segment written by an older build keeps opening and keeps
+returning exactly the same results, but without checksums damage to it goes undetected, and
+`excalibur-fsck` reports it *legacy, unprotected*. A segment older than version 2 also stored each
+postings block's score bound computed against that segment's own mean document length, which is
+not the mean a query across several segments scores with, so such a bound could be exceeded and a
+document that belonged in the top-k silently dropped. Version 2 and later store the ingredients
+instead and compute the bound at query time; a segment older than that ignores its stored bounds
+and prunes against the looser saturation ceiling — exact, and slower — and logs a `WARN` naming
+itself at open. Expect those warnings after the upgrade; they are not data loss.
+`lexical.outdatedSegments` on `/v1/stats` counts the segments still in an older format. Every
+compaction rewrites a few of them, oldest first, up to the merge fan-in — including the one the
+node's sweep asks for when nothing is being ingested — so they are upgraded without being asked
+for, and `segments_upgraded` on `/v1/compact/status` reports each pass. `POST /v1/compact` with
+`{"force": true}` upgrades all of them at once.
 
 ### Enabling debug logging
 
