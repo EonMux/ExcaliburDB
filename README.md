@@ -9,7 +9,7 @@ ExcaliburDB is built on Java 21's Panama Foreign Function & Memory API for zero-
 ### Key Features
 
 - **HNSW (Hierarchical Navigable Small World) graphs** for approximate nearest neighbor search with configurable efConstruction and efSearch parameters
-- **Cuckoo filters** for probabilistic set membership testing with deletion support: a corpus-and-segment hierarchy that tells a query which segments hold its terms, so those are searched first. It orders and never excludes: a vector query's nearest neighbours need not share its words
+- **Cuckoo filters** for probabilistic set membership testing with deletion support: the native lexical index keeps one per segment, rebuilt from its dictionary on open, and asks it whether a term is present before it looks the term up
 - **LSH (Locality-Sensitive Hashing)** for vector candidate generation beside the HNSW search: a query's bucket-mates are measured exactly and ranked in with the graph's results, never used to exclude or confine a search. Built per segment on a node that embeds its corpus. A lexical-only node writes none: it would be dead weight on every write, keyed by node ids nothing assigns
 - **Epoch-based visibility tracking** for consistent query snapshots during concurrent ingestion
 - **LLM integration** for semantic relevancy scoring, with a circuit breaker on each of the chat and embedding paths and a fallback when either is open
@@ -421,13 +421,13 @@ node mapping, for instance, is read at versions 1 to 3 — its entries name each
 versions 1 and 2 and its chunk at version 3 — and a version 4 mapping is reported unreadable, not
 checked as if it were version 3.
 
-Three files are judged by what the node does with them rather than by their name alone. A
-segment's term sketch, `segment_<N>.tfs`, is one of two derived files the node rebuilds by itself: a
-sketch that fails its checksum is reported `CORRUPT` but not counted as damage, so it neither sets
-exit code `1` nor fails `--strict`, and the repair plan moves it aside (the node would rebuild it
-anyway). A lexical segment's lookup table, `chunk-index/seg-N.keymap`, is the other, rebuilt from
-the segment's names, and is treated the same way. Only corruption is excused: a sketch the operating system will not read — an I/O error, a
-permission refused — is `UNREADABLE`, and fails the run like any file the device refuses. The
+Two files are judged by what the node does with them rather than by their name alone. A lexical
+segment's lookup table, `chunk-index/seg-N.keymap`, is a derived file the node rebuilds by itself
+from the segment's names: one that fails its checksum is reported `CORRUPT` but not counted as
+damage, so it neither sets exit code `1` nor fails `--strict`, and the repair plan moves it aside
+(the node would rebuild it anyway). Only corruption is excused: a lookup table the operating system
+will not read — an I/O error, a permission refused — is `UNREADABLE`, and fails the run like any
+file the device refuses. The
 source status history, `source-status`, is excused the same way for a different reason. It is not
 derived: how each source's last crawl ended is recorded nowhere else, and the node restores it on
 restart, so losing it loses that history, though never any of the corpus. But nothing the node
@@ -441,6 +441,11 @@ the mapping an HNSW compaction stages: beside its `segment_<N>.hnsw.compact` the
 swapped, both are staging leftovers, and the mapping is moved aside first; alone, the graph swap
 completed and it is the mapping the node installs on its next open, so it is verified, reported
 as `compacted-mapping-pending`, and never repaired — a damaged one goes to an operator.
+
+A directory an earlier build wrote may still hold a term sketch beside each segment,
+`segment_<N>.tfs`, or the staging name of one. Nothing in this build reads them, and the node
+deletes them the first time it starts. Until then each is reported `NOT_DATA` with its size — not
+damage, not an orphan, and not a failure under `--strict` — and the repair plan leaves it alone.
 
 A namespace's graph staging logs — its two label interners, `triples.log`, `entity_text.log`,
 `erasure.log` and `withdrawals.log` — are replayed record by record, each by a read-only
@@ -521,7 +526,7 @@ already there when it was copied verifies faithfully:
 | write-ahead logs | `excalibur-fsck`'s checkers, read-only | every record replayed against its checksum |
 | graph staging logs | `excalibur-fsck`, read-only | every record of the label, triple, entity text, erasure and withdrawal logs against its CRC, walked by the graph module's own replay without opening the log. One ending in a write cut short is healthy and unproven: the node trims it on open. Damage the node refuses fails the image |
 | the lexical store | `excalibur-fsck`, read-only, as one structure | the manifest against the CRC32C on its end line; every column of every segment it names; each named segment's key table against the checksums in `seg-N.keysum` and its tombstones against their trailing CRC32C; and every line of `erasure.log` against its own CRC32C. A manifest an older build wrote carries only a record count, and a key table, tombstone file or erasure log it wrote carries nothing: each is held to its structure and not proven |
-| segment term sketches (`segment_<N>.tfs`) | `excalibur-fsck`, read-only | a CRC32C over the header and one over the body. A damaged sketch is reported and does not fail the image: a node restored from it rebuilds the sketch when it opens the segment. One that cannot be read at all fails it |
+| a term sketch an earlier build kept (`segment_<N>.tfs`), in an image that build took | `excalibur-fsck`, read-only | nothing — nothing in this build reads it, so it is healthy and unproven. Its length and digests are still checked against the manifest like every file's, and a restore leaves it out |
 | the document registry, the source catalog and the source status history | `excalibur-fsck`, read-only | the CRC32C on the closing line, over every byte before it, and the record count beside it. Each is held to what its reader requires, so one the node would refuse fails the image; a status history the node would only discard does not. A file written before the format carried a checksum has only its count checked, and is reported unproven |
 | the in-flight journal | `excalibur-fsck`, read-only | every line against the CRC32C it ends with. A complete line that fails its checksum fails the image, since the node refuses to start on it; a last line cut short is an append that never finished, and does not. A version 1 journal carries no checksum and is reported unproven |
 | `routing.dir` | `excalibur-fsck`, read-only | a CRC32C over the whole file. One an older build wrote carries none and is well-formed at best, until the node next writes the directory |
@@ -548,8 +553,7 @@ path kept accepting writes would be worse than none: it would look like a consis
 not be one.
 
 `--exclude-derived` leaves out what something will rebuild — the lexical chunk index, a tenant's
-built edge store, the quantiser codebooks, the segments' term sketches (which the node rebuilds by
-itself as it opens each segment, at a cost in start-up time). The HNSW graphs and their document
+built edge store and the quantiser codebooks. The HNSW graphs and their document
 mappings are never left out, derived though they are, because **nothing rebuilds them**: deleting a
 `.hnsw` gives an empty graph attached to a populated segment, not a repopulated one. That includes
 a `segment_<N>.hnsw.compact.docmap` an interrupted compaction staged — alone, it is the only mapping
@@ -557,10 +561,13 @@ that matches a graph whose swap already completed. The write-ahead logs are
 never left out either — a segment's data file is forced only on flush, every log append is
 fsynced before it is acknowledged, and the graph integration cursor points into the log.
 
-Two things are never copied, whatever the flags, and each is reported under `omitted` with the
-reason: staged names a crash left behind (`TRANSIENT`), which nothing reads, and JVM heap dumps
+Three things are never copied, whatever the flags, and each is reported under `omitted` with the
+reason: staged names a crash left behind (`TRANSIENT`), which nothing reads; JVM heap dumps
 (`*.hprof`, `DIAGNOSTIC`), which are a record of a process rather than state and roughly the size
-of its heap.
+of its heap; and the term sketches an earlier build kept beside its segments (`segment_<N>.tfs`,
+`OBSOLETE`), which nothing in this build reads and the node deletes when it starts. An image an
+earlier build took may name those sketches: a restore verifies them with the rest of the image,
+since the manifest certifies their bytes, and then leaves them out of the restored directory.
 
 `excalibur-backup <command> --help` (or `-h`) prints that command's options and the exit codes, and
 exits `0` without touching anything; `excalibur-backup --help` prints all three.
@@ -671,9 +678,6 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.ingest.chunk-overlap-tokens` | 64 | Tokens a chunk repeats from the one before it, so an answer that straddles a boundary is not split across two chunks holding half of it each. Must be less than the target, or chunking would never advance; the node refuses the pair at startup rather than failing on the first document |
 | `excalibur.ingest.bm25-k1` | 1.2 | Where a repeated term stops earning more score. 0 reduces term frequency to a yes-or-no. Under `lexical-engine=native` this is **recorded in the index** and an index built under one value refuses to open under another — not because the bytes depend on it, but because changing it changes every score the corpus can produce, and with it every ranking and every threshold a deployment has calibrated. Changing it means reingesting. Under `lexical-engine=lucene` it is applied at query time and nothing is recorded, so a change takes effect on the next query. At least 0 |
 | `excalibur.ingest.bm25-b` | 0.75 | How much a match is discounted for the length of the chunk it was found in. 1 normalises fully by length, 0 not at all. Recorded, or not, on the same terms as `bm25-k1`. 0 to 1 |
-| `excalibur.filter.corpus-capacity` | 10000000 | Entries the membership filter is sized for. **Size this to your corpus.** A filter with no room left cannot record a term, and a level that has refused one stops being trusted to say what its segments lack: `/v1/stats` reports `cuckoo.saturated`, and queries order segments by their term sketches alone. Results are unaffected; an undersized value costs the ordering, which matters to a query that runs out of time. The filter allocates about twice this many slots, rounded up to a power of two: a cuckoo filter refuses inserts well before its slots are full, so one sized to exactly its capacity would saturate at the corpus it was configured for. At least 1 |
-| `excalibur.filter.segment-capacity` | 10000 | Distinct terms one segment's level of the membership filter is sized for. A segment that outgrows it is no longer ordered by its terms rather than being ordered wrongly; `/v1/stats` counts those under `cuckoo.saturatedSegments`. 1 to 2147483647, and at most `excalibur.filter.corpus-capacity` |
-| `excalibur.filter.fingerprint-bits` | 13 | Bits of each term the filter keeps, 8 to 16. Each extra bit halves the chance two unrelated terms look alike — and so halves the segments a query moves ahead of others for nothing — at one more bit per slot |
 | `excalibur.llm.api-key` | _(none)_ | Key for the OpenAI-compatible endpoint. Supply as `EXCALIBUR_LLM_API_KEY`, not in this file. Without it the corpus is still chunked, stored and term-indexed; only the vector signal is missing |
 | `excalibur.llm.base-url` | https://api.openai.com/v1 | API root. The clients append `/v1/embeddings` and `/v1/chat/completions` themselves; a trailing `/v1` is stripped, so `https://api.openai.com` and `https://api.openai.com/v1` mean the same thing |
 | `excalibur.llm.chat-model` | gpt-4o-mini | Chat model for relevancy scoring |
@@ -1201,7 +1205,7 @@ separate so a burst of writes cannot starve ordinary reads.
 | `GET` | `/health` | none | read | Liveness. Always 200 while the process is alive. Unauthenticated because the infrastructure that reads it frequently cannot attach a header, and still rate limited |
 | `GET` | `/health/ready` | none | read | Readiness: 200 when this node can serve, 503 when it cannot, so an unmodified `httpGet` probe can act on it. Unauthenticated for the same reason as `/health` |
 | `GET` | `/metrics` | bearer | read | Prometheus text exposition. Authenticated, unlike the probes: a scraper is yours to configure and supports a token, and the exposition names disk capacity, corpus size and error rates |
-| `GET` | `/v1/stats` | bearer | read | Segment, entry, volume, HNSW, Cuckoo and visibility counters, plus the three partial-failure blocks |
+| `GET` | `/v1/stats` | bearer | read | Segment, entry, volume, HNSW and visibility counters, plus the three partial-failure blocks |
 | `GET` | `/v1/version` | bearer | read | Which build and JVM this process is running |
 | `POST` | `/v1/drain` | bearer | mutate | Report unready so a load balancer stops choosing this node, while it keeps serving. A mutation: an anonymous caller able to drain a node is a one-request outage |
 | `DELETE` | `/v1/drain` | bearer | mutate | Report ready again |
@@ -2062,9 +2066,6 @@ curl http://localhost:8080/v1/stats
   "volumes": {"count": 1, "totalBytes": 5368709120, "usedBytes": 3221225472,
               "availableBytes": 2147483648},
   "hnsw": {"queueDepth": 50000, "queueDepthLimit": 100000, "vectorsIntegrated": 14000000},
-  "cuckoo": {"pendingDeletions": 0, "totalDeletions": 212,
-             "avgFpRate": 0.0000070547, "maxFpRate": 0.0000137324,
-             "saturated": false, "saturatedSegments": 0},
   "visibility": {"epoch": 42, "registeredSegments": 1024, "visibleSegments": 1024},
   "coverage": 1.0000,
   "workers": {"indexOrchestratorRunning": true},
@@ -2097,7 +2098,7 @@ curl http://localhost:8080/v1/stats
 
 The `lexical` block is present only on a node that keeps a chunk index, and `graph` only on a node
 that serves a graph. `breakers` holds one entry per circuit breaker the node has — `embedding`,
-`llmRelevancy` for stage 5's relevancy scoring, `queryExpansion` for the chat call that widens a
+`llmRelevancy` for stage 4's relevancy scoring, `queryExpansion` for the chat call that widens a
 lexical query, `graphExtraction` for the chat call that finds a document's facts, `graphRerank` for the
 chat call `POST /v1/graph/query` reranks its candidates with, `graphQueryEmbedding` for the
 embedding call that lets a graph built with entity vectors rerank them exactly, and
@@ -2110,12 +2111,8 @@ appears once it is first needed — `graphRerank` with the first graph opened, `
 only once a graph with entity vectors is, and `graphBuildEmbedding` only once a build has embedded
 an entity. The two embedding breakers are separate even though they call the same endpoint and
 model: an open build breaker costs a build's entities their vectors until the next build, an open
-question breaker costs one query its vector rerank, and neither should decide the other.
-`cuckoo.saturated` and `cuckoo.saturatedSegments` say
-whether the membership filter still has room to order a query's segments by. `cuckoo.avgFpRate` and `maxFpRate` are
-the false-positive rates of the per-segment filters as they stand now, printed as exact decimals;
-the deletion figures count filter entries (one per distinct term per segment), not documents. See [the stats section of USAGE.md](USAGE.md#stats) for what
-every field means.
+question breaker costs one query its vector rerank, and neither should decide the other. See
+[the stats section of USAGE.md](USAGE.md#stats) for what every field means.
 
 `purged` is always `0`. Reclaiming a segment deletes its catalog row rather than keeping a
 tombstone of one, so a retired segment is counted under `tombstoned` until it is reclaimed and
@@ -2572,7 +2569,7 @@ key plus `excalibur.graph.extraction-enabled=true`.
 | `excalibur-retrieval` | Ranking signals, reciprocal rank fusion, rerank, serialisation budget, abstention |
 | `excalibur-planner` | Deterministic query classification and lexical coreference |
 | `excalibur-tenancy` | Per-namespace index isolation, mapping budget, eviction |
-| `excalibur-filter` | Cuckoo filters, LSH indexes, Count-Min Sketch |
+| `excalibur-filter` | Cuckoo filters, LSH indexes |
 | `excalibur-query` | Query pipeline with multi-stage filtering |
 | `excalibur-ingest` | Document ingestion, chunking, source adapters |
 | `excalibur-shard` | Index orchestration, volume management, visibility tracking |
@@ -2589,82 +2586,32 @@ key plus `excalibur.graph.extraction-enabled=true`.
 
 ### Query Pipeline
 
-Queries execute through a pipeline of seven stages, numbered here as the code and its log lines
-(`Stage 1: ...`, `Stage 4: ...`) number them:
+Queries execute through a pipeline of five stages, numbered here as the code and its log lines
+(`Stage 1: ...`, `Stage 3: ...`) number them:
 
 - **Stage 0 — Epoch Snapshot** - Capture visibility epoch, resolve queryable segments
-- **Stage 0b — Segment Prioritisation** - Order the candidate segments by estimated selectivity
-- **Stage 1 — Cuckoo Filter Cascade** - Move the segments that hold none of the query text's terms behind the ones that may, checking a corpus-wide filter and then each segment's own. Excludes no segment. There is no level between them: documents are placed by key hash, so a group of segments holds nearly the whole vocabulary and could tell nothing apart
-- **Stage 2 — LSH Candidates** - Name each segment's entries that share the query's hash buckets, for stage 3 to measure beside its graph search. Excludes no segment and confines no search
-- **Stage 3 — HNSW Vector Search** - Precise ANN search, with stage 2's candidates measured and ranked in, and a tail scan for unindexed entries
-- **Stage 4 — Full Vector Rerank** - Exact distance computation on candidates
-- **Stage 5 — LLM Relevancy Scoring** - Optional semantic relevancy scoring
+- **Stage 1 — LSH Candidates** - Name each segment's entries that share the query's hash buckets, for stage 2 to measure beside its graph search. Excludes no segment and confines no search
+- **Stage 2 — HNSW Vector Search** - Precise ANN search, with stage 1's candidates measured and ranked in, and a tail scan for unindexed entries
+- **Stage 3 — Full Vector Rerank** - Exact distance computation on candidates
+- **Stage 4 — LLM Relevancy Scoring** - Optional semantic relevancy scoring
 
 Each stage checks for cancellation and timeout, allowing queries to return partial results if time-constrained.
 
-Stage 0b orders and never excludes. The estimate comes from a Count-Min sketch, which over-counts,
-and a segment dropped on an over-count loses results that are in the corpus; a segment with no
-sketch is given the highest estimate rather than the lowest. What the ordering buys is that the
-stage after it, and a query that runs out of time, spend what time there is on the segments most
-likely to answer.
+Every segment stage 0 admits is searched, in no order that depends on the query. Stage 0 admits by
+segment state alone: it holds back a segment with no graph to search, and one still taking entries
+when the caller asked for complete segments only, and counts both under `segments_excluded`.
+Nothing in the pipeline reads the query's text to decide where to look: the words a question is
+phrased in need not be the words of the documents that answer it — the semantic expansion example above turns
+`out of RAM` into `OOM killer` for exactly that reason — so a segment holding none of the
+question's terms can hold its nearest neighbours.
 
-Every segment keeps its own sketch. The storage engine counts the terms of each chunk it writes
-into a segment, whichever path the write came from (`POST /v1/ingest`, `POST /v1/documents`,
-`POST /v1/reindex`, or a split or compaction copying entries into a new segment), using the same
-tokenisation as the cuckoo filters, and the query's text is cut the same way. A term's estimate is
-its share of all the term occurrences counted in that segment; a query of several terms multiplies
-the shares.
-
-- **Deletes and overwrites over-count.** A sketch cannot take a count back, so a deleted or
-  overwritten chunk's terms stay counted until the segment is compacted, which builds the
-  replacement's sketch from the surviving entries only. The error only ever moves a segment
-  earlier.
-- **Persistence.** The sketch is written beside the segment as `segment_<N>.tfs` (versioned
-  header, CRC32C over header and body, staged and renamed into place) when the engine flushes or
-  closes the segment. The file records the write-log sequence number and entry counts it was taken
-  at. On start-up, after the write log has been replayed, a sidecar that matches is loaded; a
-  missing, damaged or out-of-date one (which is what a crash leaves) is rebuilt from the segment's
-  live entries. Deleting the file is always safe; it costs one rebuild. `excalibur-fsck` verifies it
-  and reports a damaged one without counting it as damage, and `excalibur-backup` copies it as
-  derived state that `--exclude-derived` leaves out.
-
-Stage 1 orders and never excludes, for the same reason stage 2 never does. Every query the
-pipeline runs is a nearest-neighbour search over an embedding, and `POST /v1/query` hands it the
-question's text beside that embedding. The embedding is there because the words a question is
-phrased in need not be the words of the documents that answer it — the semantic expansion example
-above turns `out of RAM` into `OOM killer` for exactly that reason — so a segment holding none of
-the question's terms can hold its nearest neighbours, and dropping it would lose them without
-saying so. What the filter's answer does say is where the question's words are, and a segment
-holding them is the likelier one to answer. Stage 1 therefore moves the segments the filter vouches
-hold none of the terms behind the others, keeping stage 0b's order within each group, and every
-segment is searched. As with stage 0b, what the ordering buys is that a query which runs out of
-time has spent it on the segments most likely to answer. The two signals differ: stage 0b's
-estimate multiplies each term's share of a segment and over-counts, while the filter asks whether
-any one term is present at all.
-
-Stage 1 moves a segment back only where the term filter can speak for it. Every write path fills
-it the same way: `POST /v1/ingest`, `POST /v1/documents` and `POST /v1/reindex` file each chunk's
-terms under the segment the storage engine reports the chunk routed to.
-Entries also reach a segment without being written to it, and each such segment's level is refilled
-from the entries it holds, on a background thread, one segment at a time: every segment when the
-node starts (the filter is in memory only), both children of a split, and the replacement a
-compaction installs — which also drops the terms of the entries the compaction removed. A level is
-marked stale before the segment can take a write that would make it look complete — for a split,
-before either child is routed to — and a stale level is not trusted until its refill finishes, so
-a segment keeps its place meanwhile rather than being moved back on a partial level. Four things
-leave the filter with nothing to say about a segment — the filter holding nothing for it, its
-level waiting to be refilled, a level having refused a term for want of room, and no filter being
-configured at all — and in each case stage 1 leaves the segment among those searched first. The
-filter decides only the order; it never costs a result. `QueryPipelineRecallGateTest` holds the
-pipeline to that with query text present.
-
-Stage 2 adds candidates and never removes any. A query asks for the k nearest vectors, and every
+Stage 1 adds candidates and never removes any. A query asks for the k nearest vectors, and every
 non-empty segment has k nearest vectors however far away they are; an LSH bucket says which entries
 hashed alongside the query, a likelihood that falls off with distance, and bounds nothing about the
 distance of what it leaves out. An empty answer therefore means "nothing within the radius the hash
 shape favours", not "no neighbours here", and a short answer is some likely neighbours rather than
-the only ones. So stage 2 excludes no segment and confines no search: it hands stage 3, per
-segment, the node ids that share the query's buckets, and stage 3 measures those nodes exactly and
+the only ones. So stage 1 excludes no segment and confines no search: it hands stage 2, per
+segment, the node ids that share the query's buckets, and stage 2 measures those nodes exactly and
 ranks them together with what the graph search returned. A named node enters the answer only by
 being closer than a result the graph search found, so the answer is never worse than the graph
 search alone, and is better wherever the graph's beam walked past a near neighbour the buckets
@@ -2681,13 +2628,13 @@ the wrong vectors, and contribute nothing but wasted measurements.
 
 A candidate set names a scattering of nodes drawn from wherever the pre-filter's buckets fell, not a
 connected region of the graph, so the graph's edges are used to reach named nodes and never to
-decide which of them may be measured. Stage 3 measures a set one of two ways, whichever does less
+decide which of them may be measured. Stage 2 measures a set one of two ways, whichever does less
 work: it reads every named node when the set is small, which is exact at one node read per name, or
 it runs a second graph search that keeps only named nodes. Reading reads `|C|` nodes; a search that
 keeps a `|C| / nodeCount` fraction of what it visits reads on the order of `ef * nodeCount / |C|`
 before its beam is full, so reading is both the cheaper and the exact answer while
 `|C|² <= ef * nodeCount` - which for a hundred-thousand-node segment at `ef = 200` covers every
-candidate set the default shape realistically produces. That is the whole cost of stage 2 to a
+candidate set the default shape realistically produces. That is the whole cost of stage 1 to a
 query: a probe of each table, plus those reads.
 
 Because it is keyed by node id, a pre-filter is only meaningful beside the graph it was built
@@ -2699,7 +2646,7 @@ which replaces the file but not the graph.
 Since the candidates can only add to an answer, an index that disagrees with its graph costs work
 and nothing else: one that has not yet seen every node names fewer of them, an id naming no live
 node is skipped when it is measured, and no index has ever seen the un-integrated write-log tail,
-which stage 3 scans directly from the log regardless. `QueryPipelineRecallGateTest` holds the whole
+which stage 2 scans directly from the log regardless. `QueryPipelineRecallGateTest` holds the whole
 pipeline to its graphs' recall against brute force - see [Running Benchmarks](#running-benchmarks).
 
 ### Segment Identity
@@ -2707,8 +2654,8 @@ pipeline to its graphs' recall against brute force - see [Running Benchmarks](#r
 A segment has two numbers, and only one of them identifies it to the rest of the system.
 
 - The **directory index** is the routing slot the storage engine holds the segment at. The
-  catalog, the visibility tracker, the term filter hierarchy, the graph provider and payload
-  resolution are all keyed by it, and it is what a query snapshot carries.
+  catalog, the visibility tracker, the graph provider and payload resolution are all keyed by
+  it, and it is what a query snapshot carries.
 - `Segment.segmentId()` counts segment instances constructed by the process. It identifies an
   instance - a zero-copy slice checks it to confirm the slice came from the segment being asked -
   and nothing files a segment under it.
@@ -2945,7 +2892,7 @@ excaliburdb/
 ├── excalibur-backup/       # Offline snapshot, verify and restore command
 ├── excalibur-core/         # Primitives: memory, hash, checksums
 ├── excalibur-config/       # Configuration loading
-├── excalibur-filter/       # Cuckoo filters, LSH, sketches
+├── excalibur-filter/       # Cuckoo filters, LSH
 ├── excalibur-fsck/         # Offline integrity check and repair command
 ├── excalibur-graph/        # CSR adjacency, bitemporal, provenance, erasure
 ├── excalibur-ingest/       # Document ingestion pipeline
@@ -3073,14 +3020,12 @@ this system's stated guarantees that no task in the build could execute.
 HNSW recall is measured on the graph alone, which says nothing about the stages in front of it. So
 `excalibur-query` gates the answer a caller actually gets: `QueryPipelineRecallGateTest` runs the
 whole query pipeline over 20,000 clustered 64-dimensional vectors spread across eight segments,
-each with a fully integrated graph, an LSH index of the default shape and a trusted term filter
-level, and asserts that its recall@10 against brute force is at least 0.95 and no more than 0.01
+each with a fully integrated graph and an LSH index of the default shape, and asserts that its recall@10 against brute force is at least 0.95 and no more than 0.01
 below that of the same graphs searched directly and merged. It measures twice: with vector-only
 queries, and with every query also carrying text that only one segment's documents share while its
 nearest vectors lie in all eight, which is how `POST /v1/query` runs every query. The 0.01 absorbs
 ties at the tenth distance and nothing else: the pipeline searches every graph at least as widely,
-the term filter only orders the segments, and its LSH candidates can displace a result only with a
-closer one. `QueryPipelineVectorRecallTest` makes both comparisons on a smaller corpus in the
+and its LSH candidates can displace a result only with a closer one. `QueryPipelineVectorRecallTest` makes both comparisons on a smaller corpus in the
 ordinary `test` task. The aggregate task is
 derived from the module list rather than written out, because a list goes stale the moment a
 module is added and a gate run that skips a module reports a pass over assertions it never ran.
@@ -3169,7 +3114,7 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 - `HierarchicalDeletionPropagationIntegrationTest` - A delete reaches the corpus and segment levels of the hierarchical filter, including under concurrency
 - `DocumentErasureIntegrationTest` - An erased document leaves storage, the lexical index's files and vector search, through the node's own erasure wiring
 - `GraphRouteIntegrationTest` - A document ingested from a directory, with extraction against a stand-in OpenAI-compatible chat endpoint, is built into the graph and answered from over HTTP as of a date after its fact began, and declined as of one before
-- `LshHnswEntryIdContractTest` - The LSH index returns ids in the HNSW graph's id space, so the candidates stage 3 measures are the nodes the buckets describe
+- `LshHnswEntryIdContractTest` - The LSH index returns ids in the HNSW graph's id space, so the candidates stage 2 measures are the nodes the buckets describe
 - `SegmentPrefilterLifecycleTest` - A segment's vector pre-filter lives and dies with the graph it is keyed against, including across a split
 - `AtomicDocumentWriterTest` - The write-log driver the other suites ingest through records true offsets and keeps each document's chunks contiguous
 - `VectorApiResolutionTest` - The test JVM resolves `jdk.incubator.vector`, so the SIMD kernels are what the suites exercise rather than the scalar fallback
@@ -3419,15 +3364,6 @@ Only by reindexing. Vectors are only comparable within one model's embedding spa
 are the old model's output and the old width. Change the model and the two width keys together,
 clear the data directory or reindex every source, and expect the startup check to stop you if the
 widths no longer agree.
-
-**`/v1/stats` reports `cuckoo.saturated` or a growing `cuckoo.saturatedSegments`.**
-The membership filter is what tells a query which segments hold its terms, so they are searched
-first, and once a level is full it cannot record a new term. A filter holding *some* of a
-segment's terms would answer "not here" for the ones it never got, so a level that has refused a
-term stops being consulted and its segments are ordered by their term sketches alone. Results are
-unaffected; what is lost is the ordering, which matters to queries that run out of time. Raise
-`excalibur.filter.corpus-capacity` (or `segment-capacity`) past your term count and restart; the
-only cost of over-sizing is memory.
 
 **How do I take a node out of rotation before restarting it?**
 `POST /v1/drain`. `/health/ready` then answers 503 for as long as the drain is in force, so a load
