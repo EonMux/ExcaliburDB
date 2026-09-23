@@ -6,8 +6,11 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Set;
 
+import com.eonmux.excalibur.core.integrity.IntegrityReport;
+import com.eonmux.excalibur.core.integrity.IntegrityStatus;
 import com.eonmux.excalibur.graph.erasure.ErasureScope;
 import com.eonmux.excalibur.graph.erasure.ServedArtifactEraser;
+import com.eonmux.excalibur.graph.file.GraphCorruptionException;
 import com.eonmux.excalibur.retrieval.build.GraphDirectoryBuilder;
 
 import org.roaringbitmap.RoaringBitmap;
@@ -47,6 +50,13 @@ import org.slf4j.LoggerFactory;
  * the retired directory afterwards, which drops the last link to a segment the merge replaced.
  * A filesystem that cannot link is copied instead, which costs the bytes and changes nothing
  * else.
+ *
+ * <h2>A damaged served index is refused, not carried</h2>
+ * <p>The served copy is verified against its checksum footers before anything is reproduced.
+ * Linking a damaged file into the replacement would publish it again under a compaction that
+ * reported success, and the node would refuse the result when it reopened it. Refused here with
+ * a {@link GraphCorruptionException}, the damage reaches the caller that can act on it: the graph
+ * is derived from staging, so a compaction that cannot rewrite it discards it instead.</p>
  *
  * @author ExcaliburDB
  */
@@ -146,6 +156,7 @@ public final class LexicalIndexEraser implements ServedArtifactEraser {
             // directory never held it would tell the carry-over to skip something real.
             return;
         }
+        requireIntact(from);
         Path to = replacement.resolve(name);
         reproduce(from, to);
         if (erasedEntities.isEmpty()) {
@@ -174,6 +185,26 @@ public final class LexicalIndexEraser implements ServedArtifactEraser {
         }
         LOGGER.info("deleted {} entity document(s) from the {} index at {} and rewrote every "
             + "segment that held them", deleted, name, index);
+    }
+
+    /**
+     * Refuses a served index whose files no longer match their checksum footers.
+     *
+     * @param index The served index
+     * @throws GraphCorruptionException if it is damaged
+     * @throws IOException if it cannot be read, or is in a format this build does not read
+     */
+    private static void requireIntact(Path index) throws IOException {
+        IntegrityReport report = LexicalIndexIntegrity.verify(index);
+        if (report.status() == IntegrityStatus.CORRUPT
+                || report.status() == IntegrityStatus.MISSING) {
+            throw new GraphCorruptionException(index, LexicalIndexIntegrity.FORMAT + " " + index
+                + " failed its integrity check: " + report.detail());
+        }
+        if (report.status() == IntegrityStatus.UNREADABLE) {
+            throw new IOException(LexicalIndexIntegrity.FORMAT + " " + index
+                + " cannot be read: " + report.detail());
+        }
     }
 
     /**

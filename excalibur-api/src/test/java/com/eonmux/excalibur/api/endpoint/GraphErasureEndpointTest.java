@@ -256,18 +256,18 @@ class GraphErasureEndpointTest {
             staging.flush();
             assertThat(tenants.shared().buildService().build().published()).isTrue();
 
-            // Fault injection: the store's column files go, so the compaction's open throws.
-            // Unlinking a mapped file is legal, and the served stack is closed before the
-            // compaction opens the directory, so this fails exactly where the test needs it to.
+            // Fault injection: the store's descriptor cannot be read, so the compaction's open
+            // throws. The served stack is closed before the compaction opens the directory, so
+            // this fails exactly where the test needs it to. It is a refusal that says nothing
+            // about the bytes; a graph whose bytes are damaged is discarded and the erasure
+            // applied to staging alone, which GraphTenantDamageTest covers.
             Path graph = root.resolve(NamespaceId.SHARED.value())
                 .resolve(GraphTenant.GRAPH_SUBDIRECTORY);
-            try (var files = Files.list(graph)) {
-                for (Path file : files.toList()) {
-                    if (Files.isRegularFile(file)) {
-                        Files.delete(file);
-                    }
-                }
-            }
+            Path descriptor = graph.resolve(
+                com.eonmux.excalibur.graph.format.EdgeStoreDescriptor.FILE_NAME);
+            Files.setPosixFilePermissions(descriptor, java.util.Set.of());
+            org.junit.jupiter.api.Assumptions.assumeTrue(!Files.isReadable(descriptor),
+                "needs a user file permissions apply to");
 
             Response response = post(
                 "{\"scope\": \"entity\", \"entity_id\": " + ada + ", \"compact\": true}");

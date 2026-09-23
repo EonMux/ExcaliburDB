@@ -167,8 +167,8 @@ class LabelDictionaryTest {
         @DisplayName("an absent dictionary is an error when opened directly")
         void openFailsWhenAbsent(@TempDir Path dir) {
             assertThatThrownBy(() -> LabelDictionary.open(dir, "entities", "E"))
-                .isInstanceOf(IOException.class)
-                .hasMessageContaining("not readable");
+                .isInstanceOf(com.eonmux.excalibur.graph.file.GraphCorruptionException.class)
+                .hasMessageContaining("does not exist");
         }
 
         @Test
@@ -192,7 +192,27 @@ class LabelDictionaryTest {
 
             assertThatThrownBy(() -> LabelDictionary.open(dir, "entities", "E"))
                 .isInstanceOf(IOException.class)
-                .hasMessageContaining("does not fit");
+                .hasMessageContaining("lost its tail");
+        }
+
+        @Test
+        @DisplayName("the highest id is read from a version 1 index as from a current one")
+        void highestIdAcrossVersions(@TempDir Path dir) throws IOException {
+            new LabelDictionaryWriter().put(3, "three").put(9, "nine").write(dir, "entities");
+            assertThat(LabelDictionary.highestId(dir, "entities")).isEqualTo(9);
+
+            Path index = dir.resolve("entities.idx");
+            byte[] current = Files.readAllBytes(index);
+            byte[] legacy = java.util.Arrays.copyOf(current,
+                current.length - LabelDictionary.TRAILER_BYTES);
+            ByteBuffer.wrap(legacy).order(ByteOrder.LITTLE_ENDIAN)
+                .putInt(8, LabelDictionary.OLDEST_VERSION);
+            Files.write(index, legacy);
+
+            assertThat(LabelDictionary.highestId(dir, "entities")).isEqualTo(9);
+            try (LabelDictionary dictionary = LabelDictionary.open(dir, "entities", "E")) {
+                assertThat(dictionary.apply(9)).isEqualTo("nine");
+            }
         }
 
         @Test

@@ -205,10 +205,17 @@ public final class LexicalIndex implements AutoCloseable, MappedFootprint {
      * is not there means the artifact is damaged, and creating an empty index in its place would
      * serve every query from nothing without saying so.</p>
      *
+     * <p>Every file of every segment is checked against its checksum footer before the index is
+     * returned, so a published index whose bytes changed on disk is refused rather than served;
+     * {@link LexicalIndexIntegrity} gives the reasons. The pass is made here, once; a later
+     * {@link #refresh()} does not repeat it.</p>
+     *
      * @param path Where the index is
      * @return The index, searchable at once
      * @throws org.apache.lucene.index.IndexNotFoundException if there is no index at {@code path}
-     * @throws IOException if the index cannot be read
+     * @throws org.apache.lucene.index.CorruptIndexException if a file does not match its footer
+     * @throws IOException if the index cannot be read; {@link LexicalIndexIntegrity#isDamage}
+     *         says whether the failure is damage
      */
     public static LexicalIndex openReadOnly(Path path) throws IOException {
         Directory directory = FSDirectory.open(path);
@@ -216,6 +223,7 @@ public final class LexicalIndex implements AutoCloseable, MappedFootprint {
             new LexicalIndex(directory, new StandardAnalyzer(), null, Bm25Parameters.DEFAULT);
         try {
             index.refresh();
+            LexicalIndexIntegrity.requireIntact(index.published.get().reader());
         } catch (IOException | RuntimeException e) {
             index.close();
             throw e;

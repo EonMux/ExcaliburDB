@@ -30,9 +30,15 @@ import java.util.function.LongFunction;
  * <p>Two files, in the same little-endian columnar style as the edge store:
  * <pre>
  * &lt;name&gt;.idx : [magic:8][version:4][count:4] then count * ([id:8][offset:4][length:4])
- *              sorted ascending by id
+ *              sorted ascending by id, then, from version 2,
+ *              [text length:8][CRC32C of the text:4][CRC32C of every index byte before it:4]
  * &lt;name&gt;.dat : the UTF-8 bytes, concatenated
  * </pre>
+ *
+ * <p>Both files are verified against the trailer on every open, and a dictionary whose bytes are
+ * no longer the ones written is refused rather than mapped; {@link LabelDictionaryIntegrity}
+ * gives the rules and the reasons. A version 1 dictionary has no trailer, is held to the one
+ * check its layout allows, and is replaced by the next build.
  *
  * <p>Sorted ids and a fixed-width index mean a lookup is a binary search over a mapped array with
  * no allocation until the one string it returns. A hash map of the same data would be faster per
@@ -59,14 +65,20 @@ public final class LabelDictionary
     /** Distinguishes this file from any other mapped file that happens to be in the directory. */
     public static final long MAGIC = 0x4558434C42444354L;
 
-    /** Format version. */
-    public static final int VERSION = 1;
+    /** Format version this build writes: the first whose index carries checksums. */
+    public static final int VERSION = 2;
+
+    /** Oldest format version this build reads: the one written before the trailer existed. */
+    public static final int OLDEST_VERSION = 1;
 
     /** Bytes before the first index entry: magic, version, count. */
     public static final int HEADER_BYTES = 16;
 
     /** Bytes per index entry: id, offset, length. */
     public static final int ENTRY_BYTES = 16;
+
+    /** Bytes after the last entry from version 2: text length, text CRC32C, index CRC32C. */
+    public static final int TRAILER_BYTES = 16;
 
     private static final ValueLayout.OfInt INT =
         ValueLayout.JAVA_INT.withOrder(EdgeStoreDescriptor.COLUMN_BYTE_ORDER);
@@ -89,101 +101,41 @@ public final class LabelDictionary
     }
 
     /**
-     * Opens the dictionary named {@code name} in {@code directory}.
+     * Opens the dictionary named {@code name} in {@code directory}, verifying both files first.
      *
      * @param directory The directory holding the dictionary files
      * @param name      The base name, without extension
      * @param prefix    The prefix for a synthesised name when an id has no entry
      * @return The dictionary
-     * @throws IOException if either file is missing or malformed
+     * @throws com.eonmux.excalibur.graph.file.GraphCorruptionException if either file is missing,
+     *         malformed, or no longer what the build wrote
+     * @throws IOException if either file cannot be read, or is at a version this build does not
+     *         read
      */
     public static LabelDictionary open(Path directory, String name, String prefix)
             throws IOException {
+        int version = LabelDictionaryIntegrity.requireIntact(directory, name);
         Path indexPath = directory.resolve(name + ".idx");
         Path dataPath = directory.resolve(name + ".dat");
-        if (!Files.isReadable(indexPath) || !Files.isReadable(dataPath)) {
-            throw new IOException("dictionary " + name + " is not readable in " + directory);
-        }
-
-        long indexBytes = Files.size(indexPath);
-        if (indexBytes < HEADER_BYTES) {
-            throw new IOException(indexPath + " is shorter than its header");
-        }
 
         Arena arena = Arena.ofShared();
         try (FileChannel indexChannel = FileChannel.open(indexPath, StandardOpenOption.READ);
              FileChannel dataChannel = FileChannel.open(dataPath, StandardOpenOption.READ)) {
 
-            MemorySegment index =
-                indexChannel.map(FileChannel.MapMode.READ_ONLY, 0, indexBytes, arena);
-            long magic = index.get(LONG, 0);
-            if (magic != MAGIC) {
-                throw new IOException(indexPath + " is not a label dictionary: magic 0x"
-                    + Long.toHexString(magic) + ", expected 0x" + Long.toHexString(MAGIC));
-            }
-            int version = index.get(INT, 8);
-            if (version != VERSION) {
-                throw new IOException(indexPath + " is version " + version
-                    + "; this build reads version " + VERSION);
-            }
+            MemorySegment index = indexChannel.map(
+                FileChannel.MapMode.READ_ONLY, 0, indexChannel.size(), arena);
             int count = index.get(INT, 12);
-            if (count < 0 || HEADER_BYTES + (long) count * ENTRY_BYTES > indexBytes) {
-                throw new IOException(indexPath + " declares " + count
-                    + " entries, which does not fit in " + indexBytes + " bytes");
-            }
-
-            long dataBytes = Files.size(dataPath);
-            requirePaired(indexPath, dataPath, index, count, dataBytes);
+            long dataBytes = dataChannel.size();
             MemorySegment data = dataBytes == 0
                 ? MemorySegment.ofArray(new byte[0])
                 : dataChannel.map(FileChannel.MapMode.READ_ONLY, 0, dataBytes, arena);
 
-            LOGGER.info("Opened label dictionary {} with {} entries ({} bytes of text)",
-                name, count, dataBytes);
+            LOGGER.info("Opened label dictionary {} (format version {}) with {} entries ({} "
+                + "bytes of text)", name, version, count, dataBytes);
             return new LabelDictionary(arena, index, data, count, prefix);
         } catch (IOException | RuntimeException e) {
             arena.close();
             throw e;
-        }
-    }
-
-    /**
-     * Refuses an index and a data file that were not written by the same build.
-     *
-     * <p>The dictionary is published as two renames, and two renames are not one atomic act: a
-     * crash between them leaves the previous index beside the new text. Every offset in the old
-     * index still lands inside the larger new blob, so the per-entry bounds check in
-     * {@link #apply} passes and returns a slice of a different entity's name — silently, which
-     * for the mapping that puts names back on an answer is the worst available failure, and worse
-     * still just after an erasure.
-     *
-     * <p>The text is written as one concatenation in id order, so the last entry ends exactly at
-     * the end of the file. Comparing those two numbers catches every mismatched pair but one, at
-     * the cost of a single index read rather than a scan: two dictionaries whose text happens to
-     * be the same total length. Refusing to open is the right answer here, unlike in
-     * {@link #apply} — an operator can restore or rebuild a dictionary, and cannot notice a wrong
-     * name.
-     *
-     * @param indexPath The index, named in the failure
-     * @param dataPath  The text
-     * @param index     The mapped index
-     * @param count     How many entries it declares
-     * @param dataBytes How long the text actually is
-     * @throws IOException if the two do not describe each other
-     */
-    private static void requirePaired(Path indexPath, Path dataPath, MemorySegment index,
-                                      int count, long dataBytes) throws IOException {
-        long implied = 0;
-        if (count > 0) {
-            long last = HEADER_BYTES + (long) (count - 1) * ENTRY_BYTES;
-            implied = Integer.toUnsignedLong(index.get(INT, last + 8))
-                + Integer.toUnsignedLong(index.get(INT, last + 12));
-        }
-        if (implied != dataBytes) {
-            throw new IOException(indexPath + " describes " + implied + " bytes of text but "
-                + dataPath + " holds " + dataBytes + "; the two files are from different builds, "
-                + "which is what a crash between their two renames leaves behind. Reading them "
-                + "together would return one entity's name for another.");
         }
     }
 
@@ -233,9 +185,10 @@ public final class LabelDictionary
             if (header.getLong(0) != MAGIC) {
                 throw new IOException(indexPath + " is not a label dictionary");
             }
-            if (header.getInt(8) != VERSION) {
-                throw new IOException(indexPath + " is version " + header.getInt(8)
-                    + "; this build reads version " + VERSION);
+            int version = header.getInt(8);
+            if (version < OLDEST_VERSION || version > VERSION) {
+                throw new IOException(indexPath + " is version " + version
+                    + "; this build reads versions " + OLDEST_VERSION + " to " + VERSION);
             }
             int count = header.getInt(12);
             if (count < 0 || HEADER_BYTES + (long) count * ENTRY_BYTES > indexBytes) {

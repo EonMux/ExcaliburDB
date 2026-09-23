@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.fsck.repair;
 
+import com.eonmux.excalibur.fsck.check.GraphStoreCheck;
 import com.eonmux.excalibur.fsck.check.WriteAheadLogCheck;
 import com.eonmux.excalibur.store.LifecycleState;
 import com.eonmux.excalibur.store.LogScan;
@@ -91,11 +92,24 @@ public final class RepairExecutor {
      * engine's own {@code discardStagedPair} forces the mapping's removal before it touches
      * the graph. A directory that cannot be forced leaves the graph where it is.</p>
      *
+     * <p>A tenant's built graph is moved only while no displaced copy of it sits beside it,
+     * checked again here because the plan describes the directory as it was: see
+     * {@link GraphStoreCheck#displacedBeside}.</p>
+     *
      * @param action What to do
      * @return What happened
      * @throws IOException if the move fails
      */
     private RepairOutcome quarantined(RepairAction action) throws IOException {
+        if (GraphStoreCheck.isGraphDirectory(action.subject())) {
+            List<Path> displaced = GraphStoreCheck.displacedBeside(action.subject());
+            if (!displaced.isEmpty()) {
+                return new RepairOutcome(action, false, "not moved, because "
+                    + displaced.get(0).getFileName() + " is now beside it. With nothing left in "
+                    + "its place the node would restore that copy and serve it, and a copy an "
+                    + "erasure compaction replaced still holds what the erasure removed");
+            }
+        }
         Path stagedMapping = stagedMappingBeside(action.subject());
         if (stagedMapping != null) {
             if (Files.exists(stagedMapping)) {

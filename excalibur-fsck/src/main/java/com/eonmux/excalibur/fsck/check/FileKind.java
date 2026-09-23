@@ -92,6 +92,26 @@ public enum FileKind {
     /** A log inside a tenant's {@code graph-staging} directory. */
     GRAPH_STAGING_LOG,
 
+    /**
+     * {@code graph-staging/erasure.interrupted}: the marker that withholds a tenant's graph until
+     * an interrupted erasure has been applied to it.
+     *
+     * <p>Empty by construction. The node reads only whether it exists, so its presence is its
+     * whole content and there is nothing in it that could differ from what was written.</p>
+     */
+    GRAPH_ERASURE_MARKER,
+
+    /**
+     * A file of a tenant's built graph, {@code <namespace>/graph/}, or of a directory a publish,
+     * a build or an erasure compaction leaves beside it.
+     *
+     * <p>Judged with the directory it sits in by {@link GraphStoreCheck}, because what a file
+     * there must hold is recorded in the graph's descriptor and dictionaries rather than in the
+     * file, and what a sibling directory is depends on its neighbours. The graph is derived from
+     * the tenant's staging logs, and the next build replaces it whole.</p>
+     */
+    GRAPH_STORE_PART,
+
     /** A file inside the native lexical store directory. */
     LEXICAL_STORE_PART,
 

@@ -6,6 +6,7 @@ import java.nio.file.Path;
 import com.eonmux.excalibur.core.memory.MappedFootprint;
 import com.eonmux.excalibur.graph.format.EdgeColumn;
 import com.eonmux.excalibur.graph.format.EdgeStoreDescriptor;
+import com.eonmux.excalibur.graph.format.EdgeStoreIntegrity;
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.temporal.TemporalFilter;
@@ -43,13 +44,20 @@ public final class MappedEdgeStore implements EdgeStore, MappedFootprint {
     }
 
     /**
-     * Opens the store in {@code directory}.
+     * Opens the store in {@code directory}, verifying every column before it is mapped.
      *
-     * @throws IOException if the descriptor is missing or a column is the wrong size
+     * <p>See {@link EdgeStoreIntegrity} for why the whole store is digested on every open rather
+     * than trusted once its sizes add up.</p>
+     *
+     * @throws com.eonmux.excalibur.graph.file.GraphCorruptionException if the descriptor or a
+     *         column is missing, the wrong size, or does not match the checksum the build
+     *         recorded for it
+     * @throws IOException if a file cannot be read
      * @throws EdgeStoreDescriptor.IncompatibleStoreException if it was written with other widths
+     *         or a format version this build does not read
      */
     public static MappedEdgeStore open(Path directory) throws IOException {
-        EdgeStoreDescriptor descriptor = EdgeStoreDescriptor.read(directory);
+        EdgeStoreDescriptor descriptor = EdgeStoreIntegrity.requireIntact(directory);
         return new MappedEdgeStore(MappedColumns.open(directory, descriptor));
     }
 

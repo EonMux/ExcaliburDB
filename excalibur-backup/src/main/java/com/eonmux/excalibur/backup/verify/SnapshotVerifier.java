@@ -74,7 +74,8 @@ public final class SnapshotVerifier {
         }
         problems.addAll(unexpectedFiles(payload, manifest));
         if (depth == VerifyDepth.DEEP) {
-            List<ContentCheck> folded = FormatChecks.withLexicalStore(payload, contentChecks);
+            List<ContentCheck> folded = FormatChecks.withGraphStores(payload,
+                FormatChecks.withLexicalStore(payload, contentChecks));
             contentChecks.clear();
             contentChecks.addAll(folded);
             contentChecks.sort(Comparator.comparing(ContentCheck::path));

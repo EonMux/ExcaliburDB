@@ -12,6 +12,7 @@ import java.util.Objects;
 
 import com.eonmux.excalibur.graph.erasure.CompactionPolicy.CompactionStats;
 import com.eonmux.excalibur.graph.erasure.EdgeStoreCompactor.CompactionResult;
+import com.eonmux.excalibur.graph.file.GraphCorruptionException;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.graph.staging.ReferencedLabels;
 import com.eonmux.excalibur.graph.store.MappedEdgeStore;
@@ -376,6 +377,11 @@ public final class GraphErasureCoordinator {
      * is forced before this returns, so a crash cannot bring back a request this has already
      * reported discharged.</p>
      *
+     * <p>A published dictionary too damaged to answer leaves the request outstanding rather than
+     * failing the open: whether the id was assigned cannot be known, and a request kept is one
+     * whose id no interner hands out again, where one discharged on a guess may be the erasure of
+     * a real entity dropped. The next open after the graph is rebuilt answers it.</p>
+     *
      * @param graphDirectory Where the namespace's graph is served from; need not exist
      * @return The requests discharged, oldest first; empty when none named an unassigned id
      * @throws IOException if a published dictionary cannot be read, or the completion cannot be
@@ -387,7 +393,7 @@ public final class GraphErasureCoordinator {
         List<ErasureRequest> unassigned = new ArrayList<>();
         for (ErasureRequest request : log.outstanding()) {
             if (request.scope() instanceof ErasureScope.Entity entity
-                    && !entityAssigned(entity.entityId(), graphDirectory)) {
+                    && !assignedOrUnknown(request, entity.entityId(), graphDirectory)) {
                 unassigned.add(request);
             }
         }
@@ -403,6 +409,28 @@ public final class GraphErasureCoordinator {
                 request.id(), ((ErasureScope.Entity) request.scope()).entityId());
         }
         return List.copyOf(unassigned);
+    }
+
+    /**
+     * Whether an id may have been assigned, counting one only a damaged dictionary could answer
+     * for as assigned.
+     *
+     * @param request        The request naming it, for the log line
+     * @param entityId       The id
+     * @param graphDirectory Where the namespace's graph is served from
+     * @return false only when the id is known to name nothing
+     * @throws IOException if a published dictionary cannot be read for a reason other than damage
+     */
+    private boolean assignedOrUnknown(ErasureRequest request, long entityId, Path graphDirectory)
+            throws IOException {
+        try {
+            return entityAssigned(entityId, graphDirectory);
+        } catch (GraphCorruptionException damage) {
+            LOGGER.warn("erasure request {} names entity {}, which staging never assigned; "
+                + "whether the published graph does cannot be told because {}. The request is "
+                + "kept outstanding", request.id(), entityId, damage.getMessage());
+            return true;
+        }
     }
 
     /**

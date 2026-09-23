@@ -2855,6 +2855,14 @@ the copy verifies faithfully without it:
   catalog or journal its reader would refuse fails the image; a status history the node would only
   discard does not. A file of any of these written before its format carried a checksum is held to
   its count and header alone, and reported unproven.
+- A tenant's built graph is checked as one structure, by the checks the node runs before it serves
+  one: `edgestore.meta` against its CRC32C, each column against the length and CRC32C the
+  descriptor records, `entities` and `relations` against the trailer on each `.idx`,
+  `entity_vectors.vec` against the CRC32Cs in its header, and every file of `labels/` and
+  `documents/` against its Lucene footer. Damage fails the image. A graph an older build wrote is
+  reported unproven, and one a newer build wrote fails the image. The scratch of a build or a
+  compaction, and a `graph.previous` or `graph.retired` beside a served graph, are reported
+  unchecked: the node never reads them.
 - Some files carry nothing to prove them by: a `routing.dir`, a lexical `manifest`, key table,
   tombstone file or `erasure.log` an older build wrote, before those formats carried a checksum —
   held to their structure and record count until the node rewrites them — and a file in
@@ -3008,6 +3016,37 @@ opens and builds from it with, so the verdict is the node's:
   opens them, and a corrupt `triples.log` fails every graph build and erasure.
 - A header naming a version this build does not read: `UNREADABLE`, as for any other file.
 
+The `erasure.interrupted` marker beside them says the graph is withheld until the erasures it still
+owes are applied. The node writes it empty and reads only whether it is there, so an empty one is
+`INTACT`, and one holding bytes is `UNCHECKED`.
+
+A namespace's built graph, `<namespace>/graph/`, is checked as one structure, by the same checks the
+node runs before it serves one:
+
+| File | `INTACT` means |
+|---|---|
+| `edgestore.meta` | the CRC32C at its end matched every byte before it |
+| each of the 13 edge columns | its length and CRC32C are the ones the descriptor records |
+| `entities.idx`, `relations.idx` | the CRC32C in the trailer matched the index, and the index is the size its header implies |
+| `entities.dat`, `relations.dat` | its length and CRC32C are the ones its index's trailer records |
+| `entity_vectors.vec` | the header's CRC32C matched, and so did the CRC32Cs it records for the presence flags and the vectors |
+| `labels`, `documents` | one verdict per Lucene index: every file of every segment matched the CRC32 in its footer |
+
+- `CORRUPT` or `MISSING`, in any file: the node does not serve the graph. It logs an `ERROR` naming
+  the file, graph queries answer that no graph is built, and staging, builds and erasures carry on;
+  `POST /v1/graph/build` replaces the graph from staging.
+- `LEGACY_UNPROTECTED`: written by a build before these checksums. Its structure and sizes are
+  checked and nothing more; the node serves it, and the next build replaces it with a checksummed
+  one.
+- `UNREADABLE`: a header naming a version this build does not read, which the node refuses.
+- A `graph.previous` or `graph.retired` with nothing served in its place is checked the same way,
+  since the node restores it on open. Beside a served graph, it is a copy the node deletes on open,
+  and is reported `UNCHECKED` — it may hold facts an erasure removed, so it is left for the node to
+  delete. The scratch in `graph.building` and `graph.compacting` is `UNCHECKED` too: nothing reads
+  it, and a `graph.compacting` directory tells the node an erasure may have been interrupted, so it
+  must not be moved.
+- Any other file in a graph directory is `UNCHECKED`; the next build replaces the directory whole.
+
 Four files are judged by what the node does with them rather than by name alone:
 
 - **`segment_<N>.tfs`, a segment's term sketch**, is one of two derived files the node rebuilds by
@@ -3050,6 +3089,11 @@ the tool writes, stating each write before it makes it, and **no repair ever del
 
 - A damaged file, an index whose segment is gone, or a staged file a rename never published is
   moved into a quarantine directory byte for byte, so the action is reversible by hand.
+- A damaged built graph is moved into the quarantine as one directory, once however many of its
+  files failed. The node serves nothing from it either way, and `POST /v1/graph/build` publishes a
+  new one from the namespace's staging logs, which hold everything it was built from. Erasures
+  accepted afterwards never reach the quarantined copy: delete it once the rebuilt graph serves, and
+  never move it back into the data directory.
 - A `catalog.dat` row naming a segment file that is no longer there is marked purged — written in
   place, through the engine's own catalog code — rather than cut out.
 - A write-ahead log ending in a torn record, an append that never completed, has that record's
@@ -3077,6 +3121,7 @@ quarantine and the original directory removed. What it refuses to attempt matter
 | A write-ahead log damaged in the middle | The records behind the damage were fsynced and acknowledged. Trimming past them would destroy committed writes, and so would moving the file aside — nothing rebuilds a log the way a reindex rebuilds an index |
 | A damaged `segment_<N>.hnsw.compact.docmap` with no `.hnsw.compact` beside it | The graph already holds the compacted numbering, and without this mapping it would be served through the pre-compaction one — wrong documents rather than an error. Restore the graph and both mappings together, or reindex the segment |
 | A damaged lexical store `manifest` | A store without its manifest opens as a new, empty index and deletes every segment the empty manifest does not name. Restore the manifest from a backup, or remove the whole `chunk-index` directory and reindex |
+| A damaged built graph with a `graph.previous` or `graph.retired` beside it | With the graph moved away the node would restore that copy and serve it, and a copy an erasure compaction replaced still holds what the erasure removed. Start the node once, which deletes the copy beside a served graph, or delete the copy, then repair again — or `POST /v1/graph/build`, which replaces the damaged graph without either. The move is checked again as it is made |
 | A damaged graph staging log | Nothing rebuilds one, and the node opens a missing one as empty. Moved aside, a label interner hands its ids out again under the published graph, so entities are served under other entities' names; `triples.log` empties the next graph build; `entity_text.log` leaves entities nothing to be ranked or embedded by; `erasure.log` and `withdrawals.log` forget what is still owed. Restore the namespace's `graph-staging` directory from a backup, all its logs together, since they refer to one another by id |
 | Anything `UNREADABLE` | A device or permission problem, or a header naming a format version a newer build wrote. Either way nothing is known about the contents, and a newer build's file is not damaged |
 
@@ -3105,6 +3150,7 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 | A re-crawl reingests everything and tombstones nothing | `<data dir>/document-registry` is missing, so change detection reads every document as new | Restore the data directory whole; the registry belongs with the segments it describes |
 | Node fails to start with `RegistryLoadException` naming a record count or saying its checksum does not match | `<data dir>/document-registry` was cut short by a crash, so it omits documents the node is still serving, or its bytes were altered after it was written. It is refused rather than loaded, because a shorter or altered registry silently makes documents unerasable and unreindexable | `excalibur-backup restore` from the last image. Deleting the registry also starts the node, at the cost of a full reingest on the next crawl |
 | A node refuses to start after a crash or a full disk, naming a file | Something under the data directory is damaged. Which file and how badly is the question, and guessing at it is how a recoverable node gets deleted | Stop the node and run `excalibur-fsck <data dir>`. Without `--repair` it only reads, and names what is damaged. `--repair` then writes: it quarantines what can be moved aside safely, marks purged a catalog row whose segment file is gone, and clears the opcode of a torn last log record — and leaves a damaged catalog or routing directory for you |
+| `/v1/graph/query` answers that no graph is built for a namespace that had one, and the log has an `ERROR` saying the tenant "does not serve its graph" | A file of the built graph is missing, cut short or no longer matches its checksum; the log line names it | `POST /v1/graph/build` with that namespace's header rebuilds the graph from staging and serves it. Run `excalibur-fsck` with the node stopped first if you want to know whether the disk is at fault |
 | A directory you restored by hand serves wrong or missing results | A partial copy: a `.hnsw` without its `.docmap`, a `*.compact` without its pair, or a sparse copy that dropped a file | `excalibur-fsck <data dir>` names the orphans and the mismatches. Take images with `excalibur-backup` instead, which classifies every file and can verify the result |
 | A `WARN` at startup naming documents that "were being ingested when this node last stopped" | Those documents were half written when the node died, and their chunks are hidden until the ingest is redone. Not an error: it is the crash being cleaned up after | Nothing — the next crawl of that source re-ingests them and they become visible again. `POST /v1/erasure` removes them instead |
 | `lexical.oldestErasureAgeMs` exceeds `lexical-max-latency-seconds` | The sweep that enforces the bound runs every tenth of it, so a reading just past the bound is ordinary; one far past it means the sweep is failing, and the node's log says why | Read the log for a failed compaction. Ingesting or reindexing anything also settles the backlog before the run finishes |
@@ -3290,6 +3336,21 @@ carry no checksum, are read as before, and are rewritten at version 3 when the n
 older build does not read version 3: it logs the file as unreadable and starts with no history, so
 rolling back loses the record of each source's last run, never indexed data, unless a
 pre-upgrade image is restored.
+
+**`<namespace>/graph/` — no step required, but a rollback needs one.** A built graph now carries a
+checksum for every file: `edgestore.meta` is version 2, recording each column's length and CRC32C
+and a CRC32C of its own; each dictionary index is version 2, ending in the length and CRC32C of its
+text and a CRC32C over the index; and `entity_vectors.vec` is version 2, whose 40-byte header adds
+CRC32Cs of the presence flags, the vectors and itself. A graph an older build wrote is read as
+before and served unverified — `excalibur-fsck` and `verify --deep` report it
+`LEGACY_UNPROTECTED` — until the next `POST /v1/graph/build` replaces it with a checksummed one.
+Nothing else changes: the staging logs are untouched, and the graph is derived from them.
+
+An older build refuses the version 2 descriptor, dictionaries and vectors, so a node rolled back
+over a graph this build wrote does not serve it. Before rolling back, stop the node and remove each
+namespace's `graph` directory (and any `graph.previous` or `graph.retired` beside it) — they are
+derived from `graph-staging`, which stays — then start the older build and `POST /v1/graph/build`
+for each namespace.
 
 ### Enabling debug logging
 

@@ -32,6 +32,12 @@ public final class FileClassifier {
         if (FileKind.isDiagnosticDump(name)) {
             return FileKind.DIAGNOSTIC_DUMP;
         }
+        // Before the leftover test: a build writes staged names inside its own scratch
+        // directory, and what any file under a graph directory is depends on that directory's
+        // role, which the graph check decides as a whole.
+        if (GraphStoreCheck.isGraphPart(relative)) {
+            return FileKind.GRAPH_STORE_PART;
+        }
         if (FileKind.isLeftover(name)) {
             return FileKind.STAGING_LEFTOVER;
         }
@@ -39,9 +45,13 @@ public final class FileClassifier {
             return name.endsWith(LexicalSidecars.LOOKUP_TABLE)
                 ? FileKind.LEXICAL_KEY_LOOKUP : FileKind.LEXICAL_STORE_PART;
         }
-        if (relative.contains(GraphStagingCheck.DIRECTORY_SUFFIX + "/")
-                && GraphStagingCheck.matches(name)) {
-            return FileKind.GRAPH_STAGING_LOG;
+        if (relative.contains(GraphStagingCheck.DIRECTORY_SUFFIX + "/")) {
+            if (GraphStagingCheck.matches(name)) {
+                return FileKind.GRAPH_STAGING_LOG;
+            }
+            if (GraphStagingCheck.ERASURE_INTERRUPTED_MARKER.equals(name)) {
+                return FileKind.GRAPH_ERASURE_MARKER;
+            }
         }
         FileKind byName = byFileName(name);
         return byName != null ? byName : FileKind.UNRECOGNISED;

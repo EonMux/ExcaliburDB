@@ -49,6 +49,13 @@ public final class DataDirectoryInventory {
     /** A tenant's built edge store, rebuildable from that tenant's staging logs. */
     private static final String BUILT_GRAPH_DIRECTORY = "graph";
 
+    /**
+     * What begins the name of each directory a publish, a build or an erasure compaction leaves
+     * beside a tenant's built graph: {@code graph.previous}, {@code graph.retired},
+     * {@code graph.building} and {@code graph.compacting}.
+     */
+    private static final String BUILT_GRAPH_SIBLING_PREFIX = BUILT_GRAPH_DIRECTORY + ".";
+
     /** The quantiser codebook sidecar, rebuildable by retraining. */
     private static final String CODEBOOK_SUFFIX = ".pqcb";
 
@@ -189,7 +196,11 @@ public final class DataDirectoryInventory {
         if (segments.length > 1 && segments[0].equals(LEXICAL_DIRECTORY)) {
             return true;
         }
-        return segments.length > 2 && segments[1].equals(BUILT_GRAPH_DIRECTORY);
+        // The directories beside the graph hold copies of it or scratch toward the next one,
+        // derived from staging like the graph itself; kept or left out with it, since what
+        // recovery does with each depends on whether the graph is there.
+        return segments.length > 2 && (segments[1].equals(BUILT_GRAPH_DIRECTORY)
+            || segments[1].startsWith(BUILT_GRAPH_SIBLING_PREFIX));
     }
 
     /**

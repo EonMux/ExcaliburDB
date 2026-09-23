@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.graph.dictionary;
 
+import com.eonmux.excalibur.core.integrity.IndexChecksum;
 import com.eonmux.excalibur.graph.file.Durability;
 import com.eonmux.excalibur.graph.format.EdgeStoreDescriptor;
 
@@ -27,8 +28,11 @@ import java.util.Map;
  * half-written one that opens and returns wrong names.
  *
  * <p>A dictionary is two files and therefore two renames, which cannot be made one atomic act. A
- * crash between them is detected on the other side, by {@link LabelDictionary#open} comparing the
- * text length the index describes against the text that is actually there.
+ * crash between them is detected on the other side: the index, written last, ends with the
+ * length and CRC32C of the text it was written beside and a CRC32C of itself, and
+ * {@link LabelDictionary#open} refuses a pair that no longer matches them. The checksums are
+ * computed from the bytes as they are handed to the file, before either is forced, so they
+ * describe exactly what the build meant to publish.
  *
  * <p>Not thread-safe: build one, write it, discard it.
  */
@@ -85,14 +89,17 @@ public final class LabelDictionaryWriter {
                 throw new IOException("dictionary text exceeds " + Integer.MAX_VALUE + " bytes");
             }
 
+            java.util.zip.CRC32C textCrc = new java.util.zip.CRC32C();
             try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(dataTemp))) {
                 for (byte[] bytes : encoded) {
                     out.write(bytes);
+                    textCrc.update(bytes);
                 }
             }
 
             ByteBuffer index = ByteBuffer
-                .allocate(LabelDictionary.HEADER_BYTES + ids.size() * LabelDictionary.ENTRY_BYTES)
+                .allocate(LabelDictionary.HEADER_BYTES + ids.size() * LabelDictionary.ENTRY_BYTES
+                    + LabelDictionary.TRAILER_BYTES)
                 .order(EdgeStoreDescriptor.COLUMN_BYTE_ORDER);
             index.putLong(LabelDictionary.MAGIC);
             index.putInt(LabelDictionary.VERSION);
@@ -105,6 +112,9 @@ public final class LabelDictionaryWriter {
                 index.putInt(bytes.length);
                 offset += bytes.length;
             }
+            index.putLong(total);
+            index.putInt((int) textCrc.getValue());
+            index.putInt((int) IndexChecksum.of(index.array(), 0, index.position()));
             try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(indexTemp));
                  DataOutputStream data = new DataOutputStream(out)) {
                 data.write(index.array());
