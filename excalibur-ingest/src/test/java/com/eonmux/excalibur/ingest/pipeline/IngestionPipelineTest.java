@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
+import com.eonmux.excalibur.ingest.erasure.RecordingVectorEraser;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.source.DocumentNotFoundException;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
@@ -1164,20 +1165,17 @@ class IngestionPipelineTest {
             // document rolled back after its chunks were written may already be in a graph -
             // rankable by name and distance, with no text behind it and nothing else able to
             // reach the node.
-            List<String> retired = new CopyOnWriteArrayList<>();
+            RecordingVectorEraser eraser = new RecordingVectorEraser(1);
             IngestionOrchestrator orchestrator = new IngestionOrchestrator(new TextChunker(),
                 embeddings, storage, index, registry, new RefusingTracker());
-            orchestrator.setVectorEraser(documentKey -> {
-                retired.add(documentKey);
-                return 1;
-            });
+            orchestrator.setVectorEraser(eraser);
 
             orchestrator.ingestNow(new FakeSource("docs", Map.of("a.txt", "some text")));
 
             assertThat(storedChunkExists("docs", "a.txt", 0))
                 .as("precondition: the rollback removed the chunks it had written")
                 .isFalse();
-            assertThat(retired)
+            assertThat(eraser.documents())
                 .as("a node outlives the chunk it was built from unless it is retired too")
                 .containsExactly("docs:a.txt");
         }

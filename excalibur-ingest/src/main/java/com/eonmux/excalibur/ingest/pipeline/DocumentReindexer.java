@@ -121,10 +121,10 @@ public class DocumentReindexer {
      * Retires the graph nodes of every document this reindex removes, or null for no vector
      * index.
      *
-     * <p>A node is attributed to a document rather than to a chunk, so nothing the storage
-     * tombstone or the registry removal touches can reach it: without this the document stays
-     * rankable by vector search - reported by name, with a distance - after the reindex has
-     * removed everything else of it.</p>
+     * <p>The storage tombstones retire the document's nodes too, once the integration worker
+     * replays them; until then a query sets the nodes aside only as far as its bounded tail scan
+     * reaches. Retiring here is what makes the removal hold however far integration has fallen
+     * behind.</p>
      */
     private volatile DocumentErasureService.VectorEraser vectorEraser;
 

@@ -146,23 +146,38 @@ public final class DocumentErasureService {
     }
 
     /**
-     * Retires the graph nodes of one document.
+     * Retires graph nodes, by document or by chunk.
      *
-     * <p>Named by document rather than by chunk because that is how a node is attributed: the
-     * integration worker records the document a node came from as it inserts, and nothing maps a
-     * node back to the chunk id the registry holds.</p>
+     * <p>A document is erased by document rather than by its chunks: a node is attributed to its
+     * chunk, but the registry names only the chunks of the current version, and a node of an
+     * earlier version the integration worker has not yet superseded belongs to the document all
+     * the same. Every graph indexes its nodes by document for exactly this call. Retiring by chunk
+     * is for the chunks a replacement no longer reaches, where the document itself stays.</p>
      */
-    @FunctionalInterface
     public interface VectorEraser {
 
         /**
-         * Retires every graph node attributed to a document.
+         * Retires every graph node attributed to a chunk of a document.
          *
          * @param documentKey The document, as {@link ChunkIdentifiers#documentKey(String, String)}
          *                    forms it
          * @return The number of nodes retired
          */
         int erase(String documentKey);
+
+        /**
+         * Retires every graph node attributed to one of the named chunks.
+         *
+         * <p>Only for chunks that are about to be tombstoned in storage, and called before they
+         * are. A value written under one of these ids before the call is deleted by that tombstone
+         * too, and one written after it is a node this call never sees; either way the graph ends
+         * up holding what storage does. Called for an id that stays in storage, it would retire a
+         * vector nothing inserts again.</p>
+         *
+         * @param chunkIds The chunk ids, as {@link ChunkIdentifiers#chunkId} forms them
+         * @return The number of nodes retired
+         */
+        int eraseChunks(Collection<String> chunkIds);
     }
 
     /**
@@ -198,8 +213,8 @@ public final class DocumentErasureService {
      *
      * <p>A node carries no text, so leaving one behind reads as harmless. It is not: a search that
      * ranks it says the document matched the query, with a distance and the document's name, which
-     * is the fact the request asked to remove. Nothing else can reach the graphs - the registry
-     * names chunks, and a node is attributed to a document.</p>
+     * is the fact the request asked to remove. The chunk tombstones reach the graphs too, but only
+     * once the integration worker replays them, which is after the caller has been answered.</p>
      */
     private final VectorEraser vectorEraser;
 
@@ -497,9 +512,9 @@ public final class DocumentErasureService {
             return vectorEraser.erase(documentKey);
         } catch (RuntimeException e) {
             // Reported by the count rather than thrown, and deliberately not a reason to keep the
-            // registry entry: the entry exists to name chunks, and a node is attributed to a
-            // document, so keeping it would not help a later attempt reach the graph. The content
-            // leaving storage is the half of the promise this node can always keep.
+            // registry entry: the chunk tombstones reach the graph through the write log whatever
+            // happens here, so keeping it would not help a later attempt. The content leaving
+            // storage is the half of the promise this node can always keep.
             LOGGER.warn("Vectors of document {} stay searchable: {}", documentKey, e.getMessage());
             return 0;
         }

@@ -339,6 +339,11 @@ class ReindexCancellationTest {
             }
             return 1;
         }
+
+        @Override
+        public int eraseChunks(java.util.Collection<String> chunkIds) {
+            return chunkIds.size();
+        }
     }
 
     /** A source whose documents, failures and cancellation point the test decides. */

@@ -78,11 +78,11 @@ class SegmentVectorEraserTest {
         return graphs;
     }
 
-    /** Inserts one node attributed to a document, and returns its node ID. */
-    private static long insert(HnswGraph graph, String documentKey, int vectorIndex)
+    /** Inserts one node attributed to a chunk, as the integration worker does, and returns it. */
+    private static long insert(HnswGraph graph, String chunkId, int vectorIndex)
         throws IOException {
         long nodeId = graph.insert(unitVector(vectorIndex));
-        graph.registerDocumentId(nodeId, documentKey);
+        graph.attributeChunk(nodeId, chunkId);
         return nodeId;
     }
 
@@ -99,8 +99,8 @@ class SegmentVectorEraserTest {
         List<Long> erased = new ArrayList<>();
         List<Long> kept = new ArrayList<>();
         for (int i = 0; i < attached.size(); i++) {
-            erased.add(insert(attached.get(i), "docs:secret.md", i));
-            kept.add(insert(attached.get(i), "docs:public.md", i + 1));
+            erased.add(insert(attached.get(i), "docs:secret.md:chunk:" + i, i));
+            kept.add(insert(attached.get(i), "docs:public.md:chunk:" + i, i + 1));
         }
 
         assertThat(eraser.erase("docs:secret.md")).isEqualTo(attached.size());
@@ -119,7 +119,7 @@ class SegmentVectorEraserTest {
     @DisplayName("the tombstone is written to the graph file, not held beside it")
     void tombstonesReachTheGraphFile() throws Exception {
         HnswGraph graph = attachGraphs().get(0);
-        long nodeId = insert(graph, "docs:secret.md", 0);
+        long nodeId = insert(graph, "docs:secret.md:chunk:0", 0);
         graph.flush();
         Path graphPath = tempDir.resolve("graph-0.hnsw");
 
@@ -136,10 +136,35 @@ class SegmentVectorEraserTest {
     @DisplayName("a document no segment holds retires nothing")
     void anUnknownDocumentRetiresNothing() throws Exception {
         HnswGraph graph = attachGraphs().get(0);
-        insert(graph, "docs:public.md", 0);
+        insert(graph, "docs:public.md:chunk:0", 0);
 
         assertThat(eraser.erase("docs:never-ingested.md")).isZero();
         assertThat(eraser.erase(null)).isZero();
+    }
+
+    @Test
+    @DisplayName("named chunks are retired in every segment, and the rest of the document is not")
+    void retiresNamedChunksAcrossEverySegment() throws Exception {
+        List<HnswGraph> attached = attachGraphs();
+        List<Long> surplus = new ArrayList<>();
+        List<Long> kept = new ArrayList<>();
+        List<String> surplusIds = new ArrayList<>();
+        for (int i = 0; i < attached.size(); i++) {
+            String surplusId = "docs:a.md:chunk:" + (attached.size() + i);
+            surplusIds.add(surplusId);
+            surplus.add(insert(attached.get(i), surplusId, i));
+            kept.add(insert(attached.get(i), "docs:a.md:chunk:" + i, i + 1));
+        }
+
+        assertThat(eraser.eraseChunks(surplusIds)).isEqualTo(attached.size());
+        assertThat(eraser.eraseChunks(List.of())).isZero();
+
+        for (int i = 0; i < attached.size(); i++) {
+            assertThat(attached.get(i).isTombstoned(surplus.get(i))).isTrue();
+            assertThat(attached.get(i).isTombstoned(kept.get(i)))
+                .as("the chunks the replacement still holds keep their vectors")
+                .isFalse();
+        }
     }
 
     @Test
@@ -151,5 +176,6 @@ class SegmentVectorEraserTest {
         assertThatCode(() -> assertThat(eraser.erase("docs:a.md")).isZero())
             .as("a node that keeps no vector index still erases from storage")
             .doesNotThrowAnyException();
+        assertThat(eraser.eraseChunks(List.of("docs:a.md:chunk:0"))).isZero();
     }
 }

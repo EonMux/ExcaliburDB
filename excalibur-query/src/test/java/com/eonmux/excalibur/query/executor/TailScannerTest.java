@@ -182,7 +182,8 @@ class TailScannerTest {
             assertThat(results).hasSize(3);
             assertThat(results)
                 .extracting(HnswSearchResult::documentId)
-                .containsExactly("src:identical", "src:orthogonal", "src:opposite");
+                .containsExactly("src:identical:chunk:0", "src:orthogonal:chunk:0",
+                    "src:opposite:chunk:0");
             assertThat(results.get(0).distance()).isLessThan(results.get(1).distance());
             assertThat(results.get(1).distance()).isLessThan(results.get(2).distance());
         }
@@ -206,16 +207,17 @@ class TailScannerTest {
 
             assertThat(results)
                 .extracting(HnswSearchResult::documentId)
-                .containsExactly("src:near", "src:middle");
+                .containsExactly("src:near:chunk:0", "src:middle:chunk:0");
         }
     }
 
     /**
-     * Every tail-scan hit must carry the document identity decoded from its entry key, so
-     * the document atomicity filter can classify it instead of dropping it.
+     * Every tail-scan hit is named by the chunk its entry was written under - the name the graph
+     * node it later becomes carries too - so the two deduplicate and the document atomicity
+     * filter can derive the document from either.
      */
     @Test
-    void testTailScanResultsCarryDocumentIds() throws IOException {
+    void testTailScanResultsCarryChunkIds() throws IOException {
         TailScanner scanner = new TailScanner();
         float[] query = {1.0f, 0.0f};
 
@@ -226,11 +228,10 @@ class TailScannerTest {
             List<HnswSearchResult> results = scanner.performTailScan(
                 query, log, 0, log.writeOffset(), 10, CosineSimilarity.getInstance());
 
-            assertThat(results).hasSize(2);
-            assertThat(results).allSatisfy(result -> {
-                assertThat(result.documentId()).isEqualTo("source1:doc1");
-                assertThat(TailScanner.isTailScanResult(result.nodeId())).isTrue();
-            });
+            assertThat(results).extracting(HnswSearchResult::documentId)
+                .containsExactly("source1:doc1:chunk:0", "source1:doc1:chunk:1");
+            assertThat(results).allSatisfy(result ->
+                assertThat(TailScanner.isTailScanResult(result.nodeId())).isTrue());
         }
     }
 
@@ -324,7 +325,7 @@ class TailScannerTest {
             assertThat(outcome.payloads()).hasSize(2);
 
             HnswSearchResult closest = outcome.results().get(0);
-            assertThat(closest.documentId()).isEqualTo("source1:doc1");
+            assertThat(closest.documentId()).isEqualTo("source1:doc1:chunk:0");
             assertThat(new String(outcome.payload(closest.nodeId()), StandardCharsets.UTF_8))
                 .isEqualTo("the closest chunk");
         }
@@ -371,6 +372,62 @@ class TailScannerTest {
             assertThat(outcome.payloads()).hasSize(1);
             assertThat(new String(outcome.payload(outcome.results().get(0).nodeId()),
                 StandardCharsets.UTF_8)).isEqualTo("near text");
+        }
+    }
+
+    /**
+     * A chunk rewritten in the tail ranks by its latest value only: the earlier value is what
+     * storage replaced, and ranking it would put text back into the answer that is no longer
+     * there.
+     */
+    @Test
+    void testARewrittenChunkRanksByItsLatestValueOnly() throws IOException {
+        TailScanner scanner = new TailScanner();
+        float[] query = {1.0f, 0.0f};
+
+        try (WriteLog log = new WriteLog(tempDir.resolve("rewrite.wal"))) {
+            appendChunk(log, "source1:doc1", 0, new float[]{1.0f, 0.0f}, "old text");
+            appendChunk(log, "source1:doc2", 0, new float[]{0.5f, 0.5f}, "other text");
+            appendChunk(log, "source1:doc1", 0, new float[]{0.0f, 1.0f}, "new text");
+
+            TailScanner.TailScanOutcome outcome = scanner.scan(
+                query, log, 0, log.writeOffset(), 10, CosineSimilarity.getInstance());
+
+            assertThat(outcome.results()).extracting(HnswSearchResult::documentId)
+                .containsExactly("source1:doc2:chunk:0", "source1:doc1:chunk:0");
+            HnswSearchResult rewritten = outcome.results().get(1);
+            assertThat(new String(outcome.payload(rewritten.nodeId()), StandardCharsets.UTF_8))
+                .as("the text returned is the value the hit ranked by").isEqualTo("new text");
+            assertThat(outcome.entriesScanned()).isEqualTo(3);
+            assertThat(outcome.touchedKeys())
+                .containsExactlyInAnyOrder("source1:doc1:chunk:0", "source1:doc2:chunk:0");
+        }
+    }
+
+    /**
+     * A chunk deleted in the tail ranks nothing, whatever it held before; one written again
+     * after its deletion ranks by the new value. Both are reported as touched, so the caller can
+     * set aside what the graph still holds for them.
+     */
+    @Test
+    void testADeletedChunkRanksNothingUntilWrittenAgain() throws IOException {
+        TailScanner scanner = new TailScanner();
+        float[] query = {1.0f, 0.0f};
+
+        try (WriteLog log = new WriteLog(tempDir.resolve("delete.wal"))) {
+            appendChunk(log, "source1:gone", 0, new float[]{1.0f, 0.0f}, "erased");
+            log.appendDelete("source1:gone:chunk:0".getBytes(StandardCharsets.UTF_8));
+            log.appendDelete("source1:back:chunk:0".getBytes(StandardCharsets.UTF_8));
+            appendChunk(log, "source1:back", 0, new float[]{0.9f, 0.1f}, "restored");
+
+            TailScanner.TailScanOutcome outcome = scanner.scan(
+                query, log, 0, log.writeOffset(), 10, CosineSimilarity.getInstance());
+
+            assertThat(outcome.results()).extracting(HnswSearchResult::documentId)
+                .containsExactly("source1:back:chunk:0");
+            assertThat(outcome.touchedKeys())
+                .containsExactlyInAnyOrder("source1:gone:chunk:0", "source1:back:chunk:0");
+            assertThat(outcome.entriesScanned()).isEqualTo(4);
         }
     }
 

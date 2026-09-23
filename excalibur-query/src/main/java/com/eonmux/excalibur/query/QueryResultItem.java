@@ -8,9 +8,10 @@ import java.util.Objects;
 /**
  * A single result item from an ANN query.
  *
- * <p>QueryResultItem represents one matching result from a top-k ANN search.
- * It includes the document ID, similarity score/distance, and optionally
- * the stored payload data.</p>
+ * <p>QueryResultItem represents one matching result from a top-k ANN search: one chunk of a
+ * document, named by its chunk id ({@link #documentIdStr()}), with its similarity
+ * score/distance and optionally the chunk's stored text. Several chunks of one document can
+ * each be a result.</p>
  *
  * <h2>Score vs Distance</h2>
  * <p>The interpretation of the score depends on the distance function:</p>
@@ -147,13 +148,18 @@ public final class QueryResultItem {
     }
 
     /**
-     * Returns the string document identifier.
+     * Returns the name the ingestion pipeline gave what this result found.
      *
-     * <p>This is the actual document ID from the source (e.g., "doc1", "source1:file1"),
-     * used by the {@code DocumentAtomicityFilter} to correctly identify which document
-     * each query result belongs to.</p>
+     * <p>For a vector result that is the chunk the vector embeds,
+     * {@code sourceId:documentId:chunk:N} - the storage key its text is read back by, and the
+     * name the lexical index gives the same passage, which is what lets hybrid fusion recognise
+     * one passage found by both. The owning document is derived from it with
+     * {@code ChunkIdentifiers.documentKeyOfChunk}, as the {@code DocumentAtomicityFilter} does
+     * to decide the result's visibility. A graph an older build attributed by document names
+     * {@code sourceId:documentId} instead, until the node re-keys it on its first integration
+     * pass.</p>
      *
-     * @return The string document ID, or null if not available
+     * @return The chunk id, or null if not available
      */
     public String documentIdStr() {
         return documentIdStr;

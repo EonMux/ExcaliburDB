@@ -31,7 +31,7 @@ import java.util.PriorityQueue;
  * <ol>
  *   <li>Collect all results from all segments</li>
  *   <li>Sort by score/distance (depending on metric)</li>
- *   <li>Deduplicate by document ID</li>
+ *   <li>Deduplicate by chunk id</li>
  *   <li>Take top-k results</li>
  * </ol>
  *
@@ -44,7 +44,7 @@ import java.util.PriorityQueue;
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Results are always sorted (closest/smallest distance first OR highest relevance first)</li>
- *   <li>No duplicate document IDs in output</li>
+ *   <li>No chunk id appears twice in the output</li>
  *   <li>Exactly k results (or fewer if insufficient candidates)</li>
  *   <li>Coverage is computed from segment statistics</li>
  * </ul>
@@ -133,7 +133,7 @@ public class ResultAggregator {
      *   <li>All scores are in range [0.0, 1.0]</li>
      *   <li>Results are sorted by score descending (highest/best first)</li>
      *   <li>Threshold is applied to normalized scores (filter out scores below threshold)</li>
-     *   <li>No duplicate document IDs in output</li>
+     *   <li>No chunk id appears twice in the output</li>
      * </ul>
      *
      * @param segmentResults Results from each segment
@@ -152,9 +152,9 @@ public class ResultAggregator {
         }
 
         // Phase 1: Collect all results, normalize scores, and deduplicate
-        // Keep the best (highest normalized score) for each document
+        // Keep the best (highest normalized score) for each chunk
         Map<String, QueryResultItem> bestResultsByDocId =
-            bestPerDocument(segmentResults, distanceFunction);
+            bestPerChunk(segmentResults, distanceFunction);
 
         // Phase 2: Select top-k results using a min-heap
         PriorityQueue<QueryResultItem> topResults = selectTopK(bestResultsByDocId.values());
@@ -163,24 +163,24 @@ public class ResultAggregator {
         List<QueryResultItem> results = new ArrayList<>(topResults);
         results.sort(Comparator.comparingDouble(QueryResultItem::score).reversed());
 
-        LOGGER.trace("Aggregated {} results from {} segments ({} unique documents)",
+        LOGGER.trace("Aggregated {} results from {} segments ({} unique chunks)",
             results.size(), segmentResults.size(), bestResultsByDocId.size());
 
         return results;
     }
 
     /**
-     * Keeps one result per document, the best-scoring one wherever several segments hold it.
+     * Keeps one result per chunk, the best-scoring one wherever several segments hold it.
      *
      * <p>A failed segment contributes nothing at all. Its result carries whatever its task had
      * recorded before it failed, and ranking a partial read alongside complete ones would put
-     * an arbitrary subset of a segment's documents into the answer.</p>
+     * an arbitrary subset of a segment's chunks into the answer.</p>
      *
      * @param segmentResults Results from each segment
      * @param distanceFunction The distance function used, for normalization
-     * @return The best result for each document, keyed as {@link #dedupeKey} describes
+     * @return The best result for each chunk, keyed as {@link #dedupeKey} describes
      */
-    private Map<String, QueryResultItem> bestPerDocument(
+    private Map<String, QueryResultItem> bestPerChunk(
             List<SegmentQueryTask.SegmentQueryResult> segmentResults,
             DistanceFunction distanceFunction) {
 
@@ -198,7 +198,7 @@ public class ResultAggregator {
                     continue;
                 }
 
-                // Keep the best (highest normalized score) result for each document
+                // Keep the best (highest normalized score) result for each chunk
                 String dedupeKey = dedupeKey(hnswResult.documentId(), segmentResult.segmentId(),
                     hnswResult.nodeId());
                 bestResultsByDocId.merge(dedupeKey, item, (existing, newItem) ->
@@ -300,8 +300,11 @@ public class ResultAggregator {
     /**
      * Builds the deduplication key for a result.
      *
-     * <p>The string document ID identifies a document across the whole corpus and is
-     * used whenever it is available. Node IDs, in contrast, are dense and allocated
+     * <p>The string identifier - the chunk id a result is named by - identifies one passage
+     * across the whole corpus and is used whenever it is available. Several chunks of one
+     * document are several results; what is collapsed is the same chunk reported twice, as the
+     * graph node and the tail-scan hit it came from, or by a segment and the one it split
+     * into. Node IDs, in contrast, are dense and allocated
      * per HNSW graph - every segment restarts them at 0, and write-log tail scans
      * derive theirs from a per-segment LSN - so a bare node ID collides across
      * segments and would silently discard a legitimate hit from another segment.
@@ -313,7 +316,7 @@ public class ResultAggregator {
      * @param documentIdStr The string document ID, or null or empty when unknown
      * @param segmentId The segment that produced the result
      * @param nodeId The node ID within that segment
-     * @return A key that is unique per document, or per (segment, node) when the
+     * @return A key that is unique per chunk, or per (segment, node) when the
      *         document ID is unknown
      */
     private static String dedupeKey(String documentIdStr, long segmentId, long nodeId) {

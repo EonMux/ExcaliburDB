@@ -27,17 +27,13 @@ import java.util.Objects;
  *
  * <h2>Key shape</h2>
  * <p>Ingestion writes one storage entry per chunk under
- * {@code sourceId:documentId:chunk:index} ({@code ChunkIdentifiers.chunkId}), but the HNSW
- * integration worker registers only the owning document key {@code sourceId:documentId}
- * against the node. A graph result therefore identifies a document, not the chunk inside
- * it, so this resolver:</p>
- * <ol>
- *   <li>tries the result's document ID as a storage key directly - which is what it is
- *       for a write-log tail-scan hit or a single-key corpus; and</li>
- *   <li>failing that, reads the document's chunks in index order and concatenates their
- *       text, bounded by {@link #MAX_CHUNK_PROBES} chunks and
- *       {@link ChunkValueCodec#MAX_TEXT_BYTES} bytes.</li>
- * </ol>
+ * {@code sourceId:documentId:chunk:index} ({@code ChunkIdentifiers.chunkId}), and a result - a
+ * graph node or a write-log tail-scan hit - is named by that same chunk id, so its text is one
+ * point lookup of its own name. The one exception is a graph an older build attributed by
+ * document, which names only {@code sourceId:documentId} until the integration worker re-keys
+ * it; for such a result this resolver reads the document's chunks in index order and
+ * concatenates their text, bounded by {@link #MAX_CHUNK_PROBES} chunks and
+ * {@link ChunkValueCodec#MAX_TEXT_BYTES} bytes.</p>
  *
  * <h2>Read scope</h2>
  * <p>The result's own segment is read first: that is the segment whose write log the

@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
+import com.eonmux.excalibur.ingest.erasure.RecordingVectorEraser;
 import com.eonmux.excalibur.core.text.ChunkIdentifiers;
 import com.eonmux.excalibur.ingest.lexical.ChunkLexicalIndex;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
@@ -28,7 +29,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -78,12 +78,9 @@ class ReingestionTest {
     @DisplayName("with fewer chunks retires the previous version's tail everywhere")
     void fewerChunksRetireTheTail() {
         DocumentVisibilityTracker tracker = new DocumentVisibilityTracker(documents);
-        List<String> retiredVectors = new CopyOnWriteArrayList<>();
+        RecordingVectorEraser retiredVectors = new RecordingVectorEraser(1);
         IngestionOrchestrator orchestrator = orchestrator(tracker);
-        orchestrator.setVectorEraser(documentKey -> {
-            retiredVectors.add(documentKey);
-            return 1;
-        });
+        orchestrator.setVectorEraser(retiredVectors);
         MutableSource source = new MutableSource("docs");
 
         List<String> oldWords = words("old", 60);
@@ -111,21 +108,22 @@ class ReingestionTest {
         assertThat(hits("replacement")).isOne();
         assertThat(tracker.getVisibility("docs:a.txt").chunkIds())
             .containsExactlyElementsOf(current.getChunkIds());
-        assertThat(retiredVectors)
-            .as("the document stays published, so its graph nodes are left to it")
+        assertThat(retiredVectors.documents())
+            .as("the document stays published, so it is not retired as a whole")
             .isEmpty();
+        assertThat(retiredVectors.chunks())
+            .as("the vectors of exactly the chunks the replacement no longer reaches are retired")
+            .containsExactlyElementsOf(
+                oldChunkIds.subList(current.getChunkIds().size(), oldChunkIds.size()));
     }
 
     @Test
     @DisplayName("that fails to publish leaves the previous version in place")
     void aFailedReplacementKeepsThePrevious() {
         RefusingTracker tracker = new RefusingTracker(documents);
-        List<String> retiredVectors = new CopyOnWriteArrayList<>();
+        RecordingVectorEraser retiredVectors = new RecordingVectorEraser(1);
         IngestionOrchestrator orchestrator = orchestrator(tracker);
-        orchestrator.setVectorEraser(documentKey -> {
-            retiredVectors.add(documentKey);
-            return 1;
-        });
+        orchestrator.setVectorEraser(retiredVectors);
         MutableSource source = new MutableSource("docs");
 
         source.put("a.txt", String.join(" ", words("old", 60)));
@@ -153,9 +151,10 @@ class ReingestionTest {
                 .isFalse();
         }
         assertThat(hits(newWords.get(newWords.size() - 1))).isZero();
-        assertThat(retiredVectors)
+        assertThat(retiredVectors.documents())
             .as("the previous version is still published and still owns its graph nodes")
             .isEmpty();
+        assertThat(retiredVectors.chunks()).isEmpty();
     }
 
     private IngestionOrchestrator orchestrator(DocumentVisibilityTracker tracker) {

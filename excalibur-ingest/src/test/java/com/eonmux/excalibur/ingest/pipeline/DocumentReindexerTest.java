@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
+import com.eonmux.excalibur.ingest.erasure.RecordingVectorEraser;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
@@ -861,13 +862,10 @@ class DocumentReindexerTest {
             // Storage tombstones the chunks and the registry entry goes, but a graph node is
             // attributed to a document rather than to a chunk: nothing else reaches it, so the
             // document stays rankable by vector search with its name and a distance.
-            List<String> retired = new ArrayList<>();
+            RecordingVectorEraser eraser = new RecordingVectorEraser(2);
             DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
                 upsertHandler, registry, storageWriter);
-            reindexer.setVectorEraser(documentKey -> {
-                retired.add(documentKey);
-                return 2;
-            });
+            reindexer.setVectorEraser(eraser);
 
             MockSource both = new MockSource("test-source");
             both.addDocument("doc-1", "kept content. ".repeat(20));
@@ -879,7 +877,7 @@ class DocumentReindexerTest {
             DocumentReindexer.ReindexResult result = reindexer.reindexAll(shrunk);
 
             assertEquals(1, result.getDocumentsTombstoned());
-            assertEquals(List.of("test-source:doc-2"), retired,
+            assertEquals(List.of("test-source:doc-2"), eraser.documents(),
                 "nodes are attributed by source and document, and must be asked for that way");
         }
 

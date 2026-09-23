@@ -277,7 +277,8 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
             segmentId, tailScanEntries, tailScan.results().size());
 
         // Step 4: Merge HNSW and tail scan results
-        List<HnswSearchResult> results = mergeResults(hnswResults, tailScan.results(), k);
+        List<HnswSearchResult> results =
+            mergeResults(hnswResults, tailScan.results(), tailScan.touchedKeys(), k);
 
         return new SegmentReading(results, payloads, tailScanEntries, complete);
     }
@@ -373,7 +374,7 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
         List<HnswSearchResult> named = graph.search(queryVector, searchK, lshCandidates);
         LOGGER.trace("Segment {}: {} LSH candidates measured, {} ranked beside {} graph results",
             segmentId, lshCandidates.size(), named.size(), walked.size());
-        return mergeResults(walked, named, searchK);
+        return mergeResults(walked, named, Set.of(), searchK);
     }
 
     /**
@@ -419,31 +420,50 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
     }
 
     /**
-     * Merges two ranked result lists, removing duplicates.
+     * Merges two ranked result lists, one per chunk.
      *
      * <p>Used for the graph search against the LSH candidates, and for the graph's answer
-     * against the tail scan's. Both inputs carry {@link HnswSearchResult#distance()}, a dissimilarity where
-     * smaller is closer for every metric, so a single ascending sort ranks them
-     * correctly against each other.</p>
+     * against the tail scan's. Both inputs carry {@link HnswSearchResult#distance()}, a
+     * dissimilarity where smaller is closer for every metric, so a single ascending sort ranks
+     * them correctly against each other.</p>
+     *
+     * <p>A first-list hit on a chunk in {@code touchedKeys} is dropped: against a tail scan, the
+     * tail holds that chunk's later value or its deletion, and the graph's node is the value
+     * storage has since replaced. The tail's own hit for it, if any, stands in its place. What
+     * remains is deduplicated by chunk, which collapses the same node found by both the walk and
+     * the LSH candidates, a node the integration worker absorbed while this search ran with the
+     * tail hit it came from, and the instant during a supersession when a chunk's old and new
+     * nodes are both still reachable.</p>
+     *
+     * @param hnswResults What the graph returned
+     * @param otherResults What the LSH candidates or the tail scan returned
+     * @param touchedKeys Every chunk the tail scan read an entry for; empty for LSH candidates
+     * @param limit How many results to keep
+     * @return The merged results, closest first
      */
     private List<HnswSearchResult> mergeResults(
             List<HnswSearchResult> hnswResults,
-            List<HnswSearchResult> tailResults,
+            List<HnswSearchResult> otherResults,
+            Set<String> touchedKeys,
             int limit) {
 
-        // Combine and sort by distance
-        List<HnswSearchResult> combined = new ArrayList<>(hnswResults.size() + tailResults.size());
-        combined.addAll(hnswResults);
-        combined.addAll(tailResults);
+        List<HnswSearchResult> combined = new ArrayList<>(hnswResults.size() + otherResults.size());
+        for (HnswSearchResult result : hnswResults) {
+            if (result.documentId() == null || !touchedKeys.contains(result.documentId())) {
+                combined.add(result);
+            }
+        }
+        combined.addAll(otherResults);
 
         combined.sort((a, b) -> Float.compare(a.distance(), b.distance()));
 
-        // Deduplicate by node ID and limit to k
-        java.util.Set<Long> seen = new java.util.HashSet<>();
+        // An unnamed result has only its node ID to be told apart by
+        java.util.Set<Object> seen = new java.util.HashSet<>();
         List<HnswSearchResult> deduped = new ArrayList<>();
 
         for (HnswSearchResult result : combined) {
-            if (seen.add(result.nodeId())) {
+            Object identity = result.documentId() != null ? result.documentId() : result.nodeId();
+            if (seen.add(identity)) {
                 deduped.add(result);
                 if (deduped.size() >= limit) {
                     break;
@@ -578,8 +598,8 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
         /**
          * Returns the chunk text of a tail-scan result, or null.
          *
-         * <p>Graph results carry no payload here: their node ID resolves to a document,
-         * not to the storage key of one chunk, so their text is resolved later by
+         * <p>Graph results carry no payload here: their text is read from storage under the
+         * chunk id they are named by, once selection has narrowed the set, by
          * {@code com.eonmux.excalibur.query.payload.ResultPayloadResolver}.</p>
          *
          * @param nodeId The node ID of a result in {@link #results()}

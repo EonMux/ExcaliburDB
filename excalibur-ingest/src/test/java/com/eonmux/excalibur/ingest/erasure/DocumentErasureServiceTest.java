@@ -22,7 +22,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -615,14 +614,11 @@ class DocumentErasureServiceTest {
     @DisplayName("The vector index")
     class Vectors {
 
-        /** Records what it was asked to retire, standing in for the segments' graphs. */
-        private final List<String> retired = new ArrayList<>();
+        private RecordingVectorEraser eraser;
 
         private DocumentErasureService.VectorEraser recording(int perDocument) {
-            return documentKey -> {
-                retired.add(documentKey);
-                return perDocument;
-            };
+            eraser = new RecordingVectorEraser(perDocument);
+            return eraser;
         }
 
         private DocumentErasureService withEraser(DocumentErasureService.VectorEraser eraser) {
@@ -643,7 +639,7 @@ class DocumentErasureServiceTest {
             DocumentErasureService.Outcome outcome =
                 withEraser(recording(2)).erase("docs", List.of("secret.md"), false);
 
-            assertThat(retired)
+            assertThat(eraser.documents())
                 .as("nodes are attributed by source and document, and must be asked for that way")
                 .containsExactly("docs:secret.md");
             assertThat(outcome.vectorsHidden()).isEqualTo(2);
@@ -661,7 +657,7 @@ class DocumentErasureServiceTest {
             DocumentErasureService.Outcome outcome =
                 withEraser(recording(3)).eraseSource("docs", 100, false);
 
-            assertThat(retired).containsExactlyInAnyOrder("docs:first.md", "docs:second.md");
+            assertThat(eraser.documents()).containsExactlyInAnyOrder("docs:first.md", "docs:second.md");
             assertThat(outcome.vectorsHidden()).isEqualTo(6);
         }
 
@@ -690,9 +686,18 @@ class DocumentErasureServiceTest {
             index.refresh();
             epoch.incrementAndGet();
 
-            DocumentErasureService.Outcome outcome = withEraser(documentKey -> {
-                throw new IllegalStateException("graph is closed");
-            }).erase("docs", List.of("secret.md"), false);
+            DocumentErasureService.Outcome outcome = withEraser(
+                new DocumentErasureService.VectorEraser() {
+                    @Override
+                    public int erase(String documentKey) {
+                        throw new IllegalStateException("graph is closed");
+                    }
+
+                    @Override
+                    public int eraseChunks(java.util.Collection<String> chunkIds) {
+                        throw new IllegalStateException("graph is closed");
+                    }
+                }).erase("docs", List.of("secret.md"), false);
 
             assertThat(outcome.documentsErased()).isEqualTo(1);
             assertThat(outcome.chunksTombstoned()).isEqualTo(1);
