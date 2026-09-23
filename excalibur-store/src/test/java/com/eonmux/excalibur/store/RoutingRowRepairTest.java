@@ -9,6 +9,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -43,7 +44,7 @@ class RoutingRowRepairTest {
             engine.start();
             populate(engine);
             engine.getSplitWorker().requestSplit(engine.getSegment(0L));
-            engine.getSplitWorker().stop();
+            engine.getSplitWorker().stop(Duration.ofSeconds(10));
             assertThat(engine.getSegmentCount()).isEqualTo(width * 2);
 
             rightPath = engine.getSegment(rightIndex).path();

@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -60,7 +61,7 @@ class ConfiguredLoadFactorInheritanceTest {
             // The callback runs in the middle of the split, and this arena closes at the end of
             // the block: without draining the requested split first, the rest of it would be
             // reading and writing memory that is being unmapped underneath it.
-            worker.stop();
+            worker.stop(Duration.ofSeconds(10));
 
             assertThat(left.get().loadFactorThreshold()).isEqualTo(CONFIGURED);
             assertThat(right.get().loadFactorThreshold()).isEqualTo(CONFIGURED);
@@ -96,7 +97,7 @@ class ConfiguredLoadFactorInheritanceTest {
 
             // Same reason as above: the swap is not the end of the rewrite, and stop() is what
             // waits for the rest of it before this arena goes away.
-            worker.stop();
+            worker.stop(Duration.ofSeconds(10));
 
             assertThat(replacement.get().loadFactorThreshold()).isEqualTo(CONFIGURED);
         }

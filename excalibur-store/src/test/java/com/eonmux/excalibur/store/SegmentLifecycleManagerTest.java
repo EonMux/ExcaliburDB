@@ -8,8 +8,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -157,7 +159,7 @@ class SegmentLifecycleManagerTest {
         @DisplayName("Should stop successfully")
         void shouldStopSuccessfully() {
             manager.start();
-            manager.stop();
+            manager.stop(Duration.ofSeconds(10));
             assertThat(manager.isRunning()).isFalse();
         }
 
@@ -170,11 +172,57 @@ class SegmentLifecycleManagerTest {
         }
 
         @Test
+        @DisplayName("stop waits out the whole of its wait for a check in progress, and a later "
+            + "stop waits again")
+        void stopWaitsAsLongAsItIsGiven() throws InterruptedException {
+            createSegment();
+            CountDownLatch inside = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            SegmentLifecycleManager held = new SegmentLifecycleManager(catalog, 10, 0.3, 100, 10);
+            held.setIndexingCompletionProbe(segmentId -> {
+                inside.countDown();
+                try {
+                    release.await(30, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return false;
+            });
+            held.start();
+            assertThat(inside.await(30, TimeUnit.SECONDS))
+                .as("a lifecycle check reached the segment")
+                .isTrue();
+            Duration wait = Duration.ofMillis(300);
+
+            long began = System.nanoTime();
+            try {
+                assertThat(held.stop(wait))
+                    .as("a check still running when the wait runs out is reported")
+                    .isFalse();
+                assertThat(Duration.ofNanos(System.nanoTime() - began))
+                    .as("the check was given all of the wait stop was handed")
+                    .isGreaterThanOrEqualTo(wait);
+            } finally {
+                release.countDown();
+            }
+            assertThat(held.stop(Duration.ofSeconds(10)))
+                .as("given long enough, a second stop waits again and sees the check end")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("stopping a manager that never started has nothing to wait for")
+        void stopBeforeStartIsClean() {
+            assertThat(manager.stop(Duration.ZERO)).isTrue();
+            assertThatThrownBy(() -> manager.stop(null)).isInstanceOf(NullPointerException.class);
+        }
+
+        @Test
         @DisplayName("Should handle double stop")
         void shouldHandleDoubleStop() {
             manager.start();
-            manager.stop();
-            manager.stop();
+            manager.stop(Duration.ofSeconds(10));
+            manager.stop(Duration.ofSeconds(10));
             assertThat(manager.isRunning()).isFalse();
         }
 

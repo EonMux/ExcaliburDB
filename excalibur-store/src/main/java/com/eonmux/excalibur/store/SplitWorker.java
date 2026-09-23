@@ -8,10 +8,11 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -59,7 +60,8 @@ import java.util.logging.Logger;
  *   <li>Runs in a dedicated virtual thread</li>
  *   <li>Uses atomic operations for state management</li>
  *   <li>Split operations do not block segment reads (reads use snapshot)</li>
- *   <li>{@link #stop()} waits, within a bounded budget, for every split still running -
+ *   <li>{@link #stop(Duration)} waits, for as long as its caller allows, for every split still
+ *       running -
  *       including those {@link #requestSplit(Segment, int)} dispatched - so the Arena the
  *       segments are mapped out of can be closed once it has returned</li>
  *   <li>Child registration is atomic via {@link SplitListener}</li>
@@ -97,8 +99,8 @@ import java.util.logging.Logger;
  * // Start the background worker
  * worker.start();
  *
- * // Later, shut down
- * worker.stop();
+ * // Later, shut down, waiting up to ten seconds for work in flight
+ * worker.stop(Duration.ofSeconds(10));
  * }</pre>
  *
  * @author ExcaliburDB
@@ -141,18 +143,6 @@ public class SplitWorker {
      */
     public static final int MAX_CONCURRENT_SPLITS_LIMIT = 8;
 
-    /**
-     * Default budget, in milliseconds, for everything {@link #stop()} waits on.
-     *
-     * <p>Shutdown has to wait: a split reads the parent's snapshot and writes two children
-     * through memory mapped out of the caller's {@link Arena}, and the caller closes that Arena
-     * once {@code stop()} has returned. It also has to be bounded, because partitioning a full
-     * segment is not quick and a shutdown that never returns is worse than the race it was
-     * avoiding. A deployment whose segments need longer says so with
-     * {@link #withStopTimeoutMs(long)}.</p>
-     */
-    public static final long DEFAULT_STOP_TIMEOUT_MS = 5000;
-
     // ==================== Instance Fields ====================
 
     private final Arena arena;
@@ -170,10 +160,10 @@ public class SplitWorker {
     private final ReentrantLock splitExecutionLock = new ReentrantLock();
 
     /**
-     * Threads started by {@link #requestSplit(Segment, int)}, awaited by {@link #stop()}.
+     * Threads started by {@link #requestSplit(Segment, int)}, awaited by {@link #stop(Duration)}.
      *
      * <p>Each is published here before it is started and removes itself once its split has
-     * returned, so what remains after {@code stop()} has spent its budget is exactly what it
+     * returned, so what remains after {@code stop(Duration)} has spent its budget is exactly what it
      * never managed to wait for.</p>
      */
     private final CopyOnWriteArrayList<Thread> requestedSplitThreads = new CopyOnWriteArrayList<>();
@@ -187,9 +177,6 @@ public class SplitWorker {
 
     private volatile long splitIntervalMs;
     private volatile int maxConcurrentSplits;
-
-    /** How long {@link #stop()} may spend waiting for splits that are already running. */
-    private volatile long stopTimeoutMs = DEFAULT_STOP_TIMEOUT_MS;
 
     private volatile Thread workerThread;
 
@@ -285,7 +272,7 @@ public class SplitWorker {
      *
      * <p>This method creates a virtual thread that continuously monitors
      * registered segments and performs splits as needed. The worker
-     * runs until {@link #stop()} is called.</p>
+     * runs until {@link #stop(Duration)} is called.</p>
      *
      * <p>If the worker is already running, this method does nothing.</p>
      *
@@ -320,31 +307,38 @@ public class SplitWorker {
      * the process. Waiting here is also what stops a split publishing children into a routing
      * table that is being torn down.</p>
      *
-     * <p>The whole wait is bounded by {@link #getStopTimeoutMs()} - one budget for all of it,
-     * not one per split - so this returns whether or not the splits finish. <strong>An expired
+     * <p>The whole wait is bounded by {@code wait} - one deadline for all of it, not one per
+     * split - so this returns whether or not the splits finish. <strong>An expired
      * wait is logged as a warning and is not the guarantee above</strong>: splits are still
      * running, the Arena is still being read and written through, and closing it is precisely
      * the crash the wait exists to prevent. A caller that sees that warning should leave the
-     * Arena open and let the process exit without it, or give the worker a timeout that matches
+     * Arena open and let the process exit without it, or give the worker a wait that matches
      * the size of its segments.</p>
      *
      * <p>A worker whose loop was never started still drains the splits requested of it.
      * Requests that arrive from here on are refused rather than started, because after this
      * returns there is nothing left that would wait for them.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains, and a caller of its own passes what its segments need to partition.</p>
+     *
+     * @param wait How long to wait for the splits in flight, all of them together
      * @return true if no split this worker started is still running, false if the wait expired
      *         first and the Arena must be left open
      */
-    public boolean stop() {
+    public boolean stop(Duration wait) {
+        Objects.requireNonNull(wait, "wait cannot be null");
         boolean first = stopped.compareAndSet(false, true);
         if (first) {
             running.set(false);
         }
         // Outside the guard, so a second call waits again for whatever the first left running
         // instead of answering from a snapshot of it.
-        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(stopTimeoutMs);
-        awaitSplitLoop(deadlineNanos);
-        awaitRequestedSplits(deadlineNanos);
+        // Wraps rather than saturates for a wait near Long.MAX_VALUE nanoseconds; every use
+        // subtracts the current time first, which undoes it.
+        long deadlineNanos = System.nanoTime() + wait.toNanos();
+        awaitSplitLoop(deadlineNanos, wait);
+        awaitRequestedSplits(deadlineNanos, wait);
         if (first) {
             LOGGER.log(Level.INFO, "Split worker stopped. Total splits: {0}, entries split: {1}",
                 new Object[] { splitCount.get(), entriesSplit.get() });
@@ -363,8 +357,9 @@ public class SplitWorker {
      * channel and leaves exactly the half-done split this avoids.</p>
      *
      * @param deadlineNanos Nanotime the whole shutdown wait is bounded by
+     * @param wait          The whole wait, as the log reports it
      */
-    private void awaitSplitLoop(long deadlineNanos) {
+    private void awaitSplitLoop(long deadlineNanos, Duration wait) {
         stopSignal.request();
         Thread loop = workerThread;
         if (loop == null) {
@@ -373,7 +368,7 @@ public class SplitWorker {
         joinUntil(loop, deadlineNanos);
         if (loop.isAlive()) {
             LOGGER.log(Level.WARNING, "The split loop did not finish within {0}ms; a scheduled "
-                + "split is still running against the Arena", stopTimeoutMs);
+                + "split is still running against the Arena", wait.toMillis());
         }
     }
 
@@ -385,8 +380,9 @@ public class SplitWorker {
      * cannot leave an entry behind.</p>
      *
      * @param deadlineNanos Nanotime the whole shutdown wait is bounded by
+     * @param wait          The whole wait, as the log reports it
      */
-    private void awaitRequestedSplits(long deadlineNanos) {
+    private void awaitRequestedSplits(long deadlineNanos, Duration wait) {
         for (Thread thread : requestedSplitThreads) {
             if (!joinUntil(thread, deadlineNanos)) {
                 break;
@@ -398,7 +394,7 @@ public class SplitWorker {
             LOGGER.log(Level.WARNING, "Split worker stopped with {0} requested split(s) still "
                 + "running after {1}ms; they are reading and writing segments mapped out of the "
                 + "Arena, which must not be closed while that is true",
-                new Object[] { straggling, stopTimeoutMs });
+                new Object[] { straggling, wait.toMillis() });
         }
     }
 
@@ -411,41 +407,17 @@ public class SplitWorker {
      *         the waiting thread was interrupted
      */
     private static boolean joinUntil(Thread thread, long deadlineNanos) {
-        long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
-        if (remainingMs <= 0) {
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        if (remainingNanos <= 0) {
             return false;
         }
         try {
-            thread.join(remainingMs);
+            thread.join(Duration.ofNanos(remainingNanos));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return false;
         }
         return true;
-    }
-
-    /**
-     * Sets how long {@link #stop()} may wait for splits that are already running.
-     *
-     * <p>Raise it for a deployment whose segments take longer to partition than the default
-     * allows. The bound is what keeps a shutdown from hanging, and what it costs when it
-     * expires is described on {@link #stop()}. Takes effect on the next {@link #stop()}.</p>
-     *
-     * @param stopTimeoutMs Budget in milliseconds; negative is treated as no wait at all
-     * @return this worker, for chaining
-     */
-    public SplitWorker withStopTimeoutMs(long stopTimeoutMs) {
-        this.stopTimeoutMs = Math.max(0, stopTimeoutMs);
-        return this;
-    }
-
-    /**
-     * Returns how long {@link #stop()} may wait for splits that are already running.
-     *
-     * @return The budget in milliseconds
-     */
-    public long getStopTimeoutMs() {
-        return stopTimeoutMs;
     }
 
     /**
@@ -523,7 +495,7 @@ public class SplitWorker {
      * the partitioning always matches the routing that will address the children.</p>
      *
      * <p>The split runs on a virtual thread of its own and this returns as soon as it has been
-     * dispatched. {@link #stop()} waits for what was dispatched here, so the split cannot
+     * dispatched. {@link #stop(Duration)} waits for what was dispatched here, so the split cannot
      * outlive the shutdown that precedes closing the {@link Arena} it is mapped out of. A
      * request that arrives once the worker has stopped is refused and logged rather than
      * started, because by then there is nothing left that would wait for it.</p>

@@ -9,6 +9,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.*;
@@ -596,7 +597,14 @@ class StorageEngineBasicTest {
         void shouldStopLifecycleManager() {
             engine.startLifecycleManager();
 
-            assertThatCode(() -> engine.stopLifecycleManager()).doesNotThrowAnyException();
+            assertThat(engine.stopBackgroundWork(Duration.ofSeconds(10)))
+                .as("an idle lifecycle manager and split worker end as soon as they are asked")
+                .isTrue();
+            assertThat(engine.stopBackgroundWork(Duration.ZERO))
+                .as("asking again finds them already ended")
+                .isTrue();
+            assertThatThrownBy(() -> engine.stopBackgroundWork(null))
+                .isInstanceOf(NullPointerException.class);
         }
     }
 
