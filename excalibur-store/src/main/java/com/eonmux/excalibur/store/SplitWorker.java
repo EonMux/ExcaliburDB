@@ -16,7 +16,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.IntSupplier;
+import java.util.function.ToIntFunction;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -71,18 +71,21 @@ import java.util.logging.Logger;
  * <ul>
  *   <li>Split interval: {@value #DEFAULT_SPLIT_INTERVAL_MS} ms (configurable, min 100ms)</li>
  *   <li>Load factor threshold: Uses Segment's LOAD_FACTOR_THRESHOLD (0.7)</li>
- *   <li>Split bit: supplied by the owning routing table, never derived here. It is the
- *       bit the router will newly consult once the routing table doubles, i.e.
- *       {@code Integer.numberOfTrailingZeros(routingSegmentCount)}. Partitioning on any
- *       other bit produces children the router cannot address.</li>
+ *   <li>Split bit: supplied by the owning routing table for each segment, never derived
+ *       here. It is the lowest bit in which the directory slots the segment owns differ, or,
+ *       for a segment owning a single slot, the bit a doubling of the directory newly
+ *       exposes. Partitioning on any other bit produces children the router cannot
+ *       address. The table may refuse instead, when the split would widen the directory past
+ *       its limit; the split then does not happen and the segment stays as it was.</li>
  *   <li>Child segment capacity: Same as parent's slot count</li>
  * </ul>
  *
  * <h2>Split Serialization</h2>
  * <p>All splits - background and explicitly requested - run one at a time. The split bit
- * is read from the supplier inside that critical section and stays valid until the
- * listener has published the children, so the partitioning and the routing table can
- * never disagree.</p>
+ * is read from the routing table inside that critical section and stays valid until the
+ * listener has published the children - it depends only on the slots the segment owns, and
+ * only the segment's own split re-points those - so the partitioning and the routing table
+ * can never disagree.</p>
  *
  * <h2>Example Usage</h2>
  * <pre>{@code
@@ -90,7 +93,7 @@ import java.util.logging.Logger;
  * SplitWorker worker = new SplitWorker(arena, (parent, leftChild, rightChild) -> {
  *     // Called to publish the split: rename the children into their canonical
  *     // segment_&lt;index&gt;.dat names and install them in the routing table.
- * }, () -> Integer.numberOfTrailingZeros(routingSegmentCount));
+ * }, segment -> routingTable.splitBitFor(segment));
  *
  * // Register segments for monitoring
  * worker.registerSegment(segment1);
@@ -143,18 +146,24 @@ public class SplitWorker {
      */
     public static final int MAX_CONCURRENT_SPLITS_LIMIT = 8;
 
+    /** A split requested without an expected bit: the routing table's answer is taken as is. */
+    private static final int NO_REQUESTED_BIT = -1;
+
     // ==================== Instance Fields ====================
 
     private final Arena arena;
     private final SplitListener listener;
 
     /**
-     * Supplies the hash bit to partition on, owned by the routing table.
+     * Answers which hash bit a given segment partitions on, owned by the routing table.
      *
      * <p>This is an explicit collaborator rather than a global read: the worker has no
-     * knowledge of the routing table and must never invent a split bit of its own.</p>
+     * knowledge of the routing table and must never invent a split bit of its own. The answer
+     * is per segment because it depends on how many directory slots the segment owns. It may
+     * throw - {@link RoutingDirectoryFullException} when the split would widen the directory past
+     * its limit - and a throw means the split does not happen.</p>
      */
-    private final IntSupplier splitBitSupplier;
+    private final ToIntFunction<Segment> splitBitFor;
 
     /** Serializes splits so a split bit cannot go stale before publication. */
     private final ReentrantLock splitExecutionLock = new ReentrantLock();
@@ -198,11 +207,11 @@ public class SplitWorker {
      *
      * @param arena            The Arena for allocating new segment memory (must not be null)
      * @param listener         Callback for split completion events (must not be null)
-     * @param splitBitSupplier Supplies the hash bit to partition on (must not be null)
+     * @param splitBitFor      Answers the hash bit a segment partitions on (must not be null)
      * @throws NullPointerException if any argument is null
      */
-    public SplitWorker(Arena arena, SplitListener listener, IntSupplier splitBitSupplier) {
-        this(arena, listener, splitBitSupplier, DEFAULT_SPLIT_INTERVAL_MS, DEFAULT_MAX_CONCURRENT_SPLITS);
+    public SplitWorker(Arena arena, SplitListener listener, ToIntFunction<Segment> splitBitFor) {
+        this(arena, listener, splitBitFor, DEFAULT_SPLIT_INTERVAL_MS, DEFAULT_MAX_CONCURRENT_SPLITS);
     }
 
     /**
@@ -210,13 +219,13 @@ public class SplitWorker {
      *
      * @param arena                The Arena for allocating new segment memory
      * @param listener             Callback for split completion events
-     * @param splitBitSupplier     Supplies the hash bit to partition on
+     * @param splitBitFor          Answers the hash bit a segment partitions on
      * @param splitIntervalMs      Interval between split checks (ms)
      * @param maxConcurrentSplits  Maximum concurrent split operations
-     * @throws NullPointerException if arena, listener or splitBitSupplier is null
+     * @throws NullPointerException if arena, listener or splitBitFor is null
      * @throws IllegalArgumentException if configuration values are out of range
      */
-    public SplitWorker(Arena arena, SplitListener listener, IntSupplier splitBitSupplier,
+    public SplitWorker(Arena arena, SplitListener listener, ToIntFunction<Segment> splitBitFor,
                        long splitIntervalMs, int maxConcurrentSplits) {
         if (arena == null) {
             throw new NullPointerException("Arena cannot be null");
@@ -224,8 +233,8 @@ public class SplitWorker {
         if (listener == null) {
             throw new NullPointerException("Listener cannot be null");
         }
-        if (splitBitSupplier == null) {
-            throw new NullPointerException("Split bit supplier cannot be null");
+        if (splitBitFor == null) {
+            throw new NullPointerException("Split bit function cannot be null");
         }
 
         // Validate configuration
@@ -234,7 +243,7 @@ public class SplitWorker {
 
         this.arena = arena;
         this.listener = listener;
-        this.splitBitSupplier = splitBitSupplier;
+        this.splitBitFor = splitBitFor;
         this.registeredSegments = new CopyOnWriteArrayList<>();
         this.running = new AtomicBoolean(false);
         this.stopped = new AtomicBoolean(false);
@@ -473,14 +482,14 @@ public class SplitWorker {
     // ==================== Manual Split ====================
 
     /**
-     * Requests immediate split of a specific segment, partitioning on the current
-     * split bit reported by the routing table.
+     * Requests immediate split of a specific segment, partitioning on whatever bit the routing
+     * table assigns it when the split runs.
      *
      * @param segment The segment to split
      * @throws NullPointerException if segment is null
      */
     public void requestSplit(Segment segment) {
-        requestSplit(segment, splitBitSupplier.getAsInt());
+        requestSplit(segment, NO_REQUESTED_BIT);
     }
 
     /**
@@ -517,6 +526,9 @@ public class SplitWorker {
         Thread thread = Thread.ofVirtual().name("excalibur-split-request").unstarted(() -> {
             try {
                 splitSegment(segment, splitBit);
+            } catch (RoutingDirectoryFullException e) {
+                // Already counted and reported, once per segment, by the routing table.
+                LOGGER.log(Level.FINE, "Requested split refused: {0}", e.getMessage());
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Manual split failed for segment: " + segment.path(), e);
             } finally {
@@ -562,8 +574,12 @@ public class SplitWorker {
                         }
 
                         try {
-                            splitSegment(segment, splitBitSupplier.getAsInt());
+                            splitSegment(segment, NO_REQUESTED_BIT);
                             splitCount++;
+                        } catch (RoutingDirectoryFullException e) {
+                            // Offered again every sweep for as long as it stays full; the
+                            // routing table reports it once and counts every refusal.
+                            LOGGER.log(Level.FINE, "Split refused: {0}", e.getMessage());
                         } catch (Exception e) {
                             LOGGER.log(Level.WARNING, "Split failed for segment: " + segment.path(), e);
                         }
@@ -678,9 +694,10 @@ public class SplitWorker {
         }
 
         // The routing table is authoritative for the split bit. A requested bit that
-        // has gone stale is discarded rather than used.
-        int splitBit = splitBitSupplier.getAsInt();
-        if (splitBit != requestedSplitBit) {
+        // has gone stale is discarded rather than used. Asked before the snapshot is taken, so
+        // a split the table refuses leaves the segment exactly as it was.
+        int splitBit = splitBitFor.applyAsInt(segment);
+        if (requestedSplitBit != NO_REQUESTED_BIT && splitBit != requestedSplitBit) {
             LOGGER.log(Level.FINE,
                 "Requested split bit {0} superseded by routing table bit {1} for {2}",
                 new Object[] { requestedSplitBit, splitBit, segment.path() });

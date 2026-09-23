@@ -12,8 +12,9 @@ import java.util.Objects;
  * a segment whose contents have already been copied into the children.</p>
  *
  * <h2>Two refusals that mean different things</h2>
- * <p>A SPLITTING segment refuses with {@link IllegalStateException}: the split may still be
- * abandoned, and the caller should treat it as a transient failure. A SPLIT_COMPLETE segment
+ * <p>A SPLITTING segment refuses with {@link SegmentSplittingException}: the split may still be
+ * abandoned, and the caller should treat it as a transient failure - wait for the split to
+ * settle and repeat the operation, which is what the engine's routed paths do. A SPLIT_COMPLETE segment
  * refuses with {@link SegmentRetiredException}, which tells the routing layer to resolve the
  * key again - the difference between a failed write and one that lands in the right child. A
  * retired parent no longer appears in the directory and its file has been replaced by the
@@ -72,11 +73,12 @@ final class SegmentSplitControl {
      * <p>Writes are rejected during splitting to ensure copy-on-write semantics.
      * Readers continue to see the pre-split snapshot.</p>
      *
-     * @throws IllegalStateException if segment is in SPLITTING state
+     * @throws SegmentSplittingException if segment is in SPLITTING state
+     * @throws SegmentRetiredException if the segment was replaced by its split children
      */
     void validateNotSplitting() {
         if (owner.splitState == Segment.SplitState.SPLITTING) {
-            throw new IllegalStateException(
+            throw new SegmentSplittingException(
                 "Cannot modify segment during split: " + owner.path);
         }
         // A retired parent no longer appears in the directory and its file has been replaced by

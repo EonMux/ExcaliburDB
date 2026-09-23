@@ -12,18 +12,20 @@ import java.util.logging.Level;
  * a split may publish - retiring the segment the operation is holding and re-pointing the slot
  * at a child. Every path here answers that the same way: read the volatile
  * {@link RoutingSnapshot} once into a local so the mask and the slot agree, act, and on
- * {@link SegmentRetiredException} go round again against the directory as it now is. The loop
- * is bounded because each retry follows a publication that has already completed, so a second
- * pass resolves; an unbounded loop would turn a routing bug into a hang instead of an
- * error.</p>
+ * {@link SegmentRetiredException} go round again against the directory as it now is. A
+ * mutation that arrives while the split is still copying gets {@link SegmentSplittingException}
+ * instead, and waits for the split to publish or be abandoned before going round. The loop is
+ * bounded because each retry follows a split that has already settled, so a later pass
+ * resolves; an unbounded loop would turn a routing bug into a hang instead of an error.</p>
  *
  * <h2>Capacity is not an error here</h2>
  * <p>A write that finds its segment full does not fail: it asks the split worker for an
- * immediate split, waits for the children to publish, and writes into the child chosen with
- * the bit the split actually partitioned on - read back from the parent rather than derived
- * independently, because deriving it is how a split loses half its keys. Only when no split
- * worker is running, or the split does not publish in time, does the caller see
- * {@link SegmentAtCapacityException} and get to decide about retrying.</p>
+ * immediate split, waits for the children to publish, and routes again - so the child it lands
+ * in is the one the directory names, found by the same path as any other write, and a child
+ * that is itself full is split in turn. Only when no split worker is running, the split does not
+ * publish in time, or the split would widen the directory past its limit does the caller see
+ * {@link SegmentAtCapacityException} and get to decide about retrying; an entry too large for
+ * any segment is refused outright, since no split can make room for it.</p>
  *
  * <p><strong>Thread safety:</strong> stateless apart from the engine it acts on. No lock is
  * taken on any path; the only shared read is the volatile routing snapshot, and the only
@@ -130,8 +132,12 @@ final class EngineWrites {
                 // unsatisfiable probe chain - is handled the same way: split and retry.
                 // Classifying these by exception message would silently miss the data
                 // region case, which is the one vector payloads hit first.
-                return putWithSplitHandling(key, value, termHashes, keyHash, segment,
-                    segmentIndex);
+                splitForRoom(key, value, segment, segmentIndex);
+            } catch (SegmentSplittingException e) {
+                // Another split of this segment is copying it into children. The write belongs
+                // in whichever child owns the key once it publishes, or back here if it is
+                // abandoned; the directory says which once the split has settled.
+                awaitSplitSettled(segment, segmentIndex);
             } catch (SegmentRetiredException e) {
                 // The split published while this write was in flight. The key belongs to one of
                 // the children now; writing it here would land in a file nothing can reach.
@@ -146,29 +152,39 @@ final class EngineWrites {
     }
 
     /**
-     * Handles a put operation when the target segment has reached capacity.
+     * Makes room for a write its segment refused for capacity: splits the segment and waits
+     * for the children to publish, so the caller can route the write again.
      *
-     * <p>This method implements automatic capacity management by:</p>
-     * <ol>
-     *   <li>Requesting an immediate split of the full segment</li>
-     *   <li>Waiting for the split to complete (up to 5 seconds)</li>
-     *   <li>Routing the insert to the appropriate child segment</li>
-     * </ol>
+     * <p>Routing again, rather than writing into the child the parent's split bit names, is
+     * what lets a write survive whatever happens next: the child it belongs in may be full in
+     * turn, or already splitting, and the routing loop treats both as it treats the parent.</p>
      *
-     * <p><strong>Domain Correctness:</strong> the child is selected with the very bit
-     * the split partitioned on, read back from the parent via {@link Segment#splitBit()}.
-     * Deriving a bit independently here is what makes a split lose half its keys.</p>
+     * <h3>What splitting cannot fix</h3>
+     * <p>Two cases are refused before any split is asked for, because a split would not make
+     * room and each one it made would still cost the directory. An entry larger than an empty
+     * segment of this geometry can hold never fits any child a split produces, and splitting
+     * for it again on every retry used to deepen the directory until the heap ran out; it is
+     * refused as an argument error. A segment whose split would widen the directory past its
+     * limit gets {@link RoutingDirectoryFullException} straight away rather than after a wait
+     * for a split that the worker will refuse.</p>
      *
-     * @param key The key to insert
-     * @param value The value to insert
-     * @param termHashes The value's term hashes
-     * @param keyHash The pre-computed key hash
-     * @param segment The segment that is at capacity
-     * @param segmentIndex The segment index
-     * @throws SegmentAtCapacityException if split cannot complete in time
+     * @param key          The key being written
+     * @param value        The value being written
+     * @param segment      The segment that is at capacity
+     * @param segmentIndex The slot the key routed to
+     * @throws IllegalArgumentException if no segment of this geometry could hold the entry
+     * @throws RoutingDirectoryFullException if the split would widen the directory past its
+     *         limit
+     * @throws SegmentAtCapacityException if there is no split worker, or the split does not
+     *         publish in time
      */
-    private long putWithSplitHandling(byte[] key, byte[] value, long[] termHashes, long keyHash,
-                                       Segment segment, int segmentIndex) {
+    private void splitForRoom(byte[] key, byte[] value, Segment segment, int segmentIndex) {
+        if (!segment.fitsWhenEmpty(key, value)) {
+            throw new IllegalArgumentException("An entry of " + key.length + " key bytes and "
+                + value.length + " value bytes can never fit in a segment: it is larger than the "
+                + "whole data region of an empty one, and splitting would only produce more "
+                + "segments of the same size");
+        }
         if (engine.splitWorker == null || !engine.splitWorker.isRunning()) {
             // No split worker available - cannot handle capacity automatically
             throw new SegmentAtCapacityException(
@@ -176,42 +192,27 @@ final class EngineWrites {
                 "Ensure StorageEngine is started to enable automatic capacity management.");
         }
 
-        // The bit a doubling of the routing table newly exposes. The worker uses the
-        // routing table's current value, so this is advisory only.
-        int expectedSplitBit = Integer.numberOfTrailingZeros(engine.routingSegmentCount);
+        // The table's answer, taken now so a refusal reaches this writer at once. The worker
+        // asks again when the split runs, so this is advisory for the bit itself.
+        int expectedSplitBit = engine.routingTable.splitBitIfRouted(segment);
+        if (expectedSplitBit < 0) {
+            // Another thread's split replaced the segment since this write found it full; the
+            // directory already names the child the key belongs in.
+            return;
+        }
         engine.splitWorker.requestSplit(segment, expectedSplitBit);
 
-        awaitSplit(segment, segmentIndex);
-
-        // Route to the child using the bit the split actually partitioned on.
-        int splitBit = segment.splitBit();
-        boolean goesRight = Segment.shouldGoToRightChild(keyHash, splitBit);
-        Segment child = goesRight ? segment.rightChild() : segment.leftChild();
-
-        if (child == null) {
-            throw new IllegalStateException(
-                "Split completed but child segment is null. Segment: " + segmentIndex);
-        }
-
-        // Insert into child segment
-        child.put(key, value, termHashes);
-
-        long catalogIndex = engine.routingTable.catalogIndexOf(child, segmentIndex);
-        engine.catalog.updateEntryCount(catalogIndex, 1);
-
-        engine.visibilityTracker.advanceEpoch();
-        engine.statistics.incrementWriteOperations();
-        return catalogIndex;
+        awaitSplitComplete(segment, segmentIndex);
     }
 
     /**
-     * Waits for an in-progress split of the given segment to publish its children.
+     * Waits for a split of the given segment to publish its children.
      *
      * @param segment      The segment being split
      * @param segmentIndex The segment's directory index, for error messages
      * @throws SegmentAtCapacityException if the split does not complete in time
      */
-    private void awaitSplit(Segment segment, int segmentIndex) {
+    private void awaitSplitComplete(Segment segment, int segmentIndex) {
         long deadline = System.currentTimeMillis() + SPLIT_WAIT_TIMEOUT_MS;
         while (!segment.isSplitComplete()) {
             if (System.currentTimeMillis() > deadline) {
@@ -219,13 +220,45 @@ final class EngineWrites {
                     "Segment " + segmentIndex + " at capacity. Split in progress but not complete. " +
                     "Please retry the operation.");
             }
-            try {
-                Thread.sleep(10); // Brief sleep before checking again
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
+            pauseForSplit();
+        }
+    }
+
+    /**
+     * Waits for a split already running on the given segment to publish or be abandoned.
+     *
+     * <p>Either outcome lets the operation go on: a published split retires the segment and the
+     * directory now names the child that owns the key, and an abandoned one returns the segment
+     * to service.</p>
+     *
+     * @param segment      The segment being split
+     * @param segmentIndex The slot the key routed to, for error messages
+     * @throws SegmentAtCapacityException if the split does not settle in time
+     */
+    private void awaitSplitSettled(Segment segment, int segmentIndex) {
+        long deadline = System.currentTimeMillis() + SPLIT_WAIT_TIMEOUT_MS;
+        while (segment.isSplitting()) {
+            if (System.currentTimeMillis() > deadline) {
                 throw new SegmentAtCapacityException(
-                    "Interrupted while waiting for segment split", ie);
+                    "Segment " + segmentIndex + " is being split and the split did not finish "
+                        + "within " + SPLIT_WAIT_TIMEOUT_MS + "ms. Please retry the operation.");
             }
+            pauseForSplit();
+        }
+    }
+
+    /**
+     * Sleeps briefly between checks on a split's progress.
+     *
+     * @throws SegmentAtCapacityException if interrupted, with the interrupt restored
+     */
+    private static void pauseForSplit() {
+        try {
+            Thread.sleep(1);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new SegmentAtCapacityException(
+                "Interrupted while waiting for segment split", ie);
         }
     }
 
@@ -341,6 +374,10 @@ final class EngineWrites {
                     return true;
                 }
                 return false;
+            } catch (SegmentSplittingException e) {
+                // A tombstone applied now would be missing from both children; once the split
+                // settles, the directory names the segment that owns the key.
+                awaitSplitSettled(segment, segmentIndex);
             } catch (SegmentRetiredException e) {
                 // Tombstoning the retired parent reported success for a key that stays live in
                 // whichever child now owns it.

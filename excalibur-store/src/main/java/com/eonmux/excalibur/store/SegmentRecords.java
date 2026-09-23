@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.store;
 
 import com.eonmux.excalibur.store.format.EntryChecksum;
+import com.eonmux.excalibur.store.format.SegmentFormat;
 import com.eonmux.excalibur.store.hash.XxHash64;
 
 import java.lang.foreign.MemorySegment;
@@ -288,6 +289,25 @@ final class SegmentRecords {
         long requiredOffset = owner.slotTableSize + owner.dataOffset + entrySize;
         long segmentSize = owner.segment.byteSize();
         return requiredOffset <= segmentSize;
+    }
+
+    /**
+     * Whether an entry of this size fits a segment of this geometry that holds nothing else.
+     *
+     * <p>Asked of the geometry rather than of this segment's free space, and in the current
+     * format, because that is what a split child is: the parent's geometry, empty, written by
+     * this build. An entry that fails this fails in every segment a split could ever produce,
+     * so splitting for it only deepens the directory.</p>
+     *
+     * @param keyLength   The key's length
+     * @param valueLength The value's length
+     * @return true if an empty segment of this geometry could take the entry
+     */
+    boolean fitsEmptySegment(int keyLength, int valueLength) {
+        SegmentFormat fresh = SegmentFormat.CURRENT;
+        long record = (long) fresh.entryHeaderSize() + keyLength + valueLength
+            + Segment.ENTRY_TRAILER_SIZE;
+        return owner.slotTableSize + fresh.firstEntryOffset() + record <= owner.segment.byteSize();
     }
 
     /**

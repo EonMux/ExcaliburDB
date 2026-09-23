@@ -2727,6 +2727,26 @@ Data is organized into segments, each backed by memory-mapped files:
 - Background compaction removes tombstones, one segment at a time
 - Elastic segment splitting based on load factor thresholds (default 0.7)
 
+A new store starts with 64 segments of 1 MiB of data each, and grows by splitting whichever one
+fills. Keys are routed through a directory of hash slots, and the directory is extendible
+hashing's: a segment owns every slot whose low hash bits match its own, so a segment shallower
+than the directory owns several, and splitting it hands half of them to each child without the
+directory changing size. Only a split of a segment that owns a single slot doubles the directory.
+That keeps the directory — which lives on the heap, at about 60 bytes a slot, while the segments
+are mapped files — a small multiple of the segment count: 300 MB of chunks with 1536-dimensional
+embeddings fill 510 segments behind a 512-slot directory, and ingest in a 256 MB heap. What it
+does not bound on its own is keys whose hashes share far more low bits than chance allows, which a
+split cannot separate. So the directory has a limit, 2^20 slots by default
+(`StorageEngine.withMaxRoutingWidth`): a split that would double it past that is refused, logged
+once for the segment and counted in `Statistics.getRefusedSplits()`, and the write that needed it
+gets `RoutingDirectoryFullException` rather than the heap running out. An entry larger than an
+empty segment's data region is refused outright, because no split makes room for it.
+
+A write that reaches a segment while it is being split waits for the split to publish or be
+abandoned and then routes again, rather than failing. The directory is written down after every
+split; a restart that finds a split's children on disk but a directory written before it replays
+that split from the file names and rewrites the directory.
+
 Every read that hands entry bytes back checks that entry's CRC first. A damaged entry is
 *reported* — never returned as data, and never flattened into "not found", because a corrupt
 entry and a missing one call for different actions. Damaged key bytes count too: without the
@@ -3217,8 +3237,9 @@ read.
 
 **Gates.** `./gradlew benchmarkTest`, the task `test` leaves out: the Cuckoo filter's false
 positive rate over a million items, HNSW recall@10 against brute force, the query pipeline's
-end-to-end recall@10 against brute force and against its own graphs, and the point-lookup
-regression floor. It is a job of its own because it takes minutes, and a timing gate going red
+end-to-end recall@10 against brute force and against its own graphs, the point-lookup
+regression floor, and 300 MB of embedded chunks ingested by eight writers into a store running
+in a 256 MB heap (`SplitHeapBoundBenchmarkTest`, which forks that JVM itself). It is a job of its own because it takes minutes, and a timing gate going red
 should not make the build look as though the code failed to compile or pass. Running it on a
 shared runner is sound because of what those tests assert: the recall and false-positive gates are
 counts, not timings, and the throughput gates assert the regression floor described under

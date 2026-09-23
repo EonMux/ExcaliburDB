@@ -3243,13 +3243,13 @@ is version 2, which ends with a CRC32C of every byte before it. Every slot value
 segment number, so a damaged slot used to read as a valid directory and route part of the
 keyspace to a segment that does not hold it; now a directory that fails its checksum, or is not
 exactly as long as its width says, is treated as one that cannot be read — the store reconstructs
-it from the segment file names while at most one segment has ever split, and otherwise refuses to
-start, naming the file and saying the checksum did not match. A version 1 directory is read and
+it from the segment file names while the directory is at most twice its starting width (128
+slots), and otherwise refuses to start, naming the file and saying the checksum did not match. A version 1 directory is read and
 applied exactly as before, reported *legacy, unprotected* by `excalibur-fsck`, and rewritten at
 version 2 the next time the directory changes — the next split, or a start that has to
-reconstruct it. An older build cannot read version 2 and treats the file as missing: a store at
-most one split old is reconstructed exactly and starts, and one split more than once refuses to
-start, so going back from such a store needs an image taken before the upgrade.
+reconstruct it. An older build cannot read version 2 and treats the file as missing: a store
+whose directory is at most 128 slots wide is reconstructed exactly and starts, and a wider one
+refuses to start, so going back from such a store needs an image taken before the upgrade.
 
 **`segment_<N>.hnsw.docmap` — no step required, and no rollback.** A graph's node mapping is
 version 3, and names each node by the chunk it embeds, `source:document:chunk:N`. Versions 1 and 2
@@ -3555,7 +3555,19 @@ memory is about to be released, which ends the process rather than failing it.
   --add-modules=jdk.incubator.vector` JVM flags. Without the last one the SIMD distance
   kernels fall back to scalar arithmetic silently.
 - HNSW graphs cap at `Integer.MAX_VALUE` nodes per segment.
-- Segment counts are power-of-two (extensible hashing on split).
+- The routing directory's width is a power of two, and it doubles only when a segment as deep as
+  the directory splits (extendible hashing); every other split re-points slots the segment
+  already owns. `getSegmentCount()` returns that width, and `getSegments().size()` the number of
+  distinct segments behind it. The directory lives on the heap at about 60 bytes a slot and stays
+  within a small multiple of the segment count: 300 MB of 1536-dimensional chunks fills 510
+  segments behind a 512-slot directory. `withMaxRoutingWidth(int)` (default 2^20 slots) bounds
+  the case keys that do not hash evenly would otherwise make unbounded: a split that would double
+  past it is refused with `RoutingDirectoryFullException` and counted in
+  `getStatistics().getRefusedSplits()`.
+- An entry larger than an empty segment's 1 MiB data region is refused with
+  `IllegalArgumentException`, since no split can make room for it. A write or delete that reaches
+  a segment in the middle of a split waits for the split to publish or be abandoned, then routes
+  again.
 - `StorageEngine` is thread-safe; multiple concurrent queries and ingests are supported.
 
 ---
