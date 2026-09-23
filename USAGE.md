@@ -2809,10 +2809,11 @@ its format, which is what turns "these bytes are unaltered" into "these segments
 open" — a checksum proves only that a file is the one that was copied, so damage already there at
 the copy verifies faithfully without it:
 
-- Segments and `catalog.dat`, HNSW graphs and their document mappings, quantiser codebooks and
+- Segments and `catalog.dat`, HNSW graphs and their node mappings, quantiser codebooks and
   LSH tables go to the engine's own checkers, on a scratch copy, because several of them repair
   what they open. Proven means every entry's checksum, the catalog's header and record CRCs, or
-  the seal a clean close writes.
+  the seal a clean close writes. A node mapping names each node's chunk at version 3 and its
+  document at versions 1 and 2; one at a version this build does not read fails the image.
 - Everything else goes to `excalibur-fsck`'s checkers, read-only, where the file lies — the same
   dispatch `excalibur-fsck` surveys a live directory with. Write-ahead logs have every record
   replayed against its checksum; the lexical store is checked as one structure, every column of
@@ -2824,9 +2825,12 @@ the copy verifies faithfully without it:
   though each is in a format the engine checks: while both are there the compaction never
   swapped, the node discards the pair on open, and a torn pair is a leftover that does not fail
   the image; a staged mapping alone is the one the swapped graph matches, and is verified.
-- Some formats carry nothing to prove them by: `routing.dir`, the document registry and source
-  catalog (whose record count is checked, not their contents), the in-flight journal, the lexical
-  store's sidecars, and the graph triple, entity and label logs, whose only open path writes.
+- Some formats carry nothing to prove them by: `routing.dir`; the document registry, the source
+  catalog and the source status history, each held to what its reader requires — a header version
+  it reads and a record count that matches its lines — though their contents are not checked; the
+  in-flight journal; the lexical store's sidecars; and the graph triple, entity and label logs,
+  whose only open path writes. A registry or catalog its reader would refuse fails the image; a
+  status history the node would only discard does not.
 
 The report counts the structures proven and lists every one that was not, with why, rather than
 leaving them out, which would read as though nothing went unverified.
@@ -2869,7 +2873,7 @@ copy loses is whatever the catalog and the segments disagree about, not the corp
 `--exclude-derived` leaves out what something will rebuild — the lexical chunk index, a tenant's
 built edge store, the quantiser codebooks, the segments' term sketches — at the cost of a reindex
 and a graph build on the far side; the sketches the node rebuilds by itself as it opens each
-segment. The HNSW graphs and their document mappings are never left out, derived though they
+segment. The HNSW graphs and their node mappings are never left out, derived though they
 are, because nothing rebuilds them: deleting a `.hnsw` gives an empty graph attached to a
 populated segment, not a repopulated one. A mapping an interrupted compaction staged
 (`segment_<N>.hnsw.compact.docmap`) is kept with them for the reason below. The write-ahead logs
@@ -2923,7 +2927,7 @@ file too damaged to open still be judged. Each is reported as one of:
 | `UNSEALED` | A writer still holds it. Deliberately not the same statement as intact |
 | `LEGACY_UNPROTECTED` | Structure proven whole, but the format carries no checksum, so the contents cannot be verified |
 | `UNCHECKED` | Not a format this tool knows, or one with no read-only replay. Not evidence of damage and not evidence of health |
-| `MISSING` / `UNREADABLE` | Named but absent, or a device or permission problem |
+| `MISSING` / `UNREADABLE` | Named but absent; or a device or permission problem, or a header naming a format version this build does not read — the node refuses such a file too, so it fails the run and is put to an operator rather than moved aside |
 | `NOT_DATA` | A JVM heap dump (`*.hprof`) a node wrote into the directory. Reported with its size and never read: not engine state, so it neither passes nor fails anything, `--strict` included. Point `-XX:HeapDumpPath` elsewhere and move it there |
 
 A file can also be `INTACT` and still only *partly* verified — an older segment whose entries
@@ -2940,7 +2944,7 @@ one document.
 It also checks across files: a catalog row naming a segment that is not there, an index with no
 segment, a staged file a rename never published.
 
-Two derived files are judged by what the node does with them rather than by name alone:
+Three files are judged by what the node does with them rather than by name alone:
 
 - **`segment_<N>.tfs`, a segment's term sketch**, is the one derived file the node rebuilds by
   itself, from the segment's live entries, whenever it opens the segment and finds the sketch
@@ -2954,8 +2958,9 @@ Two derived files are judged by what the node does with them rather than by name
   and a stranded `segment_<N>.tfs.<id>.tmp` is a staging leftover.
 - **`source-status`, how each source's last crawl ended**, is not derived and nothing rebuilds it,
   but nothing the node serves depends on it either: a node that cannot trust it logs that, treats
-  the history as empty, and reports each source from its next run. So a `source-status` whose
-  record count disagrees with its records is reported `CORRUPT`, counted with the sketches under
+  the history as empty, and reports each source from its next run. So a `source-status` its
+  reader will not take — a record count that disagrees with its records, no header, or a version
+  it does not read — is reported `CORRUPT`, counted with the sketches under
   `corruptRebuiltOnOpen` rather than as damage, and moved aside by the repair plan — what is lost
   either way is the history, never indexed data. As with a sketch, one the operating system will
   not read is `UNREADABLE` and fails the run.
@@ -3104,8 +3109,10 @@ the vector of a version that was overwritten or erased — is tombstoned. The ma
 at version 3, and a segment that held nodes logs one `INFO` line saying how many were attributed
 and how many retired. Until that pass, which the worker makes as soon as it starts, a segment's
 hits still name documents. `excalibur-fsck` and `excalibur-backup verify --deep` accept every
-version: a version 2 mapping is reported intact with a note that its entries name documents, and
-a version 1 mapping, which has no checksum, is reported legacy as before. An older build refuses a
+version the node reads: a version 2 mapping is reported intact with a note that its entries name
+documents, and a version 1 mapping, which has no checksum, is reported legacy as before. A mapping
+at any other version — a newer build's — is reported `UNREADABLE` and fails both, because the
+node refuses to open it. An older build refuses a
 version 3 mapping, so a node that has run this build cannot go back without restoring an image
 taken before the upgrade.
 
