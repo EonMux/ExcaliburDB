@@ -2531,12 +2531,20 @@ restoring it is putting the directory back.
 ./gradlew :excalibur-backup:installDist
 B=excalibur-backup/build/install/excalibur-backup/bin/excalibur-backup
 
-# 1. Stop the node and wait for the process to exit. Match on the main class, not on the jar
-#    name: a node started through bin/excalibur-api or ./gradlew :excalibur-api:run has no
-#    "excalibur.jar" on its command line, so a pattern matching that silently selects nothing.
-pid="$(pgrep -f com.eonmux.excalibur.api.ExcaliburApplication)" || { echo "no node found"; exit 1; }
-kill -TERM "$pid"
-while kill -0 "$pid" 2>/dev/null; do sleep 1; done
+# 1. Stop the node and wait for the process to exit.
+#    Under a supervisor, stop it through the supervisor: `systemctl stop excalibur` and
+#    `docker stop excalibur` both return only once the process has exited, and a signal sent
+#    around them gets the node restarted under you.
+#    Started by hand, find it by either way it can be launched. bin/excalibur-api and
+#    ./gradlew :excalibur-api:run name the main class; `java -jar excalibur.jar` names only the
+#    jar. The MCP server is launched with `-cp excalibur.jar`, not `-jar`, so it never matches.
+#    No pid file is written, so exactly one match is required rather than guessed at.
+pids="$(pgrep -f -- 'com\.eonmux\.excalibur\.api\.ExcaliburApplication( |$)|-jar ([^ ]*/)?excalibur\.jar( |$)')"
+[ "$(printf '%s\n' "$pids" | grep -c .)" -eq 1 ] \
+  || { echo "expected one node, found: ${pids:-none}"; exit 1; }
+kill -TERM "$pids"
+#    Up to excalibur.api.shutdown-timeout-seconds (30 by default) while it drains and publishes.
+while kill -0 "$pids" 2>/dev/null; do sleep 1; done
 
 # 2. Take the image.
 $B snapshot --data-dir /var/lib/excalibur/data --out /backups/excalibur-$(date +%F)
