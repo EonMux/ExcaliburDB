@@ -1563,7 +1563,14 @@ class IngestionPipelineTest {
 
             orchestrator.startIngestion(source);
             assertThat(inFetch.await(30, TimeUnit.SECONDS)).isTrue();
-            CompletableFuture<Boolean> shutdown = CompletableFuture.supplyAsync(orchestrator::shutdown);
+            CompletableFuture<Boolean> shutdown = new CompletableFuture<>();
+            Thread closing = new Thread(() -> shutdown.complete(orchestrator.shutdown()),
+                "closing-orchestrator");
+            closing.start();
+            // Released only once the shutdown is waiting for the run to end, which it does after
+            // asking every run to stop. Releasing earlier races the request, and a run that reaches
+            // its next document boundary first starts the document the stop is meant to prevent.
+            awaitTimedWaiting(closing);
             release.countDown();
 
             assertThat(shutdown.get(30, TimeUnit.SECONDS))
@@ -1576,6 +1583,20 @@ class IngestionPipelineTest {
             assertThat(storedChunkExists("closing", other, 0))
                 .as("the document the shutdown kept the run from starting")
                 .isFalse();
+        }
+
+        /**
+         * Waits until a thread is parked in a timed wait, which for a shutdown means it has made
+         * its requests and is now joining the runs it made them of.
+         */
+        private static void awaitTimedWaiting(Thread thread) throws InterruptedException {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (thread.getState() != Thread.State.TIMED_WAITING) {
+                assertThat(System.nanoTime())
+                    .as("the shutdown reached its wait for the run")
+                    .isLessThan(deadline);
+                Thread.sleep(1);
+            }
         }
 
         /**
