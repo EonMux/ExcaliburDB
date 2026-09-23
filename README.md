@@ -2711,7 +2711,11 @@ nothing from a segment's postings: it rebuilds a segment from its key table and 
 storage, so while the key table beside a damaged segment is intact the next compaction rebuilds
 it, and the sweep that enforces `lexical-max-latency-seconds` asks for that compaction on a node
 that is not ingesting. A segment whose key table is damaged too is reported as not rebuildable,
-and only reindexing its documents brings them back. A lexical segment is written once and never
+and only reindexing its documents brings them back. It stays on disk only while no erasure is owed:
+its names are the only record of what it holds, so no erasure can be shown to have reached it, and
+recording one — or opening with one owed — removes the segment, logs it at ERROR and counts its
+chunks in `lexical.unreadableChunksDropped`, rather than leaving every erasure owed for as long as
+the damaged files remain. A lexical segment is written once and never
 edited — erasure and compaction both produce a new segment — so there is no unsealed state for
 this format.
 

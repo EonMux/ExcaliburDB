@@ -34,10 +34,12 @@ import java.util.Optional;
  * @param oldestErasureRequest When the oldest of them was accepted, if any
  * @param compactionDue        Whether the index would compact if asked right now: because its
  *                             policy says so, or because a segment has to be rebuilt or upgraded
- * @param unreadableChunksDropped Chunks a compaction dropped since the index opened because
- *                             their stored text is permanently unreadable; each stopped matching
- *                             any query and needs restoring and reindexing. Always zero for an
- *                             index that keeps its own copy of the text
+ * @param unreadableChunksDropped Chunks dropped since the index opened because nothing on disk
+ *                             can bring them back: a compaction found their stored text
+ *                             permanently unreadable, or an owed erasure removed a segment whose
+ *                             postings and key table were both damaged. Each stopped matching any
+ *                             query and needs reindexing. Always zero for an index that keeps its
+ *                             own copy of the text
  * @param unreadableSegments   Segments the index holds and could not open, whose chunks no query
  *                             can match; empty for a healthy index
  * @param outdatedSegments     Segments written in an older format and not yet rewritten into the

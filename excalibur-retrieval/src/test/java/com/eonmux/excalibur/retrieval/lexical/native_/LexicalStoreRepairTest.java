@@ -218,6 +218,76 @@ class LexicalStoreRepairTest {
         }
 
         @Test
+        @DisplayName("is removed when an erasure is recorded, since nothing could show it erased")
+        void erasureRemovesAnUnrecoverableSegment(@TempDir Path dir) throws Exception {
+            String damaged = twoSegments(dir);
+            damagePostings(dir, damaged);
+            Files.write(dir.resolve(damaged + SegmentKeys.INDEX_SUFFIX), new byte[] {0, 0, 0});
+
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                assertThat(store.erase(java.util.Set.of("b1", "a2"))).isEqualTo(1);
+
+                assertThat(store.damagedSegments()).isEmpty();
+                assertThat(store.unsearchableDocuments(READ_AT)).isZero();
+                assertThat(store.unreadableKeysDropped())
+                    .as("the chunks it held are counted as lost, for an operator to reindex")
+                    .isEqualTo(2);
+                assertThat(hits(store, "quorum")).isZero();
+                assertThat(dir.resolve(damaged)).doesNotExist();
+                assertThat(dir.resolve(damaged + SegmentKeys.KEYS_SUFFIX)).doesNotExist();
+
+                CompactionResult result = store.compactNow(storage::get, 0);
+                assertThat(result.performed()).isTrue();
+                assertThat(store.outstandingErasureRequests())
+                    .as("the erasure settles like any other").isEmpty();
+            }
+            try (LexicalStore reopened = LexicalStore.open(dir)) {
+                assertThat(reopened.damagedSegments()).isEmpty();
+                assertThat(reopened.segments()).extracting(SegmentManifest.Entry::name)
+                    .doesNotContain(damaged);
+            }
+        }
+
+        @Test
+        @DisplayName("is removed on open while an erasure is owed, so the erasure can settle")
+        void owedErasureRemovesAnUnrecoverableSegmentOnOpen(@TempDir Path dir) throws Exception {
+            String damaged = twoSegments(dir);
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.erase(java.util.Set.of("a2"));
+            }
+            damagePostings(dir, damaged);
+            Files.write(dir.resolve(damaged + SegmentKeys.INDEX_SUFFIX), new byte[] {0, 0, 0});
+
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                assertThat(store.damagedSegments()).isEmpty();
+                assertThat(store.unreadableKeysDropped()).isEqualTo(1);
+
+                store.compactNow(storage::get, 0);
+
+                assertThat(store.outstandingErasureRequests()).isEmpty();
+                assertThat(hits(store, "quorum")).isEqualTo(1);
+            }
+        }
+
+        @Test
+        @DisplayName("does not stop documents being published again over what it held")
+        void republishingOverAnUnrecoverableSegment(@TempDir Path dir) throws Exception {
+            String damaged = twoSegments(dir);
+            damagePostings(dir, damaged);
+            Files.write(dir.resolve(damaged + SegmentKeys.INDEX_SUFFIX), new byte[] {0, 0, 0});
+
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a1", "quorum replication latency reindexed"), 3);
+
+                assertThat(store.search(new String[] {"quorum"}, ones(1), 10, READ_AT))
+                    .extracting(LexicalStore.Hit::key).containsExactlyInAnyOrder("a1", "b1");
+                assertThat(store.damagedSegments()).as("with nothing owed it is left as it is")
+                    .singleElement().satisfies(segment ->
+                        assertThat(segment.name()).isEqualTo(damaged));
+            }
+        }
+
+        @Test
         @DisplayName("is not rebuilt from a key table that names a different number of documents")
         void keyTableCountMustAgree(@TempDir Path dir) throws Exception {
             String damaged = twoSegments(dir);

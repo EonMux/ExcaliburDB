@@ -194,12 +194,14 @@ public final class LexicalStore implements AutoCloseable {
         new java.util.concurrent.atomic.AtomicLong();
 
     /**
-     * Keys a rewrite dropped because their stored text is permanently unreadable.
+     * Keys dropped because nothing left on disk can bring them back: a rewrite dropped them
+     * because their stored text is permanently unreadable, or an owed erasure removed the
+     * segment holding them because neither its postings nor its key table could be read.
      *
      * <p>Counted since this store was opened, and reported rather than only logged: each is a
      * chunk that stopped matching any query because storage lost it, and an operator needs the
      * number to know that something has to be restored and reindexed. See
-     * {@link UnrecoverableTextException}.</p>
+     * {@link UnrecoverableTextException} and {@link #removeUnrecoverable}.</p>
      */
     private final java.util.concurrent.atomic.AtomicLong unreadableKeysDropped =
         new java.util.concurrent.atomic.AtomicLong();
@@ -262,6 +264,10 @@ public final class LexicalStore implements AutoCloseable {
             clock, bm25, DocumentErasureLog.open(directory));
         store.removeUnreferenced();
         store.inspectSegments();
+        if (!store.erasureLog.outstanding().isEmpty()) {
+            store.removeUnrecoverable("the erasure log owes " + store.erasureLog.outstanding()
+                .size() + " erasure(s) this store cannot show it holds none of");
+        }
         store.reapplyErasures();
         return store;
     }
@@ -353,8 +359,67 @@ public final class LexicalStore implements AutoCloseable {
         LOGGER.error("Segment {} of the lexical store at {} cannot be opened, so the {} "
             + "document(s) it holds will not be found by any query until its files are restored "
             + "or its documents reindexed; its key table is damaged too, so no compaction can "
-            + "rebuild it, and its files are left untouched: {}; key table: {}",
+            + "rebuild it, and its files are left untouched until an erasure is owed, which "
+            + "removes it: {}; key table: {}",
             entry.name(), directory, entry.liveCount(), why, keyDamage);
+    }
+
+    /**
+     * Whether a segment is one this store can neither search nor rebuild: its postings could not
+     * be opened and its key table cannot be relied on either.
+     */
+    private boolean unrecoverable(String name) {
+        return unreadable.containsKey(name) && !rebuildable.contains(name);
+    }
+
+    /**
+     * Takes every unrecoverable segment out of the store, because an erasure is owed.
+     *
+     * <h3>Why an erasure is what removes it</h3>
+     * <p>An erasure is discharged by showing that no segment holds the erased name, and a segment
+     * whose key table cannot be read cannot show that: its names are the only record of what it
+     * holds. Left in place it would hold every erasure hostage - none could be marked in it, none
+     * could ever be settled against it, and each would stay owed past its deadline for as long as
+     * the damaged files sat on disk. Nothing is lost that the store could answer with: the
+     * segment is kept out of every query, and without its names no compaction can rebuild it, so
+     * reindexing its documents was already the only way back for them. Removing it keeps the
+     * promise an erasure makes - the bytes that might hold the erased name are gone - and it is
+     * the same decision a rewrite makes about a chunk whose stored text is permanently
+     * unreadable, for the same reason; see {@link UnrecoverableTextException}.</p>
+     *
+     * <p>Only when an erasure is owed. With nothing owed a damaged segment costs nothing but the
+     * documents it cannot serve, and it stays on disk and reported, where an operator can still
+     * copy it aside.</p>
+     *
+     * <p>The manifest stops naming the segments before their files go, as a compaction retires
+     * segments, so a crash between the two leaves files the next open sweeps up as unreferenced
+     * rather than a manifest naming what is gone. Each segment's documents are counted in
+     * {@link #unreadableKeysDropped()}.</p>
+     *
+     * @param why What is owed, for the log line
+     */
+    private void removeUnrecoverable(String why) throws IOException {
+        List<SegmentManifest.Entry> doomed = new ArrayList<>();
+        for (SegmentManifest.Entry entry : manifest.entries()) {
+            if (unrecoverable(entry.name())) {
+                doomed.add(entry);
+            }
+        }
+        if (doomed.isEmpty()) {
+            return;
+        }
+        manifest.removeAll(names(doomed));
+        manifest.write(directory);
+        for (SegmentManifest.Entry entry : doomed) {
+            deleteSegment(entry.name());
+            String damage = unreadable.remove(entry.name());
+            outdated.remove(entry.name());
+            unreadableKeysDropped.addAndGet(entry.liveCount());
+            LOGGER.error("Removed segment {} of the lexical store at {}: {}, and it cannot be "
+                + "read or rebuilt ({}), so its {} document(s) could never be shown free of an "
+                + "erased name. Reindex the documents of the sources it held to make them "
+                + "searchable again", entry.name(), directory, why, damage, entry.liveCount());
+        }
     }
 
     /**
@@ -511,8 +576,17 @@ public final class LexicalStore implements AutoCloseable {
             return 0;
         }
         // Read before the batch joins the manifest, so a segment supersedes what the store held
-        // rather than what arrived beside it.
-        int replaced = supersede(staged, manifest.entries());
+        // rather than what arrived beside it. A segment whose key table cannot be read is passed
+        // over: nothing in it is searched, so no earlier copy there can be returned beside the
+        // new one, and refusing the batch over it would stop the reindex that is the only way
+        // back for its documents.
+        List<SegmentManifest.Entry> targets = new ArrayList<>();
+        for (SegmentManifest.Entry entry : manifest.entries()) {
+            if (!unrecoverable(entry.name())) {
+                targets.add(entry);
+            }
+        }
+        int replaced = supersede(staged, targets);
 
         int documents = 0;
         for (Staged segment : staged) {
@@ -784,6 +858,9 @@ public final class LexicalStore implements AutoCloseable {
             DocumentKeys.require(key);
         }
         erasureLog.append(documentKeys, clock.instant());
+        // After the obligation is durable, so a crash while the segment goes still owes the
+        // erasure, and the next open removes what is left of it for the same reason.
+        removeUnrecoverable("an erasure of " + documentKeys.size() + " name(s) was recorded");
 
         int erased = markErased(documentKeys);
         if (erased > 0) {
@@ -856,10 +933,11 @@ public final class LexicalStore implements AutoCloseable {
     }
 
     /**
-     * How many keys rewrites have dropped since this store opened because their stored text is
-     * permanently unreadable.
+     * How many keys this store has dropped since it opened because nothing on disk can bring
+     * them back.
      *
-     * @return The count; see {@link UnrecoverableTextException}
+     * @return The count; see {@link UnrecoverableTextException} and the damaged segments an owed
+     *         erasure removes
      */
     public long unreadableKeysDropped() {
         return unreadableKeysDropped.get();
