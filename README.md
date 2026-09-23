@@ -977,9 +977,12 @@ Every route's answer is cached, after relevancy scoring: vector, hybrid and lexi
 hybrid answer is also fingerprinted on the lexical index — the manifest entries visible at the
 query epoch, or the Lucene reader version — so an epoch crossing a manifest entry discards it like
 any other change. Result text, snippets and explanations are read from storage on every answer, so
-quoted text can never be stale. Degraded, timed-out and cancelled answers, and answers whose
-relevancy scoring fell back, are never stored at all, so one moment's trouble cannot be replayed as
-a persistent fault.
+quoted text can never be stale. An answer that is the product of a moment's trouble is never
+stored, so that trouble cannot be replayed as a persistent fault: a vector or hybrid answer that is
+degraded, timed out, cancelled or whose relevancy scoring fell back; a lexical answer that timed
+out, was cancelled, fell back or read less than the whole index (its `degraded` flag, set on every
+lexical answer, does not count); and a BM25 answer standing in for a failed vector half. See
+[USAGE.md](USAGE.md#the-query-cache).
 
 ### Degradation
 
@@ -1003,7 +1006,11 @@ A response says which signals answered it. `retrieval` is `"hybrid"`, `"vector"`
 and a `coverage.degraded` flag distinguishes "this is all there was" from "this is all we looked
 at". A signal that was configured and then failed mid-query does not silently vanish from that
 field: a BM25 search that breaks or misses the request's budget leaves the vector answer intact and
-the response reports `"vector"`, because that is what ran.
+the response reports `"vector"`, because that is what ran. It runs the other way too: an embedding
+endpoint or vector pipeline that fails, or misses the deadline without a partial answer, leaves
+the query answered from BM25 with `"lexical"` - on a node with `excalibur.query.hybrid-retrieval=false`
+as well, which starts its BM25 search once the vector half has failed. See
+[USAGE.md](USAGE.md#hybrid-retrieval--both-signals).
 
 ### Evaluating it
 
@@ -1417,7 +1424,9 @@ The HTTP API does not accept pre-computed vectors. Embedding consistency between
 
 `document_id` is always a JSON string, never a bare number: it is the identifier ingestion
 assigned, `sourceId:documentId:chunk:N`, which is what a client can actually look something up by.
-The HNSW node id is deliberately not exposed — compaction renumbers it. `segment_id` says which
+The HNSW node id is deliberately not exposed — compaction renumbers it — so a vector hit whose
+graph node has no document identity, because its segment's mapping is damaged, is dropped rather
+than returned under that number, and the answer is marked degraded. `segment_id` says which
 segment answered, which is what makes a result traceable back to storage.
 
 Text is not on a result unless the request asked for it: send `"include_text": true` and every
@@ -1461,9 +1470,10 @@ means most of the corpus was never searched. Treating those as the same thing is
 field exists to prevent.
 
 The server-generated `query_id` can be used to cancel the query mid-flight via
-`DELETE /v1/query/{query_id}`. A cancelled query answers `200` with whatever it had reached and
-`cancelled: true` - which is the only thing separating it from a query that searched everything and
-matched nothing.
+`DELETE /v1/query/{query_id}`. When that call answers `"cancelled": true`, the query answers `200`
+with `cancelled: true` and no results, on every route and even if its search had already finished:
+a withdrawn question is not answered. `cancelled` is the only thing separating that from a query
+that searched everything and matched nothing.
 
 ### Ingest Example
 
@@ -3086,7 +3096,8 @@ are embedding the library rather than calling the API, use `documentIdStr()`, no
 
 **A query timed out. Why is it a 200?**
 Because a partial answer to a bounded question is a result, not a fault. `timed_out` is `true`, the
-results gathered so far are returned, and `coverage` tells you how much of the corpus they came
+results gathered so far are returned - fused with BM25 on a hybrid node, or BM25's alone when vector
+search produced nothing in time - and `coverage` tells you how much of the corpus they came
 from.
 
 ### The graph
