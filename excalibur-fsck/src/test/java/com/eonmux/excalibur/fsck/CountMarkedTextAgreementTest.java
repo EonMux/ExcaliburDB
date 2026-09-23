@@ -59,6 +59,12 @@ class CountMarkedTextAgreementTest {
                 replaced(lines, 0, header + (format.newestVersion() + 1))),
             new Mutation("the oldest version read", lines ->
                 replaced(lines, 0, header + format.oldestVersion())),
+            new Mutation("the last version without a checksum", lines ->
+                replaced(lines, 0, header + (format.firstChecksummedVersion() - 1))),
+            new Mutation("a record altered in place", lines ->
+                replaced(lines, 1, lines.get(1) + "x")),
+            new Mutation("the checksum lost", lines -> replaced(lines, lines.size() - 1,
+                end + (lines.size() - 2))),
             new Mutation("version zero", lines -> replaced(lines, 0, header + "0")),
             new Mutation("a version that is not a number", lines ->
                 replaced(lines, 0, header + "two")),

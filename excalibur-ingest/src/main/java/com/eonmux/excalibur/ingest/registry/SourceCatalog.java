@@ -7,7 +7,6 @@ import com.eonmux.excalibur.tenancy.NamespaceId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.BufferedWriter;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -44,11 +43,15 @@ import java.util.concurrent.ConcurrentHashMap;
  * and the line terminators escaped. Roots and URLs are caller-supplied text and contain all of
  * those, so escaping is not optional.</p>
  *
- * <p>A last line, {@code \#end|count}, closes the file. Without it a catalog that lost its tail
- * is a catalog of whole, well-formed records that simply omits sources - which reads exactly like
- * a catalog those sources were never registered in, and is the one failure a registry of promises
- * must not be able to make quietly. Neither line can collide with a record: {@link
- * #escape(String)} doubles every backslash, so no formatted record begins with a single one.</p>
+ * <p>A last line, {@code \#end|<count>|<crc>}, closes the file: how many records precede it,
+ * and the CRC32C of every byte before it, header included, in eight lowercase hexadecimal digits
+ * (see {@link EndLine}). Without the count a catalog that lost its tail is a catalog of whole,
+ * well-formed records that simply omits sources - which reads exactly like a catalog those
+ * sources were never registered in, and is the one failure a registry of promises must not be
+ * able to make quietly. Without the checksum a record altered in place is a registration nobody
+ * made: another root to crawl, another namespace to stage into. Neither line can collide with a
+ * record: {@link #escape(String)} doubles every backslash, so no formatted record begins with a
+ * single one.</p>
  *
  * <h2>Reading an older or newer file</h2>
  * <p>The header is what tells a short file from an old one. Truncation takes the tail, so the
@@ -62,7 +65,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * guess at.</p>
  *
  * <p>Every version this build has ever written is still read, because the alternative is a
- * node that refuses to start after an upgrade. Version 1 carried no namespace field, so its
+ * node that refuses to start after an upgrade. Versions 1 and 2 closed with {@code \#end|count}
+ * and no checksum: their count is checked, their records cannot be, and the next registration
+ * rewrites them in the current version. A current-version catalog whose checksum does not match
+ * its bytes is refused, as a catalog that cannot be read is. Version 1 carried no namespace field,
+ * so its
  * records name two fixed fields rather than three and load into the shared namespace - which is
  * exactly what they meant, since the build that wrote them staged every document there. The
  * declared version is therefore carried from the header down into {@link #parse(String, int)}:
@@ -109,7 +116,8 @@ public final class SourceCatalog {
     private static final String REPLACEMENT_SUFFIX = ".tmp";
 
     /**
-     * Opens the last line, which states how many records precede it.
+     * Opens the last line, which states how many records precede it and, from {@link
+     * #FIRST_CHECKSUMMED_VERSION}, the checksum of every byte before it.
      *
      * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
      * judge this file offline and must accept exactly what this class accepts.</p>
@@ -130,7 +138,15 @@ public final class SourceCatalog {
      * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
      * judge this file offline and must accept exactly what this class accepts.</p>
      */
-    public static final int FORMAT_VERSION = 2;
+    public static final int FORMAT_VERSION = 3;
+
+    /**
+     * The first version whose closing line carries a checksum.
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
+     */
+    public static final int FIRST_CHECKSUMMED_VERSION = 3;
 
     /**
      * The oldest format this build still reads.
@@ -386,28 +402,22 @@ public final class SourceCatalog {
     }
 
     /**
-     * Writes every record and the end marker that proves the file is whole.
+     * Writes every record and the closing line that proves the file is whole.
      *
      * <p>The count is taken from the same pass that writes the records rather than from
-     * {@code sources.size()}, so it states what actually reached the file.</p>
+     * {@code sources.size()}, so it states what actually reached the file, and the checksum from
+     * the bytes as they were written.</p>
      */
     private void write(Path replacement) throws IOException {
-        try (BufferedWriter out = Files.newBufferedWriter(replacement)) {
-            out.write(HEADER_MARKER);
-            out.write(FIELD_SEPARATOR);
-            out.write(Integer.toString(FORMAT_VERSION));
-            out.newLine();
+        try (ChecksummedTextWriter out = ChecksummedTextWriter.create(replacement)) {
+            out.writeLine(HEADER_MARKER + FIELD_SEPARATOR + FORMAT_VERSION);
 
             int written = 0;
             for (SourceDescriptor descriptor : sources.values()) {
-                out.write(format(descriptor));
-                out.newLine();
+                out.writeLine(format(descriptor));
                 written++;
             }
-            out.write(END_MARKER);
-            out.write(FIELD_SEPARATOR);
-            out.write(Integer.toString(written));
-            out.newLine();
+            out.writeEnd(END_MARKER, written);
         }
     }
 
@@ -449,9 +459,9 @@ public final class SourceCatalog {
 
     private void load() {
         int skipped = 0;
-        List<String> lines;
+        ChecksummedLineReader.Lines lines;
         try {
-            lines = Files.readAllLines(file);
+            lines = ChecksummedLineReader.readAll(file);
         } catch (IOException e) {
             throw new CatalogLoadException(file, e);
         }
@@ -483,20 +493,24 @@ public final class SourceCatalog {
     }
 
     /**
-     * Strips the header and the end marker, and checks that what is between them is all there.
+     * Strips the header and the closing line, and checks that what is between them is all there
+     * and is what was written.
      *
      * <p>A catalog that lost its tail keeps whole records, so nothing about the lines themselves
-     * says anything is missing; only the marker and the count it carries can. Refusing to load is
-     * the same stance the class takes on a catalog it cannot read at all - a node that starts on
-     * a short catalog re-crawls fewer sources than it was asked to and overwrites the rest at the
-     * next registration, with nothing on the way saying so.</p>
+     * says anything is missing; only the closing line and the count it carries can. A record
+     * altered in place is just as whole, and only the checksum can say it changed. Refusing to
+     * load either is the same stance the class takes on a catalog it cannot read at all - a node
+     * that starts on a short or altered catalog re-crawls other sources than it was asked to and
+     * overwrites the rest at the next registration, with nothing on the way saying so.</p>
      *
-     * @param lines Every line of the file
+     * @param read Every line of the file, and the checksum of the bytes before the last
      * @return The record lines and the version to read them in
-     * @throws CatalogLoadException if the version is not one this build reads, or the marker is
-     *                              missing or disagrees with what is there
+     * @throws CatalogLoadException if the version is not one this build reads, the closing line
+     *                              is missing or disagrees with what is there, or the checksum
+     *                              does not match
      */
-    private Body body(List<String> lines) {
+    private Body body(ChecksummedLineReader.Lines read) {
+        List<String> lines = read.lines();
         if (lines.isEmpty()) {
             throw new CatalogLoadException(file,
                 "the file is empty, so the write that created it never reached the disk");
@@ -513,15 +527,21 @@ public final class SourceCatalog {
         }
 
         List<String> records = body.subList(0, body.size() - 1);
-        int declared = declaredCount(body.get(body.size() - 1));
-        if (declared < 0) {
-            throw new CatalogLoadException(file,
-                "it does not end with a record count, so it was cut short before the write that "
+        boolean checksummed = version >= FIRST_CHECKSUMMED_VERSION;
+        EndLine end = EndLine.parse(body.get(body.size() - 1), END_MARKER, checksummed);
+        if (end == null) {
+            throw new CatalogLoadException(file, checksummed
+                ? "it does not end with a record count and checksum, so it was cut short before "
+                    + "the write that published it finished"
+                : "it does not end with a record count, so it was cut short before the write that "
                     + "published it finished, or it predates the record count entirely");
         }
-        if (declared != records.size()) {
-            throw new CatalogLoadException(file, "it declares " + declared
+        if (end.count() != records.size()) {
+            throw new CatalogLoadException(file, "it declares " + end.count()
                 + " record(s) and carries " + records.size());
+        }
+        if (checksummed && end.checksum() != read.checksumBeforeLast()) {
+            throw new CatalogLoadException(file, end.mismatch(read.checksumBeforeLast()));
         }
         return new Body(version, records);
     }
@@ -577,24 +597,6 @@ public final class SourceCatalog {
             return Integer.parseInt(line.substring(prefix.length()));
         } catch (NumberFormatException e) {
             return UNREADABLE_HEADER;
-        }
-    }
-
-    /**
-     * Reads the count out of a candidate end marker.
-     *
-     * @return The declared record count, or -1 if the line is not an end marker
-     */
-    private static int declaredCount(String line) {
-        String prefix = END_MARKER + FIELD_SEPARATOR;
-        if (!line.startsWith(prefix)) {
-            return -1;
-        }
-        try {
-            int count = Integer.parseInt(line.substring(prefix.length()));
-            return count < 0 ? -1 : count;
-        } catch (NumberFormatException e) {
-            return -1;
         }
     }
 

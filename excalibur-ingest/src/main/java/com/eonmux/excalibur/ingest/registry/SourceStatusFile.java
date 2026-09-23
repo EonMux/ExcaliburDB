@@ -3,9 +3,7 @@ package com.eonmux.excalibur.ingest.registry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.BufferedWriter;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collection;
@@ -41,22 +39,26 @@ import java.util.Objects;
  * <p>The catalog's conventions, deliberately, so the tools that check a data directory read both
  * the same way. A first line, {@code \#source-status|<version>}, names the format; one line per
  * source follows, {@code id|state|progress|ingested|pending|skipped|disallowed|updated_ms[|error]},
- * escaped as the catalog escapes; and a last line, {@code \#end|count}, closes the file, so a file
- * that lost its tail is told apart from a shorter history. The error field is absent rather than
- * empty when there is none: an empty message and no message are different answers.</p>
+ * escaped as the catalog escapes; and a last line, {@code \#end|<count>|<crc>}, closes the file:
+ * the count, so a file that lost its tail is told apart from a shorter history, and the CRC32C of
+ * every byte before the line, header included (see {@link EndLine}), so a record altered in place
+ * is told apart from the one that was written. The error field is absent rather than empty when
+ * there is none: an empty message and no message are different answers.</p>
  *
  * <p>Version 1 had no {@code disallowed} field, since nothing was left out of a crawl on a
  * publisher's say-so before robots.txt was honoured; its records are still read, with that count
- * as zero, and the next run to end rewrites the file in version 2. How many fields a record has
- * is a property of the version its file declares, never guessed from the record, because a
- * version 1 record carrying an error has as many fields as a version 2 record without one.</p>
+ * as zero. Versions 1 and 2 closed with {@code \#end|count} and no checksum, and are read with
+ * their count checked and their records unverified. Either is rewritten in the current version
+ * when the next run ends. How many fields a record has is a property of the version its file
+ * declares, never guessed from the record, because a version 1 record carrying an error has as
+ * many fields as a version 2 record without one.</p>
  *
  * <h2>Reading an unreadable file</h2>
  * <p>A file with no header, a version this build does not know, a missing or disagreeing record
- * count, or one that cannot be read at all is logged and ignored: the node starts, and each source
- * reports from its next run onwards. Refusing to start over a report would take a serving node
- * down for the sake of its history. A record that does not parse costs that one source's
- * history.</p>
+ * count, a checksum that does not match its bytes, or one that cannot be read at all is logged
+ * and ignored: the node starts, and each source reports from its next run onwards. Refusing to
+ * start over a report would take a serving node down for the sake of its history. A record that
+ * does not parse costs that one source's history.</p>
  *
  * <h2>Durability</h2>
  * <p>As the catalog's, through the same {@link SourceCatalog.CatalogWriter}: the whole file is
@@ -79,7 +81,15 @@ public final class SourceStatusFile {
      * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
      * judge this file offline and must accept exactly what this class accepts.</p>
      */
-    public static final int FORMAT_VERSION = 2;
+    public static final int FORMAT_VERSION = 3;
+
+    /**
+     * The first version whose closing line carries a checksum.
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
+     */
+    public static final int FIRST_CHECKSUMMED_VERSION = 3;
 
     /**
      * The oldest format this build still reads: the one written before the disallowed count.
@@ -101,7 +111,8 @@ public final class SourceStatusFile {
     public static final String HEADER_MARKER = "\\#source-status";
 
     /**
-     * Opens the last line, which states how many records precede it.
+     * Opens the last line, which states how many records precede it and, from {@link
+     * #FIRST_CHECKSUMMED_VERSION}, the checksum of every byte before it.
      *
      * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
      * judge this file offline and must accept exactly what this class accepts.</p>
@@ -238,19 +249,12 @@ public final class SourceStatusFile {
     }
 
     private static void writeTo(Path replacement, List<Entry> entries) throws IOException {
-        try (BufferedWriter out = Files.newBufferedWriter(replacement, StandardCharsets.UTF_8)) {
-            out.write(HEADER_MARKER);
-            out.write(FIELD_SEPARATOR);
-            out.write(Integer.toString(FORMAT_VERSION));
-            out.newLine();
+        try (ChecksummedTextWriter out = ChecksummedTextWriter.create(replacement)) {
+            out.writeLine(HEADER_MARKER + FIELD_SEPARATOR + FORMAT_VERSION);
             for (Entry entry : entries) {
-                out.write(format(entry));
-                out.newLine();
+                out.writeLine(format(entry));
             }
-            out.write(END_MARKER);
-            out.write(FIELD_SEPARATOR);
-            out.write(Integer.toString(entries.size()));
-            out.newLine();
+            out.writeEnd(END_MARKER, entries.size());
         }
     }
 
@@ -276,12 +280,13 @@ public final class SourceStatusFile {
      * @return The entries by source id
      */
     private Map<String, Entry> load() {
-        List<String> lines;
+        ChecksummedLineReader.Lines read;
         try {
-            lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+            read = ChecksummedLineReader.readAll(file);
         } catch (IOException e) {
             return ignored("it could not be read: " + e);
         }
+        List<String> lines = read.lines();
         if (lines.isEmpty()) {
             return ignored("it is empty");
         }
@@ -301,14 +306,19 @@ public final class SourceStatusFile {
                 + OLDEST_READABLE_VERSION + " to " + FORMAT_VERSION);
         }
         List<String> records = lines.subList(1, Math.max(1, lines.size() - 1));
-        int declared = lines.size() < 2 ? -1 : declaredCount(lines.get(lines.size() - 1));
-        if (declared < 0) {
-            return ignored("it does not end with a record count, so the write that published it "
-                + "was cut short");
+        boolean checksummed = version >= FIRST_CHECKSUMMED_VERSION;
+        EndLine end = lines.size() < 2 ? null
+            : EndLine.parse(lines.get(lines.size() - 1), END_MARKER, checksummed);
+        if (end == null) {
+            return ignored("it does not end with a record count" + (checksummed ? " and checksum"
+                : "") + ", so the write that published it was cut short");
         }
-        if (declared != records.size()) {
-            return ignored("it declares " + declared + " record(s) and carries "
+        if (end.count() != records.size()) {
+            return ignored("it declares " + end.count() + " record(s) and carries "
                 + records.size());
+        }
+        if (checksummed && end.checksum() != read.checksumBeforeLast()) {
+            return ignored(end.mismatch(read.checksumBeforeLast()));
         }
         return parseAll(records, version);
     }
@@ -341,19 +351,6 @@ public final class SourceStatusFile {
         LOGGER.warn("Ignoring the source status file at {}: {}. Every source reports from its "
             + "next run onwards, and the file is rewritten when the first one ends", file, reason);
         return Map.of();
-    }
-
-    private static int declaredCount(String line) {
-        String prefix = END_MARKER + FIELD_SEPARATOR;
-        if (!line.startsWith(prefix)) {
-            return -1;
-        }
-        try {
-            int count = Integer.parseInt(line.substring(prefix.length()));
-            return Math.max(-1, count);
-        } catch (NumberFormatException e) {
-            return -1;
-        }
     }
 
     /**

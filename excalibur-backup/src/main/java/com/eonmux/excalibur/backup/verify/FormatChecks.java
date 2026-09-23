@@ -50,7 +50,8 @@ import java.util.Optional;
  * write-ahead logs, whose records are replayed and their checksums compared; the routing
  * directory; the segments' term sketches, whose checker reads without writing and so needs
  * no scratch copy; the document registry, the source catalog and the source status history,
- * which are checked against the header version and the record count their readers require; the
+ * which are checked against the header version, the record count and the checksum their readers
+ * require; the in-flight ingest journal, whose every line carries its own checksum; the
  * graph staging logs; and the native lexical store, which is
  * checked as a whole by {@link #withLexicalStore} because its manifest and the segments it
  * names are one structure. The same dispatch is what {@code excalibur-fsck} surveys a live
@@ -68,8 +69,8 @@ import java.util.Optional;
  *
  * <h2>What "proven" means</h2>
  * <p>Some formats carry nothing a checker could prove: the routing directory has no
- * checksum, the in-flight ingest journal is truncation-tolerant by design, the lexical
- * store's sidecars have no verifier. Those are reported as checked and unproven - healthy,
+ * checksum, the lexical store's sidecars have no verifier, and a registry or journal written
+ * before its format carried a checksum has only its count or nothing at all. Those are reported as checked and unproven - healthy,
  * because nothing wrong was found, and not proven, because nothing could have been - rather
  * than left out, which would read as though nothing in the image went unverified.</p>
  *

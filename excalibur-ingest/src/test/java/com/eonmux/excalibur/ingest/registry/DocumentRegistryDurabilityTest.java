@@ -87,8 +87,7 @@ class DocumentRegistryDurabilityTest {
         registry.persist();
 
         List<String> lines = new ArrayList<>(Files.readAllLines(file, StandardCharsets.UTF_8));
-        lines.set(lines.size() - 1, "\\#end|3");
-        Files.write(file, lines, StandardCharsets.UTF_8);
+        Sealed.write(file, lines.subList(0, lines.size() - 1), DocumentRegistry.END_MARKER, 3);
 
         assertThatThrownBy(() -> new DocumentRegistry(file))
             .isInstanceOf(DocumentRegistry.RegistryLoadException.class)
@@ -118,11 +117,11 @@ class DocumentRegistryDurabilityTest {
         // still end up with a file the next crash can be detected against.
         registry.persist();
 
-        assertThat(Files.readAllLines(file, StandardCharsets.UTF_8))
-            .containsExactly(
-                "\\#document-registry|1",
-                "src|old.md|1000|4242|128|2000|src:old.md:chunk:0|",
-                "\\#end|1");
+        List<String> body = List.of(
+            "\\#document-registry|2",
+            "src|old.md|1000|4242|128|2000|src:old.md:chunk:0|");
+        assertThat(Files.readString(file, StandardCharsets.UTF_8))
+            .isEqualTo(Sealed.seal(body, DocumentRegistry.END_MARKER, 1));
     }
 
     @Test
@@ -147,11 +146,10 @@ class DocumentRegistryDurabilityTest {
     }
 
     @Test
-    @DisplayName("a registry holding entity tags is still version 1, which the previous build reads")
-    void entityTagsDoNotChangeTheVersion(@TempDir Path tempDir) throws IOException {
-        // The build before entity tags accepted version 1 only and read the first seven fields
-        // of a record, ignoring the rest. Written as version 1, with the tag after the chunk
-        // ids, a registry from this build is one a rollback still opens.
+    @DisplayName("an entity tag is written as an optional last field after the chunk ids")
+    void entityTagsAreAnOptionalLastField(@TempDir Path tempDir) throws IOException {
+        // After the chunk ids, where a record without one simply ends: the tag is optional in
+        // every version, never a field a reader has to know the version to find.
         Path file = tempDir.resolve("document-registry");
         DocumentRegistry registry = new DocumentRegistry(file);
         registry.register(DocumentMetadata.builder()
@@ -163,10 +161,8 @@ class DocumentRegistryDurabilityTest {
         registry.persist();
 
         assertThat(Files.readAllLines(file, StandardCharsets.UTF_8))
-            .containsExactly(
-                "\\#document-registry|1",
-                "src|tagged.md|1000|4242|128|2000|src:tagged.md:chunk:0|\"v1\"",
-                "\\#end|1");
+            .element(1)
+            .isEqualTo("src|tagged.md|1000|4242|128|2000|src:tagged.md:chunk:0|\"v1\"");
     }
 
     @Test

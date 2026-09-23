@@ -34,9 +34,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 class SourceCatalogTest {
 
-    /** The last line of a whole catalog, less the count it ends with. */
-    private static final String END_MARKER = "\\#end|";
-
     @Test
     @DisplayName("a recorded source is there for the next process to find")
     void aRecordedSourceSurvivesTheProcess(@TempDir Path dataDir) throws IOException {
@@ -106,8 +103,7 @@ class SourceCatalogTest {
         Path file = dataDir.resolve(SourceCatalog.FILE);
         List<String> lines = new ArrayList<>(readRecords(file));
         lines.add("not-a-record");
-        lines.add(END_MARKER + (lines.size() - 1));
-        Files.write(file, lines, StandardCharsets.UTF_8);
+        Sealed.write(file, lines, SourceCatalog.END_MARKER, lines.size() - 1);
 
         assertThat(SourceCatalog.open(dataDir).all())
             .extracting(SourceDescriptor::sourceId)
@@ -196,8 +192,7 @@ class SourceCatalogTest {
 
         Path file = dataDir.resolve(SourceCatalog.FILE);
         List<String> lines = new ArrayList<>(readRecords(file));
-        lines.add(END_MARKER + lines.size());
-        Files.write(file, lines, StandardCharsets.UTF_8);
+        Sealed.write(file, lines, SourceCatalog.END_MARKER, lines.size());
 
         assertThatThrownBy(() -> SourceCatalog.open(dataDir))
             .isInstanceOf(SourceCatalog.CatalogLoadException.class)

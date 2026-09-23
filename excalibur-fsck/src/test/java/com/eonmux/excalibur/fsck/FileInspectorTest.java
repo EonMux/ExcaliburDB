@@ -78,15 +78,14 @@ class FileInspectorTest {
     @Test
     void aFileWithNothingToVerifySaysSoRatherThanPassing(@TempDir Path tempDir)
             throws IOException {
-        Path journal = tempDir.resolve("document-registry.in-flight");
-        Files.writeString(journal, "begin|doc-1\n");
+        Path leftover = tempDir.resolve("document-registry.7.new");
+        Files.writeString(leftover, "\\#document-registry|2\n");
 
-        FileInspection inspection =
-            FileInspector.inspect(journal, "document-registry.in-flight");
+        FileInspection inspection = FileInspector.inspect(leftover, "document-registry.7.new");
 
-        assertThat(inspection.kind()).isEqualTo(FileKind.IN_FLIGHT_JOURNAL);
+        assertThat(inspection.kind()).isEqualTo(FileKind.STAGING_LEFTOVER);
         assertThat(inspection.check().status()).isEqualTo(CheckStatus.UNCHECKED);
-        assertThat(inspection.check().detail()).contains("neither a checksum nor a record count");
+        assertThat(inspection.check().detail()).contains("half-finished write");
     }
 
     @Test

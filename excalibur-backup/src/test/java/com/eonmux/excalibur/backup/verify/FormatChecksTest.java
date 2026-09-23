@@ -118,9 +118,9 @@ class FormatChecksTest {
     @DisplayName("a registry at a version its reader refuses fails; a status history does not")
     void aRegistryFromANewerBuildFailsAndAStatusHistoryDoesNot() throws IOException {
         Files.writeString(dataDir.resolve("document-registry"),
-            "\\#document-registry|2\n\\#end|0\n");
+            sealed(List.of("\\#document-registry|3"), 0));
         Files.writeString(dataDir.resolve("source-status"),
-            "\\#source-status|3\ndocs|idle|1.0|420|0|7|0|1730000000000\n\\#end|1\n");
+            sealed(List.of("\\#source-status|4", "docs|idle|1.0|420|0|7|0|1730000000000"), 1));
 
         ContentCheck registry = check("document-registry");
         ContentCheck status = check("source-status");
@@ -337,13 +337,100 @@ class FormatChecksTest {
     }
 
     @Test
-    @DisplayName("a format with nothing to verify says so rather than passing")
-    void aFormatWithNothingToVerifyIsReportedHonestly() throws IOException {
+    @DisplayName("a file with nothing in it to verify says so rather than passing")
+    void aFileWithNothingToVerifyIsReportedHonestly() throws IOException {
         ContentCheck check = check(DataDirectoryFixture.IN_FLIGHT_JOURNAL);
 
         assertThat(check.healthy()).isTrue();
         assertThat(check.proven()).isFalse();
-        assertThat(check.detail()).contains("UNCHECKED").contains("neither a checksum");
+        assertThat(check.detail()).contains("UNCHECKED").contains("nothing to verify");
+    }
+
+    @Test
+    @DisplayName("the ingestion registries are proven against the checksum they close with")
+    void aChecksummedRegistryIsProven() throws IOException {
+        Files.writeString(dataDir.resolve("document-registry"), sealed(List.of(
+            "\\#document-registry|2", "docs|a.txt|1000|4242|128|2000|docs:a.txt:chunk:0"), 1));
+        Files.writeString(dataDir.resolve("source-catalog"), sealed(List.of(
+            "\\#source-catalog|3", "filesystem|a|shared|root_path=/a"), 1));
+        Files.writeString(dataDir.resolve("source-status"), sealed(List.of(
+            "\\#source-status|3", "a|idle|1.0|3|0|1|0|1000"), 1));
+
+        for (String name : List.of("document-registry", "source-catalog", "source-status")) {
+            ContentCheck check = check(name);
+            assertThat(check.healthy()).as(check.detail()).isTrue();
+            assertThat(check.proven()).as(check.detail()).isTrue();
+            assertThat(check.detail()).contains("INTACT");
+        }
+    }
+
+    @Test
+    @DisplayName("a registry record altered in place fails, where its count alone would pass")
+    void anAlteredRegistryRecordFails() throws IOException {
+        Path file = dataDir.resolve("document-registry");
+        Files.writeString(file, sealed(List.of(
+            "\\#document-registry|2", "docs|a.txt|1000|4242|128|2000|docs:a.txt:chunk:0"), 1));
+        DataDirectoryFixture.flipAByte(file);
+
+        ContentCheck check = check("document-registry");
+
+        assertThat(check.healthy()).isFalse();
+        assertThat(check.detail()).contains("CORRUPT");
+    }
+
+    @Test
+    @DisplayName("a registry written before the checksum is healthy and not proven")
+    void aRegistryBeforeTheChecksumIsNotProven() throws IOException {
+        Files.writeString(dataDir.resolve("document-registry"),
+            "\\#document-registry|1\ndocs|a.txt|1000|4242|128|2000|docs:a.txt:chunk:0\n"
+                + "\\#end|1\n");
+
+        ContentCheck check = check("document-registry");
+
+        assertThat(check.healthy()).isTrue();
+        assertThat(check.proven()).isFalse();
+        assertThat(check.detail()).contains("LEGACY_UNPROTECTED");
+    }
+
+    @Test
+    @DisplayName("an in-flight journal is proven line by line, and a damaged line fails")
+    void anInFlightJournalIsProvenLineByLine() throws IOException {
+        Path file = dataDir.resolve(DataDirectoryFixture.IN_FLIGHT_JOURNAL);
+        Files.writeString(file, lineSealed("\\#in-flight|2") + "\n"
+            + lineSealed("+|docs:a.md") + "\n");
+
+        ContentCheck whole = check(DataDirectoryFixture.IN_FLIGHT_JOURNAL);
+        assertThat(whole.healthy()).as(whole.detail()).isTrue();
+        assertThat(whole.proven()).as(whole.detail()).isTrue();
+
+        Files.writeString(file, lineSealed("\\#in-flight|2") + "\n"
+            + lineSealed("+|docs:a.md").replace("docs:a", "docs:b") + "\n");
+
+        ContentCheck damaged = check(DataDirectoryFixture.IN_FLIGHT_JOURNAL);
+        assertThat(damaged.healthy()).isFalse();
+        assertThat(damaged.detail()).contains("CORRUPT").contains("checksum");
+    }
+
+    /**
+     * Renders lines followed by the checksummed closing line the ingestion writers end with.
+     */
+    private static String sealed(List<String> lines, int count) {
+        StringBuilder body = new StringBuilder();
+        lines.forEach(line -> body.append(line).append('\n'));
+        return body + "\\#end|" + count + "|" + crc(body.toString()) + "\n";
+    }
+
+    /**
+     * Renders a journal line closed with the checksum of its own bytes.
+     */
+    private static String lineSealed(String content) {
+        return content + "|" + crc(content);
+    }
+
+    private static String crc(String text) {
+        java.util.zip.CRC32C crc = new java.util.zip.CRC32C();
+        crc.update(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return String.format("%08x", crc.getValue());
     }
 
     @Test

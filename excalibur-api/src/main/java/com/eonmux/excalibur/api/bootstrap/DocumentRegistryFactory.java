@@ -24,11 +24,13 @@ import java.util.Objects;
  *
  * <h2>A registry in an older format</h2>
  * <p>A registry written before the format carried a header and a record count is read, but a
- * truncated copy of one cannot be told from a whole one. So it is rewritten in the current
- * format as it is opened, through the same durable save every other change goes through, rather
- * than at the first ingest or erasure - which on a node that is only queried after an upgrade
- * might never come. A rewrite that fails is logged and left to the next save: every record was
- * read, so the node has what it needs to start.</p>
+ * truncated copy of one cannot be told from a whole one; a registry written before the format
+ * carried a checksum is read too, but a record altered in place in one cannot be told from the
+ * record that was written. So either is rewritten in the current format as it is opened, through
+ * the same durable save every other change goes through, rather than at the first ingest or
+ * erasure - which on a node that is only queried after an upgrade might never come. A rewrite
+ * that fails is logged and left to the next save: every record was read, so the node has what it
+ * needs to start.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Stateless; the registry it returns is thread-safe.</p>

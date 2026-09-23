@@ -2,6 +2,7 @@ package com.eonmux.excalibur.api.bootstrap;
 
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
+import com.eonmux.excalibur.ingest.registry.EndLine;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -115,12 +116,12 @@ class DocumentRegistryFactoryTest {
         Path file = dataDir.resolve(DocumentRegistryFactory.FILE);
         // Among the records, not after the end marker. A line past the marker is what a file
         // truncated by a crash looks like, and that is refused rather than skipped - a different
-        // case from the one under test here, so the count moves with the line.
+        // case from the one under test here, so the count and the checksum move with the line.
         List<String> lines =
             new ArrayList<>(Files.readAllLines(file, StandardCharsets.UTF_8));
         lines.add(lines.size() - 1, "not a registry record");
-        lines.set(lines.size() - 1, "\\#end|2");
-        Files.write(file, lines, StandardCharsets.UTF_8);
+        Files.writeString(file, sealed(lines.subList(0, lines.size() - 1), 2),
+            StandardCharsets.UTF_8);
 
         DocumentRegistry reopened = DocumentRegistryFactory.open(dataDir);
 
@@ -154,11 +155,47 @@ class DocumentRegistryFactoryTest {
         DocumentRegistry opened = DocumentRegistryFactory.open(dataDir);
 
         List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
-        assertThat(lines.get(0)).isEqualTo("\\#document-registry|1");
-        assertThat(lines.get(lines.size() - 1)).isEqualTo("\\#end|1");
+        assertThat(lines.get(0)).isEqualTo("\\#document-registry|" + DocumentRegistry.FORMAT_VERSION);
+        assertThat(Files.readString(file, StandardCharsets.UTF_8))
+            .isEqualTo(sealed(lines.subList(0, lines.size() - 1), 1));
         assertThat(opened.isModified()).isFalse();
         assertThat(DocumentRegistryFactory.open(dataDir).get("docs", "handbook.md").getChunkIds())
             .hasSize(2);
+    }
+
+    @Test
+    @DisplayName("a registry in a version without a checksum is rewritten with one as the node starts")
+    void aVersionOneRegistryIsUpgradedOnOpen(@TempDir Path dataDir) throws Exception {
+        // Until it is rewritten, a record altered in place reads as a different, well-formed
+        // record; the upgrade is what gives every record a checksum to be verified against.
+        Path file = dataDir.resolve(DocumentRegistryFactory.FILE);
+        Files.write(file, List.of("\\#document-registry|1",
+            "docs|old.md|0|42|100|0|docs:old.md:chunk:0", "\\#end|1"), StandardCharsets.UTF_8);
+
+        DocumentRegistry opened = DocumentRegistryFactory.open(dataDir);
+
+        List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+        assertThat(lines.get(0)).isEqualTo("\\#document-registry|2");
+        assertThat(Files.readString(file, StandardCharsets.UTF_8))
+            .isEqualTo(sealed(lines.subList(0, lines.size() - 1), 1));
+        assertThat(opened.isModified()).isFalse();
+        assertThat(DocumentRegistryFactory.open(dataDir).get("docs", "old.md").getChunkIds())
+            .containsExactly("docs:old.md:chunk:0");
+    }
+
+    /**
+     * Renders lines followed by the closing line the registry's writer would put after them.
+     *
+     * @param lines Every line before the closing one, header included
+     * @param count The count the closing line declares
+     * @return The file's contents
+     */
+    private static String sealed(List<String> lines, int count) {
+        StringBuilder body = new StringBuilder();
+        lines.forEach(line -> body.append(line).append('\n'));
+        java.util.zip.CRC32C crc = new java.util.zip.CRC32C();
+        crc.update(body.toString().getBytes(StandardCharsets.UTF_8));
+        return body + EndLine.render(DocumentRegistry.END_MARKER, count, crc.getValue()) + "\n";
     }
 
     @Test

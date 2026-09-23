@@ -417,8 +417,9 @@ source status history, `source-status`, is excused the same way for a different 
 derived: how each source's last crawl ended is recorded nowhere else, and the node restores it on
 restart, so losing it loses that history, though never any of the corpus. But nothing the node
 serves depends on it, and the node reads one it will not take — cut short, without its header, or
-at a version it does not read — as no history and reports each source from its next run, so such a
-file is reported `CORRUPT` and not counted as damage. Every derived file but the sketch — a graph, a
+at a version it does not read, or altered so its checksum no longer matches — as no history and
+reports each source from its next run, so such a file is reported `CORRUPT` and not counted as
+damage. Every derived file but the sketch — a graph, a
 mapping, a codebook, an LSH table — is rebuilt only by a reindex or a retrain, and its damage fails
 the run. A `segment_<N>.hnsw.compact.docmap` is
 the mapping an HNSW compaction stages: beside its `segment_<N>.hnsw.compact` the compaction never
@@ -500,8 +501,9 @@ already there when it was copied verifies faithfully:
 | graph staging logs | `excalibur-fsck`, read-only | every record of the label, triple, entity text, erasure and withdrawal logs against its CRC, walked by the graph module's own replay without opening the log. One ending in a write cut short is healthy and unproven: the node trims it on open. Damage the node refuses fails the image |
 | the lexical store | `excalibur-fsck`, read-only, as one structure | every column of every segment its manifest names |
 | segment term sketches (`segment_<N>.tfs`) | `excalibur-fsck`, read-only | a CRC32C over the header and one over the body. A damaged sketch is reported and does not fail the image: a node restored from it rebuilds the sketch when it opens the segment. One that cannot be read at all fails it |
-| the document registry, the source catalog and the source status history | `excalibur-fsck`, read-only | nothing — these formats carry no checksum. Each is held to what its reader requires — a header version it reads and a trailing record count that matches its lines — so one the node would refuse fails the image; a status history the node would only discard does not |
-| `routing.dir`, the in-flight journal, lexical sidecars | `excalibur-fsck`, read-only | nothing — these formats carry no checksum, so they are well-formed at best |
+| the document registry, the source catalog and the source status history | `excalibur-fsck`, read-only | the CRC32C on the closing line, over every byte before it, and the record count beside it. Each is held to what its reader requires, so one the node would refuse fails the image; a status history the node would only discard does not. A file written before the format carried a checksum has only its count checked, and is reported unproven |
+| the in-flight journal | `excalibur-fsck`, read-only | every line against the CRC32C it ends with. A complete line that fails its checksum fails the image, since the node refuses to start on it; a last line cut short is an append that never finished, and does not. A version 1 journal carries no checksum and is reported unproven |
+| `routing.dir`, lexical sidecars | `excalibur-fsck`, read-only | nothing — these formats carry no checksum, so they are well-formed at best |
 
 The engine's own checkers run on a scratch copy because several of them repair what they open;
 `excalibur-fsck`'s are the ones it surveys a live directory with, so the two tools cannot disagree
@@ -2822,13 +2824,21 @@ chunks already there and tombstoning none of them — and would report every era
 a document it never held. A registry that exists and cannot be read fails the start rather than
 being treated as an empty one, and so does one whose record count disagrees with the records it
 carries — a registry cut short by a crash is a file of whole records that omits documents, and
-loading it would strand their chunks where nothing can name them.
+loading it would strand their chunks where nothing can name them. Its closing line carries the
+count and a CRC32C of every byte before it, so a record altered in place — a flipped bit that
+still parses, a chunk id that now names another chunk — fails the start too, with a message saying
+the checksum did not match, rather than loading as though it were what was written.
 
 `<data dir>/document-registry.in-flight` is the short log beside it naming documents whose chunks
 were being written when the process stopped. A document is marked there before its first chunk is
 written and released when it is published or rolled back, so a crash in between leaves the mark
 behind and the restarted node keeps those chunks hidden from queries instead of serving half a
-document. It is deleted whenever nothing is in flight, which is the steady state.
+document. It is deleted whenever nothing is in flight, which is the steady state. It is only ever
+appended to, so rather than a closing line every line, its header included, ends with the CRC32C
+of its own bytes. A complete line that fails its checksum fails the start, because that line may
+be the mark hiding a half-written document; a last line the file ends inside of is an append the
+process did not finish, which marked nothing that was written, so the node skips it and rewrites
+the journal without it before appending again.
 
 `<data dir>/source-catalog` holds the other half of what a restart has to carry: the registration
 requests behind every crawl this node was asked to keep running. It records the request rather than
@@ -2840,11 +2850,13 @@ crawl rather than silently cancelling it. Like the document registry, a catalog 
 cannot be read fails the start.
 
 Each registration is forced to disk and then published by an atomic rename, and the file ends with
-a `\#end|<count>` marker. Both are there for the same reason: without the force, a crash can leave
-a correctly-named catalog whose contents never reached the platter, and without the marker a
+a `\#end|<count>|<crc>` marker. Both are there for the same reason: without the force, a crash can
+leave a correctly-named catalog whose contents never reached the platter, and without the marker a
 catalog cut short is a file of whole, well-formed records — indistinguishable from a catalog those
-sources were never registered in, so the node would come back silently having forgotten them. A
-catalog written by a build older than the marker fails the start; see
+sources were never registered in, so the node would come back silently having forgotten them. The
+CRC32C in the marker covers every byte before it, so a record altered after it was written fails
+the start rather than restoring a source nobody registered. A catalog written by a build older than
+the marker fails the start; see
 [Upgrading a data directory](USAGE.md#upgrading-a-data-directory-written-by-an-older-build).
 
 `<data dir>/source-status` records how each registered source's last run ended — its state, its
@@ -2852,14 +2864,15 @@ progress and counts, when it finished, and its `last_error` — so `GET /v1/inge
 restart reports that run rather than zeros stamped with the moment the node came up. Only finished
 runs are written (`idle` or `unconfigured`); a crawl the restart cut short comes back `idle` with
 `last_error` saying that the run in progress when the node stopped did not finish, never still
-claiming to run. The file is written the way the catalog is — a `\#source-status|2` header, one
-line per source, a `\#end|<count>` marker, forced to disk and published by an atomic rename — but
-unlike the catalog, one that cannot be read does not fail the start. It is a report, not state the
-store depends on: the node logs it, treats the history as empty, and each source reports from its
-next run. A data directory from a build without the file needs nothing; it is written when the
-first run ends. A version 1 file, written before a crawl counted the pages `robots.txt` kept it
-from, is still read, with each source's `entries_disallowed` as 0, and the next run to end rewrites
-it at version 2.
+claiming to run. The file is written the way the catalog is — a `\#source-status|3` header, one
+line per source, a `\#end|<count>|<crc>` marker, forced to disk and published by an atomic rename
+— but unlike the catalog, one that cannot be read, or whose checksum does not match, does not fail
+the start. It is a report, not state the store depends on: the node logs it, treats the history as
+empty, and each source reports from its next run. A data directory from a build without the file
+needs nothing; it is written when the first run ends. Versions 1 and 2 carry no checksum and are
+still read — version 1, written before a crawl counted the pages `robots.txt` kept it from, with
+each source's `entries_disallowed` as 0 — and the next run to end rewrites the file at version
+3.
 
 ### Visibility and Consistency
 

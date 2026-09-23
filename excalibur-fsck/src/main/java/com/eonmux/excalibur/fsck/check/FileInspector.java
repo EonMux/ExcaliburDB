@@ -127,10 +127,7 @@ public final class FileInspector {
                 file, relative, CountMarkedFormat.SOURCE_CATALOG);
             case SOURCE_STATUS -> CountMarkedTextCheck.check(
                 file, relative, CountMarkedFormat.SOURCE_STATUS);
-            case IN_FLIGHT_JOURNAL -> unverifiable(file, relative, "in-flight ingest journal",
-                "this journal carries neither a checksum nor a record count, by design: it is "
-                    + "truncation-tolerant, because losing either half of a begin/end pair is "
-                    + "safe. Nothing here can confirm its contents");
+            case IN_FLIGHT_JOURNAL -> InFlightJournalCheck.check(file, relative);
             case LEXICAL_STORE_PART -> unverifiable(file, relative, "lexical store sidecar",
                 "this file sits beside the lexical segments rather than inside one - document "
                     + "keys, their offsets, a tombstone bitmap or the erasure log - and none "
