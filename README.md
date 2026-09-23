@@ -1783,8 +1783,8 @@ kept.
 stores are compacted one after the other and reported independently, so a failure in one does
 not hide what the other did: `state` and `error` describe the segment store, and a chunk index
 that failed reads `{"performed": false, "error": "..."}` with no counts. `performed` false with a
-`reason` is either the index's policy finding nothing due (`"not due: ..."`) or a run stopped
-before it reached the index. `segments_rewritten` is how many lexical segments were rewritten,
+`reason` is the index's policy finding nothing due (`"not due: ..."`), a run stopped before it
+reached the index, or one stopped during the index's rewrite (`"stopped: ..."`). `segments_rewritten` is how many lexical segments were rewritten,
 `segments_produced` how many replaced them, and `chunks_removed` how many tombstoned chunks — and
 chunks the store no longer holds — did not survive the rewrite. `groups_abandoned` counts groups
 of segments the rewrite had to leave as they were, because reading a surviving chunk's text back out
@@ -1792,9 +1792,13 @@ of storage failed in a way a later attempt may not repeat; those segments keep t
 any erasure owed in them stays owed for the next compaction. A rewrite that abandoned every group
 it selected published nothing and reads `performed: false`, with a `reason` beginning `nothing
 published:`; one that published some groups and abandoned others reads `performed: true` with a
-`reason` beginning `partial:`. A stop that arrives while the index is being rewritten lets that
-rewrite finish: the index's files are shared with every query, and interrupting a thread in the
-middle of file I/O would close them underneath those queries.
+`reason` beginning `partial:`. A stop that arrives while the index is being rewritten ends the
+rewrite at its next checkpoint — before the next group of segments or the next chunk — rather
+than by interrupting it: the index's files are shared with every query, and interrupting a thread
+in the middle of file I/O would close them underneath those queries. What the rewrite had built so
+far is discarded and nothing is published, so the index is exactly as it was; the run reads
+`cancelled`, and `lexical` reads `performed: false` with a `reason` beginning `stopped:`. The next
+compaction plans again from what is there.
 
 ### Stats Example
 

@@ -2349,7 +2349,9 @@ It is charged against the mutate budget like starting one.
 The run is *asked* to stop and ends at its next segment boundary, keeping what it had already
 reclaimed. That is safe at any point: a rewrite builds its replacement beside the original and
 swaps it in only at the end, so what a stopped run loses is its own unfinished work, never data.
-`GET /v1/compact/status` reads `cancelled` once it has ended. Only a run started with
+The chunk index is rewritten as one replacement rather than segment by segment, so a stop during
+its rewrite keeps none of that rewrite: what it had built is discarded and the index is left
+exactly as it was. `GET /v1/compact/status` reads `cancelled` once it has ended. Only a run started with
 `POST /v1/compact` is stopped; the background sweeps carry on as configured.
 
 ### Compaction status
@@ -2405,7 +2407,7 @@ curl http://localhost:8080/v1/compact/status
 - **`lexical`** is the chunk index's half, present only on a node that keeps one. It is compacted
   after the segment store and reported whatever the store's half came to, so `state` and `error`
   describe the store alone. `performed: false` with a `reason` is the index's policy finding
-  nothing due, as above, or a run stopped before it reached the index; with an `error` instead of
+  nothing due, as above, or a run stopped before it reached the index or during its rewrite; with an `error` instead of
   counts, the index's compaction failed. **`segments_rewritten`** and **`segments_produced`** are
   lexical segments in and out, and **`chunks_removed`** is the tombstoned chunks — and chunks the
   store no longer holds — that did not survive the rewrite. **`groups_abandoned`** is groups of
@@ -2414,8 +2416,10 @@ curl http://localhost:8080/v1/compact/status
   next compaction. When every group was abandoned nothing was published: `performed` is `false`
   and the `reason` begins `nothing published:`. When only some were, `performed` is `true` and the
   `reason` begins `partial:`. A `DELETE /v1/compact` arriving while
-  the index is being rewritten lets that rewrite finish rather than interrupt I/O the index's
-  queries share.
+  the index is being rewritten ends the rewrite at its next checkpoint — the next group of
+  segments or the next chunk — rather than interrupt I/O the index's queries share. What it had
+  built is discarded and nothing is published, so the index is exactly as it was: the run reads
+  `cancelled` and `lexical` reads `performed: false` with a `reason` beginning `stopped:`.
 
 Only the most recent run is kept; the next one replaces it.
 
