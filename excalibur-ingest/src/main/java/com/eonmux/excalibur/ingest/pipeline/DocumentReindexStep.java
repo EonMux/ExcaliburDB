@@ -24,6 +24,7 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.LongSupplier;
 
 /**
  * Re-indexes one document, from the bytes a source handed back to the moment the new version
@@ -54,6 +55,14 @@ import java.util.Objects;
  * hides the chunk from every query for it until the segment is next rebuilt. Filing before
  * publication costs nothing in correctness: a term filed for a chunk that is then rolled back
  * only costs its segment a search it did not need.</p>
+ *
+ * <h2>What the graph is told</h2>
+ * <p>A published version is reported to the graph exactly as a first ingest's is, through the
+ * {@link GraphReporter} ingestion reports through: numbered under the document's lock, at the
+ * commit point, as a replacement when the registry held a version of the document there and as a
+ * first publication when it did not; and reported once the lock is released and the version is
+ * searchable. Without it a re-crawl that finds a page changed leaves the graph answering with what
+ * the page used to say, and one that finds a page new never extracts it at all.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>An instance is a plain holder of collaborators and carries no mutable state, so it is safe
@@ -106,6 +115,19 @@ final class DocumentReindexStep {
     /** The direct writer, used only when there is no atomic target. */
     private final DocumentReindexer.StorageWriter storageWriter;
 
+    /** Tells the graph about each version this step publishes. */
+    private final GraphReporter graphReporter;
+
+    /**
+     * What publishing a version produced under the document's lock.
+     *
+     * @param epoch       The visibility epoch it was published at, or -1 when registered
+     *                    directly
+     * @param publication Its report to the graph, to run once the lock is released
+     */
+    private record Committed(long epoch, GraphReporter.Publication publication) {
+    }
+
     /**
      * Where an atomically published document goes.
      *
@@ -132,14 +154,17 @@ final class DocumentReindexStep {
      * @param upsertHandler Removes chunks an abandoned attempt left behind
      * @param lexical       The lexical index to keep in step with storage
      * @param termRecorder  Files each written chunk's terms under the segment it landed in
+     * @param graphReporter Tells the graph about each version published
      * @param target        Where the chunks go and how they are made visible
      */
     static DocumentReindexStep publishing(TextChunker chunker, LLMHttpClient llmClient,
                                           DocumentRegistry registry, UpsertHandler upsertHandler,
                                           ReindexLexicalIndex lexical,
-                                          SegmentTermRecorder termRecorder, AtomicTarget target) {
+                                          SegmentTermRecorder termRecorder,
+                                          GraphReporter graphReporter, AtomicTarget target) {
         return new DocumentReindexStep(chunker, llmClient, registry, upsertHandler, lexical,
-            termRecorder, Objects.requireNonNull(target, "target must not be null"), null);
+            termRecorder, graphReporter, Objects.requireNonNull(target, "target must not be null"),
+            null);
     }
 
     /**
@@ -151,6 +176,7 @@ final class DocumentReindexStep {
      * @param upsertHandler Removes chunks an abandoned attempt left behind
      * @param lexical       The lexical index to keep in step with storage
      * @param termRecorder  Files each written chunk's terms under the segment it landed in
+     * @param graphReporter Tells the graph about each version published
      * @param storageWriter Persists one chunk
      */
     static DocumentReindexStep writingDirectly(TextChunker chunker, LLMHttpClient llmClient,
@@ -158,16 +184,17 @@ final class DocumentReindexStep {
                                                UpsertHandler upsertHandler,
                                                ReindexLexicalIndex lexical,
                                                SegmentTermRecorder termRecorder,
+                                               GraphReporter graphReporter,
                                                DocumentReindexer.StorageWriter storageWriter) {
         return new DocumentReindexStep(chunker, llmClient, registry, upsertHandler, lexical,
-            termRecorder, null,
+            termRecorder, graphReporter, null,
             Objects.requireNonNull(storageWriter, "storageWriter must not be null"));
     }
 
     private DocumentReindexStep(TextChunker chunker, LLMHttpClient llmClient,
                                 DocumentRegistry registry, UpsertHandler upsertHandler,
                                 ReindexLexicalIndex lexical, SegmentTermRecorder termRecorder,
-                                AtomicTarget atomic,
+                                GraphReporter graphReporter, AtomicTarget atomic,
                                 DocumentReindexer.StorageWriter storageWriter) {
         this.chunker = chunker;
         this.llmClient = llmClient;
@@ -175,6 +202,8 @@ final class DocumentReindexStep {
         this.upsertHandler = upsertHandler;
         this.lexical = lexical;
         this.termRecorder = Objects.requireNonNull(termRecorder, "termRecorder must not be null");
+        this.graphReporter =
+            Objects.requireNonNull(graphReporter, "graphReporter must not be null");
         this.atomic = atomic;
         this.storageWriter = storageWriter;
     }
@@ -238,11 +267,10 @@ final class DocumentReindexStep {
         }
 
         if (atomic != null) {
-            return publishAtomically(sourceId, documentId, content, chunks,
-                fetched.validators(), startTime, stop);
+            return publishAtomically(sourceId, documentId, fetched, content, chunks, startTime,
+                stop);
         }
-        return writeDirectly(sourceId, documentId, content, chunks,
-            fetched.validators(), startTime, stop);
+        return writeDirectly(sourceId, documentId, fetched, content, chunks, startTime, stop);
     }
 
     /**
@@ -253,9 +281,10 @@ final class DocumentReindexStep {
      * document removes, and between them they decide whether a chunk in storage is still named
      * by anything.</p>
      */
-    private DocumentResult publishAtomically(String sourceId, String documentId, byte[] content,
-                                             List<TextChunk> chunks, DocumentValidators version,
-                                             long startTime, StopSignal stop) {
+    private DocumentResult publishAtomically(String sourceId, String documentId,
+                                             FetchedDocument fetched, byte[] content,
+                                             List<TextChunk> chunks, long startTime,
+                                             StopSignal stop) {
 
         DocumentBatchBuffer batchBuffer = new DocumentBatchBuffer(documentId, sourceId);
 
@@ -286,23 +315,22 @@ final class DocumentReindexStep {
 
         batchBuffer.seal();
 
-        DocumentMetadata metadata = metadataOf(sourceId, documentId, content, version,
-            writes.chunkIds());
+        DocumentMetadata metadata = metadataOf(sourceId, documentId, content,
+            fetched.validators(), writes.chunkIds());
 
         try {
-            DocumentBatchPublisher.PublicationResult result = DocumentLocks.shared().inDocument(
-                ChunkIdentifiers.documentKey(sourceId, documentId),
-                () -> atomic.publisher().publish(batchBuffer, metadata));
+            Committed committed = commit(sourceId, documentId,
+                () -> atomic.publisher().publish(batchBuffer, metadata).epoch());
 
             long elapsed = System.currentTimeMillis() - startTime;
             String errorMsg = writes.errors().isEmpty() ? null
                 : String.join("; ", writes.errors());
 
             LOG.info("Document {} published atomically at epoch {}: {} chunks ({} successful, "
-                    + "{} failed) in {}ms", documentId, result.epoch(),
+                    + "{} failed) in {}ms", documentId, committed.epoch(),
                 chunks.size(), writes.successes(), writes.failures(), elapsed);
 
-            lexical.index(writes.chunkIds(), chunks);
+            indexAndReport(writes.chunkIds(), chunks, committed, fetched);
             return new DocumentResult(documentId, chunks.size(), writes.successes(),
                 writes.failures(), elapsed, errorMsg, writes.chunkIds());
 
@@ -332,9 +360,10 @@ final class DocumentReindexStep {
      * Writes every chunk straight to storage and registers the document, for a node with no
      * epoch-based visibility management.
      */
-    private DocumentResult writeDirectly(String sourceId, String documentId, byte[] content,
-                                         List<TextChunk> chunks, DocumentValidators version,
-                                         long startTime, StopSignal stop) {
+    private DocumentResult writeDirectly(String sourceId, String documentId,
+                                         FetchedDocument fetched, byte[] content,
+                                         List<TextChunk> chunks, long startTime,
+                                         StopSignal stop) {
 
         ChunkWrites writes = writeChunks(sourceId, documentId, chunks, stop,
             (chunkId, chunk, embedding) ->
@@ -356,12 +385,14 @@ final class DocumentReindexStep {
                 failedElapsed, leftUnchanged(writes, chunks.size()));
         }
 
-        DocumentMetadata metadata = metadataOf(sourceId, documentId, content, version,
-            writes.chunkIds());
+        DocumentMetadata metadata = metadataOf(sourceId, documentId, content,
+            fetched.validators(), writes.chunkIds());
 
         // Under the document's lock, for the reason publishAtomically holds it.
-        DocumentLocks.shared().inDocument(ChunkIdentifiers.documentKey(sourceId, documentId),
-            () -> registry.register(metadata));
+        Committed committed = commit(sourceId, documentId, () -> {
+            registry.register(metadata);
+            return -1L;
+        });
 
         long elapsed = System.currentTimeMillis() - startTime;
         String errorMsg = writes.errors().isEmpty() ? null : String.join("; ", writes.errors());
@@ -369,9 +400,51 @@ final class DocumentReindexStep {
         LOG.debug("Re-indexed document {}: {} chunks ({} successful, {} failed) in {}ms",
             documentId, chunks.size(), writes.successes(), writes.failures(), elapsed);
 
-        lexical.index(writes.chunkIds(), chunks);
+        indexAndReport(writes.chunkIds(), chunks, committed, fetched);
         return new DocumentResult(documentId, chunks.size(), writes.successes(),
             writes.failures(), elapsed, errorMsg, writes.chunkIds());
+    }
+
+    /**
+     * Makes a version visible under the document's lock, and numbers its report to the graph
+     * there.
+     *
+     * <p>Whether the version replaces another is read under the same lock and just before the
+     * commit, because the commit is what overwrites the answer. Read any earlier and a concurrent
+     * re-post or erasure could change it: a version reported as new would stage its facts beside
+     * the ones already staged for the document, and the graph would go on saying what the
+     * document used to say. Numbered here rather than after the lock is released for the reason
+     * {@link GraphReporter} gives: it is what keeps a slow report of this version from undoing a
+     * later one's.</p>
+     *
+     * @param publish Makes the version visible, returning its epoch or -1 when it has none
+     * @throws DocumentBatchPublisher.PublicationException if the publication fails, in which case
+     *                                                     nothing is numbered
+     */
+    private Committed commit(String sourceId, String documentId, LongSupplier publish) {
+        String documentKey = ChunkIdentifiers.documentKey(sourceId, documentId);
+        return DocumentLocks.shared().inDocument(documentKey, () -> {
+            boolean replacing = registry.get(sourceId, documentId) != null;
+            long epoch = publish.getAsLong();
+            return new Committed(epoch, graphReporter.published(documentKey, replacing));
+        });
+    }
+
+    /**
+     * Indexes the published version lexically and then reports it to the graph.
+     *
+     * <p>Both outside the lock: neither rewrites what the lock guards, and extraction may call a
+     * model and take seconds. The report comes last so its facts are never about a version that
+     * is not yet searchable, and in a {@code finally} because a publication numbered and never
+     * reported would hold its document's entry in the reporter for good.</p>
+     */
+    private void indexAndReport(List<String> chunkIds, List<TextChunk> chunks,
+                                Committed committed, FetchedDocument fetched) {
+        try {
+            lexical.index(chunkIds, chunks);
+        } finally {
+            graphReporter.report(committed.publication(), fetched);
+        }
     }
 
     /**

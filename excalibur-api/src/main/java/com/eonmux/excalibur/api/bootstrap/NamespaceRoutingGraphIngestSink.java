@@ -58,7 +58,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>A document that replaced a version this node already held is the exception: it borrows
  * whether or not the new version yields facts, because what was staged from the earlier version
  * has to be withdrawn either way - see {@link StagingGraphIngestSink}, which does the withdrawing
- * inside the same borrow as the staging that follows it.</p>
+ * inside the same borrow as the staging that follows it. A document removed outright borrows for
+ * the same reason, to withdraw and stage nothing.</p>
  *
  * <h2>Why an unresolved source is not staged into the shared namespace</h2>
  * <p>A document whose source this node no longer holds - deregistered while its crawl was
@@ -98,6 +99,21 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
          * @return Its namespace, or empty if no source is registered under that id
          */
         Optional<NamespaceId> namespaceOf(String sourceId);
+    }
+
+    /** What happened to a document, which decides what is withdrawn and what is staged. */
+    private enum Change {
+        /** A first version: its facts are staged. */
+        PUBLISHED,
+        /** A later version: the earlier one's records are withdrawn and its facts staged. */
+        REPLACED,
+        /** The document is gone: its records are withdrawn and nothing is staged. */
+        REMOVED;
+
+        /** Whether records staged from the document before now have to be withdrawn. */
+        boolean withdraws() {
+            return this != PUBLISHED;
+        }
     }
 
     private final GraphTenants tenants;
@@ -142,7 +158,7 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
      */
     @Override
     public void onDocumentPublished(String documentKey, String text, long lastModifiedMillis) {
-        route(documentKey, text, lastModifiedMillis, false);
+        route(documentKey, text, lastModifiedMillis, Change.PUBLISHED);
     }
 
     /**
@@ -157,41 +173,56 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
      */
     @Override
     public void onDocumentReplaced(String documentKey, String text, long lastModifiedMillis) {
-        route(documentKey, text, lastModifiedMillis, true);
+        route(documentKey, text, lastModifiedMillis, Change.REPLACED);
     }
 
     /**
-     * Finds a published document's namespace and stages into it.
+     * Withdraws what was staged from a removed document, in its source's namespace.
+     *
+     * <p>Never throws, for the reason {@link #onDocumentPublished} does not. Not counted among
+     * the documents seen, which are the published ones offered to the graph; what it withdrew
+     * is counted with every other withdrawal.</p>
+     *
+     * @param documentKey The source-qualified document key
+     */
+    @Override
+    public void onDocumentRemoved(String documentKey) {
+        route(documentKey, null, 0L, Change.REMOVED);
+    }
+
+    /**
+     * Finds a document's namespace and withdraws from it or stages into it, as the change asks.
      *
      * @param documentKey        The source-qualified document key
-     * @param text               The document's text
+     * @param text               The document's text, or null when it was removed
      * @param lastModifiedMillis The document's own date, or 0 when unknown
-     * @param replacing          Whether an earlier version's staged records must be withdrawn
+     * @param change             What happened to the document
      */
-    private void route(String documentKey, String text, long lastModifiedMillis,
-                       boolean replacing) {
+    private void route(String documentKey, String text, long lastModifiedMillis, Change change) {
         if (documentKey == null || documentKey.isBlank()) {
             return;
         }
-        boolean hasText = text != null && !text.isBlank();
-        if (!hasText && !replacing) {
+        boolean hasText = change != Change.REMOVED && text != null && !text.isBlank();
+        if (!hasText && !change.withdraws()) {
             return;
         }
-        documentsSeen.incrementAndGet();
+        if (change != Change.REMOVED) {
+            documentsSeen.incrementAndGet();
+        }
 
         Optional<NamespaceId> namespace = resolve(documentKey);
         if (namespace.isEmpty()) {
             unresolvedDocuments.incrementAndGet();
-            LOGGER.warn("No registered source owns {}, so there is no namespace to stage its "
-                + "facts into; they are dropped rather than staged into the shared namespace, "
-                + "which every tenant reads", documentKey);
+            LOGGER.warn("No registered source owns {}, so there is no namespace to {} its facts "
+                + "in; nothing is done in the shared namespace instead, which every tenant reads",
+                documentKey, change == Change.REMOVED ? "withdraw" : "stage");
             return;
         }
         List<ExtractedTriple> extracted = hasText ? extract(documentKey, text) : List.of();
-        if (extracted.isEmpty() && !replacing) {
+        if (extracted.isEmpty() && !change.withdraws()) {
             return;
         }
-        stageInto(namespace.get(), documentKey, text, lastModifiedMillis, extracted, replacing);
+        stageInto(namespace.get(), documentKey, text, lastModifiedMillis, extracted, change);
     }
 
     /**
@@ -214,27 +245,27 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
 
     /**
      * Stages one document's facts into one namespace, for the length of a borrow, withdrawing
-     * its earlier version's first when it replaced one.
+     * what was staged from it before first when it was replaced or removed.
      *
      * @param namespace          Where the facts belong
      * @param documentKey        The document
-     * @param text               Its text
+     * @param text               Its text, or null when it was removed
      * @param lastModifiedMillis The document's own date, or 0 when unknown
      * @param extracted          Its facts, already extracted
-     * @param replacing          Whether an earlier version's staged records must be withdrawn
+     * @param change             What happened to the document
      */
     private void stageInto(NamespaceId namespace, String documentKey, String text,
                            long lastModifiedMillis, List<ExtractedTriple> extracted,
-                           boolean replacing) {
+                           Change change) {
         try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(namespace)) {
             // Handed what was already extracted, so the staging sink stages the facts and the
             // entity text they mention without calling the model a second time.
             StagingGraphIngestSink sink = new StagingGraphIngestSink(
                 lease.resource().staging(), (key, body) -> extracted);
-            if (replacing) {
-                sink.onDocumentReplaced(documentKey, text, lastModifiedMillis);
-            } else {
-                sink.onDocumentPublished(documentKey, text, lastModifiedMillis);
+            switch (change) {
+                case PUBLISHED -> sink.onDocumentPublished(documentKey, text, lastModifiedMillis);
+                case REPLACED -> sink.onDocumentReplaced(documentKey, text, lastModifiedMillis);
+                case REMOVED -> sink.onDocumentRemoved(documentKey);
             }
             factsStaged.addAndGet(sink.factsStaged());
             recordsWithdrawn.addAndGet(sink.recordsWithdrawn());
@@ -244,8 +275,9 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
             // will not open - and one namespace failing must not stop the next document, in this
             // namespace or in any other.
             tenantFailures.incrementAndGet();
-            LOGGER.warn("Could not stage {} into namespace {}: {}",
-                documentKey, namespace, e.toString());
+            LOGGER.warn("Could not {} {} in namespace {}: {}",
+                change == Change.REMOVED ? "withdraw" : "stage", documentKey, namespace,
+                e.toString());
         }
     }
 
@@ -312,7 +344,7 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
     /**
      * How many documents named no source this node has registered.
      *
-     * <p>Nothing was staged for them. A non-zero count on a node whose sources are all still
+     * <p>Nothing was staged for them, and nothing withdrawn. A non-zero count on a node whose sources are all still
      * registered means the key convention and the registry have drifted apart, which is
      * otherwise invisible: the documents are indexed and searchable, and only the graph is
      * missing what they said.</p>
@@ -336,7 +368,8 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
     }
 
     /**
-     * How many staged facts and snippets it withdrew because their document was replaced.
+     * How many staged facts and snippets it withdrew because their document was replaced or
+     * removed.
      *
      * @return The count
      */
@@ -345,10 +378,10 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
     }
 
     /**
-     * How many replaced documents' earlier facts it could not withdraw.
+     * How many replaced or removed documents' earlier facts it could not withdraw.
      *
-     * <p>Each one leaves what an earlier version said staged beside what the document says now,
-     * for the next build to publish.</p>
+     * <p>Each one leaves what the document used to say staged, for the next build to publish:
+     * beside what it says now, or in place of a document that is gone.</p>
      *
      * @return The count
      */

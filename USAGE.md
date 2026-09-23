@@ -1038,7 +1038,7 @@ id whatever version it came from, so a replacement withdraws everything staged f
 exactly as `/v1/erasure` does, labels excepted — before it stages what the new version says. The
 graph being served keeps what it was built from until the next `POST /v1/graph/build`, which no
 longer holds the earlier version's facts. A withdrawal rewrites the namespace's staging logs, so
-it is paid per replaced document that had facts staged; one that fails is logged and counted in
+it is paid per replaced or removed document that had facts staged; one that fails is logged and counted in
 `graph.ingest.withdrawalFailures` on `/v1/stats`, and the new facts are staged regardless. Two
 versions of one document published in quick succession are reported to the graph in the order
 they were published, and a version already superseded when its turn comes is skipped.
@@ -1114,10 +1114,19 @@ curl -X POST http://localhost:8080/v1/reindex \
 used only with `POST /v1/documents`: supplied documents have no target to re-read, and are updated
 by posting them again.
 
-A reindex keeps the vector index and the lexical index in step with what it rewrites, the way a
-replacement does. It does not extract graph facts: the facts staged from a document are the ones
-its ingestion or its last replacement extracted, and a document a reindex found changed or removed
-keeps them until it is erased with `/v1/erasure`, which withdraws them.
+A reindex keeps the vector index, the lexical index and the graph in step with what it rewrites,
+the way a replacement does. A document it finds new has its facts extracted and staged; one it
+finds changed has everything staged from its earlier version withdrawn and the new version's facts
+staged in its place; and one its source no longer lists has everything staged from it withdrawn.
+All three go to the namespace the source was registered in, through the same reporting a crawl and
+`POST /v1/documents` use, so a re-crawl and a re-post of one document reach the graph in the order
+they were published. A node with no chat model extracts nothing, and a removal still withdraws.
+The graph being served changes at the next `POST /v1/graph/build`.
+
+A document is removed under the same per-document lock a publication or an erasure takes, and only
+if its registry entry is still the one the reindex read when it listed the source. One posted again
+or erased while the reindex ran is left alone — the later write stands — and the next reindex reads
+it afresh.
 
 ```json
 {"error": "Source not found: unknown-source. Only a source registered with POST /v1/ingest can be reindexed; documents supplied with POST /v1/documents are replaced by posting them again"}
@@ -2500,7 +2509,7 @@ across namespaces, never a row per namespace — which namespace owes what is
 - `budget` sets two shares against each limit. `graphMappings` and `graphDescriptors` are what eviction can give back; `processMappings` and `processDescriptors` are the whole process — segments, vector graphs, the chunk index and the JVM itself — which is what the kernel limit is measured against. Graph eviction starts when the whole process crosses `mappingHighWater`. A process figure is `null` where the platform cannot be asked, and `descriptorLimit` is `0` where no descriptor limit is enforced.
 - `builds` counts builds since startup by how they ended. A cancelled build is one somebody asked to stop, not a failure.
 - `erasure` is the graph's erasure backlog across every namespace on disk, resident or not. Compare `oldestAgeMs` against `excalibur.graph.erasure-max-latency-seconds`; `overdueNamespaces` is how many have already missed it. `unreadableNamespaces` are namespaces whose log could not be read, and so are in none of the other figures. `oldestAgeMs` is `null` when nothing is owed. The block is absent when the graph root cannot be listed, which is not the same as owing nothing.
-- `ingest` is present only where ingestion stages facts into the graph (a chat model is configured). `unresolvedDocuments`, `extractionFailures`, `tenantFailures` and `sinkRefusals` are documents that were published and are searchable but whose facts never reached the graph. `sinkRefusals` counts documents the graph sink failed on outright rather than under one of the other three reasons; any non-zero value is worth a look in the log. None of these documents is offered to the graph again unless it changes. Nothing else shows that. `withdrawalFailures` counts replaced documents whose earlier version's staged facts could not be withdrawn, so the next build publishes them beside the new version's; the log names each one.
+- `ingest` is present only where ingestion stages facts into the graph (a chat model is configured). `unresolvedDocuments`, `extractionFailures`, `tenantFailures` and `sinkRefusals` are documents that were published and are searchable but whose facts never reached the graph. `sinkRefusals` counts documents the graph sink failed on outright rather than under one of the other three reasons, a reindex's removals included — those keep their staged facts until the document is erased; any non-zero value is worth a look in the log. None of these documents is offered to the graph again unless it changes. Nothing else shows that. `withdrawalFailures` counts replaced or removed documents whose earlier staged facts could not be withdrawn, so the next build publishes them beside the new version's, or for a document a reindex removed; the log names each one.
 
 ### Reclaim space now
 
@@ -2693,7 +2702,7 @@ Everything exported is a figure the node already measures; nothing here is estim
 | `excalibur_mappings{scope="graphs"\|"process"}`, `_high_water`, `_limit`; `excalibur_descriptors{scope=...}`, `_high_water`, `_limit` | gauge | The tenant budget. `scope="process"` is omitted where it cannot be measured, and the descriptor mark and limit where no limit is enforced |
 | `excalibur_graph_erasure_obligations`, `excalibur_graph_erasure_namespaces{state="owing"\|"overdue"\|"unreadable"}`, `excalibur_graph_erasure_oldest_age_seconds` | gauge | The graph erasure backlog, totalled across namespaces |
 | `excalibur_graph_ingest_documents_total`, `_facts_staged_total`, `excalibur_graph_ingest_failures_total{reason="unresolved_source"\|"extraction"\|"namespace_unavailable"\|"sink_refused"}` | counter | Documents whose facts did not reach the graph |
-| `excalibur_graph_ingest_withdrawal_failures_total` | counter | Replaced documents whose earlier version's staged facts could not be withdrawn |
+| `excalibur_graph_ingest_withdrawal_failures_total` | counter | Replaced or removed documents whose earlier staged facts could not be withdrawn |
 | `excalibur_node_draining`, `excalibur_uptime_seconds`, `excalibur_build_info{version,jvm}` | gauge | Whether an operator has drained the node, how long it has been up, and which build it is |
 
 Five alerts worth having, in ascending order of how quietly the condition fails:

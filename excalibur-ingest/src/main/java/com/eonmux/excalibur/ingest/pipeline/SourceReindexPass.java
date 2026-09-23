@@ -3,6 +3,7 @@ package com.eonmux.excalibur.ingest.pipeline;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.registry.ChangeDetector;
 import com.eonmux.excalibur.ingest.registry.ChangeSet;
+import com.eonmux.excalibur.ingest.registry.DocumentLocks;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
@@ -22,9 +23,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -38,6 +38,22 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <em>changed</em> document is the opposite case - nothing of its previous version is retired
  * until its replacement has actually been published, because tombstoning first is what makes a
  * failed re-embed destructive.</p>
+ *
+ * <h2>Why a removal takes the document's lock</h2>
+ * <p>Change detection reads the registry once, at the start of the pass, and a removal acts on
+ * what it read. A client may re-post the same document in between: its chunk ids are
+ * deterministic, so the re-post writes exactly the ids the removal is about to tombstone, and
+ * registers a new entry the removal is about to delete. So each document is removed under its
+ * lock - the one ingestion, the reindex's own publication and an erasure all take - and only if
+ * its registry entry is still the one change detection read. An entry that has changed or gone
+ * belongs to a later write, which is left alone; the next pass reads it afresh.</p>
+ *
+ * <h2>What the graph is told</h2>
+ * <p>A removed document is reported to the graph through the same {@link GraphReporter} its
+ * publications were, numbered under its lock, so whatever was staged from it is withdrawn and a
+ * report of an earlier version still in flight cannot stage it again. Re-indexed documents are
+ * reported by the step that publishes them. The registry is written only once the graph has
+ * forced what it staged, for the reason ingestion orders the two that way.</p>
  *
  * <h2>Why a document that could not be read still counts</h2>
  * <p>The progress counter advances in a {@code finally}. A run answers 202 and continues on a
@@ -90,7 +106,34 @@ final class SourceReindexPass {
      */
     private final DocumentErasureService.VectorEraser vectorEraser;
 
+    /** Tells the graph about every document this pass removes. */
+    private final GraphReporter graphReporter;
+
     private final DocumentStep documentStep;
+
+    /**
+     * What removing the documents a source no longer lists came to.
+     *
+     * <p>Accumulated as the removals go rather than returned at the end, so a pass stopped partway
+     * through them still reports the ones it made.</p>
+     */
+    private static final class Removals {
+        int documents;
+        int chunksTombstoned;
+        int vectorsRetired;
+        int passedOver;
+    }
+
+    /**
+     * What removing one document did, under its lock.
+     *
+     * @param stored      What tombstoning it in storage did
+     * @param vectors     How many of its graph nodes were retired
+     * @param publication Its removal, to report to the graph once the lock is released
+     */
+    private record Removed(UpsertHandler.UpsertResult stored, int vectors,
+                           GraphReporter.Publication publication) {
+    }
 
     /**
      * @param registry      Holds the previous pass's record of the source, which is this pass's
@@ -98,18 +141,21 @@ final class SourceReindexPass {
      * @param upsertHandler Tombstones what the source no longer lists
      * @param lexical       The lexical index to keep in step with storage
      * @param vectorEraser  Retires graph nodes of what this pass removes, or null for none
+     * @param graphReporter Tells the graph about every document this pass removes
      * @param documentStep  Re-indexes one document
      * @throws NullPointerException if any argument other than the eraser is null
      */
     SourceReindexPass(DocumentRegistry registry, UpsertHandler upsertHandler,
                       ReindexLexicalIndex lexical,
                       DocumentErasureService.VectorEraser vectorEraser,
-                      DocumentStep documentStep) {
+                      GraphReporter graphReporter, DocumentStep documentStep) {
         this.registry = Objects.requireNonNull(registry, "registry must not be null");
         this.upsertHandler =
             Objects.requireNonNull(upsertHandler, "upsertHandler must not be null");
         this.lexical = Objects.requireNonNull(lexical, "lexical must not be null");
         this.vectorEraser = vectorEraser;
+        this.graphReporter =
+            Objects.requireNonNull(graphReporter, "graphReporter must not be null");
         this.documentStep = Objects.requireNonNull(documentStep, "documentStep must not be null");
     }
 
@@ -161,18 +207,12 @@ final class SourceReindexPass {
         progress.documentsDone(0, documentsTotal);
 
         int chunksTombstoned = 0;
+        Removals removals = new Removals();
         ReindexCancelledException cancelled = null;
         try {
             // Only removals are safe to apply before the replacement content exists; see
-            // UpsertHandler.processDeletions. The lexical index is erased first: a document that
-            // has been deleted should stop being findable before its bytes go, not after.
-            lexical.retire(deletedChunkIds(changeSet));
-            retireVectors(sourceId, changeSet, stop);
-            UpsertHandler.UpsertResult tombstoneResult = upsertHandler.processDeletions(changeSet);
-            resultBuilder.documentsTombstoned(tombstoneResult.getDocumentsDeleted());
-            chunksTombstoned = tombstoneResult.getChunksTombstoned();
-            tombstoneResult.getErrors().forEach(error ->
-                resultBuilder.addError("tombstone", error.getChunkId(), error.getMessage()));
+            // UpsertHandler.processDeletions.
+            removeDeleted(sourceId, changeSet, stop, removals, resultBuilder);
 
             for (String newDocId : changeSet.getNewDocuments()) {
                 // Before the fetch, so a run that has been asked to stop starts no new work.
@@ -252,7 +292,9 @@ final class SourceReindexPass {
         // ClosedByInterruptException and closes that channel for good: the run would lose the
         // registry entries it had already earned, leaving published chunks that nothing names.
         ReindexCancellation.requested(stop);
-        resultBuilder.chunksTombstoned(chunksTombstoned);
+        logRemovals(sourceId, removals);
+        resultBuilder.documentsTombstoned(removals.documents);
+        resultBuilder.chunksTombstoned(chunksTombstoned + removals.chunksTombstoned);
         lexical.settle(stop);
         persistRegistry();
         ReindexResult result = resultBuilder.build();
@@ -290,63 +332,111 @@ final class SourceReindexPass {
     }
 
     /**
-     * Retires the graph nodes of every document the source has stopped listing.
+     * Removes every document the source has stopped listing, one at a time under its lock.
      *
-     * <p>Beside the lexical erasure and ahead of the storage tombstones. The tombstones reach the
+     * <p>Within each document the lexical index is erased first, then its graph nodes are
+     * retired, then storage is tombstoned and the registry entry removed: a document that has
+     * been deleted should stop being findable before its bytes go, not after. The graph nodes go
+     * beside the lexical erasure and ahead of the storage tombstones. The tombstones reach the
      * graph as well, as DELETEs the integration worker replays, but only once it gets to them,
      * and until then a query sets the nodes aside only as far as its bounded tail scan reaches.
      * Retiring here is what makes the removal hold however far integration has fallen
      * behind.</p>
      *
-     * <p>A <em>changed</em> document is not retired here: its replacement shares chunk ids with
+     * <p>A <em>changed</em> document is not removed here: its replacement shares chunk ids with
      * it, and retiring by document would take the replacement's own nodes. Its surplus chunks are
      * retired by id once the replacement is published, and the ids it overwrote are superseded by
      * the integration worker in log order; see {@link SupersededVersion}.</p>
      *
      * <p>Checked for cancellation per document, like the indexing loops and for the same
      * reason: a source that dropped a hundred thousand documents is exactly the run an operator
-     * cancels, and one retirement is a safe place to stop. Nothing here is half-done - a
-     * document's nodes go in one call - and nothing downstream has run yet, so the next reindex
-     * detects the same deletions and retires the rest.</p>
+     * cancels, and one removal is a safe place to stop. Nothing is half-done - each document is
+     * removed whole under its lock - and the next reindex detects the documents this one did not
+     * reach as deleted again.</p>
      *
-     * @return How many nodes were retired
      * @throws ReindexCancelledException if the run was asked to stop
      */
-    private int retireVectors(String sourceId, ChangeSet changeSet, StopSignal stop) {
+    private void removeDeleted(String sourceId, ChangeSet changeSet, StopSignal stop,
+                               Removals removals, ReindexResult.Builder resultBuilder) {
+        List<DocumentMetadata> deleted = changeSet.getDeletedDocuments();
+        int considered = 0;
+        for (DocumentMetadata listed : deleted) {
+            ReindexCancellation.checkpoint(stop, sourceId, considered++, deleted.size());
+            String documentKey = ChunkIdentifiers.documentKey(sourceId, listed.getDocumentId());
+            Removed removed = DocumentLocks.shared().inDocument(documentKey,
+                () -> removeIfUnchanged(sourceId, documentKey, listed));
+            if (removed == null) {
+                removals.passedOver++;
+                continue;
+            }
+            // Outside the lock, as ingestion reports: withdrawing staged facts may be slow, and
+            // the removal was numbered under the lock, which is what orders it.
+            graphReporter.report(removed.publication(), null);
+            removals.documents += removed.stored().getDocumentsDeleted();
+            removals.chunksTombstoned += removed.stored().getChunksTombstoned();
+            removals.vectorsRetired += removed.vectors();
+            removed.stored().getErrors().forEach(error ->
+                resultBuilder.addError("tombstone", error.getChunkId(), error.getMessage()));
+        }
+    }
+
+    /**
+     * Removes one document, provided its registry entry is still the one change detection read.
+     *
+     * <p>Called under the document's lock. An entry that has changed was written by a re-post
+     * since the listing, and one that has gone was erased; either way the removal would undo a
+     * later write rather than the one it was decided on. The comparison is of the whole entry,
+     * which carries the time it was indexed, so a re-post of identical content still counts as a
+     * later write.</p>
+     *
+     * @return What the removal did, or null when the document was passed over
+     */
+    private Removed removeIfUnchanged(String sourceId, String documentKey,
+                                      DocumentMetadata listed) {
+        DocumentMetadata current = registry.get(sourceId, listed.getDocumentId());
+        if (!listed.equals(current)) {
+            LOG.info("Not removing {}: it was {} after this reindex listed its source", documentKey,
+                current == null ? "erased" : "written again");
+            return null;
+        }
+        lexical.retire(listed.getChunkIds());
+        int vectors = retireVectors(documentKey);
+        UpsertHandler.UpsertResult stored = upsertHandler.removeDocument(listed);
+        return new Removed(stored, vectors, graphReporter.removed(documentKey));
+    }
+
+    /**
+     * Retires one removed document's graph nodes.
+     *
+     * @return How many nodes were retired
+     */
+    private int retireVectors(String documentKey) {
         DocumentErasureService.VectorEraser eraser = this.vectorEraser;
         if (eraser == null) {
             return 0;
         }
-        int retired = 0;
-        int considered = 0;
-        int deletedTotal = changeSet.getDeletedDocuments().size();
-        for (DocumentMetadata deleted : changeSet.getDeletedDocuments()) {
-            ReindexCancellation.checkpoint(stop, sourceId, considered++, deletedTotal);
-            String documentKey = ChunkIdentifiers.documentKey(sourceId, deleted.getDocumentId());
-            try {
-                retired += eraser.erase(documentKey);
-            } catch (RuntimeException e) {
-                // Reported rather than thrown, as the erasure service does: the chunks leaving
-                // storage is the part this run can always complete, and a graph that will not
-                // take the write must not cost that.
-                LOG.warn("Document {} stays rankable by vector search: {}",
-                    documentKey, e.getMessage());
-            }
+        try {
+            return eraser.erase(documentKey);
+        } catch (RuntimeException e) {
+            // Reported rather than thrown, as the erasure service does: the chunks leaving
+            // storage is the part this run can always complete, and a graph that will not take
+            // the write must not cost that.
+            LOG.warn("Document {} stays rankable by vector search: {}",
+                documentKey, e.getMessage());
+            return 0;
         }
-        if (retired > 0) {
-            LOG.info("Reindex of {} retired {} graph node(s) of {} deleted document(s)",
-                sourceId, retired, changeSet.getDeletedDocuments().size());
-        }
-        return retired;
     }
 
-    /** The chunk ids of every document this change set says has been deleted outright. */
-    private static Set<String> deletedChunkIds(ChangeSet changeSet) {
-        Set<String> ids = new LinkedHashSet<>();
-        for (DocumentMetadata deleted : changeSet.getDeletedDocuments()) {
-            ids.addAll(deleted.getChunkIds());
+    /** Logs what the removals came to, when they came to anything. */
+    private static void logRemovals(String sourceId, Removals removals) {
+        if (removals.vectorsRetired > 0) {
+            LOG.info("Reindex of {} retired {} graph node(s) of {} deleted document(s)",
+                sourceId, removals.vectorsRetired, removals.documents);
         }
-        return ids;
+        if (removals.passedOver > 0) {
+            LOG.info("Reindex of {} left {} document(s) it had listed as deleted: each was "
+                + "written again or erased while the reindex ran", sourceId, removals.passedOver);
+        }
     }
 
     /**
@@ -357,6 +447,10 @@ final class SourceReindexPass {
      * would make the next run repeat this one.</p>
      */
     private void persistRegistry() {
+        // The graph first, for the reason ingestion forces it first: a registry that reaches the
+        // disk ahead of the facts extracted from the documents it lists records those facts as
+        // taken, and nothing extracts them again.
+        graphReporter.sync();
         try {
             registry.persist();
         } catch (IOException e) {

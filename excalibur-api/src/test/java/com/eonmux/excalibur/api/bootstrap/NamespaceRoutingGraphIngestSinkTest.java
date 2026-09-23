@@ -360,6 +360,49 @@ class NamespaceRoutingGraphIngestSinkTest {
     }
 
     @Test
+    @DisplayName("a removed document's facts are withdrawn from its namespace, and only its own")
+    void aRemovalWithdrawsTheDocument(@TempDir Path root) throws IOException {
+        NamespaceId acme = NamespaceId.of("acme");
+        try (GraphTenants tenants = tenants(root, 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("docs", acme)), employer());
+            sink.onDocumentPublished("docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs:other", "Initech", 1L);
+
+            sink.onDocumentRemoved("docs:ada");
+
+            assertThat(employers(tenants, acme))
+                .as("the next build must not publish what a document the source dropped said")
+                .containsExactly("Initech");
+            assertThat(sink.recordsWithdrawn()).isPositive();
+            assertThat(sink.withdrawalFailures()).isZero();
+            assertThat(sink.documentsSeen())
+                .as("a removal is not a published document offered to the graph")
+                .isEqualTo(2);
+        }
+    }
+
+    @Test
+    @DisplayName("a removal is ignored without a key, and declined without a namespace")
+    void aRemovalWithoutAKeyOrNamespace(@TempDir Path root) throws IOException {
+        try (GraphTenants tenants = tenants(root, 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("docs", NamespaceId.SHARED)), employer());
+            sink.onDocumentPublished("docs:ada", "Acme", 1L);
+
+            sink.onDocumentRemoved(null);
+            sink.onDocumentRemoved(" ");
+            assertThat(sink.unresolvedDocuments()).isZero();
+
+            sink.onDocumentRemoved("gone:ada");
+            assertThat(sink.unresolvedDocuments()).isEqualTo(1);
+            assertThat(tenants.shared().staging().stagedCount())
+                .as("a removal no namespace owns must not withdraw from the shared one")
+                .isEqualTo(1);
+        }
+    }
+
+    @Test
     @DisplayName("refuses to be built without the three things it routes with")
     void refusesToBeBuiltIncomplete(@TempDir Path root) throws IOException {
         try (GraphTenants tenants = tenants(root, 2)) {

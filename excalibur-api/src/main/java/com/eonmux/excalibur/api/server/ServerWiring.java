@@ -384,6 +384,7 @@ final class ServerWiring {
         }
         this.documentReindexer = reindexer;
         this.sourceResolver = resolver;
+        shareGraphReporting();
         wireScheduledReindex();
         LOGGER.info("Document reindexer configured: {}",
             reindexer != null ? "enabled" : "disabled (POST /v1/reindex answers 503)");
@@ -399,9 +400,24 @@ final class ServerWiring {
         this.documentReindexer =
             Objects.requireNonNull(reindexer, "documentReindexer cannot be null");
         this.sourceResolver = createSourceResolver();
+        shareGraphReporting();
         wireScheduledReindex();
         LOGGER.info(
             "Document reindexer configured with automatic source resolution and scheduled reindex support");
+    }
+
+    /**
+     * Has the reindexer report to the graph through the ingestion pipeline, once both are here.
+     *
+     * <p>Called whichever of the two is attached second, since neither order is the only one a
+     * caller uses. Without it a reindex publishes and removes documents the graph never hears
+     * of: a changed page goes on being answered for with what it used to say, and a removed one
+     * with what it said before it went.</p>
+     */
+    private void shareGraphReporting() {
+        if (documentReindexer != null && ingestionOrchestrator != null) {
+            ingestionOrchestrator.shareGraphReporting(documentReindexer);
+        }
     }
 
     /**
@@ -480,6 +496,7 @@ final class ServerWiring {
         this.ingestionOrchestrator = attached.orchestrator();
         this.embeddingClient = attached.embeddings();
         this.queryPipeline = attached.queryPipeline();
+        shareGraphReporting();
     }
 
     // ==================== The snapshot ====================

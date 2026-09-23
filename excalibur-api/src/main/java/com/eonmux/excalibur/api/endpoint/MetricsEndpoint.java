@@ -313,7 +313,7 @@ public final class MetricsEndpoint implements HttpHandler {
             .counter("excalibur_graph_ingest_failures_total", failures,
                 Map.of("reason", "sink_refused"), ingest.sinkRefusals())
             .counter("excalibur_graph_ingest_withdrawal_failures_total",
-                "Replaced documents whose earlier version's staged facts could not be withdrawn",
+                "Replaced or removed documents whose earlier staged facts could not be withdrawn",
                 ingest.withdrawalFailures());
     }
 

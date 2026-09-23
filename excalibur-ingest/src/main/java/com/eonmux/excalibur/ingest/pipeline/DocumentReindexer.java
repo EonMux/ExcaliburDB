@@ -40,6 +40,9 @@ import java.util.function.Function;
  *   <li>Tombstones old chunks via the UpsertHandler</li>
  *   <li>Removes old chunks from the Cuckoo filter hierarchy</li>
  *   <li>Updates the document registry with new metadata</li>
+ *   <li>Tells the graph, so the facts staged from the document's earlier version are withdrawn
+ *       and the new version's staged; a document the source no longer lists has its facts
+ *       withdrawn as it is removed</li>
  * </ol>
  *
  * <h2>Atomic Publication</h2>
@@ -127,6 +130,17 @@ public class DocumentReindexer {
      * behind.</p>
      */
     private volatile DocumentErasureService.VectorEraser vectorEraser;
+
+    /**
+     * Tells the graph about every version this reindex publishes and every document it removes.
+     *
+     * <p>Its own until {@link IngestionOrchestrator#shareGraphReporting} hands over the
+     * orchestrator's, which it must before any run whose publications a graph should see: a
+     * reporter of its own has no sink, so nothing is reported through it, and a reporter of its
+     * own beside the orchestrator's could not order a re-crawl's version of a document against a
+     * re-post's. See {@link GraphReporter}.</p>
+     */
+    private volatile GraphReporter graphReporter = new GraphReporter();
 
     /**
      * Functional interface for writing chunks to storage.
@@ -361,6 +375,16 @@ public class DocumentReindexer {
     public void setVectorEraser(DocumentErasureService.VectorEraser vectorEraser) {
         this.vectorEraser = vectorEraser;
         LOG.info("Reindex vector retirement {}", vectorEraser == null ? "disabled" : "enabled");
+    }
+
+    /**
+     * Reports through the given reporter from now on.
+     *
+     * @param graphReporter The reporter ingestion reports through
+     * @throws NullPointerException if graphReporter is null
+     */
+    void reportGraphThrough(GraphReporter graphReporter) {
+        this.graphReporter = Objects.requireNonNull(graphReporter, "graphReporter must not be null");
     }
 
     /**
@@ -661,7 +685,7 @@ public class DocumentReindexer {
         DocumentReindexStep step = hasAtomicPublication()
             ? step(new DocumentReindexStep.AtomicTarget(offsetAwareWriter, batchPublisher))
             : DocumentReindexStep.writingDirectly(chunker, llmClient, registry, upsertHandler,
-                lexical, termRecorder, storageWriter);
+                lexical, termRecorder, graphReporter, storageWriter);
         return step.reindex(sourceId, documentId, fetched, stop);
     }
 
@@ -669,17 +693,19 @@ public class DocumentReindexer {
      * Builds the pass that walks a source's change set.
      *
      * <p>Built per run rather than held as a field, for the reason the rollback is: the vector
-     * eraser and the lexical index are wired after construction, and a pass built once at
-     * construction would go on reindexing as though neither had ever been attached.</p>
+     * eraser, the lexical index and the graph reporter are wired after construction, and a pass
+     * built once at construction would go on reindexing as though none had ever been
+     * attached.</p>
      */
     private SourceReindexPass pass(SourceReindexPass.DocumentStep documentStep) {
-        return new SourceReindexPass(registry, upsertHandler, lexical, vectorEraser, documentStep);
+        return new SourceReindexPass(registry, upsertHandler, lexical, vectorEraser,
+            graphReporter, documentStep);
     }
 
     /** Builds the per-document step for a run that publishes atomically. */
     private DocumentReindexStep step(DocumentReindexStep.AtomicTarget target) {
         return DocumentReindexStep.publishing(chunker, llmClient, registry, upsertHandler, lexical,
-            termRecorder, target);
+            termRecorder, graphReporter, target);
     }
 
     /**
