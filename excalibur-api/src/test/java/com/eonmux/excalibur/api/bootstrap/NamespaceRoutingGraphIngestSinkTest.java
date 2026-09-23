@@ -402,6 +402,171 @@ class NamespaceRoutingGraphIngestSinkTest {
         }
     }
 
+    /**
+     * Makes a namespace's staging refuse every erase until the returned path is removed.
+     *
+     * <p>A real refusal rather than a mocked one: an erase writes its rewrite beside the log it
+     * replaces, and a directory standing there fails it without touching the store.</p>
+     */
+    private static Path refuseErasures(Path root, NamespaceId namespace) throws IOException {
+        Path blocker = root.resolve(namespace.value()).resolve("graph-staging")
+            .resolve(com.eonmux.excalibur.graph.staging.GraphStagingStore.TRIPLE_LOG + ".erasing");
+        java.nio.file.Files.createDirectories(blocker.resolve("held"));
+        return blocker;
+    }
+
+    private static void removeBlocker(Path blocker) throws IOException {
+        java.nio.file.Files.delete(blocker.resolve("held"));
+        java.nio.file.Files.delete(blocker);
+    }
+
+    @Test
+    @DisplayName("a removal the staging refused is withdrawn by a later sweep")
+    void aRefusedRemovalIsWithdrawnBySweep(@TempDir Path root) throws IOException {
+        NamespaceId acme = NamespaceId.of("acme");
+        try (GraphTenants tenants = tenants(root, 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("docs", acme)), employer());
+            sink.onDocumentPublished("docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs:other", "Initech", 1L);
+            Path blocker = refuseErasures(root, acme);
+
+            sink.onDocumentRemoved("docs:ada");
+            assertThat(sink.withdrawalFailures()).isEqualTo(1);
+            assertThat(employers(tenants, acme)).containsExactly("Acme", "Initech");
+
+            removeBlocker(blocker);
+            tenants.compactDueErasures();
+
+            assertThat(employers(tenants, acme))
+                .as("nothing reports a removed document again, so the sweep is what withdraws it")
+                .containsExactly("Initech");
+        }
+    }
+
+    @Test
+    @DisplayName("a build makes an owed withdrawal before it publishes staging")
+    void aBuildWithdrawsWhatIsOwedFirst(@TempDir Path root) throws IOException {
+        NamespaceId acme = NamespaceId.of("acme");
+        try (GraphTenants tenants = tenants(root, 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("docs", acme)), employer());
+            sink.onDocumentPublished("docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs:other", "Initech", 1L);
+            Path blocker = refuseErasures(root, acme);
+            sink.onDocumentRemoved("docs:ada");
+            removeBlocker(blocker);
+
+            tenants.build(acme, () -> false);
+
+            assertThat(employers(tenants, acme))
+                .as("the build must not publish what a removed document said")
+                .containsExactly("Initech");
+        }
+    }
+
+    @Test
+    @DisplayName("a refused replacement stages nothing new, and a restart still withdraws the old")
+    void aRefusedReplacementIsWithdrawnAfterARestart(@TempDir Path root) throws IOException {
+        NamespaceId acme = NamespaceId.of("acme");
+        Path blocker;
+        try (GraphTenants tenants = tenants(root, 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("docs", acme)), employer());
+            sink.onDocumentPublished("docs:ada", "Acme", 1L);
+            blocker = refuseErasures(root, acme);
+
+            sink.onDocumentReplaced("docs:ada", "Globex", 2L);
+
+            assertThat(employers(tenants, acme))
+                .as("the new version would be taken by the owed withdrawal, so it is not staged")
+                .containsExactly("Acme");
+        }
+        removeBlocker(blocker);
+
+        try (GraphTenants tenants = tenants(root, 4)) {
+            assertThat(employers(tenants, acme))
+                .as("made when the namespace opened again, from the record on disk")
+                .isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("a removal in a namespace that will not open is withdrawn once it does")
+    void aRemovalInANamespaceThatWillNotOpen(@TempDir Path root) throws IOException {
+        NamespaceId acme = NamespaceId.of("acme");
+        try (GraphTenants tenants = tenants(root, 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("docs", acme)), employer());
+            sink.onDocumentPublished("docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs:other", "Initech", 1L);
+            tenants.invalidate(acme);
+            // A record of owed withdrawals the tenant cannot open fails the whole open.
+            Path record = root.resolve("acme").resolve("graph-staging")
+                .resolve(com.eonmux.excalibur.ingest.graph.StagedWithdrawals.LOG_FILE);
+            java.nio.file.Files.delete(record);
+            java.nio.file.Files.createDirectories(record.resolve("held"));
+
+            sink.onDocumentRemoved("docs:ada");
+
+            assertThat(sink.tenantFailures()).isEqualTo(1);
+            assertThat(tenants.unrecordedWithdrawals()).isEqualTo(1);
+            tenants.compactDueErasures();
+            assertThat(tenants.unrecordedWithdrawals()).as("still will not open").isEqualTo(1);
+
+            java.nio.file.Files.delete(record.resolve("held"));
+            java.nio.file.Files.delete(record);
+            tenants.compactDueErasures();
+
+            assertThat(tenants.unrecordedWithdrawals()).isZero();
+            assertThat(employers(tenants, acme)).containsExactly("Initech");
+        }
+    }
+
+    @Test
+    @DisplayName("a withdrawal owed while the namespace was opened by another request is handed "
+        + "to it at once")
+    void anOwedWithdrawalReachesAResidentTenant(@TempDir Path root) throws IOException {
+        NamespaceId acme = NamespaceId.of("acme");
+        try (GraphTenants tenants = tenants(root, 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("docs", acme)), employer());
+            sink.onDocumentPublished("docs:ada", "Acme", 1L);
+
+            tenants.oweWithdrawal(acme, "docs:ada");
+
+            assertThat(tenants.unrecordedWithdrawals()).isZero();
+            assertThat(employers(tenants, acme)).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("a withdrawal owed in a namespace since dropped is forgotten")
+    void anOwedWithdrawalInADroppedNamespace(@TempDir Path root) throws IOException {
+        NamespaceId acme = NamespaceId.of("acme");
+        NamespaceId gone = NamespaceId.of("gone");
+        try (GraphTenants tenants = tenants(root, 4)) {
+            tenants.borrow(acme).close();
+            tenants.invalidate(acme);
+            tenants.oweWithdrawal(acme, "docs:ada");
+            tenants.oweWithdrawal(gone, "docs:bob");
+            assertThat(tenants.unrecordedWithdrawals()).isEqualTo(2);
+
+            tenants.drop(acme);
+            assertThat(tenants.unrecordedWithdrawals())
+                .as("its staging went with it")
+                .isEqualTo(1);
+            tenants.compactDueErasures();
+
+            assertThat(tenants.unrecordedWithdrawals())
+                .as("a namespace with no directory has nothing staged to withdraw")
+                .isZero();
+            assertThat(tenants.namespacesOnDisk())
+                .as("and the sweep did not create one to find that out")
+                .doesNotContain(gone);
+        }
+    }
+
     @Test
     @DisplayName("refuses to be built without the three things it routes with")
     void refusesToBeBuiltIncomplete(@TempDir Path root) throws IOException {

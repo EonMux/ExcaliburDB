@@ -25,6 +25,11 @@ import java.util.List;
  * version means to it. A document removed outright - its source no longer lists it - is reported
  * through {@link #onDocumentRemoved}, which withdraws the same way and stages nothing.</p>
  *
+ * <p>Each withdrawal is asked for once. A removed document is never reported again, nor is an
+ * unchanged one, and a removed document has no registry entry left for an erasure request to
+ * resolve - so a sink that cannot withdraw when asked has to keep the withdrawal owed until it
+ * can, as {@link StagedWithdrawals} does, rather than log it and move on.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Implementations must be safe for concurrent use: one virtual thread per document.</p>
  *

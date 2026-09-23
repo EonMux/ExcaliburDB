@@ -126,8 +126,10 @@ import java.util.function.Supplier;
  * and eviction can only give back the graphs' share. {@code erasure} is absent when the graph
  * root could not be listed, and {@code ingest} on a node whose ingestion stages no facts.
  * {@code ingest.sinkRefusals} counts documents the sink threw on instead of counting them under
- * one of its own reasons; like the other failures there, those documents are published and are
- * not offered to the graph again unless they change.</p>
+ * one of its own reasons, which the sink is required never to do: a published document it threw
+ * on is not offered to the graph again unless it changes, and a removed one it threw on keeps
+ * its staged facts with nothing owing their withdrawal. {@code ingest.withdrawalFailures}, by
+ * contrast, counts withdrawals that failed and are owed, and retried until they are made.</p>
  *
  * <h2>The query cache, when there is one</h2>
  * <p>Absent unless {@code excalibur.query.cache.enabled} is on, and absent is a different

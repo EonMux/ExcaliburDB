@@ -18,6 +18,7 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -190,6 +191,24 @@ public final class GraphTenants implements AutoCloseable {
     private volatile GraphExtraction extraction;
 
     /**
+     * Withdrawals of staged facts owed in namespaces whose tenant could not be opened to record
+     * them, by the document keys they concern.
+     *
+     * <p>A tenant records the withdrawals its staging owes itself, durably; see
+     * {@code StagedWithdrawals}. One that will not open cannot, and this is where the
+     * obligation waits instead: handed to the tenant the next time it opens, whoever opens it,
+     * and the sweep tries to open it on every pass until that happens. Only this map is in
+     * memory, so a restart before the tenant opens loses what it holds, which the ingest sink
+     * logs at ERROR when it arrives here.</p>
+     *
+     * <p>Each value is an immutable set replaced whole inside {@code compute}, so a key added
+     * while the set is being handed over lands in the set handed over or in the next one, and is
+     * never added to a set already taken.</p>
+     */
+    private final ConcurrentHashMap<NamespaceId, Set<String>> unrecordedWithdrawals =
+        new ConcurrentHashMap<>();
+
+    /**
      * Opens the tenant registry rooted at {@code root}.
      *
      * @param root     Directory holding one subdirectory per namespace
@@ -226,9 +245,9 @@ public final class GraphTenants implements AutoCloseable {
 
         this.registry = new NamespaceRegistry<>(
             this.root,
-            (id, directory) ->
+            (id, directory) -> handOverWithdrawals(
                 GraphTenant.open(id, directory.resolve(GraphTenant.GRAPH_SUBDIRECTORY), config,
-                    models),
+                    models)),
             GraphTenant::cost,
             budget,
             tiering,
@@ -293,7 +312,107 @@ public final class GraphTenants implements AutoCloseable {
      */
     public int compactDueErasures() {
         int owing = compactResidentNamespaces();
-        return owing + compactOverdueEvictedNamespaces();
+        owing += compactOverdueEvictedNamespaces();
+        handOverUnrecordedWithdrawals();
+        return owing;
+    }
+
+    /**
+     * Records that a withdrawal of a document's staged facts is owed in a namespace whose tenant
+     * could not be opened to make it.
+     *
+     * <p>For the ingest sink, whose borrow of the namespace failed while a document it holds
+     * facts of was being replaced or removed. What was staged from the document stays staged
+     * until the withdrawal is made, and nothing else will ask for it: the document is not
+     * reported again unless it changes. So it waits here until the tenant opens.</p>
+     *
+     * @param id          The namespace the document's facts were staged into
+     * @param documentKey The source-qualified document key
+     * @throws NullPointerException if either argument is null
+     */
+    public void oweWithdrawal(NamespaceId id, String documentKey) {
+        Objects.requireNonNull(id, "id must not be null");
+        Objects.requireNonNull(documentKey, "documentKey must not be null");
+        unrecordedWithdrawals.compute(id, (key, owed) -> {
+            Set<String> next = owed == null ? new LinkedHashSet<>() : new LinkedHashSet<>(owed);
+            next.add(documentKey);
+            return Set.copyOf(next);
+        });
+        // Opened by another request since the borrow that failed. The loader handed over what
+        // was here then, which did not yet include this, and it will not run again while the
+        // tenant stays resident.
+        Optional<NamespaceRegistry.Lease<GraphTenant>> resident = borrowResident(id);
+        if (resident.isPresent()) {
+            try (NamespaceRegistry.Lease<GraphTenant> held = resident.get()) {
+                handOverWithdrawals(held.resource());
+            }
+        }
+    }
+
+    /**
+     * How many withdrawals are owed in namespaces whose tenant has not yet taken them over.
+     *
+     * @return The count, across every namespace
+     */
+    public int unrecordedWithdrawals() {
+        int owed = 0;
+        for (Set<String> keys : unrecordedWithdrawals.values()) {
+            owed += keys.size();
+        }
+        return owed;
+    }
+
+    /**
+     * Gives a tenant the withdrawals owed in its namespace while it could not be opened.
+     *
+     * <p>Each is attempted at once. One that fails is recorded by the tenant as owed, durably,
+     * from here on.</p>
+     *
+     * @param tenant The tenant, open
+     * @return The tenant
+     */
+    private GraphTenant handOverWithdrawals(GraphTenant tenant) {
+        Set<String> owed = unrecordedWithdrawals.remove(tenant.id());
+        if (owed != null) {
+            for (String documentKey : owed) {
+                tenant.withdrawals().withdraw(documentKey, null);
+            }
+            LOGGER.info("graph tenant {} took over {} withdrawal(s) of staged facts owed while "
+                + "it could not be opened; {} still owed", tenant.id(), owed.size(),
+                tenant.withdrawals().owedCount());
+        }
+        return tenant;
+    }
+
+    /**
+     * Opens every namespace holding withdrawals its tenant has not taken over, so it takes them.
+     *
+     * <p>Opened even though nothing is querying it, because nothing else would: the documents the
+     * withdrawals concern are not reported again unless they change. A namespace that has since
+     * been dropped owes nothing - its staging went with it - and one that still will not open is
+     * tried again on the next pass.</p>
+     */
+    private void handOverUnrecordedWithdrawals() {
+        for (NamespaceId id : List.copyOf(unrecordedWithdrawals.keySet())) {
+            if (closing) {
+                break;
+            }
+            try {
+                Optional<NamespaceRegistry.Lease<GraphTenant>> lease = registry.borrowIfPresent(id);
+                if (lease.isEmpty()) {
+                    unrecordedWithdrawals.remove(id);
+                    continue;
+                }
+                try (NamespaceRegistry.Lease<GraphTenant> held = lease.get()) {
+                    // The open handed them over; a tenant that was already resident did not.
+                    handOverWithdrawals(held.resource());
+                }
+            } catch (RuntimeException e) {
+                LOGGER.error("could not open namespace {} to withdraw the staged facts of {} "
+                    + "document(s) it owes; retried on the next pass: {}", id,
+                    unrecordedWithdrawals.getOrDefault(id, Set.of()).size(), e.toString());
+            }
+        }
     }
 
     /**
@@ -316,9 +435,30 @@ public final class GraphTenants implements AutoCloseable {
             }
             try (NamespaceRegistry.Lease<GraphTenant> held = lease.get()) {
                 owing += compactTenant(id, held.resource()) ? 1 : 0;
+                retryWithdrawals(id, held.resource());
             }
         }
         return owing;
+    }
+
+    /**
+     * Makes the withdrawals of staged facts a resident tenant still owes.
+     *
+     * <p>Only resident ones. A namespace that is not resident makes what it owes when it next
+     * opens, which a build of it does first, so staging it has not published yet is withdrawn
+     * before it can be; reopening it for that alone would spend the mapping budget on a
+     * namespace nobody is using.</p>
+     *
+     * @param id     The namespace, for the log line
+     * @param tenant Its graph, borrowed for the length of this call
+     */
+    private static void retryWithdrawals(NamespaceId id, GraphTenant tenant) {
+        try {
+            GraphTenant.retryWithdrawals(id, tenant.withdrawals());
+        } catch (RuntimeException e) {
+            LOGGER.error("could not retry the withdrawals of staged facts owed in namespace {}: "
+                + "{}", id, e.toString(), e);
+        }
     }
 
     /**
@@ -876,7 +1016,10 @@ public final class GraphTenants implements AutoCloseable {
         long stagedFacts = GraphTenant.stagedFactsOnDisk(graph);
         OptionalInt discarded = outstandingOnDisk(id, graph);
 
+        // Nothing is owed by a namespace whose staging is about to go.
+        unrecordedWithdrawals.remove(id);
         long[] removed = deleteTree(directory);
+
         // Again, because a request naming this namespace between the first eviction and the
         // delete would have reopened a tenant over files that are now gone. Dropping it here
         // means the next request opens a fresh namespace rather than writing into the void.
