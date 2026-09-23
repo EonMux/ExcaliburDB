@@ -17,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -1230,17 +1231,21 @@ public class QueryEndpoint implements HttpHandler {
      * still abandoned the way it always is, one future at a time. False means the work outlived
      * the wait and the storage and the chunk index must stay open.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains. Each task ends by its query's own deadline, so the wait is spent only on work that
+     * is still inside a read or a model request when the shutdown begins.</p>
+     *
+     * @param wait How long to wait for the work already running
      * @return true if nothing the endpoint started is still running
+     * @throws NullPointerException if wait is null
      */
-    public boolean shutdown() {
-        // The default deadline is what bounds almost every such task. A query that asked for a
-        // longer one and is still running when this runs out is reported rather than waited out.
-        long waitMillis = defaultTimeoutMs + PIPELINE_RESPONSE_GRACE_MILLIS;
-        boolean ended = ExecutorDrain.drain(executorService, waitMillis,
+    public boolean shutdown(Duration wait) {
+        boolean ended = ExecutorDrain.drain(executorService, wait,
             "Query work (BM25 search, relevancy scoring, embedding)");
         if (!ended) {
             LOGGER.error("Query work was still running {}ms after the query endpoint was shut "
-                + "down; the storage and the chunk index it reads must stay open", waitMillis);
+                + "down; the storage and the chunk index it reads must stay open",
+                wait.toMillis());
         }
         return ended;
     }

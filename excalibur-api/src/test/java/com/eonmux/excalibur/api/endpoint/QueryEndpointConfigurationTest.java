@@ -238,14 +238,14 @@ class QueryEndpointConfigurationTest extends QueryEndpointTestBase {
             QueryEndpoint endpoint = new QueryEndpoint(queryPipeline, createMockConfig(),
                 Executors.newVirtualThreadPerTaskExecutor(), null, embeddingClient);
 
-            assertThat(endpoint.shutdown()).isTrue();
+            assertThat(endpoint.shutdown(java.time.Duration.ofSeconds(10))).isTrue();
         }
 
         @Test
-        @DisplayName("work still running is reported rather than interrupted, and nothing new starts")
+        @DisplayName("work still running is waited for the whole wait, then reported rather than "
+            + "interrupted, and nothing new starts")
         void runningWorkIsReportedNotInterrupted() throws Exception {
             Config config = createMockConfig();
-            when(config.visibility().getQueryTimeoutMs()).thenReturn(50);
             ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
             QueryEndpoint endpoint =
                 new QueryEndpoint(queryPipeline, config, executor, null, embeddingClient);
@@ -265,10 +265,15 @@ class QueryEndpointConfigurationTest extends QueryEndpointTestBase {
             });
             assertThat(reading.await(5, TimeUnit.SECONDS)).isTrue();
 
+            java.time.Duration wait = java.time.Duration.ofMillis(300);
+            long began = System.nanoTime();
             try {
-                assertThat(endpoint.shutdown())
+                assertThat(endpoint.shutdown(wait))
                     .as("the storage and the chunk index must stay open under the read")
                     .isFalse();
+                assertThat(java.time.Duration.ofNanos(System.nanoTime() - began))
+                    .as("the read was given all of the wait shutdown was handed")
+                    .isGreaterThanOrEqualTo(wait);
                 assertThat(interrupted).as("the running work was never interrupted").isFalse();
                 assertThatThrownBy(() -> executor.execute(() -> { }))
                     .isInstanceOf(RejectedExecutionException.class);
@@ -277,6 +282,29 @@ class QueryEndpointConfigurationTest extends QueryEndpointTestBase {
             }
             assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
             assertThat(interrupted).isFalse();
+            assertThat(endpoint.shutdown(java.time.Duration.ofSeconds(10)))
+                .as("once the read has ended, a later shutdown finds nothing running")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("work that ends within the wait shuts down clean, and a missing wait is "
+            + "refused")
+        void workEndingInTimeIsClean() throws Exception {
+            ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+            QueryEndpoint endpoint = new QueryEndpoint(queryPipeline, createMockConfig(),
+                executor, null, embeddingClient);
+            CountDownLatch reading = new CountDownLatch(1);
+            executor.execute(() -> {
+                reading.countDown();
+                java.util.concurrent.locks.LockSupport.parkNanos(
+                    TimeUnit.MILLISECONDS.toNanos(200));
+            });
+            assertThat(reading.await(5, TimeUnit.SECONDS)).isTrue();
+
+            assertThatThrownBy(() -> endpoint.shutdown(null))
+                .isInstanceOf(NullPointerException.class);
+            assertThat(endpoint.shutdown(java.time.Duration.ofSeconds(10))).isTrue();
         }
     }
 

@@ -344,15 +344,29 @@ segments.
 `SIGTERM` runs a shutdown hook that stops the listener and drains the node. It then publishes the
 chunk index's buffer, which is the tail of an ingestion run. Next it forces staged graph facts and
 the document registry to disk, and finally closes the storage engine. The whole sequence runs
-against one deadline, `excalibur.api.shutdown-timeout-seconds` (30 by default). The drains run in
-parallel and share that deadline minus its last 10 seconds. Those 10 seconds are kept for the
-writes, so a slow drain cannot use them up. A reindex, an ingestion run, a compaction, a graph
-build and the lexical erasure sweep are each asked to stop and then given whatever is left of that
-share, with no shorter limit of their own; the graph erasure sweep is given whatever is left of the
-whole deadline once the writes are done. Raising the deadline therefore gives a slow one longer to
-finish. One still running when its time runs out is reported, with the time it was given, and left
-alone. Nothing it is using is closed underneath it, and the next start
-recovers from its write log.
+against one deadline, `excalibur.api.shutdown-timeout-seconds` (30 by default). The drains share
+that deadline minus its last 10 seconds. Those 10 seconds are kept for the writes, so a slow drain
+cannot use them up.
+
+The drains run in this order, each asked to stop and then given whatever is left of that share,
+with no shorter limit of their own:
+
+1. The listener stops accepting and waits for in-flight exchanges for half the share.
+2. Together: the request threads it stopped waiting for, a reindex, the query executors (the BM25
+   half and the vector pipeline's segment searches), a compaction, a graph build and an ingestion
+   run.
+3. The segment workers, once nothing is left that could hand them work: HNSW integration,
+   warming, graph and segment compaction, reindex scheduling, the segment sync sweep and the term
+   filter rebuilds, one after another out of the same remainder.
+4. The storage engine's own splits and segment lifecycle checks, once the segment workers can no
+   longer start one.
+5. The lexical erasure sweep.
+
+The graph erasure sweep is given whatever is left of the whole deadline once the writes are done.
+Raising the deadline therefore gives a slow drain longer to finish. One still running when its
+time runs out is reported, with the time it was given, and left alone: nothing that reads or
+writes files is interrupted, because an interrupt closes file channels that other readers share.
+Nothing it is using is closed underneath it, and the next start recovers from its write log.
 
 Set the supervisor's stop timeout to **the configured deadline plus 10 seconds**. The margin covers
 the JVM reaching its hook and the storage engine's own close. With the default, that is

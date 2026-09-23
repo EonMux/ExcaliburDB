@@ -160,7 +160,7 @@ class QueryEndpointRequestTest extends QueryEndpointTestBase {
             ExecutorService executor = Executors.newSingleThreadExecutor();
             QueryEndpoint endpointWithExecutor = new QueryEndpoint(queryPipeline, executor);
 
-            endpointWithExecutor.shutdown();
+            endpointWithExecutor.shutdown(java.time.Duration.ofSeconds(10));
 
             assertThat(executor.isShutdown()).isTrue();
         }

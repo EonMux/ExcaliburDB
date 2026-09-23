@@ -9,23 +9,28 @@ import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
+import com.eonmux.excalibur.store.StorageEngine;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -41,13 +46,15 @@ import static org.mockito.Mockito.when;
  * throws must neither skip the steps after it nor read as a clean drain.</p>
  *
  * <p>Each drain holds only what the work it waits for uses: a reindex, an ingestion run, a BM25
- * query and a request thread hold storage and the chunk index; the vector pipeline and the
- * segment workers hold storage; a graph build holds the graph tenants.</p>
+ * query and a request thread hold storage and the chunk index; the vector pipeline, the segment
+ * workers and the storage engine's own splits and lifecycle checks hold storage; a graph build
+ * holds the graph tenants.</p>
+ *
+ * <p>Every drain waits for as long as the budget leaves the drains when it starts, and the whole
+ * drain never runs into the reserve the budget keeps for the durable writes that follow.</p>
  */
 @DisplayName("Shutdown sequence")
 class ShutdownSequenceTest {
-
-    private static final Duration GRACE = Duration.ofSeconds(10);
 
     private ServerWiring wiring;
     private IngestionOrchestrator ingestion;
@@ -58,6 +65,7 @@ class ShutdownSequenceTest {
     private GraphBuildRunner graphBuild;
     private QueryEndpoint query;
     private QueryPipeline pipeline;
+    private StorageEngine storage;
     private EndpointRegistrar.Endpoints endpoints;
 
     /** A node's default budget, started now: far more than any drain here needs. */
@@ -77,9 +85,12 @@ class ShutdownSequenceTest {
         when(wiring.ingestSourceRegistry()).thenReturn(sources);
         pipeline = mock(QueryPipeline.class);
         when(wiring.queryPipeline()).thenReturn(pipeline);
-        when(pipeline.shutdown()).thenReturn(true);
+        when(pipeline.shutdown(any())).thenReturn(true);
         when(ingestion.shutdown(any())).thenReturn(true);
-        when(indexOrchestrator.shutdown()).thenReturn(true);
+        when(indexOrchestrator.shutdown(any())).thenReturn(true);
+        storage = mock(StorageEngine.class);
+        when(wiring.storageEngine()).thenReturn(storage);
+        when(storage.stopBackgroundWork(any())).thenReturn(true);
 
         reindex = mock(ReindexEndpoint.class);
         compaction = mock(CompactionRunner.class);
@@ -88,24 +99,24 @@ class ShutdownSequenceTest {
         when(compaction.drain(any())).thenReturn(CompactionRunner.Drained.CLEAN);
         when(graphBuild.drain(any())).thenReturn(true);
         query = mock(QueryEndpoint.class);
-        when(query.shutdown()).thenReturn(true);
+        when(query.shutdown(any())).thenReturn(true);
         endpoints = new EndpointRegistrar.Endpoints(query, reindex, compaction, graphBuild, null);
     }
 
     @Test
     @DisplayName("everything drained reads as clean")
     void aCleanDrain() {
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, budget()))
             .isEqualTo(ShutdownSequence.Drained.CLEAN);
     }
 
     @Test
     @DisplayName("a node that never registered its endpoints still drains what it wired")
     void withoutEndpoints() {
-        assertThat(ShutdownSequence.drain(null, wiring, null, GRACE, budget()))
+        assertThat(ShutdownSequence.drain(null, wiring, null, budget()))
             .isEqualTo(ShutdownSequence.Drained.CLEAN);
         verify(ingestion).shutdown(any());
-        verify(indexOrchestrator).close();
+        verify(indexOrchestrator).close(any());
     }
 
     @Test
@@ -116,7 +127,7 @@ class ShutdownSequenceTest {
         // with nothing but a log line to show for it.
         when(ingestion.shutdown(any())).thenReturn(false);
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, budget()))
             .isEqualTo(new ShutdownSequence.Drained(false, false, false));
     }
 
@@ -125,7 +136,7 @@ class ShutdownSequenceTest {
     void reindexStillRunning() {
         when(reindex.drain(any())).thenReturn(false);
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, budget()))
             .isEqualTo(new ShutdownSequence.Drained(false, false, true));
     }
 
@@ -134,36 +145,45 @@ class ShutdownSequenceTest {
     void compactionHoldingOnlyTheIndex() {
         when(compaction.drain(any())).thenReturn(new CompactionRunner.Drained(true, false));
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, budget()))
             .isEqualTo(new ShutdownSequence.Drained(true, false, true));
     }
 
     @Test
     @DisplayName("query work still running holds storage and the chunk index")
     void queryWorkStillRunning() {
-        when(query.shutdown()).thenReturn(false);
+        when(query.shutdown(any())).thenReturn(false);
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, budget()))
             .isEqualTo(new ShutdownSequence.Drained(false, false, true));
     }
 
     @Test
     @DisplayName("a segment search still running holds storage alone")
     void segmentSearchStillRunning() {
-        when(pipeline.shutdown()).thenReturn(false);
+        when(pipeline.shutdown(any())).thenReturn(false);
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, budget()))
             .isEqualTo(new ShutdownSequence.Drained(false, true, true));
     }
 
     @Test
     @DisplayName("segment workers still running hold storage alone, and are not closed")
     void segmentWorkersStillRunning() {
-        when(indexOrchestrator.shutdown()).thenReturn(false);
+        when(indexOrchestrator.shutdown(any())).thenReturn(false);
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, budget()))
             .isEqualTo(new ShutdownSequence.Drained(false, true, true));
-        verify(indexOrchestrator, never()).close();
+        verify(indexOrchestrator, never()).close(any());
+    }
+
+    @Test
+    @DisplayName("a split or lifecycle check still running holds storage alone")
+    void storageBackgroundWorkStillRunning() {
+        when(storage.stopBackgroundWork(any())).thenReturn(false);
+
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, budget()))
+            .isEqualTo(new ShutdownSequence.Drained(false, true, true));
     }
 
     @Test
@@ -171,7 +191,7 @@ class ShutdownSequenceTest {
     void graphBuildStillRunning() {
         when(graphBuild.drain(any())).thenReturn(false);
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, budget()))
             .isEqualTo(new ShutdownSequence.Drained(true, true, false));
     }
 
@@ -181,14 +201,13 @@ class ShutdownSequenceTest {
         doThrow(new IllegalStateException("reindex executor is wedged"))
             .when(reindex).drain(any());
 
-        assertThatThrownBy(() -> ShutdownSequence.drain(endpoints, wiring, null, GRACE,
-                budget()))
+        assertThatThrownBy(() -> ShutdownSequence.drain(endpoints, wiring, null, budget()))
             .isInstanceOf(IllegalStateException.class)
             .hasMessageContaining("reindex executor is wedged");
         verify(compaction).drain(any());
         verify(graphBuild).drain(any());
         verify(ingestion).shutdown(any());
-        verify(indexOrchestrator).close();
+        verify(indexOrchestrator).close(any());
     }
 
     @Test
@@ -197,32 +216,45 @@ class ShutdownSequenceTest {
         // The throw is rethrown, and the server keeps its pessimistic flags; the rest still ran.
         when(compaction.drain(any())).thenThrow(new IllegalStateException("drain failed"));
 
-        assertThatThrownBy(() -> ShutdownSequence.drain(endpoints, wiring, null, GRACE,
-                budget()))
+        assertThatThrownBy(() -> ShutdownSequence.drain(endpoints, wiring, null, budget()))
             .hasMessageContaining("drain failed");
         verify(ingestion).shutdown(any());
     }
 
-    @Test
-    @DisplayName("a request thread still running after every other drain holds storage")
-    void aRequestStillRunning() throws Exception {
+    /** Request threads held inside a request until {@code release} opens. */
+    private static ExecutorService requestsHeldUntil(CountDownLatch release)
+        throws InterruptedException {
         ExecutorService requests = Executors.newVirtualThreadPerTaskExecutor();
         CountDownLatch entered = new CountDownLatch(1);
-        CountDownLatch release = new CountDownLatch(1);
         requests.execute(() -> {
             entered.countDown();
             try {
-                release.await(10, TimeUnit.SECONDS);
+                release.await(60, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         });
         assertThat(entered.await(10, TimeUnit.SECONDS)).isTrue();
+        return requests;
+    }
+
+    @Test
+    @DisplayName("a request thread still running when the drains' share runs out holds storage, "
+        + "having been waited for all of it")
+    void aRequestStillRunning() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        ExecutorService requests = requestsHeldUntil(release);
+        Duration forDrains = Duration.ofMillis(600);
+        ShutdownBudget budget =
+            ShutdownBudget.startingNow(ShutdownBudget.DURABILITY_RESERVE.plus(forDrains));
+        long started = System.nanoTime();
 
         try {
-            assertThat(ShutdownSequence.drain(endpoints, wiring, requests, Duration.ofMillis(1),
-                budget()))
+            assertThat(ShutdownSequence.drain(endpoints, wiring, requests, budget))
                 .isEqualTo(new ShutdownSequence.Drained(false, false, false));
+            assertThat(Duration.ofNanos(System.nanoTime() - started))
+                .as("the request was waited for until the drains' share was spent")
+                .isGreaterThanOrEqualTo(forDrains);
             assertThat(requests.isShutdown()).as("no new request is dispatched").isTrue();
         } finally {
             release.countDown();
@@ -231,11 +263,62 @@ class ShutdownSequenceTest {
     }
 
     @Test
+    @DisplayName("a request thread that ends within the drains' share drains clean")
+    void aRequestEndingInTimeDrainsClean() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        ExecutorService requests = requestsHeldUntil(release);
+        Thread.ofVirtual().start(() -> {
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            release.countDown();
+        });
+
+        assertThat(ShutdownSequence.drain(endpoints, wiring, requests, budget()))
+            .isEqualTo(ShutdownSequence.Drained.CLEAN);
+        assertThat(requests.isTerminated()).isTrue();
+    }
+
+    @Test
+    @DisplayName("the segment workers are stopped only once the request threads have ended, and "
+        + "the storage engine's background work after them")
+    void workersStopAfterRequests() throws Exception {
+        // A request thread can still write into storage and hand the workers a segment; the
+        // workers can still hand the storage engine a split.
+        CountDownLatch release = new CountDownLatch(1);
+        ExecutorService requests = requestsHeldUntil(release);
+        AtomicBoolean requestsEndedFirst = new AtomicBoolean();
+        when(indexOrchestrator.shutdown(any())).thenAnswer(call -> {
+            requestsEndedFirst.set(requests.isTerminated());
+            return true;
+        });
+        Thread.ofVirtual().start(() -> {
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            release.countDown();
+        });
+
+        assertThat(ShutdownSequence.drain(endpoints, wiring, requests, budget()))
+            .isEqualTo(ShutdownSequence.Drained.CLEAN);
+
+        assertThat(requestsEndedFirst).as("no request thread was still running").isTrue();
+        InOrder order = inOrder(indexOrchestrator, storage);
+        order.verify(indexOrchestrator).shutdown(any());
+        order.verify(indexOrchestrator).close(any());
+        order.verify(storage).stopBackgroundWork(any());
+    }
+
+    @Test
     @DisplayName("request threads that have ended drain clean")
     void finishedRequestsDrain() {
         ExecutorService requests = Executors.newVirtualThreadPerTaskExecutor();
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, requests, GRACE, budget()))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, requests, budget()))
             .isEqualTo(ShutdownSequence.Drained.CLEAN);
         assertThat(requests.isTerminated()).isTrue();
     }
@@ -254,8 +337,7 @@ class ShutdownSequenceTest {
             return true;
         });
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE,
-            budget()))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, budget()))
             .isEqualTo(ShutdownSequence.Drained.CLEAN);
     }
 
@@ -271,7 +353,7 @@ class ShutdownSequenceTest {
         long started = System.nanoTime();
 
         try {
-            assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget))
+            assertThat(ShutdownSequence.drain(endpoints, wiring, null, budget))
                 .as("the reindex still holds storage and the chunk index; the graph build ended")
                 .isEqualTo(new ShutdownSequence.Drained(false, false, true));
             assertThat(Duration.ofNanos(System.nanoTime() - started))
@@ -286,27 +368,39 @@ class ShutdownSequenceTest {
     }
 
     @Test
-    @DisplayName("the request drain is cut to what the budget has left")
-    void theRequestDrainIsBounded() throws Exception {
-        ExecutorService requests = Executors.newVirtualThreadPerTaskExecutor();
+    @DisplayName("with every drain held past the budget, the whole drain still ends with the "
+        + "drains' share and leaves the reserve")
+    void everythingHeldStaysWithinTheBudget() throws Exception {
+        // Each of these would wait a minute of its own; the budget allows the drains one second.
         CountDownLatch release = new CountDownLatch(1);
-        requests.execute(() -> {
-            try {
-                release.await(60, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        });
-        ShutdownBudget budget = ShutdownBudget.startingNow(
-            ShutdownBudget.DURABILITY_RESERVE.plusSeconds(1));
+        ExecutorService requests = requestsHeldUntil(release);
+        when(reindex.drain(any())).thenAnswer(call -> release.await(60, TimeUnit.SECONDS));
+        when(query.shutdown(any())).thenAnswer(call -> release.await(60, TimeUnit.SECONDS));
+        when(pipeline.shutdown(any())).thenAnswer(call -> release.await(60, TimeUnit.SECONDS));
+        when(graphBuild.drain(any())).thenAnswer(call -> release.await(60, TimeUnit.SECONDS));
+        when(ingestion.shutdown(any())).thenAnswer(call -> release.await(60, TimeUnit.SECONDS));
+        when(indexOrchestrator.shutdown(any()))
+            .thenAnswer(call -> release.await(60, TimeUnit.SECONDS));
+        when(storage.stopBackgroundWork(any()))
+            .thenAnswer(call -> release.await(60, TimeUnit.SECONDS));
+        Duration forDrains = Duration.ofSeconds(1);
+        ShutdownBudget budget =
+            ShutdownBudget.startingNow(ShutdownBudget.DURABILITY_RESERVE.plus(forDrains));
         long started = System.nanoTime();
 
         try {
-            assertThat(ShutdownSequence.drain(endpoints, wiring, requests, Duration.ofMinutes(1),
-                budget))
+            assertThat(ShutdownSequence.drain(endpoints, wiring, requests, budget))
                 .isEqualTo(new ShutdownSequence.Drained(false, false, false));
-            assertThat(Duration.ofNanos(System.nanoTime() - started))
-                .isLessThan(ShutdownBudget.DURABILITY_RESERVE);
+            Duration took = Duration.ofNanos(System.nanoTime() - started);
+            assertThat(took)
+                .as("everything held was waited for until the drains' share was spent")
+                .isGreaterThanOrEqualTo(forDrains);
+            assertThat(took)
+                .as("and not past it: each drain after the first is handed what is left")
+                .isLessThan(forDrains.plus(ShutdownBudget.DURABILITY_RESERVE.dividedBy(2)));
+            assertThat(budget.remaining())
+                .as("the reserve is still there for the durable writes that follow")
+                .isGreaterThan(ShutdownBudget.DURABILITY_RESERVE.dividedBy(2));
         } finally {
             release.countDown();
         }
@@ -315,20 +409,28 @@ class ShutdownSequenceTest {
 
     @Test
     @DisplayName("each drain is handed what the budget leaves the drains, however long that is")
-    void eachDrainWaitsWhatTheBudgetAllows() {
+    void eachDrainWaitsWhatTheBudgetAllows() throws InterruptedException {
         // A clock that stands still, so what the drains are handed is exactly the budget less
         // its reserve: a hundred-second budget gives each ninety, past any wait of its own.
         Duration total = Duration.ofSeconds(100);
         ShutdownBudget budget = new ShutdownBudget(total, () -> 0L);
         Duration forDrains = total.minus(ShutdownBudget.DURABILITY_RESERVE);
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget))
+        ExecutorService requests = mock(ExecutorService.class);
+        when(requests.awaitTermination(anyLong(), any())).thenReturn(true);
+
+        assertThat(ShutdownSequence.drain(endpoints, wiring, requests, budget))
             .isEqualTo(ShutdownSequence.Drained.CLEAN);
 
+        verify(requests).awaitTermination(forDrains.toNanos(), TimeUnit.NANOSECONDS);
         verify(reindex).drain(forDrains);
+        verify(query).shutdown(forDrains);
+        verify(pipeline).shutdown(forDrains);
         verify(compaction).drain(forDrains);
         verify(graphBuild).drain(forDrains);
         verify(ingestion).shutdown(forDrains);
+        verify(indexOrchestrator).shutdown(forDrains);
+        verify(storage).stopBackgroundWork(forDrains);
     }
 
     @Test
@@ -342,9 +444,13 @@ class ShutdownSequenceTest {
         Duration whole = Duration.ofSeconds(100).minus(ShutdownBudget.DURABILITY_RESERVE);
         ArgumentCaptor<Duration> handed = ArgumentCaptor.forClass(Duration.class);
 
-        ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget);
+        ShutdownSequence.drain(endpoints, wiring, null, budget);
 
         verify(reindex).drain(handed.capture());
+        assertThat(handed.getValue()).isPositive().isLessThan(whole);
+        verify(indexOrchestrator).shutdown(handed.capture());
+        assertThat(handed.getValue()).isPositive().isLessThan(whole);
+        verify(storage).stopBackgroundWork(handed.capture());
         assertThat(handed.getValue()).isPositive().isLessThan(whole);
     }
 

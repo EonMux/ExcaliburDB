@@ -115,7 +115,9 @@ public record NodeShutdown(ExcaliburDBServer server,
      */
     public void run() {
         SweepState sweep = new SweepState(lexicalErasureSweep != null);
-        ShutdownSequence sequence = sequence(sweep, ShutdownBudget.startingNow(shutdownTimeout));
+        BackgroundWork background = new BackgroundWork();
+        ShutdownSequence sequence =
+            sequence(sweep, background, ShutdownBudget.startingNow(shutdownTimeout));
         int failedSteps = sequence.stepNames().size() - sequence.run().size();
         reportOutcome(failedSteps, storageEngine.getCatalog().closeFailure());
     }
@@ -137,16 +139,43 @@ public record NodeShutdown(ExcaliburDBServer server,
     }
 
     /**
+     * Whether the segment workers and the storage engine's own background work are still
+     * running, as far as this shutdown knows.
+     *
+     * <p>Running until their steps say otherwise, so a step that threw is read the safe way: as
+     * work still writing into storage.</p>
+     */
+    private static final class BackgroundWork {
+
+        private volatile boolean workersRunning = true;
+        private volatile boolean storageWorkRunning = true;
+
+        boolean running() {
+            return workersRunning || storageWorkRunning;
+        }
+    }
+
+    /**
      * Lists the teardown steps in the only order that is safe.
      *
-     * @param sweep  What the sweep's drain reported, filled in by its step
-     * @param budget The deadline every wait below is cut from
+     * @param sweep      What the sweep's drain reported, filled in by its step
+     * @param background What the background work's steps reported, filled in by them
+     * @param budget     The deadline every wait below is cut from
      * @return The sequence, built but not yet run
      */
-    private ShutdownSequence sequence(SweepState sweep, ShutdownBudget budget) {
+    private ShutdownSequence sequence(SweepState sweep, BackgroundWork background,
+                                      ShutdownBudget budget) {
         return new ShutdownSequence()
             .add("stop HTTP server and drain in-flight requests", () -> server.stop(budget))
-            .add("stop index orchestrator", indexOrchestrator::close)
+            // The server's stop has already drained both of these when it was running, and then
+            // they answer at once. They wait here only for what that stop left running, or for
+            // what a server that never started did not reach; and no longer than the drains have
+            // left, so the reserve stays intact. Their answers gate the storage engine's close.
+            .add("stop index orchestrator",
+                () -> background.workersRunning = !stopIndexOrchestrator(budget))
+            // After the workers, the last thing that could start a split or a lifecycle check.
+            .add("stop storage background work", () -> background.storageWorkRunning =
+                !storageEngine.stopBackgroundWork(budget.forDrains()))
             // Before the index: a sweep in flight is inside a compaction of it. Told to stop,
             // never interrupted, and what it answers decides whether what it reads may close.
             // It waits only for what the drains have left, so the reserve stays intact.
@@ -176,13 +205,35 @@ public record NodeShutdown(ExcaliburDBServer server,
                 tenants.close(budget.remaining());
             })
             .add("close storage engine", () -> {
-                requireStorageReleased(sweep, "the storage engine");
+                requireStorageReleased(sweep, background, "the storage engine");
                 storageEngine.close();
             })
             .addIfPresent("release memory-mapped segments", arena, mappings -> {
-                requireStorageReleased(sweep, "the memory-mapped segments");
+                requireStorageReleased(sweep, background, "the memory-mapped segments");
                 mappings.close();
             });
+    }
+
+    /**
+     * Stops the segment workers within what the drains have left and, once they have ended,
+     * releases the rest of what the orchestrator holds.
+     *
+     * <p>Not closed when a worker is still running: what the close releases beyond the workers
+     * is theirs to finish with.</p>
+     *
+     * @param budget The shutdown's deadline
+     * @return true if every worker has ended
+     */
+    private boolean stopIndexOrchestrator(ShutdownBudget budget) {
+        if (!indexOrchestrator.shutdown(budget.forDrains())) {
+            LOGGER.error("Segment workers were still running when the drains' share of the "
+                + "shutdown ran out; the storage engine will be left open rather than closed "
+                + "underneath them");
+            return false;
+        }
+        // Everything it waits for has already ended, so this returns without waiting.
+        indexOrchestrator.close(budget.forDrains());
+        return true;
     }
 
     /**
@@ -259,17 +310,27 @@ public record NodeShutdown(ExcaliburDBServer server,
      * <p>The sweep counts only for an index whose compactions read text back out of storage;
      * one still force-merging its own segments reads nothing of the storage engine's.</p>
      *
-     * @param sweep What the sweep's drain reported
-     * @param what  What the step would have closed
+     * <p>The segment workers and the storage engine's splits and lifecycle checks count
+     * whatever the server reported, because a server that never started drained neither.</p>
+     *
+     * @param sweep      What the sweep's drain reported
+     * @param background What the background work's steps reported
+     * @param what       What the step would have closed
      * @throws IllegalStateException if storage is still in use
      */
-    private void requireStorageReleased(SweepState sweep, String what) {
+    private void requireStorageReleased(SweepState sweep, BackgroundWork background,
+                                        String what) {
         boolean sweepReadsStorage = sweep.running
             && (chunkIndex == null || chunkIndex.compactionReadsStorage());
         if (sweepReadsStorage || server.isStorageStillInUse()) {
             throw new IllegalStateException("left " + what + " open: a compaction still running "
                 + "after the drain is reading it, and closing it underneath the run could crash "
                 + "the process");
+        }
+        if (background.running()) {
+            throw new IllegalStateException("left " + what + " open: a segment worker, split or "
+                + "lifecycle check still running after its drain is writing into it, and closing "
+                + "it underneath that work could crash the process");
         }
     }
 

@@ -8,6 +8,7 @@ import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
+import com.eonmux.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -26,9 +27,10 @@ import java.util.concurrent.TimeoutException;
  * <p>A node's shutdown is not a list of {@code close()} calls in any convenient sequence. The
  * storage engine's mappings live in an arena the caller closes once this returns, and a
  * background task still writing into a mapping whose arena has been closed takes the JVM down
- * rather than throwing. Everything that can still reach storage - the query pipeline's own
- * threads, a compaction rewrite, an ingestion run, the segment workers - therefore has to be
- * drained first, and each of those is owned by a different collaborator.</p>
+ * rather than throwing. Everything that can still reach storage - the request threads, the
+ * query pipeline's own threads, a compaction rewrite, an ingestion run, the segment workers, the
+ * storage engine's own lifecycle checks and splits - therefore has to be drained first, and each
+ * of those is owned by a different collaborator.</p>
  *
  * <p>Written here rather than inside {@code stop()} because the ordering is the whole content:
  * on its own it reads as a sequence with a reason attached to each step, where interleaved with
@@ -88,38 +90,40 @@ final class ShutdownSequence {
      * rethrown once every step has had its turn.</p>
      *
      * <h3>Together, then in order</h3>
-     * <p>The reindex, the query executors, a compaction, a graph build and ingestion each run on
-     * executors of their own and none of them waits on another, so they are all asked to stop at
-     * once and waited for together: the time this takes is the slowest of them, where one after
-     * another it was their sum. The segment workers follow, because until the endpoints and
-     * ingestion have stopped something can still hand them work; the request threads come last,
-     * because everything that can end one early has been delivered by then.</p>
+     * <p>The request threads, the reindex, the query executors, a compaction, a graph build and
+     * ingestion each run on executors of their own and none of them waits on another, so they are
+     * all asked to stop at once and waited for together: the time this takes is the slowest of
+     * them, where one after another it was their sum. The request threads are among them rather
+     * than after them, so the ones the listener stopped waiting for are waited for with the same
+     * deadline as everything else, not with what the others leave; everything that can end one
+     * early - the erasure's stop request, the stopped query executors, the stop asked of
+     * synchronous ingestion - is delivered while they are being waited for. The segment workers
+     * follow, because until every one of those has stopped something can still write into storage
+     * and hand them work. The storage engine's own background work - its lifecycle checks and its
+     * splits - comes last, for the same reason one level down: the segment workers are the last
+     * thing that could have given it anything to do.</p>
      *
      * <h3>What the budget does</h3>
-     * <p>Each drain is handed what the budget leaves the drains as its own wait, so a reindex,
-     * a compaction, a graph build or an ingestion run is waited for as long as the budget
-     * allows and no longer - a longer budget is a longer wait, not a fixed one cut short. The
-     * wait for each drain's answer is bounded the same way. A drain still going when that
-     * runs out is not waited for further and not interrupted - it has already been asked to stop,
-     * and goes on stopping on its own thread - but is reported as still running, so the caller
-     * leaves open what it uses. The budget's reserve is then still whole for the durable writes
-     * the caller makes next.</p>
+     * <p>Each drain is handed what the budget leaves the drains when it starts, so a request, a
+     * reindex, a compaction, a query, a graph build, an ingestion run or a background worker is
+     * waited for as long as the budget allows and no longer - a longer budget is a longer wait,
+     * not a fixed one cut short. The wait for each drain's answer is bounded the same way. A
+     * drain still going when that runs out is not waited for further and not interrupted - it has
+     * already been asked to stop, and goes on stopping on its own thread - but is reported as
+     * still running, so the caller leaves open what it uses. The budget's reserve is then still
+     * whole for the durable writes the caller makes next.</p>
      *
-     * @param endpoints    The endpoints that own executors, or null if {@code start()} never
-     *                     reached the point of registering them
-     * @param wiring       What the node is made of, for the pipelines and registries it owns
-     * @param requests     The executor the listener dispatched requests on, or null
-     * @param requestGrace How long request threads still running once everything else has
-     *                     drained are given to end, before the budget cuts it
-     * @param budget       The shutdown's deadline
+     * @param endpoints The endpoints that own executors, or null if {@code start()} never
+     *                  reached the point of registering them
+     * @param wiring    What the node is made of, for the pipelines and registries it owns
+     * @param requests  The executor the listener dispatched requests on, or null
+     * @param budget    The shutdown's deadline
      * @return What is still running, as storage, the chunk index and the graph tenants see it
-     * @throws NullPointerException if wiring, requestGrace or budget is null
+     * @throws NullPointerException if wiring or budget is null
      */
     static Drained drain(EndpointRegistrar.Endpoints endpoints, ServerWiring wiring,
-                         ExecutorService requests, Duration requestGrace,
-                         ShutdownBudget budget) {
+                         ExecutorService requests, ShutdownBudget budget) {
         Objects.requireNonNull(wiring, "wiring cannot be null");
-        Objects.requireNonNull(requestGrace, "requestGrace cannot be null");
         Objects.requireNonNull(budget, "budget cannot be null");
 
         Steps steps = new Steps(budget);
@@ -127,6 +131,7 @@ final class ShutdownSequence {
         // shutdown() below refuses new tasks and leaves the ones running to finish.
         ExecutorService drains = Executors.newThreadPerTaskExecutor(
             Thread.ofVirtual().name("shutdown-drain-", 0).factory());
+        boolean requestsDrained;
         boolean reindexDrained;
         boolean queriesDrained;
         boolean pipelineDrained;
@@ -134,14 +139,18 @@ final class ShutdownSequence {
         boolean graphBuildDrained;
         boolean ingestionDrained;
         boolean orchestratorDrained;
+        boolean storageWorkDrained;
         try {
             // Each reads the budget when it starts rather than here, so the wait it is handed is
             // what is actually left.
+            Future<Boolean> requestThreads =
+                drains.submit(() -> drainRequests(requests, budget.forDrains()));
             Future<Boolean> reindex =
                 drains.submit(() -> drainReindex(endpoints, budget.forDrains()));
-            Future<Boolean> queries = drains.submit(() -> drainQueryEndpoint(endpoints));
-            Future<Boolean> pipeline =
-                drains.submit(() -> drainQueryPipeline(wiring.queryPipeline()));
+            Future<Boolean> queries =
+                drains.submit(() -> drainQueryEndpoint(endpoints, budget.forDrains()));
+            Future<Boolean> pipeline = drains.submit(
+                () -> drainQueryPipeline(wiring.queryPipeline(), budget.forDrains()));
             Future<CompactionRunner.Drained> compacting =
                 drains.submit(() -> drainCompaction(endpoints, budget.forDrains()));
             Future<Boolean> graphBuild =
@@ -149,6 +158,7 @@ final class ShutdownSequence {
             Future<Boolean> ingestion =
                 drains.submit(() -> drainIngestion(wiring, budget.forDrains()));
 
+            requestsDrained = steps.await("the request threads", requestThreads, false);
             reindexDrained = steps.await("the reindex", reindex, false);
             queriesDrained = steps.await("the query executor", queries, false);
             pipelineDrained = steps.await("the vector pipeline", pipeline, false);
@@ -157,32 +167,32 @@ final class ShutdownSequence {
             graphBuildDrained = steps.await("the graph build", graphBuild, false);
             ingestionDrained = steps.await("ingestion", ingestion, false);
 
-            // After the listener has stopped and the endpoints have drained, so no new query or
-            // write can hand the workers anything more.
+            // After the listener has stopped and the requests, the endpoints and ingestion have
+            // drained, so nothing can write into storage and hand the workers anything more.
             orchestratorDrained = steps.await("the segment workers",
-                drains.submit(() -> drainIndexOrchestrator(wiring)), false);
+                drains.submit(() -> drainIndexOrchestrator(wiring, budget.forDrains())), false);
+
+            // After the segment workers, the last thing that could have given the storage
+            // engine a split or a segment to move through its lifecycle.
+            storageWorkDrained = steps.await("the storage engine's background work",
+                drains.submit(() -> drainStorageEngine(wiring, budget.forDrains())), false);
         } finally {
             drains.shutdown();
         }
 
-        // Last, so that everything that could end a request thread early - the stop asked of
-        // synchronous ingestion, the drained query executor, the erasure's stop request - has
-        // already been delivered.
-        boolean requestsDrained =
-            steps.run(() -> drainRequests(requests, budget.bound(requestGrace)));
-
         // Who holds what. A reindex, an ingestion run, a BM25 query and a request thread each
-        // reach both storage and the chunk index; the vector pipeline and the segment workers
-        // reach storage alone; a graph build, a request thread and an ingestion run the graph
-        // tenants - the last because every document it publishes is staged into its namespace's
-        // graph, and a run still going stages into whatever the shutdown closes next. The
-        // graph sink cannot fail the document it is reporting, so a tenant closed under it
-        // costs that document's facts for good rather than an error anyone sees.
+        // reach both storage and the chunk index; the vector pipeline, the segment workers and
+        // the storage engine's own background work reach storage alone; a graph build, a request
+        // thread and an ingestion run the graph tenants - the last because every document it
+        // publishes is staged into its namespace's graph, and a run still going stages into
+        // whatever the shutdown closes next. The graph sink cannot fail the document it is
+        // reporting, so a tenant closed under it costs that document's facts for good rather
+        // than an error anyone sees.
         boolean indexUsersDrained =
             reindexDrained && queriesDrained && ingestionDrained && requestsDrained;
         Drained drained = new Drained(
             compaction.storageReleased() && indexUsersDrained && pipelineDrained
-                && orchestratorDrained,
+                && orchestratorDrained && storageWorkDrained,
             compaction.chunkIndexReleased() && indexUsersDrained,
             graphBuildDrained && requestsDrained && ingestionDrained);
         steps.rethrow();
@@ -291,16 +301,16 @@ final class ShutdownSequence {
      * here, and reported, so storage is not closed underneath one.</p>
      *
      * @param requests The listener's executor, or null if it never started
-     * @param grace    How long to wait
+     * @param wait     How long the budget leaves it
      * @return true if no request thread is still running
      */
-    private static boolean drainRequests(ExecutorService requests, Duration grace) {
+    private static boolean drainRequests(ExecutorService requests, Duration wait) {
         if (requests == null) {
             return true;
         }
         requests.shutdown();
         try {
-            if (requests.awaitTermination(grace.toMillis(), TimeUnit.MILLISECONDS)) {
+            if (requests.awaitTermination(wait.toNanos(), TimeUnit.NANOSECONDS)) {
                 return true;
             }
         } catch (InterruptedException e) {
@@ -309,8 +319,8 @@ final class ShutdownSequence {
                 return true;
             }
         }
-        LOGGER.error("Requests were still running {}ms after every other drain; the storage "
-            + "engine will be left open rather than closed underneath them", grace.toMillis());
+        LOGGER.error("Requests were still running {}ms after the listener stopped; the storage "
+            + "engine will be left open rather than closed underneath them", wait.toMillis());
         return false;
     }
 
@@ -335,11 +345,13 @@ final class ShutdownSequence {
      * Waits for the query work the query endpoint runs on its own executor - the BM25 half.
      *
      * @param endpoints What was registered, or null
+     * @param wait      How long the budget leaves it
      * @return false if query work outlived the wait and is still reading storage and the index
      */
-    private static boolean drainQueryEndpoint(EndpointRegistrar.Endpoints endpoints) {
+    private static boolean drainQueryEndpoint(EndpointRegistrar.Endpoints endpoints,
+                                              Duration wait) {
         QueryEndpoint query = endpoints == null ? null : endpoints.query();
-        if (query != null && !query.shutdown()) {
+        if (query != null && !query.shutdown(wait)) {
             LOGGER.error("Query work was still running when the node shut down; the storage "
                 + "engine and the chunk index will be left open rather than closed underneath it");
             return false;
@@ -355,10 +367,12 @@ final class ShutdownSequence {
      * next.</p>
      *
      * @param queryPipeline The pipeline the query endpoint dispatches into, or null
+     * @param wait          How long the budget leaves it, for its threads and its segment
+     *                      searches together
      * @return false if a segment search outlived the wait and is still reading storage
      */
-    private static boolean drainQueryPipeline(QueryPipeline queryPipeline) {
-        if (queryPipeline != null && !queryPipeline.shutdown()) {
+    private static boolean drainQueryPipeline(QueryPipeline queryPipeline, Duration wait) {
+        if (queryPipeline != null && !queryPipeline.shutdown(wait)) {
             LOGGER.error("Segment searches were still running when the node shut down; the "
                 + "storage engine will be left open rather than closed underneath them");
             return false;
@@ -370,19 +384,51 @@ final class ShutdownSequence {
      * Stops the segment workers - integration, warming, compaction, splits, reindex scheduling -
      * and waits for them.
      *
+     * <p>The workers stop one after another, in the order the orchestrator gives, and share the
+     * one wait: each is handed what the ones before it left, so a slow one is given the rest of
+     * the budget's share rather than a fixed wait of its own.</p>
+     *
      * @param wiring What the node is made of
+     * @param wait   How long the budget leaves them, all of them together
      * @return false if a worker outlived the wait and is still writing into storage
      */
-    private static boolean drainIndexOrchestrator(ServerWiring wiring) {
+    private static boolean drainIndexOrchestrator(ServerWiring wiring, Duration wait) {
         IndexOrchestrator orchestrator = wiring.indexOrchestrator();
-        if (!orchestrator.shutdown()) {
+        if (!orchestrator.shutdown(wait)) {
             // Not closed: what close() releases beyond the workers is theirs to finish with.
             LOGGER.error("Segment workers were still running when the node shut down; the "
                 + "storage engine will be left open rather than closed underneath them");
             return false;
         }
-        orchestrator.close();
+        // Everything it waits for has already ended, so this returns without waiting and only
+        // releases what the orchestrator holds beyond the workers.
+        orchestrator.close(wait);
         LOGGER.info("Index orchestrator stopped");
+        return true;
+    }
+
+    /**
+     * Stops the storage engine's own background work - its lifecycle checks and its splits -
+     * and waits for it.
+     *
+     * <p>Among the drains rather than inside the engine's close, which runs after the durable
+     * writes: waited for there, a slow split would spend the reserve the budget keeps for those
+     * writes, and a close has no answer to give about work it could not stop. Waited for here, it
+     * is given what the drains' share has left, and what it leaves running keeps storage open like
+     * any other drain's.</p>
+     *
+     * @param wiring What the node is made of
+     * @param wait   How long the budget leaves it
+     * @return false if a lifecycle check or a split outlived the wait and is still writing into
+     *         storage
+     */
+    private static boolean drainStorageEngine(ServerWiring wiring, Duration wait) {
+        StorageEngine storage = wiring.storageEngine();
+        if (!storage.stopBackgroundWork(wait)) {
+            LOGGER.error("A segment lifecycle check or split was still running when the node shut "
+                + "down; the storage engine will be left open rather than closed underneath it");
+            return false;
+        }
         return true;
     }
 

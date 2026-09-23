@@ -145,22 +145,10 @@ public final class ShutdownBudget {
     }
 
     /**
-     * A step's own wait, cut to what the drains have left.
-     *
-     * @param wanted How long the step would wait on its own
-     * @return The shorter of the two
-     */
-    public Duration bound(Duration wanted) {
-        Objects.requireNonNull(wanted, "wanted cannot be null");
-        Duration left = forDrains();
-        return wanted.compareTo(left) <= 0 ? wanted : left;
-    }
-
-    /**
      * How long the listener may wait for in-flight exchanges, in the whole seconds it takes.
      *
      * <p>Half the drains' share rather than all of it. Requests the listener stops waiting for
-     * are waited for again by the request drain at the end, so its grace is not their only
+     * are waited for again by the request drain that follows, so its grace is not their only
      * chance; the background work drained in between has no second chance, and a listener that
      * spent the whole share would leave every one of them reported as still running. Rounded
      * down, so the listener never waits past what it was given.</p>

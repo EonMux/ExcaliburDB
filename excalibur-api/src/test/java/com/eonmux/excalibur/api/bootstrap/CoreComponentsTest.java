@@ -293,7 +293,7 @@ class CoreComponentsTest {
                 .as("a live worker takes the rewrite, so the segment really is handled")
                 .isTrue();
 
-            worker.stop();
+            worker.stop(java.time.Duration.ofSeconds(10));
 
             assertThat(callback.onCompactionNeeded(segmentId))
                 .as("a stopped worker rewrites nothing, and the manager must not record it as handled")
