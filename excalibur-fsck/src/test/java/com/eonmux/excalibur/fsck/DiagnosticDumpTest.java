@@ -76,7 +76,7 @@ class DiagnosticDumpTest {
         DataDirectoryFixture.createStore(dataDir, 8);
         writeDump(dataDir, DUMP);
 
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
 
         FileCheck dump = scan.files().stream()
             .filter(file -> file.relative().equals(DUMP)).findFirst().orElseThrow();
@@ -96,8 +96,8 @@ class DiagnosticDumpTest {
         DataDirectoryFixture.createStore(without, 8);
         writeDump(withDump, DUMP);
 
-        assertThat(new DataDirectoryScanner(withDump, null).scan().hasUnverified())
-            .isEqualTo(new DataDirectoryScanner(without, null).scan().hasUnverified());
+        assertThat(new DataDirectoryScanner(withDump).scan().hasUnverified())
+            .isEqualTo(new DataDirectoryScanner(without).scan().hasUnverified());
     }
 
     @Test
@@ -145,7 +145,7 @@ class DiagnosticDumpTest {
         Path dataDir = Files.createDirectories(tempDir.resolve("data"));
         writeDump(dataDir, DUMP);
 
-        var plan = RepairPlanner.plan(new DataDirectoryScanner(dataDir, null).scan());
+        var plan = RepairPlanner.plan(new DataDirectoryScanner(dataDir).scan());
 
         assertThat(plan.actions()).isEmpty();
         assertThat(plan.needsOperator()).isEmpty();

@@ -288,7 +288,7 @@ class ExcaliburFsckTest {
             .contains("--quarantine-dir");
         assertThat(repair.out()).as("nothing was checked, so nothing is reported").isEmpty();
         assertThat(check.exitCode())
-            .as("a check skips the quarantine, so one inside would hide files from it")
+            .as("a check rehearses the repair, so it refuses the same command line")
             .isEqualTo(FsckExit.USAGE);
         assertThat(Files.exists(damaged)).isTrue();
         assertThat(DataDirectoryFixture.fingerprint(dataDir))

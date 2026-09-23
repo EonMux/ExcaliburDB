@@ -82,7 +82,7 @@ class SegmentSlotCheckTest {
         String name = segment.getFileName().toString();
 
         FileCheck check = SegmentDataCheck.check(segment, name);
-        RepairPlan plan = RepairPlanner.plan(new DataDirectoryScanner(dataDir, null).scan());
+        RepairPlan plan = RepairPlanner.plan(new DataDirectoryScanner(dataDir).scan());
 
         assertThat(check.status()).isEqualTo(CheckStatus.CORRUPT);
         assertThat(check.detail())
@@ -114,7 +114,7 @@ class SegmentSlotCheckTest {
         flipFirstOccupiedSlotKeyHash(segment);
         String name = segment.getFileName().toString();
 
-        RepairPlan plan = RepairPlanner.plan(new DataDirectoryScanner(dataDir, null).scan());
+        RepairPlan plan = RepairPlanner.plan(new DataDirectoryScanner(dataDir).scan());
 
         assertThat(plan.actions())
             .describedAs("neither side of a slot/entry disagreement can be shown right")
@@ -129,7 +129,7 @@ class SegmentSlotCheckTest {
         Path segment = DataDirectoryFixture.flipPayloadByteInSomeSegment(dataDir);
         String name = segment.getFileName().toString();
 
-        RepairPlan plan = RepairPlanner.plan(new DataDirectoryScanner(dataDir, null).scan());
+        RepairPlan plan = RepairPlanner.plan(new DataDirectoryScanner(dataDir).scan());
 
         assertThat(plan.actions())
             .describedAs("a record that has lost data is the case quarantine is for")

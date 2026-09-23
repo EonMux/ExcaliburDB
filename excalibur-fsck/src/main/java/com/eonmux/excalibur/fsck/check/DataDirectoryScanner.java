@@ -28,18 +28,17 @@ import java.util.Objects;
 public final class DataDirectoryScanner {
 
     private final Path dataDirectory;
-    private final Path quarantineDirectory;
 
     /**
      * Prepares a scan of one directory.
      *
-     * @param dataDirectory       The directory to survey
-     * @param quarantineDirectory A directory to skip, or null; quarantined files are
-     *                            evidence set aside, not state to be re-reported
+     * <p>Nothing inside the directory is skipped: the quarantine is refused anywhere within
+     * it, so every file here is state the node reads.</p>
+     *
+     * @param dataDirectory The directory to survey
      */
-    public DataDirectoryScanner(Path dataDirectory, Path quarantineDirectory) {
+    public DataDirectoryScanner(Path dataDirectory) {
         this.dataDirectory = Objects.requireNonNull(dataDirectory, "dataDirectory");
-        this.quarantineDirectory = quarantineDirectory;
     }
 
     /**
@@ -90,7 +89,7 @@ public final class DataDirectoryScanner {
     }
 
     /**
-     * Lists every regular file under the data directory, skipping quarantine.
+     * Lists every regular file under the data directory.
      *
      * @return The files, in walk order
      * @throws IOException if the tree cannot be walked
@@ -99,23 +98,11 @@ public final class DataDirectoryScanner {
         List<Path> files = new ArrayList<>();
         try (var stream = Files.walk(dataDirectory)) {
             for (Path path : stream.toList()) {
-                if (Files.isRegularFile(path) && !isQuarantined(path)) {
+                if (Files.isRegularFile(path)) {
                     files.add(path);
                 }
             }
         }
         return files;
-    }
-
-    /**
-     * Reports whether a path lies inside the quarantine directory.
-     *
-     * @param path The path
-     * @return true if it has been set aside already
-     */
-    private boolean isQuarantined(Path path) {
-        return quarantineDirectory != null
-            && path.toAbsolutePath().normalize()
-                .startsWith(quarantineDirectory.toAbsolutePath().normalize());
     }
 }

@@ -56,7 +56,7 @@ class SourceStatusCheckTest {
     void aWholeFileIsProvenWholeButNotVerified(@TempDir Path dataDir) throws IOException {
         Files.writeString(dataDir.resolve("source-status"), WHOLE);
 
-        FileCheck check = verdictOn(new DataDirectoryScanner(dataDir, null).scan());
+        FileCheck check = verdictOn(new DataDirectoryScanner(dataDir).scan());
 
         assertThat(check.status()).as(check.detail()).isEqualTo(CheckStatus.LEGACY_UNPROTECTED);
         assertThat(check.version()).isEqualTo("v1");
@@ -69,7 +69,7 @@ class SourceStatusCheckTest {
         Files.writeString(dataDir.resolve("source-status"),
             "\\#source-status|1\ndocs|idle|1.0|420|0|7|1730000000000\n\\#end|2\n");
 
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
         FileCheck check = verdictOn(scan);
 
         assertThat(check.status()).isEqualTo(CheckStatus.CORRUPT);

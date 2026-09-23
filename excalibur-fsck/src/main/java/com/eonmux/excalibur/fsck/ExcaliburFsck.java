@@ -86,10 +86,11 @@ public final class ExcaliburFsck {
      * Refuses a quarantine that lies inside the data directory, once links are followed.
      *
      * <p>Refused for a check as well as a repair. A repair would move damaged files to a place
-     * still inside the directory it is repairing; a check skips the quarantine's subtree, so
-     * one inside the data directory hides whatever lives under it from the check. Either way
-     * the answer would be about a different directory than the one asked about. A usage error,
-     * since the command line is what has to change.</p>
+     * still inside the directory it is repairing, where the next check reports them again and
+     * the next backup carries them along. A check writes nothing there, but it is how a repair
+     * is rehearsed: accepting the option on a check would pass the very command line that goes
+     * wrong once {@code --repair} is added. A usage error, since the command line is what has
+     * to change.</p>
      *
      * @param options What was asked for
      * @param err     Where the refusal is written
@@ -145,8 +146,7 @@ public final class ExcaliburFsck {
     private static int execute(FsckOptions options, PrintStream out, PrintStream err) {
         DataDirectoryScan scan;
         try {
-            scan = new DataDirectoryScanner(
-                options.dataDirectory(), options.quarantineDirectory()).scan();
+            scan = new DataDirectoryScanner(options.dataDirectory()).scan();
         } catch (IOException | RuntimeException e) {
             err.println("The data directory " + options.dataDirectory()
                 + " could not be surveyed, so nothing is known about it: " + e);

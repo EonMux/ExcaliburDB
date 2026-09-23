@@ -11,9 +11,8 @@ import java.util.Deque;
  * Where a quarantine directory really is, and whether that is inside the data directory.
  *
  * <p>A quarantine inside the data directory defeats the point of one. The files moved there are
- * still in the directory being checked, so the next check reports them again - or, because the
- * scan skips the quarantine, stops reporting whatever else lives under it - and the next backup,
- * disk-usage alarm and recursive copy all carry the damaged files along. So the question has to
+ * still in the directory being checked, so the next check reports them again, and the next
+ * backup, disk-usage alarm and recursive copy all carry the damaged files along. So the question has to
  * be answered about the directory the files would actually land in, not about how its path is
  * spelled: a path that reads as a sibling can reach the data directory through a symbolic link,
  * and a {@code ..} after a link climbs from where the link points, not from where it sits.</p>

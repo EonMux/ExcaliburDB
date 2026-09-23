@@ -58,7 +58,7 @@ class SegmentNewerFormatCheckTest {
         restampVersion(segment, NEWER);
         String name = segment.getFileName().toString();
 
-        RepairPlan plan = RepairPlanner.plan(new DataDirectoryScanner(dataDir, null).scan());
+        RepairPlan plan = RepairPlanner.plan(new DataDirectoryScanner(dataDir).scan());
 
         assertThat(plan.actions())
             .describedAs("a sound file this build cannot read is not damage to repair")

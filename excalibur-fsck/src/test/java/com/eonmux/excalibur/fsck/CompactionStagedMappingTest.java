@@ -110,7 +110,7 @@ class CompactionStagedMappingTest {
         Files.write(dataDir.resolve(COMPACTED_GRAPH), new byte[256]);
         writeMapping(dataDir.resolve(STAGED_MAPPING));
 
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
 
         FileCheck staged = verdictOn(scan, STAGED_MAPPING);
         assertThat(staged.status())
@@ -141,7 +141,7 @@ class CompactionStagedMappingTest {
         DataDirectoryFixture.createStore(dataDir, 8);
         writeMapping(dataDir.resolve(STAGED_MAPPING));
 
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
 
         FileCheck staged = verdictOn(scan, STAGED_MAPPING);
         assertThat(staged.status()).as(staged.detail()).isEqualTo(CheckStatus.INTACT);
@@ -177,7 +177,7 @@ class CompactionStagedMappingTest {
         DataDirectoryFixture.createStore(dataDir, 8);
         Files.write(dataDir.resolve(STAGED_MAPPING), new byte[64]);
 
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
         FileCheck staged = verdictOn(scan, STAGED_MAPPING);
         assertThat(staged.status()).isEqualTo(CheckStatus.CORRUPT);
         assertThat(staged.needsOperator()).isTrue();
@@ -202,7 +202,7 @@ class CompactionStagedMappingTest {
         String orphan = "segment_9001.hnsw.compact.docmap";
         writeMapping(dataDir.resolve(orphan));
 
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
 
         assertThat(findingKindsFor(scan, orphan)).containsExactly("index-without-segment");
         assertThat(RepairPlanner.plan(scan).actions()).anySatisfy(action -> {

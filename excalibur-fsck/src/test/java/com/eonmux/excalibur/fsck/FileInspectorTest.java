@@ -38,7 +38,7 @@ class FileInspectorTest {
         Path dataDir = tempDir.resolve("data");
         DataDirectoryFixture.createStore(dataDir, 16);
 
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
 
         assertThat(scan.files()).isNotEmpty();
         for (FileCheck surveyed : scan.files()) {
@@ -118,7 +118,7 @@ class FileInspectorTest {
         Files.createDirectories(dataDir.resolve(FileClassifier.LEXICAL_STORE_DIRECTORY)
             .resolve(".compact-0"));
 
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
 
         assertThat(FileInspector.lexicalStore(dataDir))
             .as("a node that started and stopped without ingesting leaves exactly this")
@@ -176,7 +176,7 @@ class FileInspectorTest {
         Files.writeString(store.resolve("manifest"), "excalibur-lexical-store v2\n#end\t0\n");
         Files.writeString(store.resolve("seg-0.keys"), "doc-1\n");
 
-        List<FileCheck> lexical = new DataDirectoryScanner(dataDir, null).scan().files()
+        List<FileCheck> lexical = new DataDirectoryScanner(dataDir).scan().files()
             .stream().filter(file -> file.relative().startsWith("chunk-index/")).toList();
 
         assertThat(lexical).extracting(FileCheck::relative)

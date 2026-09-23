@@ -79,7 +79,7 @@ class LexicalSegmentRepairTest {
             throws IOException {
         Path dataDir = damagedStore(tempDir);
 
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
 
         assertThat(verdictOn(scan, SEGMENT).status()).isEqualTo(CheckStatus.CORRUPT);
         assertThat(verdictOn(scan, SEGMENT).detail()).contains("post.dat");
@@ -116,7 +116,7 @@ class LexicalSegmentRepairTest {
         lines.remove(1);
         Files.write(manifest, lines);
 
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
 
         assertThat(verdictOn(scan, "chunk-index/manifest").status())
             .isEqualTo(CheckStatus.CORRUPT);

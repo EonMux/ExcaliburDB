@@ -168,7 +168,7 @@ class TermSketchCheckTest {
                 .isTrue();
             assertThat(check.detail()).doesNotContain("not counted as damage");
 
-            DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+            DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
             assertThat(verdictOn(scan, relative).status()).isEqualTo(CheckStatus.UNREADABLE);
             assertThat(scan.hasDamage()).isTrue();
             assertThat(scan.rebuiltOnOpenCount()).isZero();
@@ -201,7 +201,7 @@ class TermSketchCheckTest {
         DataDirectoryFixture.createStore(dataDir, 16);
 
         List<Path> sketches = sketches(dataDir);
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
 
         assertThat(sketches).as("a clean close persists each segment's sketch").isNotEmpty();
         for (Path sketch : sketches) {
@@ -224,7 +224,7 @@ class TermSketchCheckTest {
         int strictBefore = invoke(dataDir.toString(), "--strict").exitCode();
         flipLastByte(sketch);
 
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
         assertThat(verdictOn(scan, relative).status()).isEqualTo(CheckStatus.CORRUPT);
         assertThat(scan.hasDamage()).isFalse();
         assertThat(scan.rebuiltOnOpenCount()).isEqualTo(1);
@@ -282,7 +282,7 @@ class TermSketchCheckTest {
         DataDirectoryFixture.createStore(dataDir, 8);
         writeSketch(dataDir.resolve("segment_9001.tfs"));
 
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
 
         assertThat(scan.findings()).filteredOn(f -> f.subject().equals("segment_9001.tfs"))
             .singleElement().satisfies(finding -> {
@@ -303,7 +303,7 @@ class TermSketchCheckTest {
         String staged = "segment_0.tfs.0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11.tmp";
         Files.write(dataDir.resolve(staged), new byte[40]);
 
-        DataDirectoryScan scan = new DataDirectoryScanner(dataDir, null).scan();
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
 
         assertThat(scan.findings()).filteredOn(f -> f.subject().equals(staged))
             .extracting(ConsistencyFinding::kind).containsExactly("staging-leftover");
