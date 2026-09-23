@@ -173,13 +173,12 @@ public class ParallelQueryDispatcher {
      *
      * <p>The dispatcher fans out; it does not decide what to fan out to. Which segments a query
      * may read is settled by {@link com.eonmux.excalibur.query.pipeline.QueryPipeline}'s earlier stages -
-     * visibility, lifecycle state, the Cuckoo filter cascade, LSH pre-filtering - and arrives
+     * visibility, lifecycle state, the Cuckoo filter cascade - and arrives
      * here already chosen, so there is one answer to "was this segment searched" rather than two
      * that can drift apart.</p>
      *
      * @param segmentsToSearch The segments to search, each with the graph to search it in and the
-     *                         node ids a pre-filter narrowed it to, or a null set for a whole-graph
-     *                         search
+     *                         node ids its LSH index named, to measure beside that search
      * @param queryVector The query vector
      * @param options Query options
      * @param distanceFunction The distance function
@@ -199,8 +198,7 @@ public class ParallelQueryDispatcher {
      * Dispatches a query that may be answered from each segment's product quantizer.
      *
      * @param segmentsToSearch The segments to search, each with the graph to search it in and the
-     *                         node ids a pre-filter narrowed it to, or a null set for a whole-graph
-     *                         search
+     *                         node ids its LSH index named, to measure beside that search
      * @param queryVector The query vector
      * @param options Query options
      * @param distanceFunction The distance function
@@ -259,7 +257,7 @@ public class ParallelQueryDispatcher {
      * Builds one search task per segment.
      *
      * @param segmentsToSearch The segments to search, each with the graph to search it in and
-     *                         the node ids a pre-filter narrowed it to
+     *                         the node ids its LSH index named, to measure beside that search
      * @param queryVector The query vector
      * @param options Query options
      * @param distanceFunction The distance function
@@ -436,13 +434,13 @@ public class ParallelQueryDispatcher {
     }
 
     /**
-     * Creates a SegmentInfo carrying the node ids a pre-filter narrowed this segment to.
+     * Creates a SegmentInfo carrying the node ids this segment's LSH index named for the query.
      *
      * @param segmentId The segment ID
      * @param segment The segment instance
      * @param graph The HNSW graph for the segment
-     * @param lshCandidates The node ids the pre-filter named for this segment, or null when no
-     *                      pre-filter ran and the whole graph is to be searched
+     * @param lshCandidates The node ids the index named, to measure beside the graph search, or
+     *                      null when it named none
      * @return A new SegmentInfo instance
      */
     public static SegmentInfo createSegmentInfo(long segmentId, Segment segment, HnswGraph graph,
@@ -451,24 +449,24 @@ public class ParallelQueryDispatcher {
     }
 
     /**
-     * A segment to search, and the node ids a pre-filter has already narrowed it to.
+     * A segment to search, and the node ids its LSH index named for the query.
      *
-     * <p>{@code lshCandidates} is what the LSH stage decided about this particular segment, and it
-     * has to be carried per segment rather than shared: each segment has its own index, its own
-     * probe, and its own node id space. A null set means no pre-filter ran and the whole graph is
-     * to be walked; that is the only reading of "no candidates" that can be acted on, since an
-     * empty set is the pre-filter's way of saying the segment holds nothing worth visiting.</p>
+     * <p>{@code lshCandidates} is what the LSH stage found in this particular segment, and it has
+     * to be carried per segment rather than shared: each segment has its own index, its own probe,
+     * and its own node id space. The whole graph is searched either way; the named nodes are
+     * measured exactly beside that search and ranked in with its results, and a null or empty set
+     * simply adds nothing.</p>
      *
      * @param segmentId The routing index the storage engine holds the segment at
      * @param segment The segment to search
      * @param graph The segment's HNSW graph
-     * @param lshCandidates The node ids the pre-filter named, or null when it did not run
+     * @param lshCandidates The node ids the index named, or null when it named none
      */
     public record SegmentInfo(long segmentId, Segment segment, HnswGraph graph,
                               Set<Long> lshCandidates) {
 
         /**
-         * A segment to search in full, with no pre-filter narrowing it.
+         * A segment to search with no LSH candidates beside its graph search.
          *
          * @param segmentId The routing index the storage engine holds the segment at
          * @param segment The segment to search

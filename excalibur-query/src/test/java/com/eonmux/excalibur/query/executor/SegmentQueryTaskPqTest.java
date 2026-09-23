@@ -33,10 +33,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * nothing asked for and nothing said. With the flag off the task must take the same search it
  * always took.</p>
  *
- * <p>When it is on, two things still rule the quantised pass out. A segment with no trained
- * quantiser has no codes to look up, and a pre-filter's candidate set has no quantised
- * overload to be honoured by - narrowing to it matters more than quantising, because dropping
- * it would search nodes the filter excluded.</p>
+ * <p>When it is on, a segment with no trained quantiser still rules the quantised pass out: it
+ * has no codes to look up. The nodes an LSH index named do not: they are measured beside
+ * whichever search runs, never in place of it.</p>
  */
 @DisplayName("Segment query task, quantised path")
 class SegmentQueryTaskPqTest {
@@ -160,8 +159,8 @@ class SegmentQueryTaskPqTest {
     }
 
     @Test
-    @DisplayName("a pre-filter's candidates outrank the quantised path")
-    void candidatesTakePrecedence() throws Exception {
+    @DisplayName("LSH candidates are measured beside the quantised search, not instead of it")
+    void candidatesSupplementTheQuantisedPath() throws Exception {
         quantise();
 
         SegmentQueryTask.SegmentQueryResult result = new SegmentQueryTask(
@@ -170,10 +169,11 @@ class SegmentQueryTaskPqTest {
 
         assertThat(result.success()).isTrue();
         assertThat(graph.calls)
-            .as("there is no candidate-restricted quantised search; narrowing wins")
-            .containsExactly("searchCandidates");
-        assertThat(result.results()).extracting(HnswSearchResult::nodeId)
-            .isSubsetOf(1L, 2L, 3L);
+            .as("the configured search still runs; the named nodes are measured as well")
+            .containsExactly("rerank:4", "searchCandidates");
+        assertThat(result.results())
+            .as("three named nodes cannot confine a top-5 over a corpus of forty")
+            .hasSize(5);
     }
 
     private void quantise() {

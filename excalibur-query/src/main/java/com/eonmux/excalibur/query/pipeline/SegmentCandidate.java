@@ -84,7 +84,7 @@ public final class SegmentCandidate {
      * @param graph The HNSW graph for the segment
      * @param state The lifecycle state of the segment
      * @param lshIndex The LSH index for the segment (may be null)
-     * @param lshCandidates The set of candidate entry IDs from LSH filtering
+     * @param lshCandidates The node IDs the LSH index named for the query
      */
     private SegmentCandidate(long segmentId, Segment segment, HnswGraph graph,
                              LifecycleState state, LshIndex lshIndex, Set<Long> lshCandidates) {
@@ -142,10 +142,10 @@ public final class SegmentCandidate {
     }
 
     /**
-     * Gets the set of candidate entry IDs from LSH filtering.
+     * Gets the node IDs this segment's LSH index named for the query.
      *
-     * <p>These are the entry IDs that passed LSH pre-filtering for this segment.
-     * This set is populated during Stage 2 of the query pipeline.</p>
+     * <p>Populated during Stage 2 of the query pipeline. Stage 3 measures them beside its
+     * graph search; they add to what the search may return and never restrict it.</p>
      *
      * @return The set of candidate entry IDs (may be empty)
      */
@@ -156,10 +156,10 @@ public final class SegmentCandidate {
     /**
      * Creates a new SegmentCandidate with the specified LSH candidates.
      *
-     * <p>This method is used during Stage 2 (LSH pre-filter) to attach
-     * the set of candidate entry IDs that passed LSH filtering.</p>
+     * <p>This method is used during Stage 2 (LSH candidates) to attach the node IDs the
+     * segment's LSH index named for the query.</p>
      *
-     * @param lshCandidates The set of candidate entry IDs from LSH filtering
+     * @param lshCandidates The node IDs the LSH index named
      * @return A new SegmentCandidate with the LSH candidates
      */
     public SegmentCandidate withLshCandidates(Set<Long> lshCandidates) {
@@ -186,7 +186,7 @@ public final class SegmentCandidate {
     }
 
     /**
-     * Checks if this candidate has LSH pre-filtered candidates.
+     * Checks if this candidate carries node IDs its LSH index named.
      *
      * @return true if LSH candidates are available (non-empty), false otherwise
      */

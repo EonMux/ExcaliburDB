@@ -240,33 +240,81 @@ class SegmentQueryTaskTest {
         }
 
         @Test
-        @DisplayName("an empty candidate set is honoured as a pre-filter that selected nothing")
-        void emptyCandidateSetIsNotAFullSearch() throws Exception {
+        @DisplayName("an empty candidate set adds nothing and restricts nothing")
+        void emptyCandidateSetIsAPlainSearch() throws Exception {
+            // HnswGraph reads an empty candidate set as "nothing is admissible". An LSH index
+            // that named nothing has not said the segment holds nothing, so the task must not
+            // pass that reading on.
             for (int i = 0; i < 5; i++) {
                 graph.insert(vector(i));
             }
 
-            SegmentQueryTask.SegmentQueryResult result = new SegmentQueryTask(
+            SegmentQueryTask.SegmentQueryResult withEmpty = new SegmentQueryTask(
                 SEGMENT_ID, segment, graph, vector(1f), 3, 1, distance, Set.of()).call();
+            SegmentQueryTask.SegmentQueryResult without = new SegmentQueryTask(
+                SEGMENT_ID, segment, graph, vector(1f), 3, 1, distance, null).call();
 
-            assertThat(result.success()).isTrue();
+            assertThat(withEmpty.success()).isTrue();
+            assertThat(withEmpty.results()).extracting(HnswSearchResult::nodeId)
+                .hasSize(3)
+                .containsExactlyElementsOf(without.results().stream()
+                    .map(HnswSearchResult::nodeId).toList());
         }
 
         @Test
-        @DisplayName("a candidate set narrows the search to those nodes")
-        void candidatesConstrainTheSearch() throws Exception {
+        @DisplayName("a candidate set never confines the search to its members")
+        void candidatesDoNotConstrainTheSearch() throws Exception {
+            // An LSH bucket bounds nothing about the distance of what it leaves out, so a
+            // segment holding ten nodes answers a top-10 with ten, whoever the index named.
             List<Long> inserted = new ArrayList<>();
             for (int i = 0; i < 10; i++) {
                 inserted.add(graph.insert(vector(i)));
             }
-            Set<Long> candidates = Set.of(inserted.get(0), inserted.get(1));
+            Set<Long> candidates = Set.of(inserted.get(8), inserted.get(9));
 
             SegmentQueryTask.SegmentQueryResult result = new SegmentQueryTask(
                 SEGMENT_ID, segment, graph, vector(0f), 10, 1, distance, candidates).call();
 
             assertThat(result.success()).isTrue();
-            assertThat(result.results().stream().map(HnswSearchResult::nodeId))
-                .allMatch(candidates::contains);
+            assertThat(result.results()).extracting(HnswSearchResult::nodeId)
+                .containsExactlyInAnyOrderElementsOf(inserted);
+        }
+
+        @Test
+        @DisplayName("a named node the graph search passed over is ranked in by its distance")
+        void aMissedNeighbourNamedByTheIndexIsRecovered() throws Exception {
+            // The graph search is approximate. Stand in for a beam that walked past the true
+            // nearest node, and check the candidate the index named is measured and ranked in
+            // ahead of the farther results the search did return.
+            MissingNearestGraph lossy = new MissingNearestGraph(tempDir.resolve("lossy.hnsw"));
+            try {
+                List<Long> inserted = new ArrayList<>();
+                for (int i = 0; i < 10; i++) {
+                    inserted.add(lossy.insert(vector(i)));
+                }
+                long nearest = inserted.get(0);
+                lossy.hide(nearest);
+
+                SegmentQueryTask.SegmentQueryResult blind = new SegmentQueryTask(
+                    SEGMENT_ID, segment, lossy, vector(0f), 3, 1, distance, null).call();
+                SegmentQueryTask.SegmentQueryResult named = new SegmentQueryTask(
+                    SEGMENT_ID, segment, lossy, vector(0f), 3, 1, distance, Set.of(nearest)).call();
+
+                assertThat(blind.results()).extracting(HnswSearchResult::nodeId)
+                    .as("the fixture's graph search misses the nearest node")
+                    .doesNotContain(nearest);
+                assertThat(named.results()).hasSize(3);
+                assertThat(named.results().get(0).nodeId())
+                    .as("the named node is the closest, so it leads the answer")
+                    .isEqualTo(nearest);
+                assertThat(named.results().subList(1, 3))
+                    .extracting(HnswSearchResult::nodeId)
+                    .as("and it displaces only the farthest of what the search found")
+                    .containsExactlyElementsOf(blind.results().subList(0, 2).stream()
+                        .map(HnswSearchResult::nodeId).toList());
+            } finally {
+                lossy.close();
+            }
         }
 
         @Test
@@ -416,6 +464,30 @@ class SegmentQueryTaskTest {
             assertThat(result.success())
                 .as("still a success: its results are kept and merged")
                 .isTrue();
+        }
+    }
+
+    /**
+     * A graph whose unrestricted search walks past one node, as an approximate beam can.
+     */
+    private static final class MissingNearestGraph extends HnswGraph {
+
+        private long hidden = -1;
+
+        MissingNearestGraph(Path path) throws IOException {
+            super(path, HnswConfig.create(DIMENSION), CosineSimilarity.getInstance(), 1_000);
+        }
+
+        void hide(long nodeId) {
+            hidden = nodeId;
+        }
+
+        @Override
+        public List<HnswSearchResult> search(float[] query, int k) {
+            return super.search(query, k + 1).stream()
+                .filter(result -> result.nodeId() != hidden)
+                .limit(k)
+                .toList();
         }
     }
 }

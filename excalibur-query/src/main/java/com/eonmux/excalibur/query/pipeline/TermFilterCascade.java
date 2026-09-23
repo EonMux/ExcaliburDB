@@ -107,9 +107,8 @@ final class TermFilterCascade {
         // level that ran out of room refused terms it was asked to record, so it holds some of a
         // segment and reads as though it held all of it. Reading either silence as "this term
         // is in no segment" makes queries return zero results for documents sitting in storage.
-        // Nothing errors; the database simply answers that it knows nothing. This is the same
-        // rule stage 2 already applies to an LSH index that does not cover its segment: an
-        // index that cannot speak for a segment has no verdict to give.
+        // Nothing errors; the database simply answers that it knows nothing. An index that
+        // cannot speak for a segment has no verdict to give.
         List<SegmentCandidate> passed = context.candidates.stream()
             .filter(c -> survivesTermFilter(hierarchicalFilter, c.segmentId(), matches.segmentIds(),
                 coveredBefore.getOrDefault(c.segmentId(), HierarchicalCuckooFilter.NOT_COVERED)))

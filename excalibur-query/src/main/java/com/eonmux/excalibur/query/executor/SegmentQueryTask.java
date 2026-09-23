@@ -80,12 +80,12 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
     }
 
     /**
-     * Creates a new SegmentQueryTask with LSH pre-filtered candidates.
+     * Creates a new SegmentQueryTask with the nodes an LSH index named for the query.
      *
-     * <p>This constructor allows passing a set of LSH pre-filtered candidate
-     * node IDs to constrain the HNSW search. When LSH candidates are provided,
-     * the HNSW search only considers those specific nodes rather than searching
-     * the entire graph.</p>
+     * <p>The named nodes are measured exactly and ranked together with what the graph search
+     * returns. They add to the pool the answer is drawn from and never restrict it: an LSH bucket
+     * puts no bound on the distance of what it leaves out, so confining the search to it would
+     * drop neighbours the graph would have found.</p>
      *
      * @param segmentId The segment identifier
      * @param segment The segment to search
@@ -94,7 +94,8 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
      * @param k The number of results to retrieve
      * @param oversamplingFactor The oversampling factor for HNSW search
      * @param distanceFunction The distance function
-     * @param lshCandidates The set of LSH pre-filtered candidate node IDs (may be null or empty)
+     * @param lshCandidates The node IDs an LSH index named for the query, to measure beside the
+     *                      graph search (may be null or empty)
      * @throws NullPointerException if any required parameter is null
      * @throws IllegalArgumentException if k is not positive
      */
@@ -115,10 +116,9 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
     /**
      * Creates a new SegmentQueryTask that may search the segment through its quantizer.
      *
-     * <p>The quantised search is taken only when this deployment asked for it, the segment has
-     * a trained quantizer, and no pre-filter narrowed the search - {@link HnswGraph} has no
-     * candidate-restricted quantised search, and honouring the candidate set matters more,
-     * since ignoring it would search nodes the pre-filter ruled out.</p>
+     * <p>The quantised search is taken only when this deployment asked for it and the segment
+     * has a trained quantizer. It rescores what it finds on full-precision vectors, so its
+     * distances rank against the exactly-measured LSH candidates and the tail scan's hits.</p>
      *
      * @param segmentId The segment identifier
      * @param segment The segment to search
@@ -127,7 +127,8 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
      * @param k The number of results to retrieve
      * @param oversamplingFactor The oversampling factor for HNSW search
      * @param distanceFunction The distance function
-     * @param lshCandidates The set of LSH pre-filtered candidate node IDs (may be null or empty)
+     * @param lshCandidates The node IDs an LSH index named for the query, to measure beside the
+     *                      graph search (may be null or empty)
      * @param pqSearch Whether this search may use the segment's quantizer, and how widely
      * @throws NullPointerException if any required parameter is null
      * @throws IllegalArgumentException if k is not positive
@@ -352,24 +353,36 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
     }
 
     /**
-     * Searches the segment's graph the way this task is configured to.
+     * Searches the segment's graph, and measures the nodes its LSH index named beside it.
      *
-     * <p>A pre-filter's candidate set comes first: it names the only nodes this query may be
-     * answered from, and there is no candidate-restricted quantised search to honour it with.
-     * The set is consulted only when it holds something -
-     * {@code HnswGraph.search(query, k, emptySet)} means "nothing is admissible" and returns
-     * nothing, which is not what "no pre-filter ran" means.</p>
+     * <p>The two are ranked together by exact distance and cut to {@code searchK}. A named node
+     * enters that cut only by being closer than a result the graph search returned, so the
+     * answer is never worse than the graph search's alone; it is better wherever the search's
+     * beam passed over a near neighbour the query's buckets caught.</p>
+     *
+     * @param searchK The oversampled number of results to ask the graph for
+     * @return What the graph returned, with any closer named node ranked in, closest first
+     */
+    private List<HnswSearchResult> searchGraph(int searchK) {
+        List<HnswSearchResult> walked = walkGraph(searchK);
+        if (lshCandidates.isEmpty()) {
+            return walked;
+        }
+        // HnswGraph.search(query, k, emptySet) means "nothing is admissible", so the named set
+        // is consulted only when it holds something.
+        List<HnswSearchResult> named = graph.search(queryVector, searchK, lshCandidates);
+        LOGGER.trace("Segment {}: {} LSH candidates measured, {} ranked beside {} graph results",
+            segmentId, lshCandidates.size(), named.size(), walked.size());
+        return mergeResults(walked, named, searchK);
+    }
+
+    /**
+     * Runs the graph search this task is configured for, over the whole graph.
      *
      * @param searchK The oversampled number of results to ask the graph for
      * @return What the graph returned, closest first
      */
-    private List<HnswSearchResult> searchGraph(int searchK) {
-        if (!lshCandidates.isEmpty()) {
-            List<HnswSearchResult> results = graph.search(queryVector, searchK, lshCandidates);
-            LOGGER.trace("Segment {}: HNSW search with {} LSH candidates returned {} results",
-                segmentId, lshCandidates.size(), results.size());
-            return results;
-        }
+    private List<HnswSearchResult> walkGraph(int searchK) {
         if (quantisedSearchApplies()) {
             List<HnswSearchResult> results =
                 graph.searchWithPQThenRerank(queryVector, searchK, pqSearch.oversample());
@@ -378,8 +391,7 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
             return results;
         }
         List<HnswSearchResult> results = graph.search(queryVector, searchK);
-        LOGGER.trace("Segment {}: HNSW search (full) returned {} results",
-            segmentId, results.size());
+        LOGGER.trace("Segment {}: HNSW search returned {} results", segmentId, results.size());
         return results;
     }
 
@@ -407,9 +419,10 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
     }
 
     /**
-     * Merges HNSW and tail scan results, removing duplicates.
+     * Merges two ranked result lists, removing duplicates.
      *
-     * <p>Both inputs carry {@link HnswSearchResult#distance()}, a dissimilarity where
+     * <p>Used for the graph search against the LSH candidates, and for the graph's answer
+     * against the tail scan's. Both inputs carry {@link HnswSearchResult#distance()}, a dissimilarity where
      * smaller is closer for every metric, so a single ascending sort ranks them
      * correctly against each other.</p>
      */
