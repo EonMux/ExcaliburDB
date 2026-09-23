@@ -29,6 +29,9 @@ import static org.mockito.Mockito.when;
  */
 class ReindexEndpointTest {
 
+    /** Far longer than any run here takes to act on its stop. */
+    private static final java.time.Duration DRAIN_WAIT = java.time.Duration.ofSeconds(10);
+
     private InMemorySourceRegistry sourceRegistry;
     private ReindexEndpoint.InMemoryReindexStatusRegistry statusRegistry;
 
@@ -355,8 +358,8 @@ class ReindexEndpointTest {
                 org.mockito.Mockito.mock(com.eonmux.excalibur.ingest.source.SourceResolver.class),
                 null, null, new com.eonmux.excalibur.api.reindex.ReindexCoordinator(), null);
 
-            assertThat(endpoint.drain()).isTrue();
-            assertThat(endpoint.drain()).as("a second drain has nothing left to wait for").isTrue();
+            assertThat(endpoint.drain(DRAIN_WAIT)).isTrue();
+            assertThat(endpoint.drain(DRAIN_WAIT)).as("a second drain has nothing left to wait for").isTrue();
         }
 
         /**
@@ -379,7 +382,33 @@ class ReindexEndpointTest {
             assertThat(run.finished.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
             assertThat(run.sawStop).as("the run read its stop request").isTrue();
             assertThat(run.interrupted).as("the run's thread was never interrupted").isFalse();
-            assertThat(endpoint.drain()).isTrue();
+            assertThat(endpoint.drain(DRAIN_WAIT)).isTrue();
+        }
+
+        @Test
+        @DisplayName("a drain waits out the whole of the wait it is given before reporting a run")
+        void aDrainWaitsAsLongAsItIsGiven() throws Exception {
+            BlockingRun run = new BlockingRun(true);
+            ReindexEndpoint endpoint = run.endpoint();
+            endpoint.handle(exchange("POST", "{\"source_id\": \"docs\"}",
+                new java.io.ByteArrayOutputStream()));
+            assertThat(run.started.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            java.time.Duration wait = java.time.Duration.ofMillis(300);
+
+            long began = System.nanoTime();
+            try {
+                assertThat(endpoint.drain(wait))
+                    .as("the run is still acting on its stop")
+                    .isFalse();
+                assertThat(java.time.Duration.ofNanos(System.nanoTime() - began))
+                    .as("the drain gave the run all of the wait it was handed")
+                    .isGreaterThanOrEqualTo(wait);
+            } finally {
+                run.release.countDown();
+            }
+            assertThat(endpoint.drain(DRAIN_WAIT))
+                .as("given longer, the drain sees the run end")
+                .isTrue();
         }
 
         @Test
@@ -391,7 +420,7 @@ class ReindexEndpointTest {
                 new java.io.ByteArrayOutputStream()));
             assertThat(run.started.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
 
-            assertThat(endpoint.drain())
+            assertThat(endpoint.drain(DRAIN_WAIT))
                 .as("the run ended within the drain, so nothing is left writing to storage")
                 .isTrue();
             assertThat(run.sawStop).isTrue();
@@ -429,7 +458,7 @@ class ReindexEndpointTest {
                         // The drain closes the executor and then waits for this request's
                         // claim, so once it is waiting the executor is certainly closed.
                         Thread thread = Thread.ofPlatform().start(
-                            () -> drained.set(endpoint.get().drain()));
+                            () -> drained.set(endpoint.get().drain(DRAIN_WAIT)));
                         drainer.set(thread);
                         long deadline = System.nanoTime()
                             + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
@@ -487,7 +516,7 @@ class ReindexEndpointTest {
             assertThat(statusRegistry.getStatus("docs"))
                 .as("the stopped run's status went with its source")
                 .isNull();
-            assertThat(endpoint.drain()).isTrue();
+            assertThat(endpoint.drain(DRAIN_WAIT)).isTrue();
         }
 
         /**
@@ -556,6 +585,18 @@ class ReindexEndpointTest {
      * A reindex of {@code docs} that runs until it is asked to stop, recording how it was asked.
      */
     private final class BlockingRun {
+        /** Holds a run that has read its stop, when it is one that is slow to act on it. */
+        final java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        private final boolean slowToStop;
+
+        BlockingRun() {
+            this(false);
+        }
+
+        BlockingRun(boolean slowToStop) {
+            this.slowToStop = slowToStop;
+        }
+
         final java.util.concurrent.CountDownLatch started = new java.util.concurrent.CountDownLatch(1);
         final java.util.concurrent.CountDownLatch finished = new java.util.concurrent.CountDownLatch(1);
         final java.util.concurrent.atomic.AtomicBoolean sawStop =
@@ -587,6 +628,9 @@ class ReindexEndpointTest {
                         }
                         sawStop.set(stop.isRequested());
                         interrupted.set(Thread.currentThread().isInterrupted());
+                        if (slowToStop) {
+                            release.await(30, java.util.concurrent.TimeUnit.SECONDS);
+                        }
                     } finally {
                         finished.countDown();
                     }

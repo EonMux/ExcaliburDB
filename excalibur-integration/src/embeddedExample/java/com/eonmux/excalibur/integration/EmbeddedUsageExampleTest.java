@@ -34,6 +34,7 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -213,7 +214,7 @@ class EmbeddedUsageExampleTest {
                 } finally {
                     // Stop taking work before the storage underneath it closes.
                     pipeline.shutdown();
-                    ingestion.shutdown();
+                    ingestion.shutdown(Duration.ofSeconds(30));
                 }
             }
         }

@@ -129,8 +129,8 @@ public final class GraphTenants implements AutoCloseable {
      */
     static final int MAX_REOPENS_PER_SWEEP = 4;
 
-    /** How long close() waits for a sweep in flight, which may be inside a compaction. */
-    private static final long SHUTDOWN_WAIT_SECONDS = 30L;
+    /** What {@link #close()} waits for: a sweep in flight, for as long as it takes to stop. */
+    private static final Duration UNTIL_STOPPED = Duration.ofNanos(Long.MAX_VALUE);
 
     private final Path root;
     private final NamespaceRegistry<GraphTenant> registry;
@@ -1375,35 +1375,40 @@ public final class GraphTenants implements AutoCloseable {
      * the close. It is asked to stop between namespaces rather than interrupted, for the reason
      * {@link #closing} gives, so a compaction already under way is finished.</p>
      *
-     * @throws IllegalStateException if the sweep is still compacting when the wait runs out; the
-     *                               tenants are then left open rather than closed under it, and
-     *                               the failure is what tells the shutdown it did not finish
+     * <p>Waits for as long as the sweep takes to stop, for an owner with no deadline - the way
+     * {@code ExecutorService.close} waits. A node's shutdown uses {@link #close(Duration)}.</p>
+     *
+     * @throws IllegalStateException if the wait is interrupted while the sweep is still
+     *                               compacting; the tenants are then left open rather than
+     *                               closed under it
      */
     @Override
     public void close() {
-        close(Duration.ofSeconds(SHUTDOWN_WAIT_SECONDS));
+        close(UNTIL_STOPPED);
     }
 
     /**
-     * As {@link #close()}, waiting for the sweep no longer than {@code sweepWait} - for a
-     * shutdown whose budget has less left than the sweep's own wait.
+     * As {@link #close()}, waiting for the sweep no longer than {@code sweepWait}.
+     *
+     * <p>How long is the caller's: a node's shutdown passes what its budget has left, so a
+     * longer budget is a longer wait. A sweep stops at its next namespace boundary, so a stopped
+     * one needs about one namespace's compaction.</p>
      *
      * @param sweepWait How long to wait for a sweep in flight to reach its next boundary
-     * @throws IllegalStateException if the sweep is still compacting when the wait runs out
+     * @throws IllegalStateException if the sweep is still compacting when the wait runs out; the
+     *                               tenants are then left open rather than closed under it, and
+     *                               the failure is what tells the shutdown it did not finish
      * @throws NullPointerException  if sweepWait is null
      */
     public void close(Duration sweepWait) {
         Objects.requireNonNull(sweepWait, "sweepWait must not be null");
-        Duration wait = sweepWait.compareTo(Duration.ofSeconds(SHUTDOWN_WAIT_SECONDS)) < 0
-            ? sweepWait
-            : Duration.ofSeconds(SHUTDOWN_WAIT_SECONDS);
         closing = true;
         // shutdown, not shutdownNow: the periodic task is cancelled and a sweep in progress
         // runs to its next namespace boundary uninterrupted.
         erasureSweep.shutdown();
         boolean sweepEnded;
         try {
-            sweepEnded = erasureSweep.awaitTermination(wait.toMillis(), TimeUnit.MILLISECONDS);
+            sweepEnded = erasureSweep.awaitTermination(sweepWait.toNanos(), TimeUnit.NANOSECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             sweepEnded = erasureSweep.isTerminated();
@@ -1411,7 +1416,8 @@ public final class GraphTenants implements AutoCloseable {
         if (!sweepEnded) {
             LOGGER.error("the graph erasure sweep was still compacting {}ms after being asked to "
                 + "stop; the graph tenants are left open rather than closed under it",
-                wait.toMillis());
+                sweepWait.toMillis());
+
             throw new IllegalStateException("left the graph tenants open: the erasure sweep is "
                 + "still compacting a namespace");
         }

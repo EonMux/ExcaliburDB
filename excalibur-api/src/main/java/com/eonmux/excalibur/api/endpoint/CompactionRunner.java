@@ -41,7 +41,7 @@ import java.util.function.BooleanSupplier;
  * store reads before each segment and between graphs, and the chunk index between segment groups
  * and between chunks. What a stop costs is the run's own unfinished work: a rewrite builds its
  * replacement beside the original and swaps it in only at the end. A cancel sends that signal,
- * and so does {@link #drain()}: a rewrite can outlast any shutdown budget, and one still reading
+ * and so does {@link #drain(Duration)}: a rewrite can outlast any shutdown budget, and one still reading
  * when the storage engine closes is reading memory that is no longer mapped.</p>
  *
  * <p>The chunk index is rewritten on a thread of its own, so the run's wait for it can be
@@ -72,17 +72,8 @@ public final class CompactionRunner implements AutoCloseable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(CompactionRunner.class);
 
-    /**
-     * How long {@link #drain()} waits for a run it has asked to stop.
-     *
-     * <p>The same budget the reindex drain uses, because it is the same class of work: a
-     * rewrite of the served data that cannot be abandoned cheaply. The segment store's half
-     * reads the stop before each segment, so this bounds one segment's rewrite.</p>
-     */
-    private static final long SHUTDOWN_TIMEOUT_SECONDS = 60;
-
-    /** How long {@link #drain()} then waits for the chunk index's rewrite to end. */
-    private static final long LEXICAL_TIMEOUT_SECONDS = 30;
+    /** What {@link #close()} waits for: a run it asked to stop, for as long as that takes. */
+    private static final Duration UNTIL_STOPPED = Duration.ofNanos(Long.MAX_VALUE);
 
     /** No run has been asked for since this node started. */
     public static final String STATE_IDLE = "idle";
@@ -151,7 +142,7 @@ public final class CompactionRunner implements AutoCloseable {
         /**
          * Whether this compaction reads chunk text back out of the storage engine.
          *
-         * <p>What {@link #drain()} needs to know about a rewrite that outlived it: one that
+         * <p>What {@link #drain(Duration)} needs to know about a rewrite that outlived it: one that
          * reads storage keeps the storage engine and its arena open, and one that rewrites from
          * its own copy of the text keeps only the chunk index open. True unless told otherwise,
          * because the wrong answer in that direction closes storage under a running read.</p>
@@ -293,12 +284,6 @@ public final class CompactionRunner implements AutoCloseable {
      */
     private final Runnable afterSettle;
 
-    /** How long a drain waits for a run it has asked to stop. */
-    private final Duration stopWait;
-
-    /** How long a drain waits for the chunk index's rewrite once the run's wait is over. */
-    private final Duration lexicalWait;
-
     /** Guards {@link #current} and every write of {@link #snapshot}. */
     private final Object lock = new Object();
 
@@ -373,31 +358,9 @@ public final class CompactionRunner implements AutoCloseable {
      */
     CompactionRunner(Compactor compactor, LexicalCompactor lexicalCompactor,
                      Runnable afterSettle) {
-        this(compactor, lexicalCompactor, afterSettle,
-            Duration.ofSeconds(SHUTDOWN_TIMEOUT_SECONDS),
-            Duration.ofSeconds(LEXICAL_TIMEOUT_SECONDS));
-    }
-
-    /**
-     * Creates a runner whose drain waits the given budgets rather than the shutdown defaults.
-     *
-     * <p>For a test of what a drain reports about a run that outlives it, which would otherwise
-     * have to outwait the production budgets.</p>
-     *
-     * @param compactor        What a run does to the segment store and its graphs
-     * @param lexicalCompactor What a run does to the chunk index, or null when there is none
-     * @param afterSettle      Runs on the worker once a run has settled
-     * @param stopWait         How long a drain waits for a run asked to stop
-     * @param lexicalWait      How long a drain then waits for the chunk index's rewrite
-     * @throws NullPointerException if compactor, afterSettle or either wait is null
-     */
-    CompactionRunner(Compactor compactor, LexicalCompactor lexicalCompactor,
-                     Runnable afterSettle, Duration stopWait, Duration lexicalWait) {
         this.compactor = Objects.requireNonNull(compactor, "compactor cannot be null");
         this.lexicalCompactor = lexicalCompactor;
         this.afterSettle = Objects.requireNonNull(afterSettle, "afterSettle cannot be null");
-        this.stopWait = Objects.requireNonNull(stopWait, "stopWait cannot be null");
-        this.lexicalWait = Objects.requireNonNull(lexicalWait, "lexicalWait cannot be null");
         this.executor = daemonExecutor("compaction-on-demand");
         this.lexicalExecutor = lexicalCompactor != null
             ? daemonExecutor("compaction-on-demand-lexical")
@@ -672,9 +635,17 @@ public final class CompactionRunner implements AutoCloseable {
      * index rewrite that reads text back out of storage, holds storage; any chunk index rewrite
      * still running holds the chunk index.</p>
      *
+     * <p>One wait covers both halves, because the caller's budget does: a node's shutdown
+     * passes what its budget leaves the drains, and the chunk index gets whatever the segment
+     * store's half did not use. The segment store's half reads the stop before each segment, so
+     * a stopped run needs about one segment's rewrite.</p>
+     *
+     * @param wait How long to wait for both halves of a run asked to stop to end
      * @return What is still running, as storage and the chunk index see it
+     * @throws NullPointerException if wait is null
      */
-    public Drained drain() {
+    public Drained drain(Duration wait) {
+        Objects.requireNonNull(wait, "wait must not be null");
         requestStop();
         // shutdown, never shutdownNow: both halves are told to stop, not interrupted.
         executor.shutdown();
@@ -683,10 +654,13 @@ public final class CompactionRunner implements AutoCloseable {
         }
         boolean runEnded;
         boolean lexicalEnded;
+        // Wraps rather than saturates for a wait near Long.MAX_VALUE nanoseconds; the
+        // subtraction below undoes it, so what is left is still the wait less the time spent.
+        long deadline = System.nanoTime() + wait.toNanos();
         try {
-            runEnded = executor.awaitTermination(stopWait.toMillis(), TimeUnit.MILLISECONDS);
+            runEnded = executor.awaitTermination(wait.toNanos(), TimeUnit.NANOSECONDS);
             lexicalEnded = lexicalExecutor == null || lexicalExecutor.awaitTermination(
-                lexicalWait.toMillis(), TimeUnit.MILLISECONDS);
+                Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             runEnded = executor.isTerminated();
@@ -694,7 +668,11 @@ public final class CompactionRunner implements AutoCloseable {
         }
         if (!runEnded && segmentHalfRunning) {
             LOGGER.error("Compaction of the segment store did not stop within {}ms of being "
-                + "asked to; the storage it rewrites must stay open", stopWait.toMillis());
+                + "asked to; the storage it rewrites must stay open", wait.toMillis());
+        }
+        if (!lexicalEnded) {
+            LOGGER.error("Compaction of the chunk index did not stop within {}ms of being asked "
+                + "to; the index's files must stay open", wait.toMillis());
         }
         // The run's thread outliving the wait holds storage only while it is inside the segment
         // store's half; past it, it is waiting on the chunk index and nothing else.
@@ -705,15 +683,13 @@ public final class CompactionRunner implements AutoCloseable {
     }
 
     /**
-     * Stops accepting runs and waits for one in progress, logging if it outlives the wait.
+     * As {@link #drain(Duration)}, waiting for as long as a run takes to stop, for an owner with
+     * no deadline and no use for the answer - the way {@code ExecutorService.close} waits. Only
+     * an interrupt ends the wait early, and the drain logs what that left running.
      */
     @Override
     public void close() {
-        if (!drain().clean()) {
-            LOGGER.error("A compaction is still rewriting segments {}s after being asked to "
-                + "stop. Closing the storage engine underneath it can take the process down; "
-                + "the run itself loses only its own work, never data.",
-                (stopWait.toMillis() + lexicalWait.toMillis()) / 1000);
-        }
+        drain(UNTIL_STOPPED);
     }
+
 }

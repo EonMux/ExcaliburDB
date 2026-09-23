@@ -135,7 +135,9 @@ class NodeShutdownTest {
         shutdown(sweep, chunkIndex).run();
 
         verify(tenants).close(tenantsWait.capture());
-        assertThat(budget.getValue().isBounded()).isTrue();
+        assertThat(budget.getValue().forDrains())
+            .as("the server drains within the configured timeout, less the reserve")
+            .isLessThanOrEqualTo(TIMEOUT.minus(ShutdownBudget.DURABILITY_RESERVE));
         assertThat(sweepWait.getValue())
             .as("the sweep waits only for what the drains have left")
             .isLessThanOrEqualTo(TIMEOUT.minus(ShutdownBudget.DURABILITY_RESERVE));

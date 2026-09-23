@@ -42,6 +42,7 @@ import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 
 /**
  * HTTP API server for ExcaliburDB.
@@ -690,13 +691,16 @@ public class ExcaliburDBServer {
      * <p>The server stops accepting new connections immediately but waits
      * for in-flight requests to complete before fully shutting down.</p>
      *
-     * <p>Each drain behind the listener waits as long as it does on its own; a caller with a
-     * deadline to keep uses {@link #stop(ShutdownBudget)}.</p>
+     * <p>The drains behind the listener share a budget of
+     * {@link ShutdownBudget#DEFAULT_TIMEOUT_SECONDS}, started once the listener has stopped so
+     * the grace given here does not eat into it. A caller with a deadline of its own to keep
+     * uses {@link #stop(ShutdownBudget)}.</p>
      *
      * @param timeoutSeconds Maximum time to wait for in-flight requests (0 for immediate)
      */
     public void stop(int timeoutSeconds) {
-        stop(timeoutSeconds, ShutdownBudget.unbounded());
+        stop(timeoutSeconds, () -> ShutdownBudget.startingNow(
+            Duration.ofSeconds(ShutdownBudget.DEFAULT_TIMEOUT_SECONDS)));
     }
 
     /**
@@ -713,10 +717,17 @@ public class ExcaliburDBServer {
      */
     public void stop(ShutdownBudget budget) {
         Objects.requireNonNull(budget, "budget cannot be null");
-        stop(budget.listenerGraceSeconds(), budget);
+        stop(budget.listenerGraceSeconds(), () -> budget);
     }
 
-    private synchronized void stop(int timeoutSeconds, ShutdownBudget budget) {
+    /**
+     * Stops the listener, then drains within the budget {@code drainBudget} supplies.
+     *
+     * @param timeoutSeconds The listener's grace for in-flight exchanges
+     * @param drainBudget    The budget the drains run against, asked for once the listener has
+     *                       stopped
+     */
+    private synchronized void stop(int timeoutSeconds, Supplier<ShutdownBudget> drainBudget) {
         if (!running.compareAndSet(true, false)) {
             return;
         }
@@ -742,7 +753,8 @@ public class ExcaliburDBServer {
         }
 
         ShutdownSequence.Drained drained = ShutdownSequence.drain(endpoints, wiring,
-            requestExecutor, REQUEST_DRAIN_GRACE, budget);
+            requestExecutor, REQUEST_DRAIN_GRACE, drainBudget.get());
+
         storageStillInUse = !drained.storageReleased();
         chunkIndexStillInUse = !drained.chunkIndexReleased();
         graphsStillInUse = !drained.graphsReleased();

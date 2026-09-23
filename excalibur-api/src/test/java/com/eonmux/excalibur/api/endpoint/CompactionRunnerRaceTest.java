@@ -38,6 +38,9 @@ class CompactionRunnerRaceTest {
 
     private static final long WAIT_SECONDS = 10;
 
+    /** Far longer than any run here takes to act on its stop. */
+    private static final Duration DRAIN_WAIT = Duration.ofSeconds(WAIT_SECONDS);
+
     /** Holds the worker of the first run to settle, until released. */
     private static final class HeldSettle implements Runnable {
         final CountDownLatch reached = new CountDownLatch(1);
@@ -188,7 +191,7 @@ class CompactionRunnerRaceTest {
         runner.start(true);
         assertThat(rewriting.await(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
 
-        assertThat(runner.drain().clean())
+        assertThat(runner.drain(DRAIN_WAIT).clean())
             .as("nothing is left reading storage when drain says so")
             .isTrue();
         assertThat(stoppedCleanly).isTrue();
@@ -229,13 +232,13 @@ class CompactionRunnerRaceTest {
     @DisplayName("a rewrite that reads storage and outlives the drain holds storage and the index")
     void aStuckRewriteThatReadsStorageHoldsBoth() throws Exception {
         StuckRewrite rewrite = new StuckRewrite(true);
-        CompactionRunner runner = new CompactionRunner((force, stop) -> REPORT, rewrite, () -> { },
-            Duration.ofMillis(1), Duration.ofMillis(1));
+        CompactionRunner runner = new CompactionRunner((force, stop) -> REPORT, rewrite, () -> { });
         runner.start(true);
         assertThat(rewrite.rewriting.await(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
 
         try {
-            assertThat(runner.drain()).isEqualTo(new CompactionRunner.Drained(false, false));
+            assertThat(runner.drain(Duration.ofMillis(1)))
+                .isEqualTo(new CompactionRunner.Drained(false, false));
         } finally {
             rewrite.release.countDown();
         }
@@ -247,16 +250,39 @@ class CompactionRunnerRaceTest {
         // A Lucene force-merge: it never asks storage for text, so storage may close under it,
         // while the index's own files may not.
         StuckRewrite rewrite = new StuckRewrite(false);
-        CompactionRunner runner = new CompactionRunner((force, stop) -> REPORT, rewrite, () -> { },
-            Duration.ofMillis(1), Duration.ofMillis(1));
+        CompactionRunner runner = new CompactionRunner((force, stop) -> REPORT, rewrite, () -> { });
         runner.start(true);
         assertThat(rewrite.rewriting.await(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
 
         try {
-            assertThat(runner.drain()).isEqualTo(new CompactionRunner.Drained(true, false));
+            assertThat(runner.drain(Duration.ofMillis(1)))
+                .isEqualTo(new CompactionRunner.Drained(true, false));
         } finally {
             rewrite.release.countDown();
         }
+    }
+
+    @Test
+    @DisplayName("a drain waits out the whole of the wait it is given before reporting a rewrite")
+    void aDrainWaitsAsLongAsItIsGiven() throws Exception {
+        StuckRewrite rewrite = new StuckRewrite(true);
+        CompactionRunner runner = new CompactionRunner((force, stop) -> REPORT, rewrite, () -> { });
+        runner.start(true);
+        assertThat(rewrite.rewriting.await(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
+        Duration wait = Duration.ofMillis(300);
+
+        long began = System.nanoTime();
+        try {
+            assertThat(runner.drain(wait).clean()).isFalse();
+            assertThat(Duration.ofNanos(System.nanoTime() - began))
+                .as("the rewrite was given all of the wait, not a share the other half left")
+                .isGreaterThanOrEqualTo(wait);
+        } finally {
+            rewrite.release.countDown();
+        }
+        assertThat(runner.drain(DRAIN_WAIT))
+            .as("given longer, the drain sees the rewrite end")
+            .isEqualTo(CompactionRunner.Drained.CLEAN);
     }
 
     @Test
@@ -265,7 +291,7 @@ class CompactionRunnerRaceTest {
         CompactionRunner runner = new CompactionRunner((force, stop) -> REPORT,
             (force, stop) -> CompactionResult.declined("idle"));
 
-        assertThat(runner.drain()).isEqualTo(CompactionRunner.Drained.CLEAN);
-        assertThat(runner.drain().clean()).isTrue();
+        assertThat(runner.drain(DRAIN_WAIT)).isEqualTo(CompactionRunner.Drained.CLEAN);
+        assertThat(runner.drain(DRAIN_WAIT).clean()).isTrue();
     }
 }

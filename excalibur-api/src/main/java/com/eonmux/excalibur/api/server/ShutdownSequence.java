@@ -76,7 +76,8 @@ final class ShutdownSequence {
     }
 
     /**
-     * Drains everything the node started, in the order that keeps it off closed storage.
+     * Drains everything the node started, within a shutdown's budget, in the order that keeps
+     * it off closed storage.
      *
      * <p>The listener must already have stopped accepting: this drains what the requests it
      * accepted left running, and nothing here refuses new work.</p>
@@ -85,26 +86,6 @@ final class ShutdownSequence {
      * that left its work running: a compaction nobody asked to stop because the step before it
      * failed is still reading storage, and the answer has to say so. The first failure is
      * rethrown once every step has had its turn.</p>
-     *
-     * <p>No deadline beyond each drain's own wait; a node's shutdown passes its budget to the
-     * form that takes one.</p>
-     *
-     * @param endpoints    The endpoints that own executors, or null if {@code start()} never
-     *                     reached the point of registering them
-     * @param wiring       What the node is made of, for the pipelines and registries it owns
-     * @param requests     The executor the listener dispatched requests on, or null
-     * @param requestGrace How long request threads still running once everything else has
-     *                     drained are given to end
-     * @return What is still running, as storage, the chunk index and the graph tenants see it
-     * @throws NullPointerException if wiring or requestGrace is null
-     */
-    static Drained drain(EndpointRegistrar.Endpoints endpoints, ServerWiring wiring,
-                         ExecutorService requests, Duration requestGrace) {
-        return drain(endpoints, wiring, requests, requestGrace, ShutdownBudget.unbounded());
-    }
-
-    /**
-     * Drains everything the node started, within a shutdown's budget.
      *
      * <h3>Together, then in order</h3>
      * <p>The reindex, the query executors, a compaction, a graph build and ingestion each run on
@@ -115,7 +96,10 @@ final class ShutdownSequence {
      * because everything that can end one early has been delivered by then.</p>
      *
      * <h3>What the budget does</h3>
-     * <p>Every wait is cut to what the budget leaves the drains. A drain still going when that
+     * <p>Each drain is handed what the budget leaves the drains as its own wait, so a reindex,
+     * a compaction, a graph build or an ingestion run is waited for as long as the budget
+     * allows and no longer - a longer budget is a longer wait, not a fixed one cut short. The
+     * wait for each drain's answer is bounded the same way. A drain still going when that
      * runs out is not waited for further and not interrupted - it has already been asked to stop,
      * and goes on stopping on its own thread - but is reported as still running, so the caller
      * leaves open what it uses. The budget's reserve is then still whole for the durable writes
@@ -151,14 +135,19 @@ final class ShutdownSequence {
         boolean ingestionDrained;
         boolean orchestratorDrained;
         try {
-            Future<Boolean> reindex = drains.submit(() -> drainReindex(endpoints));
+            // Each reads the budget when it starts rather than here, so the wait it is handed is
+            // what is actually left.
+            Future<Boolean> reindex =
+                drains.submit(() -> drainReindex(endpoints, budget.forDrains()));
             Future<Boolean> queries = drains.submit(() -> drainQueryEndpoint(endpoints));
             Future<Boolean> pipeline =
                 drains.submit(() -> drainQueryPipeline(wiring.queryPipeline()));
             Future<CompactionRunner.Drained> compacting =
-                drains.submit(() -> drainCompaction(endpoints));
-            Future<Boolean> graphBuild = drains.submit(() -> drainGraphBuild(endpoints));
-            Future<Boolean> ingestion = drains.submit(() -> drainIngestion(wiring));
+                drains.submit(() -> drainCompaction(endpoints, budget.forDrains()));
+            Future<Boolean> graphBuild =
+                drains.submit(() -> drainGraphBuild(endpoints, budget.forDrains()));
+            Future<Boolean> ingestion =
+                drains.submit(() -> drainIngestion(wiring, budget.forDrains()));
 
             reindexDrained = steps.await("the reindex", reindex, false);
             queriesDrained = steps.await("the query executor", queries, false);
@@ -329,11 +318,12 @@ final class ShutdownSequence {
      * Stops reindexing, asking what is running to stop, and waits for it.
      *
      * @param endpoints What was registered, or null
+     * @param wait      How long the budget leaves it
      * @return false if a reindex outlived its drain and is still writing into storage
      */
-    private static boolean drainReindex(EndpointRegistrar.Endpoints endpoints) {
+    private static boolean drainReindex(EndpointRegistrar.Endpoints endpoints, Duration wait) {
         ReindexEndpoint reindex = endpoints == null ? null : endpoints.reindex();
-        if (reindex != null && !reindex.drain()) {
+        if (reindex != null && !reindex.drain(wait)) {
             LOGGER.error("A reindex was still running when the node shut down; the storage "
                 + "engine and the chunk index will be left open rather than closed underneath it");
             return false;
@@ -406,13 +396,15 @@ final class ShutdownSequence {
      * dangerous - the caller leaves storage open rather than closing it underneath the run.</p>
      *
      * @param endpoints What was registered, or null
+     * @param wait      How long the budget leaves it
      * @return What the compaction left running
      */
-    private static CompactionRunner.Drained drainCompaction(EndpointRegistrar.Endpoints endpoints) {
+    private static CompactionRunner.Drained drainCompaction(EndpointRegistrar.Endpoints endpoints,
+                                                            Duration wait) {
         if (endpoints == null || endpoints.compaction() == null) {
             return CompactionRunner.Drained.CLEAN;
         }
-        CompactionRunner.Drained drained = endpoints.compaction().drain();
+        CompactionRunner.Drained drained = endpoints.compaction().drain(wait);
         if (!drained.storageReleased()) {
             LOGGER.error("A compaction was still reading storage when the node shut down; "
                 + "the storage engine will be left open rather than closed underneath it");
@@ -433,11 +425,12 @@ final class ShutdownSequence {
      * nothing.</p>
      *
      * @param endpoints What was registered, or null
+     * @param wait      How long the budget leaves it
      * @return false if a build outlived the wait and is still writing into a graph tenant
      */
-    private static boolean drainGraphBuild(EndpointRegistrar.Endpoints endpoints) {
+    private static boolean drainGraphBuild(EndpointRegistrar.Endpoints endpoints, Duration wait) {
         GraphBuildRunner graphBuild = endpoints == null ? null : endpoints.graphBuild();
-        if (graphBuild != null && !graphBuild.drain()) {
+        if (graphBuild != null && !graphBuild.drain(wait)) {
             LOGGER.error("A graph build was still running when the node shut down; the graph "
                 + "tenants will be left open rather than closed underneath it");
             return false;
@@ -449,14 +442,16 @@ final class ShutdownSequence {
      * Stops background ingestion and closes the sources the registry published.
      *
      * @param wiring What the node is made of
+     * @param wait   How long the budget leaves it
      * @return false if an ingestion run outlived the drain and is still writing into storage,
      *         the chunk index and the graph tenants
      */
-    private static boolean drainIngestion(ServerWiring wiring) {
+    private static boolean drainIngestion(ServerWiring wiring, Duration wait) {
         IngestionOrchestrator ingestion = wiring.ingestionOrchestrator();
         boolean drained = true;
-        if (ingestion != null && !ingestion.shutdown()) {
-            LOGGER.error("Ingestion threads did not finish before the shutdown timeout; the "
+        if (ingestion != null && !ingestion.shutdown(wait)) {
+            LOGGER.error("Ingestion threads did not finish within the shutdown budget; the "
+
                 + "storage engine, the chunk index and the graph tenants will be left open "
                 + "rather than closed underneath them");
             drained = false;

@@ -3223,6 +3223,7 @@ import com.eonmux.excalibur.vector.hnsw.HnswConfigFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 
 static List<QueryResultItem> ingestAndQuery(Path dataDir, String embeddingEndpoint)
@@ -3319,7 +3320,7 @@ static List<QueryResultItem> ingestAndQuery(Path dataDir, String embeddingEndpoi
             } finally {
                 // Stop taking work before the storage underneath it closes.
                 pipeline.shutdown();
-                ingestion.shutdown();
+                ingestion.shutdown(Duration.ofSeconds(30));
             }
         }
     }
