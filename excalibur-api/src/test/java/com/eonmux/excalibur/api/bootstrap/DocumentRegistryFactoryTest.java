@@ -128,6 +128,84 @@ class DocumentRegistryFactoryTest {
         assertThat(reopened.size()).isEqualTo(1);
     }
 
+    /**
+     * Writes a registry holding one document, then takes away its header and end marker, which
+     * is the file a build from before the format carried a version left behind.
+     */
+    private static Path headerlessRegistry(Path dataDir) throws Exception {
+        DocumentRegistry first = DocumentRegistryFactory.open(dataDir);
+        first.register(document("docs", "handbook.md", 2));
+        first.persist();
+        Path file = dataDir.resolve(DocumentRegistryFactory.FILE);
+        List<String> lines = new ArrayList<>(Files.readAllLines(file, StandardCharsets.UTF_8));
+        lines.remove(lines.size() - 1);
+        lines.remove(0);
+        Files.write(file, lines, StandardCharsets.UTF_8);
+        return file;
+    }
+
+    @Test
+    @DisplayName("a registry in the format from before the header is rewritten as the node starts")
+    void aHeaderlessRegistryIsUpgradedOnOpen(@TempDir Path dataDir) throws Exception {
+        // Until it is rewritten, a truncated copy of this file cannot be told from a whole one,
+        // and a node that is only queried after an upgrade would otherwise never rewrite it.
+        Path file = headerlessRegistry(dataDir);
+
+        DocumentRegistry opened = DocumentRegistryFactory.open(dataDir);
+
+        List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+        assertThat(lines.get(0)).isEqualTo("\\#document-registry|1");
+        assertThat(lines.get(lines.size() - 1)).isEqualTo("\\#end|1");
+        assertThat(opened.isModified()).isFalse();
+        assertThat(DocumentRegistryFactory.open(dataDir).get("docs", "handbook.md").getChunkIds())
+            .hasSize(2);
+    }
+
+    @Test
+    @DisplayName("a registry already in the current format is not rewritten on open")
+    void aCurrentRegistryIsLeftAlone(@TempDir Path dataDir) throws Exception {
+        DocumentRegistry first = DocumentRegistryFactory.open(dataDir);
+        first.register(document("docs", "a.md", 1));
+        first.persist();
+        Path file = dataDir.resolve(DocumentRegistryFactory.FILE);
+        java.nio.file.attribute.FileTime written = java.nio.file.attribute.FileTime.fromMillis(0);
+        Files.setLastModifiedTime(file, written);
+
+        DocumentRegistryFactory.open(dataDir);
+
+        assertThat(Files.getLastModifiedTime(file)).isEqualTo(written);
+    }
+
+    @Test
+    @DisplayName("an upgrade that cannot be saved does not keep the node from starting")
+    void anUpgradeThatCannotBeSavedIsNotFatal(@TempDir Path dataDir) throws Exception {
+        // The records were read; only the rewrite failed. The next save that has a reason to
+        // happen - an ingest, an erasure, shutdown - tries again, and reports its own failure.
+        Path file = headerlessRegistry(dataDir);
+        java.util.Set<java.nio.file.attribute.PosixFilePermission> before;
+        try {
+            before = Files.getPosixFilePermissions(dataDir);
+        } catch (UnsupportedOperationException e) {
+            org.junit.jupiter.api.Assumptions.abort("needs POSIX permissions");
+            return;
+        }
+        Files.setPosixFilePermissions(dataDir,
+            java.nio.file.attribute.PosixFilePermissions.fromString("r-x------"));
+        try {
+            org.junit.jupiter.api.Assumptions.assumeFalse(Files.isWritable(dataDir),
+                "a user that ignores permissions cannot make the save fail");
+
+            DocumentRegistry opened = DocumentRegistryFactory.open(dataDir);
+
+            assertThat(opened.contains("docs", "handbook.md")).isTrue();
+            assertThat(opened.isModified()).as("still owed to the next save").isTrue();
+        } finally {
+            Files.setPosixFilePermissions(dataDir, before);
+        }
+        assertThat(Files.readAllLines(file, StandardCharsets.UTF_8).get(0))
+            .doesNotStartWith("\\#document-registry");
+    }
+
     @Test
     @DisplayName("a data directory is required")
     void dataDirectoryIsRequired() {
