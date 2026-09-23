@@ -1891,11 +1891,12 @@ curl -X POST http://localhost:8080/v1/graph/build
  "extraction": "active"}
 ```
 
-`extraction` says whether ingestion on this node extracts the facts a build publishes: `active`,
-`disabled` when `excalibur.graph.extraction-enabled` is off, or `missing_api_key` when it is on but
-no LLM API key is configured — the one case that also carries a `warning`, because nobody chose it
-and the build it answers publishes nothing ingestion staged since startup. The status route carries
-the same two fields.
+`extraction` says whether ingestion on this node extracts the facts a build publishes, and is on
+every answer from both routes: `active`, `disabled` when `excalibur.graph.extraction-enabled` is
+off, `missing_api_key` when it is on but no LLM API key is configured, or `unavailable` when both
+are set but the ingestion pipeline could not be set up — its failure is in the startup log. The
+last two also carry a `warning`, because nobody chose them and the build they answer publishes
+nothing ingestion staged since startup. The status route carries the same fields.
 
 `202`, not `200`. On a real corpus the build takes minutes — it replays every staged fact, embeds
 every entity and writes two Lucene indexes — so it runs behind the response and the request does
@@ -3134,7 +3135,9 @@ and extracts nothing — so it says so everywhere you would look: a WARN at star
 settings, and `"extraction": "missing_api_key"` with a `warning` on the answer to
 `POST /v1/graph/build` and on `GET /v1/graph/build/status`. Set the key, restart, and re-ingest:
 documents ingested while extraction was inactive were never offered to the extractor, and a build
-cannot recover facts nobody extracted.
+cannot recover facts nobody extracted. With both set and `"extraction": "unavailable"`, the key is
+not the problem: the ingestion pipeline failed to set up at startup, and the WARN logged then says
+why.
 
 **How much memory does a build need?**
 The edge store is sorted in memory before it is written, so a namespace's build holds every staged

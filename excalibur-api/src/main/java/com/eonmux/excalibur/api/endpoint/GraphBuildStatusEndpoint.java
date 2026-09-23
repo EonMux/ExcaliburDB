@@ -57,9 +57,10 @@ import java.util.Optional;
  * nothing was staged, so the namespace goes on serving whatever graph it already had. Replacing
  * it with an empty one would turn every question into a refusal. Such a build carries a
  * {@code message} saying why nothing was staged, read from {@code extraction} - the same field
- * {@code POST /v1/graph/build} answers with, present on every status once ingestion is wired:
- * {@code active}, {@code disabled}, or {@code missing_api_key} with a {@code warning} when
- * extraction was asked for and no LLM API key is configured.</p>
+ * {@code POST /v1/graph/build} answers with, present on every status: {@code active},
+ * {@code disabled}, or - each with a {@code warning} - {@code missing_api_key} when extraction was
+ * asked for and no LLM API key is configured, and {@code unavailable} when it has a key but the
+ * ingestion pipeline could not be set up.</p>
  *
  * <p>A cancelled build reports {@code "published": false} for a different reason: it stopped
  * before the rename that would have published it. There is no partial graph to describe,

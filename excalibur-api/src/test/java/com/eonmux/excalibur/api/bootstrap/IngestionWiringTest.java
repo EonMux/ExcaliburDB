@@ -240,7 +240,7 @@ class IngestionWiringTest {
         assertThat(tenants.extraction())
             .as("the build routes read this, and it is what tells an operator why a build "
                 + "published nothing")
-            .contains(GraphExtraction.MISSING_API_KEY);
+            .isEqualTo(GraphExtraction.MISSING_API_KEY);
     }
 
     @Test
@@ -250,7 +250,59 @@ class IngestionWiringTest {
             "excalibur.graph.extraction-enabled", "true",
             "excalibur.llm.api-key", "test-key")), dataDir);
 
-        assertThat(tenants.extraction()).contains(GraphExtraction.ACTIVE);
+        assertThat(tenants.extraction()).isEqualTo(GraphExtraction.ACTIVE);
+    }
+
+    @Test
+    @DisplayName("extraction with a key but no ingestion to feed it is reported unavailable")
+    void extractionWithNoOrchestratorIsUnavailable(@TempDir Path dataDir) throws IOException {
+        // A server whose pipeline never produced an orchestrator: nothing ingested reaches the
+        // extractor, so reporting "active" would send an operator looking everywhere but here.
+        Config config = config(Map.of(
+            "excalibur.graph.extraction-enabled", "true",
+            "excalibur.llm.api-key", "test-key"));
+        ExcaliburDBServer server = mock(ExcaliburDBServer.class);
+
+        attachWiringOnly(config, dataDir, server);
+
+        assertThat(tenants.extraction()).isEqualTo(GraphExtraction.UNAVAILABLE);
+    }
+
+    @Test
+    @DisplayName("extraction whose ingestion setup failed is reported unavailable, not left out")
+    void extractionWhoseSetupFailedIsUnavailable(@TempDir Path dataDir) throws IOException {
+        Config config = config(Map.of(
+            "excalibur.graph.extraction-enabled", "true",
+            "excalibur.llm.api-key", "test-key"));
+        ExcaliburDBServer server = mock(ExcaliburDBServer.class);
+        org.mockito.Mockito.doThrow(new IllegalStateException("pipeline refused"))
+            .when(server).withIngestionPipeline(org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any());
+
+        attachWiringOnly(config, dataDir, server);
+
+        assertThat(tenants.extraction()).isEqualTo(GraphExtraction.UNAVAILABLE);
+    }
+
+    /**
+     * Attaches the ingestion half to a server the test supplies rather than a real one.
+     *
+     * @param config  The deployment being described
+     * @param dataDir Where the node keeps everything
+     * @param server  The server to attach to
+     * @throws IOException if the graph tenants cannot be opened
+     */
+    private void attachWiringOnly(Config config, Path dataDir, ExcaliburDBServer server)
+            throws IOException {
+        core = CoreComponents.create(config, dataDir, HnswConfigFactory.withDefaults());
+        DocumentVisibilityTracker tracker = new DocumentVisibilityTracker(
+            DocumentRegistryFactory.open(dataDir),
+            core.indexOrchestrator().getVisibilityTracker());
+        tenants = new GraphTenants(dataDir.resolve("graph"), config, MappingBudget.detect(), 4);
+        attachment = new IngestionWiring(config, dataDir, core.storageEngine(),
+            core.indexOrchestrator(), core.hierarchicalFilter(), tracker, tenants)
+            .attachTo(server);
     }
 
     @Test
@@ -258,11 +310,11 @@ class IngestionWiringTest {
     void extractionOffIsDisabled(@TempDir Path withoutKey, @TempDir Path withKey)
             throws IOException {
         attach(config(Map.of()), withoutKey);
-        assertThat(tenants.extraction()).contains(GraphExtraction.DISABLED);
+        assertThat(tenants.extraction()).isEqualTo(GraphExtraction.DISABLED);
         tearDown();
 
         attach(config(Map.of("excalibur.llm.api-key", "test-key")), withKey);
-        assertThat(tenants.extraction()).contains(GraphExtraction.DISABLED);
+        assertThat(tenants.extraction()).isEqualTo(GraphExtraction.DISABLED);
     }
 
     /**
