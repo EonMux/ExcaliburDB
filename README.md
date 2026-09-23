@@ -461,7 +461,20 @@ but a label interner, a label interner's damage when the staged facts, the entit
 published beside the staging directory or an outstanding erasure or withdrawal names an id at or
 past it, or a file shorter than its header that does not begin it — is `CORRUPT`. The verdict on
 `erasure.log` also counts the outstanding entity erasures that name an id nothing in the namespace
-holds, which the node discharges when it next opens the namespace.
+holds, which the node discharges when it next opens the namespace. The `erasure.interrupted`
+marker beside them is recognised as well; the node writes it empty and reads only whether it is
+there, so an empty one is `INTACT`.
+
+A namespace's built graph, `<namespace>/graph/`, is checked as one structure, by the checks the node
+runs before it serves one: the descriptor, every column against the length and CRC32C the descriptor
+records, both dictionaries against their trailers, the entity vectors against their header, and
+each Lucene index against the footer of every file in it — one verdict per index. Any of them
+`CORRUPT` or `MISSING` is damage: the node does not serve that graph. A graph an older build wrote
+is `LEGACY_UNPROTECTED`, and the next build replaces it; a newer build's is `UNREADABLE`. A
+`graph.previous` or `graph.retired` with nothing served in its place is checked the same way, since
+the node restores it. One beside a served graph, and the scratch in `graph.building` and
+`graph.compacting`, are reported `UNCHECKED` and left alone: the node deletes the first on open and
+never reads the others, and a copy an erasure compaction replaced may hold what the erasure removed.
 
 Repair is off by default: without `--repair` the plan is printed and nothing is touched. With it,
 the tool writes, and each write is stated before it is made. **No repair ever deletes anything.**
@@ -487,7 +500,13 @@ missing one as empty, so moved aside, a label interner would hand its ids out ag
 published graph, the triple log would empty the next build, and the erasure and withdrawal logs
 would forget what is still owed. A damaged lexical segment, by contrast, is moved aside like any
 damaged file — the node keeps it out of every query either way, and its next compaction rebuilds
-it from its key table and the stored text.
+it from its key table and the stored text. So is a damaged built graph, as one directory however
+many of its files failed: the node serves nothing from it either way, and `POST /v1/graph/build`
+publishes a new one from staging. Erasures accepted afterwards never reach the quarantined copy, so
+delete it once the rebuilt graph serves and never move it back. The move is refused, and put to an
+operator, while a `graph.previous` or `graph.retired` sits beside the damaged graph: with nothing
+left in its place the node would restore that copy, and one an erasure compaction replaced still
+holds what the erasure removed.
 
 Damaged files are moved into a timestamped directory beside the data directory unless
 `--quarantine-dir=<path>` names another. It takes the `--flag=value` form only. The default needs
@@ -527,6 +546,7 @@ already there when it was copied verifies faithfully:
 | a compaction's staged pair (`segment_<N>.hnsw.compact`, `.hnsw.compact.docmap`) | `excalibur-fsck`, read-only | nothing, while both are there: the compaction never swapped, the node discards the pair on open, and a torn pair does not fail the image. A staged mapping alone is the only mapping the swapped graph matches, and is verified against its seal like any mapping |
 | write-ahead logs | `excalibur-fsck`'s checkers, read-only | every record replayed against its checksum |
 | graph staging logs | `excalibur-fsck`, read-only | every record of the label, triple, entity text, erasure and withdrawal logs against its CRC, walked by the graph module's own replay without opening the log. One ending in a write cut short is healthy and unproven: the node trims it on open. Damage the node refuses fails the image |
+| a tenant's built graph (`<namespace>/graph/`) | `excalibur-fsck`, read-only, as one structure | the edge store's descriptor against its CRC32C, every column against the length and CRC32C the descriptor records, both dictionaries against their trailers, the entity vectors against the CRC32Cs in their header, and every file of both Lucene indexes against its footer. Damage fails the image. A graph an older build wrote is reported unproven; a newer build's fails the image. Scratch and a copy the node deletes on open are reported unchecked |
 | the lexical store | `excalibur-fsck`, read-only, as one structure | the manifest against the CRC32C on its end line; every column of every segment it names; each named segment's key table against the checksums in `seg-N.keysum` and its tombstones against their trailing CRC32C; and every line of `erasure.log` against its own CRC32C. A manifest an older build wrote carries only a record count, and a key table, tombstone file or erasure log it wrote carries nothing: each is held to its structure and not proven |
 | segment term sketches (`segment_<N>.tfs`) | `excalibur-fsck`, read-only | a CRC32C over the header and one over the body. A damaged sketch is reported and does not fail the image: a node restored from it rebuilds the sketch when it opens the segment. One that cannot be read at all fails it |
 | the document registry, the source catalog and the source status history | `excalibur-fsck`, read-only | the CRC32C on the closing line, over every byte before it, and the record count beside it. Each is held to what its reader requires, so one the node would refuse fails the image; a status history the node would only discard does not. A file written before the format carried a checksum has only its count checked, and is reported unproven |
@@ -1265,20 +1285,40 @@ directory by default. A node that never sees the `X-Excalibur-Namespace` header 
 `shared`, so the default single-tenant store is `<data dir>/shared/graph` and it stages in
 `<data dir>/shared/graph-staging`. A store is a directory holding:
 
-| File | What it is |
-|------|------------|
-| the edge columns | CSR adjacency, its transpose, validity and provenance |
-| `documents/` | Lucene index over each entity's text, for the lexical retrieval signal |
-| `labels/` | Lucene index over entity names, for entity linking |
-| `entity_vectors.vec` | one full-precision vector per entity, for the exact rerank |
-| `entities.idx` / `entities.dat` | entity id → name, so answers name people rather than integers |
-| `relations.idx` / `relations.dat` | relation id → name |
+| File | What it is | Checked against |
+|------|------------|-----------------|
+| `edgestore.meta` | the edge store's descriptor: counts, widths, and each column's length and CRC32C | a CRC32C over every byte before it |
+| the edge columns | CSR adjacency (`edges_fwd.csr`, `offsets_fwd.idx`, `rel_fwd.csr`), its transpose (`edges_rev.csr`, `offsets_rev.idx`, `rel_rev.csr`, `perm_rev.idx`), validity (`valid_from.col`, `valid_to.col`) and provenance (`source_type.col`, `source_id.col`, `extraction_conf.col`, `extractor_version.col`) | the length and CRC32C the descriptor records for each |
+| `documents/` | Lucene index over each entity's text, for the lexical retrieval signal | the CRC32 footer Lucene ends every file with |
+| `labels/` | Lucene index over entity names, for entity linking | the same |
+| `entity_vectors.vec` | one full-precision vector per entity, for the exact rerank | CRC32Cs of the presence flags and of the vectors, in a header with a CRC32C of its own |
+| `entities.idx` / `entities.dat` | entity id → name, so answers name people rather than integers | a trailer on the index holding the text's length and CRC32C and a CRC32C over the index |
+| `relations.idx` / `relations.dat` | relation id → name | the same |
 
 All of it or none of it, `entity_vectors.vec` excepted: a directory missing any of the others
 fails the start rather than serving a pipeline that silently resolves nothing, while absent entity
 vectors are a configuration rather than a fault - a graph built without an embedder has none, and
 the rerank stage that reads them is skipped. The whole directory is assembled beside the live
 one and renamed into place, so a reader sees the previous graph or the new one and never a mixture.
+While that happens the namespace's directory can also hold `graph.building` (a build's scratch, which
+the next build deletes), `graph.compacting` (an erasure compaction's scratch), and `graph.previous`
+or `graph.retired` (the graph a publish set aside, which the node deletes beside a served graph and
+restores when nothing is served in its place).
+
+Every file of the store is checked against its checksum each time the namespace opens, before
+anything is mapped — one sequential read of the graph, the policy the lexical segments and the HNSW
+graphs already follow. The Lucene indexes check the small files they read whole as they open, and
+the postings, stored fields and doc values they would otherwise read lazily are checked then too. A
+graph with any file missing, cut short or no longer matching is **not served**: the node logs an
+`ERROR` naming the file and saying `POST /v1/graph/build` replaces it, graph queries answer that no
+graph is built, and the namespace otherwise keeps working — its staging, its builds and its erasures.
+Nothing is lost: the store is derived from the staging logs beside it, and the next build rewrites
+it whole. An erasure compaction that meets such a graph cannot rewrite it, so it deletes it and
+erases the staged facts alone, which discharges the obligation; the graph is served again once a
+build publishes one. A request to erase an entity whose id only a damaged dictionary could vouch for
+is kept outstanding rather than discharged. A graph written before these checksums is served as it
+always was, unverified, until the next build replaces it with a checksummed one; one a newer build
+wrote is refused.
 
 Facts accumulate in `<graph dir>-staging`, beside the store rather than inside it — every build
 replaces the store wholesale, and the record the next build reads has to survive that. Entity ids
