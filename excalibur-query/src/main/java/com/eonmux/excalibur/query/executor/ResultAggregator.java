@@ -307,14 +307,17 @@ public class ResultAggregator {
      * segments and would silently discard a legitimate hit from another segment.
      * The fallback key is therefore scoped by segment.</p>
      *
-     * @param documentIdStr The string document ID, or null when unknown
+     * <p>An empty document ID is as unknown as a null one - a write-log entry with an empty
+     * key yields it - and keying on it would merge every such result into one.</p>
+     *
+     * @param documentIdStr The string document ID, or null or empty when unknown
      * @param segmentId The segment that produced the result
      * @param nodeId The node ID within that segment
      * @return A key that is unique per document, or per (segment, node) when the
      *         document ID is unknown
      */
     private static String dedupeKey(String documentIdStr, long segmentId, long nodeId) {
-        if (documentIdStr != null) {
+        if (documentIdStr != null && !documentIdStr.isEmpty()) {
             return documentIdStr;
         }
         return segmentId + ":" + nodeId;

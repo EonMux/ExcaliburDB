@@ -424,6 +424,20 @@ class QueryEndpointRelevancyTest extends QueryEndpointTestBase {
         }
 
         @Test
+        @DisplayName("gives an exact count when the threshold chose from everything retrieval "
+            + "found")
+        void scoredTotalIsExactWhenRetrievalRanOut() throws IOException {
+            when(queryPipeline.execute(any(QueryRequest.class), any(CancellationToken.class)))
+                .thenReturn(CompletableFuture.completedFuture(
+                    dense(1).withLlmScored(true).withRetrievalExhausted(true)));
+            QueryEndpoint node = vectorNode(judging(Map.of()));
+
+            String json = ask(node, "{\"query\": \"q\", \"top_k\": 5}");
+
+            assertThat(json).contains("\"result_total\": {\"value\": 1, \"relation\": \"exact\"}");
+        }
+
+        @Test
         @DisplayName("names the scoring fields on a node with no model")
         void namesScoringFieldsWithoutAModel() throws IOException {
             when(queryPipeline.execute(any(QueryRequest.class), any(CancellationToken.class)))

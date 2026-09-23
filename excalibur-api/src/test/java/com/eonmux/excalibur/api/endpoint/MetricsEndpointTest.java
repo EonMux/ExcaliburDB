@@ -125,6 +125,17 @@ class MetricsEndpointTest {
         }
 
         @Test
+        @DisplayName("exposes the query results dropped for want of a document identity")
+        void exposesUnnamedResultsDropped() throws IOException {
+            long before = Metrics.getUnnamedResultsDropped();
+            Metrics.recordUnnamedResultsDropped(2);
+
+            String body = send("GET").body();
+            assertThat(body).contains("# TYPE excalibur_query_unnamed_results_dropped_total counter")
+                .contains("excalibur_query_unnamed_results_dropped_total " + (before + 2));
+        }
+
+        @Test
         @DisplayName("exposes the segment lifecycle as one labelled family")
         void exposesSegments() throws IOException {
             addActiveSegment(1);

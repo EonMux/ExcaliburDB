@@ -14,6 +14,8 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -32,6 +34,8 @@ import java.util.stream.Collectors;
  *   <li>For each segment, use VectorReranker to compute exact distances from full-precision vectors stored in HNSW graph</li>
  *   <li>Merge all reranked results and take top-k</li>
  *   <li>Apply DocumentAtomicityFilter to exclude partial documents</li>
+ *   <li>Drop results that carry no document identity, when the request can only use named
+ *       ones - see {@link QueryRequest#requireNamedResults()}</li>
  * </ol>
  *
  * <h2>Why Reranking is Critical</h2>
@@ -118,18 +122,24 @@ final class RerankStage {
         // Oversample so reranking and filtering have spare candidates to work with.
         // topK is client-supplied, so widen before multiplying and saturate instead of
         // wrapping to a negative candidate count.
+        int candidateCount = rerankCandidateCount(context.request.topK());
         ResultAggregator aggregator = new ResultAggregator(
-            rerankCandidateCount(context.request.topK()),
+            candidateCount,
             context.request.threshold(),
             coverageThreshold
         );
 
         List<QueryResultItem> candidates = aggregator.mergeAndRankWithNormalization(
             context.segmentResults, distanceFunction);
+        // A merge that came back shallower than it was asked had nothing further to give, so
+        // however this ranking is narrowed afterwards - by a relevancy threshold included -
+        // nothing past it was left unconsidered. That is what lets a short answer's total be
+        // exact once Stage 5 has shortened it.
+        boolean exhausted = candidates.size() < candidateCount;
 
         if (candidates.isEmpty()) {
             LOGGER.debug("Stage 4: No candidates to rerank");
-            return context.withMergedResults(candidates);
+            return context.withRanking(candidates, exhausted, 0);
         }
 
         List<QueryResultItem> rerankedResults = rerankBySegment(context, candidates);
@@ -146,6 +156,14 @@ final class RerankStage {
         // enough valid candidates were available.
         rerankedResults = applyAtomicityFilter(rerankedResults, context.epoch);
 
+        // Before truncation, for the same reason as the atomicity filter: a dropped result is
+        // replaced by the next named one rather than leaving the page short.
+        int beforeNaming = rerankedResults.size();
+        if (context.request.requireNamedResults()) {
+            rerankedResults = namedOnly(rerankedResults);
+        }
+        int unnamedDropped = beforeNaming - rerankedResults.size();
+
         // Step 6: Truncate to topK once the result set is final. When Stage 5 is going to
         // run, leave the oversampled list intact: its threshold filter would otherwise be
         // applied to an already-truncated list and return fewer than topK results even
@@ -157,7 +175,44 @@ final class RerankStage {
         LOGGER.debug("Stage 4: Reranked {} candidates to {} results (atomicity filtered from {})",
             candidates.size(), rerankedResults.size(), beforeAtomicityFilter);
 
-        return context.withMergedResults(rerankedResults);
+        return context.withRanking(rerankedResults, exhausted, unnamedDropped);
+    }
+
+    /**
+     * The results that carry the identifier ingestion assigned.
+     *
+     * <p>A result without one is a graph node the node-to-document mapping has no entry for:
+     * its mapping file could not be opened, or lost entries it had not yet persisted. The
+     * search found it, but the only name it has is its node id, which compaction renumbers
+     * and which names nothing a caller outside this process can fetch, fuse or erase by.
+     * Dropping it is logged with the segments involved, because nothing rebuilds a mapping in
+     * place - the cure is restoring those segments' graphs together with their mappings, or
+     * reindexing what they hold - and the answer says it is degraded, because the node found
+     * something it could not return.</p>
+     *
+     * @param results The ranking
+     * @return The ranking without unnamed results, the same list when there were none
+     */
+    private static List<QueryResultItem> namedOnly(List<QueryResultItem> results) {
+        List<QueryResultItem> named = new ArrayList<>(results.size());
+        Set<Long> unnamedSegments = new TreeSet<>();
+        for (QueryResultItem item : results) {
+            String name = item.documentIdStr();
+            if (name == null || name.isEmpty()) {
+                unnamedSegments.add(item.segmentId());
+            } else {
+                named.add(item);
+            }
+        }
+        if (named.size() == results.size()) {
+            return results;
+        }
+        LOGGER.warn("Stage 4: dropped {} result(s) that carry no document identity, from "
+            + "segment(s) {}; their node-to-document mapping is missing entries. Run "
+            + "excalibur-fsck, then restore each graph with its mapping or reindex its source",
+            results.size() - named.size(),
+            unnamedSegments);
+        return named;
     }
 
     /**

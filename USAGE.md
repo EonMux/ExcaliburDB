@@ -1505,18 +1505,21 @@ If you need custom embeddings (e.g., a local model, a different provider), chang
 Key fields:
 
 - **`query_id`** — Server-generated UUID for this query. Pass it to `DELETE /v1/query/{query_id}` to cancel mid-flight.
-- **`results`** — Each item has `document_id` (string), `score` (float, six decimal places) and `segment_id` (int). `document_id` is the identifier ingestion assigned, `sourceId:documentId:chunk:N`; it is always a JSON string, never a bare number, and it is never the HNSW node id, which compaction renumbers. Text is not returned unless the request asked for it — send `"include_text": true` and every result also carries `text` and `text_truncated`; add `"snippet": true` for the part of the passage the query matched, and `"explain": true` for why the result is there at all.
+- **`results`** — Each item has `document_id` (string), `score` (float, six decimal places) and `segment_id` (int). `document_id` is the identifier ingestion assigned, `sourceId:documentId:chunk:N`; it is always a JSON string, never a bare number, and it is never the HNSW node id, which compaction renumbers. A vector hit whose graph node has no document identity — its segment's node-to-document mapping is missing or damaged — is dropped before the page is cut, so the page is still filled from results that do have one; each drop sets `coverage.degraded`, counts in `excalibur_query_unnamed_results_dropped_total`, and names its segment in the node's log. Text is not returned unless the request asked for it — send `"include_text": true` and every result also carries `text` and `text_truncated`; add `"snippet": true` for the part of the passage the query matched, and `"explain": true` for why the result is there at all.
 - **`retrieval`** — Which signals answered: `"hybrid"`, `"vector"` or `"lexical"`. Always present, on every path. It also tells you how to read `score`, because the three have no common scale — see [Hybrid retrieval](#hybrid-retrieval--both-signals).
 - **`llm_scored`** — `true` when a relevancy model reordered this answer. `score` is then the model's judgement between 0 and 1 for each result it judged, and not a similarity or a rank sum. It is set on every route: a vector answer is scored before it leaves the pipeline, a hybrid answer after fusion, a lexical answer over its BM25 candidates. `false` when scoring was not asked for, the node has no chat model, or the model failed or ran out of time. In that last case `coverage.degraded` is `true` and the results are in retrieval order.
 - **`coverage.estimated_corpus_coverage`** — Fraction of the live corpus this query actually read. Segments it did not read (`segments_excluded`), that failed (`segments_with_errors`) or that did not answer in time (`segments_timed_out`) each reduce it, and each is counted once. < 1.0 during cold-start or heavy ingestion. Use this to decide whether to retry.
 - **`coverage.segments_excluded`** — Live segments this query did not read for a reason that is not a failure. Two things land here: segments held back because `include_partial_segments` was `false`, which is your own choice; and segments with no vector index to search, which is the node's — their entries are in storage and no graph speaks for them. If you sent `include_partial_segments: true` and this is not zero, it is the second, and the node's log says which segments and why.
 - **`coverage.tail_scan_entries`** — How many entries this query read straight from segment write-log tails, i.e. entries that are already stored and searchable but not yet built into an HNSW graph. It is a freshness signal, not a fault: a steady non-zero value under ingestion is normal, and a large one means the tail scan is doing work the graph would otherwise do faster. If a tail scan has to stop early, `degraded` says so.
-- **`coverage.degraded`** — `true` when this answer is not what a fully healthy node would have returned. Four things set it: `estimated_corpus_coverage` below the node's threshold; a segment that errored; a segment that did not answer in time; and a segment whose write-log tail scan stopped early, which is the one case the counts above cannot show you — it is neither an error nor a timeout, its results are kept, and `segments_searched` still counts it, so without this flag the response would claim the whole corpus was read. It is also set when `enable_llm_scoring` was honoured and the relevancy model failed or ran out of time, so the answer kept its retrieval order. `degraded` never means the results are wrong; it means they are partial or ranked by a weaker signal, so retrying is worth considering.
+- **`coverage.degraded`** — `true` when this answer is not what a fully healthy node would have returned. Four things set it: `estimated_corpus_coverage` below the node's threshold; a segment that errored; a segment that did not answer in time; and a segment whose write-log tail scan stopped early, which is the one case the counts above cannot show you — it is neither an error nor a timeout, its results are kept, and `segments_searched` still counts it, so without this flag the response would claim the whole corpus was read. It is also set when `enable_llm_scoring` was honoured and the relevancy model failed or ran out of time, so the answer kept its retrieval order; when a result was dropped for having no document identity; and on every lexical answer, which came from one signal — see [the lexical answer](#degraded-retrieval--lexical-answers). `degraded` never means the results are wrong; it means they are partial or ranked by a weaker signal, so retrying is worth considering.
 - **`ignored_fields`** — the fields you sent that this answer accepted and did not act on. It is on every answer, empty included, on every route. See [the lexical answer](#degraded-retrieval--lexical-answers) and [hybrid retrieval](#hybrid-retrieval--both-signals) for which fields each route can leave unacted on.
 - **`timed_out`** — `true` if the timeout was hit. Partial results may still be returned (best-effort).
-- **`cancelled`** — `true` if `DELETE /v1/query/{query_id}` withdrew this query before it finished. A
-  cancelled query answers with whatever it had reached, which is usually nothing; without this field
-  that answer is indistinguishable from a query that searched the whole corpus and matched nothing.
+- **`cancelled`** — `true` exactly when `DELETE /v1/query/{query_id}` withdrew this query, which is
+  exactly when that call answered `"cancelled": true`. A withdrawn query answers with no results and
+  `coverage.degraded: true`, on every route and however far its search had got — a search that had
+  already finished included, since a withdrawn question is not answered, not even in part. Without
+  this field that answer is indistinguishable from a query that searched the whole corpus and
+  matched nothing.
   It is separate from `timed_out` on purpose: a deadline the server missed and a request you
   withdrew are different events, and only one of them is the server's to answer for.
 - **`from_cache`** — `true` when this answer came out of the query result cache instead of being
@@ -1525,8 +1528,9 @@ Key fields:
   and without this beside it a cache hit looks like a search that suddenly got faster. Always
   `false` on a node with `excalibur.query.cache.enabled=false`, which is the default; otherwise it
   can be `true` on every route. A cached answer is never a stale one — see
-  [the query cache](#the-query-cache) — and degraded, timed-out and cancelled answers, and answers
-  whose relevancy scoring fell back, are never cached at all, so a moment's trouble cannot be replayed as a persistent fault.
+  [the query cache](#the-query-cache) — and an answer that is the product of a moment's trouble is
+  never cached at all, so that trouble cannot be replayed as a persistent fault. See the cache
+  section for exactly which answers those are.
 - **`page`** — `offset`, `limit`, `returned` and `next_offset` for the page you got. Present on
   every answer, including the empty one a timed-out or cancelled query returns, so a caller never
   has to branch on whether it is there. `next_offset` is `null` unless the engine actually filled
@@ -1661,6 +1665,11 @@ key and `excalibur.llm.embeddings-enabled=false` the chat model is kept and spen
 query instead of on embedding every document, which is the deployment this path was built for: a
 few dozen generated tokens per query against billions of embedded tokens per corpus.
 
+A node that does embed its corpus answers here too, one query at a time, when its vector half
+cannot answer: the embedding endpoint fails or misses the deadline, or the pipeline does. That
+answer has the same shape, with `timed_out` saying whether a deadline was the cause — see
+[Hybrid retrieval](#hybrid-retrieval--both-signals) for each case.
+
 ### Hybrid retrieval — both signals
 
 A node with an embedding model indexes its chunks twice: into the HNSW graphs vector search reads,
@@ -1713,14 +1722,23 @@ Neither signal is allowed to fail the query, and that runs both ways.
 
 - **BM25 breaks, or misses the budget.** The vector answer stands and the response reports
   `"retrieval": "vector"`.
-- **The embedding endpoint or the vector pipeline misses the deadline.** You get the answer BM25
-  already finished, with `"retrieval": "lexical"` and `"timed_out": true` — the request did miss
-  its deadline, and it was answered by fewer signals than this node has, so both are said. If BM25
-  had not finished either, the response is the empty timeout answer as before.
+- **The vector pipeline reaches its deadline with partial results.** The pipeline hands back what
+  it had found, and that is still fused with BM25: the answer says `"retrieval": "hybrid"` with
+  `"timed_out": true` and `coverage.degraded: true`, because both signals did contribute.
+- **The embedding endpoint misses the deadline, or the pipeline hands back nothing in time.** You
+  get the answer BM25 already finished, with `"retrieval": "lexical"` and `"timed_out": true` — the
+  request did miss its deadline, and it was answered by fewer signals than this node has, so both
+  are said. If BM25 had not finished either, the response is the empty timeout answer.
+- **The embedding endpoint fails** — refuses the key, is behind an open circuit breaker, answers
+  `429` or `5xx`, or returns a vector with no usable values — **or the pipeline fails.** The query
+  is answered from BM25 with `"retrieval": "lexical"`, `"timed_out": false` and
+  `coverage.degraded: true`. Only when BM25 cannot answer either is it a `500` or `503`.
 - **The node is saturated.** Concurrent BM25 searches are capped at one per core, and never
   below two, because a search inside the lexical engine does not stop when its request does; past that cap the second
-  signal is shed for that request and the answer comes from vector search. This is load shedding,
-  not an error, and `retrieval` is the only place it shows.
+  signal is shed for that request and the answer comes from vector search. On a node with both
+  signals this is load shedding, not an error, and `retrieval` is the only place it shows. A node
+  with no embedding client has nothing to shed to, and answers `503` — see
+  [Error responses](#error-responses).
 - **You cancel with `DELETE /v1/query/{query_id}`.** Both halves stop and nothing is returned,
   including from the half that had finished: a withdrawn question is not answered.
 
@@ -1728,7 +1746,11 @@ In every case `retrieval` names the signals that actually ran, never a fusion th
 
 Set `excalibur.query.hybrid-retrieval=false` for vector-only ranking, which is what a deployment
 with a threshold tuned against cosine scores wants. The key has no effect on a node holding only
-one signal.
+one signal. It turns off fusion, not the lexical index: when the vector half fails on such a node,
+a BM25 search is started then — under the same concurrency cap, and within what is left of the
+request's deadline — and answers with `"retrieval": "lexical"` exactly as above. After a missed
+deadline there is nothing left to run one in, so a vector-only node's timeout answer is the empty
+one.
 
 The BM25 half of a hybrid query is not expanded by default. Query expansion is what carries the
 meaning of a question when there are no vectors, and here there are — so the lexical signal
@@ -1776,9 +1798,14 @@ Three things are deliberately never cached:
 
 - **Result text, snippets and explanations.** Read from chunk storage on every answer, so quoted
   text can never be stale.
-- **Degraded, timed-out and cancelled answers, and answers whose relevancy scoring fell back.** Enforced where entries are stored rather than at
-  each call site, so no path can forget it. Otherwise one moment's trouble would be replayed as a
-  persistent fault.
+- **Answers that are the product of a moment's trouble.** A vector or hybrid answer is not
+  stored when it is degraded, timed out or cancelled, or when its relevancy scoring fell back or ran
+  out of time. A lexical answer is not stored when it timed out or was cancelled, when its scoring
+  fell back, or when it read less than the whole index. Its `degraded` flag alone does not stop it:
+  that flag is set on every lexical answer, saying the answer came from one signal, and is not a
+  sign of trouble on a node that has only that one. And an answer from BM25 standing in for a
+  failed vector half is never stored, because it is not the answer the node's cache key names.
+  Enforced where entries are stored rather than at each call site, so no path can forget it.
 - **Anything at all, when either fingerprint cannot be read.** "I could not check whether anything
   changed" is not evidence that nothing did, so the cache stands aside for that request.
 
@@ -1823,6 +1850,50 @@ instead — see **Degraded retrieval** above. Reaching 503 means the chunk lexic
 index failed to open as well. The body names the configuration key and nothing else — no paths,
 no exception text — so it stays safe to return to an unauthenticated caller while still being
 actionable; the reason the index would not open is in the startup log.
+
+**`400 Bad Request` — `explain` or `snippet` on a query of more than 64 distinct terms**
+
+```json
+{"error": "Bad Request: the query holds 71 distinct terms and at most 64 can be explained or highlighted: shorten the query, or drop 'explain' and 'snippet'"}
+```
+
+Each term is looked for in every returned passage, so the count bounds the work a single request
+can ask for. Without `explain` and `snippet` the query is not held to it.
+
+**`413 Payload Too Large` — the body is over 1 MB**
+
+```json
+{"error": "Request body too large (max 1048576 bytes)"}
+```
+
+**`500 Internal Server Error` — the search failed**
+
+```json
+{"error": "Query execution failed"}
+```
+
+The vector half failed and BM25 could not answer in its place, or, on a node with no embedding
+client, the BM25 search itself failed. The reason is in the node's log, not the body.
+
+**`503 Service Unavailable` — the query service is saturated**
+
+```json
+{"error": "Query service is saturated"}
+```
+
+Only on a node with no embedding client: BM25 is its only signal, and every permit for a
+concurrent BM25 search is taken. Retry with backoff. A node that also has vector search sheds the
+BM25 half instead and answers from vectors.
+
+**`503 Service Unavailable` — the query service is not available, or was interrupted**
+
+```json
+{"error": "Query service is not available"}
+```
+
+The embedding came back unusable and BM25 could not answer in its place, or the node is not ready
+to search. `"Query interrupted"` is the same status for a request the node stopped while shutting
+down. Retry against a node that is up.
 
 **`401 Unauthorized` — missing or wrong bearer token**
 
@@ -1893,7 +1964,9 @@ colons and slashes.
 identifiers, so one page of results is always fetchable in one request.
 
 **Error — `400 Bad Request`** — a `GET` naming no `document_id`, a `POST` naming none, more than the
-bound, or an empty identifier in the array.
+bound, an empty identifier in the array, or the same identifier twice. A repeat is refused rather
+than answered twice, because otherwise the bound would limit how many identifiers are named and not
+how much text comes back. **`413 Payload Too Large`** — the body is over the request size limit.
 
 ### List what the node holds
 
@@ -1994,9 +2067,13 @@ curl -X DELETE http://localhost:8080/v1/query/b3d9f4a0-1e2c-4a7b-9c3d-5e6f7a8b9c
 ```
 
 Use the `query_id` returned in the original query response. Cancellation is cooperative and
-propagates through all query pipeline stages — an in-flight query will observe the cancel signal and
-return its own response with partial (or empty) results, marked `"cancelled": true`. A lexical
-answer is cancellable the same way: the search is interrupted where it stands.
+propagates through all query pipeline stages, both signals of a hybrid query, and the relevancy
+model. The two answers agree: when this route answers `"cancelled": true`, the query's own response
+is `200` with `"cancelled": true`, no results, and `coverage.degraded: true` — on the vector, hybrid
+and lexical routes alike, and even when the search had already finished, because the query's answer
+is written only once it can no longer be withdrawn. When this route answers `"cancelled": false` or
+`404`, the query was not withdrawn and answers as it would have. A query that misses its deadline
+is never reported cancelled, and is not "already cancelled" to this route.
 
 ---
 
@@ -2511,6 +2588,7 @@ Everything exported is a figure the node already measures; nothing here is estim
 | `excalibur_index_orchestrator_running`, `excalibur_segments_without_vector_index`, `excalibur_circuit_breaker_state{breaker="embedding"\|"llm_relevancy"\|"query_expansion"\|"graph_extraction"\|"graph_rerank"\|"graph_query_embedding"\|"graph_build_embedding"}` | gauge | The three partial failures described under Stats. Each breaker is `0` closed, `1` half-open, `2` open, so `> 0` is "this node is not using that part of its provider". A label is present only where the node has that component: `query_expansion` with a chat model behind query expansion, `graph_extraction` with a chat model behind relation extraction, `graph_rerank` once a graph that reranks with the chat model has been opened, `graph_query_embedding` once a graph built with entity vectors has, `graph_build_embedding` once a graph build has embedded an entity. The graph three carry no namespace label - every namespace shares them - so the series count stays at seven however many tenants the node serves |
 | `excalibur_lexical_*` | gauge | Chunk index size and the erasure backlog, including `_oldest_erasure_age_seconds` |
 | `excalibur_lexical_unreadable_chunks_dropped_total` | counter | Chunks a compaction dropped from the native index because their stored text was corrupt. Any increase means a damaged storage segment; alert on it |
+| `excalibur_query_unnamed_results_dropped_total` | counter | Vector hits dropped from `/v1/query` answers because their graph node has no document identity. Any increase means a segment's node-to-document mapping is missing entries; alert on it |
 | `excalibur_query_cache_lookups_total{result="hit"\|"miss"}`, `_evictions_total`, `_invalidations_total`, `excalibur_query_cache_entries`, `_capacity` | counter, gauge | Present only on a node with `excalibur.query.cache.enabled=true`. Hits and misses share one family so a hit ratio cannot be computed from a stale pairing. Evictions and invalidations are separate because they call for different actions: evictions mean the cache is too small for the traffic and `max-entries` is the answer, invalidations mean the corpus moved and no size would have helped |
 | `excalibur_graph_namespaces_open`, `_open_limit`, `excalibur_graph_namespace_evictions_total` | gauge, counter | Graph tenants open, the open bound, and evictions |
 | `excalibur_graph_build_running`, `excalibur_graph_builds_total{outcome="completed"\|"failed"\|"cancelled"}` | gauge, counter | Graph builds |
@@ -2827,6 +2905,7 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 | A `WARN` at startup naming documents that "were being ingested when this node last stopped" | Those documents were half written when the node died, and their chunks are hidden until the ingest is redone. Not an error: it is the crash being cleaned up after | Nothing — the next crawl of that source re-ingests them and they become visible again. `POST /v1/erasure` removes them instead |
 | `lexical.oldestErasureAgeMs` exceeds `lexical-max-latency-seconds` | The sweep that enforces the bound runs every tenth of it, so a reading just past the bound is ordinary; one far past it means the sweep is failing, and the node's log says why | Read the log for a failed compaction. Ingesting or reindexing anything also settles the backlog before the run finishes |
 | `lexical.unreadableChunksDropped` is above zero, or `excalibur_lexical_unreadable_chunks_dropped_total` rose | A compaction found chunks whose stored text fails its checksum or cannot be decoded, and dropped them from keyword search so the rest of their segments could be rewritten. The node's log names each chunk at ERROR | Check the disk under the data directory, run `excalibur-fsck` with the node stopped, and reindex the named chunks' documents from their source |
+| `excalibur_query_unnamed_results_dropped_total` rose, or query answers are `degraded` at full coverage with a WARN naming segments whose results "carry no document identity" | Those segments' `.docmap` is missing or damaged, so their graph nodes name no document and cannot be returned | Run `excalibur-fsck` with the node stopped to confirm which mapping is damaged. Nothing rebuilds a mapping in place, and a compaction only re-keys the one it finds: restore the graph and its mapping together from an `excalibur-backup` image, or reindex the sources whose documents that segment holds |
 | A re-crawled document appears twice in results | Not the chunk index — it replaces a chunk identifier rather than appending. Check whether the source is listing one document under two ids | Compare the `document_id` values on the two hits — that is the chunk identifier, `source:document:chunk:N`: identical means a bug, different means the source |
 | Queries slow down on a large corpus, and `/v1/stats` reports `cuckoo.saturated: true` | The membership filter is full. A level that cannot record a term is no longer trusted to rule a segment out, so pruning is off and every query scans every segment | Raise `excalibur.filter.corpus-capacity` past your term count and restart |
 | Node refuses to start: `Refusing to create segment N in <dir>: <other dir> already holds segment_N.dat` | Two volumes hold a file for the same segment index, usually from a volume set that changed between runs on an older build | Move or delete the stale copy — the one whose directory the catalog does not name — then restart |
@@ -3116,7 +3195,9 @@ The pipeline operates on vectors, so the caller embeds the question — with the
 itself. Results come back closest first. Read `documentIdStr()`, not `documentId()`: the string is
 the identifier ingestion assigned — `<sourceId>:<documentId>`, so `handbook:tiering.txt` here — and
 the one the HTTP API returns; `documentId()` is the numeric handle, which for a string-keyed result
-is the HNSW node id and matches nothing a caller can look up.
+is the HNSW node id and matches nothing a caller can look up. A result whose graph node has no
+document identity carries an empty `documentIdStr()`; set `requireNamedResults(true)` on the
+`QueryRequest`, as the HTTP API does, to have such results dropped before the page is cut.
 
 Shut down in the reverse of the order things were started: the pipeline and the ingestion
 orchestrator first, so nothing is still taking work, then the index orchestrator and the storage

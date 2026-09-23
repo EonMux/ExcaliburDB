@@ -120,13 +120,29 @@ import java.util.concurrent.*;
  *
  * <p>Neither signal is allowed to fail the query, and that runs both ways. A BM25 search that
  * breaks, misses the budget, or is shed because too many are already running leaves the vector
- * answer intact and the response says {@code "retrieval": "vector"}. An embedding endpoint or a
- * vector pipeline that misses the deadline, refuses the call, or returns something unusable is
- * answered from the BM25 half, which needed no embedding and has usually finished, with
- * {@code "retrieval": "lexical"}; {@code "timed_out"} then says whether a deadline is what ended
- * the vector half, and degraded coverage says the answer came from fewer signals either way. A
- * cancelled request is the one exception: it is answered by neither, because a withdrawn question
- * is not answered. What the field never reports is a fusion that did not happen.</p>
+ * answer intact and the response says {@code "retrieval": "vector"}. When the vector half
+ * cannot answer - the embedding endpoint misses the deadline, refuses the call or returns
+ * something unusable, or the pipeline fails or does not hand back even a partial answer within
+ * its grace period - the query is answered from BM25, which needs no embedding, with
+ * {@code "retrieval": "lexical"}. That holds on a node with fusion turned off too: it keeps the
+ * lexical index, so a failed vector half starts a BM25 search then, under the same permit cap
+ * and within what is left of the deadline. After a deadline nothing is left to wait with, so
+ * only a BM25 search that was already running can answer. {@code "timed_out"} says whether a
+ * deadline is what ended the vector half, and degraded coverage says the answer came from
+ * fewer signals either way. Only when BM25 cannot answer either does the query fail, with 500
+ * or 503.</p>
+ *
+ * <p>A pipeline that reaches its deadline hands back the results it already has, and those are
+ * still fused with BM25: the answer says {@code "retrieval": "hybrid"} with
+ * {@code "timed_out": true} and degraded coverage, because both signals did contribute.
+ * What the field never reports is a fusion that did not happen.</p>
+ *
+ * <h2>Withdrawing a query</h2>
+ * <p>{@code DELETE /v1/query/{id}} answers {@code "cancelled": true} only when it withdrew a
+ * query that was still running, and a query it withdrew answers 200 with
+ * {@code "cancelled": true}, no results, and degraded coverage - on every route, and however
+ * far the search had got, a finished one included. A withdrawn question is not answered, not
+ * even in part. See {@link QueryWithdrawal} for how the two answers are kept consistent.</p>
  *
  * <h2>Relevancy scoring</h2>
  * <p>{@code enable_llm_scoring}, {@code llm_threshold} and {@code oversampling_factor} apply on
@@ -139,9 +155,18 @@ import java.util.concurrent.*;
  * scoring fields in {@code ignored_fields} instead.</p>
  *
  * <h2>Timeout Handling</h2>
- * <p>Queries that exceed their timeout return partial results with
- * {@code timed_out: true}. The cancellation token is used to propagate
- * cancellation to all query stages.</p>
+ * <p>A query that exceeds its timeout returns what it reached, with {@code timed_out: true}:
+ * the pipeline's partial results, fused with BM25 where the node fuses, or BM25's alone when the
+ * vector half produced nothing in time. The pipeline stops on a token of its own, which it also
+ * cancels when its deadline passes; that is why a missed deadline is never reported as
+ * {@code cancelled}.</p>
+ *
+ * <h2>Result identity</h2>
+ * <p>Every {@code document_id} names stored content. A vector hit whose graph node has no
+ * document identity - its segment's node-to-document mapping is missing or damaged - is dropped
+ * before the page is cut rather than returned under a node number, which names nothing a caller
+ * could fetch. Dropping one marks coverage degraded and counts it in
+ * {@code excalibur_query_unnamed_results_dropped_total}.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is thread-safe. Each request creates its own CancellationToken
@@ -619,6 +644,11 @@ public class QueryEndpoint implements HttpHandler {
      * undo the judgement. The share of the budget the model needs is held back from both
      * signals, as Stage 5's is held back from the segment search.</p>
      *
+     * <h3>When the caller withdraws it</h3>
+     * <p>The answer is decided while the query can still be withdrawn and written only once it
+     * cannot - see {@link QueryWithdrawal}. A query {@code DELETE /v1/query/{id}} withdrew is
+     * answered as cancelled with no results, whatever either signal had reached by then.</p>
+     *
      * @param exchange The request to answer
      * @param request  The request
      * @param lookup   Where a cacheable answer is stored
@@ -626,39 +656,76 @@ public class QueryEndpoint implements HttpHandler {
      */
     private void search(HttpExchange exchange, Request request, QueryCacheLookup lookup)
             throws IOException {
-        QueryRequestParser.ParsedQuery parsed = request.parsed();
-        QueryContext context = request.context();
-        String queryId = request.queryId();
-        int depth = context.depth();
-        long deadlineNanos = request.deadlineNanos();
-
         // The BM25 signal needs no embedding, so it is started before the embedding call
         // rather than after the pipeline returns. Run in series the two signals would
         // cost the sum of their latencies, and their independence is the whole premise.
         com.eonmux.excalibur.api.retrieval.LexicalSignal lexicalSignal =
-            startLexicalSignal(request, request.plan().candidates(depth));
+            startLexicalSignal(request, request.plan().candidates(request.context().depth()));
         // Scored here, after fusion, only when there is going to be a fusion to score; a
         // request answered by vector search alone keeps its scoring in the pipeline.
         RelevancyScoring.Plan plan = lexicalSignal != null
             ? request.plan() : RelevancyScoring.Plan.NONE;
-        int candidates = plan.candidates(depth);
 
-        // Create cancellation token
-        CancellationToken token = new CancellationToken();
-
-        // Register query with registry for cancellation support
-        if (queryRegistry != null) {
-            queryRegistry.register(queryId, token, request.correlationId());
-        }
+        // Stops the pipeline. The pipeline cancels it itself when its deadline passes, which is
+        // why it is not the token a withdrawal is recorded on.
+        CancellationToken pipelineToken = new CancellationToken();
+        QueryWithdrawal withdrawal = QueryWithdrawal.open(queryRegistry, request.queryId(),
+            request.correlationId()).stops(pipelineToken);
         // Cancelling a query has to reach both signals. Without this the vector half
         // stops and the BM25 half keeps a Lucene search running for a request nobody
         // is waiting for.
         if (lexicalSignal != null) {
-            token.addListener(lexicalSignal::cancel);
+            withdrawal.token().addListener(lexicalSignal::cancel);
         }
 
-        QueryResponse response;
-        HybridResponse fusedAnswer = null;
+        QueryReply reply;
+        boolean withdrawn;
+        try {
+            reply = searchSignals(request, lookup, lexicalSignal, plan, pipelineToken,
+                withdrawal.token());
+        } finally {
+            // A no-op once it has been consumed; on every path that did not consume it
+            // this is what stops an abandoned search outliving the request that asked
+            // for it.
+            if (lexicalSignal != null) {
+                lexicalSignal.cancel();
+            }
+            withdrawn = withdrawal.close();
+        }
+        if (withdrawn && !Thread.currentThread().isInterrupted()) {
+            // Whatever the search reached, a finished answer and the half that happened to
+            // finish included: the cancel route told the caller this query was withdrawn, and
+            // a withdrawn question is not answered.
+            LOGGER.info("Query withdrawn after {}ms", request.elapsedMs());
+            QueryResponse cancelled = buildCancelledResponse(request.queryId(),
+                request.elapsedMs());
+            reply = answered -> sendVector(answered, cancelled, request);
+        }
+        reply.send(exchange);
+    }
+
+    /**
+     * Runs the vector half, and the BM25 half beside it when there is one, and decides the
+     * answer.
+     *
+     * @param request       The request
+     * @param lookup        Where a cacheable answer is stored
+     * @param lexicalSignal The BM25 search started beside the vector half, or null
+     * @param plan          How an answer the pipeline does not score is scored here
+     * @param pipelineToken Stops the pipeline
+     * @param withdrawal    Cancelled when, and only when, the caller withdraws the query
+     * @return The answer, to be written once the query can no longer be withdrawn
+     */
+    private QueryReply searchSignals(Request request, QueryCacheLookup lookup,
+                                     com.eonmux.excalibur.api.retrieval.LexicalSignal lexicalSignal,
+                                     RelevancyScoring.Plan plan, CancellationToken pipelineToken,
+                                     CancellationToken withdrawal) {
+        QueryRequestParser.ParsedQuery parsed = request.parsed();
+        QueryContext context = request.context();
+        String queryId = request.queryId();
+        int depth = context.depth();
+        int candidates = plan.candidates(depth);
+        long deadlineNanos = request.deadlineNanos();
         try {
             float[] vector = embedWithinBudget(parsed.query(), request.correlationId(),
                 deadlineNanos);
@@ -667,13 +734,9 @@ public class QueryEndpoint implements HttpHandler {
                 // The BM25 half needed no embedding and has usually finished by now.
                 // Answering empty would throw away a complete answer the node is
                 // holding and report the corpus as having nothing to say.
-                if (!lexicalAnswer.fallback(exchange, lexicalSignal, queryId,
-                        request.requestBody(), parsed, context, plan, token,
-                        request.startTime(), deadlineNanos, true)) {
-                    sendResponse(exchange, 200,
-                        buildTimeoutResponse(queryId, request.elapsedMs()), request);
-                }
-                return;
+                QueryResponse timedOut = buildTimeoutResponse(queryId, request.elapsedMs());
+                return fallBackToLexical(request, lexicalSignal, withdrawal, true,
+                    answered -> sendVector(answered, timedOut, request));
             }
 
             // What is left after embedding, not what the client asked for: the pipeline
@@ -686,9 +749,9 @@ public class QueryEndpoint implements HttpHandler {
             QueryRequest pipelineRequest = pipelineQuery(context, parsed, plan, candidates)
                 .toRequest(vector, request.correlationId(), budgetMs);
             CompletableFuture<QueryResponse> future =
-                queryPipeline.execute(pipelineRequest, token);
+                queryPipeline.execute(pipelineRequest, pipelineToken);
 
-            response = future.get(
+            QueryResponse response = future.get(
                 budgetMs + PIPELINE_RESPONSE_GRACE_MILLIS, TimeUnit.MILLISECONDS);
             response = response.withQueryId(queryId);
             List<com.eonmux.excalibur.api.retrieval.LexicalQueryService.Hit> hits =
@@ -699,99 +762,82 @@ public class QueryEndpoint implements HttpHandler {
             if (fused != null) {
                 RelevancyScoring.Outcome<com.eonmux.excalibur.api.retrieval.HybridFusion.Result>
                     scored = relevancy.score(plan, fused, depth, RelevancyScoring.FUSED,
-                        deadlineNanos, token);
+                        deadlineNanos, withdrawal);
                 if (scored.cancelled()) {
-                    response = buildCancelledResponse(queryId, request.elapsedMs());
-                } else {
-                    fusedAnswer = new HybridResponse(
-                        response.withQueryTimeMs(request.elapsedMs()), hits, scored.ranking(),
-                        fused.size() < candidates, scored.scored(), scored.fellBack(),
-                        scored.timedOut());
-                    // Refused by the cache unless the search reached the whole corpus it
-                    // meant to, inside its deadline, against the corpus it was fingerprinted
-                    // at, and any scoring it was due finished. A degraded answer replayed to
-                    // later callers turns one moment's trouble into a persistent fault.
-                    lookup.keep(QueryResponseJson.HYBRID, fusedAnswer);
+                    return cancelledReply(request);
                 }
-            } else {
-                response = scoredAlone(response, plan, depth, deadlineNanos, token, request);
-                // Only stored when vector search is the answer this node's key names. On a
-                // node that fuses, this is the answer it gives when BM25 failed, which is not
-                // the fused answer the next caller with this key is owed.
-                lookup.keep(QueryResponseJson.VECTOR, response);
+                HybridResponse fusedAnswer = new HybridResponse(
+                    response.withQueryTimeMs(request.elapsedMs()), hits, scored.ranking(),
+                    fused.size() < candidates, scored.scored(), scored.fellBack(),
+                    scored.timedOut());
+                // Refused by the cache unless the search reached the whole corpus it
+                // meant to, inside its deadline, against the corpus it was fingerprinted
+                // at, and any scoring it was due finished. A degraded answer replayed to
+                // later callers turns one moment's trouble into a persistent fault.
+                lookup.keep(QueryResponseJson.HYBRID, fusedAnswer);
+                return answered -> sendHybrid(answered, fusedAnswer, request);
             }
+            QueryResponse alone = scoredAlone(response, plan, depth, deadlineNanos, withdrawal,
+                request);
+            // Only stored when vector search is the answer this node's key names. On a
+            // node that fuses, this is the answer it gives when BM25 failed, which is not
+            // the fused answer the next caller with this key is owed.
+            lookup.keep(QueryResponseJson.VECTOR, alone);
+            return answered -> sendVector(answered, alone, request);
         } catch (TimeoutException e) {
-            // Cancel the token to propagate cancellation
-            token.cancel("Query timeout");
+            pipelineToken.cancel("Query timeout");
             long durationMs = request.elapsedMs();
             LOGGER.warn("Query timed out after {}ms", durationMs);
             // Which half missed the deadline does not change what the other half is
             // holding. Answering empty here would claim vector search produced the
             // answer when vector search is exactly what failed.
-            if (lexicalAnswer.fallback(exchange, lexicalSignal, queryId, request.requestBody(),
-                    parsed, context, plan, token, request.startTime(), deadlineNanos, true)) {
-                return;
-            }
-            response = buildTimeoutResponse(queryId, durationMs);
+            QueryResponse timedOut = buildTimeoutResponse(queryId, durationMs);
+            return fallBackToLexical(request, lexicalSignal, withdrawal, true,
+                answered -> sendVector(answered, timedOut, request));
         } catch (CancellationException e) {
             // No fallback here, unlike the timeout above: the caller withdrew the
             // request, and handing back an answer from the signal that happened to
             // finish is answering a question that was taken back.
-            long durationMs = request.elapsedMs();
-            LOGGER.info("Query cancelled after {}ms", durationMs);
-            response = buildCancelledResponse(queryId, durationMs);
+            LOGGER.info("Query cancelled after {}ms", request.elapsedMs());
+            return cancelledReply(request);
         } catch (InterruptedException e) {
-            // Restore the flag: swallowing it leaves the carrier thread unable
-            // to observe the shutdown that interrupted it.
+            // Restore the flag: swallowing it leaves the carrier thread unable to observe
+            // the shutdown that interrupted it.
             Thread.currentThread().interrupt();
-            token.cancel("Query interrupted");
+            pipelineToken.cancel("Query interrupted");
             LOGGER.warn("Query interrupted");
-            sendError(exchange, 503, "Query interrupted");
-            return;
+            return QueryReply.error(503, "Query interrupted");
         } catch (ExecutionException e) {
             // A rejected key, an open circuit breaker, a 429, a 5xx, or a pipeline that
-            // threw. None of those is a fact about the corpus, and the BM25 half needed
-            // no embedding: the documented effect of a missing embedding endpoint is no
+            // threw. None of those is a fact about the corpus, and BM25 needs no
+            // embedding: the documented effect of a missing embedding endpoint is no
             // dense signal, not a failed query. So this degrades exactly as a missed
             // deadline does, and answers 500 only when there is nothing to degrade to -
             // where 200 with an empty list would be indistinguishable from "nothing
             // matched".
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             LOGGER.error("Query failed: {}", cause.getMessage(), cause);
-            if (degradeToLexical(exchange, lexicalSignal, request, plan, token)) {
-                return;
-            }
-            sendError(exchange, 500, "Query execution failed");
-            return;
+            return fallBackToLexical(request, lexicalSignal, withdrawal, false,
+                QueryReply.error(500, "Query execution failed"));
         } catch (IllegalStateException e) {
             // An empty or non-finite embedding: the vector half cannot produce a
             // meaningful distance from it, which makes this the same outage as one the
-            // provider reports outright. It reached the handler's own 503 before, which
-            // threw away the BM25 answer this node was already holding.
+            // provider reports outright.
             LOGGER.error("Query embedding is unusable: {}", e.getMessage(), e);
-            if (degradeToLexical(exchange, lexicalSignal, request, plan, token)) {
-                return;
-            }
-            sendError(exchange, 503, "Query service is not available");
-            return;
-        } finally {
-            // A no-op once it has been consumed; on every path that did not consume it
-            // this is what stops an abandoned search outliving the request that asked
-            // for it.
-            if (lexicalSignal != null) {
-                lexicalSignal.cancel();
-            }
-            // Unregister query when complete
-            if (queryRegistry != null) {
-                queryRegistry.unregister(queryId);
-            }
+            return fallBackToLexical(request, lexicalSignal, withdrawal, false,
+                QueryReply.error(503, "Query service is not available"));
         }
+    }
 
-        if (fusedAnswer != null) {
-            sendHybrid(exchange, fusedAnswer, request);
-            return;
-        }
-        sendVector(exchange, response, request);
+    /**
+     * The answer to a withdrawn query: no results, and nothing claimed as covered.
+     *
+     * @param request The request
+     * @return The reply
+     */
+    private QueryReply cancelledReply(Request request) {
+        QueryResponse cancelled = buildCancelledResponse(request.queryId(), request.elapsedMs());
+        return answered -> sendVector(answered, cancelled, request);
     }
 
     /**
@@ -825,30 +871,33 @@ public class QueryEndpoint implements HttpHandler {
      * <p>The pipeline was asked for the fused candidate set unscored, and then BM25 produced
      * nothing to fuse. The candidates are scored here instead, so a request that asked for
      * relevancy scoring gets it whichever signal ended up answering, and are cut to the page's
-     * depth either way.</p>
+     * depth either way. Whether retrieval ran out of candidates is then this method's to say:
+     * the pipeline was asked for the candidate set, and a set shorter than that was
+     * everything there was.</p>
      *
      * @param response      What the pipeline produced
      * @param plan          How this request is scored here, {@code NONE} when the pipeline did
      * @param depth         How deep the answer is, being offset plus page size
      * @param deadlineNanos {@link System#nanoTime()} value the request must finish by
-     * @param token         Withdraws the scoring call when the caller cancels
+     * @param withdrawal    Withdraws the scoring call when the caller cancels
      * @param request       The request
      * @return The answer
      * @throws InterruptedException if the request is interrupted while it is scored
      */
     private QueryResponse scoredAlone(QueryResponse response, RelevancyScoring.Plan plan,
-                                      int depth, long deadlineNanos, CancellationToken token,
+                                      int depth, long deadlineNanos, CancellationToken withdrawal,
                                       Request request) throws InterruptedException {
         if (!plan.runs()) {
             return response;
         }
         RelevancyScoring.Outcome<QueryResultItem> scored = relevancy.score(plan,
-            response.results(), depth, RelevancyScoring.VECTOR, deadlineNanos, token);
+            response.results(), depth, RelevancyScoring.VECTOR, deadlineNanos, withdrawal);
         if (scored.cancelled()) {
             return buildCancelledResponse(request.queryId(), request.elapsedMs());
         }
         return response.withResults(scored.ranking())
             .withLlmScored(scored.scored())
+            .withRetrievalExhausted(response.results().size() < plan.candidates(depth))
             .withCoverage(response.coverage().orDegraded(scored.degraded()))
             .withTimedOut(response.timedOut() || scored.timedOut())
             .withQueryTimeMs(request.elapsedMs());
@@ -908,9 +957,11 @@ public class QueryEndpoint implements HttpHandler {
      * ones.
      *
      * <p>A search that was cut short cannot establish that there was nothing more to find, so
-     * its total is a floor however many results it came back with. Nor can a relevancy-scored
-     * one: its threshold chose from a candidate set, and a short list says only that few of
-     * those candidates passed, not that nothing past them would have.</p>
+     * its total is a floor however many results it came back with. A relevancy-scored answer
+     * can, when retrieval had run out of candidates: its threshold then chose from everything
+     * there was, so a short list is the whole of what passed. When retrieval had not, a short
+     * list says only that few of the candidates passed, not that nothing past them would
+     * have.</p>
      *
      * @param exchange The request to answer
      * @param response The vector answer, searched or held
@@ -920,8 +971,9 @@ public class QueryEndpoint implements HttpHandler {
     private void sendVector(HttpExchange exchange, QueryResponse response, Request request)
             throws IOException {
         QueryContext context = request.context();
-        boolean complete = !response.llmScored() && ResultTotal.searchWasComplete(
-            response.coverage(), response.timedOut(), response.cancelled());
+        boolean complete = (!response.llmScored() || response.retrievalExhausted())
+            && ResultTotal.searchWasComplete(
+                response.coverage(), response.timedOut(), response.cancelled());
         List<QueryResultItem> produced = response.results();
         List<QueryResultItem> page = context.page(produced.size()).slice(produced);
         QueryExplanation explanation = context.explaining()
@@ -933,42 +985,73 @@ public class QueryEndpoint implements HttpHandler {
     }
 
     /**
-     * Answers from the BM25 half after the vector half failed outright.
+     * Answers from BM25 after the vector half failed, or the given reply when it cannot.
      *
-     * <p>Distinct from the timeout paths in one way that matters: a failure can leave budget on
-     * the clock. A circuit breaker refuses in microseconds, so the BM25 search that started
-     * alongside the embedding call may well still be running, and reading only what it has
-     * finished would report "no answer" for a search that was about to produce one. So what is
-     * left of the request's own deadline is waited out first, and no longer - less the model's
-     * share, when the answer is to be scored.</p>
+     * <p>The BM25 search that started beside the vector half is used when there is one. When
+     * there is none - fusion is turned off, or the node was saturated when this request
+     * started - and the node keeps a lexical index, one is started now: BM25 needs no
+     * embedding, so an embedding endpoint that is down leaves this node with no dense signal,
+     * not with no answer. It takes a permit like any other BM25 search, and is not started
+     * after a timeout, since there is nothing left of the deadline to wait for its answer
+     * with.</p>
      *
-     * @param exchange      The request to answer
-     * @param lexicalSignal The BM25 search, or null when none was started
-     * @param request       The request
-     * @param plan          How the BM25 ranking is to be scored
-     * @param token         Withdraws the scoring call when the caller cancels
-     * @return true when an answer was sent, false when this signal had none to give
-     * @throws IOException if the response cannot be written
+     * <p>A failure can leave budget on the clock. A circuit breaker refuses in microseconds, so
+     * the BM25 search may well still be running, and reading only what it has finished would
+     * report "no answer" for a search that was about to produce one. So what is left of the
+     * request's own deadline is waited out first, and no longer - less the model's share,
+     * when the answer is to be scored. After a timeout nothing is left, and only what has
+     * already finished is read.</p>
+     *
+     * @param request    The request
+     * @param running    The BM25 search started beside the vector half, or null
+     * @param withdrawal Withdraws the search and the scoring when the caller cancels
+     * @param timedOut   Whether a deadline, rather than a failure, ended the vector half
+     * @param otherwise  The reply when BM25 has no answer to give either
+     * @return The lexical answer, or {@code otherwise}
      */
-    private boolean degradeToLexical(HttpExchange exchange,
-                                     com.eonmux.excalibur.api.retrieval.LexicalSignal lexicalSignal,
-                                     Request request, RelevancyScoring.Plan plan,
-                                     CancellationToken token) throws IOException {
-        if (lexicalSignal == null) {
-            return false;
-        }
+    private QueryReply fallBackToLexical(Request request,
+                                         com.eonmux.excalibur.api.retrieval.LexicalSignal running,
+                                         CancellationToken withdrawal, boolean timedOut,
+                                         QueryReply otherwise) {
         long deadlineNanos = request.deadlineNanos();
+        RelevancyScoring.Plan plan = request.plan();
+        com.eonmux.excalibur.api.retrieval.LexicalSignal signal = running;
+        boolean startedHere = false;
+        if (signal == null && !timedOut && request.lexical() != null
+                && Deadline.remainingMillis(deadlineNanos) > 0) {
+            signal = com.eonmux.excalibur.api.retrieval.LexicalSignal.start(request.lexical(),
+                executorService, request.parsed().query(),
+                plan.candidates(request.context().depth()));
+            startedHere = signal != null;
+            if (startedHere) {
+                withdrawal.addListener(signal::cancel);
+            }
+        }
+        if (signal == null) {
+            return otherwise;
+        }
         try {
-            lexicalSignal.await(plan.retrievalBudgetMs(Deadline.remainingMillis(deadlineNanos)));
+            if (!timedOut) {
+                signal.await(plan.retrievalBudgetMs(Deadline.remainingMillis(deadlineNanos)));
+            }
+            LexicalResponse response = lexicalAnswer.fallback(signal, request.queryId(),
+                request.context(), plan, withdrawal, request.startTime(), deadlineNanos,
+                timedOut);
+            if (response == null) {
+                return otherwise;
+            }
+            return LexicalAnswer.reply(response, request.requestBody(), request.parsed(),
+                request.context(), plan);
         } catch (InterruptedException e) {
             // Restore the flag and let the caller answer: building a 200 on a thread carrying
             // an unanswered interrupt closes the channel mid-write.
             Thread.currentThread().interrupt();
-            return false;
+            return otherwise;
+        } finally {
+            if (startedHere) {
+                signal.cancel();
+            }
         }
-        return lexicalAnswer.fallback(exchange, lexicalSignal, request.queryId(),
-            request.requestBody(), request.parsed(), request.context(), plan, token,
-            request.startTime(), deadlineNanos, false);
     }
 
     /**
@@ -1054,25 +1137,6 @@ public class QueryEndpoint implements HttpHandler {
                     "Embedding contains non-finite value at index " + i + ": " + vector[i]);
             }
         }
-    }
-
-    /**
-     * Sends an answer that has no results and no page behind it.
-     *
-     * <p>For the exits where the search produced nothing and could not establish that there
-     * was nothing to produce. The envelope is the same one every other answer uses, because a
-     * client that has to test for the page block on some answers cannot use it on any.</p>
-     *
-     * @param exchange   The request to answer
-     * @param statusCode The status to answer with
-     * @param response   The empty answer
-     * @param request    The request, for its page size and the fields it sent
-     * @throws IOException if the response cannot be written
-     */
-    private void sendResponse(HttpExchange exchange, int statusCode, QueryResponse response,
-                              Request request) throws IOException {
-        sendJson(exchange, statusCode, QueryResponseJson.vector(response, response.results(),
-            QueryAnswer.nothing(request.parsed().topK()).ignoring(request.ignored())));
     }
 
     /**

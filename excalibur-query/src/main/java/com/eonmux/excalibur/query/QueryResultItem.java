@@ -166,13 +166,20 @@ public final class QueryResultItem {
      * identifier a caller can actually look something up by, and the one both retrieval paths
      * report, which is what lets a result found by each of them be recognised as one result.</p>
      *
-     * <p><strong>Not a unique key.</strong> A result the pipeline could not name - a graph with
-     * no node-document mapping, a write-log entry with an empty key - falls back to the numeric
-     * identifier, and for those results the numeric identifier is the node ID. Node IDs are
-     * unique only within their segment and are renumbered by compaction, so two such results
-     * can share this string and be different documents. Anything keying on identity rather than
-     * display must pair it with {@link #segmentId()}, as
-     * {@code ResultAggregator} and {@code HybridFusion} both do.</p>
+     * <p><strong>Not a unique key.</strong> A result the pipeline could not name - a graph node
+     * its node-to-document mapping has no entry for, a write-log entry with an empty key - falls
+     * back to the numeric identifier, and for those results the numeric identifier is the node
+     * ID. Node IDs are unique only within their segment and are renumbered by compaction, so two
+     * such results can share this string and be different documents, and none of them names
+     * anything outside this process. Anything keying on identity rather than display must pair
+     * it with {@link #segmentId()}, as {@code ResultAggregator} and {@code HybridFusion} both
+     * do.</p>
+     *
+     * <p>The fallback is for embedded callers, which can use the node id together with
+     * {@link #segmentId()} and {@link #generation()}. A caller that hands identifiers to someone
+     * outside the process must never see it, and asks the pipeline to drop unnamed results
+     * instead - see {@link QueryRequest#requireNamedResults()}. The HTTP query route does, so
+     * a node id never reaches a client as a {@code document_id}.</p>
      *
      * @return The display identifier, never null
      */

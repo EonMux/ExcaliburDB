@@ -32,10 +32,12 @@ import java.util.concurrent.TimeoutException;
  * Answers a query from the BM25 signal.
  *
  * <p>Two routes reach this. A node with no embedding client has no vector half at all and
- * answers every query here. A node that has one answers here only when the vector half misses
- * its deadline, because the two signals are independent and one failing does not decide the
- * other's fate - the node is holding a complete lexical answer, and returning nothing would
- * report the corpus as empty of what it actually contains.</p>
+ * answers every query here. A node that has one answers here when the vector half cannot -
+ * its embedding or pipeline misses the deadline, fails, or produces something unusable - because
+ * the two signals are independent and one failing does not decide the other's fate: BM25 needs
+ * no embedding, and returning nothing would report the corpus as empty of what it actually
+ * contains. That includes a node with fusion turned off, which starts its BM25 search only once
+ * the vector half has failed.</p>
  *
  * <p>Both say so in the response rather than passing a partial answer off as a whole one:
  * coverage is marked degraded, and the request fields this path cannot act on are named back
@@ -47,6 +49,11 @@ import java.util.concurrent.TimeoutException;
  * {@link RelevancyScoring} puts that candidate set in front of the model, inside the same
  * deadline and the same cancellation as the search. A node with no embeddings is the deployment
  * that most needs the model's judgement, since expansion is the only semantics it has.</p>
+ *
+ * <h2>Withdrawal</h2>
+ * <p>A query {@code DELETE /v1/query/{id}} withdrew answers {@code "cancelled": true} with no
+ * results, whatever the search had reached; the answer is decided while the query can still be
+ * withdrawn and written only once it cannot. See {@link QueryWithdrawal}.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is thread-safe, holding only the collaborators a request needs.</p>
@@ -116,34 +123,30 @@ final class LexicalAnswer {
      * node has, and {@code timed_out} reports whether a deadline is what ended the other half
      * rather than being set because the answer is degraded.</p>
      *
-     * <p>When the request was to be scored after fusion, the BM25 search ranked the whole
-     * candidate set, so it is scored here instead - with whatever is left of the deadline, which
-     * after a vector timeout is nothing, and then the BM25 order is returned and the answer says
-     * it timed out. Either way the ranking is cut to the page's depth before it is answered.
-     * Never cached: it is not the answer the request's cache key names.</p>
+     * <p>When the request is to be scored, the BM25 search ranked the whole candidate set, so
+     * it is scored here - with whatever is left of the deadline, which after a vector timeout is
+     * nothing, and then the BM25 order is returned and the answer says it timed out. Either way
+     * the ranking is cut to the page's depth before it is answered. Never cached: it is not the
+     * answer the request's cache key names.</p>
      *
-     * @param exchange      The request to answer
+     * <p>Decided here and written by the caller, after the query stops being cancellable - see
+     * {@link QueryReply}.</p>
+     *
      * @param lexicalSignal The BM25 search, or null when none was started
      * @param queryId       The identifier this query was registered under
-     * @param requestBody   The raw request, for the fields this path cannot honour
-     * @param parsed        The validated request
      * @param context       What this request asked for beyond the search
-     * @param plan          How this request's answer was to be scored
-     * @param token         Withdraws the scoring call when the caller cancels the request
+     * @param plan          How this request's answer is to be scored
+     * @param withdrawal    Withdraws the scoring call when the caller cancels the request
      * @param startTime     {@link System#nanoTime()} value the request's budget runs from
      * @param deadlineNanos {@link System#nanoTime()} value the request must finish by
      * @param timedOut      Whether the vector half ran out of time rather than failing
-     * @return true when an answer was sent, false when this signal had none to give, or the
-     *         request was interrupted while its answer was being scored
-     * @throws IOException if the response cannot be written
+     * @return The answer, or null when this signal had none to give, or the request was
+     *         interrupted while its answer was being scored
      */
-    boolean fallback(HttpExchange exchange,
-                     LexicalSignal lexicalSignal,
-                     String queryId, String requestBody,
-                     QueryRequestParser.ParsedQuery parsed, QueryContext context,
-                     RelevancyScoring.Plan plan, CancellationToken token,
-                     long startTime, long deadlineNanos, boolean timedOut)
-            throws IOException {
+    LexicalResponse fallback(LexicalSignal lexicalSignal, String queryId,
+                             QueryContext context, RelevancyScoring.Plan plan,
+                             CancellationToken withdrawal, long startTime, long deadlineNanos,
+                             boolean timedOut) {
         List<LexicalQueryService.Hit> hits =
             lexicalSignal == null ? null : lexicalSignal.ready();
         // Completed, not non-empty: BM25 running and matching nothing is a fact about the
@@ -151,7 +154,7 @@ final class LexicalAnswer {
         // depend on whether the query happened to match. `retrieval` means which signals ran
         // everywhere else on this route, and it has to mean that here too.
         if (hits == null) {
-            return false;
+            return null;
         }
         IndexCoverage coverage;
         try {
@@ -161,28 +164,26 @@ final class LexicalAnswer {
             // a reason to lose the answer - but coverage that cannot be read cannot be
             // guessed at either, so this falls back to the timeout response.
             LOGGER.warn("The lexical index could not report its coverage: {}", e.getMessage());
-            return false;
+            return null;
         }
         int depth = context.depth();
         boolean exhausted = hits.size() < plan.candidates(depth);
         RelevancyScoring.Outcome<LexicalQueryService.Hit> scored;
         try {
             scored = relevancy.score(plan, hits, depth, RelevancyScoring.HITS, deadlineNanos,
-                token);
+                withdrawal);
         } catch (InterruptedException e) {
             // Restore the flag and let the caller answer: building a 200 on a thread carrying
             // an unanswered interrupt closes the channel mid-write.
             Thread.currentThread().interrupt();
-            return false;
+            return null;
         }
         long durationMs = (System.nanoTime() - startTime) / 1_000_000;
-        LexicalResponse response = new LexicalResponse(queryId, scored.ranking(), exhausted,
+        return new LexicalResponse(queryId, scored.ranking(), exhausted,
             scored.cancelled() ? LexicalCoverage.cancelled(lexicalSignal.service().stats())
                 : coverage,
             timedOut || scored.timedOut(), scored.cancelled(), scored.scored(),
             scored.fellBack(), durationMs, false);
-        send(exchange, response, requestBody, parsed, context, plan);
-        return true;
     }
 
     /**
@@ -249,27 +250,57 @@ final class LexicalAnswer {
             return;
         }
 
-        CancellationToken token = new CancellationToken();
         // Registered before the search starts and kept until scoring is over, so
         // DELETE /v1/query/{id} can find it for the whole time it is running rather than
         // answering "not found or already completed" for a query that is neither.
-        if (queryRegistry != null) {
-            queryRegistry.register(queryId, token, correlationId);
-        }
-        LexicalResponse response;
+        QueryWithdrawal withdrawal = QueryWithdrawal.open(queryRegistry, queryId, correlationId);
+        QueryReply reply;
+        boolean withdrawn;
         try {
-            response = searchAndScore(exchange, lexical, parsed, context, plan, queryId, token,
-                startTime);
+            reply = searchAndScore(lexical, lookup, requestBody, parsed, context, plan, queryId,
+                withdrawal.token(), startTime);
         } finally {
-            if (queryRegistry != null) {
-                queryRegistry.unregister(queryId);
-            }
+            withdrawn = withdrawal.close();
         }
-        if (response == null) {
-            return;
+        if (withdrawn && !Thread.currentThread().isInterrupted()) {
+            // Whatever the search reached, a finished answer or a failure included: the cancel
+            // route told the caller this query was withdrawn, and a withdrawn question is not
+            // answered.
+            LOGGER.info("Lexical query withdrawn after {}ms", elapsedMs(startTime));
+            reply = reply(cancelled(lexical, queryId, startTime), requestBody, parsed, context,
+                plan);
         }
-        lookup.keep(QueryResponseJson.LEXICAL, response);
-        send(exchange, response, requestBody, parsed, context, plan);
+        reply.send(exchange);
+    }
+
+    /**
+     * The answer to a query the caller withdrew: no results, and nothing claimed as covered.
+     *
+     * @param lexical   The index, asked for its own account of itself
+     * @param queryId   The identifier the query was registered under
+     * @param startTime {@link System#nanoTime()} value the request's budget runs from
+     * @return The answer
+     */
+    private static LexicalResponse cancelled(LexicalQueryService lexical, String queryId,
+                                             long startTime) {
+        return new LexicalResponse(queryId, List.of(), false, coverageFor(lexical, false, true),
+            false, true, false, false, elapsedMs(startTime), false);
+    }
+
+    /**
+     * A lexical answer, to be written once the query can no longer be withdrawn.
+     *
+     * @param response    What the search produced, or what the cache held
+     * @param requestBody The raw request, for the fields this path cannot honour
+     * @param parsed      The validated request
+     * @param context     What this request asked for beyond the search
+     * @param plan        How this request's answer was to be scored
+     * @return The reply
+     */
+    static QueryReply reply(LexicalResponse response, String requestBody,
+                            QueryRequestParser.ParsedQuery parsed, QueryContext context,
+                            RelevancyScoring.Plan plan) {
+        return exchange -> send(exchange, response, requestBody, parsed, context, plan);
     }
 
     /**
@@ -307,51 +338,55 @@ final class LexicalAnswer {
     /**
      * Searches, then scores what the search found, all inside the request's budget.
      *
-     * @param exchange  The request, answered here when the search could not produce one
-     * @param lexical   The index to search
-     * @param parsed    The validated request
-     * @param context   What this request asked for beyond the search, for its depth
-     * @param plan      How this request's answer is to be scored
-     * @param queryId   The identifier the running query is registered under
-     * @param token     Cancels the search and the scoring when the caller withdraws
-     * @param startTime {@link System#nanoTime()} value the request's budget runs from
-     * @return The answer, or null when this method has already answered
-     * @throws IOException if a refusal cannot be written
+     * @param lexical     The index to search
+     * @param lookup      Where a cacheable answer is stored
+     * @param requestBody The raw request, for the fields this path cannot honour
+     * @param parsed      The validated request
+     * @param context     What this request asked for beyond the search, for its depth
+     * @param plan        How this request's answer is to be scored
+     * @param queryId     The identifier the running query is registered under
+     * @param token       Cancels the search and the scoring when the caller withdraws
+     * @param startTime   {@link System#nanoTime()} value the request's budget runs from
+     * @return The answer, or the refusal when the search could not produce one
      */
-    private LexicalResponse searchAndScore(HttpExchange exchange, LexicalQueryService lexical,
-                                           QueryRequestParser.ParsedQuery parsed,
-                                           QueryContext context, RelevancyScoring.Plan plan,
-                                           String queryId, CancellationToken token,
-                                           long startTime) throws IOException {
+    private QueryReply searchAndScore(LexicalQueryService lexical, QueryCacheLookup lookup,
+                                      String requestBody, QueryRequestParser.ParsedQuery parsed,
+                                      QueryContext context, RelevancyScoring.Plan plan,
+                                      String queryId, CancellationToken token,
+                                      long startTime) {
         long deadlineNanos = startTime + TimeUnit.MILLISECONDS.toNanos(parsed.timeoutMs());
         int depth = context.depth();
         int candidates = plan.candidates(depth);
-        Outcome outcome = search(exchange, lexical, parsed, candidates, token, deadlineNanos);
-        if (outcome == null) {
-            return null;
+        Outcome outcome = search(lexical, parsed, candidates, token, deadlineNanos);
+        if (outcome.refusal() != null) {
+            return outcome.refusal();
         }
+        LexicalResponse response;
         if (outcome.timedOut() || outcome.cancelled()) {
-            return new LexicalResponse(queryId, List.of(), false,
+            response = new LexicalResponse(queryId, List.of(), false,
                 coverageFor(lexical, outcome.timedOut(), outcome.cancelled()),
                 outcome.timedOut(), outcome.cancelled(), false, false, elapsedMs(startTime),
                 false);
+        } else {
+            RelevancyScoring.Outcome<LexicalQueryService.Hit> scored;
+            try {
+                scored = relevancy.score(plan, outcome.hits(), depth, RelevancyScoring.HITS,
+                    deadlineNanos, token);
+            } catch (InterruptedException e) {
+                // Restore the flag: swallowing it leaves the carrier thread unable to observe
+                // the shutdown that interrupted it.
+                Thread.currentThread().interrupt();
+                return QueryReply.error(503, "Query interrupted");
+            }
+            response = new LexicalResponse(queryId, scored.ranking(),
+                outcome.hits().size() < candidates,
+                coverageFor(lexical, false, scored.cancelled()),
+                scored.timedOut(), scored.cancelled(), scored.scored(), scored.fellBack(),
+                elapsedMs(startTime), false);
         }
-        RelevancyScoring.Outcome<LexicalQueryService.Hit> scored;
-        try {
-            scored = relevancy.score(plan, outcome.hits(), depth, RelevancyScoring.HITS,
-                deadlineNanos, token);
-        } catch (InterruptedException e) {
-            // Restore the flag: swallowing it leaves the carrier thread unable to observe the
-            // shutdown that interrupted it.
-            Thread.currentThread().interrupt();
-            ResponseBody.sendError(exchange, 503, "Query interrupted");
-            return null;
-        }
-        return new LexicalResponse(queryId, scored.ranking(),
-            outcome.hits().size() < candidates,
-            coverageFor(lexical, false, scored.cancelled()),
-            scored.timedOut(), scored.cancelled(), scored.scored(), scored.fellBack(),
-            elapsedMs(startTime), false);
+        // The cache refuses anything but a whole answer; see LexicalResponse.cacheable.
+        lookup.keep(QueryResponseJson.LEXICAL, response);
+        return reply(response, requestBody, parsed, context, plan);
     }
 
     private static long elapsedMs(long startTime) {
@@ -364,31 +399,33 @@ final class LexicalAnswer {
      * @param hits      The ranked passages, empty when the search did not finish
      * @param timedOut  Whether the request's budget ran out
      * @param cancelled Whether the caller withdrew the request
+     * @param refusal   The error answer when the search produced nothing to answer with,
+     *                  otherwise null
      */
     private record Outcome(List<LexicalQueryService.Hit> hits, boolean timedOut,
-                           boolean cancelled) {
+                           boolean cancelled, QueryReply refusal) {
+
+        static Outcome refused(QueryReply refusal) {
+            return new Outcome(List.of(), false, false, refusal);
+        }
     }
 
     /**
      * Starts the search, inside the node-wide bound on concurrent BM25 searches.
      *
-     * @param exchange The request, answered here when the search cannot be started
-     * @param lexical  The index to search
-     * @param query    The query text
-     * @param limit    How deep the search ranks
-     * @return The running search, or null when this method has already answered
-     * @throws IOException if a refusal cannot be written
+     * @param lexical The index to search
+     * @param query   The query text
+     * @param limit   How deep the search ranks
+     * @return The running search, or null when it could not be started
      */
-    private Future<List<LexicalQueryService.Hit>> start(HttpExchange exchange,
-                                                        LexicalQueryService lexical,
-                                                        String query, int limit)
-            throws IOException {
+    private Future<List<LexicalQueryService.Hit>> start(LexicalQueryService lexical,
+                                                        String query, int limit) {
         // The same node-wide bound the hybrid route takes. This route is the whole answer on a
         // node that does not embed its corpus, so a bound held only by the other route leaves
         // that deployment with none: a BM25 search outlives the request's deadline, and at the
         // rate the guard allows, abandoned searches accumulate faster than they drain.
         if (!LexicalSearchPermits.tryAcquire()) {
-            refuse(exchange, "every BM25 permit is in use");
+            LOGGER.warn("Could not start the lexical search: every BM25 permit is in use");
             return null;
         }
         try {
@@ -404,46 +441,31 @@ final class LexicalAnswer {
             });
         } catch (RejectedExecutionException e) {
             LexicalSearchPermits.release();
-            refuse(exchange, e.getMessage());
+            LOGGER.warn("Could not start the lexical search: {}", e.getMessage());
             return null;
         }
     }
 
     /**
-     * Answers 503 for a search that could not be started.
-     *
-     * <p>The registration is unwound by the caller, which holds it for the search and the
-     * scoring together.</p>
-     *
-     * @param exchange The request to refuse
-     * @param reason   Why the search could not start, for the node's log only
-     * @throws IOException if the refusal cannot be written
-     */
-    private static void refuse(HttpExchange exchange, String reason) throws IOException {
-        LOGGER.warn("Could not start the lexical search: {}", reason);
-        ResponseBody.sendError(exchange, 503, "Query service is saturated");
-    }
-
-    /**
      * Runs the search inside the request's budget, cancellable for as long as it runs.
      *
-     * @param exchange      The request, answered here when the search could not produce one
+     * <p>A search that cannot start is refused with 503 rather than queued: this route is the
+     * whole answer on a node that does not embed its corpus, so there is no other signal to
+     * shed to, and queueing would make the node slower under exactly the load that made the
+     * permits scarce.</p>
+     *
      * @param lexical       The index to search
      * @param parsed        The validated request
      * @param limit         How deep the search ranks
      * @param token         Cancels the search when the caller withdraws the request
      * @param deadlineNanos {@link System#nanoTime()} value the request must finish by
-     * @return What the search produced, or null when this method has already answered
-     * @throws IOException if a refusal cannot be written
+     * @return What the search produced, or the refusal when it produced nothing to answer with
      */
-    private Outcome search(HttpExchange exchange, LexicalQueryService lexical,
-                           QueryRequestParser.ParsedQuery parsed, int limit,
-                           CancellationToken token, long deadlineNanos)
-            throws IOException {
-        Future<List<LexicalQueryService.Hit>> pending =
-            start(exchange, lexical, parsed.query(), limit);
+    private Outcome search(LexicalQueryService lexical, QueryRequestParser.ParsedQuery parsed,
+                           int limit, CancellationToken token, long deadlineNanos) {
+        Future<List<LexicalQueryService.Hit>> pending = start(lexical, parsed.query(), limit);
         if (pending == null) {
-            return null;
+            return Outcome.refused(QueryReply.error(503, "Query service is saturated"));
         }
         // Attached after the submit because it needs the future, and addListener runs
         // immediately if a cancellation arrived in between. It releases the request, not the
@@ -452,28 +474,26 @@ final class LexicalAnswer {
         try {
             return new Outcome(
                 pending.get(Deadline.remainingMillis(deadlineNanos), TimeUnit.MILLISECONDS),
-                false, false);
+                false, false, null);
         } catch (TimeoutException e) {
             abandon(pending);
             LOGGER.warn("Lexical query exceeded its {}ms budget", parsed.timeoutMs());
-            return new Outcome(List.of(), true, false);
+            return new Outcome(List.of(), true, false, null);
         } catch (CancellationException e) {
             LOGGER.info("Lexical query cancelled");
-            return new Outcome(List.of(), false, true);
+            return new Outcome(List.of(), false, true, null);
         } catch (InterruptedException e) {
             // Restore the flag: swallowing it leaves the carrier thread unable to observe the
             // shutdown that interrupted it.
             Thread.currentThread().interrupt();
             abandon(pending);
-            ResponseBody.sendError(exchange, 503, "Query interrupted");
-            return null;
+            return Outcome.refused(QueryReply.error(503, "Query interrupted"));
         } catch (ExecutionException e) {
             // A failed search is a failure. Reporting it as 200 with an empty result list is
             // indistinguishable from "nothing matched".
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             LOGGER.error("Lexical query failed: {}", cause.getMessage(), cause);
-            ResponseBody.sendError(exchange, 500, "Query execution failed");
-            return null;
+            return Outcome.refused(QueryReply.error(500, "Query execution failed"));
         }
     }
 
