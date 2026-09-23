@@ -2,6 +2,8 @@ package com.eonmux.excalibur.graph.staging;
 
 import com.eonmux.excalibur.graph.build.BuildCancellation;
 import com.eonmux.excalibur.graph.file.Durability;
+import com.eonmux.excalibur.graph.file.LogCorruptionException;
+import com.eonmux.excalibur.graph.file.LogInspection;
 import com.eonmux.excalibur.graph.file.TailIntegrity;
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
@@ -20,6 +22,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.zip.CRC32;
@@ -213,21 +216,121 @@ public final class EntityTextLog implements AutoCloseable {
             return;
         }
         byte[] all = Files.readAllBytes(path);
-        Cursor cursor = new Cursor(all);
-        while (cursor.next()) {
-            // Walked only for where the readable records end; nothing here decodes a snippet.
-        }
-        if (cursor.position >= all.length) {
+        LogInspection walked = walk(path, all);
+        if (!walked.hasTornTail()) {
             return;
         }
 
-        cursor.requireTornTail(path);
         LOGGER.warn("truncating {} from {} to {} bytes after {} snippet(s): a write was cut "
             + "short, and appending after it would leave every later snippet behind damage that "
-            + "replay stops at", path, all.length, cursor.position, cursor.read);
+            + "replay stops at", path, all.length, walked.intactBytes(), walked.records());
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
-            channel.truncate(cursor.position);
+            channel.truncate(walked.intactBytes());
         }
+    }
+
+    /**
+     * Reads what a log holds without opening it.
+     *
+     * <h3>Why this is not {@link #open}</h3>
+     * <p>Opening creates the file and its directory when they are missing, rewrites a
+     * pre-provenance log in the current version, cuts a torn tail off the end and takes an append
+     * handle - the right things for a node taking the log over, and writes an offline checker
+     * must not make. This reads the file once and walks it with the framing the open walks it
+     * with: the current version's through the same cursor {@link #forEach} and {@link #erase}
+     * read, and a pre-provenance log's through the same walk its upgrade copies records with.
+     * It writes nothing, and a pre-provenance log is reported at the version it is, since that is
+     * what is on disk.</p>
+     *
+     * <h3>What it refuses</h3>
+     * <p>Everything {@link #open} refuses, on the same terms: a file that is not one of these
+     * logs, a version this build does not read, and a record that fails its checksum with an
+     * intact record somewhere after it - the last as a {@link LogCorruptionException}, so that
+     * damage can be told apart from a file that merely could not be read. A record that fails its
+     * checksum with nothing readable after it is reported rather than refused, because the open
+     * treats it as a write cut short and trims it; see {@link LogInspection#hasTornTail()}.</p>
+     *
+     * @param path The log's file
+     * @return How many snippets matched their checksums, and where the file stops reading cleanly
+     * @throws IOException if the file is absent, shorter than its header, not a log of a version
+     *                     this build reads, or cannot be read
+     * @throws LogCorruptionException if damage has an intact snippet behind it
+     * @throws NullPointerException if {@code path} is null
+     */
+    public static LogInspection inspect(Path path) throws IOException {
+        Objects.requireNonNull(path, "path must not be null");
+        byte[] all = Files.readAllBytes(path);
+        if (versionOf(all, path) == VERSION_WITHOUT_PROVENANCE) {
+            return walkLegacy(path, all, (entityId, text) -> {
+                // Counted only; nothing is carried anywhere.
+            });
+        }
+        return walk(path, all);
+    }
+
+    /**
+     * Walks every current-version record, refusing damage that is not a tail.
+     *
+     * <p>The judgement the open's trim and {@link #inspect} share. Nothing here decodes a
+     * snippet: all either needs is where the readable records end, and whether what follows
+     * them is a write cut short or damage with acknowledged records behind it.</p>
+     *
+     * @param path The log, named in any failure
+     * @param all  The whole log as read
+     * @return What the walk found
+     * @throws LogCorruptionException if damage has an intact record behind it
+     */
+    private static LogInspection walk(Path path, byte[] all) throws LogCorruptionException {
+        Cursor cursor = new Cursor(all);
+        while (cursor.next()) {
+            // Walked only for where the readable records end.
+        }
+        cursor.requireTornTail(path);
+        return new LogInspection(VERSION, cursor.read, cursor.position, all.length);
+    }
+
+    /** Receives each record of a pre-provenance log, in order. */
+    @FunctionalInterface
+    private interface LegacyVisitor {
+
+        /**
+         * @param entityId The entity the text mentions
+         * @param text     The snippet's bytes, a copy the visitor may keep
+         * @throws IOException if the visitor's own write fails
+         */
+        void visit(int entityId, byte[] text) throws IOException;
+    }
+
+    /**
+     * Walks every record of a pre-provenance log, refusing damage that is not a tail.
+     *
+     * <p>Shared by the upgrade, which copies each record across as it is reached, and by
+     * {@link #inspect}, which counts them - so the two cannot disagree about which bytes of an
+     * old log are a snippet and which a torn tail the upgrade leaves behind.</p>
+     *
+     * @param path    The log, named in any failure
+     * @param all     The whole log as read
+     * @param visitor Receives each record
+     * @return What the walk found
+     * @throws IOException if the visitor fails
+     * @throws LogCorruptionException if damage has an intact record behind it
+     */
+    private static LogInspection walkLegacy(Path path, byte[] all, LegacyVisitor visitor)
+            throws IOException {
+        int position = HEADER_BYTES;
+        long read = 0;
+        while (legacyRecordStartsAt(all, position)) {
+            ByteBuffer buffer = ByteBuffer.wrap(all, position, all.length - position);
+            int entityId = buffer.getInt();
+            int length = buffer.getInt();
+            int text = position + LEGACY_RECORD_HEADER_BYTES;
+            visitor.visit(entityId, Arrays.copyOfRange(all, text, text + length));
+            position = text + length + Integer.BYTES;
+            read++;
+        }
+        TailIntegrity.requireTornTail(path, "entity text log", all, position,
+            EntityTextLog::legacyRecordStartsAt);
+        return new LogInspection(VERSION_WITHOUT_PROVENANCE, read, position, all.length);
     }
 
     /**
@@ -431,27 +534,16 @@ public final class EntityTextLog implements AutoCloseable {
         byte[] all = Files.readAllBytes(path);
         Path temp = path.resolveSibling(path.getFileName() + REWRITE_SUFFIX);
         Files.deleteIfExists(temp);
-        long upgraded = 0;
-        int validBytes = HEADER_BYTES;
+        long upgraded;
 
         try (DataOutputStream rewritten = new DataOutputStream(new BufferedOutputStream(
                 Files.newOutputStream(temp, StandardOpenOption.CREATE_NEW,
                     StandardOpenOption.WRITE)))) {
             writeHeader(rewritten);
-            ByteBuffer buffer = ByteBuffer.wrap(all);
-            buffer.position(HEADER_BYTES);
-            while (legacyRecordStartsAt(all, buffer.position())) {
-                int entityId = buffer.getInt();
-                int length = buffer.getInt();
-                byte[] text = new byte[length];
-                buffer.get(text);
-                buffer.getInt();
-                rewritten.write(encode(entityId, text, Provenance.UNKNOWN));
-                validBytes = buffer.position();
-                upgraded++;
-            }
-            TailIntegrity.requireTornTail(path, "entity text log", all, validBytes,
-                EntityTextLog::legacyRecordStartsAt);
+            // Damage that is not a tail is refused by the walk after the copy, before anything
+            // is swapped in, so the old log is left exactly as it was.
+            upgraded = walkLegacy(path, all, (entityId, text) ->
+                rewritten.write(encode(entityId, text, Provenance.UNKNOWN))).records();
         } catch (IOException | RuntimeException e) {
             Files.deleteIfExists(temp);
             throw e;
@@ -487,12 +579,27 @@ public final class EntityTextLog implements AutoCloseable {
 
     private static int versionOf(Path path) throws IOException {
         byte[] header = new byte[HEADER_BYTES];
+        int read;
         try (var in = Files.newInputStream(path)) {
-            if (in.readNBytes(header, 0, HEADER_BYTES) < HEADER_BYTES) {
-                throw new IOException("entity text log " + path + " is shorter than its header");
-            }
+            read = in.readNBytes(header, 0, HEADER_BYTES);
         }
-        ByteBuffer buffer = ByteBuffer.wrap(header);
+        return versionOf(Arrays.copyOf(header, read), path);
+    }
+
+    /**
+     * Reads the magic and the version from the front of a log.
+     *
+     * @param head At least the log's first {@value #HEADER_BYTES} bytes
+     * @param path The log, named in any failure
+     * @return The version, one this build reads
+     * @throws IOException if the bytes are too few for a header, are not one of these logs, or
+     *                     name a version this build does not read
+     */
+    private static int versionOf(byte[] head, Path path) throws IOException {
+        if (head.length < HEADER_BYTES) {
+            throw new IOException("entity text log " + path + " is shorter than its header");
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(head);
         long magic = buffer.getLong();
         if (magic != MAGIC) {
             throw new IOException("not an entity text log (magic 0x" + Long.toHexString(magic)
@@ -626,7 +733,7 @@ public final class EntityTextLog implements AutoCloseable {
                 end - start - RECORD_HEADER_BYTES - Integer.BYTES, StandardCharsets.UTF_8);
         }
 
-        void requireTornTail(Path path) throws IOException {
+        void requireTornTail(Path path) throws LogCorruptionException {
             TailIntegrity.requireTornTail(path, "entity text log", all, position,
                 EntityTextLog::recordStartsAt);
         }

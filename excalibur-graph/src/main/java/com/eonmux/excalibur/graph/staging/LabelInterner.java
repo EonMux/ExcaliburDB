@@ -1,6 +1,8 @@
 package com.eonmux.excalibur.graph.staging;
 
 import com.eonmux.excalibur.graph.file.Durability;
+import com.eonmux.excalibur.graph.file.LogCorruptionException;
+import com.eonmux.excalibur.graph.file.LogInspection;
 import com.eonmux.excalibur.graph.file.TailIntegrity;
 
 import org.slf4j.Logger;
@@ -116,24 +118,18 @@ public final class LabelInterner implements AutoCloseable {
             Files.createDirectories(parent);
         }
 
-        Replay replay = readExisting(path);
+        Replay replay = readChecked(path);
         List<String> existing = replay.labels();
 
         // Truncated to the last record that read cleanly, before anything is appended. Without
         // this, a torn tail stays in the file and every record written after it sits behind a
         // record the next replay stops at - so those labels are read back as absent and their ids
         // are handed out again to different labels. Ids that move are the one thing this class
-        // exists to prevent.
-        //
-        // Which is also why the truncation is refused unless the unreadable bytes really are a
-        // tail. Labels lost from the middle of the file would be reassigned to whatever is
-        // interned next, while the published entities.idx still maps those ids to the labels that
-        // were lost - one entity served under another's name, reported by nothing.
-        if (Files.exists(path) && Files.size(path) > replay.validBytes()) {
-            TailIntegrity.requireTornTail(path, "label interner", replay.contents(),
-                replay.validBytes(), LabelInterner::recordStartsAt);
+        // exists to prevent. readChecked has already refused unreadable bytes that are not a
+        // tail; see there for why.
+        if (replay.contents().length > replay.validBytes()) {
             LOGGER.warn("truncating {} from {} to {} bytes: the tail was not readable",
-                path, Files.size(path), replay.validBytes());
+                path, replay.contents().length, replay.validBytes());
             try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(
                     path, StandardOpenOption.WRITE)) {
                 channel.truncate(replay.validBytes());
@@ -147,6 +143,46 @@ public final class LabelInterner implements AutoCloseable {
         }
         LOGGER.debug("opened label interner {} holding {} labels", path, existing.size());
         return interner;
+    }
+
+    /**
+     * Reads what an interner holds without opening it.
+     *
+     * <h3>Why this is not {@link #open}</h3>
+     * <p>Opening creates the file and its directory when they are missing, cuts a torn tail off
+     * the end and takes an append handle - the right things for a node taking the interner over,
+     * and writes an offline checker must not make. This reads the file once, walks it with the
+     * replay {@link #open} uses, draws the same line between a torn tail and damage, and writes
+     * nothing.</p>
+     *
+     * <h3>What it refuses</h3>
+     * <p>Everything {@link #open} refuses, on the same terms: a file that is not an interner, a
+     * version this build does not read, and a record that fails its checksum with an intact
+     * record somewhere after it - the last as a {@link LogCorruptionException}, so that damage
+     * can be told apart from a file that merely could not be read. Counting the labels before
+     * such damage would be a wrong answer rather than a partial one: the open refuses the file,
+     * and a count that read as sound would say the node will start when it will not.</p>
+     *
+     * <p>A record that fails its checksum with nothing readable after it is reported rather than
+     * refused, because the open treats it as a write cut short and trims it; see
+     * {@link LogInspection#hasTornTail()}.</p>
+     *
+     * @param path The interner's file
+     * @return How many labels matched their checksums, and where the file stops reading cleanly
+     * @throws IOException if the file is absent, shorter than its header, not an interner of a
+     *                     version this build reads, or cannot be read
+     * @throws LogCorruptionException if damage has an intact label behind it
+     * @throws NullPointerException if {@code path} is null
+     */
+    public static LogInspection inspect(Path path) throws IOException {
+        Objects.requireNonNull(path, "path must not be null");
+        if (Files.size(path) < HEADER_BYTES) {
+            throw new IOException("label interner " + path + " is shorter than its "
+                + HEADER_BYTES + "-byte header");
+        }
+        Replay replay = readChecked(path);
+        return new LogInspection(VERSION, replay.labels().size(), replay.validBytes(),
+            replay.contents().length);
     }
 
     /**
@@ -450,6 +486,27 @@ public final class LabelInterner implements AutoCloseable {
             }
         }
         return new Replay(labels, validBytes, all);
+    }
+
+    /**
+     * Reads back the assignments a previous run recorded, refusing damage that is not a tail.
+     *
+     * <p>The one judgement {@link #open} and {@link #inspect} share. Labels lost from the middle
+     * of the file would be reassigned to whatever is interned next, while the published
+     * {@code entities.idx} still maps those ids to the labels that were lost - one entity served
+     * under another's name, reported by nothing - so unreadable bytes are accepted only when
+     * nothing readable follows them.</p>
+     *
+     * @param path The file
+     * @return The labels, in id order, and where they end
+     * @throws IOException if the file cannot be read or is not an interner this build reads
+     * @throws LogCorruptionException if damage has an intact label behind it
+     */
+    private static Replay readChecked(Path path) throws IOException {
+        Replay replay = readExisting(path);
+        TailIntegrity.requireTornTail(path, "label interner", replay.contents(),
+            replay.validBytes(), LabelInterner::recordStartsAt);
+        return replay;
     }
 
     /**

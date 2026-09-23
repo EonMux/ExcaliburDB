@@ -2,6 +2,8 @@ package com.eonmux.excalibur.graph.staging;
 
 import com.eonmux.excalibur.graph.build.BuildCancellation;
 import com.eonmux.excalibur.graph.file.Durability;
+import com.eonmux.excalibur.graph.file.LogCorruptionException;
+import com.eonmux.excalibur.graph.file.LogInspection;
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.store.RelationSelector;
@@ -366,8 +368,8 @@ public final class GraphStagingStore implements AutoCloseable {
      * @param factsBefore  How many records read cleanly before the damage
      * @return The failure to throw
      */
-    private static IOException corrupt(Path logPath, long factsBefore) {
-        return new IOException("triple log " + logPath + " has a corrupt record at fact "
+    private static LogCorruptionException corrupt(Path logPath, long factsBefore) {
+        return new LogCorruptionException("triple log " + logPath + " has a corrupt record at fact "
             + factsBefore + ". The records are fixed width and a partial trailing one is trimmed "
             + "when the log is opened, so this is rot rather than a write cut short, and the "
             + "facts after it were written and acknowledged. Building from the facts before it "
@@ -670,28 +672,19 @@ public final class GraphStagingStore implements AutoCloseable {
 
         Path temp = logPath.resolveSibling(logPath.getFileName() + REWRITE_SUFFIX);
         Files.deleteIfExists(temp);
-        long upgraded = 0;
+        long upgraded;
         try {
             try (DataOutputStream rewritten = openLog(temp)) {
                 byte[] record = new byte[RECORD_BYTES];
                 ByteBuffer view = ByteBuffer.wrap(record).order(ByteOrder.LITTLE_ENDIAN);
-                for (int start = HEADER_BYTES; start + LEGACY_RECORD_BYTES <= all.length;
-                     start += LEGACY_RECORD_BYTES) {
-                    CRC32 crc = new CRC32();
-                    crc.update(all, start, LEGACY_RECORD_BYTES - Integer.BYTES);
-                    int stored = ByteBuffer.wrap(all, start + LEGACY_RECORD_BYTES - Integer.BYTES,
-                        Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN).getInt();
-                    if (stored != (int) crc.getValue()) {
-                        throw corrupt(logPath, upgraded);
-                    }
+                upgraded = walkLegacy(logPath, all, start -> {
                     System.arraycopy(all, start, record, 0, INTERVAL_END);
                     view.putInt(INTERVAL_END, TemporalFilter.UNDATED);
                     System.arraycopy(all, start + INTERVAL_END, record,
                         INTERVAL_END + Integer.BYTES, PROVENANCE_BYTES);
                     sealRecord(record);
                     rewritten.write(record);
-                    upgraded++;
-                }
+                });
             }
             Durability.DEVICE.replaceDurably(temp, logPath);
         } finally {
@@ -700,6 +693,102 @@ public final class GraphStagingStore implements AutoCloseable {
         LOGGER.warn("upgraded {} to triple log version {}: {} fact(s) carried across with no "
             + "stated day, so the order they were staged in is what orders them for supersession",
             logPath, VERSION, upgraded);
+    }
+
+    /** Receives the offset of each whole, checksum-clean record of a version 1 log, in order. */
+    @FunctionalInterface
+    private interface LegacyRecordVisitor {
+
+        /**
+         * @param start Where the record begins in the log as read
+         * @throws IOException if the visitor's own write fails
+         */
+        void visit(int start) throws IOException;
+    }
+
+    /**
+     * Walks every whole record of a version 1 log, refusing one whose checksum fails.
+     *
+     * <p>Shared by the upgrade, which carries each record across as it is reached, and by
+     * {@link #inspectTripleLog}, which counts them, so the two cannot disagree about which
+     * records an old log holds. A partial record at the end is not reached: the upgrade drops
+     * it, as opening trims one in any version.</p>
+     *
+     * @param logPath The log, named in any failure
+     * @param all     The whole log as read
+     * @param visitor Receives each record
+     * @return How many whole records the log holds
+     * @throws IOException if the visitor fails
+     * @throws LogCorruptionException if a whole record's checksum fails; see {@link #corrupt}
+     */
+    private static long walkLegacy(Path logPath, byte[] all, LegacyRecordVisitor visitor)
+            throws IOException {
+        long read = 0;
+        for (int start = HEADER_BYTES; start + LEGACY_RECORD_BYTES <= all.length;
+             start += LEGACY_RECORD_BYTES) {
+            CRC32 crc = new CRC32();
+            crc.update(all, start, LEGACY_RECORD_BYTES - Integer.BYTES);
+            int stored = ByteBuffer.wrap(all, start + LEGACY_RECORD_BYTES - Integer.BYTES,
+                Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN).getInt();
+            if (stored != (int) crc.getValue()) {
+                throw corrupt(logPath, read);
+            }
+            visitor.visit(start);
+            read++;
+        }
+        return read;
+    }
+
+    /**
+     * Reads what a triple log holds without opening the store.
+     *
+     * <h3>Why this is not {@link #open}</h3>
+     * <p>Opening a store creates its directory and every missing file in it, rewrites a version
+     * 1 log in the current version, trims a partial trailing record and takes append handles -
+     * the right things for a node taking the store over, and writes an offline checker must not
+     * make. This reads the one file and walks its records with the code the node does: a current
+     * log through the cursor every build's replay and every erasure's rewrite read it with, and a
+     * version 1 log through the walk its upgrade copies records with. It writes nothing, and a
+     * version 1 log is reported at the version it is, since that is what is on disk.</p>
+     *
+     * <h3>What it refuses, and what it reports</h3>
+     * <p>A record whose checksum fails is refused, as a {@link LogCorruptionException}, wherever
+     * it is in the log - including the last whole record. The records are fixed width, so every
+     * whole record was written whole, and a failed checksum over one is rot rather than a write
+     * cut short; the node refuses such a log in its build and its erasure (and, at version 1, in
+     * its upgrade, so the store does not open at all). See {@link #corrupt}. What is reported
+     * rather than refused is a trailing partial record, which the open trims; see
+     * {@link LogInspection#hasTornTail()}.</p>
+     *
+     * @param log The triple log
+     * @return How many facts matched their checksums, and where the whole records end
+     * @throws IOException if the file is absent, shorter than its header, not a triple log of a
+     *                     version this build reads, or cannot be read
+     * @throws LogCorruptionException if a whole record's checksum fails
+     * @throws NullPointerException if {@code log} is null
+     */
+    public static LogInspection inspectTripleLog(Path log) throws IOException {
+        Objects.requireNonNull(log, "log must not be null");
+        byte[] all = Files.readAllBytes(log);
+        if (all.length < HEADER_BYTES) {
+            throw new IOException("triple log " + log + " is shorter than its "
+                + HEADER_BYTES + "-byte header");
+        }
+        int version = versionOf(ByteBuffer.wrap(all), log, "triple log");
+        long records;
+        if (version == VERSION_WITHOUT_STATED_ON) {
+            records = walkLegacy(log, all, start -> {
+                // Counted only; nothing is carried anywhere.
+            });
+        } else {
+            Cursor cursor = new Cursor(all, log);
+            while (cursor.next()) {
+                // Walked only for the checksums; every fact is decoded and dropped.
+            }
+            records = cursor.read;
+        }
+        return new LogInspection(version, records,
+            HEADER_BYTES + records * recordBytes(version), all.length);
     }
 
     /**

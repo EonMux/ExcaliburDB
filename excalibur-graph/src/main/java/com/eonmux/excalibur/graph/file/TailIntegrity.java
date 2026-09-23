@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.graph.file;
 
-import java.io.IOException;
 import java.nio.file.Path;
 
 /**
@@ -80,10 +79,10 @@ public final class TailIntegrity {
      * @param contents   The whole file
      * @param validBytes Where the records that replayed cleanly ended
      * @param scan       Recognises this log's framing
-     * @throws IOException if a well-formed record follows the break
+     * @throws LogCorruptionException if a well-formed record follows the break
      */
     public static void requireTornTail(Path file, String what, byte[] contents, long validBytes,
-                                       RecordScan scan) throws IOException {
+                                       RecordScan scan) throws LogCorruptionException {
         if (validBytes >= contents.length) {
             return;
         }
@@ -91,7 +90,7 @@ public final class TailIntegrity {
         if (intact < 0) {
             return;
         }
-        throw new IOException(what + " " + file + " is unreadable from byte " + validBytes
+        throw new LogCorruptionException(what + " " + file + " is unreadable from byte " + validBytes
             + ", but holds a further intact record at byte " + intact + ". That is corruption in "
             + "the middle of the log rather than a write cut short at the end, so the records "
             + "after the damage were written and acknowledged. Truncating to the damage would "
