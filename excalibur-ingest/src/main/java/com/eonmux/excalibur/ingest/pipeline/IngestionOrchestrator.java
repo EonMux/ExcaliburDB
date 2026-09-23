@@ -150,9 +150,6 @@ public class IngestionOrchestrator {
     /** The BM25 index kept beside the chunks written here, if the node keeps one. */
     private final LexicalSideIndex lexicalSideIndex;
 
-    /** Files written terms under their segment, so queries search the segments holding theirs first. */
-    private final SegmentTermRecorder termRecorder = new SegmentTermRecorder();
-
     /** Reports published documents onwards, so a graph can be built from them. */
     private final GraphReporter graphReporter = new GraphReporter();
 
@@ -300,7 +297,7 @@ public class IngestionOrchestrator {
         this.lexicalSideIndex = new LexicalSideIndex(storageEngine);
         this.documentIngestor = new DocumentIngestor(textChunker, embeddingClient, storageEngine,
             visibilityTracker, this.documentRegistry,
-            this.lexicalSideIndex, this.termRecorder, this.graphReporter);
+            this.lexicalSideIndex, this.graphReporter);
         this.documentTimeoutMs = documentTimeoutMs > 0 ? documentTimeoutMs : DEFAULT_DOCUMENT_TIMEOUT_MS;
         this.activeIngestions = ConcurrentHashMap.newKeySet();
         this.ingestionThreads = new ConcurrentHashMap<>();
@@ -333,19 +330,6 @@ public class IngestionOrchestrator {
                 "lexical refresh interval must be positive: " + intervalMs);
         }
         this.lexicalRefreshIntervalMs = intervalMs;
-    }
-
-    /**
-     * Points ingestion at the membership filter the query pipeline orders segments by.
-     *
-     * <p>Set after construction, like the lexical index: the filter is built by the API layer's
-     * bootstrap alongside the index orchestrator. Without one, stage 1 of the query pipeline
-     * has nothing to say about anything this node crawled.</p>
-     *
-     * @param membershipFilter The filter, or null to keep none
-     */
-    public void setMembershipFilter(com.eonmux.excalibur.filter.HierarchicalCuckooFilter membershipFilter) {
-        this.termRecorder.setFilter(membershipFilter);
     }
 
     /**
@@ -397,7 +381,7 @@ public class IngestionOrchestrator {
     /**
      * Wires the eraser that retires a rolled back document's graph nodes.
      *
-     * <p>Set after construction, like the lexical index and the membership filter: the vector
+     * <p>Set after construction, like the lexical index: the vector
      * stack belongs to the API layer, which is assembled after this orchestrator.</p>
      *
      * @param vectorEraser The eraser, or null on a node that keeps no vector index

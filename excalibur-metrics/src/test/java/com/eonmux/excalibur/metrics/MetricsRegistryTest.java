@@ -33,7 +33,6 @@ class MetricsRegistryTest {
         "com.eonmux.excalibur:type=SystemHealth",
         "com.eonmux.excalibur:type=IngestionQueue",
         "com.eonmux.excalibur:type=VisibilityEpoch",
-        "com.eonmux.excalibur:type=CuckooFpRate",
         "com.eonmux.excalibur:type=HnswQueueDepth",
         "com.eonmux.excalibur:type=IngestionThroughput"
     };

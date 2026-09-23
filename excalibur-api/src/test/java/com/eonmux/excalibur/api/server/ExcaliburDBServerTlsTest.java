@@ -6,7 +6,6 @@ import com.eonmux.excalibur.api.security.TlsConfig;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.EpochTickScheduler;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
-import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
 
@@ -60,7 +59,6 @@ class ExcaliburDBServerTlsTest {
         SegmentCatalog segmentCatalog = new SegmentCatalog();
 
         indexOrchestrator = mock(IndexOrchestrator.class);
-        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         storageEngine = mock(StorageEngine.class);
         queryPipeline = mock(QueryPipeline.class);
 

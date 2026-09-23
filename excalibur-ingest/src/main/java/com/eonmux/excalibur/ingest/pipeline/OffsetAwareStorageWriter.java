@@ -1,7 +1,5 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
-import java.util.List;
-
 /**
  * Storage writer that returns write log offsets for atomic batch publication.
  *
@@ -55,31 +53,6 @@ public interface OffsetAwareStorageWriter {
      * @throws IllegalArgumentException if embedding dimension doesn't match configuration
      */
     long writeChunkWithOffset(String chunkId, String content, float[] embedding);
-
-    /**
-     * Writes a chunk the caller has already tokenised, and reports where it landed.
-     *
-     * <p>The storage engine counts a chunk's terms into its segment's frequency sketch, and the
-     * caller files the same terms in the membership filter under the segment the write landed
-     * in. Handing them over here is what lets the text be tokenised once per chunk rather than
-     * once for each, and reporting the segment is what lets the caller file them where the chunk
-     * is: a hash-routed engine picks the segment, and nothing outside it can say afterwards which
-     * one it picked.</p>
-     *
-     * <p>The default is for writers that route by no segment: the terms are ignored and the
-     * placement carries no segment, so nothing is filed in the membership filter.</p>
-     *
-     * @param chunkId   Unique chunk identifier
-     * @param content   Chunk text content
-     * @param terms     {@link com.eonmux.excalibur.core.text.TermExtractor#extractTerms(String)}
-     *                  of {@code content}, with repetition
-     * @param embedding Embedding vector, or null on a node that embeds nothing
-     * @return Where the chunk landed, or {@link ChunkPlacement#FAILED}
-     */
-    default ChunkPlacement writeChunk(String chunkId, String content, List<String> terms,
-                                      float[] embedding) {
-        return ChunkPlacement.unrouted(writeChunkWithOffset(chunkId, content, embedding));
-    }
 
     /**
      * Whether a segment ID names a segment of the storage engine's own, one writes could land in.

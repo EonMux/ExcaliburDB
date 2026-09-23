@@ -309,7 +309,7 @@ public final class TestAssertionMessages {
      * Creates a message asserting deleted key must not be found.
      *
      * @param key The deleted key
-     * @param filterType The filter type (e.g., "Cuckoo", "HierarchicalCuckoo")
+     * @param filterType The filter type (e.g., "Cuckoo")
      * @return A specific assertion message
      */
     public static String deletedKeyMustNotBeFound(String key, String filterType) {
@@ -317,8 +317,7 @@ public final class TestAssertionMessages {
             "Deleted key '%s' must NOT be found by %s filter. " +
             "DOMAIN VIOLATION: After delete(key), contains(key) MUST return false. " +
             "False positive for deleted key indicates: (1) delete() not removing fingerprint, " +
-            "(2) Fingerprint collision with another key (rare at normal load factors), " +
-            "(3) Hierarchical deletion not propagating to all levels.",
+            "(2) Fingerprint collision with another key (rare at normal load factors).",
             key, filterType
         );
     }

@@ -135,7 +135,7 @@ class IndexOrchestratorCompactionArenaTest {
             Segment segment = mock(Segment.class);
 
             assertThatCode(() -> {
-                orchestrator.registerSegment(1L, segment, null, null, null);
+                orchestrator.registerSegment(1L, segment, null, null);
                 orchestrator.unregisterSegment(1L);
             }).doesNotThrowAnyException();
         }

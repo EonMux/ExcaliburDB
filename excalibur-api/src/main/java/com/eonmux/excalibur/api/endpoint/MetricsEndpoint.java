@@ -378,29 +378,15 @@ public final class MetricsEndpoint implements HttpHandler {
                 "Share of live segments a query reads, 0 to 1", stats.coverage());
     }
 
-    /** The vector integration queue and the membership filters. */
+    /** The vector integration queue. */
     private static void appendIndexes(PrometheusText text, NodeStats stats) {
         NodeStats.HnswStats hnsw = stats.hnsw();
-        NodeStats.CuckooStats cuckoo = stats.cuckoo();
         text.gauge("excalibur_hnsw_queue_depth", "Vectors waiting to be integrated",
                 hnsw.queueDepth())
             .gauge("excalibur_hnsw_queue_depth_limit",
                 "Depth at which the integration queue refuses more", hnsw.queueDepthLimit())
             .counter("excalibur_hnsw_vectors_integrated_total",
-                "Vectors integrated since startup", hnsw.vectorsIntegrated())
-            .gauge("excalibur_cuckoo_pending_deletions",
-                "Filter entries of tombstoned segments not yet removed from the membership filters",
-                cuckoo.pendingDeletions())
-            .counter("excalibur_cuckoo_deletions_total",
-                "Deletions applied to the membership filters", cuckoo.totalDeletions())
-            .gauge("excalibur_cuckoo_fp_rate_average",
-                "Mean false-positive rate across segments", cuckoo.avgFpRate())
-            .gauge("excalibur_cuckoo_fp_rate_max",
-                "Worst false-positive rate of any segment", cuckoo.maxFpRate())
-            .gauge("excalibur_cuckoo_saturated",
-                "1 when a membership filter can take no more", cuckoo.saturated() ? 1 : 0)
-            .gauge("excalibur_cuckoo_saturated_segments",
-                "Segments whose membership filter is saturated", cuckoo.saturatedSegments());
+                "Vectors integrated since startup", hnsw.vectorsIntegrated());
     }
 
     /** Disk, including what is left of it, which is what readiness is decided on. */

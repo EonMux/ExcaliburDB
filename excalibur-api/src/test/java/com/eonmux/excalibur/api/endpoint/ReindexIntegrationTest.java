@@ -7,7 +7,6 @@ import com.eonmux.excalibur.ingest.source.SourceResolver;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.EpochTickScheduler;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
-import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
 import org.junit.jupiter.api.AfterEach;
@@ -69,7 +68,6 @@ class ReindexIntegrationTest {
         segmentCatalog = new SegmentCatalog();
 
         indexOrchestrator = mock(IndexOrchestrator.class);
-        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         storageEngine = mock(StorageEngine.class);
         queryPipeline = mock(QueryPipeline.class);
 
@@ -83,8 +81,6 @@ class ReindexIntegrationTest {
         when(indexOrchestrator.getHnswQueueDepth()).thenReturn(0L);
         when(indexOrchestrator.getHnswQueueDepthLimit()).thenReturn(100000);
         when(indexOrchestrator.getTotalVectorsIntegrated()).thenReturn(0L);
-        when(indexOrchestrator.getPendingCuckooDeletions()).thenReturn(0);
-        when(indexOrchestrator.getTotalCuckooDeletions()).thenReturn(0L);
 
         server = new com.eonmux.excalibur.api.server.ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
         server.withSecurity(security);

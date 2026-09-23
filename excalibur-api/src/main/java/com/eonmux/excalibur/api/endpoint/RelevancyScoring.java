@@ -31,7 +31,7 @@ import java.util.function.Function;
  * <h2>Why it runs here</h2>
  * <p>Relevancy scoring is the last stage of retrieval: whatever ranking the signals agreed on,
  * a chat model reads each candidate's text against the question and reorders it. Inside the
- * vector pipeline it is Stage 5, and a node answering from vector search alone keeps it there.
+ * vector pipeline it is Stage 4, and a node answering from vector search alone keeps it there.
  * Two answers are not the pipeline's to score. A BM25 answer never reaches the pipeline at all,
  * so a node with a chat model and no embeddings - a deployment this route is built for - would
  * never score. And a fused answer is only final after fusion: scoring the vector half first
@@ -42,7 +42,7 @@ import java.util.function.Function;
  * <h2>The same stage, not a second one</h2>
  * <p>The scorer is the pipeline's own instance - the same chat model, the same query timeout
  * ({@code excalibur.query.llm-timeout-ms}) and the same circuit breaker, so a breaker that has
- * opened on one route is open on all of them. The contract is Stage 5's: the candidate set is
+ * opened on one route is open on all of them. The contract is Stage 4's: the candidate set is
  * {@code oversampling_factor} times the depth the page needs, so {@code llm_threshold} chooses
  * from more than a page; a candidate the model judged carries its relevancy as its score and a
  * candidate it could not judge keeps its retrieval score; the list is ordered by score; and a
@@ -68,7 +68,7 @@ final class RelevancyScoring {
      * The share of what is left of a request's budget that retrieval leaves for scoring, when
      * both signals retrieve before the model is asked.
      *
-     * <p>Stage 5's own margin - the pipeline holds back the same share of its search for the
+     * <p>Stage 4's own margin - the pipeline holds back the same share of its search for the
      * model when it scores. A fused answer is scored after both signals have returned, so the
      * endpoint holds it back instead: the vector pipeline and the wait on BM25 are given the
      * rest, and the model gets a realistic chance to answer inside the request's deadline.</p>
@@ -153,7 +153,7 @@ final class RelevancyScoring {
          * How deep retrieval must rank for this request's page.
          *
          * <p>The depth itself when nothing is scored. When the answer is scored, that depth
-         * times {@code oversampling_factor} - Stage 5's candidate set - so the threshold filter
+         * times {@code oversampling_factor} - Stage 4's candidate set - so the threshold filter
          * chooses from more than a page and a page is still full after it. The widening is
          * held to {@link QueryRequest#MAX_TOP_K}, the most the pipeline accepts; it never
          * narrows below the depth itself.</p>
@@ -336,7 +336,7 @@ final class RelevancyScoring {
             return new Outcome<>(List.of(), false, false, false, true);
         }
         if (ranking.isEmpty()) {
-            // The stage ran over nothing, which is what Stage 5 reports for an empty candidate
+            // The stage ran over nothing, which is what Stage 4 reports for an empty candidate
             // set too; there is no call to make.
             return new Outcome<>(ranking, true, false, false, false);
         }
@@ -380,7 +380,7 @@ final class RelevancyScoring {
      * <p>Each candidate is handed over as a result carrying its retrieval score, with its
      * position in the ranking as its node id - which is how the verdict is mapped back, since
      * the scorer keeps every result's identity and changes only its score. What comes back is
-     * Stage 5's answer: a judged candidate carries its relevancy, one the model could not judge
+     * Stage 4's answer: a judged candidate carries its relevancy, one the model could not judge
      * is the very result it was handed in as and keeps its retrieval score, one the threshold
      * removed is gone, and the list is ordered by score. A result naming a position outside the
      * ranking is dropped, since there is nothing for it to be about.</p>

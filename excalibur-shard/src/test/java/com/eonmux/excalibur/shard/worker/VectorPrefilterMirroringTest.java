@@ -30,7 +30,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * The vector pre-filter is keyed by the ids the graph assigns, and is written where they exist.
  *
- * <p>Stage 2 of the query pipeline hands a pre-filter's answer to
+ * <p>Stage 1 of the query pipeline hands a pre-filter's answer to
  * {@code HnswGraph.search(query, k, candidateIds)}, which keeps only the results whose node id is
  * in that set. A pre-filter populated from any other id space - a chunk id hash, a write log
  * offset - therefore does not narrow a search, it empties it: every candidate names a node the

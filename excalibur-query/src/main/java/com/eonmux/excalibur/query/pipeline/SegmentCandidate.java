@@ -1,7 +1,6 @@
 package com.eonmux.excalibur.query.pipeline;
 
 import com.eonmux.excalibur.filter.lsh.LshIndex;
-import com.eonmux.excalibur.filter.sketch.CountMinSketch;
 import com.eonmux.excalibur.store.LifecycleState;
 import com.eonmux.excalibur.store.Segment;
 import com.eonmux.excalibur.vector.hnsw.HnswGraph;
@@ -144,7 +143,7 @@ public final class SegmentCandidate {
     /**
      * Gets the node IDs this segment's LSH index named for the query.
      *
-     * <p>Populated during Stage 2 of the query pipeline. Stage 3 measures them beside its
+     * <p>Populated during Stage 1 of the query pipeline. Stage 2 measures them beside its
      * graph search; they add to what the search may return and never restrict it.</p>
      *
      * @return The set of candidate entry IDs (may be empty)
@@ -156,7 +155,7 @@ public final class SegmentCandidate {
     /**
      * Creates a new SegmentCandidate with the specified LSH candidates.
      *
-     * <p>This method is used during Stage 2 (LSH candidates) to attach the node IDs the
+     * <p>This method is used during Stage 1 (LSH candidates) to attach the node IDs the
      * segment's LSH index named for the query.</p>
      *
      * @param lshCandidates The node IDs the LSH index named
@@ -221,27 +220,6 @@ public final class SegmentCandidate {
      */
     public boolean hasWriteLog() {
         return segment != null && segment.writeLog() != null;
-    }
-
-    /**
-     * Gets the Count-Min Sketch for term frequency estimation.
-     *
-     * <p>The sketch is used by the query planner to estimate term selectivity
-     * for query optimization. Returns null if no sketch is attached.</p>
-     *
-     * @return The Count-Min Sketch, or null if not available
-     */
-    public CountMinSketch termFrequencySketch() {
-        return segment != null ? segment.termFrequencySketch() : null;
-    }
-
-    /**
-     * Checks if this candidate has a term frequency sketch attached.
-     *
-     * @return true if the segment has a term frequency sketch, false otherwise
-     */
-    public boolean hasTermFrequencySketch() {
-        return segment != null && segment.termFrequencySketch() != null;
     }
 
     @Override

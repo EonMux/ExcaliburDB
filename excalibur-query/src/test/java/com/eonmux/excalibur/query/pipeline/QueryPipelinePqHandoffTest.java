@@ -150,7 +150,6 @@ class QueryPipelinePqHandoffTest {
             null,
             QueryPipeline.DEFAULT_COVERAGE_THRESHOLD,
             null,
-            null,
             pqSearch);
 
         return pipeline.executeSync(

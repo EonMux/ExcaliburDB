@@ -51,7 +51,6 @@ import java.util.Set;
  * <ul>
  *   <li>Segment visibility state at query epoch</li>
  *   <li>HNSW graph health (node count, entry point, active nodes)</li>
- *   <li>LSH and Cuckoo filter state</li>
  *   <li>Coverage metrics</li>
  *   <li>Reason for empty results (legitimate vs. potential bug)</li>
  * </ul>

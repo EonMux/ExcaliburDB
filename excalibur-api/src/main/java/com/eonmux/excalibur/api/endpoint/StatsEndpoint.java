@@ -48,14 +48,6 @@ import java.util.function.Supplier;
  *     "queueDepthLimit": 100000,
  *     "vectorsIntegrated": 14000000
  *   },
- *   "cuckoo": {
- *     "pendingDeletions": 0,
- *     "totalDeletions": 212,
- *     "avgFpRate": 0.0000070547,
- *     "maxFpRate": 0.0000137324,
- *     "saturated": false,
- *     "saturatedSegments": 0
- *   },
  *   "visibility": {
  *     "epoch": 42,
  *     "registeredSegments": 1024,
@@ -315,7 +307,7 @@ public class StatsEndpoint implements HttpHandler {
     /**
      * Reports the LLM relevancy circuit breaker's state.
      *
-     * <p>Stage 5's breaker. When it opens the pipeline keeps the vector ranking and the node
+     * <p>Stage 4's breaker. When it opens the pipeline keeps the vector ranking and the node
      * goes on answering 200, so every ranking it returns changes with nothing in the response
      * saying so.</p>
      *
@@ -506,22 +498,13 @@ public class StatsEndpoint implements HttpHandler {
             .append("}, ");
     }
 
-    /** The vector integration queue and the membership filters. */
+    /** The vector integration queue. */
     private static void appendIndexes(StringBuilder sb, NodeStats stats) {
         NodeStats.HnswStats hnsw = stats.hnsw();
-        NodeStats.CuckooStats cuckoo = stats.cuckoo();
         sb.append("\"hnsw\": {")
             .append("\"queueDepth\": ").append(hnsw.queueDepth()).append(", ")
             .append("\"queueDepthLimit\": ").append(hnsw.queueDepthLimit()).append(", ")
             .append("\"vectorsIntegrated\": ").append(hnsw.vectorsIntegrated())
-            .append("}, ")
-            .append("\"cuckoo\": {")
-            .append("\"pendingDeletions\": ").append(cuckoo.pendingDeletions()).append(", ")
-            .append("\"totalDeletions\": ").append(cuckoo.totalDeletions()).append(", ")
-            .append("\"avgFpRate\": ").append(JsonText.exact(cuckoo.avgFpRate())).append(", ")
-            .append("\"maxFpRate\": ").append(JsonText.exact(cuckoo.maxFpRate())).append(", ")
-            .append("\"saturated\": ").append(cuckoo.saturated()).append(", ")
-            .append("\"saturatedSegments\": ").append(cuckoo.saturatedSegments())
             .append("}, ");
     }
 
@@ -553,7 +536,7 @@ public class StatsEndpoint implements HttpHandler {
      * The circuit breakers this node has, each omitted where there is none.
      *
      * <p>Seven breakers and seven different degradations: an open embedding breaker drops
-     * retrieval to lexical-only, an open relevancy breaker bypasses stage-5 re-ranking, an open
+     * retrieval to lexical-only, an open relevancy breaker bypasses stage-4 re-ranking, an open
      * query-expansion breaker searches every query as typed, an open graph-extraction breaker
      * indexes documents without adding their facts to the graph, an open graph-rerank breaker
      * leaves graph answers in the order the stage before the model gave them, an open

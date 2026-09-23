@@ -54,15 +54,6 @@ public enum FileKind {
     /** {@code segment_N.hnsw.pqcb}: a product quantizer's codebook. */
     PQ_CODEBOOK,
 
-    /**
-     * {@code segment_N.tfs}: a segment's term-frequency sketch.
-     *
-     * <p>Derived entirely from the segment's live entries and dated by a watermark the node
-     * compares on open; a missing, stale or damaged sketch is rebuilt from the segment before
-     * it serves anything. See {@link #rebuiltOnOpen()}.</p>
-     */
-    TERM_SKETCH,
-
     /** {@code lsh_table_N.dat}: a locality-sensitive hash table. */
     LSH_TABLE,
 
@@ -128,6 +119,17 @@ public enum FileKind {
     STAGING_LEFTOVER,
 
     /**
+     * A file an earlier build kept beside a segment and this build neither reads nor writes.
+     *
+     * <p>The term-frequency sketch, {@code segment_N.tfs}, and the name one was staged under.
+     * The node removes these when it starts, so one is found only in a directory no node of
+     * this build has started on yet, or where the removal failed. Nothing about it is checked:
+     * it is not engine state, and its bytes say nothing about the data beside it. The names are
+     * the store's own, from {@link com.eonmux.excalibur.store.ObsoleteSidecars}.</p>
+     */
+    OBSOLETE,
+
+    /**
      * A JVM diagnostic dump, {@code *.hprof}: not engine state at all.
      *
      * <p>{@code -XX:+HeapDumpOnOutOfMemoryError} writes one wherever
@@ -160,18 +162,6 @@ public enum FileKind {
     public static final Pattern SEGMENT_STAGED_MAPPING_NAME =
         Pattern.compile("^segment_(\\d+)\\.hnsw\\.compact\\.docmap$");
 
-    /**
-     * {@code segment_N.tfs}, the only name a term sketch is written under.
-     *
-     * <p>The store derives the sidecar's name from its segment's - {@code .dat} replaced, or
-     * {@code .tfs} appended to any other name - but writes one only for a segment that has a
-     * write log, and only a segment at its canonical {@code segment_N.dat} name has one. A
-     * split child or a compaction target is renamed onto that name, and the sidecar there
-     * removed, before it is given a log. A {@code .tfs} under any other name is therefore
-     * nothing this build writes, and is left unrecognised rather than read as a sketch.</p>
-     */
-    public static final Pattern TERM_SKETCH_NAME = Pattern.compile("^segment_(\\d+)\\.tfs$");
-
     /** Suffixes and prefixes that mark a write that never completed. */
     private static final Pattern LEFTOVER_NAME = Pattern.compile(
         ".*(\\.tmp|\\.compact|\\.rewriting|\\.erasing)$|^\\.compact-.*|.*\\.new(\\.\\d+)?$");
@@ -185,15 +175,15 @@ public enum FileKind {
      * <p>Which decides whether damage to one is damage to the store. Every other derived file
      * - a graph, its mapping, a codebook, an LSH table - is rebuilt only when someone runs a
      * reindex or a retrain, so a damaged one leaves the node serving less until an operator
-     * acts, and it fails the run like any other damage. A term sketch is recomputed from the
-     * segment's live entries before the segment serves, whenever the file is missing, stale or
-     * fails its checksum, and a lexical segment's lookup table from its names the same way, so a
-     * damaged one costs a rebuild at start-up and nothing else.</p>
+     * acts, and it fails the run like any other damage. A lexical segment's lookup table is
+     * recomputed from the segment's names before the segment serves, whenever the file is
+     * missing, the wrong size or fails its checksum, so a damaged one costs a rebuild at start-up
+     * and nothing else.</p>
      *
      * @return true for a kind whose damage the node repairs by itself on open
      */
     public boolean rebuiltOnOpen() {
-        return this == TERM_SKETCH || this == LEXICAL_KEY_LOOKUP;
+        return this == LEXICAL_KEY_LOOKUP;
     }
 
     /**
@@ -235,6 +225,17 @@ public enum FileKind {
      */
     public static boolean isDiagnosticDump(String fileName) {
         return fileName.endsWith(DIAGNOSTIC_DUMP_SUFFIX);
+    }
+
+    /**
+     * Reports whether a name is a file an earlier build wrote beside a segment and this build
+     * has no use for.
+     *
+     * @param fileName The file's name
+     * @return true for a term sketch or its staging file
+     */
+    public static boolean isObsolete(String fileName) {
+        return com.eonmux.excalibur.store.ObsoleteSidecars.isObsolete(fileName);
     }
 
     /**

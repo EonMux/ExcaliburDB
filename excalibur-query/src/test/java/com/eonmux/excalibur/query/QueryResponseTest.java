@@ -222,7 +222,7 @@ class QueryResponseTest {
         }
 
         @Test
-        @DisplayName("is unscored unless Stage 5 says otherwise, and every copy keeps the flag")
+        @DisplayName("is unscored unless Stage 4 says otherwise, and every copy keeps the flag")
         void llmScoredSurvivesEveryCopy() {
             QueryResponse scored = healthy().withLlmScored(true);
 

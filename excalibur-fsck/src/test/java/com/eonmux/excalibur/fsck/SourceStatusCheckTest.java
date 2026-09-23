@@ -24,8 +24,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>Written the way the source catalog is - a versioned header, one line per source, a
  * trailing record count - so it is checked the same way. What differs is what damage to it
  * costs: the node reads a history it cannot trust as no history and reports each source from its
- * next run, so a damaged one is reported and not counted against the store, as a damaged term
- * sketch is not.</p>
+ * next run, so a damaged one is reported and not counted against the store, as a damaged lexical
+ * lookup table is not.</p>
  */
 class SourceStatusCheckTest {
 

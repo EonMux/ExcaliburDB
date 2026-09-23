@@ -16,7 +16,6 @@ import com.eonmux.excalibur.retrieval.expand.QueryExpander;
 import com.eonmux.excalibur.shard.EpochTickScheduler;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.shard.VisibilityTracker;
-import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
 import com.eonmux.excalibur.tenancy.MappingBudget;
@@ -72,7 +71,6 @@ class ChatBreakerRouteTest {
     private ExcaliburDBServer server(QueryExpander expander, NamespaceRoutingGraphIngestSink sink) {
         SegmentCatalog catalog = new SegmentCatalog();
         IndexOrchestrator indexOrchestrator = mock(IndexOrchestrator.class);
-        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         StorageEngine storageEngine = mock(StorageEngine.class);
         EpochTickScheduler scheduler = mock(EpochTickScheduler.class);
         when(indexOrchestrator.getVisibilityTracker()).thenReturn(new VisibilityTracker(catalog));

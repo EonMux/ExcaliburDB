@@ -1498,8 +1498,7 @@ caller looping a source erasure until `documents_remaining` reaches zero **must 
 
 The vector indexes are covered as well: each erased document's HNSW nodes are retired in every
 segment's graph before the response is sent, so no vector query ranks them afterwards; only the disk
-space they occupy waits for the graph's compaction. What it does not cover is the membership filter,
-left alone deliberately: it indexes terms, which are shared with documents that remain.
+space they occupy waits for the graph's compaction.
 
 Nor can it reach the source. A document erased here and still present in the directory or website it
 was crawled from comes back on the next re-crawl — which is why a source-scoped erasure deregisters
@@ -2388,9 +2387,6 @@ curl http://localhost:8080/v1/stats
   "volumes": {"count": 1, "totalBytes": 5368709120, "usedBytes": 3221225472,
               "availableBytes": 2147483648},
   "hnsw": {"queueDepth": 50000, "queueDepthLimit": 100000, "vectorsIntegrated": 14000000},
-  "cuckoo": {"pendingDeletions": 0, "totalDeletions": 212,
-             "avgFpRate": 0.0000070547, "maxFpRate": 0.0000137324,
-             "saturated": false, "saturatedSegments": 0},
   "visibility": {"epoch": 42, "registeredSegments": 1024, "visibleSegments": 1024},
   "coverage": 1.0000,
   "workers": {"indexOrchestratorRunning": true},
@@ -2482,28 +2478,6 @@ the traffic, which a larger `excalibur.query.cache.max-entries` fixes, and an in
 corpus having moved under an entry, which no size would have helped. A node with a low
 `hitRatio` and near-zero `evictions` is not under-sized — it is being written to faster than the
 same question comes back, and the cache is not the right tool for it.
-
-The other four `cuckoo` figures describe the per-segment membership filters that stage 1 of a
-query orders segments by, searching the segments that hold the question's terms first. Every
-segment is still searched: a question's nearest vectors need not share its words.
-
-- `avgFpRate` and `maxFpRate` are the mean and the worst estimated false-positive rate across the
-  segment filters holding anything, computed from their current load when the request is served.
-  They are printed as exact decimals rather than in exponent notation; `0` means no filter holds a
-  term yet. A rising `maxFpRate` is one segment's filter filling up, and a false positive only
-  moves a segment that holds none of the question's terms ahead of others.
-- `pendingDeletions` is the number of filter entries (one per distinct term a segment was filed
-  under) still held for segments that have been tombstoned, and `totalDeletions` how many such
-  entries have been removed since the process started. The maintenance worker removes them in
-  batches, so after a segment is retired its entries move from the first figure to the second.
-  A `pendingDeletions` that stays high means the worker is not keeping up or is not running.
-
-`cuckoo.saturated` is the membership filter having run out of room at the corpus level, and
-`saturatedSegments` counts the segments whose own filter did. Neither changes an answer: a level
-that has refused a term is no longer trusted to say what its segment lacks, so its scope is
-ordered by the segments' term sketches alone. What they cost is the ordering, which matters to a
-query that runs out of time, and nothing else in this response would show it. Raise
-`excalibur.filter.corpus-capacity` and restart.
 
 The `lexical` block is present only when this node keeps a chunk index; an absent block and an index
 reporting zeroes are different states. Within it:
@@ -2707,7 +2681,6 @@ Everything exported is a figure the node already measures; nothing here is estim
 | `excalibur_segments{state=...}`, `excalibur_segments_total`, `excalibur_entries_total` | gauge | The segment lifecycle and corpus size |
 | `excalibur_coverage_ratio`, `excalibur_visibility_epoch`, `excalibur_visible_segments` | gauge | Visibility |
 | `excalibur_hnsw_queue_depth`, `_limit`, `excalibur_hnsw_vectors_integrated_total` | gauge, counter | Vector integration backlog |
-| `excalibur_cuckoo_*` | gauge, counter | Membership filter saturation, live false-positive rates, and filter entries of tombstoned segments pending and removed |
 | `excalibur_volume_bytes_total`, `_used`, `_available`, `excalibur_volume_count` | gauge | Disk |
 | `excalibur_index_orchestrator_running`, `excalibur_segments_without_vector_index`, `excalibur_circuit_breaker_state{breaker="embedding"\|"llm_relevancy"\|"query_expansion"\|"graph_extraction"\|"graph_rerank"\|"graph_query_embedding"\|"graph_build_embedding"}` | gauge | The three partial failures described under Stats. Each breaker is `0` closed, `1` half-open, `2` open, so `> 0` is "this node is not using that part of its provider". A label is present only where the node has that component: `query_expansion` with a chat model behind query expansion, `graph_extraction` with a chat model behind relation extraction, `graph_rerank` once a graph that reranks with the chat model has been opened, `graph_query_embedding` once a graph built with entity vectors has, `graph_build_embedding` once a graph build has embedded an entity. The graph three carry no namespace label - every namespace shares them - so the series count stays at seven however many tenants the node serves |
 | `excalibur_lexical_*` | gauge | Chunk index size and the erasure backlog, including `_oldest_erasure_age_seconds` |
@@ -2736,7 +2709,7 @@ excalibur_graph_erasure_namespaces{state=~"overdue|unreadable"} > 0
 
 #### JMX
 
-Seven MBeans are published under the `com.eonmux.excalibur` domain, for a local VisualVM or
+Six MBeans are published under the `com.eonmux.excalibur` domain, for a local VisualVM or
 JConsole session attached to the process. They cover a subset of what `/metrics` serves, not all
 of it:
 
@@ -2747,7 +2720,6 @@ of it:
 | `type=IngestionQueue` | `depth`, `percent`, `isUnderControl`, `isCritical`, `isFull` |
 | `type=HnswQueueDepth` | `depth`, `percent`, `isUnderControl`, `isCritical`, `isFull`, and the tail-scan figures `averageTailScan`, `maxTailScan`, `totalTailScanned`, `totalVectorEntriesFound` |
 | `type=VisibilityEpoch` | `epoch` |
-| `type=CuckooFpRate` | `fpRate`, `fpRateEpoch`, `fpRateCount`, `avgFpRate`, `maxFpRate`, `currentEpoch` |
 | `type=IngestionThroughput` | `entriesIngested`, `queriesExecuted`, `ingestionRate`, `peakIngestionRate` |
 
 Everything else in the table above is served by `/metrics` only: HTTP responses and rejections,
@@ -2839,10 +2811,10 @@ the copy verifies faithfully without it:
   lexical store is checked as one structure — its manifest against the CRC32C on its last line,
   every column of every segment the manifest names, each named segment's key table against
   `seg-N.keysum` and its tombstones against their CRC32C, and every line of `erasure.log`
-  against its own; the graph erasure ledger has every record checked; a segment's
-  term sketch (`segment_<N>.tfs`) has its header and body checked against their CRC32Cs. A damaged
-  sketch is reported and does not fail the image, because a node restored from it rebuilds the
-  sketch when it opens the segment; one that cannot be read at all does fail it. A compaction's
+  against its own; the graph erasure ledger has every record checked. A term sketch an earlier
+  build kept beside a segment (`segment_<N>.tfs`), in an image that build took, is reported healthy
+  and unproven: nothing in this build reads it, so its contents prove nothing either way, though its
+  length and digests are still held to the manifest like every file's. A compaction's
   staged pair, `segment_<N>.hnsw.compact` and `segment_<N>.hnsw.compact.docmap`, comes here too,
   though each is in a format the engine checks: while both are there the compaction never
   swapped, the node discards the pair on open, and a torn pair is a leftover that does not fail
@@ -2907,17 +2879,20 @@ fsynced before it is acknowledged, so the acknowledged writes are on disk; what 
 copy loses is whatever the catalog and the segments disagree about, not the corpus.
 
 `--exclude-derived` leaves out what something will rebuild — the lexical chunk index, a tenant's
-built edge store, the quantiser codebooks, the segments' term sketches — at the cost of a reindex
-and a graph build on the far side; the sketches the node rebuilds by itself as it opens each
-segment. The HNSW graphs and their node mappings are never left out, derived though they
+built edge store and the quantiser codebooks — at the cost of a reindex and a graph build on the
+far side. The HNSW graphs and their node mappings are never left out, derived though they
 are, because nothing rebuilds them: deleting a `.hnsw` gives an empty graph attached to a
 populated segment, not a repopulated one. A mapping an interrupted compaction staged
 (`segment_<N>.hnsw.compact.docmap`) is kept with them for the reason below. The write-ahead logs
 are never left out either.
 
-Two things are never copied, and each is reported under `omitted` with the reason: staged names a
-crash left behind, which nothing reads, and JVM heap dumps (`*.hprof`), which are a record of a
-process rather than state and roughly the size of its heap.
+Three things are never copied, and each is reported under `omitted` with the reason: staged names
+a crash left behind, which nothing reads; JVM heap dumps (`*.hprof`), which are a record of a
+process rather than state and roughly the size of its heap; and the term sketches an earlier build
+kept beside its segments (`segment_<N>.tfs`, reported `OBSOLETE`), which nothing in this build reads
+and the node deletes when it starts. A restore of an image an earlier build took verifies those
+sketches with the rest of the image, since the manifest certifies their bytes, and then leaves them
+out of the restored directory.
 
 `excalibur-backup <command> --help` prints that command's options and the exit codes, and exits
 `0` without touching anything.
@@ -3047,23 +3022,17 @@ node runs before it serves one:
   must not be moved.
 - Any other file in a graph directory is `UNCHECKED`; the next build replaces the directory whole.
 
-Four files are judged by what the node does with them rather than by name alone:
+Three files are judged by what the node does with them rather than by name alone:
 
-- **`segment_<N>.tfs`, a segment's term sketch**, is one of two derived files the node rebuilds by
-  itself, from the segment's live entries, whenever it opens the segment and finds the sketch
-  missing, stale or damaged. A sketch that fails its checksum is reported `CORRUPT` and not
-  counted as damage: it does not set exit code `1` or fail `--strict`, the summary counts it
-  separately (`corruptRebuiltOnOpen` in `--json`, where each file also carries `damage`), and the
-  repair plan moves it aside. Only corruption is excused: a sketch the operating system will not
-  read — an I/O error, a permission refused — is `UNREADABLE` and fails the run, because that says
-  something about the device rather than about one derived file. Every derived file but this and
-  the lexical lookup table below is rebuilt only by a reindex or a retrain, so its damage fails the
-  run. A sketch whose segment is gone is an orphaned index like any other,
-  and a stranded `segment_<N>.tfs.<id>.tmp` is a staging leftover.
-- **`chunk-index/seg-N.keymap`, a lexical segment's lookup table**, is the other: the store
-  rebuilds it from the segment's names when it is missing, the wrong size, or does not match the
-  checksum in `seg-N.keysum`. One that fails is reported `CORRUPT`, counted under
-  `corruptRebuiltOnOpen` rather than as damage, and moved aside by the repair plan. The rest of
+- **`chunk-index/seg-N.keymap`, a lexical segment's lookup table**, is a derived file the store
+  rebuilds by itself from the segment's names when it is missing, the wrong size, or does not
+  match the checksum in `seg-N.keysum`. One that fails is reported `CORRUPT` and not counted as
+  damage: it does not set exit code `1` or fail `--strict`, the summary counts it separately
+  (`corruptRebuiltOnOpen` in `--json`, where each file also carries `damage`), and the repair plan
+  moves it aside. Only corruption is excused: a lookup table the operating system will not read —
+  an I/O error, a permission refused — is `UNREADABLE` and fails the run, because that says
+  something about the device rather than about one derived file. Every other derived file is
+  rebuilt only by a reindex or a retrain, so its damage fails the run. The rest of
   the key table — `seg-N.keys`, `seg-N.keyidx`, `seg-N.keysum` — and `seg-N.tomb` and
   `erasure.log` are the opposite: damage to any of them fails the run and goes to an operator,
   never into the quarantine, because a tombstone file or erasure log moved aside reads as nothing
@@ -3072,10 +3041,10 @@ Four files are judged by what the node does with them rather than by name alone:
   but nothing the node serves depends on it either: a node that cannot trust it logs that, treats
   the history as empty, and reports each source from its next run. So a `source-status` its
   reader will not take — a record count that disagrees with its records, a checksum that does not
-  match its bytes, no header, or a version it does not read — is reported `CORRUPT`, counted with the sketches under
-  `corruptRebuiltOnOpen` rather than as damage, and moved aside by the repair plan — what is lost
-  either way is the history, never indexed data. As with a sketch, one the operating system will
-  not read is `UNREADABLE` and fails the run.
+  match its bytes, no header, or a version it does not read — is reported `CORRUPT`, counted with the
+  lookup tables under `corruptRebuiltOnOpen` rather than as damage, and moved aside by the repair
+  plan — what is lost either way is the history, never indexed data. As with a lookup table, one
+  the operating system will not read is `UNREADABLE` and fails the run.
 - **`segment_<N>.hnsw.compact.docmap`, a compaction's staged mapping**, means one of two things.
   Beside `segment_<N>.hnsw.compact`, the compaction never swapped its graph in: both are staging
   leftovers the node would discard, and the repair moves the mapping aside before the graph —
@@ -3139,7 +3108,7 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 | `hnsw.queueDepth` keeps growing | Integration worker falling behind | Check logs for errors; slow down ingestion; increase hardware |
 | All LLM calls failing | A circuit breaker tripped. Embeddings, relevancy scoring, query expansion, relation extraction, the graph rerank, the graph question embedding and the graph build's entity embedding each have their own, so check which on `breakers` in `/v1/stats`: relevancy scoring stopping while ingestion continues is `llmRelevancy`, the reverse is `embedding`, queries losing their expansions is `queryExpansion`, a graph that stopped growing is `graphExtraction`, graph answers no longer reranked by the model is `graphRerank` (or `graphQueryEmbedding` for the vector rerank), and a build that published entities without vectors is `graphBuildEmbedding` | Wait for the cooldown (default 60s), after which one probe is admitted. Confirm API key/endpoint. Queries still work without LLM scoring. |
 | Queries return nothing on a fresh node, but `coverage` reads `1.0000` | Not a cold-start indicator. `/health` coverage counts the segments a query reads, and an empty segment is read as readily as a full one, so it reads `1.0000` and `/health` reports `ready` and `healthy` | Look at `/v1/stats` instead: `entries.total` and `segments.active` are `0` until something is indexed |
-| A node answers `200` to everything but its results are getting worse | A circuit breaker has opened: the embedding one drops retrieval to lexical-only, the relevancy one bypasses stage 5's relevancy scoring, the query-expansion one searches every query as typed, and on the graph route the rerank one keeps the BM25 order and the question-embedding one skips the vector rerank; the graph build-embedding one publishes a build's entities without vectors | `breakers` on `/v1/stats`, or `excalibur_circuit_breaker_state` on `/metrics`. Alert on `> 0` for any `breaker` label |
+| A node answers `200` to everything but its results are getting worse | A circuit breaker has opened: the embedding one drops retrieval to lexical-only, the relevancy one bypasses stage 4's relevancy scoring, the query-expansion one searches every query as typed, and on the graph route the rerank one keeps the BM25 order and the question-embedding one skips the vector rerank; the graph build-embedding one publishes a build's entities without vectors | `breakers` on `/v1/stats`, or `excalibur_circuit_breaker_state` on `/metrics`. Alert on `> 0` for any `breaker` label |
 | `hnsw.queueDepth` grows without bound while `coverage` stays `1.0000` and `/health` stays healthy | The index orchestrator is dead | `workers.indexOrchestratorRunning` on `/v1/stats`, `indexerRunning` on `/health`, and `/health/ready` answers `503` with `indexer` in `failed` |
 | Vector search returns fewer results than the corpus should hold, with no error | One or more segments came up without their vector index and are serving key-value data only | `vectorIndex.segmentsWithoutIndex` on `/v1/stats` names each segment and why |
 | A rolling restart drops in-flight requests | The load balancer was still choosing the node when it stopped | `POST /v1/drain`, wait for in-flight work to finish, then restart. `/health/ready` answers `503` for the duration |
@@ -3158,7 +3127,6 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 | `excalibur_query_unnamed_results_dropped_total` rose, or query answers are `degraded` at full coverage with a WARN naming segments whose results "carry no chunk identity" | Those segments' `.docmap` is missing or damaged, so their graph nodes name no chunk and cannot be returned | Run `excalibur-fsck` with the node stopped to confirm which mapping is damaged. Nothing rebuilds a mapping in place, and a compaction only re-keys the one it finds: restore the graph and its mapping together from an `excalibur-backup` image, or reindex the sources whose documents that segment holds |
 | `lexical.unreadableSegments` is above zero, or `excalibur_lexical_unreadable_segments` is | A lexical segment failed its checksum or lost a file, so its chunks (`unsearchableChunks`) match no keyword query. The node's log names it at `ERROR` as it opens, with the reason | If `lexical.unreadable` says `rebuildable: true`, nothing: the next compaction rebuilds it, and `segments_rebuilt` on `/v1/compact/status` reports it. Otherwise its key table is damaged too — check the disk, and reindex the documents of the sources it served. The first erasure the node records removes such a segment, so copy it aside with `excalibur-fsck --repair` first if you want to keep it |
 | A re-crawled document appears twice in results | Not the chunk index — it replaces a chunk identifier rather than appending. Check whether the source is listing one document under two ids | Compare the `document_id` values on the two hits — that is the chunk identifier, `source:document:chunk:N`: identical means a bug, different means the source |
-| `/v1/stats` reports `cuckoo.saturated: true` | The membership filter is full. A level that cannot record a term is no longer trusted to say what its segment lacks, so queries order segments by their term sketches alone. Answers are unaffected; a query that runs out of time may have spent it on less likely segments first | Raise `excalibur.filter.corpus-capacity` past your term count and restart |
 | Node refuses to start: `Refusing to create segment N in <dir>: <other dir> already holds segment_N.dat` | Two volumes hold a file for the same segment index, usually from a volume set that changed between runs on an older build | Move or delete the stale copy — the one whose directory the catalog does not name — then restart |
 | Node refuses to start naming two `excalibur.shard.volumes` entries that resolve to one directory | A symlink, a relative path or a `..` in the list makes two entries the same directory, which would give it two shares of the ring | Drop one of the two spellings |
 | Node fails to start with `CatalogLoadException` | `<data dir>/source-catalog` was written by a build older than the end marker, was cut short by a crash, or its checksum does not match because its bytes were altered after it was written | [Upgrading a data directory](#upgrading-a-data-directory-written-by-an-older-build) — append the marker, or delete the file and re-register the sources |
@@ -3170,7 +3138,7 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 
 ### Upgrading a data directory written by an older build
 
-Several on-disk formats differ from those older builds wrote. A node reads the old and the current form of each, but one of them needs a manual step.
+Several on-disk formats differ from those older builds wrote. A node reads the old and the current form of each, but one of them needs a manual step. The last entries below are not formats: they are a file this build no longer keeps, and settings and figures it no longer has.
 
 **`<data dir>/source-catalog` — a manual step is required.** The catalog of registered ingestion
 sources ends with a marker line, `\#end|<count>`, written after the records are forced to
@@ -3351,6 +3319,28 @@ over a graph this build wrote does not serve it. Before rolling back, stop the n
 namespace's `graph` directory (and any `graph.previous` or `graph.retired` beside it) — they are
 derived from `graph-staging`, which stays — then start the older build and `POST /v1/graph/build`
 for each namespace.
+
+**`<data dir>/segment_<N>.tfs` — no step required.** Older builds kept a term sketch beside each
+segment, which ordered a query's segments by its terms. This build searches segments in no order
+that depends on the query, reads no sketch, and deletes every `segment_<N>.tfs`, and any staging
+file of one, the first time it starts, logging one INFO line with how many it removed. Until then
+`excalibur-fsck` reports each as `NOT_DATA` — not damage, and not a failure under `--strict` —
+and `excalibur-backup` leaves them out of a snapshot. An image an older build took still names
+them: `verify` checks them against the manifest like every file, and `restore` leaves them out of
+the restored directory. Rolling back is safe: an older build rebuilds a missing sketch from the
+segment's live entries as it opens the segment, at a cost in start-up time.
+
+**`excalibur.filter.*` settings — no step required.** `excalibur.filter.corpus-capacity`,
+`excalibur.filter.segment-capacity` and `excalibur.filter.fingerprint-bits` sized the term filter
+that ordered a query's segments, which this build no longer has. A node started with any of them
+still starts, and logs a warning naming each: `<key> is no longer read: the term filter it
+configured has been removed, and the line can be deleted`.
+
+**Monitoring — the filter's figures are gone.** The `cuckoo` block of `/v1/stats`, the
+`excalibur_cuckoo_*` families on `/metrics` and the `type=CuckooFpRate` MBean described that same
+filter and are no longer published. A dashboard or alert keyed on them will find nothing; remove
+it. The Cuckoo filter the native lexical index keeps per segment is rebuilt from its dictionary
+every time the segment opens and has no figures of its own.
 
 ### Enabling debug logging
 
@@ -3582,9 +3572,7 @@ What each piece is for:
 - **`QueryPipeline`** is built over the same engine and clock, and the document tracker's adapter,
   which hides a document until all of its chunks are published. This 5-argument constructor is
   the plain pipeline; the wider constructors add what the server adds on top — LLM relevancy
-  scoring and its coverage threshold, the hierarchical Cuckoo filter that orders segments by the
-  question's terms, the
-  epoch isolation validator and product-quantisation settings — and `withLlmScorer` adds the
+  scoring and its coverage threshold, the epoch isolation validator and product-quantisation settings — and `withLlmScorer` adds the
   scorer to a pipeline already built.
 
 The pipeline operates on vectors, so the caller embeds the question — with the **same**

@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
-import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
@@ -43,7 +42,7 @@ class LexicalOnlyReindexTest {
         chunker = new TextChunker(512, 64);
         registry = new DocumentRegistry();
         writer = new RecordingWriter();
-        upsertHandler = new UpsertHandler(registry, CuckooFilter.create(10_000), writer);
+        upsertHandler = new UpsertHandler(registry, writer);
     }
 
     private DocumentReindexer lexicalOnly() {

@@ -92,10 +92,8 @@ public final class TextChunk {
      * The chunk's terms, as {@link TermExtractor#extractTerms(String)} finds them in its text:
      * in order, with repetition.
      *
-     * <p>Everything a write of this chunk feeds reads them from here - the segment's
-     * term-frequency sketch counts every occurrence, the membership filter files each distinct
-     * term - so the text is tokenised once per chunk rather than once per consumer, and the two
-     * cannot come to disagree about what the chunk holds.</p>
+     * <p>A consumer that needs a chunk's terms reads them from here, so the text is tokenised
+     * once however often they are asked for.</p>
      *
      * <p>Worked out on first use and kept. Synchronized so that holds under concurrent first
      * calls too; after the first, the cost is an uncontended lock.</p>

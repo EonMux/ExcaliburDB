@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.api.bootstrap;
 
-import com.eonmux.excalibur.ingest.pipeline.ChunkPlacement;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
 import com.eonmux.excalibur.store.Segment;
 import com.eonmux.excalibur.store.StorageEngine;
@@ -12,13 +11,10 @@ import org.junit.jupiter.api.Test;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -57,38 +53,15 @@ class StorageChunkWriterTest {
         }
 
         @Test
-        @DisplayName("reports the segment the engine wrote to, with the chunk's terms handed over")
-        void reportsTheSegmentTheEngineChose() {
-            StorageEngine engine = mock(StorageEngine.class);
-            List<String> terms = List.of("hello", "world");
-            Segment landed = segmentWithOffset(12L);
-            when(engine.putReportingSegment(any(byte[].class), any(byte[].class), eq(terms)))
-                .thenReturn(37L);
-            when(engine.getSegment(37L)).thenReturn(landed);
-
-            ChunkPlacement placement = new StorageChunkWriter(engine)
-                .writeChunk("doc-1:chunk:0", "hello world", terms, EMBEDDING);
-
-            assertThat(placement.written()).isTrue();
-            assertThat(placement.segmentId()).isEqualTo(37L);
-            assertThat(placement.writeLogOffset()).isEqualTo(12L);
-            verify(engine, never()).getSegmentCount();
-        }
-
-        @Test
         @DisplayName("reports failure when the engine refuses the write")
         void reportsEngineFailure() {
             StorageEngine engine = mock(StorageEngine.class);
             when(engine.putReportingSegment(any(byte[].class), any(byte[].class)))
                 .thenThrow(new IllegalStateException("engine not started"));
-            when(engine.putReportingSegment(any(byte[].class), any(byte[].class), anyList()))
-                .thenThrow(new IllegalStateException("engine not started"));
             StorageChunkWriter writer = new StorageChunkWriter(engine);
 
             assertThat(writer.writeChunkWithOffset("doc-1:chunk:0", "hello", EMBEDDING))
                 .isEqualTo(StorageChunkWriter.WRITE_FAILED);
-            assertThat(writer.writeChunk("doc-1:chunk:0", "hello", List.of("hello"), EMBEDDING))
-                .isEqualTo(ChunkPlacement.FAILED);
         }
 
         @Test

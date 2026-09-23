@@ -61,12 +61,6 @@ public final class DataDirectoryFixture {
     /** The graph's quantiser codebook. */
     public static final String CODEBOOK = "segment_0.hnsw.pqcb";
 
-    /**
-     * The first segment's term sketch, which the storage engine itself writes beside the
-     * segment when it closes cleanly.
-     */
-    public static final String TERM_SKETCH = "segment_0.tfs";
-
     /** The first table of the segment's LSH index. */
     public static final String LSH_TABLE = "segment_0.lsh/lsh_table_0.dat";
 

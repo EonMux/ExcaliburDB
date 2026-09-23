@@ -123,8 +123,7 @@ class ReindexGraphIntegrationTest {
         DocumentVisibilityTracker tracker = new DocumentVisibilityTracker(
             DocumentRegistryFactory.open(dataDir), core.indexOrchestrator().getVisibilityTracker());
         QueryPipeline queryPipeline = QueryPipelineFactory.create(config, core.storageEngine(),
-            core.indexOrchestrator(), new DocumentVisibilityTrackerAdapter(tracker),
-            core.hierarchicalFilter());
+            core.indexOrchestrator(), new DocumentVisibilityTrackerAdapter(tracker));
         tenants = new GraphTenants(GraphRagFactory.tenantRootFor(config, dataDir), config,
             MappingBudget.detect(), config.graph().getMaxOpenNamespaces());
 
@@ -134,12 +133,12 @@ class ReindexGraphIntegrationTest {
         server.withSecurity(ApiSecurityConfig.fromConfig(config));
         server.withSourceCatalog(SourceCatalog.open(dataDir));
         attachment = new IngestionWiring(config, dataDir, core.storageEngine(),
-            core.indexOrchestrator(), core.hierarchicalFilter(), tracker, tenants)
+            core.indexOrchestrator(), tracker, tenants)
             .attachTo(server);
         server.withDocumentRegistry(tracker.getRegistry());
         server.withGraphSupport(tenants);
         server.withReindexer(ReindexerFactory.create(config, core.storageEngine(),
-            core.volumeManager(), core.indexOrchestrator(), core.hierarchicalFilter(),
+            core.volumeManager(), core.indexOrchestrator(),
             tracker.getRegistry(), attachment.chunkIndex()));
         server.start();
     }

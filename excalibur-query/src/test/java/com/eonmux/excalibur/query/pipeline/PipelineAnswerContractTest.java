@@ -146,7 +146,7 @@ class PipelineAnswerContractTest {
         @Test
         @DisplayName("is not reported when the merge filled every candidate slot")
         void fullMergeIsNotExhausted() {
-            // Stage 4 asks the merge for twice the depth, so twenty hits fill it for ten.
+            // Stage 3 asks the merge for twice the depth, so twenty hits fill it for ten.
             PipelineContext ranked = stage().rerank(searched(request(10, true), named(20)),
                 new CancellationToken());
 

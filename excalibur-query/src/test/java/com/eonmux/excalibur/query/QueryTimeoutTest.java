@@ -656,22 +656,22 @@ class QueryTimeoutTest {
                 stageReached.set(0);
                 Thread.sleep(50);
 
-                // Stage 1: Cuckoo filter cascade
+                // Stage 1: LSH candidates
                 token.checkCancelled();
                 stageReached.set(1);
                 Thread.sleep(50);
 
-                // Stage 2: LSH pre-filter
+                // Stage 2: HNSW search (should be cancelled here)
                 token.checkCancelled();
                 stageReached.set(2);
                 Thread.sleep(50);
 
-                // Stage 3: HNSW search (should be cancelled here)
+                // Stage 3: Rerank
                 token.checkCancelled();
                 stageReached.set(3);
                 Thread.sleep(50);
 
-                // Stage 4: Rerank
+                // Stage 4: LLM relevancy scoring
                 token.checkCancelled();
                 stageReached.set(4);
 

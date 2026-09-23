@@ -5,7 +5,6 @@ import com.sun.net.httpserver.HttpExchange;
 import com.eonmux.excalibur.query.executor.CancellationToken;
 import com.eonmux.excalibur.query.executor.QueryRegistry;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
-import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.metrics.Metrics;
 import com.eonmux.excalibur.metrics.ResponseCounters;
@@ -54,7 +53,6 @@ class MetricsEndpointTest {
         ResponseCounters.reset();
         catalog = new SegmentCatalog();
         indexOrchestrator = mock(IndexOrchestrator.class);
-        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         storageEngine = mock(StorageEngine.class);
         when(indexOrchestrator.getVisibilityTracker()).thenReturn(new VisibilityTracker(catalog));
         when(indexOrchestrator.isRunning()).thenReturn(true);
@@ -148,12 +146,14 @@ class MetricsEndpointTest {
         }
 
         @Test
-        @DisplayName("exposes the queue depths, the filters and the disk")
+        @DisplayName("exposes the queue depths and the disk")
         void exposesTheRestOfWhatIsMeasured() throws IOException {
             String body = send("GET").body();
             assertThat(body).contains("excalibur_hnsw_queue_depth 42");
             assertThat(body).contains("excalibur_hnsw_queue_depth_limit 100000");
-            assertThat(body).contains("excalibur_cuckoo_saturated 0");
+            assertThat(body)
+                .as("the term filter these gauges described has been removed")
+                .doesNotContain("excalibur_cuckoo_");
             assertThat(body).contains("excalibur_volume_bytes_available");
             assertThat(body).contains("excalibur_coverage_ratio");
         }

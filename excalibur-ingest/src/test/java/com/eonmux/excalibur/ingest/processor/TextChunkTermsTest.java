@@ -9,11 +9,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * A chunk's terms, tokenised once for everything a write feeds.
+ * A chunk's terms, tokenised once however often they are asked for.
  *
- * <p>Storing a chunk counts its terms into the segment's frequency sketch, and filing it counts
- * its distinct terms into the membership filter. Both read the terms from here, so the text is
- * tokenised once per chunk and the two can never disagree about what the chunk holds.</p>
+ * <p>A consumer that needs a chunk's terms reads them from here, so the text is tokenised once
+ * per chunk rather than once per consumer.</p>
  */
 @DisplayName("Text chunk terms")
 class TextChunkTermsTest {

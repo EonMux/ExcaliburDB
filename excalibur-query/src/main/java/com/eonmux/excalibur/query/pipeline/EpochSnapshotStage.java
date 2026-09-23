@@ -82,9 +82,8 @@ final class EpochSnapshotStage {
         int segmentsExcluded = 0;
 
         // The ID comes from the snapshot, not from the segment. Segment.segmentId() counts every
-        // segment instance the process has constructed; the catalog, the visibility tracker, the
-        // term filter hierarchy and the graph provider are all keyed by the directory index the
-        // engine routes by. The two agree while segments are created in directory order and part
+        // segment instance the process has constructed; the catalog, the visibility tracker and
+        // the graph provider are all keyed by the directory index the engine routes by. The two agree while segments are created in directory order and part
         // company the moment one is created out of it - which is what a compaction and a split
         // both do. Past that point the catalog lookup below misses, the segment is dropped from
         // stage 0, and it is absent from every query result with nothing logged as an error.

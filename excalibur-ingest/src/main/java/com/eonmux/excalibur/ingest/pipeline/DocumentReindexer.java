@@ -1,7 +1,6 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
 import com.eonmux.excalibur.core.util.StopSignal;
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
@@ -35,10 +34,8 @@ import java.util.function.Function;
  *   <li>Generates an embedding for each chunk, on a node configured with an embedding
  *       endpoint; a node that indexes its corpus lexically skips this step and stores the
  *       chunk with no vector, exactly as its ingestion did</li>
- *   <li>Upserts the new chunks into storage, filing each chunk's terms in the membership
- *       filter under the segment its write landed in, as a first ingest does</li>
+ *   <li>Upserts the new chunks into storage</li>
  *   <li>Tombstones old chunks via the UpsertHandler</li>
- *   <li>Removes old chunks from the Cuckoo filter hierarchy</li>
  *   <li>Updates the document registry with new metadata</li>
  *   <li>Tells the graph, so the facts staged from the document's earlier version are withdrawn
  *       and the new version's staged; a document the source no longer lists has its facts
@@ -52,7 +49,6 @@ import java.util.function.Function;
  *   <li>No partial documents in query results</li>
  *   <li>Consistent snapshots across concurrent queries</li>
  *   <li>Epoch isolation for in-flight ingestion</li>
- *   <li>Cuckoo filter insertion for chunk membership</li>
  * </ul>
  *
  * <h2>What this class itself does</h2>
@@ -115,12 +111,6 @@ public class DocumentReindexer {
     private final ReindexLexicalIndex lexical = new ReindexLexicalIndex();
 
     /**
-     * Files the terms of every chunk this reindex writes under the segment it landed in - the
-     * same recorder, with the same filter, that files them for a first ingest.
-     */
-    private final SegmentTermRecorder termRecorder = new SegmentTermRecorder();
-
-    /**
      * Retires the graph nodes of every document this reindex removes, or null for no vector
      * index.
      *
@@ -157,27 +147,6 @@ public class DocumentReindexer {
          * @return true if write succeeded
          */
         boolean writeChunk(String chunkId, String content, float[] embedding);
-
-        /**
-         * Writes a chunk the caller has already tokenised, and reports where it landed.
-         *
-         * <p>The same contract as
-         * {@link OffsetAwareStorageWriter#writeChunk(String, String, List, float[])}: a writer
-         * over a segmented store reports the segment the chunk landed in, so its terms can be
-         * filed there in the membership filter. The default is for writers that route by no segment, and
-         * reports none.</p>
-         *
-         * @param chunkId   Unique chunk identifier
-         * @param content   Chunk text content
-         * @param terms     The chunk's terms, with repetition
-         * @param embedding Embedding vector, or null on a node that embeds nothing
-         * @return Where the chunk landed, or {@link ChunkPlacement#FAILED}
-         */
-        default ChunkPlacement writeChunk(String chunkId, String content, List<String> terms,
-                                          float[] embedding) {
-            return writeChunk(chunkId, content, embedding)
-                ? ChunkPlacement.unrouted(0L) : ChunkPlacement.FAILED;
-        }
     }
 
     /**
@@ -256,7 +225,6 @@ public class DocumentReindexer {
      * <ul>
      *   <li>All chunks for a document become visible at the same epoch</li>
      *   <li>No partial documents in query results</li>
-     *   <li>Cuckoo filter insertion for chunk membership</li>
      *   <li>Write log sync before epoch advancement</li>
      * </ul>
      *
@@ -350,21 +318,6 @@ public class DocumentReindexer {
      */
     public void setLexicalIndex(ChunkIndex lexicalIndex, Function<String, String> storedText) {
         lexical.use(lexicalIndex, storedText);
-    }
-
-    /**
-     * Points this reindexer at the membership filter the query pipeline orders segments by.
-     *
-     * <p>A reindex writes chunks exactly as a first ingest does, and once a segment's level is
-     * trusted the query pipeline takes it as holding no term the level does not name. So every
-     * chunk written here has its terms filed under the segment its write landed in, as it is
-     * written; a reindexed-in term missing from that level would move the segment to the back of
-     * every query for it until the segment's next rebuild.</p>
-     *
-     * @param membershipFilter The filter, or null to keep none
-     */
-    public void setMembershipFilter(HierarchicalCuckooFilter membershipFilter) {
-        termRecorder.setFilter(membershipFilter);
     }
 
     /**
@@ -657,7 +610,6 @@ public class DocumentReindexer {
      * <ul>
      *   <li>All chunks become visible at the same visibility epoch</li>
      *   <li>No partial documents in query results</li>
-     *   <li>Cuckoo filter insertion for chunk membership</li>
      * </ul>
      *
      * @param sourceId Source identifier
@@ -685,7 +637,7 @@ public class DocumentReindexer {
         DocumentReindexStep step = hasAtomicPublication()
             ? step(new DocumentReindexStep.AtomicTarget(offsetAwareWriter, batchPublisher))
             : DocumentReindexStep.writingDirectly(chunker, llmClient, registry, upsertHandler,
-                lexical, termRecorder, graphReporter, storageWriter);
+                lexical, graphReporter, storageWriter);
         return step.reindex(sourceId, documentId, fetched, stop);
     }
 
@@ -705,7 +657,7 @@ public class DocumentReindexer {
     /** Builds the per-document step for a run that publishes atomically. */
     private DocumentReindexStep step(DocumentReindexStep.AtomicTarget target) {
         return DocumentReindexStep.publishing(chunker, llmClient, registry, upsertHandler, lexical,
-            termRecorder, graphReporter, target);
+            graphReporter, target);
     }
 
     /**

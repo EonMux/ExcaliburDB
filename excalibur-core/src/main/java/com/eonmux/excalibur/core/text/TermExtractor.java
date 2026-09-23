@@ -10,12 +10,9 @@ import java.util.Set;
  * Simple term extractor for text tokenization without NLP dependencies.
  *
  * <h2>Purpose</h2>
- * <p>Extracts significant terms from text for use in:
- * <ul>
- *   <li>Hierarchical Cuckoo filter term insertion during ingestion</li>
- *   <li>Hierarchical Cuckoo filter term lookup during query</li>
- *   <li>Count-Min Sketch term frequency estimation</li>
- * </ul>
+ * <p>Extracts the significant terms of a text: the normalised words a chunk's
+ * {@code TextChunk.terms()} reports. The same text yields the same terms on every JVM, so terms
+ * extracted at different times, or on different nodes, can be compared.</p>
  *
  * <h2>Tokenization Strategy</h2>
  * <p>Uses whitespace-based tokenization with:
@@ -187,7 +184,7 @@ public final class TermExtractor {
 
         // Convert to lowercase with a fixed locale: the default locale would make
         // tokenization JVM-dependent (Turkish 'I' maps to a dotless i), silently
-        // desynchronizing persisted term filters from the terms a query produces.
+        // desynchronizing terms extracted on one JVM from the same text's terms on another.
         term = term.toLowerCase(java.util.Locale.ROOT);
 
         // Check minimum length

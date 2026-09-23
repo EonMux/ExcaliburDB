@@ -1,7 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
 import com.eonmux.excalibur.shard.IndexOrchestrator;
-import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
@@ -18,7 +17,7 @@ import static org.mockito.Mockito.when;
 /**
  * That the node reports the LLM relevancy breaker, not only the embedding one.
  *
- * <p>Stage 5 relevancy scoring is guarded by its own circuit breaker, configured by
+ * <p>Stage 4 relevancy scoring is guarded by its own circuit breaker, configured by
  * {@code excalibur.llm.failure-threshold} and {@code excalibur.llm.cooldown-period-ms}. When it
  * opens, the pipeline keeps the vector ranking and the node keeps answering 200, so every
  * ranking it returns changes with nothing anywhere saying so. It is reported the way the
@@ -36,7 +35,6 @@ class NodeStatsLlmBreakerTest {
     void setUp() {
         segmentCatalog = new SegmentCatalog();
         indexOrchestrator = mock(IndexOrchestrator.class);
-        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         storageEngine = mock(StorageEngine.class);
         when(indexOrchestrator.getVisibilityTracker())
             .thenReturn(new VisibilityTracker(segmentCatalog));
@@ -53,7 +51,7 @@ class NodeStatsLlmBreakerTest {
     }
 
     @Test
-    @DisplayName("reports the state stage 5 is currently running under")
+    @DisplayName("reports the state stage 4 is currently running under")
     void reportsTheState() {
         NodeStatsCollector collector = collector();
         collector.withLlmRelevancyBreaker(() -> "OPEN");

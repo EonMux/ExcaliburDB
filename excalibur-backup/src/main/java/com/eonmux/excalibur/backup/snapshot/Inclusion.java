@@ -39,9 +39,8 @@ public enum Inclusion {
     /**
      * Derived, with a rebuild path. Copied unless the operator asks for a smaller image.
      *
-     * <p>The lexical chunk index, a tenant's built edge store, the quantiser codebooks and
-     * each segment's term sketch. Each can be regenerated - by a reindex, by a graph build,
-     * by retraining, or for a sketch by the node itself as it opens the segment - at a cost
+     * <p>The lexical chunk index, a tenant's built edge store and the quantiser codebooks.
+     * Each can be regenerated - by a reindex, by a graph build or by retraining - at a cost
      * in time rather than in data. Excluding them makes a much smaller backup whose restore
      * is followed by work; including them makes a backup that can serve immediately.</p>
      */
@@ -68,7 +67,19 @@ public enum Inclusion {
      * snapshot reports it as omitted, so the dump is seen rather than silently left
      * behind.</p>
      */
-    DIAGNOSTIC(false, false);
+    DIAGNOSTIC(false, false),
+
+    /**
+     * A file an earlier build kept that this build neither reads nor writes. Never copied.
+     *
+     * <p>The term-frequency sketch an earlier build wrote beside each segment,
+     * {@code segment_N.tfs}, and the name it staged one under. Nothing reads them, the node
+     * removes them when it starts, and a restored node would remove them again, so an image
+     * that carried one would only be larger. The snapshot reports each as omitted, and a
+     * restore of an image an earlier build took verifies it with the rest of the image and
+     * then leaves it out of the restored directory.</p>
+     */
+    OBSOLETE(false, false);
 
     /** Whether a snapshot that keeps derived state copies this. */
     private final boolean withDerived;

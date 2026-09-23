@@ -45,7 +45,6 @@ class MBeanBulkAccessTest {
             Metrics.getSystemHealthMBean(),
             Metrics.getIngestionQueueMBean(),
             Metrics.getVisibilityEpochMBean(),
-            Metrics.getCuckooFpRateMBean(),
             Metrics.getHnswQueueDepthMBean(),
             Metrics.getIngestionThroughputMBean()
         );
@@ -56,7 +55,6 @@ class MBeanBulkAccessTest {
         Metrics.setHealthScore(0.7);
         Metrics.setEstimatedCoverage(0.3);
         Metrics.recordEpoch(9L);
-        Metrics.recordCuckooFpRate(0.0004);
         Metrics.recordHnswDepth(1234L);
         Metrics.recordTailScanMetrics(10, 4);
         Metrics.recordIngestEntry();

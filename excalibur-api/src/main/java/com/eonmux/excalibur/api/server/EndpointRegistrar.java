@@ -545,7 +545,7 @@ final class EndpointRegistrar {
     }
 
     /**
-     * Reads the stage-5 relevancy breaker's state, or null on a node that does no scoring.
+     * Reads the stage-4 relevancy breaker's state, or null on a node that does no scoring.
      *
      * <p>The scorer arrives as a {@code QueryPipeline.LlmScorer}, and only the shipped
      * implementation owns a breaker; anything else - a no-op scorer, a test double - reports

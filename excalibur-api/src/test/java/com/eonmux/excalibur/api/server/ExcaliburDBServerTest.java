@@ -5,7 +5,6 @@ import com.eonmux.excalibur.api.endpoint.StatsEndpoint;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.EpochTickScheduler;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
-import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
 import org.junit.jupiter.api.AfterEach;
@@ -51,7 +50,6 @@ class ExcaliburDBServerTest {
         segmentCatalog = new SegmentCatalog();
 
         indexOrchestrator = mock(IndexOrchestrator.class);
-        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         storageEngine = mock(StorageEngine.class);
         queryPipeline = mock(QueryPipeline.class);
 
@@ -65,8 +63,6 @@ class ExcaliburDBServerTest {
         when(indexOrchestrator.getHnswQueueDepth()).thenReturn(0L);
         when(indexOrchestrator.getHnswQueueDepthLimit()).thenReturn(100000);
         when(indexOrchestrator.getTotalVectorsIntegrated()).thenReturn(0L);
-        when(indexOrchestrator.getPendingCuckooDeletions()).thenReturn(0);
-        when(indexOrchestrator.getTotalCuckooDeletions()).thenReturn(0L);
         when(indexOrchestrator.shutdown(any())).thenReturn(true);
         when(queryPipeline.shutdown(any())).thenReturn(true);
         when(storageEngine.stopBackgroundWork(any())).thenReturn(true);
@@ -175,7 +171,6 @@ class ExcaliburDBServerTest {
          */
         private IndexOrchestrator orchestratorFor() {
             IndexOrchestrator orchestrator = mock(IndexOrchestrator.class);
-            when(orchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
             when(orchestrator.getVisibilityTracker())
                 .thenReturn(new com.eonmux.excalibur.shard.VisibilityTracker(segmentCatalog));
             return orchestrator;
@@ -416,7 +411,9 @@ class ExcaliburDBServerTest {
             assertThat(response).contains("\"entries\":");
             assertThat(response).contains("\"volumes\":");
             assertThat(response).contains("\"hnsw\":");
-            assertThat(response).contains("\"cuckoo\":");
+            assertThat(response)
+                .as("the term filter this block described has been removed")
+                .doesNotContain("\"cuckoo\":");
             assertThat(response).contains("\"visibility\":");
             assertThat(response).contains("\"coverage\":");
             conn.disconnect();

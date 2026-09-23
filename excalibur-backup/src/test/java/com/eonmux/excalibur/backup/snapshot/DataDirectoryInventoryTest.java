@@ -52,9 +52,10 @@ class DataDirectoryInventoryTest {
         "shared/graph.compacting/valid_to.col, REBUILDABLE",
         "shared/graph.building/edgestore.meta.tmp, TRANSIENT",
         "segment_0.pqcb,                       REBUILDABLE",
-        "segment_0.tfs,                        REBUILDABLE",
-        "segment_12.tfs,                       REBUILDABLE",
-        "segment_0.tfs.0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11.tmp, TRANSIENT",
+        "segment_0.tfs,                        OBSOLETE",
+        "segment_12.tfs,                       OBSOLETE",
+        "segment_0.tfs.0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11.tmp, OBSOLETE",
+        "segment_0.tfs.notes,                  AUTHORITATIVE",
         "routing.dir.tmp,                      TRANSIENT",
         "source-catalog.tmp,                   TRANSIENT",
         "source-status.tmp,                    TRANSIENT",
@@ -97,14 +98,14 @@ class DataDirectoryInventoryTest {
     }
 
     @Test
-    @DisplayName("a term sketch is derived state the node rebuilds on open, and says so")
-    void aTermSketchIsRebuildable() {
+    @DisplayName("an earlier build's term sketch is never copied, and the reason says why")
+    void anObsoleteTermSketchIsNeverCopied() {
         Inclusion inclusion = DataDirectoryInventory.classify("segment_0.tfs");
 
-        assertThat(inclusion.includedWhen(true)).isTrue();
+        assertThat(inclusion.includedWhen(true)).isFalse();
         assertThat(inclusion.includedWhen(false)).isFalse();
         assertThat(DataDirectoryInventory.reason("segment_0.tfs"))
-            .contains("term sketch", "rebuilds", "start-up");
+            .contains("term sketch", "earlier build", "removes it");
     }
 
     @Test

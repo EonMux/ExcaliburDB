@@ -32,8 +32,8 @@ import static org.junit.jupiter.api.Assertions.*;
  * produced, which is the mechanism rather than its use: they say that the answer stays inside the
  * set, agrees with an unrestricted search when the set holds everything, and is the nearest of the
  * set rather than whichever members the graph happened to link together - which is what lets
- * stage 3 rank the named nodes in beside its graph search by exact distance. That the query
- * pipeline actually hands stage 3 such a set, and never lets it confine the search, is a separate
+ * stage 2 rank the named nodes in beside its graph search by exact distance. That the query
+ * pipeline actually hands stage 2 such a set, and never lets it confine the search, is a separate
  * question, and {@link LshCandidateHandoffTest} is where it is asked.</p>
  *
  * <h2>Test Scenarios</h2>

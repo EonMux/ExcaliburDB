@@ -59,10 +59,7 @@ final class SplitBookkeeping {
         try {
             long parentId = registry.registeredIdOf(parent);
             if (parentId >= 0) {
-                // The left child inherits the parent's directory index, and with it the
-                // parent's place in the filter hierarchy: the terms it holds are still
-                // the terms of the keys that index serves.
-                registry.unregister(parentId, false);
+                registry.unregister(parentId);
             }
 
             installSplitChild(leftChild);
@@ -110,6 +107,6 @@ final class SplitBookkeeping {
             return;
         }
 
-        registry.register(childId, child, child.getHnswGraph(), null, tracker);
+        registry.register(childId, child, child.getHnswGraph(), tracker);
     }
 }

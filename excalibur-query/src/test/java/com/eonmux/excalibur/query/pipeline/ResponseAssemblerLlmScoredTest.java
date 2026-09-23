@@ -21,7 +21,7 @@ import static org.mockito.Mockito.when;
 /**
  * Whether a pipeline answer says its scores are a relevancy model's judgement.
  *
- * <p>The flag is what tells a caller how to read {@code score}, so it must follow what Stage 5
+ * <p>The flag is what tells a caller how to read {@code score}, so it must follow what Stage 4
  * actually did - on a finished answer and on the partial one an interruption hands back - and
  * never be claimed by an answer a stage failed to produce.</p>
  */
@@ -49,7 +49,7 @@ class ResponseAssemblerLlmScoredTest {
     }
 
     @Test
-    @DisplayName("a finished answer says it was scored when Stage 5 scored it")
+    @DisplayName("a finished answer says it was scored when Stage 4 scored it")
     void finishedAndScored() {
         QueryResponse response = assembler.buildResponse(context.withLlmScored(true), 3L);
 
@@ -57,7 +57,7 @@ class ResponseAssemblerLlmScoredTest {
     }
 
     @Test
-    @DisplayName("a finished answer says it was not when Stage 5 did not run")
+    @DisplayName("a finished answer says it was not when Stage 4 did not run")
     void finishedUnscored() {
         assertThat(assembler.buildResponse(context, 3L).llmScored()).isFalse();
     }

@@ -3,7 +3,6 @@ package com.eonmux.excalibur.api.endpoint;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
-import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
@@ -44,7 +43,6 @@ class StatsPartialFailureTest {
     void setUp() {
         segmentCatalog = new SegmentCatalog();
         indexOrchestrator = mock(IndexOrchestrator.class);
-        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         storageEngine = mock(StorageEngine.class);
         when(indexOrchestrator.getVisibilityTracker())
             .thenReturn(new VisibilityTracker(segmentCatalog));

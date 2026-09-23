@@ -75,18 +75,12 @@ final class EngineWrites {
      * retry. Classifying them by message would silently miss the data-region case, which is
      * the one vector payloads hit first.</p>
      *
-     * <h2>Why the terms are hashed here</h2>
-     * <p>The value's chunk-text terms are counted into the sketch of whichever segment accepts
-     * the write, under that segment's write lock. Hashing them here, once and before any lock,
-     * keeps the tokenising out of the lock and out of every retry.</p>
-     *
-     * @param key        The key
-     * @param value      The value
-     * @param termHashes The value's {@linkplain SegmentTermSketch#termHashes(byte[]) term hashes}
+     * @param key   The key
+     * @param value The value
      * @return The catalog index of the segment the key was written to
      * @see StorageEngine#putReportingSegment(byte[], byte[])
      */
-    long putReportingSegment(byte[] key, byte[] value, long[] termHashes) {
+    long putReportingSegment(byte[] key, byte[] value) {
         if (key == null || value == null) {
             throw new NullPointerException("Key and value cannot be null");
         }
@@ -115,7 +109,7 @@ final class EngineWrites {
             }
 
             try {
-                segment.put(key, value, termHashes);
+                segment.put(key, value);
 
                 // Update catalog entry count only - don't change lifecycle state
                 // Segments remain in INDEXING state during writes

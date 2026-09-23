@@ -5,7 +5,6 @@ import com.eonmux.excalibur.ingest.lexical.ChunkIndexStats;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.shard.allocator.VolumeManager;
-import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
@@ -66,7 +65,7 @@ public final class NodeStatsCollector {
     private volatile Supplier<String> embeddingBreaker;
 
     /**
-     * Reads the stage-5 relevancy breaker's state, or null on a node that does no scoring.
+     * Reads the stage-4 relevancy breaker's state, or null on a node that does no scoring.
      *
      * <p>A separate breaker from the embedding one and separately reportable: they guard
      * different endpoints of the provider, and either can be open while the other is
@@ -180,7 +179,7 @@ public final class NodeStatsCollector {
     /**
      * Reports the LLM relevancy circuit breaker's state.
      *
-     * <p>The breaker in front of stage-5 relevancy scoring, configured by
+     * <p>The breaker in front of stage-4 relevancy scoring, configured by
      * {@code excalibur.llm.failure-threshold} and {@code excalibur.llm.cooldown-period-ms}.
      * When it opens the pipeline keeps the vector ranking and the node goes on answering 200,
      * so every ranking it returns changes with nothing in the response saying so. Reported the
@@ -319,7 +318,6 @@ public final class NodeStatsCollector {
                 indexOrchestrator.getHnswQueueDepth(),
                 indexOrchestrator.getHnswQueueDepthLimit(),
                 indexOrchestrator.getTotalVectorsIntegrated()),
-            cuckooStats(),
             new NodeStats.VisibilityStats(
                 visStats.currentEpoch(), visStats.totalSegments(), visStats.visibleSegments()),
             catalogMeta.getEstimatedCoverage(),
@@ -371,27 +369,6 @@ public final class NodeStatsCollector {
             LOGGER.warn("Query cache stats unavailable: {}", e.getMessage());
             return null;
         }
-    }
-
-    /**
-     * The membership filters, which report saturation only when one is attached.
-     *
-     * <p>The false-positive rates are read from the segments' filters at the time of the
-     * request. The process-wide histogram the metrics worker also feeds is a lifetime record
-     * of past samples, averaged over the whole run, so a node whose filters had just filled
-     * would go on reporting the rates of when they were empty.</p>
-     */
-    private NodeStats.CuckooStats cuckooStats() {
-        com.eonmux.excalibur.filter.HierarchicalCuckooFilter membership =
-            indexOrchestrator.getHierarchicalCuckooFilter();
-        CuckooMetricsWorker.FpRates rates = indexOrchestrator.getCuckooFpRates();
-        return new NodeStats.CuckooStats(
-            indexOrchestrator.getPendingCuckooDeletions(),
-            indexOrchestrator.getTotalCuckooDeletions(),
-            rates.average(),
-            rates.max(),
-            membership != null && membership.isSaturated(),
-            membership == null ? 0 : membership.saturatedSegmentCount());
     }
 
     /**

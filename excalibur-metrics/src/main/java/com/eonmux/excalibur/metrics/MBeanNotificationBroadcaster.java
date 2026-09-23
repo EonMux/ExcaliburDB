@@ -298,8 +298,6 @@ public class MBeanNotificationBroadcaster implements NotificationEmitter {
         public static final String INGESTION_QUEUE = "excalibur.ingest.queue";
         /** Visibility epoch advanced */
         public static final String VISIBILITY_EPOCH = "excalibur.visibility.epoch";
-        /** Cuckoo filter FP rate changed */
-        public static final String CUCKOO_FP_RATE = "excalibur.cuckoo.fprate";
         /** HNSW queue depth changed */
         public static final String HNSW_QUEUE_DEPTH = "excalibur.hnsw.queue";
         /** Ingestion throughput updated */

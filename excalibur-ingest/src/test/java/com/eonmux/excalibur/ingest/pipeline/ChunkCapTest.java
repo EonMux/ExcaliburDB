@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
-import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
@@ -74,7 +73,7 @@ class ChunkCapTest {
     @DisplayName("a re-crawl refuses the same document, leaving its entry as it was")
     void reindexRefusesItToo() {
         DocumentRegistry registry = new DocumentRegistry();
-        UpsertHandler upsert = new UpsertHandler(registry, CuckooFilter.create(1_000), key -> true);
+        UpsertHandler upsert = new UpsertHandler(registry, key -> true);
         DocumentReindexer reindexer = new DocumentReindexer(TINY_CHUNKS, null, upsert, registry,
             (chunkId, content, embedding) -> true);
         FetchedDocument document = new FetchedDocument("big.txt",

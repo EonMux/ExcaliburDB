@@ -101,8 +101,9 @@ public final class TextReportWriter {
             counts.get(CheckStatus.UNCHECKED), scan.partlyVerifiedCount());
         long notData = counts.get(CheckStatus.NOT_DATA);
         if (notData > 0) {
-            out.printf("  %d not engine data - JVM heap dumps, reported so the disk they take "
-                + "is seen, never read, and not counted as unverified%n", notData);
+            out.printf("  %d not engine data - JVM heap dumps and files an earlier build kept, "
+                + "reported so the disk they take is seen, never read, and not counted as "
+                + "unverified%n", notData);
         }
         out.println(scan.hasDamage()
             ? "  VERDICT: damage found"

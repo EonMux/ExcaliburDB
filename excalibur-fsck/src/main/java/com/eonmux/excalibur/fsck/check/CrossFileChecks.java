@@ -123,7 +123,7 @@ public final class CrossFileChecks {
     }
 
     /**
-     * Finds vector indexes, sketches and logs whose segment data file is gone.
+     * Finds vector indexes and logs whose segment data file is gone.
      *
      * <p>A staged mapping whose compacted graph is still beside it is left to
      * {@link #leftovers}: it is scratch whether its segment is here or not.</p>
@@ -168,12 +168,6 @@ public final class CrossFileChecks {
                 + " is not here. Any record in it that had not been integrated when the "
                 + "segment was lost has nothing left to be replayed into, and there is no "
                 + "way from here to tell which records those were";
-        }
-        if (kind == FileKind.TERM_SKETCH) {
-            return name + " is the term sketch of segment " + segment + ", and " + missing
-                + " is not here. The sketch itself is harmless - nothing opens it without its "
-                + "segment, and a segment that took the name would rebuild its own - but it "
-                + "is evidence that the segment it counted was lost";
         }
         return name + " indexes segment " + segment + ", and " + missing + " is not here. It "
             + "points at records that are not in this directory, so nothing can open it and "
@@ -304,12 +298,12 @@ public final class CrossFileChecks {
      * Reports whether a kind is a file that belongs to a segment data file.
      *
      * @param kind What the file is
-     * @return true for the log, the index sidecars, a staged mapping and the term sketch
+     * @return true for the log, the index sidecars and a staged mapping
      */
     private static boolean isSegmentSidecar(FileKind kind) {
         return kind == FileKind.WRITE_AHEAD_LOG || kind == FileKind.HNSW_GRAPH
             || kind == FileKind.HNSW_DOCUMENT_MAP || kind == FileKind.PQ_CODEBOOK
-            || kind == FileKind.HNSW_STAGED_DOCUMENT_MAP || kind == FileKind.TERM_SKETCH;
+            || kind == FileKind.HNSW_STAGED_DOCUMENT_MAP;
     }
 
     /**

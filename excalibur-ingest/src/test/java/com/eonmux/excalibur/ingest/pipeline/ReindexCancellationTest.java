@@ -1,7 +1,6 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
 import com.eonmux.excalibur.core.util.StopSignal;
-import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
@@ -55,7 +54,7 @@ class ReindexCancellationTest {
         registry = new DocumentRegistry();
         writer = new RecordingWriter();
         reindexer = new DocumentReindexer(new TextChunker(512, 64), null,
-            new UpsertHandler(registry, CuckooFilter.create(10_000), writer), registry, writer);
+            new UpsertHandler(registry, writer), registry, writer);
     }
 
     @AfterEach

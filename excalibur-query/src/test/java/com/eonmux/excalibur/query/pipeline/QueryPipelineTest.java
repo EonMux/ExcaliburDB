@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.query.pipeline;
 
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker;
 import com.eonmux.excalibur.query.IndexCoverage;
 import com.eonmux.excalibur.query.QueryRequest;
@@ -52,9 +51,6 @@ class QueryPipelineTest {
 
     @Mock
     private QueryPipeline.LlmScorer llmScorer;
-
-    @Mock
-    private HierarchicalCuckooFilter hierarchicalFilter;
 
     private QueryPipeline pipeline;
 
@@ -235,8 +231,8 @@ class QueryPipelineTest {
     class Constructor8Params {
 
         @Test
-        @DisplayName("creates pipeline with hierarchical filter")
-        void createsPipelineWithHierarchicalFilter() {
+        @DisplayName("creates pipeline with an epoch isolation validator")
+        void createsPipelineWithEpochIsolation() {
             QueryPipeline p = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
@@ -245,8 +241,7 @@ class QueryPipelineTest {
                 distanceFunction,
                 llmScorer,
                 0.75,
-                hierarchicalFilter
-            );
+                new com.eonmux.excalibur.shard.visibility.EpochIsolationValidator());
 
             assertThat(p).isNotNull();
         }

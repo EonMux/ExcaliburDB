@@ -404,106 +404,6 @@ class IngestionPipelineTest {
         }
 
         @Test
-        @DisplayName("a crawled chunk's terms reach the membership filter, trusted only once rebuilt")
-        void crawledTermsPopulateTheMembershipFilter() {
-            // Stage 1 of the query pipeline orders segments by whether a trusted level names a
-            // query's terms. It was fed only by the reindex path, which targets a segment it
-            // chose itself, so a node that ingested and never reindexed had no trusted level to
-            // order by, and searched every segment in sketch order alone.
-            com.eonmux.excalibur.filter.HierarchicalCuckooFilter membership =
-                new com.eonmux.excalibur.filter.HierarchicalCuckooFilter(1_000_000);
-            IngestionOrchestrator orchestrator = orchestrator();
-            orchestrator.setMembershipFilter(membership);
-
-            ingest(orchestrator, new FakeSource("docs",
-                Map.of("a.txt", "Ada Lovelace wrote the first algorithm.")));
-
-            java.util.List<String> segments = membership.findCandidateSegments(
-                "lovelace".getBytes(StandardCharsets.UTF_8));
-            assertThat(segments)
-                .as("a term of an ingested chunk must be findable in the filter")
-                .hasSize(1);
-            String segment = segments.get(0);
-            assertThat(membership.findCandidateSegments(
-                "babbage".getBytes(StandardCharsets.UTF_8)))
-                .as("a term no ingested chunk holds must not be reported")
-                .isEmpty();
-
-            // Present is not the same as trusted. A level is born stale: it holds the terms of
-            // the writes recorded into it, and nothing says those are all the segment holds -
-            // a split, a restart or a compaction puts entries in a segment without passing
-            // through here. Only a rebuild that refills the level from the segment may vouch
-            // for it, so until one has, the segment is searched for every query.
-            assertThat(membership.isSegmentStale(segment)).isTrue();
-            assertThat(membership.coversSegment(segment))
-                .as("ingest alone must not make the segment trusted")
-                .isFalse();
-
-            // The refill a rebuild performs: every entry the segment holds, read back from
-            // storage and tokenised as the write was.
-            long generation = membership.beginSegmentRebuild(segment);
-            String stored = com.eonmux.excalibur.core.codec.ChunkPayloadCodec.textOf(
-                storedChunk("docs", "a.txt", 0));
-            for (String term : com.eonmux.excalibur.core.text.TermExtractor
-                    .extractUniqueTerms(stored)) {
-                membership.insert(term.getBytes(StandardCharsets.UTF_8), segment);
-            }
-            assertThat(membership.completeSegmentRebuild(segment, generation)).isTrue();
-
-            assertThat(membership.coversSegment(segment))
-                .as("a completed rebuild is what makes the segment trusted")
-                .isTrue();
-            assertThat(membership.findCandidateSegments(
-                "lovelace".getBytes(StandardCharsets.UTF_8))).containsExactly(segment);
-        }
-
-        @Test
-        @DisplayName("the frequency sketch and the membership filter are given the same terms")
-        void theSketchAndTheFilterSeeTheSameTerms() {
-            // Both are fed from the one tokenisation of each chunk. Were they tokenised apart,
-            // a change to either would let the sketch and the filter disagree about what a
-            // segment holds, and the query ordering each feeds would no longer agree.
-            com.eonmux.excalibur.filter.HierarchicalCuckooFilter membership =
-                new com.eonmux.excalibur.filter.HierarchicalCuckooFilter(1_000_000);
-            IngestionOrchestrator orchestrator = orchestrator();
-            orchestrator.setMembershipFilter(membership);
-            String text = "Lovelace annotated the engine; Lovelace published the engine notes.";
-
-            ingest(orchestrator, new FakeSource("docs", Map.of("a.txt", text)));
-
-            java.util.List<String> terms =
-                com.eonmux.excalibur.core.text.TermExtractor.extractTerms(text);
-            assertThat(terms).contains("lovelace", "engine");
-            java.util.List<String> segments = membership.findCandidateSegments(
-                "lovelace".getBytes(StandardCharsets.UTF_8));
-            assertThat(segments).hasSize(1);
-            com.eonmux.excalibur.filter.sketch.CountMinSketch sketch =
-                storage.getSegment(Long.parseLong(segments.get(0))).termFrequencySketch();
-            assertThat(sketch).isNotNull();
-
-            for (String term : new java.util.LinkedHashSet<>(terms)) {
-                byte[] bytes = term.getBytes(StandardCharsets.UTF_8);
-                assertThat(membership.findCandidateSegments(bytes))
-                    .as("the filter holds %s under the segment the chunk landed in", term)
-                    .containsExactlyElementsOf(segments);
-                long occurrences = terms.stream().filter(term::equals).count();
-                assertThat(sketch.estimate(bytes))
-                    .as("the sketch counted every occurrence of %s", term)
-                    .isGreaterThanOrEqualTo(occurrences);
-            }
-        }
-
-        @Test
-        @DisplayName("ingestion without a membership filter still writes its chunks")
-        void noMembershipFilterIsNotAFailure() {
-            RecordingStatus status = ingest(orchestrator(),
-                new FakeSource("docs", Map.of("a.txt", "some text")));
-
-            assertThat(status.error).isNull();
-            assertThat(storedChunkExists("docs", "a.txt", 0)).isTrue();
-        }
-
-        @Test
         @DisplayName("chunks are written under the shared naming convention")
         void chunksUseTheSharedConvention() {
             // The key written here is the one excalibur-shard derives a document key from and
@@ -1168,8 +1068,7 @@ class IngestionPipelineTest {
             RegistryWatchingSink sink = new RegistryWatchingSink(registryFile);
             orchestrator.setGraphSink(sink);
             DocumentReindexer reindexer = new DocumentReindexer(new TextChunker(), null,
-                new com.eonmux.excalibur.ingest.registry.UpsertHandler(documents,
-                    com.eonmux.excalibur.filter.CuckooFilter.create(1_000), key -> true),
+                new com.eonmux.excalibur.ingest.registry.UpsertHandler(documents, key -> true),
                 documents, (chunkId, content, embedding) -> true);
             orchestrator.shareGraphReporting(reindexer);
 

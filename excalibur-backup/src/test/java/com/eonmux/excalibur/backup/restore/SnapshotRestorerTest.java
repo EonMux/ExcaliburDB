@@ -1,6 +1,10 @@
 package com.eonmux.excalibur.backup.restore;
 
+import com.eonmux.excalibur.backup.io.FileDigest;
+import com.eonmux.excalibur.backup.io.FileDigests;
+import com.eonmux.excalibur.backup.manifest.FileEntry;
 import com.eonmux.excalibur.backup.manifest.ManifestCodec;
+import com.eonmux.excalibur.backup.manifest.SnapshotManifest;
 import com.eonmux.excalibur.backup.snapshot.SnapshotLayout;
 import com.eonmux.excalibur.backup.snapshot.SnapshotOptions;
 import com.eonmux.excalibur.backup.snapshot.SnapshotWriter;
@@ -14,6 +18,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -46,36 +53,75 @@ class SnapshotRestorerTest {
     }
 
     @Test
-    @DisplayName("an image without term sketches says the node rebuilds them at start-up")
-    void anImageWithoutSketchesSaysTheyAreRebuilt() throws IOException {
-        Path dataDir = DataDirectoryFixture.syntheticDirectory(tempDir.resolve("data"));
-        Files.write(dataDir.resolve("segment_0.tfs"), new byte[48]);
-        Path snapshotDir = tempDir.resolve("snap");
-        new SnapshotWriter().take(new SnapshotOptions(dataDir, snapshotDir, false, false));
-
-        RestoreResult result = new SnapshotRestorer().restore(new RestoreOptions(
-            snapshotDir, tempDir.resolve("restored"), false, VerifyDepth.CHECKSUM));
-
-        assertThat(tempDir.resolve("restored/segment_0.tfs"))
-            .as("derived state left out on request").doesNotExist();
-        assertThat(result.rebuildRequired())
-            .anySatisfy(line -> assertThat(line).contains("term sketches", "start-up"));
-    }
-
-    @Test
-    @DisplayName("an image with its term sketches has nothing to say about them")
-    void anImageWithSketchesSaysNothingAboutThem() throws IOException {
+    @DisplayName("a snapshot leaves out an earlier build's term sketch")
+    void aSnapshotLeavesOutAnObsoleteSketch() throws IOException {
         Path dataDir = DataDirectoryFixture.syntheticDirectory(tempDir.resolve("data"));
         Files.write(dataDir.resolve("segment_0.tfs"), new byte[48]);
         Path snapshotDir = tempDir.resolve("snap");
         new SnapshotWriter().take(new SnapshotOptions(dataDir, snapshotDir, true, false));
 
+        assertThat(payload(snapshotDir, "segment_0.tfs"))
+            .as("nothing in this build reads it, even with derived state kept").doesNotExist();
+        assertThat(ManifestCodec.read(snapshotDir.resolve(ManifestCodec.FILE_NAME)).files())
+            .noneMatch(entry -> entry.path().equals("segment_0.tfs"));
+    }
+
+    @Test
+    @DisplayName("an earlier build's image restores without its term sketches")
+    void anEarlierBuildsImageRestoresWithoutItsSketches() throws IOException {
+        Path snapshotDir = imageWithSketches();
+
         RestoreResult result = new SnapshotRestorer().restore(new RestoreOptions(
             snapshotDir, tempDir.resolve("restored"), false, VerifyDepth.CHECKSUM));
 
-        assertThat(tempDir.resolve("restored/segment_0.tfs")).exists();
+        assertThat(tempDir.resolve("restored/segment_0.tfs"))
+            .as("verified with the image, then left out rather than restored for the node to "
+                + "remove")
+            .doesNotExist();
+        assertThat(tempDir.resolve("restored/segment_0.dat")).exists();
+        assertThat(result.filesRestored()).isEqualTo(result.manifest().files().size() - 1);
         assertThat(result.rebuildRequired())
-            .noneSatisfy(line -> assertThat(line).contains("term sketches"));
+            .noneSatisfy(line -> assertThat(line).containsIgnoringCase("sketch"));
+    }
+
+    @Test
+    @DisplayName("an earlier build's image whose term sketch was altered is still refused")
+    void anAlteredSketchInAnEarlierBuildsImageIsRefused() throws IOException {
+        Path snapshotDir = imageWithSketches();
+        DataDirectoryFixture.flipAByte(payload(snapshotDir, "segment_0.tfs"));
+        Path target = tempDir.resolve("restored");
+
+        assertThatThrownBy(() -> new SnapshotRestorer().restore(new RestoreOptions(
+            snapshotDir, target, false, VerifyDepth.CHECKSUM)))
+            .as("the file is not restored, but its bytes are still part of what the image "
+                + "certifies")
+            .isInstanceOf(RestoreRefusedException.class);
+        assertThat(target).doesNotExist();
+    }
+
+    /**
+     * Builds the image an earlier build would have taken: this build's, with a term sketch
+     * beside the first segment in the payload and named in the manifest.
+     *
+     * @return The image
+     * @throws IOException if it cannot be written
+     */
+    private Path imageWithSketches() throws IOException {
+        Path snapshotDir = snapshot();
+        Path sketch = payload(snapshotDir, "segment_0.tfs");
+        Files.write(sketch, new byte[48]);
+        FileDigest digest = FileDigests.of(sketch);
+        Path manifestFile = snapshotDir.resolve(ManifestCodec.FILE_NAME);
+        SnapshotManifest manifest = ManifestCodec.read(manifestFile);
+        List<FileEntry> files = new ArrayList<>(manifest.files());
+        files.add(new FileEntry("segment_0.tfs", digest.size(), digest.crc32c(),
+            digest.sha256()));
+        files.sort(Comparator.comparing(FileEntry::path));
+        ManifestCodec.write(new SnapshotManifest(manifest.manifestVersion(),
+            manifest.snapshotId(), manifest.createdAt(), manifest.producer(),
+            manifest.sourceDataDir(), manifest.epoch(), manifest.epochSource(),
+            manifest.consistency(), manifest.formatVersions(), files), manifestFile);
+        return snapshotDir;
     }
 
     @Test

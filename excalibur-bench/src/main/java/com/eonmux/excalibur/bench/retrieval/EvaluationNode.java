@@ -212,7 +212,7 @@ final class EvaluationNode implements AutoCloseable {
                 core.indexOrchestrator().getVisibilityTracker());
             QueryPipeline queryPipeline = QueryPipelineFactory.create(config,
                 core.storageEngine(), core.indexOrchestrator(),
-                new DocumentVisibilityTrackerAdapter(tracker), core.hierarchicalFilter());
+                new DocumentVisibilityTrackerAdapter(tracker));
             tenants = new GraphTenants(GraphRagFactory.tenantRootFor(config, dataDir), config,
                 MappingBudget.detect(), config.graph().getMaxOpenNamespaces());
             server = new ExcaliburDBServer(0, ExcaliburDBServer.DEFAULT_BACKLOG,
@@ -221,7 +221,7 @@ final class EvaluationNode implements AutoCloseable {
             server.withSecurity(ApiSecurityConfig.fromConfig(config));
             server.withSourceCatalog(SourceCatalog.open(dataDir));
             attachment = new IngestionWiring(config, dataDir, core.storageEngine(),
-                core.indexOrchestrator(), core.hierarchicalFilter(), tracker, tenants)
+                core.indexOrchestrator(), tracker, tenants)
                 .attachTo(server);
             server.withDocumentRegistry(tracker.getRegistry());
             server.withGraphSupport(tenants);

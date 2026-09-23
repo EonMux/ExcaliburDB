@@ -689,7 +689,7 @@ class MBeanNotificationObserverTest {
     @Test
     @DisplayName("All MBeans return non-empty getAttributes set")
     void testAllMBeansReturnNonEmptyAttributesSet() {
-        // Verify all 6 MBeans have getAttributes() that return non-empty sets
+        // Verify each MBean has getAttributes() that returns a non-empty set
         assertTrue(Metrics.getQueryLatencyMBean().getAttributes().size() > 0,
             "QueryLatencyMBean should have attributes");
         assertTrue(Metrics.getSystemHealthMBean().getAttributes().size() > 0,
@@ -698,8 +698,6 @@ class MBeanNotificationObserverTest {
             "IngestionQueueMBean should have attributes");
         assertTrue(Metrics.getVisibilityEpochMBean().getAttributes().size() > 0,
             "VisibilityEpochMBean should have attributes");
-        assertTrue(Metrics.getCuckooFpRateMBean().getAttributes().size() > 0,
-            "CuckooFpRateMBean should have attributes");
         assertTrue(Metrics.getHnswQueueDepthMBean().getAttributes().size() > 0,
             "HnswQueueDepthMBean should have attributes");
 
@@ -712,8 +710,6 @@ class MBeanNotificationObserverTest {
             "IngestionQueueMBean should have 5 attributes");
         assertEquals(1, Metrics.getVisibilityEpochMBean().getAttributes().size(),
             "VisibilityEpochMBean should have 1 attribute");
-        assertEquals(6, Metrics.getCuckooFpRateMBean().getAttributes().size(),
-            "CuckooFpRateMBean should have 6 attributes");
         assertEquals(9, Metrics.getHnswQueueDepthMBean().getAttributes().size(),
             "HnswQueueDepthMBean should have 9 attributes");
     }
@@ -751,15 +747,6 @@ class MBeanNotificationObserverTest {
         // VisibilityEpochMBean attributes (this was missing before fix)
         java.util.Set<String> epochAttrs = Metrics.getVisibilityEpochMBean().getAttributes();
         assertTrue(epochAttrs.contains("epoch"), "Should contain 'epoch'");
-
-        // CuckooFpRateMBean attributes (this was missing before fix)
-        java.util.Set<String> cuckooAttrs = Metrics.getCuckooFpRateMBean().getAttributes();
-        assertTrue(cuckooAttrs.contains("fpRate"), "Should contain 'fpRate'");
-        assertTrue(cuckooAttrs.contains("fpRateEpoch"), "Should contain 'fpRateEpoch'");
-        assertTrue(cuckooAttrs.contains("fpRateCount"), "Should contain 'fpRateCount'");
-        assertTrue(cuckooAttrs.contains("avgFpRate"), "Should contain 'avgFpRate'");
-        assertTrue(cuckooAttrs.contains("maxFpRate"), "Should contain 'maxFpRate'");
-        assertTrue(cuckooAttrs.contains("currentEpoch"), "Should contain 'currentEpoch'");
 
         // HnswQueueDepthMBean attributes (this was missing before fix)
         java.util.Set<String> hnswAttrs = Metrics.getHnswQueueDepthMBean().getAttributes();

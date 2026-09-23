@@ -939,40 +939,6 @@ public class SplitWorker {
          * @param rightChild The right child segment (entries whose split bit is 1)
          */
         void onSplitComplete(Segment parent, Segment leftChild, Segment rightChild);
-
-        /**
-         * Told, as a split observer, that a split is about to become reachable.
-         *
-         * <p>Called with the directory lock held, after the children's indices are fixed and
-         * before any key routes to either child. An observer that keeps state per segment which
-         * the children's entries will not reach by themselves - a membership filter filled by
-         * writes, for one - marks it here, because {@link #onSplitComplete} comes only after the
-         * children are routed to and have started taking writes. Anything done here holds up
-         * every routing decision in the engine, so it must be cheap and must not block. A
-         * throw is logged and does not stop the split. The worker's own listener, which
-         * publishes the split, is never called with this.</p>
-         *
-         * @param parent     The segment being split, still serving its keys
-         * @param leftIndex  The directory index the left child will be published at
-         * @param rightIndex The directory index the right child will be published at
-         */
-        default void onSplitPublishing(Segment parent, long leftIndex, long rightIndex) {
-        }
-
-        /**
-         * Told, as a split observer, that a split it heard {@link #onSplitPublishing} for was
-         * not published after all.
-         *
-         * <p>The parent goes back to serving its keys and the right index to routing nowhere.
-         * Called outside the directory lock. A throw is logged and does not change the
-         * outcome.</p>
-         *
-         * @param parent     The segment that was to be split, back in service
-         * @param leftIndex  The index the left child would have been published at
-         * @param rightIndex The index the right child would have been published at
-         */
-        default void onSplitAbandoned(Segment parent, long leftIndex, long rightIndex) {
-        }
     }
 
     // ==================== Object Methods ====================

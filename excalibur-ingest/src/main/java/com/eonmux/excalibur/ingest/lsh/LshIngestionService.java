@@ -17,7 +17,7 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * <h2>Purpose</h2>
  * <p>Maintains one locality-sensitive hash index per segment, keyed by HNSW node id, whose
- * bucket-mates of a query stage 2 of the query pipeline hands to stage 3 to measure exactly beside
+ * bucket-mates of a query stage 1 of the query pipeline hands to stage 2 to measure exactly beside
  * the graph search.</p>
  *
  * <h2>Integration Points</h2>

@@ -163,8 +163,10 @@ public final class FsckOptionsParser {
               2  the command line was wrong, or the directory is not there
               3  the check could not be performed
 
-            A corrupt segment_N.tfs term sketch is reported and does not exit 1: the node
-            rebuilds it from its segment's live entries the next time it opens the segment.
+            A corrupt chunk-index/seg-N.keymap is reported and does not exit 1: the node
+            rebuilds it from the segment's names the next time it opens the segment. A
+            segment_N.tfs term sketch an earlier build kept is reported as not engine data:
+            nothing reads it, and the node removes it the next time it starts.
             """;
     }
 }

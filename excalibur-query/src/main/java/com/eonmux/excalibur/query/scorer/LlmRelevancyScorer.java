@@ -65,7 +65,7 @@ public final class LlmRelevancyScorer implements LlmScorer {
     /**
      * The circuit breaker this scorer's calls are made through.
      *
-     * <p>Exposed so the node can report it. When it opens, stage 5 is bypassed, the pipeline
+     * <p>Exposed so the node can report it. When it opens, stage 4 is bypassed, the pipeline
      * keeps the ranking it already had and the node goes on answering 200 - so without this
      * the only evidence that every ranking changed is a log line.</p>
      *

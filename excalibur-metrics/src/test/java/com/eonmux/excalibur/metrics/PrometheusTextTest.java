@@ -70,9 +70,9 @@ class PrometheusTextTest {
         try {
             Locale.setDefault(Locale.GERMANY);
             String text = new PrometheusText()
-                .gauge("excalibur_fp_rate", "False positive rate", 0.0005)
+                .gauge("excalibur_coverage_ratio", "Share of live segments read", 0.0005)
                 .render();
-            assertThat(text).contains("excalibur_fp_rate 0.0005");
+            assertThat(text).contains("excalibur_coverage_ratio 0.0005");
             assertThat(text).doesNotContain(",");
         } finally {
             Locale.setDefault(original);

@@ -89,7 +89,7 @@ class IndexOrchestratorCompactionOutcomeTest {
         Segment original = storageEngine.getSegment(0L);
         original.put("keep".getBytes(StandardCharsets.UTF_8),
             "value".getBytes(StandardCharsets.UTF_8));
-        orchestrator.registerSegment(0L, original, null, null, null);
+        orchestrator.registerSegment(0L, original, null, null);
 
         boolean compacted = orchestrator.getCompactionWorker().compactNow(original, true);
 

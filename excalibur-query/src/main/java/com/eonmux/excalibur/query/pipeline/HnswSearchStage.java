@@ -17,17 +17,16 @@ import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 /**
- * Stage 3: HNSW Vector Search with Tail Scan.
+ * Stage 2: HNSW Vector Search with Tail Scan.
  *
  * <p>Performs precise ANN search within candidate segments using HNSW.
  * For segments where lastIntegratedOffset &lt; writeLogHead, also performs
  * brute-force tail scan over un-integrated entries.</p>
  *
  * <p><strong>Candidate-Based Execution:</strong> Uses the candidates from
- * stages 0-1, which visibility tracking has filtered and the sketch estimate and the Cuckoo
- * filter cascade have ordered, each carrying the nodes stage 2's LSH lookup named for it.
- * This ensures that only segments visible at the captured epoch are searched, and that the
- * segments likeliest to answer are dispatched first.</p>
+ * stage 0, which visibility tracking has filtered, each carrying the nodes stage 1's LSH
+ * lookup named for it. This ensures that only segments visible at the captured epoch are
+ * searched.</p>
  *
  * <p><strong>Parallel Execution:</strong> Searches are executed in parallel
  * using the {@link ParallelQueryDispatcher} for improved latency across
@@ -41,11 +40,11 @@ final class HnswSearchStage {
     private static final Logger LOGGER = LoggerFactory.getLogger(HnswSearchStage.class);
 
     /**
-     * The share of the remaining query budget Stage 3 leaves for a merge alone.
+     * The share of the remaining query budget Stage 2 leaves for a merge alone.
      *
-     * <p>Stage 3 is the only stage that waits on work it did not do itself, so it is the only
+     * <p>Stage 2 is the only stage that waits on work it did not do itself, so it is the only
      * one that needs a deadline of its own - and that deadline has to end early enough for
-     * Stage 4 to still merge what came back. Reranking is bounded work over a bounded candidate
+     * Stage 3 to still merge what came back. Reranking is bounded work over a bounded candidate
      * set and holds no locks and does no I/O beyond reading vectors already mapped, so the
      * margin it needs is small; what is held back is recall, and holding back more than the
      * merge can use trades recall for nothing.</p>
@@ -53,12 +52,12 @@ final class HnswSearchStage {
     private static final double MERGE_SHARE_HELD_BACK = 0.05;
 
     /**
-     * The share Stage 3 leaves when Stage 5 will also run.
+     * The share Stage 2 leaves when Stage 4 will also run.
      *
      * <p>Relevancy scoring is a call to a model, so unlike the merge its cost is not a function
      * of the candidate count and cannot be bounded from here. The wider margin buys it a
      * realistic chance to answer; if it overruns anyway, the pipeline's own deadline fires and
-     * Stage 4's ranking is returned, which is the fallback this stage already has.</p>
+     * Stage 3's ranking is returned, which is the fallback this stage already has.</p>
      */
     private static final double SCORING_SHARE_HELD_BACK = 0.20;
 
@@ -75,7 +74,7 @@ final class HnswSearchStage {
     private final PqSearchSettings pqSearch;
 
     /**
-     * Whether Stage 5 will score this request, which widens the margin this stage leaves
+     * Whether Stage 4 will score this request, which widens the margin this stage leaves
      * behind. The pipeline supplies its own predicate so the stages cannot drift apart.
      */
     private final Predicate<QueryRequest> llmScoringWillRun;
@@ -101,12 +100,12 @@ final class HnswSearchStage {
      * @return Context carrying the per-segment results
      */
     PipelineContext search(PipelineContext context, CancellationToken token, QueryDeadline deadline) {
-        token.checkCancelled("Stage 3 cancelled before HNSW search");
+        token.checkCancelled("Stage 2 cancelled before HNSW search");
 
-        LOGGER.trace("Stage 3: Running HNSW vector search with {} candidates", context.candidates.size());
+        LOGGER.trace("Stage 2: Running HNSW vector search with {} candidates", context.candidates.size());
 
         if (context.candidates.isEmpty()) {
-            LOGGER.debug("Stage 3: No candidates to search");
+            LOGGER.debug("Stage 2: No candidates to search");
             return context.withSegmentResults(List.of(), 0, 0);
         }
 
@@ -118,7 +117,7 @@ final class HnswSearchStage {
 
         List<ParallelQueryDispatcher.SegmentInfo> segmentsToSearch = segmentsToSearch(context);
 
-        LOGGER.trace("Stage 3: Dispatching to {} valid segments", segmentsToSearch.size());
+        LOGGER.trace("Stage 2: Dispatching to {} valid segments", segmentsToSearch.size());
 
         // Use ParallelQueryDispatcher for parallel execution
         ParallelQueryDispatcher.DispatchResult dispatchResult = dispatcher.get().dispatchToSpecificSegments(
@@ -130,7 +129,7 @@ final class HnswSearchStage {
         );
 
         // Check cancellation after dispatch completes
-        token.checkCancelled("Stage 3 cancelled after segment search");
+        token.checkCancelled("Stage 2 cancelled after segment search");
 
         List<SegmentQueryTask.SegmentQueryResult> segmentResults = dispatchResult.segmentResults();
         long totalTailScanEntries = dispatchResult.tailScanEntries();
@@ -143,7 +142,7 @@ final class HnswSearchStage {
 
         long durationMs = (System.nanoTime() - startTime) / 1_000_000;
 
-        LOGGER.debug("Stage 3: Search completed - {} segments, {} tail scan entries, {}ms",
+        LOGGER.debug("Stage 2: Search completed - {} segments, {} tail scan entries, {}ms",
             segmentResults.size(), totalTailScanEntries, durationMs);
 
         return context.withSegmentResults(segmentResults, totalTailScanEntries, segmentsTimedOut);
@@ -152,7 +151,7 @@ final class HnswSearchStage {
     /**
      * The options the fan-out runs under, and the slice of the query's budget it may spend.
      *
-     * <p>The fan-out gets what is left of the query's budget, less the share Stage 4 needs to
+     * <p>The fan-out gets what is left of the query's budget, less the share Stage 3 needs to
      * merge the answers - not the request's timeout, which is measured from before Stage 0
      * and so would always expire after the pipeline's own deadline. Handing it the full
      * timeout means the pipeline is abandoned first and every segment that did answer is
@@ -172,14 +171,14 @@ final class HnswSearchStage {
     }
 
     /**
-     * Describes each candidate to the dispatcher, carrying across the nodes stage 2 named in it.
+     * Describes each candidate to the dispatcher, carrying across the nodes stage 1 named in it.
      *
      * @param context The pipeline context with the surviving candidates
      * @return The segments to fan out to
      */
     private static List<ParallelQueryDispatcher.SegmentInfo> segmentsToSearch(PipelineContext context) {
         // Convert SegmentCandidates to SegmentInfo for the dispatcher, carrying across the nodes
-        // stage 2 found in each segment's LSH index. They are measured beside the graph search,
+        // stage 1 found in each segment's LSH index. They are measured beside the graph search,
         // which covers the whole graph either way; a segment whose index named nothing, or that
         // has none, is handed a null set and adds nothing to it.
         List<ParallelQueryDispatcher.SegmentInfo> segmentsToSearch = new ArrayList<>();
@@ -197,7 +196,7 @@ final class HnswSearchStage {
     }
 
     /**
-     * The share of the remaining budget Stage 3 must leave behind for the stages after it.
+     * The share of the remaining budget Stage 2 must leave behind for the stages after it.
      *
      * @param request The query request
      * @return The fraction to hold back

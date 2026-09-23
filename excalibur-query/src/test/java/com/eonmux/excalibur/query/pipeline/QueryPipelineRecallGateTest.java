@@ -17,11 +17,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * answers, and a stage that skips answers fails nothing: the query succeeds, coverage reads as
  * complete, and the results are simply further away than they should be. This gate measures the
  * answer a caller actually gets - every stage from the epoch snapshot to the rerank, over a corpus
- * spread across several segments whose graphs, LSH indexes and term filter levels are fully
- * integrated, under the LSH shape a node runs with by default - against exact search over the
+ * spread across several segments whose graphs and LSH indexes are fully integrated, under the LSH shape a node runs with by default - against exact search over the
  * same vectors. It is measured twice: with vector-only queries, and with each query also
- * carrying text phrased in words the documents nearest it do not use, which is how the HTTP route
- * runs every query and the case in which a stage reading the text could cost answers.</p>
+ * carrying text, which is how the HTTP route runs every query and the case in which a stage
+ * reading the text could cost answers.</p>
  *
  * <p>Two bounds are asserted. Against the graphs searched directly and merged, the pipeline may
  * fall short only by ties at the k-th distance: it searches each graph at least as widely, and
@@ -51,11 +50,10 @@ class QueryPipelineRecallGateTest {
     }
 
     /**
-     * The same gate with the query's text present, as the HTTP route always sends it, phrased in
-     * words only one segment's documents use while its nearest vectors are in all of them.
+     * The same gate with the query's text present, as the HTTP route always sends it.
      */
     @Test
-    @DisplayName("pipeline recall@10 with query text the neighbours do not share matches its graphs'")
+    @DisplayName("pipeline recall@10 with query text present matches its graphs'")
     void pipelineRecallGateWithMismatchedQueryText(@TempDir Path dir) throws Exception {
         assertRecallGate(dir, VectorRecallCorpus.MISMATCHED_QUERY_TEXT, "with query text");
     }
@@ -64,10 +62,6 @@ class QueryPipelineRecallGateTest {
             throws Exception {
         try (VectorRecallCorpus corpus = new VectorRecallCorpus(
                 dir, SEGMENTS, VECTORS, DIMENSION, VectorRecallCorpus.PRODUCTION_SHAPE, 7L)) {
-
-            assertThat(corpus.termFilterCoversEverySegment())
-                .as("the term filter has to speak for every segment for the gate to test it")
-                .isTrue();
 
             VectorRecallCorpus.Recall recall = corpus.measure(QUERIES, K, queryText);
 

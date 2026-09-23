@@ -39,19 +39,12 @@ import java.util.logging.Level;
  * <h2>What happens outside the lock</h2>
  * <p>Only the directory mutation holds {@code StorageEngine.segmentLock}. Persisting the
  * directory, notifying observers and retiring the parent all happen after it is released:
- * observers re-register index structures against the children, which means opening graphs and
- * filters, and that work must not run while every routing decision in the engine is blocked.
+ * observers re-register index structures against the children, which means opening graphs,
+ * and that work must not run while every routing decision in the engine is blocked.
  * An observer that throws is logged and skipped - by that point the split is durable and the
  * directory already points at the children, so unwinding is not possible and letting one
  * observer's failure abort the notification would leave the rest permanently unaware of a
  * split that did happen.</p>
- *
- * <p>One notice is given under the lock, because it has to precede the first write a child
- * can take: {@link SplitWorker.SplitListener#onSplitPublishing} names the indices the children
- * are about to be published at, once the publication can no longer be refused and before any
- * key routes to them. State that a child's inherited entries will never reach through writes -
- * a membership filter filled by them - is marked there, not after the fact. A publication that
- * then fails tells the same observers {@link SplitWorker.SplitListener#onSplitAbandoned}.</p>
  */
 final class SplitPublication {
 
@@ -121,15 +114,8 @@ final class SplitPublication {
      */
     void handleSplitComplete(Segment parent, Segment leftChild, Segment rightChild) {
         long[] published;
-        try {
-            synchronized (engine.segmentLock) {
-                published = publishUnderLock(parent, leftChild, rightChild);
-            }
-        } catch (AnnouncedPublicationFailure failure) {
-            // Observers were told this split was coming, so they are owed the news that it did
-            // not happen - outside the lock, like every other notification that can take time.
-            notifySplitAbandoned(parent, failure.leftIndex, failure.rightIndex);
-            throw failure.failure;
+        synchronized (engine.segmentLock) {
+            published = publishUnderLock(parent, leftChild, rightChild);
         }
 
         StorageEngine.LOGGER.info(String.format(
@@ -140,28 +126,6 @@ final class SplitPublication {
     }
 
     /**
-     * A publication that failed after observers were told it was coming.
-     *
-     * <p>Carries the failure out of the directory lock, so the observers are told it was
-     * abandoned without holding up routing, and then rethrown as it was.</p>
-     */
-    private static final class AnnouncedPublicationFailure extends RuntimeException {
-
-        private static final long serialVersionUID = 1L;
-
-        private final RuntimeException failure;
-        private final long leftIndex;
-        private final long rightIndex;
-
-        AnnouncedPublicationFailure(RuntimeException failure, long leftIndex, long rightIndex) {
-            super(failure.getMessage(), failure, false, false);
-            this.failure = failure;
-            this.leftIndex = leftIndex;
-            this.rightIndex = rightIndex;
-        }
-    }
-
-    /**
      * The part of publication that mutates the directory. The caller holds
      * {@code StorageEngine.segmentLock}.
      *
@@ -169,8 +133,8 @@ final class SplitPublication {
      * @param leftChild  The left child
      * @param rightChild The right child
      * @return The left and right indices the children were published at
-     * @throws IllegalStateException if the publication is refused before observers were told
-     * @throws AnnouncedPublicationFailure if it fails after they were
+     * @throws IllegalStateException if the publication is refused, or a child cannot be moved
+     *                               into place
      */
     private long[] publishUnderLock(Segment parent, Segment leftChild, Segment rightChild) {
         // The same plan the worker partitioned by: it depends only on the parent's own slots,
@@ -187,100 +151,91 @@ final class SplitPublication {
         engine.catalog.checkRoutingRegistration(leftIndex);
         engine.catalog.checkRoutingRegistration(rightIndex);
 
-        // Before the children become reachable: the first write routed to a child reaches it
-        // after this, so an observer that marks per-segment state here has it marked before any
-        // key could reach the segment it describes.
-        notifySplitPublishing(parent, leftIndex, rightIndex);
+        // Step 1: give the children discoverable identities before publishing them.
+        // The right child goes first: its target name is unused, so a failure there
+        // leaves everything untouched. The left child's target is the parent's own
+        // file, so that move is done last - and even if the process dies between the
+        // two, the parent file still holds every key both children were built from.
+        prepareSplitChild(rightChild, rightIndex);
 
-        try {
-            // Step 1: give the children discoverable identities before publishing them.
-            // The right child goes first: its target name is unused, so a failure there
-            // leaves everything untouched. The left child's target is the parent's own
-            // file, so that move is done last - and even if the process dies between the
-            // two, the parent file still holds every key both children were built from.
-            prepareSplitChild(rightChild, rightIndex);
-
-            // The left child is about to take over the parent's file names, the HNSW graph
-            // file among them. Two graphs mapping one file is not survivable: the parent's
-            // close() forces its own stale pages over whatever the child has written since.
-            // Releasing the parent's graph here, before the child opens one, is what keeps the
-            // retirement below from corrupting the child.
-            com.eonmux.excalibur.vector.hnsw.HnswGraph parentGraph = parent.detachHnswGraph();
-            if (parentGraph != null) {
-                try {
-                    parentGraph.close();
-                } catch (Exception e) {
-                    StorageEngine.LOGGER.log(java.util.logging.Level.WARNING,
-                        "Failed to close the parent's HNSW graph during split of "
-                            + parent.path(), e);
-                }
+        // The left child is about to take over the parent's file names, the HNSW graph
+        // file among them. Two graphs mapping one file is not survivable: the parent's
+        // close() forces its own stale pages over whatever the child has written since.
+        // Releasing the parent's graph here, before the child opens one, is what keeps the
+        // retirement below from corrupting the child.
+        com.eonmux.excalibur.vector.hnsw.HnswGraph parentGraph = parent.detachHnswGraph();
+        if (parentGraph != null) {
+            try {
+                parentGraph.close();
+            } catch (Exception e) {
+                StorageEngine.LOGGER.log(java.util.logging.Level.WARNING,
+                    "Failed to close the parent's HNSW graph during split of "
+                        + parent.path(), e);
             }
-
-            prepareSplitChild(leftChild, leftIndex);
-
-            // Catalog rows go in before either child becomes reachable, so every reader that
-            // routes to a child also finds its row; a segment routed to without one is skipped
-            // by the queryable-segment scans. The left child inherits the parent's entry (same
-            // index), which may be in any lifecycle state, so it is re-pointed rather than
-            // re-added.
-            engine.catalog.registerFile(leftIndex, leftChild.path()).setEntryCount(leftChild.entryCount());
-            engine.catalog.add(rightIndex, rightChild.path()).setEntryCount(rightChild.entryCount());
-
-            if (plan.doubles()) {
-                // Step 2: fill the new upper half. These indices are unreachable under the
-                // old mask, so this is invisible to concurrent readers. The parent's buddy is
-                // the right child's slot, so it is given the right child directly.
-                int oldRouting = engine.routingSegmentCount;
-                for (int i = 0; i < oldRouting; i++) {
-                    Segment current = engine.segments.get((long) i);
-                    if (current == null) {
-                        continue;
-                    }
-                    engine.segments.put(i + (long) oldRouting,
-                        current == parent ? rightChild : current);
-                }
-
-                // Step 3: widen the mask. The parent still serves its own slot and holds
-                // every key that maps to it, so this is safe to publish now.
-                engine.routingSegmentCount = oldRouting * 2;
-            } else {
-                // Step 2, without a doubling: the parent's slots with the split bit set go to
-                // the right child. The parent still holds every key both children were built
-                // from, so a reader that reaches either child or the parent finds its key.
-                for (long slot : plan.parentSlots()) {
-                    if (Segment.shouldGoToRightChild(slot, plan.splitBit())) {
-                        engine.segments.put(slot, rightChild);
-                    }
-                }
-            }
-
-            // Step 4: retire the parent from the slots the left child keeps.
-            for (long slot : plan.parentSlots()) {
-                if (!Segment.shouldGoToRightChild(slot, plan.splitBit())) {
-                    engine.segments.put(slot, leftChild);
-                }
-            }
-
-            engine.canonicalIndex.remove(parent);
-            engine.canonicalIndex.put(leftChild, leftIndex);
-            engine.canonicalIndex.put(rightChild, rightIndex);
-
-            if (engine.splitWorker != null) {
-                engine.splitWorker.unregisterSegment(parent);
-            }
-
-            if (engine.splitWorker != null && engine.splitWorker.isRunning()) {
-                engine.splitWorker.registerSegment(leftChild);
-                engine.splitWorker.registerSegment(rightChild);
-            }
-
-            // Increment visibility epoch to signal state change
-            engine.visibilityTracker.advanceEpoch();
-
-            engine.routingTable.publishRouting();
-        } catch (RuntimeException e) {
-            throw new AnnouncedPublicationFailure(e, leftIndex, rightIndex);
         }
+
+        prepareSplitChild(leftChild, leftIndex);
+
+        // Catalog rows go in before either child becomes reachable, so every reader that
+        // routes to a child also finds its row; a segment routed to without one is skipped
+        // by the queryable-segment scans. The left child inherits the parent's entry (same
+        // index), which may be in any lifecycle state, so it is re-pointed rather than
+        // re-added.
+        engine.catalog.registerFile(leftIndex, leftChild.path()).setEntryCount(leftChild.entryCount());
+        engine.catalog.add(rightIndex, rightChild.path()).setEntryCount(rightChild.entryCount());
+
+        if (plan.doubles()) {
+            // Step 2: fill the new upper half. These indices are unreachable under the
+            // old mask, so this is invisible to concurrent readers. The parent's buddy is
+            // the right child's slot, so it is given the right child directly.
+            int oldRouting = engine.routingSegmentCount;
+            for (int i = 0; i < oldRouting; i++) {
+                Segment current = engine.segments.get((long) i);
+                if (current == null) {
+                    continue;
+                }
+                engine.segments.put(i + (long) oldRouting,
+                    current == parent ? rightChild : current);
+            }
+
+            // Step 3: widen the mask. The parent still serves its own slot and holds
+            // every key that maps to it, so this is safe to publish now.
+            engine.routingSegmentCount = oldRouting * 2;
+        } else {
+            // Step 2, without a doubling: the parent's slots with the split bit set go to
+            // the right child. The parent still holds every key both children were built
+            // from, so a reader that reaches either child or the parent finds its key.
+            for (long slot : plan.parentSlots()) {
+                if (Segment.shouldGoToRightChild(slot, plan.splitBit())) {
+                    engine.segments.put(slot, rightChild);
+                }
+            }
+        }
+
+        // Step 4: retire the parent from the slots the left child keeps.
+        for (long slot : plan.parentSlots()) {
+            if (!Segment.shouldGoToRightChild(slot, plan.splitBit())) {
+                engine.segments.put(slot, leftChild);
+            }
+        }
+
+        engine.canonicalIndex.remove(parent);
+        engine.canonicalIndex.put(leftChild, leftIndex);
+        engine.canonicalIndex.put(rightChild, rightIndex);
+
+        if (engine.splitWorker != null) {
+            engine.splitWorker.unregisterSegment(parent);
+        }
+
+        if (engine.splitWorker != null && engine.splitWorker.isRunning()) {
+            engine.splitWorker.registerSegment(leftChild);
+            engine.splitWorker.registerSegment(rightChild);
+        }
+
+        // Increment visibility epoch to signal state change
+        engine.visibilityTracker.advanceEpoch();
+
+        engine.routingTable.publishRouting();
         return new long[] {leftIndex, rightIndex};
     }
 
@@ -298,7 +253,7 @@ final class SplitPublication {
         engine.routingTable.persistRoutingDirectory();
 
         // Outside the lock, and only after publication. Observers re-register index structures
-        // against the children, which means opening graphs and filters -- work that must not run
+        // against the children, which means opening graphs -- work that must not run
         // while every routing decision in the engine is blocked behind segmentLock.
         notifySplitObservers(parent, leftChild, rightChild);
 
@@ -309,47 +264,10 @@ final class SplitPublication {
         // unlinked the parent's file, so did the disk blocks behind it. One of each, per split,
         // forever. Its graph was already released above.
         try {
-            // The left child owns the parent's name and its sidecar now.
-            parent.detachTermFrequencySketch();
             parent.close();
         } catch (RuntimeException e) {
             StorageEngine.LOGGER.log(java.util.logging.Level.WARNING,
                 "Failed to retire the parent segment after splitting " + parent.path(), e);
-        }
-    }
-
-    /**
-     * Tells observers a split is about to become reachable. The caller holds the directory lock.
-     *
-     * <p>An observer that throws is logged and skipped: this is advance notice, and one observer
-     * failing to take it is no reason to refuse a split the others were told about.</p>
-     */
-    private void notifySplitPublishing(Segment parent, long leftIndex, long rightIndex) {
-        for (SplitWorker.SplitListener observer : splitObservers) {
-            try {
-                observer.onSplitPublishing(parent, leftIndex, rightIndex);
-            } catch (RuntimeException e) {
-                StorageEngine.LOGGER.log(java.util.logging.Level.SEVERE,
-                    "Split observer failed on the advance notice for parent " + parent.path()
-                        + "; the split proceeds and other observers are still told", e);
-            }
-        }
-    }
-
-    /**
-     * Tells observers that a split they were told was coming was not published.
-     *
-     * <p>An observer that throws is logged and skipped, so the rest still hear it.</p>
-     */
-    private void notifySplitAbandoned(Segment parent, long leftIndex, long rightIndex) {
-        for (SplitWorker.SplitListener observer : splitObservers) {
-            try {
-                observer.onSplitAbandoned(parent, leftIndex, rightIndex);
-            } catch (RuntimeException e) {
-                StorageEngine.LOGGER.log(java.util.logging.Level.SEVERE,
-                    "Split observer failed on the abandonment of the split of " + parent.path()
-                        + "; other observers are still told", e);
-            }
         }
     }
 
@@ -474,7 +392,6 @@ final class SplitPublication {
      * @throws IOException if the rename fails
      */
     private static void moveIntoPlace(Path source, Path target) throws IOException {
-        TermSketchFile.deleteFor(target);
         java.nio.file.Files.move(source, target,
             java.nio.file.StandardCopyOption.REPLACE_EXISTING,
             java.nio.file.StandardCopyOption.ATOMIC_MOVE);

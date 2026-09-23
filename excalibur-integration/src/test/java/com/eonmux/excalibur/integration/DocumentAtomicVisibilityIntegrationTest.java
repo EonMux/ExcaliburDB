@@ -79,7 +79,6 @@ class DocumentAtomicVisibilityIntegrationTest {
         publisher = new DocumentBatchPublisher(
             visibilityTracker,
             documentRegistry,
-            (com.eonmux.excalibur.filter.CuckooFilter) null,
             // com.eonmux.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
             // durability barrier is already satisfied before the adapter runs.
             () -> { },

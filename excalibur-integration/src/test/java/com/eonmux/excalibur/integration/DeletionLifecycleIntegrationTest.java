@@ -1,9 +1,7 @@
 package com.eonmux.excalibur.integration;
 
 import com.eonmux.excalibur.filter.CuckooFilter;
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -20,120 +18,18 @@ import static com.eonmux.excalibur.integration.DeletionTestFilters.filter;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The full insert, query, delete and verify lifecycle across the filter hierarchy.
+ * The insert, query, delete and verify lifecycle of the Cuckoo filter at stress volume.
  *
- * <p>The other deletion suites each isolate one property. These two exercise the
- * sequence a real deployment runs — populate, query, delete a subset, query again —
- * against both a flat and a hierarchical filter, and then repeat it at stress volume
- * with many interleaved operations. Their value is in the combination: a delete path
- * that is correct in isolation can still be wrong once insertions have relocated
- * fingerprints around it.</p>
+ * <p>The other deletion suites each isolate one property. This one runs the sequence a real
+ * deployment runs - populate, query, delete a subset, query again - many times over with the
+ * operations interleaved. Its value is in the combination: a delete path that is correct in
+ * isolation can still be wrong once insertions have relocated fingerprints around it.</p>
  */
 class DeletionLifecycleIntegrationTest {
-
-    private Random random;
-
-    @BeforeEach
-    void setUp() {
-        random = new Random(42);
-    }
 
     @Nested
     @DisplayName("End-to-End System Integration")
     class EndToEndSystemIntegration {
-
-        /**
-         * Test: Full lifecycle - insert, query, delete, verify.
-         *
-         * <p>Domain correctness: Simulates real user workflow with a complete
-         * lifecycle of entries in the system.</p>
-         */
-        @Test
-        @DisplayName("full lifecycle insert query delete verify")
-        void fullLifecycleInsertQueryDeleteVerify() {
-            // Create a hierarchical filter simulating a multi-segment index
-            HierarchicalCuckooFilter hcf = new HierarchicalCuckooFilter(50000);
-
-            // Register segments for different document types
-            for (int seg = 0; seg < 10; seg++) {
-                hcf.registerSegment("documents-" + seg);
-            }
-
-            // Insert documents (simulating ingestion)
-            Set<String> allKeys = new HashSet<>();
-            for (int seg = 0; seg < 10; seg++) {
-                String segmentId = "documents-" + seg;
-                for (int doc = 0; doc < 100; doc++) {
-                    String key = "doc-" + seg + "-" + doc + "-" + System.nanoTime();
-                    boolean inserted = hcf.insertKey(key, segmentId);
-                    if (inserted) {
-                        allKeys.add(key);
-                    }
-                }
-            }
-
-            System.out.println("Inserted " + allKeys.size() + " documents across 10 segments");
-
-            // Query phase - verify all inserted documents are findable
-            int foundCount = 0;
-            for (String key : allKeys) {
-                if (hcf.mightContainKey(key)) {
-                    foundCount++;
-                }
-            }
-            assertThat(foundCount).isEqualTo(allKeys.size());
-
-            // Simulate document deletion (e.g., user deleted documents)
-            Set<String> keysToDelete = new HashSet<>();
-            int deleteCount = 0;
-            for (String key : allKeys) {
-                if (deleteCount >= allKeys.size() / 2) break;
-                keysToDelete.add(key);
-                deleteCount++;
-            }
-
-            // Delete documents - must determine segment for each key
-            // For this test, we search segments to find the right one
-            int successfullyDeleted = 0;
-            for (String key : keysToDelete) {
-                byte[] keyBytes = HierarchicalCuckooFilter.toBytes(key);
-                List<String> candidates = hcf.findCandidateSegments(keyBytes);
-                for (String segId : candidates) {
-                    if (hcf.deleteFromHierarchy(keyBytes, segId)) {
-                        successfullyDeleted++;
-                        break;
-                    }
-                }
-            }
-
-            System.out.println("Deleted " + successfullyDeleted + " documents");
-
-            // Verify deleted documents are NOT found (no false positives)
-            int falsePositives = 0;
-            for (String key : keysToDelete) {
-                if (hcf.mightContainKey(key)) {
-                    falsePositives++;
-                }
-            }
-            assertThat(falsePositives)
-                .as("CRITICAL: Deleted documents must not appear in queries")
-                .isEqualTo(0);
-
-            // Verify remaining documents are still findable
-            Set<String> remainingKeys = new HashSet<>(allKeys);
-            remainingKeys.removeAll(keysToDelete);
-            int remainingFound = 0;
-            for (String key : remainingKeys) {
-                if (hcf.mightContainKey(key)) {
-                    remainingFound++;
-                }
-            }
-            assertThat(remainingFound).isEqualTo(remainingKeys.size());
-
-            System.out.println("End-to-end verification: " + falsePositives +
-                " false positives, " + remainingFound + "/" + remainingKeys.size() +
-                " remaining documents found");
-        }
 
         /**
          * Test: Stress test with many operations.

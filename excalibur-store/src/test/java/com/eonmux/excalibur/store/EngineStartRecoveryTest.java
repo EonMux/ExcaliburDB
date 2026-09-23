@@ -23,11 +23,12 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /**
  * What a start does with a store it cannot fully trust.
  *
- * <p>Two policies meet here. Damage to one entry costs that entry and nothing else, so derived
- * data built from the entries at start - the term sketch - is built from the rest and the node
- * serves. Damage that leaves a segment's committed state unknown - a write-ahead log that will
- * not replay - refuses the start; and a refused start must let go of everything it opened, or
- * every retry leaves another set of descriptors behind an engine nobody will close.</p>
+ * <p>Two policies meet here. Damage to one entry costs that entry and nothing else, so the node
+ * starts and serves the rest. Damage that leaves a segment's committed state unknown - a
+ * write-ahead log that will not replay - refuses the start; and a refused start must let go of
+ * everything it opened, or every retry leaves another set of descriptors behind an engine nobody
+ * will close. A start also clears away the files an earlier build kept beside its segments that
+ * this build no longer reads.</p>
  */
 @DisplayName("Engine start over damaged files")
 class EngineStartRecoveryTest {
@@ -44,7 +45,7 @@ class EngineStartRecoveryTest {
     }
 
     @Test
-    @DisplayName("a damaged entry does not keep the engine from starting, and the rest are counted")
+    @DisplayName("a damaged entry does not keep the engine from starting, and the rest serve")
     void aDamagedEntryDoesNotFailTheStart() throws IOException {
         Path dataDir = Files.createDirectories(tempDir.resolve("damaged-entry"));
         try (StorageEngine engine = new StorageEngine(dataDir)) {
@@ -52,26 +53,13 @@ class EngineStartRecoveryTest {
             engine.put(key("healthy"), chunk("alpha"));
             engine.put(key("damaged"), chunk("zanzibar"));
         }
-        // No sidecar, so the start has to rebuild every sketch from the entries; and no log, as
-        // for entries a log had long since moved past, or the replay would rewrite the entry
-        // over its damage before the sketch is built.
-        deleteAll(dataDir, ".tfs");
+        // No log, as for entries a log had long since moved past, or the replay would rewrite
+        // the entry over its damage.
         deleteAll(dataDir, ".wal");
         flipByteInsideSegment(dataDir, "zanzibar".getBytes(StandardCharsets.UTF_8));
 
         try (StorageEngine engine = new StorageEngine(dataDir)) {
             engine.start();
-
-            long alpha = 0;
-            long damaged = 0;
-            for (Segment segment : engine.getSegments().values()) {
-                alpha += segment.termFrequencySketch().estimate(key("alpha"));
-                // The flip only changes case, which tokenising folds away: had the damaged
-                // entry been read rather than left out, it would count as "zanzibar".
-                damaged += segment.termFrequencySketch().estimate(key("zanzibar"));
-            }
-            assertThat(alpha).as("the healthy entry is counted").isEqualTo(1);
-            assertThat(damaged).as("the damaged entry is left out, not counted as read").isZero();
             assertThat(engine.get(key("healthy"))).isNotNull();
         }
     }
@@ -110,35 +98,42 @@ class EngineStartRecoveryTest {
     }
 
     @Test
-    @DisplayName("staging files an interrupted sketch write left are removed when the segment "
-        + "is opened, and only that segment's")
-    void interruptedSketchWritesAreSwept() throws IOException {
-        Path dataDir = Files.createDirectories(tempDir.resolve("staging"));
+    @DisplayName("the term sketches an earlier build kept beside its segments are removed at start")
+    void obsoleteTermSketchesAreRemoved() throws IOException {
+        Path dataDir = Files.createDirectories(tempDir.resolve("upgraded"));
         try (StorageEngine engine = new StorageEngine(dataDir)) {
             engine.start();
             engine.put(key("a"), chunk("alpha"));
         }
-        Path sidecar = TermSketchFile.pathFor(largestFile(dataDir, ".dat"));
-        String name = sidecar.getFileName().toString();
-        Path orphan = Files.write(sidecar.resolveSibling(name + ".0f3c.tmp"), new byte[] {1});
-        Path otherSegments = Files.write(
-            sidecar.resolveSibling(name.replace(".tfs", "9.tfs") + ".0f3c.tmp"), new byte[] {1});
-        Path notStaging = Files.write(sidecar.resolveSibling(name + ".tmp"), new byte[] {1});
+        String segment = largestFile(dataDir, ".dat").getFileName().toString();
+        String base = segment.substring(0, segment.length() - ".dat".length());
+        Path sketch = Files.write(dataDir.resolve(base + ".tfs"), new byte[] {1});
+        Path staged = Files.write(dataDir.resolve(base + ".tfs.0f3c.tmp"), new byte[] {1});
+        Path orphan = Files.write(dataDir.resolve("segment_4096.tfs"), new byte[] {1});
+        Path unrelated = Files.write(dataDir.resolve("notes.tfs"), new byte[] {1});
+        Path notStaged = Files.write(dataDir.resolve(base + ".tfs.tmp"), new byte[] {1});
 
         try (StorageEngine engine = new StorageEngine(dataDir)) {
             engine.start();
+            assertThat(engine.get(key("a"))).isNotNull();
         }
 
-        assertThat(orphan).doesNotExist();
-        assertThat(otherSegments).as("another segment's name").exists();
-        assertThat(notStaging).as("not a name a write stages under").exists();
+        assertThat(sketch).doesNotExist();
+        assertThat(staged).doesNotExist();
+        assertThat(orphan).as("a sketch whose segment is gone is as obsolete").doesNotExist();
+        assertThat(unrelated).as("not a name an earlier build wrote").exists();
+        assertThat(notStaged).as("not a name an earlier build staged under").exists();
     }
 
     @Test
-    @DisplayName("the sweep reports nothing for a directory that is not there")
-    void sweepingAMissingDirectoryRemovesNothing() {
-        assertThat(TermSketchFile.sweepStaging(tempDir.resolve("gone").resolve("segment_0.tfs")))
-            .isZero();
+    @DisplayName("obsolete names are recognised by name alone, and a missing directory yields none")
+    void obsoleteNamesAreRecognised() {
+        assertThat(ObsoleteSidecars.isObsolete("segment_0.tfs")).isTrue();
+        assertThat(ObsoleteSidecars.isObsolete("segment_12.tfs.5b1e.tmp")).isTrue();
+        assertThat(ObsoleteSidecars.isObsolete("segment_0.dat")).isFalse();
+        assertThat(ObsoleteSidecars.isObsolete("segment_0.tfsx")).isFalse();
+        assertThat(ObsoleteSidecars.isObsolete("segment_x.tfs")).isFalse();
+        assertThat(ObsoleteSidecars.removeFrom(List.of(tempDir.resolve("gone")))).isZero();
     }
 
     private static void deleteAll(Path dir, String suffix) throws IOException {

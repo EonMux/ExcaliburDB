@@ -26,9 +26,6 @@ final class MetricMBeanRegistrations {
     /** JMX object name of the visibility epoch bean. */
     private static final String VISIBILITY_EPOCH = "com.eonmux.excalibur:type=VisibilityEpoch";
 
-    /** JMX object name of the Cuckoo filter false-positive rate bean. */
-    private static final String CUCKOO_FP_RATE = "com.eonmux.excalibur:type=CuckooFpRate";
-
     /** JMX object name of the HNSW integration backlog bean. */
     private static final String HNSW_QUEUE_DEPTH = "com.eonmux.excalibur:type=HnswQueueDepth";
 
@@ -50,7 +47,6 @@ final class MetricMBeanRegistrations {
         registry.registerMBean(Metrics.getSystemHealthMBean(), SYSTEM_HEALTH);
         registry.registerMBean(Metrics.getIngestionQueueMBean(), INGESTION_QUEUE);
         registry.registerMBean(Metrics.getVisibilityEpochMBean(), VISIBILITY_EPOCH);
-        registry.registerMBean(Metrics.getCuckooFpRateMBean(), CUCKOO_FP_RATE);
         registry.registerMBean(Metrics.getHnswQueueDepthMBean(), HNSW_QUEUE_DEPTH);
         registry.registerMBean(Metrics.getIngestionThroughputMBean(), INGESTION_THROUGHPUT);
     }

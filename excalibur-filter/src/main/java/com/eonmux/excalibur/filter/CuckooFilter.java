@@ -59,24 +59,26 @@ import java.util.concurrent.locks.StampedLock;
  * </pre>
  * <p><b>Conclusion:</b> 13-bit fingerprints are required to achieve ≤0.1% FP rate at load factor 0.95.</p>
  *
- * <h2>Memory Layout (CRITICAL - Exact Specification)</h2>
- * <p>The memory layout is exactly as specified:</p>
+ * <h2>Memory Layout</h2>
  * <pre>
- * [magic(4B)|version(4B)|fingerprintBits(4B)|numBuckets(8B)|seed(8B)|buckets(numBuckets*4*fingerprintBits/8)]
+ * [header (64B)][buckets (numBuckets * 8B)]
  * </pre>
- * <p>Header offsets:</p>
+ * <p>Header offsets, all big-endian:</p>
  * <ul>
  *   <li>offset 0: magic (4 bytes) - 0x4355434B ("CUCK")</li>
  *   <li>offset 4: version (4 bytes) - format version</li>
  *   <li>offset 8: fingerprintBits (4 bytes) - bits per fingerprint (8-16)</li>
- *   <li>offset 12: numBuckets (8 bytes) - number of buckets</li>
- *   <li>offset 20: seed (8 bytes) - hash seed</li>
- *   <li>offset 28: bucket data begins</li>
+ *   <li>offset 12: padding (4 bytes), aligning the 8-byte fields that follow</li>
+ *   <li>offset 16: numBuckets (8 bytes) - number of buckets</li>
+ *   <li>offset 24: seed (8 bytes) - hash seed</li>
+ *   <li>offset 32: the integrity block, see {@link CuckooFilterIntegrity}</li>
+ *   <li>offset 64: bucket data begins</li>
  * </ul>
- * <p>Bucket storage: Each bucket holds 4 fingerprints, packed at fingerprintBits each.
- * Total bytes per bucket = (4 * fingerprintBits + 7) / 8 (rounded up to byte boundary).</p>
- * <p>For fingerprintBits=12: 4*12=48 bits = 6 bytes per bucket.</p>
- * <p>For fingerprintBits=13: 4*13=52 bits = 7 bytes per bucket (52/8 rounded up).</p>
+ * <p>Bucket storage: every bucket is a fixed 8 bytes, so eight of them fill a cache line and
+ * none crosses one, and it holds 4 fingerprints packed at {@code fingerprintBits} each. That is
+ * 16 bits of memory per slot whatever the fingerprint width: a narrower fingerprint leaves the
+ * rest of the bucket unused rather than making the filter smaller. The width decides the false
+ * positive rate, never the memory.</p>
  *
  * <h2>Thread Safety</h2>
  * <ul>
@@ -180,8 +182,7 @@ public class CuckooFilter {
     private final MemorySegment segment;
     private final long bucketDataOffset;
 
-    // Bytes per bucket: (4 * fingerprintBits + 7) / 8
-    // For 12 bits: 6 bytes, for 13 bits: 7 bytes
+    // Bytes per bucket: always ALIGNED_BYTES_PER_BUCKET, whatever the fingerprint width
     private final int bytesPerBucket;
 
     // Entry counter (thread-safe atomic operations)
@@ -292,8 +293,8 @@ public class CuckooFilter {
         // slots are full, because an insert that cannot find a free slot displaces an occupant
         // and gives up after a bounded chain of displacements. Sized to exactly the capacity,
         // a filter asked to hold its documented capacity sits near 98% full and starts refusing
-        // terms - and a filter that has refused a term is no longer trusted to speak for its
-        // segment at all.
+        // items - and a membership filter that has refused an item answers "absent" for
+        // something it was given.
         long numBuckets = bucketsFor(capacity);
 
         // Cache-line aligned bucket storage: 8 bytes per bucket
@@ -306,9 +307,9 @@ public class CuckooFilter {
 
         // Allocate memory segment.
         // An automatic arena is used deliberately: a CuckooFilter has no owner that could
-        // close an explicit arena (filters are handed to HierarchicalCuckooFilter and
-        // dropped on unregister), and Arena.ofShared() memory is never reclaimed by the
-        // collector, so every discarded filter would leak its whole bucket region.
+        // close an explicit arena (a filter is simply dropped by whatever holds it), and
+        // Arena.ofShared() memory is never reclaimed by the collector, so every discarded
+        // filter would leak its whole bucket region.
         Arena arena = Arena.ofAuto();
         MemorySegment segment = arena.allocate(totalSize);
 
@@ -639,36 +640,6 @@ public class CuckooFilter {
      */
     public long count() {
         return count.get();
-    }
-
-    /**
-     * Empties the filter in place.
-     *
-     * <p>In place rather than by replacement because a filter is shared by reference: a
-     * hierarchy level is held by the hierarchy, the maintenance worker and the metrics worker at
-     * once, and a replacement reaches only whichever holder the caller re-points. Emptying the
-     * one instance they all hold keeps them looking at the same filter.</p>
-     *
-     * <p>Runs under the exclusive side of the displacement barrier, so no insert, delete or
-     * displacement is inside a bucket while it is zeroed, and every reader whose optimistic read
-     * overlapped it retries and sees the empty filter. The integrity mark is left as it is: a
-     * live filter is already marked open, and emptying it is one more change of the kind that
-     * mark already says has happened.</p>
-     *
-     * @throws UnsupportedOperationException if the filter was opened over a read-only image
-     */
-    public void clear() {
-        if (segment.isReadOnly()) {
-            throw new UnsupportedOperationException("a filter over a read-only image cannot be "
-                + "cleared");
-        }
-        long stamp = displacementBarrier.writeLock();
-        try {
-            segment.asSlice(bucketDataOffset, numBuckets * bytesPerBucket).fill((byte) 0);
-            count.set(0);
-        } finally {
-            displacementBarrier.unlockWrite(stamp);
-        }
     }
 
     /**
@@ -1190,8 +1161,7 @@ public class CuckooFilter {
      * Runs the displacement chain. The caller must hold the exclusive displacement barrier.
      *
      * <h3>No stripe locks</h3>
-     * <p>Every other writer - the insert and delete fast paths, and {@link #clear()} - holds
-     * one side or the other of the displacement barrier while it touches a bucket, so the
+     * <p>Every other writer - the insert and delete fast paths - holds one side or the other of the displacement barrier while it touches a bucket, so the
      * exclusive side already keeps them all out of every bucket for the whole chain. Taking
      * the stripe locks as well bought nothing and cost two lock round trips per step.</p>
      *

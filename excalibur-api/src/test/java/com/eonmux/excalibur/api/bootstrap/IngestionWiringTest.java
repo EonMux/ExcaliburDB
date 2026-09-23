@@ -118,7 +118,7 @@ class IngestionWiringTest {
             mock(QueryPipeline.class, Answers.RETURNS_SELF));
 
         attachment = new IngestionWiring(config, dataDir, core.storageEngine(),
-            core.indexOrchestrator(), core.hierarchicalFilter(), tracker, tenants)
+            core.indexOrchestrator(), tracker, tenants)
             .attachTo(server);
         return server;
     }
@@ -198,13 +198,13 @@ class IngestionWiringTest {
     void refusesMissingCollaborators(@TempDir Path dataDir) {
         Config config = config(Map.of());
 
-        assertThatThrownBy(() -> new IngestionWiring(null, dataDir, null, null, null, null, null))
+        assertThatThrownBy(() -> new IngestionWiring(null, dataDir, null, null, null, null))
             .isInstanceOf(NullPointerException.class)
             .hasMessageContaining("config");
-        assertThatThrownBy(() -> new IngestionWiring(config, null, null, null, null, null, null))
+        assertThatThrownBy(() -> new IngestionWiring(config, null, null, null, null, null))
             .isInstanceOf(NullPointerException.class)
             .hasMessageContaining("dataDirectory");
-        assertThatThrownBy(() -> new IngestionWiring(config, dataDir, null, null, null, null, null))
+        assertThatThrownBy(() -> new IngestionWiring(config, dataDir, null, null, null, null))
             .isInstanceOf(NullPointerException.class)
             .hasMessageContaining("storageEngine");
     }
@@ -301,7 +301,7 @@ class IngestionWiringTest {
             core.indexOrchestrator().getVisibilityTracker());
         tenants = new GraphTenants(dataDir.resolve("graph"), config, MappingBudget.detect(), 4);
         attachment = new IngestionWiring(config, dataDir, core.storageEngine(),
-            core.indexOrchestrator(), core.hierarchicalFilter(), tracker, tenants)
+            core.indexOrchestrator(), tracker, tenants)
             .attachTo(server);
     }
 

@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
-import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
@@ -45,17 +44,16 @@ class RollingReplacementCleanupTest {
     void setUp() {
         catalog = new CountingCatalog(tempDir.resolve("catalog"));
         DocumentRegistry registry = new DocumentRegistry();
-        CuckooFilter filter = CuckooFilter.create(1024);
         VisibilityTracker visibility = new VisibilityTracker(catalog);
         UnwritableWriter writer = new UnwritableWriter();
 
         reindexer = new DocumentReindexer(
             new TextChunker(512, 64),
             null,
-            new UpsertHandler(registry, filter, writer),
+            new UpsertHandler(registry, writer),
             registry,
             writer,
-            new DocumentBatchPublisher(visibility, registry, filter, () -> { },
+            new DocumentBatchPublisher(visibility, registry, () -> { },
                 new ReentrantLock()),
             catalog,
             visibility);

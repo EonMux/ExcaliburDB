@@ -24,10 +24,11 @@ dependencies {
     // that stamp is half of what a node recomputes its epoch counter from on open.
     implementation(project(":excalibur-retrieval"))
     // For every format the engine keeps no verifier of its own beside - the write-ahead logs,
-    // the routing directory, the registries, the graph staging logs, the lexical store and the
-    // term sketches - and for a compaction's staged pair, whose verdict depends on which of
-    // the two is present rather than on either file's format. verify --deep hands those to the same per-file dispatch excalibur-fsck surveys a live
-    // directory with, so the two tools agree on which checker a file belongs to.
+    // the routing directory, the registries, the graph staging logs, the lexical store and each
+    // tenant's built graph - and for a compaction's staged pair, whose verdict depends on which
+    // of the two is present rather than on either file's format. verify --deep hands those to
+    // the same per-file dispatch excalibur-fsck surveys a live directory with, so the two tools
+    // agree on which checker a file belongs to.
     implementation(project(":excalibur-fsck"))
 
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")

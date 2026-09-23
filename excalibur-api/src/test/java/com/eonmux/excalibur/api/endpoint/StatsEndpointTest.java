@@ -3,7 +3,6 @@ package com.eonmux.excalibur.api.endpoint;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
-import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
@@ -64,9 +63,6 @@ class StatsEndpointTest {
         when(indexOrchestrator.getHnswQueueDepth()).thenReturn(0L);
         when(indexOrchestrator.getHnswQueueDepthLimit()).thenReturn(100000);
         when(indexOrchestrator.getTotalVectorsIntegrated()).thenReturn(0L);
-        when(indexOrchestrator.getPendingCuckooDeletions()).thenReturn(0);
-        when(indexOrchestrator.getTotalCuckooDeletions()).thenReturn(0L);
-        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
     }
 
     @Nested
@@ -419,75 +415,6 @@ class StatsEndpointTest {
         }
 
         @Test
-        @DisplayName("returns Cuckoo filter stats")
-        void returnsCuckooStats() throws IOException {
-            when(indexOrchestrator.getPendingCuckooDeletions()).thenReturn(50);
-            when(indexOrchestrator.getTotalCuckooDeletions()).thenReturn(500L);
-            when(indexOrchestrator.getCuckooFpRates())
-                .thenReturn(new CuckooMetricsWorker.FpRates(2, 2.4414e-6, 3.6621e-6));
-
-            StatsEndpoint endpoint = new StatsEndpoint(indexOrchestrator, storageEngine);
-            HttpExchange exchange = createMockExchange("GET");
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            when(exchange.getResponseBody()).thenReturn(baos);
-
-            endpoint.handle(exchange);
-
-            String response = baos.toString(StandardCharsets.UTF_8);
-            assertThat(response).contains("\"cuckoo\":");
-            assertThat(response).contains("\"pendingDeletions\": 50");
-            assertThat(response).contains("\"totalDeletions\": 500");
-            assertThat(response)
-                .as("rates this small are the normal case and must not round to zero")
-                .contains("\"avgFpRate\": 0.0000024414")
-                .contains("\"maxFpRate\": 0.0000036621");
-        }
-
-        @Test
-        @DisplayName("reports that a full membership filter can no longer speak for segments")
-        void reportsFilterSaturation() throws IOException {
-            // Saturation stops the filter ordering segments rather than turning queries wrong,
-            // so it is invisible in the results of any query that finishes in time. Nothing else
-            // in this response would tell an operator that the corpus capacity is now too small.
-            com.eonmux.excalibur.filter.HierarchicalCuckooFilter filter =
-                new com.eonmux.excalibur.filter.HierarchicalCuckooFilter(8L, 13, 8);
-            // Spread over many segments, so the level holding every term fills before any one.
-            for (int i = 0; i < 4096 && !filter.isSaturated(); i++) {
-                String spread = String.valueOf(i % 64);
-                filter.registerSegment(spread);
-                filter.insert(("term-" + i).getBytes(StandardCharsets.UTF_8), spread);
-            }
-            assertThat(filter.isSaturated())
-                .as("the corpus filter has to fill for this test to mean anything").isTrue();
-            when(indexOrchestrator.getHierarchicalCuckooFilter()).thenReturn(filter);
-
-            StatsEndpoint endpoint = new StatsEndpoint(indexOrchestrator, storageEngine);
-            HttpExchange exchange = createMockExchange("GET");
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            when(exchange.getResponseBody()).thenReturn(baos);
-
-            endpoint.handle(exchange);
-
-            String response = baos.toString(StandardCharsets.UTF_8);
-            assertThat(response).contains("\"saturated\": true");
-            assertThat(response).contains("\"saturatedSegments\": 0");
-        }
-
-        @Test
-        @DisplayName("reports a healthy membership filter as unsaturated")
-        void reportsNoSaturationWhenTheFilterHasRoom() throws IOException {
-            StatsEndpoint endpoint = new StatsEndpoint(indexOrchestrator, storageEngine);
-            HttpExchange exchange = createMockExchange("GET");
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            when(exchange.getResponseBody()).thenReturn(baos);
-
-            endpoint.handle(exchange);
-
-            String response = baos.toString(StandardCharsets.UTF_8);
-            assertThat(response).contains("\"saturated\": false");
-        }
-
-        @Test
         @DisplayName("returns visibility epoch")
         void returnsVisibilityEpoch() throws IOException {
             visibilityTracker.advanceEpoch();
@@ -638,30 +565,6 @@ class StatsEndpointTest {
             assertThatCode(() -> new NodeStats.HnswStats(0, 0, 0))
                 .doesNotThrowAnyException();
 
-            // CuckooStats - all fields validated
-            assertThatThrownBy(() -> new NodeStats.CuckooStats(-1, 0, 0.0, 0.0, false, 0))
-                .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, -1, 0.0, 0.0, false, 0))
-                .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, -0.1, 0.0, false, 0))
-                .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, 0.0, -0.1, false, 0))
-                .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, 1.1, 0.0, false, 0))
-                .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, 0.0, 1.1, false, 0))
-                .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, Double.NaN, 0.0, false, 0))
-                .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, 0.0, Double.NaN, false, 0))
-                .isInstanceOf(IllegalArgumentException.class);
-            assertThatCode(() -> new NodeStats.CuckooStats(0, 0, 0.0, 0.0, false, 0))
-                .doesNotThrowAnyException();
-            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, 0.0, 0.0, false, -1))
-                .isInstanceOf(IllegalArgumentException.class);
-            assertThatCode(() -> new NodeStats.CuckooStats(0, 0, 1.0, 1.0, false, 0))
-                .doesNotThrowAnyException();
-
             // VisibilityStats - all fields validated
             assertThatThrownBy(() -> new NodeStats.VisibilityStats(-1, 0, 0))
                 .isInstanceOf(IllegalArgumentException.class);
@@ -680,47 +583,43 @@ class StatsEndpointTest {
             NodeStats.EntryStats entries = new NodeStats.EntryStats(0);
             NodeStats.VolumeStats volumes = new NodeStats.VolumeStats(0, 0, 0);
             NodeStats.HnswStats hnsw = new NodeStats.HnswStats(0, 0, 0);
-            NodeStats.CuckooStats cuckoo = new NodeStats.CuckooStats(0, 0, 0.0, 0.0, false, 0);
             NodeStats.VisibilityStats visibility = new NodeStats.VisibilityStats(0, 0, 0);
 
             // Coverage validation
             assertThatThrownBy(() -> new NodeStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, Double.NaN, null, null, true, null))
+                segments, entries, volumes, hnsw, visibility, Double.NaN, null, null, true, null))
                 .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new NodeStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, -0.1, null, null, true, null))
+                segments, entries, volumes, hnsw, visibility, -0.1, null, null, true, null))
                 .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new NodeStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, 1.1, null, null, true, null))
+                segments, entries, volumes, hnsw, visibility, 1.1, null, null, true, null))
                 .isInstanceOf(IllegalArgumentException.class);
             assertThatCode(() -> new NodeStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, 0.0, null, null, true, null))
+                segments, entries, volumes, hnsw, visibility, 0.0, null, null, true, null))
                 .doesNotThrowAnyException();
             assertThatCode(() -> new NodeStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, 1.0, null, null, true, null))
+                segments, entries, volumes, hnsw, visibility, 1.0, null, null, true, null))
                 .doesNotThrowAnyException();
 
             // Null validation
             assertThatThrownBy(() -> new NodeStats(
-                null, entries, volumes, hnsw, cuckoo, visibility, 0.5, null, null, true, null))
+                null, entries, volumes, hnsw, visibility, 0.5, null, null, true, null))
                 .isInstanceOf(NullPointerException.class);
             assertThatThrownBy(() -> new NodeStats(
-                segments, null, volumes, hnsw, cuckoo, visibility, 0.5, null, null, true, null))
+                segments, null, volumes, hnsw, visibility, 0.5, null, null, true, null))
                 .isInstanceOf(NullPointerException.class);
             assertThatThrownBy(() -> new NodeStats(
-                segments, entries, null, hnsw, cuckoo, visibility, 0.5, null, null, true, null))
+                segments, entries, null, hnsw, visibility, 0.5, null, null, true, null))
                 .isInstanceOf(NullPointerException.class);
             assertThatThrownBy(() -> new NodeStats(
-                segments, entries, volumes, null, cuckoo, visibility, 0.5, null, null, true, null))
+                segments, entries, volumes, null, visibility, 0.5, null, null, true, null))
                 .isInstanceOf(NullPointerException.class);
             assertThatThrownBy(() -> new NodeStats(
-                segments, entries, volumes, hnsw, null, visibility, 0.5, null, null, true, null))
-                .isInstanceOf(NullPointerException.class);
-            assertThatThrownBy(() -> new NodeStats(
-                segments, entries, volumes, hnsw, cuckoo, null, 0.5, null, null, true, null))
+                segments, entries, volumes, hnsw, null, 0.5, null, null, true, null))
                 .isInstanceOf(NullPointerException.class);
             assertThatCode(() -> new NodeStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, 0.5, null, null, true, null))
+                segments, entries, volumes, hnsw, visibility, 0.5, null, null, true, null))
                 .as("a node that keeps no lexical index reports no lexical block")
                 .doesNotThrowAnyException();
         }

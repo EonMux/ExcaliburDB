@@ -74,7 +74,7 @@ final class EpochIsolationFilter {
         }
 
         if (totalFiltered > 0) {
-            LOGGER.debug("Stage 3: Epoch isolation filtered out {} results not visible at epoch {}",
+            LOGGER.debug("Stage 2: Epoch isolation filtered out {} results not visible at epoch {}",
                 totalFiltered, queryEpoch);
         }
 

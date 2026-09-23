@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.integration;
 
-import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.ingest.pipeline.DocumentBatchBuffer;
 import com.eonmux.excalibur.ingest.pipeline.DocumentBatchPublisher;
 import com.eonmux.excalibur.ingest.processor.TextChunk;
@@ -122,7 +121,6 @@ class FullPipelineIntegrationTest {
         publisher = new DocumentBatchPublisher(
             visibilityTracker,
             documentRegistry,
-            (CuckooFilter) null,
             // com.eonmux.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
             // durability barrier is already satisfied before the adapter runs.
             () -> { },

@@ -2,11 +2,9 @@ package com.eonmux.excalibur.api.endpoint;
 
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.query.QueryResponse;
 import com.eonmux.excalibur.query.cache.QueryResultCache;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
-import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
@@ -43,7 +41,6 @@ class QueryCacheStatsReportingTest {
     @BeforeEach
     void setUp() {
         indexOrchestrator = mock(IndexOrchestrator.class);
-        when(indexOrchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         storageEngine = mock(StorageEngine.class);
         SegmentCatalog catalog = mock(SegmentCatalog.class);
         VisibilityTracker visibility = mock(VisibilityTracker.class);
@@ -54,8 +51,6 @@ class QueryCacheStatsReportingTest {
             .thenReturn(new SegmentCatalog.CatalogMetadata());
         lenient().when(visibility.getStats())
             .thenReturn(new VisibilityTracker.VisibilityStats(1L, 0, 0, 0));
-        lenient().when(indexOrchestrator.getHierarchicalCuckooFilter())
-            .thenReturn(mock(HierarchicalCuckooFilter.class));
         lenient().when(storageEngine.segmentsWithoutVectorIndex()).thenReturn(Map.of());
     }
 

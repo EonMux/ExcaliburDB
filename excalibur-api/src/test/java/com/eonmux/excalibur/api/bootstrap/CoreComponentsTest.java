@@ -19,7 +19,6 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests for the storage stack the whole server is built on.
@@ -65,11 +64,10 @@ class CoreComponentsTest {
     }
 
     @Test
-    @DisplayName("wires the hierarchical filter and the volume manager")
+    @DisplayName("wires the volume manager and the catalog")
     void wiresSupportingComponents(@TempDir Path dataDir) {
         components = CoreComponents.create(config(), dataDir, HnswConfigFactory.withDefaults());
 
-        assertThat(components.hierarchicalFilter()).isNotNull();
         assertThat(components.volumeManager().getVolumeCount()).isGreaterThan(0);
         assertThat(components.storageEngine().getCatalog()).isNotNull();
     }
@@ -83,145 +81,21 @@ class CoreComponentsTest {
             .isEqualTo(components.storageEngine().getSegments().size());
     }
 
-    @Nested
-    @DisplayName("the membership filter's corpus capacity")
-    class CorpusCapacity {
+    @Test
+    @DisplayName("starts on a file that still sizes the removed term filter")
+    void startsWithRetiredFilterSettings(@TempDir Path dataDir) {
+        // A properties file written for an earlier build still carries the excalibur.filter.*
+        // keys. Nothing reads them any more, and a node refusing to start on one would turn an
+        // upgrade into an outage.
+        Map<String, String> props = new HashMap<>();
+        props.put("excalibur.query.vector-dimensions", "128");
+        props.put("excalibur.filter.corpus-capacity", "not-a-number");
+        props.put("excalibur.filter.fingerprint-bits", "99");
 
-        // This value was read from System.getProperty rather than from the configuration, so it
-        // answered to neither the properties file nor the environment while looking exactly like
-        // every key that does. Sizing it too small costs every query its ordering, because a
-        // level that has refused a term stops being trusted to speak for its segment, and an
-        // untrusted segment is searched as if it might hold anything. These tests pin the
-        // channel, because a capacity that does not reach the filter is invisible from the
-        // outside.
+        components = CoreComponents.create(
+            new Config(props), dataDir, HnswConfigFactory.withDefaults());
 
-        @Test
-        @DisplayName("comes from the properties, not from a system property")
-        void readsTheConfiguredValue(@TempDir Path dataDir) {
-            Map<String, String> props = new HashMap<>();
-            props.put("excalibur.query.vector-dimensions", "128");
-            props.put(CoreComponents.KEY_CORPUS_CAPACITY, "40000000");
-
-            components = CoreComponents.create(
-                new Config(props), dataDir, HnswConfigFactory.withDefaults());
-
-            assertThat(components.hierarchicalFilter().corpusCapacity())
-                .as("a raised capacity that does not reach the filter is silently ignored")
-                .isGreaterThanOrEqualTo(40_000_000L);
-        }
-
-        @Test
-        @DisplayName("falls back to the default when nothing is configured")
-        void defaultsWhenAbsent(@TempDir Path dataDir) {
-            components = CoreComponents.create(
-                config(), dataDir, HnswConfigFactory.withDefaults());
-
-            assertThat(components.hierarchicalFilter().corpusCapacity())
-                .isGreaterThanOrEqualTo(CoreComponents.DEFAULT_CORPUS_CAPACITY);
-        }
-
-        @Test
-        @DisplayName("the per-segment level is sizeable too")
-        void readsTheConfiguredSegmentCapacity(@TempDir Path dataDir) {
-            // A segment level that runs out of room stops speaking for that segment, so queries
-            // no longer order it by their terms, which costs ordering and never an answer.
-            // Without a knob an operator watching cuckoo.saturatedSegments climb has nothing to
-            // turn: the corpus capacity does not size this level.
-            Map<String, String> props = new HashMap<>();
-            props.put("excalibur.query.vector-dimensions", "128");
-            props.put(CoreComponents.KEY_SEGMENT_CAPACITY, "250000");
-
-            components = CoreComponents.create(
-                new Config(props), dataDir, HnswConfigFactory.withDefaults());
-
-            assertThat(components.hierarchicalFilter().segmentCapacity())
-                .isGreaterThanOrEqualTo(250_000);
-        }
-
-        @Test
-        @DisplayName("the per-segment level falls back to its default")
-        void defaultsTheSegmentCapacity(@TempDir Path dataDir) {
-            components = CoreComponents.create(
-                config(), dataDir, HnswConfigFactory.withDefaults());
-
-            assertThat(components.hierarchicalFilter().segmentCapacity())
-                .isGreaterThanOrEqualTo(CoreComponents.DEFAULT_SEGMENT_CAPACITY);
-        }
-
-        @Test
-        @DisplayName("a per-segment value that is not a positive int fails the start")
-        void refusesNonsenseSegmentCapacity(@TempDir Path dataDir) {
-            for (String bad : new String[] {"not-a-number", "0", "-1", "2147483648"}) {
-                Map<String, String> props = new HashMap<>();
-                props.put("excalibur.query.vector-dimensions", "128");
-                props.put(CoreComponents.KEY_SEGMENT_CAPACITY, bad);
-
-                assertThatThrownBy(() -> CoreComponents.create(
-                    new Config(props), dataDir, HnswConfigFactory.withDefaults()))
-                    .as("rejected value: %s", bad)
-                    .isInstanceOf(IllegalArgumentException.class)
-                    .hasMessageContaining(CoreComponents.KEY_SEGMENT_CAPACITY);
-            }
-
-            assertThat(dataDir).isEmptyDirectory();
-        }
-
-        @Test
-        @DisplayName("a segment level larger than the corpus level fails the start")
-        void refusesASegmentLevelPastTheCorpus(@TempDir Path dataDir) {
-            Map<String, String> props = new HashMap<>();
-            props.put("excalibur.query.vector-dimensions", "128");
-            props.put(CoreComponents.KEY_CORPUS_CAPACITY, "1000");
-            props.put(CoreComponents.KEY_SEGMENT_CAPACITY, "1001");
-
-            assertThatThrownBy(() -> CoreComponents.create(
-                new Config(props), dataDir, HnswConfigFactory.withDefaults()))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining(CoreComponents.KEY_SEGMENT_CAPACITY)
-                .hasMessageContaining(CoreComponents.KEY_CORPUS_CAPACITY);
-            assertThat(dataDir).isEmptyDirectory();
-        }
-
-        @Test
-        @DisplayName("a fingerprint width the filter cannot hold fails the start, naming the key")
-        void refusesFingerprintWidthsOutsideTheFormat(@TempDir Path dataDir) {
-            for (String bad : new String[] {"7", "17", "twelve"}) {
-                Map<String, String> props = new HashMap<>();
-                props.put("excalibur.query.vector-dimensions", "128");
-                props.put(CoreComponents.KEY_FINGERPRINT_BITS, bad);
-
-                assertThatThrownBy(() -> CoreComponents.create(
-                    new Config(props), dataDir, HnswConfigFactory.withDefaults()))
-                    .as("rejected value: %s", bad)
-                    .isInstanceOf(IllegalArgumentException.class)
-                    .hasMessageContaining(CoreComponents.KEY_FINGERPRINT_BITS);
-            }
-
-            assertThat(dataDir).isEmptyDirectory();
-        }
-
-        @Test
-        @DisplayName("a value that is not a positive number fails the start")
-        void refusesNonsense(@TempDir Path dataDir) {
-            // Falling back to the default would leave a node sized for a tenth of the corpus its
-            // operator asked for, scanning every segment on every query and reporting nothing
-            // about why.
-            for (String bad : new String[] {"not-a-number", "0", "-1"}) {
-                Map<String, String> props = new HashMap<>();
-                props.put("excalibur.query.vector-dimensions", "128");
-                props.put(CoreComponents.KEY_CORPUS_CAPACITY, bad);
-
-                assertThatThrownBy(() -> CoreComponents.create(
-                    new Config(props), dataDir, HnswConfigFactory.withDefaults()))
-                    .as("rejected value: %s", bad)
-                    .isInstanceOf(IllegalArgumentException.class)
-                    .hasMessageContaining(CoreComponents.KEY_CORPUS_CAPACITY);
-            }
-
-            // Nothing was opened before the value was rejected, so the directory the engine
-            // would have used is still untouched and a retry with a good value can proceed.
-            assertThat(dataDir).isEmptyDirectory();
-        }
+        assertThat(components.storageEngine().getSegments()).isNotEmpty();
     }
 
     @Nested

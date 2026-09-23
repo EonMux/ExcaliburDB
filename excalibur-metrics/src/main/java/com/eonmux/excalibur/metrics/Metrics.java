@@ -39,7 +39,6 @@ public final class Metrics {
     private static final SystemHealthMBean systemHealthMBeanInstance = new SystemHealthMBean();
     private static final IngestionQueueMBean ingestionQueueMBeanInstance = new IngestionQueueMBean();
     private static final VisibilityEpochMBean visibilityEpochMBeanInstance = new VisibilityEpochMBean();
-    private static final CuckooFpRateMBean cuckooFpRateMBeanInstance = new CuckooFpRateMBean();
     private static final HnswQueueDepthMBean hnswQueueDepthMBeanInstance = new HnswQueueDepthMBean();
     private static final IngestionThroughputMBean ingestionThroughputMBeanInstance = new IngestionThroughputMBean();
 
@@ -77,15 +76,6 @@ public final class Metrics {
      */
     public static VisibilityEpochMBean getVisibilityEpochMBean() {
         return visibilityEpochMBeanInstance;
-    }
-
-    /**
-     * Gets the CuckooFpRate MBean instance.
-     *
-     * @return The CuckooFpRate MBean
-     */
-    public static CuckooFpRateMBean getCuckooFpRateMBean() {
-        return cuckooFpRateMBeanInstance;
     }
 
     /**
@@ -493,7 +483,7 @@ public final class Metrics {
      */
     public static void recordEpoch(long epoch) {
         currentEpoch.set(epoch);
-        // Keep the histogram's epoch in step so FP rate samples are stamped correctly
+        // Keep the latency histogram's epoch in step with the node's
         queryLatencyHistogram.setEpoch(epoch);
         // Emit notification
         visibilityEpochMBeanInstance.getBroadcaster().sendNotification(
@@ -654,38 +644,6 @@ public final class Metrics {
         );
     }
 
-    // ============================================
-    // Cuckoo Filter FP Rate
-    // ============================================
-
-    /**
-     * Records a Cuckoo filter false positive rate measurement.
-     *
-     * <p>This method should be called periodically by a background worker that
-     * samples FP rates from active Cuckoo filters across all segments.</p>
-     *
-     * <h3>Domain Constraints</h3>
-     * <ul>
-     *   <li>FP rate must be between 0.0 and 1.0 (values are clamped)</li>
-     *   <li>Expected range for well-configured filters: 0.0001 to 0.001 (0.01% to 0.1%)</li>
-     * </ul>
-     *
-     * @param fpRate False positive rate between 0.0 and 1.0
-     */
-    public static void recordCuckooFpRate(double fpRate) {
-        // Clamp to valid range [0.0, 1.0]
-        double clamped = UnitInterval.clamp(fpRate);
-
-        queryLatencyHistogram.recordFpRate(clamped, getCurrentEpoch());
-
-        // Emit notification for JMX listeners
-        cuckooFpRateMBeanInstance.getBroadcaster().sendNotification(
-            MBeanNotificationBroadcaster.NotificationTypes.CUCKOO_FP_RATE,
-            "Cuckoo FP rate recorded: " + clamped,
-            clamped
-        );
-    }
-
     /**
      * Gets the HNSW queue depth percentage.
      *
@@ -816,21 +774,6 @@ public final class Metrics {
             super("VisibilityEpoch",
                 MBeanNotificationBroadcaster.NotificationTypes.VISIBILITY_EPOCH,
                 "Visibility Epoch MBean", MetricAttributeCatalog.visibilityEpoch());
-        }
-    }
-
-    /**
-     * JMX MBean for Cuckoo filter false positive rate.
-     * Implements DynamicMBean and NotificationEmitter for JMX compliance.
-     */
-    public static class CuckooFpRateMBean extends ObserverRegisteringMBean {
-
-        /**
-         * Creates the Cuckoo filter FP rate MBean over the shared histogram's rate samples.
-         */
-        public CuckooFpRateMBean() {
-            super("CuckooFpRate", MBeanNotificationBroadcaster.NotificationTypes.CUCKOO_FP_RATE,
-                "Cuckoo Filter False Positive Rate MBean", MetricAttributeCatalog.cuckooFpRate());
         }
     }
 

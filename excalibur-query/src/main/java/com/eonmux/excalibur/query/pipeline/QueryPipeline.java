@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.query.pipeline;
 
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker;
 import com.eonmux.excalibur.query.IndexCoverage;
 import com.eonmux.excalibur.query.QueryRequest;
@@ -34,16 +33,14 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Executes the full query pipeline with cancellation and timeout support.
  *
- * <p>QueryPipeline implements the six-stage query execution flow from Phase 6:</p>
+ * <p>QueryPipeline implements the five-stage query execution flow:</p>
  * <ol>
  *   <li><strong>Stage 0 - Epoch Snapshot:</strong> Capture visibility epoch and resolve queryable segments</li>
- *   <li><strong>Stage 1 - Cuckoo Filter Cascade:</strong> Search the segments that may hold the query text's
- *       terms first; every segment is still searched, since a vector's neighbours need not share its words</li>
- *   <li><strong>Stage 2 - LSH Candidates:</strong> Name the entries sharing the query's hash buckets,
- *       for Stage 3 to measure exactly beside its graph search; never excludes or narrows</li>
- *   <li><strong>Stage 3 - HNSW Vector Search:</strong> Precise ANN within candidate segments with tail scan</li>
- *   <li><strong>Stage 4 - Full Vector Rerank:</strong> Exact distance on full-precision vectors</li>
- *   <li><strong>Stage 5 - LLM Relevancy Scoring:</strong> Score candidates with LLM (optional)</li>
+ *   <li><strong>Stage 1 - LSH Candidates:</strong> Name the entries sharing the query's hash buckets,
+ *       for Stage 2 to measure exactly beside its graph search; never excludes or narrows</li>
+ *   <li><strong>Stage 2 - HNSW Vector Search:</strong> Precise ANN within candidate segments with tail scan</li>
+ *   <li><strong>Stage 3 - Full Vector Rerank:</strong> Exact distance on full-precision vectors</li>
+ *   <li><strong>Stage 4 - LLM Relevancy Scoring:</strong> Score candidates with LLM (optional)</li>
  * </ol>
  *
  * <h2>Timeout and Cancellation</h2>
@@ -86,9 +83,7 @@ public class QueryPipeline {
     private final DistanceFunction distanceFunction;
     private final LlmScorer llmScorer;
     private final double coverageThreshold;
-    private final HierarchicalCuckooFilter hierarchicalFilter;
     private final PqSearchSettings pqSearch;
-    private final TermFilterCascade termFilterCascade;
     private final EpochSnapshotStage epochSnapshotStage;
     private final HnswSearchStage hnswSearchStage;
     private final RerankStage rerankStage;
@@ -110,7 +105,7 @@ public class QueryPipeline {
     private final EpochIsolationValidator epochIsolationValidator;
 
     /**
-     * Resolves the stored chunk text of the results Stage 5 is about to score.
+     * Resolves the stored chunk text of the results Stage 4 is about to score.
      *
      * <p>A search result identifies a node, not a document body, so without this the
      * relevancy scorer receives one empty string per candidate.</p>
@@ -194,7 +189,7 @@ public class QueryPipeline {
      * @param visibilityTracker The visibility tracker
      * @param graphProvider Provider for HNSW graphs
      * @param distanceFunction The distance function
-     * @param llmScorer Optional LLM scorer for Stage 5
+     * @param llmScorer Optional LLM scorer for Stage 4
      * @param coverageThreshold Threshold for degraded state
      */
     public QueryPipeline(
@@ -216,7 +211,7 @@ public class QueryPipeline {
      * @param visibilityChecker The visibility checker for document atomicity (may be null)
      * @param graphProvider Provider for HNSW graphs
      * @param distanceFunction The distance function
-     * @param llmScorer Optional LLM scorer for Stage 5
+     * @param llmScorer Optional LLM scorer for Stage 4
      * @param coverageThreshold Threshold for degraded state
      */
     public QueryPipeline(
@@ -232,32 +227,6 @@ public class QueryPipeline {
     }
 
     /**
-     * Creates a new QueryPipeline with all options including hierarchical filter.
-     *
-     * @param storageEngine The storage engine
-     * @param visibilityTracker The visibility tracker
-     * @param visibilityChecker The visibility checker for document atomicity (may be null)
-     * @param graphProvider Provider for HNSW graphs
-     * @param distanceFunction The distance function
-     * @param llmScorer Optional LLM scorer for Stage 5
-     * @param coverageThreshold Threshold for degraded state
-     * @param hierarchicalFilter Optional hierarchical Cuckoo filter Stage 1 orders segments by
-     */
-    public QueryPipeline(
-            StorageEngine storageEngine,
-            VisibilityTracker visibilityTracker,
-            DocumentVisibilityChecker visibilityChecker,
-            HnswGraphProvider graphProvider,
-            DistanceFunction distanceFunction,
-            LlmScorer llmScorer,
-            double coverageThreshold,
-            HierarchicalCuckooFilter hierarchicalFilter) {
-
-        this(storageEngine, visibilityTracker, visibilityChecker, graphProvider, distanceFunction,
-             llmScorer, coverageThreshold, hierarchicalFilter, null);
-    }
-
-    /**
      * Creates a new QueryPipeline with all options including epoch isolation.
      *
      * <p>This is the full constructor that accepts all configurable parameters including
@@ -268,9 +237,8 @@ public class QueryPipeline {
      * @param visibilityChecker The visibility checker for document atomicity (may be null)
      * @param graphProvider Provider for HNSW graphs
      * @param distanceFunction The distance function
-     * @param llmScorer Optional LLM scorer for Stage 5
+     * @param llmScorer Optional LLM scorer for Stage 4
      * @param coverageThreshold Threshold for degraded state
-     * @param hierarchicalFilter Optional hierarchical Cuckoo filter Stage 1 orders segments by
      * @param epochIsolationValidator Optional validator for node-level epoch filtering
      */
     public QueryPipeline(
@@ -281,12 +249,10 @@ public class QueryPipeline {
             DistanceFunction distanceFunction,
             LlmScorer llmScorer,
             double coverageThreshold,
-            HierarchicalCuckooFilter hierarchicalFilter,
             EpochIsolationValidator epochIsolationValidator) {
 
         this(storageEngine, visibilityTracker, visibilityChecker, graphProvider, distanceFunction,
-            llmScorer, coverageThreshold, hierarchicalFilter, epochIsolationValidator,
-            PqSearchSettings.DISABLED);
+            llmScorer, coverageThreshold, epochIsolationValidator, PqSearchSettings.DISABLED);
     }
 
     /**
@@ -302,9 +268,8 @@ public class QueryPipeline {
      * @param visibilityChecker The visibility checker for document atomicity (may be null)
      * @param graphProvider Provider for HNSW graphs
      * @param distanceFunction The distance function
-     * @param llmScorer Optional LLM scorer for Stage 5
+     * @param llmScorer Optional LLM scorer for Stage 4
      * @param coverageThreshold Threshold for degraded state
-     * @param hierarchicalFilter Optional hierarchical Cuckoo filter Stage 1 orders segments by
      * @param epochIsolationValidator Optional validator for node-level epoch filtering
      * @param pqSearch Whether a segment holding a trained quantizer may be searched through it
      */
@@ -316,14 +281,12 @@ public class QueryPipeline {
             DistanceFunction distanceFunction,
             LlmScorer llmScorer,
             double coverageThreshold,
-            HierarchicalCuckooFilter hierarchicalFilter,
             EpochIsolationValidator epochIsolationValidator,
             PqSearchSettings pqSearch) {
 
         // Dispatcher and pipeline executor are lazily initialized on first use
         this(storageEngine, visibilityTracker, visibilityChecker, graphProvider, distanceFunction,
-            llmScorer, coverageThreshold, hierarchicalFilter, epochIsolationValidator, pqSearch,
-            null, null);
+            llmScorer, coverageThreshold, epochIsolationValidator, pqSearch, null, null);
     }
 
     /**
@@ -340,7 +303,6 @@ public class QueryPipeline {
             DistanceFunction distanceFunction,
             LlmScorer llmScorer,
             double coverageThreshold,
-            HierarchicalCuckooFilter hierarchicalFilter,
             EpochIsolationValidator epochIsolationValidator,
             PqSearchSettings pqSearch,
             ParallelQueryDispatcher dispatcher,
@@ -353,9 +315,7 @@ public class QueryPipeline {
         this.distanceFunction = Objects.requireNonNull(distanceFunction, "DistanceFunction cannot be null");
         this.llmScorer = llmScorer;
         this.coverageThreshold = coverageThreshold;
-        this.hierarchicalFilter = hierarchicalFilter;
         this.pqSearch = Objects.requireNonNull(pqSearch, "PqSearchSettings cannot be null");
-        this.termFilterCascade = new TermFilterCascade(hierarchicalFilter);
         this.epochIsolationValidator = epochIsolationValidator;
         this.payloadResolver = new ResultPayloadResolver(this.storageEngine);
         this.coverageCounts = new CoverageCounts(this.storageEngine);
@@ -443,10 +403,10 @@ public class QueryPipeline {
      * Returns a new QueryPipeline with the specified LLM scorer.
      *
      * <p>This method creates a new QueryPipeline instance with the provided LLM scorer,
-     * preserving all other configuration. Use this to enable Stage 5 LLM relevancy scoring
+     * preserving all other configuration. Use this to enable Stage 4 LLM relevancy scoring
      * on an existing pipeline.</p>
      *
-     * @param llmScorer The LLM scorer to use for Stage 5, or null to disable
+     * @param llmScorer The LLM scorer to use for Stage 4, or null to disable
      * @return A new QueryPipeline instance with the specified LLM scorer
      */
     public QueryPipeline withLlmScorer(LlmScorer llmScorer) {
@@ -474,7 +434,7 @@ public class QueryPipeline {
      * so reconfiguring a pipeline that has already served a query does not strand the threads
      * it started.</p>
      *
-     * @param scorer The LLM scorer the copy uses, or null to disable Stage 5
+     * @param scorer The LLM scorer the copy uses, or null to disable Stage 4
      * @param checker The visibility checker the copy uses, or null to disable atomicity
      *                filtering
      * @return The reconfigured copy
@@ -482,8 +442,7 @@ public class QueryPipeline {
     private QueryPipeline copyWith(LlmScorer scorer, DocumentVisibilityChecker checker) {
         return new QueryPipeline(this.storageEngine, this.visibilityTracker, checker,
             this.graphProvider, this.distanceFunction, scorer, this.coverageThreshold,
-            this.hierarchicalFilter, this.epochIsolationValidator, this.pqSearch,
-            this.dispatcher, this.pipelineExecutor);
+            this.epochIsolationValidator, this.pqSearch, this.dispatcher, this.pipelineExecutor);
     }
 
     /**
@@ -658,27 +617,19 @@ public class QueryPipeline {
         PipelineContext context = epochSnapshotStage.capture(request, token);
         partialContext.set(context);
 
-        // Stage 0b: Selectivity Estimation and Segment Prioritization
-        context = SegmentPrioritizer.prioritize(context, token);
-        partialContext.set(context);
-
-        // Stage 1: Cuckoo Filter Cascade, which orders the segments and never excludes one
-        context = termFilterCascade.apply(context, token);
-        partialContext.set(context);
-
-        // Stage 2: LSH candidates, measured beside the graph search rather than instead of it
+        // Stage 1: LSH candidates, measured beside the graph search rather than instead of it
         context = LshCandidateStage.apply(context, token);
         partialContext.set(context);
 
-        // Stage 3: HNSW Vector Search with Tail Scan
+        // Stage 2: HNSW Vector Search with Tail Scan
         context = hnswSearchStage.search(context, token, deadline);
         partialContext.set(context);
 
-        // Stage 4: Full Vector Rerank
+        // Stage 3: Full Vector Rerank
         context = rerankStage.rerank(context, token);
         partialContext.set(context);
 
-        // Stage 5: LLM Relevancy Scoring (optional)
+        // Stage 4: LLM Relevancy Scoring (optional)
         context = llmScoringStage.score(context, token);
         partialContext.set(context);
 
@@ -707,12 +658,12 @@ public class QueryPipeline {
     }
 
     /**
-     * Returns whether Stage 5 will actually score this request.
+     * Returns whether Stage 4 will actually score this request.
      *
      * <p>The single definition, handed to the three stages that must agree on it exactly:
-     * Stage 3 widens the margin it leaves behind when scoring follows, Stage 4 decides whether
-     * it may truncate to topK or must leave spare candidates for Stage 5's threshold filter,
-     * and Stage 5 decides whether to score at all. A second copy of this rule would let them
+     * Stage 2 widens the margin it leaves behind when scoring follows, Stage 3 decides whether
+     * it may truncate to topK or must leave spare candidates for Stage 4's threshold filter,
+     * and Stage 4 decides whether to score at all. A second copy of this rule would let them
      * disagree, and every way they can disagree silently returns fewer results than asked
      * for.</p>
      *

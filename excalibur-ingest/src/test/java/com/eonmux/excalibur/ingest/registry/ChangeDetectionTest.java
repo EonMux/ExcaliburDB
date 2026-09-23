@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.ingest.registry;
 
-import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
@@ -26,7 +25,7 @@ import static org.junit.jupiter.api.Assertions.*;
  *   <li>DocumentRegistry: Registration, retrieval, persistence</li>
  *   <li>ChangeDetector: New, changed, and deleted document detection</li>
  *   <li>ChangeSet: Result composition and chunk ID collection</li>
- *   <li>UpsertHandler: Tombstoning and filter deletion</li>
+ *   <li>UpsertHandler: Tombstoning</li>
  * </ul>
  *
  * <h2>Domain Correctness Verification</h2>
@@ -518,7 +517,7 @@ class ChangeDetectionTest {
             return true;
         };
 
-        UpsertHandler handler = new UpsertHandler(registry, (CuckooFilter) null, storageAdapter);
+        UpsertHandler handler = new UpsertHandler(registry, storageAdapter);
 
         DocumentMetadata oldMeta = DocumentMetadata.builder()
             .sourceId("source1")
@@ -554,7 +553,7 @@ class ChangeDetectionTest {
         registry.register(deletedMeta);
         assertNotNull(registry.get("source1", "doc1"));
 
-        UpsertHandler handler = new UpsertHandler(registry, (CuckooFilter) null, key -> true);
+        UpsertHandler handler = new UpsertHandler(registry, key -> true);
 
         ChangeSet changeSet = ChangeSet.builder("source1")
             .addDeleted(deletedMeta)
@@ -572,7 +571,7 @@ class ChangeDetectionTest {
             throw new RuntimeException("Storage error");
         };
 
-        UpsertHandler handler = new UpsertHandler(registry, (CuckooFilter) null, failingStorage);
+        UpsertHandler handler = new UpsertHandler(registry, failingStorage);
 
         DocumentMetadata oldMeta = DocumentMetadata.builder()
             .sourceId("source1")
@@ -598,7 +597,7 @@ class ChangeDetectionTest {
     @Test
     void testTombstoneSingleChunk() {
         List<String> tombstonedChunks = new java.util.ArrayList<>();
-        UpsertHandler handler = new UpsertHandler(registry, (CuckooFilter) null, key -> {
+        UpsertHandler handler = new UpsertHandler(registry, key -> {
             tombstonedChunks.add(new String(key, StandardCharsets.UTF_8));
             return true;
         });
@@ -613,7 +612,7 @@ class ChangeDetectionTest {
     @Test
     void testTombstoneMultipleChunks() {
         List<String> tombstonedChunks = new java.util.ArrayList<>();
-        UpsertHandler handler = new UpsertHandler(registry, (CuckooFilter) null, key -> {
+        UpsertHandler handler = new UpsertHandler(registry, key -> {
             tombstonedChunks.add(new String(key, StandardCharsets.UTF_8));
             return true;
         });

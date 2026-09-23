@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.api.bootstrap;
 
-import com.eonmux.excalibur.ingest.pipeline.ChunkPlacement;
 import com.eonmux.excalibur.ingest.pipeline.OffsetAwareStorageWriter;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
 import com.eonmux.excalibur.store.Segment;
@@ -11,12 +10,11 @@ import org.slf4j.LoggerFactory;
 import com.eonmux.excalibur.core.codec.ChunkPayloadCodec;
 
 import java.nio.charset.StandardCharsets;
-import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Writes reindexed chunks into the storage engine and reports where each one landed.
+ * Writes reindexed chunks into the storage engine and reports each one's write log offset.
  *
  * <h2>Routing</h2>
  * <p>Every write goes through {@link StorageEngine#putReportingSegment}, so the chunk lands in
@@ -25,13 +23,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * reindexed chunk unreachable by the routed read path.</p>
  *
  * <h2>Where a chunk landed</h2>
- * <p>The engine reports the segment that took each write, and that is the segment returned in
- * the {@link ChunkPlacement}, never one worked out here. The engine may split the target while
- * the write is in flight and retry into a child, so recomputing the route from the key after the
- * write can name a segment the chunk is not in; the caller files the chunk's terms in the
- * membership filter under the segment reported, and a term filed under the wrong one hides the
- * chunk from every query for it once the right one's level is trusted. The write log offset is
- * read from the same segment.</p>
+ * <p>The write log offset is read from the segment the engine reports took the write, never
+ * one worked out here. The engine may split the target while the write is in flight and retry
+ * into a child, so recomputing the route from the key after the write can name a segment the
+ * chunk is not in, and an offset read from that segment belongs to another write log.</p>
  *
  * <h2>Value encoding</h2>
  * <p>{@code [4:dimension][dimension*4:embedding floats][text bytes]}, little-endian,
@@ -91,42 +86,24 @@ public final class StorageChunkWriter implements OffsetAwareStorageWriter {
         };
     }
 
-    @Override
-    public long writeChunkWithOffset(String chunkId, String content, float[] embedding) {
-        return write(chunkId, content, null, embedding).writeLogOffset();
-    }
-
-    /**
-     * Writes a chunk the caller has tokenised, handing its terms to the engine so it does not
-     * tokenise the text a second time to count them, and reports the segment it landed in.
-     */
-    @Override
-    public ChunkPlacement writeChunk(String chunkId, String content, List<String> terms,
-                                     float[] embedding) {
-        Objects.requireNonNull(terms, "terms cannot be null");
-        return write(chunkId, content, terms, embedding);
-    }
-
     /**
      * Writes a chunk wherever the engine routes it.
      *
-     * @param terms The chunk's terms, or null to have the engine extract them from the value
-     * @return Where the chunk landed, or {@link ChunkPlacement#FAILED}
+     * @return The write log offset of the segment that took the write, or
+     *         {@link #WRITE_FAILED}
      */
-    private ChunkPlacement write(String chunkId, String content, List<String> terms,
-                                 float[] embedding) {
+    @Override
+    public long writeChunkWithOffset(String chunkId, String content, float[] embedding) {
         byte[] key = keyOf(chunkId);
         byte[] value = encode(content, embedding);
         long segmentId;
         try {
-            segmentId = terms == null
-                ? storageEngine.putReportingSegment(key, value)
-                : storageEngine.putReportingSegment(key, value, terms);
+            segmentId = storageEngine.putReportingSegment(key, value);
         } catch (RuntimeException e) {
             LOGGER.warn("Failed to write chunk {}: {}", chunkId, e.getMessage());
-            return ChunkPlacement.FAILED;
+            return WRITE_FAILED;
         }
-        return new ChunkPlacement(offsetOf(storageEngine.getSegment(segmentId)), segmentId);
+        return offsetOf(storageEngine.getSegment(segmentId));
     }
 
     /**

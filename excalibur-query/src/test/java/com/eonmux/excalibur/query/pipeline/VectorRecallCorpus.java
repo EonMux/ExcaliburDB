@@ -1,7 +1,5 @@
 package com.eonmux.excalibur.query.pipeline;
 
-import com.eonmux.excalibur.core.text.TermExtractor;
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.filter.lsh.LshConfig;
 import com.eonmux.excalibur.filter.lsh.LshIndex;
 import com.eonmux.excalibur.query.QueryRequest;
@@ -20,7 +18,6 @@ import com.eonmux.excalibur.vector.hnsw.HnswSearchResult;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -40,18 +37,15 @@ import static org.mockito.Mockito.when;
  * against both exact search and the graph it is built on.
  *
  * <p>Every segment is set up the way a node that embeds its corpus leaves it once integration has
- * caught up: an HNSW graph holding every vector, an LSH pre-filter holding one entry per graph
- * node under the graph's own ids, and a level of the term filter that has been refilled from the
- * segment's text and vouched for. That is the state in which each pre-filter's answer is at its
+ * caught up: an HNSW graph holding every vector and an LSH pre-filter holding one entry per graph
+ * node under the graph's own ids. That is the state in which the pre-filter's answer is at its
  * most authoritative, and therefore the state in which a pre-filter that is allowed to cut a
  * search short does the most damage.</p>
  *
- * <p>The text is chosen so that the words a query is phrased in need not be the words the
- * documents nearest it use - the case semantic search exists for. The first segment's documents
- * say {@value #QUERY_WORDING_SEGMENT_TEXT}; every other segment's say
- * {@value #OTHER_SEGMENT_TEXT}. A query measured with {@link #MISMATCHED_QUERY_TEXT} therefore
- * shares a term with the first segment only, while its nearest vectors are spread over all of
- * them, just as the HTTP route hands the pipeline a question's text beside its embedding.</p>
+ * <p>A query may carry text beside its vector, as the HTTP route hands the pipeline a question's
+ * text beside its embedding. {@link #MISMATCHED_QUERY_TEXT} is such a question, phrased in words
+ * that say nothing about which vectors are nearest it - the case semantic search exists for - so a
+ * measurement with it shows whether anything in the pipeline lets the wording cost answers.</p>
  *
  * <p>The vectors are clustered and the clusters are scattered across segments by a random
  * placement, as documents are placed by key hash. A query's true neighbours therefore live in
@@ -76,15 +70,7 @@ final class VectorRecallCorpus implements AutoCloseable {
     /** Vectors per cluster, on average. */
     private static final int CLUSTER_SIZE = 40;
 
-    /** What the first segment's documents say: the query's own wording. */
-    static final String QUERY_WORDING_SEGMENT_TEXT = "the machine ran out of ram";
-
-    /** What every other segment's documents say: the same subject, in other words. */
-    static final String OTHER_SEGMENT_TEXT = "oom killer sigkill enomem cgroup memory limit";
-
-    /**
-     * Query text sharing a term with the first segment only, whatever the query vector is near.
-     */
+    /** Query text carried beside a vector, saying nothing of which vectors are nearest it. */
     static final String MISMATCHED_QUERY_TEXT =
         "why does my service die when the machine runs out of RAM?";
 
@@ -95,7 +81,6 @@ final class VectorRecallCorpus implements AutoCloseable {
     private final Map<Long, HnswGraph> graphs = new HashMap<>();
     private final List<StoredVector> corpus = new ArrayList<>();
     private final List<float[]> centres = new ArrayList<>();
-    private final HierarchicalCuckooFilter termFilter;
     private final int dimension;
     private final Random random;
 
@@ -144,9 +129,6 @@ final class VectorRecallCorpus implements AutoCloseable {
         VisibilityTracker visibility = new VisibilityTracker(catalog);
 
         Map<Long, LshIndex> prefilters = new HashMap<>();
-        // Sized well past the handful of distinct terms the segments' text holds, so no level
-        // saturates and every one is trusted.
-        this.termFilter = new HierarchicalCuckooFilter(10_000L, 13, 100);
         for (long id = 1; id <= segmentCount; id++) {
             catalog.add(id, dir.resolve("vol-" + id + ".dat"));
             catalog.completeIndexing(id);
@@ -185,7 +167,6 @@ final class VectorRecallCorpus implements AutoCloseable {
             }
             segment.attachHnswGraph(graph);
             segment.attachLshIndex(prefilters.get(id));
-            fileTerms(termFilter, id, id == 1 ? QUERY_WORDING_SEGMENT_TEXT : OTHER_SEGMENT_TEXT);
         }
 
         StorageEngine storageEngine = mock(StorageEngine.class);
@@ -193,20 +174,7 @@ final class VectorRecallCorpus implements AutoCloseable {
         when(storageEngine.getSegment(anyLong()))
             .thenAnswer(invocation -> segments.get(invocation.<Long>getArgument(0)));
         this.pipeline = new QueryPipeline(storageEngine, visibility, null, graphs::get, DISTANCE,
-            null, QueryPipeline.DEFAULT_COVERAGE_THRESHOLD, termFilter);
-    }
-
-    /**
-     * Fills a segment's level of the term filter from its text and vouches for it, as the shard
-     * does when it refills a level from the entries a segment holds.
-     */
-    private static void fileTerms(HierarchicalCuckooFilter filter, long segmentId, String text) {
-        String key = String.valueOf(segmentId);
-        long generation = filter.beginSegmentRebuild(key);
-        for (String term : TermExtractor.extractTerms(text)) {
-            filter.insert(term.getBytes(StandardCharsets.UTF_8), key);
-        }
-        filter.completeSegmentRebuild(key, generation);
+            null, QueryPipeline.DEFAULT_COVERAGE_THRESHOLD);
     }
 
     /**
@@ -216,18 +184,6 @@ final class VectorRecallCorpus implements AutoCloseable {
      * @param k How many neighbours each query asks for
      * @return The pipeline's recall and the graphs' own, against exact search
      */
-    /**
-     * Whether the term filter speaks for every segment, which is what makes a measurement with
-     * query text mean anything: a filter that covers nothing has no verdict for any stage to act
-     * on.
-     *
-     * @return true when every segment's level is trusted
-     */
-    boolean termFilterCoversEverySegment() {
-        return segments.keySet().stream()
-            .allMatch(id -> termFilter.coversSegment(String.valueOf(id)));
-    }
-
     Recall measure(int queryCount, int k) {
         return measure(queryCount, k, null);
     }

@@ -34,8 +34,7 @@ import java.util.Objects;
  * <h2>What this costs</h2>
  * <p>The accumulated postings live on the heap until written, so a build is bounded by memory
  * rather than by corpus size. Very large corpora want this run per shard and the shards searched
- * together - which is the arrangement the engine's segments already impose, and the reason the
- * term-membership filter is hierarchical.</p>
+ * together - which is the arrangement the engine's segments already impose.</p>
  */
 public final class PostingsWriter {
 

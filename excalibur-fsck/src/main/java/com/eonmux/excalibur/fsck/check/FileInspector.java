@@ -13,8 +13,8 @@ import java.util.Optional;
  * <p>Public because it has two callers. {@link DataDirectoryScanner} surveys a live data
  * directory with it, and {@code excalibur-backup verify --deep} hands it every file in a
  * snapshot's payload whose format the backup tool has no engine checker of its own for - the
- * write-ahead logs, the routing directory, the lexical store, the graph staging logs, the
- * segments' term sketches and the ingestion registries. One dispatch rather than two is the
+ * write-ahead logs, the routing directory, the lexical store, the graph staging logs and the
+ * ingestion registries. One dispatch rather than two is the
  * point: a format added to one caller's switch and not the other's would be verified by one
  * tool and waved through by the other.</p>
  *
@@ -134,7 +134,6 @@ public final class FileInspector {
             case HNSW_STAGED_DOCUMENT_MAP ->
                 VectorIndexCheck.stagedDocumentMapping(file, relative);
             case PQ_CODEBOOK -> VectorIndexCheck.codebook(file, relative);
-            case TERM_SKETCH -> TermSketchCheck.check(file, relative);
             case LSH_TABLE -> LshTableCheck.check(file, relative);
             case GRAPH_STAGING_LOG -> GraphStagingCheck.check(file, relative);
             case GRAPH_ERASURE_MARKER -> GraphStagingCheck.marker(file, relative);
@@ -160,6 +159,7 @@ public final class FileInspector {
                 "this is a half-finished write, not state: nothing reads it, and it is here "
                     + "because the operation that staged it did not finish");
             case DIAGNOSTIC_DUMP -> diagnosticDump(file, relative);
+            case OBSOLETE -> obsolete(file, relative);
             case UNRECOGNISED -> unverifiable(file, relative, "unrecognised",
                 "nothing in this build recognises this file, so it was not read at all. It is "
                     + "not evidence of damage and it is not evidence of health");
@@ -187,6 +187,29 @@ public final class FileInspector {
                 "the file could not be sized: " + e, -1);
         }
         return new FileCheck(file, relative, format, null, CheckStatus.UNCHECKED, detail, size);
+    }
+
+    /**
+     * Builds the verdict for a file an earlier build wrote, which is reported and never read.
+     *
+     * @param file     The file
+     * @param relative Its path relative to the data directory
+     * @return A not-data verdict carrying the file's size
+     */
+    private static FileCheck obsolete(Path file, String relative) {
+        String format = "obsolete term sketch";
+        long size;
+        try {
+            size = Files.size(file);
+        } catch (IOException e) {
+            return new FileCheck(file, relative, format, null, CheckStatus.UNREADABLE,
+                "the file could not be sized: " + e, -1);
+        }
+        return new FileCheck(file, relative, format, null, CheckStatus.NOT_DATA,
+            "a term-frequency sketch an earlier build kept beside its segment. Nothing in this "
+                + "build reads it, so there is nothing in it to verify, and it does not count "
+                + "against --strict. The node removes it the next time it starts; deleting it by "
+                + "hand loses nothing", size);
     }
 
     /**

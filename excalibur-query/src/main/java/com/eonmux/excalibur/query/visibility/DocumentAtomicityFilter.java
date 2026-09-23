@@ -28,7 +28,7 @@ import java.util.Objects;
  * </ul>
  *
  * <h2>Query Pipeline Integration</h2>
- * <p>This filter is used in Stage 4 of the query pipeline (full vector rerank):</p>
+ * <p>This filter is used in Stage 3 of the query pipeline (full vector rerank):</p>
  * <pre>{@code
  * // After aggregating results from all segments
  * List<QueryResultItem> merged =

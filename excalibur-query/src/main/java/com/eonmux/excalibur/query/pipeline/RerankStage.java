@@ -20,16 +20,16 @@ import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 /**
- * Stage 4: Full Vector Rerank.
+ * Stage 3: Full Vector Rerank.
  *
  * <p>Re-measurement of the top candidates against the query, on the full-precision vectors
- * the graph holds now. Stage 3 measured them exactly too, so the number is the same for a
+ * the graph holds now. Stage 2 measured them exactly too, so the number is the same for a
  * node that has not moved; the second look is what drops one tombstoned since, or whose id a
  * compaction has since given to another node.</p>
  *
  * <h2>Reranking Process</h2>
  * <ol>
- *   <li>Aggregate results from Stage 3 using ResultAggregator</li>
+ *   <li>Aggregate results from Stage 2 using ResultAggregator</li>
  *   <li>Group candidates by segment ID</li>
  *   <li>For each segment, use VectorReranker to compute exact distances from full-precision vectors stored in HNSW graph</li>
  *   <li>Merge all reranked results and take top-k</li>
@@ -56,7 +56,7 @@ final class RerankStage {
     private static final Logger LOGGER = LoggerFactory.getLogger(RerankStage.class);
 
     /**
-     * Multiplier applied to topK when collecting Stage 4 rerank candidates.
+     * Multiplier applied to topK when collecting Stage 3 rerank candidates.
      */
     private static final int RERANK_CANDIDATE_MULTIPLIER = 2;
 
@@ -76,7 +76,7 @@ final class RerankStage {
      * applied without an epoch bound, which reduces it to exactly the guarantee it exists
      * to provide: a result is dropped only when its document is registered as not yet
      * complete. Epoch-based snapshot isolation is still enforced, in its own domain, by
-     * the shard {@code EpochIsolationValidator} in Stage 3.</p>
+     * the shard {@code EpochIsolationValidator} in Stage 2.</p>
      *
      * <p>Restoring an epoch bound here requires the query epoch to be drawn from the same
      * counter that stamps document commits - i.e. an accessor for the current commit epoch
@@ -90,7 +90,7 @@ final class RerankStage {
     private final DocumentVisibilityChecker visibilityChecker;
 
     /**
-     * Whether Stage 5 will score this request, which decides whether this stage may truncate
+     * Whether Stage 4 will score this request, which decides whether this stage may truncate
      * to topK or must leave spare candidates behind. The pipeline supplies its own predicate
      * so that the two stages cannot drift apart.
      */
@@ -107,18 +107,18 @@ final class RerankStage {
     }
 
     /**
-     * Reranks, filters and (when Stage 5 will not run) truncates the merged results.
+     * Reranks, filters and (when Stage 4 will not run) truncates the merged results.
      *
      * @param context The pipeline context carrying the per-segment results
      * @param token The cancellation token
      * @return Context with the final ranking
      */
     PipelineContext rerank(PipelineContext context, CancellationToken token) {
-        token.checkCancelled("Stage 4 cancelled before reranking");
+        token.checkCancelled("Stage 3 cancelled before reranking");
 
-        LOGGER.trace("Stage 4: Running full vector rerank");
+        LOGGER.trace("Stage 3: Running full vector rerank");
 
-        // Step 1: Aggregate results from Stage 3 to get candidates
+        // Step 1: Aggregate results from Stage 2 to get candidates
         // Oversample so reranking and filtering have spare candidates to work with.
         // topK is client-supplied, so widen before multiplying and saturate instead of
         // wrapping to a negative candidate count.
@@ -134,11 +134,11 @@ final class RerankStage {
         // A merge that came back shallower than it was asked had nothing further to give, so
         // however this ranking is narrowed afterwards - by a relevancy threshold included -
         // nothing past it was left unconsidered. That is what lets a short answer's total be
-        // exact once Stage 5 has shortened it.
+        // exact once Stage 4 has shortened it.
         boolean exhausted = candidates.size() < candidateCount;
 
         if (candidates.isEmpty()) {
-            LOGGER.debug("Stage 4: No candidates to rerank");
+            LOGGER.debug("Stage 3: No candidates to rerank");
             return context.withRanking(candidates, exhausted, 0);
         }
 
@@ -164,7 +164,7 @@ final class RerankStage {
         }
         int unnamedDropped = beforeNaming - rerankedResults.size();
 
-        // Step 6: Truncate to topK once the result set is final. When Stage 5 is going to
+        // Step 6: Truncate to topK once the result set is final. When Stage 4 is going to
         // run, leave the oversampled list intact: its threshold filter would otherwise be
         // applied to an already-truncated list and return fewer than topK results even
         // though enough candidates passed the threshold.
@@ -172,7 +172,7 @@ final class RerankStage {
             rerankedResults = QueryPipeline.truncate(rerankedResults, context.request.topK());
         }
 
-        LOGGER.debug("Stage 4: Reranked {} candidates to {} results (atomicity filtered from {})",
+        LOGGER.debug("Stage 3: Reranked {} candidates to {} results (atomicity filtered from {})",
             candidates.size(), rerankedResults.size(), beforeAtomicityFilter);
 
         return context.withRanking(rerankedResults, exhausted, unnamedDropped);
@@ -207,7 +207,7 @@ final class RerankStage {
         if (named.size() == results.size()) {
             return results;
         }
-        LOGGER.warn("Stage 4: dropped {} result(s) that carry no chunk identity, from "
+        LOGGER.warn("Stage 3: dropped {} result(s) that carry no chunk identity, from "
             + "segment(s) {}; their node-to-chunk mapping is missing entries. Run "
             + "excalibur-fsck, then restore each graph with its mapping or reindex its source",
             results.size() - named.size(),
@@ -219,7 +219,7 @@ final class RerankStage {
      * Recomputes exact distances a segment at a time, against the graph that holds the vectors.
      *
      * @param context The pipeline context, which carries the segment candidates and their graphs
-     * @param candidates The merged candidates from Stage 3
+     * @param candidates The merged candidates from Stage 2
      * @return The reranked candidates, in no particular order
      */
     private List<QueryResultItem> rerankBySegment(PipelineContext context,
@@ -245,7 +245,7 @@ final class RerankStage {
                 .orElse(null);
 
             if (segmentCandidate == null || segmentCandidate.graph() == null) {
-                LOGGER.warn("Stage 4: No graph found for segment {}, keeping {} candidates with approximate distances",
+                LOGGER.warn("Stage 3: No graph found for segment {}, keeping {} candidates with approximate distances",
                     segmentId, segmentCandidates.size());
                 rerankedResults.addAll(segmentCandidates);
                 continue;
@@ -266,7 +266,7 @@ final class RerankStage {
     }
 
     /**
-     * Returns the number of candidates Stage 4 collects for reranking.
+     * Returns the number of candidates Stage 3 collects for reranking.
      *
      * @param topK The requested result count (client-controlled)
      * @return {@code topK * RERANK_CANDIDATE_MULTIPLIER}, saturated at {@link Integer#MAX_VALUE}
@@ -332,7 +332,7 @@ final class RerankStage {
 
         int registeredDocuments = visibilityChecker.getDocumentCount();
         if (registeredDocuments == 0) {
-            LOGGER.trace("Stage 4: Skipping document atomicity filter - no documents registered");
+            LOGGER.trace("Stage 3: Skipping document atomicity filter - no documents registered");
             return results;
         }
 
@@ -343,7 +343,7 @@ final class RerankStage {
         List<QueryResultItem> filtered = atomicityFilter.filterPartialDocuments(results, bound);
 
         if (filtered.size() < results.size()) {
-            LOGGER.debug("Stage 4: Document atomicity filter removed {} partial document results "
+            LOGGER.debug("Stage 3: Document atomicity filter removed {} partial document results "
                 + "({} documents registered, bound={})", results.size() - filtered.size(),
                 registeredDocuments, bounded ? String.valueOf(bound) : "unbounded");
         }

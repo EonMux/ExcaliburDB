@@ -170,88 +170,57 @@ class SplitObserverTest {
     }
 
     @Test
-    @DisplayName("an observer is told the children's indices before any key can route to them")
-    void observerHearsOfTheSplitBeforeItIsReachable() throws Exception {
-        // State a child's inherited entries never reach through writes - a membership filter
-        // filled by them - has to be marked before the first write lands in the child, and
-        // onSplitComplete comes only after the children are routed to.
+    @DisplayName("a split that fails to publish tells no observer and leaves the parent serving")
+    void failedPublicationIsNotAnnounced() throws Exception {
         List<String> events = new CopyOnWriteArrayList<>();
-        List<long[]> announced = new CopyOnWriteArrayList<>();
-        AtomicInteger routingAtAnnouncement = new AtomicInteger();
-        engine.addSplitObserver(new SplitWorker.SplitListener() {
-            @Override
-            public void onSplitPublishing(Segment parent, long leftIndex, long rightIndex) {
-                events.add("publishing");
-                announced.add(new long[] {leftIndex, rightIndex});
-                routingAtAnnouncement.set(engine.getSegmentCount());
-            }
-
-            @Override
-            public void onSplitComplete(Segment parent, Segment left, Segment right) {
-                events.add("complete");
-            }
-        });
-
-        int routingBefore = engine.getSegmentCount();
-        fill();
-        Segment parent = findPopulatedSegment(routingBefore);
-        long parentIndex = indexOf(parent);
-        split(parent, routingBefore);
-
-        assertThat(events).containsExactly("publishing", "complete");
-        assertThat(routingAtAnnouncement.get())
-            .as("the routing table is not yet widened when the advance notice is given")
-            .isEqualTo(routingBefore);
-        assertThat(announced.get(0)).containsExactly(parentIndex, parentIndex + routingBefore);
-        assertThat(engine.getSegment(parentIndex + routingBefore))
-            .as("the right child is published at the announced index")
-            .isNotNull()
-            .isNotSameAs(engine.getSegment(parentIndex));
-    }
-
-    @Test
-    @DisplayName("an observer told a split was coming is told when it is abandoned")
-    void observerHearsOfAnAbandonedSplit() throws Exception {
-        List<String> events = new CopyOnWriteArrayList<>();
-        List<long[]> abandoned = new CopyOnWriteArrayList<>();
-        engine.addSplitObserver(new SplitWorker.SplitListener() {
-            @Override
-            public void onSplitPublishing(Segment parent, long leftIndex, long rightIndex) {
-                events.add("publishing");
-                throw new IllegalStateException("a failing advance notice does not stop a split");
-            }
-
-            @Override
-            public void onSplitAbandoned(Segment parent, long leftIndex, long rightIndex) {
-                events.add("abandoned");
-                abandoned.add(new long[] {leftIndex, rightIndex});
-            }
-
-            @Override
-            public void onSplitComplete(Segment parent, Segment left, Segment right) {
-                events.add("complete");
-            }
-        });
+        engine.addSplitObserver((parent, left, right) -> events.add("complete"));
 
         int routingBefore = engine.getSegmentCount();
         fill();
         Segment parent = findPopulatedSegment(routingBefore);
         long parentIndex = indexOf(parent);
         // A non-empty directory where the right child is to be renamed makes the rename fail
-        // after the advance notice has been given.
+        // part-way through publication.
         Path blocker = dataDir.resolve("segment_" + (parentIndex + routingBefore) + ".dat");
         Files.createDirectories(blocker.resolve("occupied"));
 
-        engine.getSplitWorker().requestSplit(parent, Integer.numberOfTrailingZeros(routingBefore));
-        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(10);
-        while (abandoned.isEmpty() && System.currentTimeMillis() < deadline) {
-            Thread.sleep(10);
+        // The worker logs the failed split once the parent is back in service; that line is
+        // what says the attempt is over.
+        java.util.concurrent.CountDownLatch failed = new java.util.concurrent.CountDownLatch(1);
+        java.util.logging.Logger workerLog =
+            java.util.logging.Logger.getLogger(SplitWorker.class.getName());
+        java.util.logging.Handler watcher = new java.util.logging.Handler() {
+            @Override
+            public void publish(java.util.logging.LogRecord logged) {
+                if (logged.getMessage() != null
+                        && logged.getMessage().startsWith("Manual split failed")) {
+                    failed.countDown();
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        workerLog.addHandler(watcher);
+        try {
+            engine.getSplitWorker().requestSplit(parent,
+                Integer.numberOfTrailingZeros(routingBefore));
+            assertThat(failed.await(10, TimeUnit.SECONDS))
+                .as("the split fails on the blocked rename")
+                .isTrue();
+        } finally {
+            workerLog.removeHandler(watcher);
         }
 
-        assertThat(events).containsExactly("publishing", "abandoned");
-        assertThat(abandoned.get(0)).containsExactly(parentIndex, parentIndex + routingBefore);
+        assertThat(events).isEmpty();
         assertThat(engine.getSegmentCount()).isEqualTo(routingBefore);
         assertThat(engine.getSegment(parentIndex)).isSameAs(parent);
+        assertThat(parent.isClosed()).isFalse();
     }
 
     @Test

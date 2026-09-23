@@ -133,31 +133,6 @@ final class MetricAttributeCatalog {
     }
 
     /**
-     * The attributes of {@code com.eonmux.excalibur:type=CuckooFpRate}.
-     *
-     * @return The Cuckoo filter false-positive rate attribute table
-     */
-    static MetricAttributeTable cuckooFpRate() {
-        return MetricAttributeTable.builder()
-            .read("fpRate", "double", "Current false positive rate",
-                () -> FixedBucketHistogram.getInstance().getAverageFpRate())
-            .read("fpRateEpoch", "long", "Epoch of last FP rate measurement",
-                () -> FixedBucketHistogram.getInstance().getFpRateEpoch())
-            .read("fpRateCount", "long", "Count of FP rate measurements",
-                () -> FixedBucketHistogram.getInstance().getFpRateCount())
-            .read("avgFpRate", "double", "Average false positive rate",
-                () -> FixedBucketHistogram.getInstance().getAverageFpRate())
-            .read("maxFpRate", "double", "Maximum false positive rate",
-                () -> FixedBucketHistogram.getInstance().getMaxFpRate())
-            // The node's visibility epoch, read from the one store that owns it, so this and
-            // VisibilityEpoch.epoch cannot disagree. The histogram keeps an epoch of its own
-            // to stamp samples with, and Metrics.recordQueryLatency(ms, epoch) moves it, so
-            // reading it here would publish a query's read-epoch as the node's.
-            .read("currentEpoch", "long", "Current epoch", Metrics::getCurrentEpoch)
-            .build();
-    }
-
-    /**
      * The attributes of {@code com.eonmux.excalibur:type=HnswQueueDepth}.
      *
      * @return The HNSW queue depth attribute table

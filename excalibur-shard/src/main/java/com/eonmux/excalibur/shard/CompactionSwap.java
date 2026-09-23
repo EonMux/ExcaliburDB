@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.shard;
 
-import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.store.CompactionListener;
 import com.eonmux.excalibur.store.CompactionOutcome;
 import com.eonmux.excalibur.store.Segment;
@@ -16,7 +15,7 @@ import org.slf4j.LoggerFactory;
  *
  * <p>{@code excalibur-store} rewrites the data file and installs it at the canonical path;
  * everything attached to the segment is invisible to it. The HNSW graph, its integration
- * checkpoint, the term frequency sketch and the LSH pre-filter all describe entries that
+ * checkpoint and the LSH pre-filter all describe entries that
  * survived the rewrite unchanged, and three workers hold registrations keyed by the
  * {@link Segment} instance that is about to be retired. Moving all of that across, in an order
  * that leaves nothing pointing at a closed mapping, is this class.</p>
@@ -70,8 +69,8 @@ final class CompactionSwap implements CompactionListener {
      * that are keyed by segment identity.</p>
      *
      * <ol>
-     *   <li>Carries the HNSW graph, its tail tracker and the term frequency sketch onto
-     *       the replacement</li>
+     *   <li>Carries the HNSW graph, its tail tracker and the LSH pre-filter onto the
+     *       replacement</li>
      *   <li>Swaps the StorageEngine's registry entry</li>
      *   <li>Re-points every worker that held the old {@link Segment} instance</li>
      *   <li>Completes the catalog's compaction transition</li>
@@ -179,8 +178,7 @@ final class CompactionSwap implements CompactionListener {
             ? oldInfo.graph() : oldSegment.getHnswGraph();
         TailOffsetTracker tracker = oldInfo != null && oldInfo.tracker() != null
             ? oldInfo.tracker() : oldSegment.getTailOffsetTracker();
-        CuckooFilter filter = oldInfo != null ? oldInfo.filter() : null;
-        return new CompactionSwapContext(directoryId, registeredId, oldInfo, graph, tracker, filter);
+        return new CompactionSwapContext(directoryId, registeredId, oldInfo, graph, tracker);
     }
 
     /**
@@ -238,14 +236,7 @@ final class CompactionSwap implements CompactionListener {
                                          CompactionSwapContext context) {
         long segmentId = context.segmentId();
         try {
-            repointWorkers(segmentId, oldSegment, newSegment,
-                context.graph(), context.filter(), context.tracker());
-
-            // The level still counts every term the compacted-away entries held. That errs
-            // toward searching the segment, never away from it, but the replacement's own
-            // entries are the exact answer and cost one pass to file - the same pass the term
-            // sketch already makes when it counts every copied entry.
-            registry.rebuildTermFilter(segmentId);
+            repointWorkers(segmentId, oldSegment, newSegment, context.graph(), context.tracker());
 
             if (context.hasDriftedRegistration()) {
                 // The drifted entry names the segment the worker is about to close. Left in
@@ -275,11 +266,10 @@ final class CompactionSwap implements CompactionListener {
      * @param oldInfo      The old registration, or null if there is none
      * @param graph        The HNSW graph to carry, or null
      * @param tracker      The tail offset tracker to carry, or null
-     * @param filter       The Cuckoo filter to carry, or null
      */
     private record CompactionSwapContext(long segmentId, long registeredId,
                                          SegmentIndexInfo oldInfo, HnswGraph graph,
-                                         TailOffsetTracker tracker, CuckooFilter filter) {
+                                         TailOffsetTracker tracker) {
 
         /**
          * Whether this orchestrator holds the segment at an index the directory disagrees with.
@@ -295,9 +285,8 @@ final class CompactionSwap implements CompactionListener {
      * Moves the owned index structures back off a replacement that was not installed.
      *
      * <p>The mirror of {@link #carryIndexAttachments}, for the swap that did not happen. Only the
-     * two structures a segment closes are moved: the tail offset tracker and the term frequency
-     * sketch were attached to the replacement without being taken from the original, which still
-     * has them. Leaving the graph and the pre-filter on the replacement would hand them to
+     * two structures a segment closes are moved: the tail offset tracker was attached to the
+     * replacement without being taken from the original, which still has it. Leaving the graph and the pre-filter on the replacement would hand them to
      * {@code discardCompacted}, which closes it - releasing the mappings under the original
      * segment, which is about to go on serving queries.</p>
      *
@@ -325,15 +314,6 @@ final class CompactionSwap implements CompactionListener {
      * tracker describe exactly the same entries and belong to the replacement - the query path
      * reads them off the segment ({@code segment.getHnswGraph()}), so a replacement without
      * them drops the whole segment out of vector search with no error.</p>
-     *
-     * <p>The term frequency sketch is not carried: the replacement counted the terms of every
-     * entry copied into it, so its own sketch is exact where the original's still counts what
-     * compaction just removed.</p>
-     *
-     * <p>The LSH index is deliberately <strong>not</strong> carried: it is owned by the
-     * old segment, whose {@code close()} closes it as soon as this listener returns, and
-     * the ingestion pipeline re-opens it from its persisted directory - named after the
-     * unchanged segment path - on the next write.</p>
      *
      * @param oldSegment The compacted segment
      * @param newSegment The replacement
@@ -421,11 +401,10 @@ final class CompactionSwap implements CompactionListener {
      * @param oldSegment The compacted segment
      * @param newSegment The replacement
      * @param graph      The carried HNSW graph, or null
-     * @param filter     The carried Cuckoo filter, or null
      * @param tracker    The carried tail offset tracker, or null
      */
     private void repointWorkers(long segmentId, Segment oldSegment, Segment newSegment,
-                                HnswGraph graph, CuckooFilter filter, TailOffsetTracker tracker) {
+                                HnswGraph graph, TailOffsetTracker tracker) {
         workers.hnsw().unregisterSegment(oldSegment);
         workers.unregisterFromCompaction(oldSegment);
 
@@ -438,6 +417,6 @@ final class CompactionSwap implements CompactionListener {
 
         workers.registerForCompaction(newSegment);
 
-        registry.put(segmentId, new SegmentIndexInfo(newSegment, graph, filter, tracker));
+        registry.put(segmentId, new SegmentIndexInfo(newSegment, graph, tracker));
     }
 }
