@@ -115,16 +115,6 @@ public class ExcaliburDBServer {
     private volatile HttpServer server;
     private final AtomicBoolean running;
 
-    /**
-     * How long request threads still running after every other drain are given to end.
-     *
-     * <p>Short, because the listener has already given them its own grace period and everything
-     * that can end one early - the erasure's stop request, the interrupts to synchronous
-     * ingestion, the stopped query executor - has been delivered by then. What is still running
-     * after this is reported, and storage is left open under it.</p>
-     */
-    static final Duration REQUEST_DRAIN_GRACE = Duration.ofSeconds(10);
-
     /** The executor requests are dispatched on, once {@link #start()} has created it. */
     private volatile ExecutorService requestExecutor;
 
@@ -636,22 +626,27 @@ public class ExcaliburDBServer {
      * is free. The shutdown that follows a failed start closes the storage engine and its arena
      * on that word. A worker that outlived its bound here is still reading segments mapped out
      * of that arena, and closing it under the worker ends the process rather than failing it;
-     * so the answer {@link IndexOrchestrator#shutdown()} gives is what the flag is set from,
-     * exactly as a drain's would be.</p>
+     * so the answer {@link IndexOrchestrator#shutdown(Duration)} gives is what the flag is set
+     * from, exactly as a drain's would be.</p>
      *
-     * <p>{@link IndexOrchestrator#close()} still runs either way, for the executors it releases:
-     * it cannot report an answer, which is why it is not what the answer is read from. A failure
-     * of either is attached to the start's own failure rather than replacing it, and leaves
-     * storage held, since nothing then says the workers ended.</p>
+     * <p>Both waits come out of one default shutdown budget's share for drains, the share a
+     * {@link #stop(int)} would have given the workers: the start has already failed, and a
+     * worker that will not stop must not hold the failure back past what a stop would have
+     * waited. {@link IndexOrchestrator#close(Duration)} still runs either way, for the executors
+     * it releases: it cannot report an answer, which is why it is not what the answer is read
+     * from. A failure of either is attached to the start's own failure rather than replacing it,
+     * and leaves storage held, since nothing then says the workers ended.</p>
      *
      * @param indexOrchestrator The orchestrator the start brought up, possibly only in part
      * @param failure           Why the start failed, which is rethrown by the caller
      */
     private void stopOrchestratorAfterFailedStart(IndexOrchestrator indexOrchestrator,
                                                   RuntimeException failure) {
+        ShutdownBudget budget = ShutdownBudget.startingNow(
+            Duration.ofSeconds(ShutdownBudget.DEFAULT_TIMEOUT_SECONDS));
         boolean ended = false;
         try {
-            ended = indexOrchestrator.shutdown();
+            ended = indexOrchestrator.shutdown(budget.forDrains());
         } catch (RuntimeException e) {
             failure.addSuppressed(e);
         }
@@ -661,7 +656,7 @@ public class ExcaliburDBServer {
                 + "engine is left open for the work still running against it");
         }
         try {
-            indexOrchestrator.close();
+            indexOrchestrator.close(budget.forDrains());
         } catch (RuntimeException e) {
             failure.addSuppressed(e);
         }
@@ -707,7 +702,8 @@ public class ExcaliburDBServer {
      * Stops the API server within a shutdown's budget.
      *
      * <p>The listener is given {@link ShutdownBudget#listenerGraceSeconds()} for in-flight
-     * exchanges, and every drain after it is cut to what the budget leaves the drains. What has
+     * exchanges, and every drain after it - the request threads the listener stopped waiting for
+     * among them - is given what the budget leaves the drains, and no more. What has
      * not stopped by then is reported through {@link #isStorageStillInUse()} and its two
      * siblings, as a drain that timed out on its own always was, so the caller leaves it open.
      * The budget's reserve is left for the caller's durable writes.</p>
@@ -753,7 +749,7 @@ public class ExcaliburDBServer {
         }
 
         ShutdownSequence.Drained drained = ShutdownSequence.drain(endpoints, wiring,
-            requestExecutor, REQUEST_DRAIN_GRACE, drainBudget.get());
+            requestExecutor, drainBudget.get());
 
         storageStillInUse = !drained.storageReleased();
         chunkIndexStillInUse = !drained.chunkIndexReleased();

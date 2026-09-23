@@ -198,14 +198,9 @@ public class EpochTickScheduler implements AutoCloseable {
             LOGGER.info("Stopping epoch tick scheduler...");
 
             if (tickTask != null) {
+                // Cancelling is all there is to wait for: a tick already running finishes under
+                // the lock taken below, and one that starts later finds the scheduler stopped.
                 tickTask.cancel(false);
-                try {
-                    // Wait for the task to fully terminate (with timeout)
-                    tickTask.get(100, TimeUnit.MILLISECONDS);
-                } catch (Exception e) {
-                    // Ignore interruptions and exceptions during shutdown
-                    LOGGER.debug("Interrupted while waiting for tick task to complete", e);
-                }
                 tickTask = null;
             }
 
@@ -399,18 +394,18 @@ public class EpochTickScheduler implements AutoCloseable {
         }
     }
 
+    /**
+     * Stops the scheduler and releases its executor.
+     *
+     * <p>No wait of its own is needed. {@link #stop()} has already fenced any tick in progress
+     * under the tick lock, so what is left on the executor is at most a tick that starts, finds
+     * the scheduler stopped and returns; closing the executor waits for that the way
+     * {@code ExecutorService.close} does.</p>
+     */
     @Override
     public void close() {
         stop();
-        scheduler.shutdown();
-        try {
-            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                scheduler.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            scheduler.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
+        scheduler.close();
         LOGGER.info("EpochTickScheduler closed");
     }
 

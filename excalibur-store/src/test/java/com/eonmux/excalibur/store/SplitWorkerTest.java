@@ -38,6 +38,9 @@ import static org.junit.jupiter.api.Assertions.*;
 @DisplayName("SplitWorker Background Split Tests")
 class SplitWorkerTest {
 
+    /** Far longer than any work here takes to stop once asked. */
+    private static final Duration STOP_WAIT = Duration.ofSeconds(10);
+
     /**
      * How long a split is allowed to take before the test calls it broken.
      *
@@ -90,7 +93,7 @@ class SplitWorkerTest {
         warnings.clear();
 
         if (splitWorker != null) {
-            splitWorker.stop();
+            splitWorker.stop(STOP_WAIT);
         }
         if (segment != null && !segment.isClosed()) {
             segment.close();
@@ -122,7 +125,7 @@ class SplitWorkerTest {
             // Second start should return false
             assertFalse(splitWorker.start(), "Second start should return false");
 
-            splitWorker.stop();
+            splitWorker.stop(STOP_WAIT);
             assertFalse(splitWorker.isRunning(), "Worker should not be running after stop");
         }
 
@@ -298,7 +301,8 @@ class SplitWorkerTest {
 
             // Shutdown is now under way and blocked on the split this test is holding, which is
             // the window a late request arrives in.
-            Thread stopper = Thread.ofVirtual().name("stop-caller").start(splitWorker::stop);
+            Thread stopper = Thread.ofVirtual().name("stop-caller")
+                .start(() -> splitWorker.stop(STOP_WAIT));
             assertFalse(stopper.join(Duration.ofSeconds(1)),
                 "stop() must wait for the split it already has in flight");
 
@@ -338,7 +342,8 @@ class SplitWorkerTest {
          * A split that outlives the budget leaves {@code stop()} returning, and saying so.
          */
         @Test
-        @DisplayName("stop() gives up on a split that outlives its budget rather than hanging")
+        @DisplayName("stop waits out the whole of its wait for a split, then gives up rather "
+            + "than hanging")
         void stopBoundsTheWaitForARequestedSplit() throws Exception {
             CountDownLatch insideTheSplit = new CountDownLatch(1);
             CountDownLatch releaseTheSplit = new CountDownLatch(1);
@@ -350,7 +355,8 @@ class SplitWorkerTest {
                 rightChildRef.set(right);
                 insideTheSplit.countDown();
                 awaitRelease(releaseTheSplit);
-            }, () -> 0).withStopTimeoutMs(200);
+            }, () -> 0);
+            Duration wait = Duration.ofMillis(200);
 
             fill(segment, "held-key-");
 
@@ -358,11 +364,12 @@ class SplitWorkerTest {
             assertTrue(insideTheSplit.await(SPLIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
                 "the split must reach the listener");
 
-            // Held for far longer than the budget: a shutdown that waited without a bound
+            // Held for far longer than the wait: a shutdown that waited without a bound
             // would never come back from here.
             long startNanos = System.nanoTime();
-            splitWorker.stop();
-            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+            boolean endedWhileHeld = splitWorker.stop(wait);
+            long elapsedNanos = System.nanoTime() - startNanos;
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
 
             releaseTheSplit.countDown();
 
@@ -372,13 +379,19 @@ class SplitWorkerTest {
             boolean finished = awaitSplitComplete(segment);
             closeChildren(leftChildRef, rightChildRef);
 
+            assertFalse(endedWhileHeld,
+                "a split still running when the wait runs out is reported, not claimed ended");
+            assertTrue(elapsedNanos >= wait.toNanos(),
+                "the split was given all of the wait stop was handed, took " + elapsedMs + "ms");
             assertTrue(elapsedMs < 5000,
-                "stop() returned on its own budget rather than waiting out the split, took "
+                "stop returned on the wait it was handed rather than waiting out the split, took "
                     + elapsedMs + "ms");
             assertTrue(warnings.stream().anyMatch(msg -> msg.contains("still running after")),
                 "an expired wait is not silent: the Arena is not safe to close and the log "
                     + "says so");
             assertTrue(finished, "the split finished once it was released");
+            assertTrue(awaitStopped(splitWorker),
+                "given long enough, stop sees the released split end");
         }
 
         /**
@@ -401,7 +414,7 @@ class SplitWorkerTest {
                 insideTheSplit.countDown();
                 awaitRelease(releaseTheSplit);
                 interruptedInside.set(Thread.currentThread().isInterrupted());
-            }, () -> 0).withStopTimeoutMs(200);
+            }, () -> 0);
             fillToThreshold(segment);
             assertTrue(segment.shouldSplit(), "the loop needs a segment over its threshold");
             splitWorker.registerSegment(segment);
@@ -410,14 +423,14 @@ class SplitWorkerTest {
             assertTrue(insideTheSplit.await(SPLIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
                 "the background loop must reach the listener");
 
-            boolean endedWhileHeld = splitWorker.stop();
+            boolean endedWhileHeld = splitWorker.stop(Duration.ofMillis(200));
 
             releaseTheSplit.countDown();
             boolean finished = awaitSplitComplete(segment);
             closeChildren(leftChildRef, rightChildRef);
 
             assertFalse(endedWhileHeld,
-                "a split still running when the budget expires is reported, not claimed ended");
+                "a split still running when the wait runs out is reported, not claimed ended");
             assertTrue(finished, "the split finished once it was released");
             assertFalse(interruptedInside.get(),
                 "stop() must not interrupt a thread that is writing through shared channels");
@@ -429,11 +442,11 @@ class SplitWorkerTest {
         @DisplayName("stop() wakes the loop from its pause without waiting out the interval")
         void stopWakesThePausingLoop() {
             splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, () -> 0,
-                TimeUnit.HOURS.toMillis(1), 1).withStopTimeoutMs(TimeUnit.MINUTES.toMillis(5));
+                TimeUnit.HOURS.toMillis(1), 1);
             splitWorker.start();
 
             long startNanos = System.nanoTime();
-            assertTrue(splitWorker.stop());
+            assertTrue(splitWorker.stop(Duration.ofMinutes(5)));
             assertTrue(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - startNanos) < 60,
                 "returned because the pause was woken, not because a budget or interval ran out");
         }
@@ -465,7 +478,7 @@ class SplitWorkerTest {
                     insideFirstSplit.countDown();
                     awaitRelease(releaseFirstSplit);
                 }
-            }, () -> 0).withStopTimeoutMs(500);
+            }, () -> 0);
 
             fill(segment, "shared-key-");
             fill(queuedA, "queued-a-key-");
@@ -478,7 +491,7 @@ class SplitWorkerTest {
             splitWorker.requestSplit(queuedB);
 
             long startNanos = System.nanoTime();
-            splitWorker.stop();
+            splitWorker.stop(Duration.ofMillis(500));
             long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
 
             releaseFirstSplit.countDown();
@@ -847,15 +860,15 @@ class SplitWorkerTest {
      * Asks a stopped worker again until it reports that its loop has ended.
      *
      * <p>Released work finishes on its own thread, so the first ask after the release can still
-     * see it running; each ask waits within the worker's own budget.</p>
+     * see it running; each ask waits within the wait it is handed.</p>
      */
     private static boolean awaitStopped(SplitWorker worker) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SPLIT_TIMEOUT_SECONDS);
         while (System.nanoTime() < deadline) {
-            if (worker.stop()) {
+            if (worker.stop(STOP_WAIT)) {
                 return true;
             }
         }
-        return worker.stop();
+        return worker.stop(STOP_WAIT);
     }
 }

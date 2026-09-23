@@ -13,12 +13,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -65,8 +67,9 @@ class ExcaliburDBServerTest {
         when(indexOrchestrator.getTotalVectorsIntegrated()).thenReturn(0L);
         when(indexOrchestrator.getPendingCuckooDeletions()).thenReturn(0);
         when(indexOrchestrator.getTotalCuckooDeletions()).thenReturn(0L);
-        when(indexOrchestrator.shutdown()).thenReturn(true);
-        when(queryPipeline.shutdown()).thenReturn(true);
+        when(indexOrchestrator.shutdown(any())).thenReturn(true);
+        when(queryPipeline.shutdown(any())).thenReturn(true);
+        when(storageEngine.stopBackgroundWork(any())).thenReturn(true);
 
         server = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
         server.start();
@@ -110,9 +113,9 @@ class ExcaliburDBServerTest {
         @DisplayName("closes index orchestrator when server stops")
         void closesIndexOrchestrator() {
             server.stop(0);
-            // Verify that indexOrchestrator.close() was called during server shutdown
+            // Verify that indexOrchestrator.close(Duration) was called during server shutdown
             // This ensures the epoch tick scheduler is stopped cleanly
-            verify(indexOrchestrator).close();
+            verify(indexOrchestrator).close(any());
         }
 
         @Test
@@ -128,7 +131,19 @@ class ExcaliburDBServerTest {
         @Test
         @DisplayName("segment workers that did not stop hold storage and nothing else")
         void workersStillRunningHoldStorage() {
-            when(indexOrchestrator.shutdown()).thenReturn(false);
+            when(indexOrchestrator.shutdown(any())).thenReturn(false);
+
+            server.stop(0);
+
+            assertThat(server.isStorageStillInUse()).isTrue();
+            assertThat(server.isChunkIndexStillInUse()).isFalse();
+            assertThat(server.isGraphsStillInUse()).isFalse();
+        }
+
+        @Test
+        @DisplayName("a split or lifecycle check that did not stop holds storage and nothing else")
+        void storageBackgroundWorkStillRunningHoldsStorage() {
+            when(storageEngine.stopBackgroundWork(any())).thenReturn(false);
 
             server.stop(0);
 
@@ -143,7 +158,7 @@ class ExcaliburDBServerTest {
             // Whatever that step was meant to stop may still be running; closing storage
             // underneath it would crash the process, where leaving it open costs a log replay.
             doThrow(new IllegalStateException("workers refused to stop"))
-                .when(indexOrchestrator).shutdown();
+                .when(indexOrchestrator).shutdown(any());
 
             assertThatThrownBy(() -> server.stop(0))
                 .isInstanceOf(IllegalStateException.class)
@@ -175,7 +190,7 @@ class ExcaliburDBServerTest {
             IndexOrchestrator orchestrator = orchestratorFor();
             when(orchestrator.getEpochTickScheduler())
                 .thenThrow(new IllegalStateException("scheduler missing"));
-            when(orchestrator.shutdown()).thenReturn(false);
+            when(orchestrator.shutdown(any())).thenReturn(false);
             ExcaliburDBServer failing =
                 new ExcaliburDBServer(0, orchestrator, storageEngine, queryPipeline);
 
@@ -186,8 +201,16 @@ class ExcaliburDBServerTest {
 
             assertThat(failing.isRunning()).isFalse();
             assertThat(failing.isStorageStillInUse()).isTrue();
-            verify(orchestrator).shutdown();
-            verify(orchestrator).close();
+            // Waited for as a stop would have waited for them - out of a default budget's
+            // share for drains - and no longer, however long a worker takes.
+            Duration drainsShare = Duration.ofSeconds(ShutdownBudget.DEFAULT_TIMEOUT_SECONDS)
+                .minus(ShutdownBudget.DURABILITY_RESERVE);
+            ArgumentCaptor<Duration> shutdownWait = ArgumentCaptor.forClass(Duration.class);
+            ArgumentCaptor<Duration> closeWait = ArgumentCaptor.forClass(Duration.class);
+            verify(orchestrator).shutdown(shutdownWait.capture());
+            verify(orchestrator).close(closeWait.capture());
+            assertThat(shutdownWait.getValue()).isPositive().isLessThanOrEqualTo(drainsShare);
+            assertThat(closeWait.getValue()).isLessThanOrEqualTo(shutdownWait.getValue());
         }
 
         @Test
@@ -196,14 +219,14 @@ class ExcaliburDBServerTest {
             IndexOrchestrator orchestrator = orchestratorFor();
             when(orchestrator.getEpochTickScheduler())
                 .thenThrow(new IllegalStateException("scheduler missing"));
-            when(orchestrator.shutdown()).thenReturn(true);
+            when(orchestrator.shutdown(any())).thenReturn(true);
             ExcaliburDBServer failing =
                 new ExcaliburDBServer(0, orchestrator, storageEngine, queryPipeline);
 
             assertThatThrownBy(failing::start).isInstanceOf(IllegalStateException.class);
 
             assertThat(failing.isStorageStillInUse()).isFalse();
-            verify(orchestrator).close();
+            verify(orchestrator).close(any());
         }
 
         @Test
@@ -212,14 +235,14 @@ class ExcaliburDBServerTest {
             // Workers ahead of the one that failed are already running.
             IndexOrchestrator orchestrator = orchestratorFor();
             when(orchestrator.start()).thenThrow(new IllegalStateException("worker failed"));
-            when(orchestrator.shutdown()).thenReturn(false);
+            when(orchestrator.shutdown(any())).thenReturn(false);
             ExcaliburDBServer failing =
                 new ExcaliburDBServer(0, orchestrator, storageEngine, queryPipeline);
 
             assertThatThrownBy(failing::start).hasMessageContaining("worker failed");
 
-            verify(orchestrator).shutdown();
-            verify(orchestrator).close();
+            verify(orchestrator).shutdown(any());
+            verify(orchestrator).close(any());
             assertThat(failing.isStorageStillInUse()).isTrue();
         }
 
@@ -229,8 +252,8 @@ class ExcaliburDBServerTest {
             IndexOrchestrator orchestrator = orchestratorFor();
             when(orchestrator.getEpochTickScheduler())
                 .thenThrow(new IllegalStateException("scheduler missing"));
-            when(orchestrator.shutdown()).thenThrow(new IllegalStateException("stop failed"));
-            doThrow(new IllegalStateException("close failed")).when(orchestrator).close();
+            when(orchestrator.shutdown(any())).thenThrow(new IllegalStateException("stop failed"));
+            doThrow(new IllegalStateException("close failed")).when(orchestrator).close(any());
             ExcaliburDBServer failing =
                 new ExcaliburDBServer(0, orchestrator, storageEngine, queryPipeline);
 

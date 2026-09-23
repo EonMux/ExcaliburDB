@@ -236,6 +236,11 @@ final class ServerWiring {
         return indexOrchestrator;
     }
 
+    /** @return The storage engine whose own background work a shutdown drains last */
+    StorageEngine storageEngine() {
+        return storageEngine;
+    }
+
     /** @return The query pipeline as it now stands, scorers and filters included */
     QueryPipeline queryPipeline() {
         return queryPipeline;

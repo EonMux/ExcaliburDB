@@ -16,6 +16,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -177,6 +178,50 @@ class TermFilterRebuildsTest {
 
         assertThat(filter.isSegmentStale("0")).isFalse();
         assertThat(filter.coversSegment("0")).isTrue();
+    }
+
+    @Test
+    @DisplayName("a drain waits out the whole of its wait for a rebuild that has not stopped, "
+        + "and a later drain waits again")
+    void drainWaitsAsLongAsItIsGiven() throws Exception {
+        store("a", "harbour");
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        queue(text -> {
+            entered.countDown();
+            // Stands in for an entry the interrupt does not reach: only the stop between
+            // entries ends a rebuild, so the drain has to wait for this one.
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    release.await();
+                    break;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            return TermExtractor.extractUniqueTerms(text);
+        }).schedule(0);
+        assertThat(entered.await(BOUND_SECONDS, TimeUnit.SECONDS)).isTrue();
+        Duration wait = Duration.ofMillis(300);
+
+        long began = System.nanoTime();
+        try {
+            assertThat(rebuilds.drain(wait))
+                .as("a rebuild still copying out of the segment is reported")
+                .isFalse();
+            assertThat(Duration.ofNanos(System.nanoTime() - began))
+                .as("the rebuild was given all of the wait the drain was handed")
+                .isGreaterThanOrEqualTo(wait);
+        } finally {
+            release.countDown();
+        }
+        assertThat(rebuilds.drain(Duration.ofSeconds(BOUND_SECONDS)))
+            .as("given long enough, a later drain sees the rebuild end")
+            .isTrue();
     }
 
     @Test

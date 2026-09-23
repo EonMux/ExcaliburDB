@@ -2,6 +2,7 @@ package com.eonmux.excalibur.store;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -43,6 +44,9 @@ import java.util.logging.Level;
  * every worker has been stopped.</p>
  */
 final class EngineLifecycle {
+
+    /** What {@link #close()} waits for: background work in flight, for as long as it takes. */
+    private static final Duration UNTIL_STOPPED = Duration.ofNanos(Long.MAX_VALUE);
 
     /** The engine this brings up and takes down. */
     private final StorageEngine engine;
@@ -486,13 +490,10 @@ final class EngineLifecycle {
      * @see StorageEngine#close()
      */
     void close() {
-        // Stop the lifecycle manager if running
-        engine.stopLifecycleManager();
-
-        // Stop the split worker if running
-        if (engine.splitWorker != null) {
-            engine.splitWorker.stop();
-        }
+        // The lifecycle manager and the split worker, for as long as they take: everything
+        // below closes what they write through. A node's shutdown has already stopped them
+        // within its budget, and does not get this far while either is still running.
+        engine.stopBackgroundWork(UNTIL_STOPPED);
 
         // The directory, before the segments go. Splits already persist it; this covers a
         // directory that was reconstructed at start and never split afterwards.

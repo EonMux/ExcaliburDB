@@ -237,26 +237,35 @@ public class SegmentReindexScheduler {
      * node drains before stopping this; what is left here is waited for and, if it outlives the
      * wait, reported, because the caller closes the storage it is writing into next.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains. A later call waits again for a re-index an earlier one left running.</p>
+     *
+     * @param wait How long to wait for a scheduled re-index in progress
      * @return true if no scheduled re-index is still running
+     * @throws NullPointerException if wait is null
      */
-    public boolean stop() {
+    public boolean stop(Duration wait) {
+        Objects.requireNonNull(wait, "wait cannot be null");
+        if (scheduler == null) {
+            return true;
+        }
         if (stopped.compareAndSet(false, true)) {
             running.set(false);
-
             scheduler.shutdown();
-            try {
-                if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                    LOGGER.warn("A scheduled re-index was still running 5s after the scheduler "
-                        + "was asked to stop; it is left to reach its own stopping point");
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-
-            LOGGER.info("Segment re-index scheduler stopped. Triggered: {}, completed: {}, failed: {}",
-                totalReindexesTriggered.get(), totalReindexesCompleted.get(), totalReindexesFailed.get());
+            LOGGER.info("Segment re-index scheduler asked to stop. Triggered: {}, completed: {}, "
+                + "failed: {}", totalReindexesTriggered.get(), totalReindexesCompleted.get(),
+                totalReindexesFailed.get());
         }
-        return scheduler == null || scheduler.isTerminated();
+        try {
+            if (!scheduler.awaitTermination(wait.toNanos(), TimeUnit.NANOSECONDS)) {
+                LOGGER.warn("A scheduled re-index was still running {}ms after the scheduler was "
+                    + "asked to stop; it is left to reach its own stopping point",
+                    wait.toMillis());
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return scheduler.isTerminated();
     }
 
     /**

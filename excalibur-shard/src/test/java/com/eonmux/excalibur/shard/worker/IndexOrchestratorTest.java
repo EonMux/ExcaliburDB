@@ -17,6 +17,7 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -27,6 +28,9 @@ import static org.junit.jupiter.api.Assertions.*;
  * Full integration tests require a StorageEngine instance which is tested separately.</p>
  */
 class IndexOrchestratorTest {
+
+    /** Far longer than any work here takes to stop once asked. */
+    private static final Duration STOP_WAIT = Duration.ofSeconds(10);
 
     private static final Logger LOGGER = LoggerFactory.getLogger(IndexOrchestratorTest.class);
 
@@ -120,7 +124,7 @@ class IndexOrchestratorTest {
         assertTrue(worker.isRunning());
         assertFalse(worker.start()); // Already running
 
-        worker.stop();
+        worker.stop(STOP_WAIT);
         assertFalse(worker.isRunning());
 
         catalog.close();
@@ -138,7 +142,7 @@ class IndexOrchestratorTest {
         assertTrue(worker.isRunning());
         assertFalse(worker.start()); // Already running
 
-        worker.stop();
+        worker.stop(STOP_WAIT);
         assertFalse(worker.isRunning());
 
         catalog.close();
@@ -156,7 +160,7 @@ class IndexOrchestratorTest {
         assertTrue(scheduler.isRunning());
         assertFalse(scheduler.start()); // Already running
 
-        scheduler.stop();
+        scheduler.stop(STOP_WAIT);
         assertFalse(scheduler.isRunning());
 
         catalog.close();
@@ -609,7 +613,7 @@ class IndexOrchestratorTest {
         assertTrue(orchestrator.isRunning());
         assertFalse(orchestrator.start()); // Already running
 
-        orchestrator.stop();
+        orchestrator.stop(STOP_WAIT);
         assertFalse(orchestrator.isRunning());
 
         orchestrator.close();
@@ -876,7 +880,7 @@ class IndexOrchestratorTest {
         // Need enough time for at least 2 checks after the first reindex
         Thread.sleep(100);
 
-        scheduler.stop();
+        scheduler.stop(STOP_WAIT);
         catalog.close();
 
         // Verify multiple reindexes occurred (should have at least 2)
@@ -912,7 +916,7 @@ class IndexOrchestratorTest {
         // Wait for multiple potential reindex cycles
         Thread.sleep(80);
 
-        scheduler.stop();
+        scheduler.stop(STOP_WAIT);
         catalog.close();
 
         // Without proper flag management, only 1 reindex should occur
@@ -1182,7 +1186,7 @@ class IndexOrchestratorTest {
         assertFalse(hierarchicalFilter.mightContainInSegment(testKey, segmentId),
             "Item should no longer be present in segment filter after deletion");
 
-        worker.stop();
+        worker.stop(STOP_WAIT);
         storageEngine.close();
         arena.close();
         catalog.close();

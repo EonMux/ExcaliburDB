@@ -5,7 +5,9 @@ import com.eonmux.excalibur.metrics.Metrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -164,19 +166,28 @@ public class CuckooMetricsWorker {
     /**
      * Stops the background metrics collection worker.
      *
-     * <p>This method signals the worker to stop and waits for it to complete
-     * any in-progress sampling operations.</p>
+     * <p>This method signals the worker to stop and waits for it to complete any in-progress
+     * sampling operation, for no longer than {@code wait}; a sample still running then is
+     * interrupted. That is safe here, unlike in the workers beside it, because sampling reads
+     * filters in memory and publishes to JMX and touches no file channel an interrupt could
+     * close. How long to wait is the caller's: a node's shutdown passes what its budget leaves
+     * the drains.</p>
+     *
+     * @param wait How long to wait for a sample in progress
+     * @throws NullPointerException if wait is null
      */
-    public void stop() {
+    public void stop(Duration wait) {
+        Objects.requireNonNull(wait, "wait cannot be null");
         if (stopped.compareAndSet(false, true)) {
             running.set(false);
 
             scheduler.shutdown();
             try {
-                if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                if (!scheduler.awaitTermination(wait.toNanos(), TimeUnit.NANOSECONDS)) {
                     scheduler.shutdownNow();
                 }
             } catch (InterruptedException e) {
+                scheduler.shutdownNow();
                 Thread.currentThread().interrupt();
             }
 

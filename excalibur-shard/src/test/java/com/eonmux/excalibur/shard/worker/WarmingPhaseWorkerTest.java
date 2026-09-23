@@ -17,6 +17,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -32,6 +33,9 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  * Integration tests verify the full PQ training flow.</p>
  */
 class WarmingPhaseWorkerTest {
+
+    /** Far longer than any work here takes to stop once asked. */
+    private static final Duration STOP_WAIT = Duration.ofSeconds(10);
 
     @TempDir
     Path tempDir;
@@ -56,7 +60,7 @@ class WarmingPhaseWorkerTest {
     @AfterEach
     void tearDown() {
         if (worker != null) {
-            worker.stop();
+            worker.stop(STOP_WAIT);
         }
         if (catalog != null) {
             catalog.close();
@@ -130,7 +134,7 @@ class WarmingPhaseWorkerTest {
         assertThat(worker.start()).isFalse();
 
         // Stop
-        worker.stop();
+        worker.stop(STOP_WAIT);
         assertThat(worker.isRunning()).isFalse();
     }
 
@@ -138,8 +142,8 @@ class WarmingPhaseWorkerTest {
     @DisplayName("Should handle multiple stop calls")
     void shouldHandleMultipleStops() {
         worker.start();
-        worker.stop();
-        worker.stop(); // Should not throw
+        worker.stop(STOP_WAIT);
+        worker.stop(STOP_WAIT); // Should not throw
         assertThat(worker.isRunning()).isFalse();
     }
 

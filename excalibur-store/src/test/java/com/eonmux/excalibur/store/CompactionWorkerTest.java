@@ -40,6 +40,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 class CompactionWorkerTest {
 
+    /** Far longer than any work here takes to stop once asked. */
+    private static final Duration STOP_WAIT = Duration.ofSeconds(10);
+
     @TempDir
     Path tempDir;
 
@@ -188,7 +191,7 @@ class CompactionWorkerTest {
         // Starting again should return false
         assertThat(worker.start()).isFalse();
 
-        worker.stop();
+        worker.stop(STOP_WAIT);
     }
 
     @Test
@@ -198,7 +201,7 @@ class CompactionWorkerTest {
         worker.start();
         assertThat(worker.isRunning()).isTrue();
 
-        worker.stop();
+        worker.stop(STOP_WAIT);
 
         // Give time for thread to terminate
         Thread.sleep(100);
@@ -210,7 +213,7 @@ class CompactionWorkerTest {
         CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
 
         // Should not throw
-        assertThatCode(worker::stop).doesNotThrowAnyException();
+        assertThatCode(() -> worker.stop(STOP_WAIT)).doesNotThrowAnyException();
     }
 
     // ==================== Segment Registration Tests ====================
@@ -295,7 +298,7 @@ class CompactionWorkerTest {
         assertThat(newSegmentRef.get().get(key)).isNotNull();
         assertThat(newSegmentRef.get().get(deleteKey)).isNull();
 
-        worker.stop();
+        worker.stop(STOP_WAIT);
     }
 
     @Test
@@ -332,7 +335,7 @@ class CompactionWorkerTest {
             .as("nothing may be left behind at the scratch path")
             .isFalse();
 
-        worker.stop();
+        worker.stop(STOP_WAIT);
     }
 
     /**
@@ -378,7 +381,7 @@ class CompactionWorkerTest {
 
         // Completion is what stop() waits for, and the only thing that makes the arena this
         // test closes in teardown safe to close.
-        worker.stop();
+        worker.stop(STOP_WAIT);
 
         assertThat(worker.getCompactionCount())
             .as("the dispatched rewrite finished, and finished before stop() returned")
@@ -412,7 +415,8 @@ class CompactionWorkerTest {
 
         // The rewrite is now provably in flight and pinned there by a latch this test owns, so
         // there is no race to lose: whatever stop() does next, it does with a compaction running.
-        Thread stopper = Thread.ofVirtual().name("stop-caller").start(worker::stop);
+        Thread stopper = Thread.ofVirtual().name("stop-caller")
+            .start(() -> worker.stop(STOP_WAIT));
         boolean stopReturnedMidRewrite = stopper.join(Duration.ofSeconds(1));
 
         releaseTheRewrite.countDown();
@@ -433,7 +437,8 @@ class CompactionWorkerTest {
     }
 
     @Test
-    @DisplayName("stop() gives up on a compaction that outlives its budget rather than hanging")
+    @DisplayName("stop waits out the whole of its wait for a compaction, then gives up rather "
+        + "than hanging")
     void stop_boundsTheWaitForARequestedCompaction() throws IOException, InterruptedException {
         CountDownLatch insideTheRewrite = new CountDownLatch(1);
         CountDownLatch releaseTheRewrite = new CountDownLatch(1);
@@ -442,7 +447,8 @@ class CompactionWorkerTest {
             insideTheRewrite.countDown();
             awaitRelease(releaseTheRewrite);
             return CompactionOutcome.INSTALLED;
-        }).withStopTimeoutMs(200);
+        });
+        Duration wait = Duration.ofMillis(200);
 
         Segment segment = compactableSegment("stop-bounds-the-wait");
 
@@ -451,17 +457,23 @@ class CompactionWorkerTest {
             .as("the requested compaction reached the rewrite")
             .isTrue();
 
-        // The rewrite is held for longer than the budget and is never going to finish inside
+        // The rewrite is held for longer than the wait and is never going to finish inside
         // it. A shutdown that waited without a bound would never come back from here.
         long startNanos = System.nanoTime();
-        worker.stop();
-        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+        boolean endedWhileHeld = worker.stop(wait);
+        Duration elapsed = Duration.ofNanos(System.nanoTime() - startNanos);
 
         releaseTheRewrite.countDown();
 
-        assertThat(elapsedMs)
-            .as("stop() returned on its own budget rather than waiting out the rewrite")
-            .isLessThan(5000);
+        assertThat(endedWhileHeld)
+            .as("a rewrite still running when the wait runs out is reported, not claimed ended")
+            .isFalse();
+        assertThat(elapsed)
+            .as("the rewrite was given all of the wait stop was handed")
+            .isGreaterThanOrEqualTo(wait);
+        assertThat(elapsed)
+            .as("stop returned on the wait it was handed rather than waiting out the rewrite")
+            .isLessThan(Duration.ofSeconds(5));
         assertThat(warnings)
             .as("an expired wait is not silent: the Arena is not safe to close and the log says so")
             .anyMatch(message -> message.contains("still running after"));
@@ -469,6 +481,9 @@ class CompactionWorkerTest {
         // Nothing here proved the Arena was safe to close - that is the point of the warning -
         // so the rewrite is waited out before teardown closes it.
         awaitCompactionCount(worker, 1);
+        assertThat(worker.stop(STOP_WAIT))
+            .as("given long enough, stop sees the released rewrite end")
+            .isTrue();
     }
 
     /**
@@ -488,7 +503,7 @@ class CompactionWorkerTest {
             awaitRelease(releaseTheRewrite);
             interruptedInside.set(Thread.currentThread().isInterrupted());
             return CompactionOutcome.INSTALLED;
-        }).withStartDelayMs(0).withStopTimeoutMs(200);
+        }).withStartDelayMs(0);
         worker.registerSegment(compactableSegment("loop-rewrite"));
 
         worker.start();
@@ -496,8 +511,8 @@ class CompactionWorkerTest {
             .as("the background loop reached the rewrite")
             .isTrue();
 
-        assertThat(worker.stop())
-            .as("a rewrite still running when the budget expires is reported, not claimed ended")
+        assertThat(worker.stop(Duration.ofMillis(200)))
+            .as("a rewrite still running when the wait runs out is reported, not claimed ended")
             .isFalse();
 
         releaseTheRewrite.countDown();
@@ -506,11 +521,11 @@ class CompactionWorkerTest {
             .as("stop() must not interrupt a thread that is writing through shared channels")
             .isFalse();
         // Released work finishes on the loop's own thread, so an ask right after the release can
-        // still see it; each ask waits within the worker's own budget.
+        // still see it; each ask waits within the wait it is handed.
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-        boolean ended = worker.stop();
+        boolean ended = worker.stop(STOP_WAIT);
         while (!ended && System.nanoTime() < deadline) {
-            ended = worker.stop();
+            ended = worker.stop(STOP_WAIT);
         }
         assertThat(ended)
             .as("once the loop has left its rewrite, stop() reports the worker ended")
@@ -522,12 +537,11 @@ class CompactionWorkerTest {
     void stop_wakesThePausingLoop() {
         CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED,
             TimeUnit.HOURS.toMillis(1), 0.2, 16L * 1024 * 1024, 1)
-            .withStartDelayMs(0)
-            .withStopTimeoutMs(TimeUnit.MINUTES.toMillis(5));
+            .withStartDelayMs(0);
         worker.start();
 
         long startNanos = System.nanoTime();
-        assertThat(worker.stop()).isTrue();
+        assertThat(worker.stop(Duration.ofMinutes(5))).isTrue();
         assertThat(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - startNanos))
             .as("returned because the pause was woken, not because a budget or interval ran out")
             .isLessThan(60);
@@ -537,12 +551,11 @@ class CompactionWorkerTest {
     @DisplayName("stop() wakes the loop from its start delay")
     void stop_wakesTheStartDelay() {
         CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED)
-            .withStartDelayMs(TimeUnit.HOURS.toMillis(1))
-            .withStopTimeoutMs(TimeUnit.MINUTES.toMillis(5));
+            .withStartDelayMs(TimeUnit.HOURS.toMillis(1));
         worker.start();
 
         long startNanos = System.nanoTime();
-        assertThat(worker.stop()).isTrue();
+        assertThat(worker.stop(Duration.ofMinutes(5))).isTrue();
         assertThat(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - startNanos))
             .isLessThan(60);
     }
@@ -555,7 +568,7 @@ class CompactionWorkerTest {
 
         Segment segment = compactableSegment("request-after-stop");
 
-        worker.stop();
+        worker.stop(STOP_WAIT);
         worker.requestCompaction(segment);
 
         // A request accepted after shutdown is the same defect wearing a later timestamp: a
@@ -592,7 +605,7 @@ class CompactionWorkerTest {
         // The dispatch must finish before the arena is torn down in teardown.
         awaitCompactionCount(worker, 1);
 
-        worker.stop();
+        worker.stop(STOP_WAIT);
         Segment afterStop = compactableSegment("refusal-reported");
 
         assertThat(worker.requestCompaction(afterStop))
@@ -710,7 +723,7 @@ class CompactionWorkerTest {
         boolean compacted = compactionLatch.await(10, TimeUnit.SECONDS);
         assertThat(compacted).isTrue();
 
-        worker.stop();
+        worker.stop(STOP_WAIT);
     }
 
     /**
@@ -777,7 +790,7 @@ class CompactionWorkerTest {
 
         // Completion, not the callback: stop() is what waits for the rewrite the request
         // dispatched, and teardown closes the arena it is mapped out of straight afterwards.
-        worker.stop();
+        worker.stop(STOP_WAIT);
 
         assertThat(readFailure.get())
             .as("a compaction in flight must not turn a read into an error")
@@ -840,7 +853,7 @@ class CompactionWorkerTest {
                     || name.endsWith(".dat.wal"));
         }
 
-        worker.stop();
+        worker.stop(STOP_WAIT);
     }
 
     @Test
@@ -873,7 +886,7 @@ class CompactionWorkerTest {
             .as("a compaction must not widen the slot table it was asked to reproduce")
             .isEqualTo(before);
 
-        worker.stop();
+        worker.stop(STOP_WAIT);
     }
 
     /**

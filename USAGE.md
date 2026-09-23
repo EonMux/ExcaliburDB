@@ -3400,7 +3400,7 @@ static List<QueryResultItem> ingestAndQuery(Path dataDir, String embeddingEndpoi
                 return response.results();
             } finally {
                 // Stop taking work before the storage underneath it closes.
-                pipeline.shutdown();
+                pipeline.shutdown(Duration.ofSeconds(30));
                 ingestion.shutdown(Duration.ofSeconds(30));
             }
         }
@@ -3446,6 +3446,17 @@ carries an empty `documentIdStr()`; set `requireNamedResults(true)` on the
 Shut down in the reverse of the order things were started: the pipeline and the ingestion
 orchestrator first, so nothing is still taking work, then the index orchestrator and the storage
 engine, which the `try`-with-resources blocks close.
+
+Every wait is the caller's to choose. `pipeline.shutdown(wait)` and `ingestion.shutdown(wait)`
+wait no longer than they are handed and answer whether everything ended; neither interrupts work
+still running, because an interrupt inside a read or a write closes the file channels every other
+reader shares. The two `close()` calls wait, the way `ExecutorService.close` does, until the
+background workers have stopped. An embedder with a deadline of its own bounds those too:
+`indexing.shutdown(wait)` and `storage.stopBackgroundWork(wait)` answer whether the segment
+workers, and the storage engine's own splits and lifecycle checks, have ended, and
+`indexing.close(wait)` releases the orchestrator waiting no longer than that. Close the engine
+only on a `true`: a worker still running when the engine closes is writing into a mapping whose
+memory is about to be released, which ends the process rather than failing it.
 
 ### Remember when embedding
 

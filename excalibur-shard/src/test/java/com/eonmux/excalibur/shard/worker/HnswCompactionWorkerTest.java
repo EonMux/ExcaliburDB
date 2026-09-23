@@ -11,6 +11,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Random;
 
 import static org.assertj.core.api.Assertions.*;
@@ -27,6 +28,9 @@ import static org.assertj.core.api.Assertions.*;
  * </ul>
  */
 class HnswCompactionWorkerTest {
+
+    /** Far longer than any work here takes to stop once asked. */
+    private static final Duration STOP_WAIT = Duration.ofSeconds(10);
 
     @TempDir
     Path tempDir;
@@ -47,7 +51,7 @@ class HnswCompactionWorkerTest {
     @AfterEach
     void tearDown() {
         if (worker != null) {
-            worker.stop();
+            worker.stop(STOP_WAIT);
         }
     }
 
@@ -70,14 +74,14 @@ class HnswCompactionWorkerTest {
     @Test
     void shouldStopWorker() {
         worker.start();
-        worker.stop();
+        worker.stop(STOP_WAIT);
         assertThat(worker.isRunning()).isFalse();
     }
 
     @Test
     void shouldStopIdempotently() {
-        worker.stop(); // Should not throw
-        worker.stop(); // Should not throw
+        worker.stop(STOP_WAIT); // Should not throw
+        worker.stop(STOP_WAIT); // Should not throw
         assertThat(worker.isRunning()).isFalse();
     }
 
@@ -123,13 +127,13 @@ class HnswCompactionWorkerTest {
     @Test
     void stopReportsTheLoopEnded() {
         worker.start();
-        assertThat(worker.stop()).isTrue();
-        assertThat(worker.stop()).as("a second stop answers from the same state").isTrue();
+        assertThat(worker.stop(STOP_WAIT)).isTrue();
+        assertThat(worker.stop(STOP_WAIT)).as("a second stop answers from the same state").isTrue();
     }
 
     @Test
     void stopOfAWorkerNeverStartedReportsEnded() {
-        assertThat(worker.stop()).isTrue();
+        assertThat(worker.stop(STOP_WAIT)).isTrue();
     }
 
     @Test
@@ -138,7 +142,7 @@ class HnswCompactionWorkerTest {
         // join bound and report the loop still running.
         worker.start();
         long startNanos = System.nanoTime();
-        assertThat(worker.stop()).isTrue();
+        assertThat(worker.stop(STOP_WAIT)).isTrue();
         assertThat(java.util.concurrent.TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - startNanos))
             .isLessThan(5);
     }

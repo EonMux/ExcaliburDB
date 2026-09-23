@@ -5,6 +5,10 @@ import com.eonmux.excalibur.store.StorageEngine;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -47,5 +51,55 @@ class SegmentSyncSchedulerTest {
     void theStockPeriodIsAboveTheFloor() {
         assertThat(IndexOrchestrator.DEFAULT_SEGMENT_SYNC_INTERVAL_MS)
             .isGreaterThanOrEqualTo(SegmentSyncScheduler.MIN_INTERVAL_MS);
+    }
+
+    @Test
+    @DisplayName("shutdown waits out the whole of its wait for a sweep in progress, and a later "
+        + "one waits again")
+    void shutdownWaitsAsLongAsItIsGiven() throws InterruptedException {
+        CountDownLatch sweeping = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        SegmentSyncScheduler scheduler = new SegmentSyncScheduler(mock(StorageEngine.class),
+            mock(IndexOrchestrator.class), () -> {
+                sweeping.countDown();
+                boolean interrupted = false;
+                while (true) {
+                    try {
+                        release.await();
+                        break;
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    }
+                }
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }, SegmentSyncScheduler.MIN_INTERVAL_MS);
+        scheduler.start();
+        assertThat(sweeping.await(30, TimeUnit.SECONDS)).as("a sweep started").isTrue();
+        scheduler.stop();
+        Duration wait = Duration.ofMillis(300);
+
+        long began = System.nanoTime();
+        try {
+            assertThat(scheduler.shutdown(wait))
+                .as("a sweep still registering index structures is reported")
+                .isFalse();
+            assertThat(Duration.ofNanos(System.nanoTime() - began))
+                .as("the sweep was given all of the wait shutdown was handed")
+                .isGreaterThanOrEqualTo(wait);
+        } finally {
+            release.countDown();
+        }
+        assertThat(scheduler.shutdown(Duration.ofSeconds(10)))
+            .as("given long enough, a later shutdown sees the sweep end")
+            .isTrue();
+    }
+
+    @Test
+    @DisplayName("a scheduler that never started has nothing to wait for")
+    void neverStartedShutsDownAtOnce() {
+        assertThat(schedulerAt(SegmentSyncScheduler.MIN_INTERVAL_MS).shutdown(Duration.ZERO))
+            .isTrue();
     }
 }

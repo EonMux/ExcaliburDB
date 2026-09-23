@@ -5,10 +5,12 @@ import com.eonmux.excalibur.core.memory.MemorySegmentFactory;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -816,12 +818,39 @@ public class StorageEngine implements AutoCloseable {
     }
 
     /**
-     * Stops the lifecycle manager.
+     * Stops the engine's own background work - the lifecycle manager and the split worker - and
+     * says whether it has ended.
+     *
+     * <p>Both work inside what {@link #close()} releases: a lifecycle check moves segments
+     * through the catalog and purges reclaimable ones, and a split writes two children through
+     * memory mapped out of the engine's arena. Neither is interrupted, for the reasons each gives
+     * on its own stop; each is asked to stop and waited for, the two together for no longer than
+     * {@code wait}.</p>
+     *
+     * <p>A node's shutdown calls this among its drains, with what its budget leaves them, so
+     * that the close which follows the durable writes has nothing left to wait for; false means
+     * work is still running inside the engine and it must be left open. {@link #close()} calls
+     * it too, for an owner that did not, and waits for as long as the work takes.</p>
+     *
+     * @param wait How long to wait for a lifecycle check and the splits in flight
+     * @return true if neither is still running
+     * @throws NullPointerException if wait is null
      */
-    public void stopLifecycleManager() {
-        if (lifecycleManager != null) {
-            lifecycleManager.stop();
+    public boolean stopBackgroundWork(Duration wait) {
+        Objects.requireNonNull(wait, "wait cannot be null");
+        // Wraps rather than saturates for a wait near Long.MAX_VALUE nanoseconds; the remainder
+        // below subtracts the current time first, which undoes it.
+        long deadline = System.nanoTime() + wait.toNanos();
+        boolean ended = true;
+        SegmentLifecycleManager manager = lifecycleManager;
+        if (manager != null) {
+            ended = manager.stop(wait);
         }
+        SplitWorker splits = splitWorker;
+        if (splits != null) {
+            ended &= splits.stop(Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
+        }
+        return ended;
     }
 
     /**
@@ -1051,7 +1080,8 @@ public class StorageEngine implements AutoCloseable {
      *
      * <h3>Shutdown Sequence</h3>
      * <ol>
-     *   <li>Stop background workers (lifecycle manager, split worker)</li>
+     *   <li>Stop background workers (lifecycle manager, split worker), waiting for as long as
+     *       they take - see {@link #stopBackgroundWork(Duration)}</li>
      *   <li>Flush all segments to disk</li>
      *   <li>Close all segment file handles</li>
      *   <li>Flush and close the catalog</li>

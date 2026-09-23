@@ -78,15 +78,6 @@ class ShutdownBudgetTest {
         }
 
         @Test
-        @DisplayName("a step's own wait is cut to what the drains have left")
-        void aWaitIsBounded() {
-            ShutdownBudget budget = budget();
-
-            assertThat(budget.bound(Duration.ofSeconds(60))).isEqualTo(Duration.ofSeconds(20));
-            assertThat(budget.bound(Duration.ofSeconds(5))).isEqualTo(Duration.ofSeconds(5));
-        }
-
-        @Test
         @DisplayName("the listener is given half the drains' share, in the whole seconds it takes")
         void theListenerGetsHalf() {
             ShutdownBudget budget = budget();

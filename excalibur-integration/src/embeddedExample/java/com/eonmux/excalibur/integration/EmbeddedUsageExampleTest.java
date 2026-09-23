@@ -213,7 +213,7 @@ class EmbeddedUsageExampleTest {
                     return response.results();
                 } finally {
                     // Stop taking work before the storage underneath it closes.
-                    pipeline.shutdown();
+                    pipeline.shutdown(Duration.ofSeconds(30));
                     ingestion.shutdown(Duration.ofSeconds(30));
                 }
             }

@@ -7,6 +7,8 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -95,12 +97,6 @@ public class HnswCompactionWorker {
      * Maximum allowed tombstone threshold.
      */
     public static final double MAX_TOMBSTONE_THRESHOLD = 0.50;
-
-    /**
-     * How long {@link #stop()} waits for an in-progress compaction to finish its file
-     * swap before giving up and warning.
-     */
-    private static final long STOP_JOIN_TIMEOUT_MS = 30_000;
 
     // ==================== Instance Fields ====================
 
@@ -277,26 +273,35 @@ public class HnswCompactionWorker {
      * race a live file swap, and reports a thread that outlived the wait rather than pretending
      * it ended.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains, so a longer budget gives a graph compaction needs to finish rebuilding and swapping its graph rather than a fixed wait cut short.
+     * A later call waits again for a thread an earlier one left running.</p>
+     *
+     * @param wait How long to wait for the worker thread to end
      * @return true if the worker thread has ended, or was never started
+     * @throws NullPointerException if wait is null
      */
-    public boolean stop() {
+    public boolean stop(Duration wait) {
+        Objects.requireNonNull(wait, "wait cannot be null");
         Thread worker = workerThread;
         if (stopped.compareAndSet(false, true)) {
             running.set(false);
             stopSignal.request();
-            if (worker != null) {
-                try {
-                    worker.join(STOP_JOIN_TIMEOUT_MS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-                if (worker.isAlive()) {
-                    LOGGER.warn("HnswCompactionWorker did not finish within {}ms; a graph "
-                        + "compaction may still be swapping files", STOP_JOIN_TIMEOUT_MS);
-                }
-            }
-            LOGGER.info("HnswCompactionWorker stopped. Total compactions: {}, total nodes removed: {}",
+            LOGGER.info("HnswCompactionWorker asked to stop. Total compactions: {}, total nodes removed: {}",
                 compactionCount.get(), totalNodesRemoved.get());
+        }
+        // Outside the guard, so a later call waits again for a thread an earlier one left
+        // running instead of answering from a snapshot of it.
+        if (worker != null) {
+            try {
+                worker.join(wait);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (worker.isAlive()) {
+                LOGGER.warn("HnswCompactionWorker did not finish within {}ms; a graph "
+                    + "compaction may still be swapping files", wait.toMillis());
+            }
         }
         return worker == null || !worker.isAlive();
     }

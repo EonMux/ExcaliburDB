@@ -9,6 +9,8 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.time.Duration;
+
 /**
  * Unit tests for {@link CuckooMetricsWorker}.
  *
@@ -17,6 +19,9 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 @DisplayName("CuckooMetricsWorker Tests")
 class CuckooMetricsWorkerTest {
+
+    /** Far longer than any work here takes to stop once asked. */
+    private static final Duration STOP_WAIT = Duration.ofSeconds(10);
 
     @BeforeEach
     void resetHistogram() {
@@ -194,7 +199,7 @@ class CuckooMetricsWorkerTest {
             assertFalse(worker.start());
 
             // Stop and verify
-            worker.stop();
+            worker.stop(STOP_WAIT);
             assertFalse(worker.isRunning());
         }
 
@@ -204,8 +209,8 @@ class CuckooMetricsWorkerTest {
             CuckooMetricsWorker worker = new CuckooMetricsWorker(1000);
             worker.start();
 
-            worker.stop();
-            worker.stop(); // Should not throw
+            worker.stop(STOP_WAIT);
+            worker.stop(STOP_WAIT); // Should not throw
             assertFalse(worker.isRunning());
         }
     }
@@ -233,7 +238,7 @@ class CuckooMetricsWorkerTest {
             // Start the worker and wait for a sampling cycle
             worker.start();
             Thread.sleep(1500); // Wait for at least one cycle
-            worker.stop();
+            worker.stop(STOP_WAIT);
 
             // Verify samples were recorded
             assertTrue(worker.getTotalSamplesRecorded() > initialSamples,
@@ -252,7 +257,7 @@ class CuckooMetricsWorkerTest {
 
             worker.start();
             Thread.sleep(1500);
-            worker.stop();
+            worker.stop(STOP_WAIT);
 
             // Empty filter should not contribute to samples
             // (This is an implementation detail - the worker skips count() == 0 filters)

@@ -159,7 +159,7 @@ class IngestEndpointTest {
         assertNotNull(scheduler.getNextReindexTime("12345"), "Source should have scheduled reindex time");
 
         // Cleanup
-        scheduler.stop();
+        scheduler.stop(java.time.Duration.ofSeconds(10));
     }
 
     @Test
@@ -186,7 +186,7 @@ class IngestEndpointTest {
             "the schedule has to be addressable by the name /v1/ingest accepted");
 
         // Cleanup
-        scheduler.stop();
+        scheduler.stop(java.time.Duration.ofSeconds(10));
     }
 
     @Test
@@ -211,7 +211,7 @@ class IngestEndpointTest {
         assertEquals(1, scheduler.getRegisteredSourceCount());
 
         // Cleanup
-        scheduler.stop();
+        scheduler.stop(java.time.Duration.ofSeconds(10));
     }
 
     @Test

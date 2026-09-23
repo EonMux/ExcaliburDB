@@ -4,10 +4,11 @@ import com.eonmux.excalibur.core.util.StopSignal;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
@@ -54,7 +55,8 @@ import java.util.logging.Logger;
  *       through to the registry swap, so that no write is accepted and then lost in between.
  *       Reads and writes of that segment are served before the rewrite or after it, never
  *       during; every other segment is untouched by it</li>
- *   <li>{@link #stop()} waits, within a bounded budget, for every compaction still running -
+ *   <li>{@link #stop(Duration)} waits, for as long as its caller allows, for every compaction still
+ *       running -
  *       including those {@link #requestCompaction(Segment)} dispatched - so the Arena the
  *       segments are mapped out of can be closed once it has returned</li>
  *   <li>Segment swap is atomic via {@link CompactionListener#onCompactionComplete(Segment, Segment)}</li>
@@ -84,8 +86,8 @@ import java.util.logging.Logger;
  * // Start the background worker
  * worker.start();
  *
- * // Later, shut down
- * worker.stop();
+ * // Later, shut down, waiting up to ten seconds for work in flight
+ * worker.stop(Duration.ofSeconds(10));
  * }</pre>
  *
  * @author ExcaliburDB
@@ -158,19 +160,6 @@ public class CompactionWorker {
     public static final int MAX_CONCURRENT_COMPACTIONS = 16;
 
     /**
-     * Default budget, in milliseconds, for everything {@link #stop()} waits on.
-     *
-     * <p>Shutdown has to wait: a rewrite reads the segment it is replacing and writes the
-     * replacement through memory mapped out of the caller's {@link Arena}, and the caller closes
-     * that Arena once {@code stop()} has returned. It also has to be bounded, because a rewrite
-     * of a large segment is not quick and a shutdown that never returns is worse than the race
-     * it was avoiding. Five seconds is enough for the segment sizes this engine produces and
-     * short enough to be an acceptable pause on the way out; a deployment whose segments need
-     * longer says so with {@link #withStopTimeoutMs(long)}.</p>
-     */
-    public static final long DEFAULT_STOP_TIMEOUT_MS = 5000;
-
-    /**
      * Minimum write log size threshold in bytes.
      */
     public static final long MIN_WRITE_LOG_SIZE_THRESHOLD = 1024 * 1024; // 1 MB
@@ -239,18 +228,13 @@ public class CompactionWorker {
      *
      * <p>A requested rewrite runs on a thread of its own so the request does not block its
      * caller, which leaves nothing holding it: the background loop's thread is the only one
-     * {@code stop()} could otherwise join, and it is not this one. Every dispatched thread is
+     * {@code stop(Duration)} could otherwise join, and it is not this one. Every dispatched thread is
      * published here before it is started and removes itself once its rewrite has returned, so
-     * {@link #stop()} has something to wait on and the owner of the Arena can close it
+     * {@link #stop(Duration)} has something to wait on and the owner of the Arena can close it
      * afterwards.</p>
      */
     private final CopyOnWriteArrayList<Thread> requestedCompactionThreads =
         new CopyOnWriteArrayList<>();
-
-    /**
-     * How long {@link #stop()} may spend waiting for compactions that are already running.
-     */
-    private volatile long stopTimeoutMs = DEFAULT_STOP_TIMEOUT_MS;
 
     /**
      * Sets how long the loop waits before its first compaction check.
@@ -272,30 +256,6 @@ public class CompactionWorker {
      */
     public long getStartDelayMs() {
         return startDelayMs;
-    }
-
-    /**
-     * Sets how long {@link #stop()} may wait for compactions that are already running.
-     *
-     * <p>Raise it for a deployment whose segments take longer to rewrite than the default
-     * allows. The bound is what keeps a shutdown from hanging, and what it costs when it
-     * expires is described on {@link #stop()}. Takes effect on the next {@link #stop()}.</p>
-     *
-     * @param stopTimeoutMs Budget in milliseconds; negative is treated as no wait at all
-     * @return this worker, for chaining
-     */
-    public CompactionWorker withStopTimeoutMs(long stopTimeoutMs) {
-        this.stopTimeoutMs = Math.max(0, stopTimeoutMs);
-        return this;
-    }
-
-    /**
-     * Returns how long {@link #stop()} may wait for compactions that are already running.
-     *
-     * @return The budget in milliseconds
-     */
-    public long getStopTimeoutMs() {
-        return stopTimeoutMs;
     }
 
     // ==================== Constructors ====================
@@ -399,7 +359,7 @@ public class CompactionWorker {
      *
      * <p>This method creates a virtual thread that continuously monitors
      * registered segments and performs compaction as needed. The worker
-     * runs until {@link #stop()} is called.</p>
+     * runs until {@link #stop(Duration)} is called.</p>
      *
      * <p>If the worker is already running, this method does nothing.</p>
      *
@@ -433,30 +393,38 @@ public class CompactionWorker {
      * shutdown has returned. Closing it under a live rewrite is not an exception a caller could
      * catch; it ends the process. Waiting here is what makes closing it afterwards safe.</p>
      *
-     * <p>The whole wait is bounded by {@link #getStopTimeoutMs()}, so this returns whether or
-     * not the compactions finish. <strong>An expired wait is logged as a warning and is not the
-     * guarantee above</strong>: rewrites are still running, the Arena is still being read and
-     * written through, and closing it is precisely the crash the wait exists to prevent. A
-     * caller that sees that warning should leave the Arena open and let the process exit
-     * without it, or give the worker a timeout that matches the size of its segments.</p>
+     * <p>The whole wait is bounded by {@code wait} - one deadline for all of it, not one per
+     * compaction - so this returns whether or not the compactions finish. <strong>An expired
+     * wait is logged as a warning and is not the guarantee above</strong>: rewrites are still
+     * running, the Arena is still being read and written through, and closing it is precisely
+     * the crash the wait exists to prevent. A caller that sees that warning should leave the
+     * Arena open and let the process exit without it, or give the worker a wait that matches
+     * the size of its segments.</p>
      *
      * <p>A worker whose loop was never started still drains the compactions requested of it.
      * Requests that arrive from here on are refused rather than started, because after this
      * returns there is nothing left that would wait for them.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains, and a caller of its own passes what its segments need to rewrite.</p>
+     *
+     * @param wait How long to wait for the compactions in flight, all of them together
      * @return true if no compaction this worker started is still running, false if the wait
      *         expired first and the Arena must be left open
      */
-    public boolean stop() {
+    public boolean stop(Duration wait) {
+        Objects.requireNonNull(wait, "wait cannot be null");
         boolean first = stopped.compareAndSet(false, true);
         if (first) {
             running.set(false);
         }
         // Outside the guard, so a second call waits again for whatever the first left running
         // instead of answering from a snapshot of it.
-        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(stopTimeoutMs);
-        awaitCompactionLoop(deadlineNanos);
-        awaitRequestedCompactions(deadlineNanos);
+        // Wraps rather than saturates for a wait near Long.MAX_VALUE nanoseconds; every use
+        // subtracts the current time first, which undoes it.
+        long deadlineNanos = System.nanoTime() + wait.toNanos();
+        awaitCompactionLoop(deadlineNanos, wait);
+        awaitRequestedCompactions(deadlineNanos, wait);
         if (first) {
             LOGGER.log(Level.INFO, "Compaction worker stopped. Total compactions: {0}, bytes reclaimed: {1}",
                 new Object[] { compactionCount.get(), bytesReclaimed.get() });
@@ -475,8 +443,9 @@ public class CompactionWorker {
      * channel and leaves exactly the half-done rewrite this avoids.</p>
      *
      * @param deadlineNanos Nanotime the whole shutdown wait is bounded by
+     * @param wait          The whole wait, as the log reports it
      */
-    private void awaitCompactionLoop(long deadlineNanos) {
+    private void awaitCompactionLoop(long deadlineNanos, Duration wait) {
         stopSignal.request();
         Thread loop = workerThread;
         if (loop == null) {
@@ -485,7 +454,7 @@ public class CompactionWorker {
         joinUntil(loop, deadlineNanos);
         if (loop.isAlive()) {
             LOGGER.log(Level.WARNING, "The compaction loop did not finish within {0}ms; a "
-                + "scheduled rewrite is still running against the Arena", stopTimeoutMs);
+                + "scheduled rewrite is still running against the Arena", wait.toMillis());
         }
     }
 
@@ -497,8 +466,9 @@ public class CompactionWorker {
      * cannot leave an entry behind.</p>
      *
      * @param deadlineNanos Nanotime the whole shutdown wait is bounded by
+     * @param wait          The whole wait, as the log reports it
      */
-    private void awaitRequestedCompactions(long deadlineNanos) {
+    private void awaitRequestedCompactions(long deadlineNanos, Duration wait) {
         for (Thread thread : requestedCompactionThreads) {
             if (!joinUntil(thread, deadlineNanos)) {
                 break;
@@ -510,7 +480,7 @@ public class CompactionWorker {
             LOGGER.log(Level.WARNING, "Compaction worker stopped with {0} requested compaction(s) "
                 + "still running after {1}ms; they are reading and writing segments mapped out of "
                 + "the Arena, which must not be closed while that is true",
-                new Object[] { straggling, stopTimeoutMs });
+                new Object[] { straggling, wait.toMillis() });
         }
     }
 
@@ -523,12 +493,12 @@ public class CompactionWorker {
      *         the waiting thread was interrupted
      */
     private static boolean joinUntil(Thread thread, long deadlineNanos) {
-        long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
-        if (remainingMs <= 0) {
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        if (remainingNanos <= 0) {
             return false;
         }
         try {
-            thread.join(remainingMs);
+            thread.join(Duration.ofNanos(remainingNanos));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return false;
@@ -596,7 +566,7 @@ public class CompactionWorker {
      * may cause unnecessary I/O if the segment doesn't need compaction.</p>
      *
      * <p>The rewrite runs on a virtual thread of its own and this returns as soon as it has been
-     * dispatched. {@link #stop()} waits for what was dispatched here, so the rewrite cannot
+     * dispatched. {@link #stop(Duration)} waits for what was dispatched here, so the rewrite cannot
      * outlive the shutdown that precedes closing the {@link Arena} it is mapped out of. A
      * request that arrives once the worker has stopped is refused and logged rather than
      * started, because by then there is nothing left that would wait for it.</p>

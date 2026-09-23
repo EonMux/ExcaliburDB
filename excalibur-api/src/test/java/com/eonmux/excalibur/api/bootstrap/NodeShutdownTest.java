@@ -68,6 +68,8 @@ class NodeShutdownTest {
         when(storageEngine.getCatalog()).thenReturn(new SegmentCatalog());
         when(sweep.drain(any(Duration.class))).thenReturn(true);
         when(chunkIndex.compactionReadsStorage()).thenReturn(true);
+        when(indexOrchestrator.shutdown(any(Duration.class))).thenReturn(true);
+        when(storageEngine.stopBackgroundWork(any(Duration.class))).thenReturn(true);
         arena = Arena.ofShared();
     }
 
@@ -103,7 +105,10 @@ class NodeShutdownTest {
         InOrder order = inOrder(server, indexOrchestrator, sweep, chunkIndex, registry, tenants,
             storageEngine);
         order.verify(server).stop(any(ShutdownBudget.class));
-        order.verify(indexOrchestrator).close();
+        order.verify(indexOrchestrator).shutdown(any(Duration.class));
+        order.verify(indexOrchestrator).close(any(Duration.class));
+        // After the segment workers, the last thing that could start a split.
+        order.verify(storageEngine).stopBackgroundWork(any(Duration.class));
         // The sweep before the index it compacts: a sweep in flight is inside a compaction of it.
         order.verify(sweep).drain(any(Duration.class));
         // The index after ingestion has stopped and before storage closes: its buffer is
@@ -128,15 +133,28 @@ class NodeShutdownTest {
             Thread.sleep(50);
             return null;
         }).when(server).stop(budget.capture());
+        ArgumentCaptor<Duration> orchestratorWait = ArgumentCaptor.forClass(Duration.class);
+        ArgumentCaptor<Duration> storageWorkWait = ArgumentCaptor.forClass(Duration.class);
         ArgumentCaptor<Duration> sweepWait = ArgumentCaptor.forClass(Duration.class);
         ArgumentCaptor<Duration> tenantsWait = ArgumentCaptor.forClass(Duration.class);
         when(sweep.drain(sweepWait.capture())).thenReturn(true);
 
         shutdown(sweep, chunkIndex).run();
 
+        verify(indexOrchestrator).shutdown(orchestratorWait.capture());
+        verify(storageEngine).stopBackgroundWork(storageWorkWait.capture());
         verify(tenants).close(tenantsWait.capture());
         assertThat(budget.getValue().forDrains())
             .as("the server drains within the configured timeout, less the reserve")
+            .isLessThanOrEqualTo(TIMEOUT.minus(ShutdownBudget.DURABILITY_RESERVE));
+        assertThat(orchestratorWait.getValue())
+            .as("workers the server's stop left running are waited for only with what the "
+                + "drains have left")
+            .isPositive()
+            .isLessThanOrEqualTo(TIMEOUT.minus(ShutdownBudget.DURABILITY_RESERVE));
+        assertThat(storageWorkWait.getValue())
+            .as("so are the storage engine's splits and lifecycle checks")
+            .isPositive()
             .isLessThanOrEqualTo(TIMEOUT.minus(ShutdownBudget.DURABILITY_RESERVE));
         assertThat(sweepWait.getValue())
             .as("the sweep waits only for what the drains have left")
@@ -189,6 +207,53 @@ class NodeShutdownTest {
         org.assertj.core.api.Assertions.assertThat(arena.allocate(8, 8))
             .as("the arena the run is reading through is still open")
             .isNotNull();
+    }
+
+    @Test
+    @DisplayName("storage stays open, and the orchestrator unreleased, while a segment worker "
+        + "its stop could not end still writes it")
+    void leavesStorageOpenUnderARunningWorker() throws IOException {
+        // A server that never started drained nothing, so what the workers answer here is the
+        // only word on whether they have ended.
+        when(indexOrchestrator.shutdown(any(Duration.class))).thenReturn(false);
+
+        shutdown(sweep, chunkIndex).run();
+
+        verify(indexOrchestrator, never()).close(any(Duration.class));
+        verify(storageEngine, never()).close();
+        verify(registry).persist();
+        org.assertj.core.api.Assertions.assertThat(arena.allocate(8, 8))
+            .as("the arena the worker is writing through is still open")
+            .isNotNull();
+    }
+
+    @Test
+    @DisplayName("storage stays open while a split or lifecycle check its stop could not end "
+        + "still writes it")
+    void leavesStorageOpenUnderRunningStorageWork() throws IOException {
+        when(storageEngine.stopBackgroundWork(any(Duration.class))).thenReturn(false);
+
+        shutdown(sweep, chunkIndex).run();
+
+        verify(storageEngine, never()).close();
+        verify(registry).persist();
+        verify(tenants).close(any(Duration.class));
+        org.assertj.core.api.Assertions.assertThat(arena.allocate(8, 8))
+            .as("the arena the split is writing through is still open")
+            .isNotNull();
+    }
+
+    @Test
+    @DisplayName("a worker stop that throws is taken to have left the workers running")
+    void aThrowingWorkerStopHoldsStorage() throws IOException {
+        when(indexOrchestrator.shutdown(any(Duration.class)))
+            .thenThrow(new IllegalStateException("sweep refused to stop"));
+
+        shutdown(sweep, chunkIndex).run();
+
+        verify(storageEngine).stopBackgroundWork(any(Duration.class));
+        verify(storageEngine, never()).close();
+        verify(registry).persist();
     }
 
     @Test
@@ -356,7 +421,8 @@ class NodeShutdownTest {
 
         InOrder order = inOrder(server, indexOrchestrator, registry, storageEngine);
         order.verify(server).stop(any(ShutdownBudget.class));
-        order.verify(indexOrchestrator).close();
+        order.verify(indexOrchestrator).close(any(Duration.class));
+        order.verify(storageEngine).stopBackgroundWork(any(Duration.class));
         order.verify(registry).persist();
         order.verify(storageEngine).close();
     }

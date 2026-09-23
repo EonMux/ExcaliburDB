@@ -3,7 +3,9 @@ package com.eonmux.excalibur.store;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -83,6 +85,9 @@ public class SegmentLifecycleManager implements AutoCloseable {
      * source is available.
      */
     private static final long LEGACY_RECLAMATION_GRACE_MS = TimeUnit.MINUTES.toMillis(5);
+
+    /** What {@link #close()} waits for: a check in progress, for as long as it takes to end. */
+    private static final Duration UNTIL_STOPPED = Duration.ofNanos(Long.MAX_VALUE);
 
     // Callbacks for external integration (e.g., HNSW, Cuckoo filter)
     private volatile CompactionCallback compactionCallback;
@@ -253,27 +258,43 @@ public class SegmentLifecycleManager implements AutoCloseable {
      * could cut short. A check that outlives the wait is reported, since the caller closes the
      * storage the check is working on next.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains. Idempotent: a later call waits again for a check an earlier one left running.</p>
+     *
+     * @param wait How long to wait for a check in progress
      * @return true if no lifecycle check is still running
+     * @throws NullPointerException if wait is null
      */
-    public boolean stop() {
+    public boolean stop(Duration wait) {
+        Objects.requireNonNull(wait, "wait cannot be null");
         if (running.compareAndSet(true, false)) {
             scheduler.shutdown();
-            try {
-                if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                    logger.warn("A segment lifecycle check was still running 5s after the "
-                        + "manager was asked to stop");
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
             logger.info("SegmentLifecycleManager stopped");
         }
-        return !scheduler.isShutdown() || scheduler.isTerminated();
+        if (!scheduler.isShutdown()) {
+            // Never started, so nothing was ever scheduled.
+            return true;
+        }
+        try {
+            if (scheduler.awaitTermination(wait.toNanos(), TimeUnit.NANOSECONDS)) {
+                return true;
+            }
+            logger.warn("A segment lifecycle check was still running {}ms after the manager was "
+                + "asked to stop", wait.toMillis());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return scheduler.isTerminated();
     }
 
+    /**
+     * As {@link #stop(Duration)}, waiting for as long as a check in progress takes to end, for
+     * an owner with no deadline and no use for the answer - the way
+     * {@code ExecutorService.close} waits.
+     */
     @Override
     public void close() {
-        stop();
+        stop(UNTIL_STOPPED);
     }
 
     /**

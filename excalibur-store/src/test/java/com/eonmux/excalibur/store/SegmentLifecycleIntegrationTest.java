@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -325,7 +326,7 @@ class SegmentLifecycleIntegrationTest {
             manager.start();
             assertTrue(manager.isRunning(), "Lifecycle manager should be running after start");
 
-            manager.stop();
+            manager.stop(Duration.ofSeconds(10));
             assertFalse(manager.isRunning(), "Lifecycle manager should not be running after stop");
         }
 

@@ -24,6 +24,7 @@ import com.eonmux.excalibur.vector.hnsw.TailOffsetTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
@@ -109,6 +110,9 @@ import java.util.function.BooleanSupplier;
 public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListener {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(IndexOrchestrator.class);
+
+    /** What {@link #close()} waits for: the workers, for as long as they take to stop. */
+    private static final Duration UNTIL_STOPPED = Duration.ofNanos(Long.MAX_VALUE);
 
     // ==================== Configuration Constants ====================
 
@@ -631,11 +635,15 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * EpochTickScheduler. The epoch ticker is last because its stop fences an
      * already-dispatched tick, a promise that only holds once nothing can publish new work.</p>
      *
-     * <p>The workers are asked to stop, not interrupted, and each is waited for within its own
-     * bound; {@link #shutdown()} is the variant that says whether they all ended.</p>
+     * <p>The workers are asked to stop, not interrupted, and waited for with what is left of
+     * {@code wait}; {@link #shutdown(Duration)} is the variant that says whether they all
+     * ended.</p>
+     *
+     * @param wait How long to wait for the sweep and the workers together
+     * @throws NullPointerException if wait is null
      */
-    public void stop() {
-        stopWorkers();
+    public void stop(Duration wait) {
+        stopWorkers(Objects.requireNonNull(wait, "wait cannot be null"));
     }
 
     /**
@@ -644,8 +652,13 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * <p>No worker is interrupted. Each rewrites, maps, grows or forces files through channels
      * that queries and writers share, and an interrupt reaching one inside such an operation
      * closes the channel for all of them; so each is asked through a signal it reads between
-     * units of work and waited for within its own bound. A worker still inside a segment
-     * rewrite or a graph swap when its bound runs out is left to finish it.</p>
+     * units of work and waited for with what is left of {@code wait}. A worker still inside a
+     * segment rewrite or a graph swap when the wait runs out is left to finish it.</p>
+     *
+     * <p>One wait for everything here, not one per worker: the sweep, the workers in their order
+     * and then the term filter rebuilds each get what the ones before them left. How long is the
+     * caller's - a node's shutdown passes what its budget leaves the drains, so a longer budget
+     * is a longer wait for a slow worker rather than a fixed one cut short.</p>
      *
      * <p>The answer is what a caller about to close the storage engine needs: false means work
      * is still running against segments mapped out of the engine's arena, and closing it would
@@ -653,26 +666,34 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * for what an earlier one left running, and answers from the workers' state, not from
      * whether this is the first call.</p>
      *
-     * <p>Unlike {@link #stop()} this is final: it also drains the term filter rebuilds, which
-     * copy out of the same segment mappings, and a drained orchestrator is not started again.
-     * {@link #close()} still has to be called for the rest of what the orchestrator holds, and
-     * calls this first.</p>
+     * <p>Unlike {@link #stop(Duration)} this is final: it also drains the term filter rebuilds,
+     * which copy out of the same segment mappings, and a drained orchestrator is not started
+     * again. {@link #close(Duration)} still has to be called for the rest of what the
+     * orchestrator holds, and calls this first.</p>
      *
+     * @param wait How long to wait for all of it together
      * @return true if every background worker, the reconciliation sweep and every term filter
      *         rebuild have ended
+     * @throws NullPointerException if wait is null
      */
-    public boolean shutdown() {
-        boolean workersEnded = stopWorkers();
-        boolean rebuildsEnded = registry.close();
+    public boolean shutdown(Duration wait) {
+        Objects.requireNonNull(wait, "wait cannot be null");
+        // Wraps rather than saturates for a wait near Long.MAX_VALUE nanoseconds; left()
+        // subtracts the current time first, which undoes it.
+        long deadline = System.nanoTime() + wait.toNanos();
+        boolean workersEnded = stopWorkers(wait);
+        boolean rebuildsEnded = registry.close(ShardWorkers.left(deadline));
         return workersEnded && rebuildsEnded;
     }
 
     /**
-     * Stops the reconciliation sweep and then the workers, once, and reports whether they ended.
+     * Stops the reconciliation sweep and then the workers, and reports whether they ended.
      *
+     * @param wait How long to wait for the sweep and the workers together
      * @return true if every one of them has ended
      */
-    private boolean stopWorkers() {
+    private boolean stopWorkers(Duration wait) {
+        long deadline = System.nanoTime() + wait.toNanos();
         boolean first = stopped.compareAndSet(false, true);
         if (first) {
             running.set(false);
@@ -684,8 +705,8 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
             // into a worker set that is going down.
             segmentSync.stop();
         }
-        boolean syncEnded = segmentSync.shutdown();
-        boolean workersEnded = workers.stop();
+        boolean syncEnded = segmentSync.shutdown(ShardWorkers.left(deadline));
+        boolean workersEnded = workers.stop(ShardWorkers.left(deadline));
         if (first) {
 
             LOGGER.info("Index orchestrator stopped. HNSW integrated: {}, Cuckoo deletions: {}, Reindexes: {}, Compactions: {}, HNSW compactions: {}, PQ trained: {}, Epoch ticks: {}, Cuckoo FP samples: {}",
@@ -697,21 +718,35 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
         }
         boolean ended = syncEnded && workersEnded;
         if (!ended) {
-            LOGGER.warn("Index orchestrator stopped with background work still running; the "
-                + "storage engine it runs against must not be closed under it");
+            LOGGER.warn("Index orchestrator stopped with background work still running {}ms "
+                + "after being asked; the storage engine it runs against must not be closed "
+                + "under it", wait.toMillis());
         }
         return ended;
     }
 
     /**
-     * Stops the workers, as {@link #shutdown()}, and releases what the orchestrator holds.
+     * Stops the workers, as {@link #shutdown(Duration)}, and releases what the orchestrator
+     * holds, waiting for as long as the workers take to stop - the way
+     * {@code ExecutorService.close} waits.
      *
-     * <p>Callers that go on to close the storage engine should call {@link #shutdown()} first
-     * and act on its answer; this cannot return one.</p>
+     * <p>Callers that go on to close the storage engine should call
+     * {@link #shutdown(Duration)} first and act on its answer; this cannot return one. A node's
+     * shutdown uses {@link #close(Duration)}, with what its budget leaves it.</p>
      */
     @Override
     public void close() {
-        shutdown();
+        close(UNTIL_STOPPED);
+    }
+
+    /**
+     * As {@link #close()}, waiting for the workers no longer than {@code wait}.
+     *
+     * @param wait How long to wait for the workers to stop
+     * @throws NullPointerException if wait is null
+     */
+    public void close(Duration wait) {
+        shutdown(wait);
         // Close the epoch tick scheduler to shut down its executor
         workers.close();
     }

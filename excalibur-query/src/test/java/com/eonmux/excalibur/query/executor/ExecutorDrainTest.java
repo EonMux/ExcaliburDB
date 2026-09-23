@@ -3,6 +3,7 @@ package com.eonmux.excalibur.query.executor;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -38,7 +39,7 @@ class ExecutorDrainTest {
         });
         assertThat(inside.await(30, TimeUnit.SECONDS)).isTrue();
 
-        assertThat(ExecutorDrain.drain(executor, 50, "Test work"))
+        assertThat(ExecutorDrain.drain(executor, Duration.ofMillis(50), "Test work"))
             .as("a drain whose wait ran out must say so")
             .isFalse();
         assertThatThrownBy(() -> executor.submit(() -> { }))
@@ -46,7 +47,7 @@ class ExecutorDrainTest {
             .isInstanceOf(RejectedExecutionException.class);
 
         release.countDown();
-        assertThat(ExecutorDrain.drain(executor, TimeUnit.SECONDS.toMillis(30), "Test work"))
+        assertThat(ExecutorDrain.drain(executor, Duration.ofSeconds(30), "Test work"))
             .as("a later drain waits again and reports the work ended")
             .isTrue();
         assertThat(interrupted)
@@ -59,8 +60,8 @@ class ExecutorDrainTest {
     void idleExecutorDrains() {
         ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
-        assertThat(ExecutorDrain.drain(executor, 0, "Idle")).isTrue();
-        assertThat(ExecutorDrain.drain(executor, -1, "Idle")).isTrue();
+        assertThat(ExecutorDrain.drain(executor, Duration.ZERO, "Idle")).isTrue();
+        assertThat(ExecutorDrain.drain(executor, Duration.ofMillis(-1), "Idle")).isTrue();
     }
 
     @Test
@@ -78,7 +79,7 @@ class ExecutorDrainTest {
 
         Thread.currentThread().interrupt();
         try {
-            assertThat(ExecutorDrain.drain(executor, TimeUnit.MINUTES.toMillis(5), "Test work"))
+            assertThat(ExecutorDrain.drain(executor, Duration.ofMinutes(5), "Test work"))
                 .isFalse();
             assertThat(Thread.currentThread().isInterrupted())
                 .as("the caller's interrupt is kept for it to see")
@@ -87,13 +88,42 @@ class ExecutorDrainTest {
             Thread.interrupted();
             release.countDown();
         }
-        assertThat(ExecutorDrain.drain(executor, TimeUnit.SECONDS.toMillis(30), "Test work")).isTrue();
+        assertThat(ExecutorDrain.drain(executor, Duration.ofSeconds(30), "Test work")).isTrue();
     }
 
     @Test
-    @DisplayName("a null executor is refused")
+    @DisplayName("work still running is given the whole of the wait before it is reported")
+    void theWholeWaitIsGiven() throws Exception {
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        CountDownLatch inside = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        executor.submit(() -> {
+            inside.countDown();
+            release.await();
+            return null;
+        });
+        assertThat(inside.await(30, TimeUnit.SECONDS)).isTrue();
+        Duration wait = Duration.ofMillis(300);
+
+        long began = System.nanoTime();
+        try {
+            assertThat(ExecutorDrain.drain(executor, wait, "Test work")).isFalse();
+            assertThat(Duration.ofNanos(System.nanoTime() - began))
+                .as("the drain waited all of the time it was handed")
+                .isGreaterThanOrEqualTo(wait);
+        } finally {
+            release.countDown();
+        }
+        assertThat(ExecutorDrain.drain(executor, Duration.ofSeconds(30), "Test work")).isTrue();
+    }
+
+    @Test
+    @DisplayName("a null executor or wait is refused")
     void nullExecutorIsRefused() {
-        assertThatThrownBy(() -> ExecutorDrain.drain(null, 0, "None"))
+        assertThatThrownBy(() -> ExecutorDrain.drain(null, Duration.ZERO, "None"))
+            .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> ExecutorDrain.drain(
+                Executors.newVirtualThreadPerTaskExecutor(), null, "None"))
             .isInstanceOf(NullPointerException.class);
     }
 }

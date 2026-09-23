@@ -14,6 +14,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -375,12 +376,12 @@ class EpochTickSchedulerIntegrationTest {
             .as("Should have at least 1 tick after first run")
             .isGreaterThanOrEqualTo(1L);
 
-        // Stop via orchestrator.stop() (not close)
-        orchestrator.stop();
+        // Stop via orchestrator.stop (not close)
+        orchestrator.stop(Duration.ofSeconds(10));
 
         // Verify scheduler is stopped
         assertThat(scheduler.isRunning())
-            .as("Scheduler should be stopped after orchestrator.stop()")
+            .as("Scheduler should be stopped after orchestrator.stop")
             .isFalse();
 
         // Restart

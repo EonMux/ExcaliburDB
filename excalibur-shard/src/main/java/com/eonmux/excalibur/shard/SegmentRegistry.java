@@ -10,6 +10,7 @@ import com.eonmux.excalibur.vector.hnsw.TailOffsetTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -507,10 +508,11 @@ final class SegmentRegistry {
     /**
      * Stops the term filter rebuild queue.
      *
+     * @param wait How long to wait for the rebuild already running
      * @return true if no rebuild is still reading a segment
      */
-    boolean close() {
-        return termFilterRebuilds.drain();
+    boolean close(Duration wait) {
+        return termFilterRebuilds.drain(wait);
     }
 
     /**

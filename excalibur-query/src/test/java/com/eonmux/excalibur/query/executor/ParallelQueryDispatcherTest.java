@@ -19,6 +19,7 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -40,6 +41,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 @DisplayName("ParallelQueryDispatcher")
 class ParallelQueryDispatcherTest {
+
+    /** Far longer than any search here takes to finish. */
+    private static final Duration SHUTDOWN_WAIT = Duration.ofSeconds(10);
 
     private static final int DIMENSION = 8;
 
@@ -67,7 +71,7 @@ class ParallelQueryDispatcherTest {
     @AfterEach
     void tearDown() {
         for (ParallelQueryDispatcher extra : extraDispatchers) {
-            extra.shutdown();
+            extra.shutdown(SHUTDOWN_WAIT);
         }
         for (HnswGraph graph : openGraphs) {
             try {
@@ -77,7 +81,7 @@ class ParallelQueryDispatcherTest {
             }
         }
         if (dispatcher != null) {
-            dispatcher.shutdown();
+            dispatcher.shutdown(SHUTDOWN_WAIT);
         }
         if (catalog != null) {
             catalog.close();
@@ -268,8 +272,8 @@ class ParallelQueryDispatcherTest {
     @Test
     @DisplayName("shutdown is idempotent")
     void shutdownIsIdempotent() {
-        assertThat(dispatcher.shutdown()).isTrue();
-        assertThat(dispatcher.shutdown()).isTrue();
+        assertThat(dispatcher.shutdown(SHUTDOWN_WAIT)).isTrue();
+        assertThat(dispatcher.shutdown(SHUTDOWN_WAIT)).isTrue();
     }
 
     @Test

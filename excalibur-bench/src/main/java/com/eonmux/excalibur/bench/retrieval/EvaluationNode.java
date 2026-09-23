@@ -73,6 +73,15 @@ final class EvaluationNode implements AutoCloseable {
     private static final String UNTHROTTLED = "100000";
 
     private static final Duration POLL = Duration.ofMillis(100);
+
+    /**
+     * How long a start that failed before its server existed waits for the background work it
+     * already started: the segment workers, then the storage engine's splits and lifecycle
+     * checks, one wait for both. A node that has only just come up has nothing long in flight,
+     * so this is ample; work still running after it keeps storage open rather than having it
+     * closed underneath.
+     */
+    private static final Duration FAILED_START_STOP_WAIT = Duration.ofSeconds(30);
     private static final long PROGRESS_EVERY_NANOS = Duration.ofSeconds(30).toNanos();
 
     /**
@@ -225,13 +234,38 @@ final class EvaluationNode implements AutoCloseable {
                 if (tenants != null) {
                     tenants.close();
                 }
-                core.indexOrchestrator().close();
-                core.storageEngine().close();
-                if (core.arena() != null) {
-                    core.arena().close();
-                }
+                releaseAfterFailedStart(core);
             }
             throw e;
+        }
+    }
+
+    /**
+     * Takes down what a start that failed before its server existed brought up.
+     *
+     * <p>Storage and its arena are closed only once the work writing into them has ended: a
+     * worker still writing into a mapping whose arena has been closed ends the process rather
+     * than failing it, and the failure the caller is about to see would be lost with it.</p>
+     *
+     * @param core What the start had brought up
+     */
+    private static void releaseAfterFailedStart(CoreComponents core) {
+        long deadline = System.nanoTime() + FAILED_START_STOP_WAIT.toNanos();
+        boolean workersEnded = core.indexOrchestrator().shutdown(FAILED_START_STOP_WAIT);
+        if (workersEnded) {
+            // Everything it would wait for has ended, so this only releases the executors.
+            core.indexOrchestrator().close(Duration.ZERO);
+        }
+        boolean storageWorkEnded = core.storageEngine().stopBackgroundWork(
+            Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
+        if (!workersEnded || !storageWorkEnded) {
+            System.err.println("Background work was still running " + FAILED_START_STOP_WAIT
+                .toSeconds() + "s after a failed start; storage is left open under it");
+            return;
+        }
+        core.storageEngine().close();
+        if (core.arena() != null) {
+            core.arena().close();
         }
     }
 

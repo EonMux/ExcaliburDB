@@ -12,6 +12,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -33,6 +34,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("On-demand HNSW compaction sweep")
 class HnswCompactionSweepTest {
 
+    /** Far longer than any work here takes to stop once asked. */
+    private static final Duration STOP_WAIT = Duration.ofSeconds(10);
+
     @TempDir
     Path tempDir;
 
@@ -52,7 +56,7 @@ class HnswCompactionSweepTest {
 
     @AfterEach
     void tearDown() {
-        worker.stop();
+        worker.stop(STOP_WAIT);
         for (HnswGraph graph : opened) {
             if (!graph.isClosed()) {
                 graph.close();
@@ -103,6 +107,52 @@ class HnswCompactionSweepTest {
         assertThat(worker.getRegisteredGraphCount())
             .as("a closed graph can never be compacted again, so it is retired")
             .isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("stop waits out the whole of its wait for a compaction in progress, and a later "
+        + "stop waits again")
+    void stopWaitsAsLongAsItIsGiven() throws Exception {
+        HnswGraph live = graph("held.hnsw", 10, 6);
+        CountDownLatch compacting = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        worker.setCompactionListener((g, removed) -> {
+            compacting.countDown();
+            // Uninterruptible, as a file swap is: only the stop between graphs ends the loop.
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    release.await();
+                    break;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        worker.registerGraph(live);
+        worker.start();
+        assertThat(compacting.await(30, TimeUnit.SECONDS))
+            .as("the loop reached a compaction")
+            .isTrue();
+        Duration wait = Duration.ofMillis(300);
+
+        long began = System.nanoTime();
+        try {
+            assertThat(worker.stop(wait))
+                .as("a compaction still swapping files is reported, not claimed ended")
+                .isFalse();
+            assertThat(Duration.ofNanos(System.nanoTime() - began))
+                .as("the compaction was given all of the wait stop was handed")
+                .isGreaterThanOrEqualTo(wait);
+        } finally {
+            release.countDown();
+        }
+        assertThat(worker.stop(STOP_WAIT))
+            .as("given long enough, a later stop sees the loop end")
+            .isTrue();
     }
 
     @Test

@@ -70,7 +70,7 @@ class StorageChunkWriterTargetTest {
             engine.getSplitWorker().requestSplit(engine.getSegment(0L));
             // Joins every split requestSplit dispatched, so the split has been published or
             // refused by the time this returns.
-            engine.getSplitWorker().stop();
+            engine.getSplitWorker().stop(java.time.Duration.ofSeconds(30));
             assertThat(engine.getSegmentCount())
                 .as("the split must publish before the rest of the test means anything")
                 .isEqualTo(widthBefore * 2);
