@@ -1758,7 +1758,9 @@ meaning of a question when there are no vectors, and here there are — so the l
 matches the words as typed, which makes it weaker than the same node would run with no embedding
 model at all. Whether that trade pays depends on the corpus, so
 `excalibur.query.expand-hybrid-queries=true` expands the lexical half as well, at one extra chat
-call per query. It requires `excalibur.llm.api-key`.
+call per query. It requires `excalibur.llm.api-key`. The retrieval harness in `excalibur-bench`
+measures the two side by side on your corpus; see
+[Evaluating it](README.md#evaluating-it).
 
 A query longer than `excalibur.api.max-query-chars` is refused, on every route; there is no
 second, shorter bound for expansion. A hybrid answer carries `ignored_fields` like every other:

@@ -669,6 +669,9 @@ class GraphRagPipelineTest {
             assertThat(result.context().orElseThrow().tokens())
                 .isEqualTo(BpeTokenCounter.defaultCounter().count(result.contextText()))
                 .isLessThanOrEqualTo(2000);
+            assertThat(result.context().orElseThrow().edges())
+                .as("the facts under the aggregate line are still named, for citing them")
+                .hasSize(3);
         }
 
         @Test

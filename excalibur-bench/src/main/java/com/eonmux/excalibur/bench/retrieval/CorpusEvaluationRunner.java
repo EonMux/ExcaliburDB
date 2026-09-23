@@ -1,8 +1,10 @@
 package com.eonmux.excalibur.bench.retrieval;
 
+import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
 import com.eonmux.excalibur.ingest.lexical.ChunkLexicalIndex;
 import com.eonmux.excalibur.ingest.lexical.NativeChunkIndex;
+import com.eonmux.excalibur.llm.client.LLMClientConfig;
 import com.eonmux.excalibur.llm.client.LLMHttpClient;
 import com.eonmux.excalibur.retrieval.expand.ExpandedLexicalRanker;
 import com.eonmux.excalibur.retrieval.expand.LlmQueryExpander;
@@ -20,40 +22,43 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 
 /**
- * Indexes a real corpus and scores the retrieval strategies over it.
+ * Reads a real corpus and scores every retrieval strategy over it.
  *
- * <p>Deliberately built without the HTTP server, the storage engine or the HNSW segments: those
- * are not what a retrieval comparison measures, and running them makes the number harder to read
- * rather than more realistic. What is real here is the corpus, the chunking, the lexical index and
- * the query model.
+ * <h2>Two ways a strategy is run</h2>
+ * <p>The strategies that need no model beyond query expansion run on a lexical index the harness
+ * builds itself, from the corpus as ingestion would chunk and name it (see
+ * {@link EvaluationCorpus}). No storage engine, vector segments or HTTP server are involved, so
+ * the index's cost is the only cost in its row.
+ *
+ * <p>The strategies that need the corpus embedded, or its facts extracted into a graph, run on an
+ * {@link EvaluationNode}: a real node, composed in-process, that ingests the same directory
+ * through its own ingestion pipeline and answers through its own routes. Reassembling the hybrid
+ * route or the graph build in the harness would measure the reassembly; see
+ * {@link ModelStrategies} for what each of those strategies is. The node for an engine keeps its
+ * data under {@code <indexDir>/node-<engine>}, which must be empty: a node over an earlier run's
+ * data would serve a corpus that is not the one being judged.
  *
  * <h2>Which engine it measures</h2>
  * <p>The one a node ships with, {@code native}, unless told otherwise - a benchmark of an engine
  * the product does not use is a number about nothing. {@code lucene} measures the alternative and
  * {@code both} runs each in turn, which is the only way to read the two side by side: they index
  * the same corpus with the same chunking, so the difference in the reported index size is the cost
- * of Lucene keeping its own copy of every chunk's text.
+ * of Lucene keeping its own copy of every chunk's text. With a model, {@code both} ingests the
+ * corpus once per engine, so it pays for embedding and extraction twice.
  *
  * <p>Not every strategy exists on both engines, and the ones that do not are reported as skipped
  * with the reason rather than left out. The native ranker checks generated terms against the corpus
  * before searching for them, so an ungated expansion is not a configuration it can be asked for;
  * the approximate vocabulary gate needs the index's whole term list, which only Lucene enumerates.
  *
- * <pre>
- * usage: CorpusEvaluationRunner &lt;corpusDir&gt; &lt;indexDir&gt; &lt;qrelsFile&gt; [k] [chatBaseUrl]
- *                              [chatModel] [native|lucene|both]
- * </pre>
- *
- * <p>The optional arguments are positional, so {@code -} stands in for one being skipped:
- * {@code ... 10 - - both} measures both engines with no query expansion.</p>
- *
- * <p>The qrels file is one judged query per line: {@code query<TAB>chunkId[,chunkId...]}.
+ * <p>For the command line see {@link EvaluationArguments}. The qrels file is one judged query per
+ * line: {@code query<TAB>id[,id...]}, where an id names a chunk or a document; every hit is
+ * credited to its document (see {@link StrategyEvaluator}).
  */
 public final class CorpusEvaluationRunner {
 
@@ -64,24 +69,7 @@ public final class CorpusEvaluationRunner {
      * is waiting, and a benchmark that inherited that bound would record a slow endpoint as a
      * weak retrieval strategy.</p>
      */
-    private static final long EXPANSION_DEADLINE_MS = 120_000L;
-
-    /** Chunk size, matching the ingestion pipeline's own target. */
-    private static final int CHUNK_CHARS = 2048;
-
-    /** Which lexical engine indexed the corpus for one pass of the comparison. */
-    private enum Engine {
-        NATIVE("native", "chunk-index"),
-        LUCENE("lucene", "lucene-chunks");
-
-        private final String id;
-        private final String directory;
-
-        Engine(String id, String directory) {
-            this.id = id;
-            this.directory = directory;
-        }
-    }
+    static final long EXPANSION_DEADLINE_MS = 120_000L;
 
     /** What one engine cost to build, which is half of what the comparison is about. */
     private record IndexCost(long chunks, long corpusBytes, long indexBytes, double seconds) {
@@ -100,59 +88,85 @@ public final class CorpusEvaluationRunner {
         }
     }
 
+    /** Everything one engine's pass needs that does not depend on the engine. */
+    private record Run(EvaluationArguments arguments, EvaluationCorpus corpus, Path corpusRoot,
+                       List<StrategyEvaluator.Judged> judged, QueryExpander expander) {
+    }
+
     private CorpusEvaluationRunner() {
     }
 
     public static void main(String[] args) throws Exception {
         if (args.length < 3) {
-            System.err.println("usage: CorpusEvaluationRunner <corpusDir> <indexDir> <qrels> "
-                + "[k] [chatBaseUrl] [chatModel] [native|lucene|both]\n"
-                + "       optional arguments are positional; '-' skips one");
+            System.err.println(EvaluationArguments.USAGE);
             System.exit(2);
         }
-        Path corpus = Path.of(args[0]);
-        Path indexRoot = Path.of(args[1]);
-        Path qrelsFile = Path.of(args[2]);
-        int k = args.length > 3 ? Integer.parseInt(args[3]) : 10;
-        // Blank is absent, not empty: these are positional, so naming an engine without a chat
-        // model means passing placeholders for the two in between. Taking "" as a base URL fails
-        // deep inside the client with a message about configuration the caller never set.
-        String chatBaseUrl = optional(args, 4);
-        String chatModel = optional(args, 5);
-        String engineArg = optional(args, 6);
-        List<Engine> engines = enginesFrom(engineArg == null ? Engine.NATIVE.id : engineArg);
+        EvaluationArguments arguments = EvaluationArguments.parse(args, System.getenv());
 
-        List<StrategyEvaluator.Judged> judged = readQrels(qrelsFile);
+        List<StrategyEvaluator.Judged> judged = readQrels(arguments.qrels());
         System.out.printf("  judged queries: %d%n", judged.size());
         if (judged.isEmpty()) {
             return;
         }
 
+        Path corpusRoot = arguments.corpus().toRealPath();
+        // Refused before anything is indexed or any model is called, rather than after an hour
+        // of embedding the corpus into a second copy beside the first.
+        if (arguments.hasChatModel() || arguments.hasEmbeddingModel()) {
+            for (LexicalEngine engine : arguments.engines()) {
+                requireEmpty(arguments.indexRoot().resolve(engine.nodeDirectory()));
+            }
+        }
+        // The chunk sizing is read from the configuration an evaluation node runs with, so the
+        // harness's own index and the node's are cut from the corpus the same way. Building it
+        // also validates the model arguments the way a node would refuse them.
+        Config nodeConfig = EvaluationNode.configFor(arguments, arguments.engines().get(0),
+            corpusRoot, false);
+        EvaluationCorpus corpus = EvaluationCorpus.read(corpusRoot, nodeConfig.ingest());
+        System.out.printf("  corpus: %,d documents, %,d chunks%n", corpus.documents(),
+            corpus.chunks().size());
+
         QueryExpander expander = null;
-        if (chatBaseUrl != null && chatModel != null) {
+        if (arguments.hasChatModel()) {
             // A longer deadline than a served query gets, deliberately. The node's 5s bound
             // exists because a caller is holding a socket open; nobody is holding one here, and
             // an expansion that timed out would be scored as a strategy that produced nothing
             // rather than as a call that was cut short - which would read as a result.
-            expander = new LlmQueryExpander(new LLMHttpClient(
-                com.eonmux.excalibur.llm.client.LLMClientConfig.builder()
-                    .baseUrl(chatBaseUrl).chatModel(chatModel).apiKey("none").build()),
+            expander = new LlmQueryExpander(new LLMHttpClient(LLMClientConfig.builder()
+                .baseUrl(arguments.baseUrl()).chatModel(arguments.chatModel())
+                .apiKey(arguments.apiKey()).build()),
                 EXPANSION_DEADLINE_MS);
         }
 
-        for (Engine engine : engines) {
-            evaluate(engine, corpus, indexRoot.resolve(engine.directory), judged, k, expander);
+        Run run = new Run(arguments, corpus, corpusRoot, judged, expander);
+        for (LexicalEngine engine : arguments.engines()) {
+            evaluate(run, engine);
+        }
+    }
+
+    /** Refuses a node directory an earlier run left data in. */
+    private static void requireEmpty(Path directory) throws IOException {
+        if (!Files.isDirectory(directory)) {
+            return;
+        }
+        try (Stream<Path> entries = Files.list(directory)) {
+            if (entries.findAny().isPresent()) {
+                throw new IllegalArgumentException(directory + " holds an evaluation node from "
+                    + "an earlier run, which would serve that run's corpus rather than this one; "
+                    + "remove it or choose another index directory");
+            }
         }
     }
 
     /** Runs the whole comparison on one engine. */
-    private static void evaluate(Engine engine, Path corpus, Path indexDir,
-                                 List<StrategyEvaluator.Judged> judged, int k,
-                                 QueryExpander expander) throws IOException {
-        System.out.printf("%n=== %s engine ===%n", engine.id);
+    private static void evaluate(Run run, LexicalEngine engine)
+            throws IOException, InterruptedException {
+        System.out.printf("%n=== %s engine ===%n", engine.id());
+        Path indexRoot = run.arguments().indexRoot();
+        Path indexDir = indexRoot.resolve(engine.directory());
         AtomicLong epoch = new AtomicLong(1);
         try (ChunkIndex index = open(engine, indexDir, epoch)) {
-            IndexCost cost = indexCorpus(corpus, index, indexDir);
+            IndexCost cost = indexCorpus(run.corpus(), index, indexDir);
             // The native index publishes at the epoch after the one it read, so nothing it just
             // wrote is visible to a query still reading at the old one. A node's tick advances
             // this; here the harness does, once, after the corpus is in.
@@ -165,46 +179,43 @@ public final class CorpusEvaluationRunner {
             System.out.printf("  index on disk: %.1f MiB (%.2fx the text it indexes)%n",
                 cost.indexMiB(), cost.overhead());
 
-            List<StrategyResult> results = new StrategyEvaluator(judged, k)
-                .evaluateAll(strategiesFor(engine, index, expander), skipReasonsFor(engine));
-            System.out.println(StrategyEvaluator.report(results, k, engine.id));
-        }
-    }
+            StrategyEvaluator evaluator =
+                new StrategyEvaluator(run.judged(), run.arguments().k());
+            Map<RetrievalStrategy, StrategyEvaluator.Retrieval> lexical =
+                strategiesFor(engine, index, run.expander());
+            Map<RetrievalStrategy, StrategyResult> ran =
+                new EnumMap<>(RetrievalStrategy.class);
+            ran.putAll(evaluator.evaluateEach(lexical));
+            Map<RetrievalStrategy, String> reasons = new EnumMap<>(RetrievalStrategy.class);
+            reasons.putAll(skipReasonsFor(engine));
+            if (run.expander() == null) {
+                for (RetrievalStrategy strategy : List.of(RetrievalStrategy.BM25_EXPANSION,
+                        RetrievalStrategy.BM25_EXPANSION_EXACT_VOCAB,
+                        RetrievalStrategy.BM25_EXPANSION_APPROX_VOCAB)) {
+                    reasons.putIfAbsent(strategy, ModelStrategies.NO_EXPANSION);
+                }
+            }
 
-    /**
-     * A positional argument that was actually supplied.
-     *
-     * <p>Blank and {@code -} both mean "not supplied", because these are positional: naming an
-     * engine without a chat model means passing placeholders for the two arguments in between, and
-     * a runner invoked through Gradle cannot pass an empty one. Without this, {@code ''} arrives as
-     * two literal quote characters and fails deep inside the LLM client with a message about
-     * configuration the caller never set.</p>
-     */
-    private static String optional(String[] args, int index) {
-        if (args.length <= index) {
-            return null;
-        }
-        String value = args[index].trim();
-        return value.isEmpty() || "-".equals(value) || "''".equals(value) || "\"\"".equals(value)
-            ? null : value;
-    }
+            try (ModelStrategies models = ModelStrategies.prepare(run.arguments(), engine,
+                    run.corpus(), run.corpusRoot(), indexRoot.resolve(engine.nodeDirectory()))) {
+                models.costs().forEach(System.out::println);
+                // The ranker a node's lexical route runs with a chat model, which on the native
+                // engine is the gated expansion and on Lucene the ungated one.
+                StrategyEvaluator.Retrieval expanded = run.expander() == null ? null
+                    : retrievalFor(index.ranker(run.expander()), index);
+                ran.putAll(evaluator.evaluateEach(
+                    models.firstPass(lexical.get(RetrievalStrategy.BM25), expanded)));
+                ran.putAll(evaluator.evaluateEach(models.secondPass()));
+                models.skipReasons().forEach(reasons::putIfAbsent);
 
-    /** The engines a run was asked for. */
-    private static List<Engine> enginesFrom(String argument) {
-        String value = argument.trim().toLowerCase(Locale.ROOT);
-        if ("both".equals(value)) {
-            return List.of(Engine.NATIVE, Engine.LUCENE);
-        }
-        for (Engine engine : Engine.values()) {
-            if (engine.id.equals(value)) {
-                return List.of(engine);
+                System.out.println(StrategyEvaluator.report(
+                    StrategyEvaluator.inOrder(ran, reasons), run.arguments().k(), engine.id()));
+                models.notes().forEach(System.out::println);
             }
         }
-        throw new IllegalArgumentException(
-            "unknown engine '" + argument + "'; expected native, lucene or both");
     }
 
-    private static ChunkIndex open(Engine engine, Path directory, AtomicLong epoch)
+    private static ChunkIndex open(LexicalEngine engine, Path directory, AtomicLong epoch)
             throws IOException {
         return switch (engine) {
             // Never compacts during a run: compaction reads surviving text back from the storage
@@ -217,13 +228,13 @@ public final class CorpusEvaluationRunner {
     }
 
     /**
-     * The strategies this engine can actually be asked for.
+     * The lexical strategies this engine can actually be asked for.
      *
      * <p>A strategy an engine cannot run is left out, so the evaluator reports it as skipped. A
      * row scored on a substitute would be the one thing worse than a missing row.</p>
      */
     private static Map<RetrievalStrategy, StrategyEvaluator.Retrieval> strategiesFor(
-            Engine engine, ChunkIndex index, QueryExpander expander) throws IOException {
+            LexicalEngine engine, ChunkIndex index, QueryExpander expander) throws IOException {
         Map<RetrievalStrategy, StrategyEvaluator.Retrieval> available =
             new EnumMap<>(RetrievalStrategy.class);
         available.put(RetrievalStrategy.BM25,
@@ -232,7 +243,7 @@ public final class CorpusEvaluationRunner {
             return available;
         }
 
-        if (engine == Engine.NATIVE) {
+        if (engine == LexicalEngine.NATIVE) {
             // The native ranker checks a generated formulation's terms against the corpus before
             // searching for them, so what it runs is the gated configuration and there is no
             // ungated one to report beside it.
@@ -259,8 +270,8 @@ public final class CorpusEvaluationRunner {
      * <p>Without these the table says "no retrieval function supplied" for a configuration that
      * cannot exist, which reads as an omission a better-configured run would fill in.</p>
      */
-    private static Map<RetrievalStrategy, String> skipReasonsFor(Engine engine) {
-        if (engine != Engine.NATIVE) {
+    private static Map<RetrievalStrategy, String> skipReasonsFor(LexicalEngine engine) {
+        if (engine != LexicalEngine.NATIVE) {
             return Map.of();
         }
         return Map.of(
@@ -313,34 +324,19 @@ public final class CorpusEvaluationRunner {
         return gate;
     }
 
-    /** Chunks and indexes every file under a directory, reporting what it cost. */
-    private static IndexCost indexCorpus(Path corpus, ChunkIndex index, Path indexDir)
+    /** Indexes every chunk of the corpus, reporting what it cost. */
+    private static IndexCost indexCorpus(EvaluationCorpus corpus, ChunkIndex index, Path indexDir)
             throws IOException {
         long start = System.nanoTime();
-        long bytes = 0;
-        long chunks = 0;
-        try (Stream<Path> files = Files.walk(corpus)) {
-            for (Path file : files.filter(Files::isRegularFile).toList()) {
-                String text;
-                try {
-                    text = Files.readString(file, StandardCharsets.UTF_8);
-                } catch (IOException | RuntimeException e) {
-                    continue;
-                }
-                bytes += text.length();
-                String documentKey = "corpus:" + corpus.relativize(file);
-                for (int offset = 0, n = 0; offset < text.length(); offset += CHUNK_CHARS, n++) {
-                    index.add(documentKey + ":chunk:" + n,
-                        text.substring(offset, Math.min(text.length(), offset + CHUNK_CHARS)));
-                    chunks++;
-                }
-            }
+        for (EvaluationCorpus.Chunk chunk : corpus.chunks()) {
+            index.add(chunk.id(), chunk.text());
         }
         index.refresh();
         double seconds = (System.nanoTime() - start) / 1e9;
         // Measured after the refresh, so what is counted is what a node would be left holding
         // rather than what was still buffered when the clock stopped.
-        return new IndexCost(chunks, bytes, bytesUnder(indexDir), seconds);
+        return new IndexCost(corpus.chunks().size(), corpus.characters(), bytesUnder(indexDir),
+            seconds);
     }
 
     /** Every byte the engine wrote, which is the cost the quality number has to be read against. */

@@ -42,19 +42,22 @@ public enum RetrievalStrategy {
      */
     BM25_EXPANSION_APPROX_VOCAB(true, false, false),
 
-    /** The lexical index, then relationship traversal from what it found. No corpus embedding. */
+    /**
+     * The lexical index fused by rank with the documents the graph route's answer cites. No corpus
+     * embedding, but the corpus's facts extracted by a chat model.
+     */
     BM25_GRAPH(false, true, false),
 
     /** The lexical index fused with dense retrieval. Requires the corpus to be embedded. */
     BM25_VECTOR(false, false, true),
 
-    /** Expansion and traversal together, still with no corpus embedding. */
+    /** Expanded BM25 fused with the graph's citations, still with no corpus embedding. */
     BM25_EXPANSION_GRAPH(true, true, false),
 
-    /** Expansion and dense retrieval, without traversal. */
+    /** Dense retrieval fused with expanded BM25, without the graph. */
     BM25_EXPANSION_VECTOR(true, false, true),
 
-    /** Everything: expansion, traversal and dense retrieval, fused. */
+    /** Everything: dense retrieval fused with expanded BM25, then with the graph's citations. */
     FULL_HYBRID(true, true, true);
 
     private final boolean expansion;

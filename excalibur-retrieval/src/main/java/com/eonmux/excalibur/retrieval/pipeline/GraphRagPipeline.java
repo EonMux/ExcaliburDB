@@ -452,7 +452,7 @@ public final class GraphRagPipeline {
         SerializedSubgraph facts = serializer.serialize(subgraph,
             new SerializationBudget(budget.maxTokens() - cost, budget.counter()), relevance);
         String text = line + facts.text();
-        return new SerializedSubgraph(text, budget.counter().count(text), facts.edgesIncluded(),
+        return new SerializedSubgraph(text, budget.counter().count(text), facts.edges(),
             facts.edgesDropped(), facts.format());
     }
 

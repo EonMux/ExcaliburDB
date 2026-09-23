@@ -183,6 +183,47 @@ class TripleSubgraphSerializerTest {
     }
 
     @Test
+    @DisplayName("names the facts it stated, in the order it stated them")
+    void reportsTheFactsItStated() {
+        // A caller citing the context - which document each fact came from - has to know which
+        // facts made it in and in what order. Re-deriving that from the text would be a second
+        // parser of a format that is free to change, and re-ranking the subgraph would be a
+        // second copy of the ranking.
+        SubgraphEdge deep = edge(0, 1, 900, 0, 4, 99);
+        SubgraphEdge shallow = edge(0, 1, 100, 1, 1, 50);
+        SubgraphEdge middle = edge(0, 1, 500, 2, 2, 50);
+        Subgraph subgraph = new Subgraph.Builder()
+            .seed(0).edge(deep).edge(shallow).edge(middle).build();
+
+        SerializedSubgraph all = serializer.serialize(
+            subgraph, budget(100_000), SeedRelevance.uniform());
+
+        assertThat(all.edges()).containsExactly(shallow, middle, deep);
+        assertThat(all.edgesIncluded()).isEqualTo(3);
+    }
+
+    @Test
+    @DisplayName("a fact the budget left out is not named as stated")
+    void factsLeftOutAreNotNamed() {
+        SubgraphEdge deep = edge(0, 1, 900, 0, 4, 99);
+        SubgraphEdge shallow = edge(0, 1, 100, 1, 1, 50);
+        Subgraph subgraph = new Subgraph.Builder().seed(0).edge(deep).edge(shallow).build();
+
+        SerializedSubgraph result = serializer.serialize(
+            subgraph, budget(budgetForOneFact(shallow)), SeedRelevance.uniform());
+
+        assertThat(result.edges()).containsExactly(shallow);
+        assertThat(result.edgesDropped()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("an empty subgraph states no facts")
+    void emptySubgraphStatesNoFacts() {
+        assertThat(serializer.serialize(Subgraph.empty(), budget(1000), SeedRelevance.uniform())
+            .edges()).isEmpty();
+    }
+
+    @Test
     @DisplayName("at equal depth the more confident fact is kept")
     void confidenceBreaksDepthTies() {
         Subgraph subgraph = new Subgraph.Builder()
