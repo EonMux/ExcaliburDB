@@ -3,7 +3,6 @@ package com.eonmux.excalibur.ingest.pipeline;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityRegistry;
-import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.store.VisibilityTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,17 +60,6 @@ public class DocumentBatchPublisher {
     private final Lock publicationLock;
 
     /**
-     * Optional index orchestrator for backpressure checking.
-     * When set, publications will block if the HNSW queue is overloaded.
-     */
-    private final IndexOrchestrator orchestrator;
-
-    /**
-     * Default backpressure timeout in milliseconds (30 seconds).
-     */
-    public static final long DEFAULT_BACKPRESSURE_TIMEOUT_MS = 30_000;
-
-    /**
      * Functional interface for write log operations.
      */
     @FunctionalInterface
@@ -100,34 +88,11 @@ public class DocumentBatchPublisher {
             DocumentVisibilityRegistry visibilityRegistry,
             WriteLogAdapter writeLogAdapter,
             Lock publicationLock) {
-        this(visibilityTracker, documentRegistry, visibilityRegistry, writeLogAdapter,
-             publicationLock, null);
-    }
-
-    /**
-     * Creates a new DocumentBatchPublisher with backpressure support.
-     *
-     * @param visibilityTracker The visibility tracker for epoch management
-     * @param documentRegistry The document registry for metadata tracking
-     * @param visibilityRegistry The visibility registry for document-atomic visibility (may be null)
-     * @param writeLogAdapter The write log adapter for fsync operations
-     * @param publicationLock Lock for serializing publications (may be null)
-     * @param orchestrator The index orchestrator for backpressure checking (may be null)
-     * @throws NullPointerException if visibilityTracker or documentRegistry is null
-     */
-    public DocumentBatchPublisher(
-            VisibilityTracker visibilityTracker,
-            DocumentRegistry documentRegistry,
-            DocumentVisibilityRegistry visibilityRegistry,
-            WriteLogAdapter writeLogAdapter,
-            Lock publicationLock,
-            IndexOrchestrator orchestrator) {
         this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "visibilityTracker must not be null");
         this.documentRegistry = Objects.requireNonNull(documentRegistry, "documentRegistry must not be null");
         this.visibilityRegistry = visibilityRegistry;
         this.writeLogAdapter = writeLogAdapter;
         this.publicationLock = publicationLock;
-        this.orchestrator = orchestrator;
     }
 
     /**
@@ -144,7 +109,7 @@ public class DocumentBatchPublisher {
             DocumentRegistry documentRegistry,
             WriteLogAdapter writeLogAdapter,
             Lock publicationLock) {
-        this(visibilityTracker, documentRegistry, null, writeLogAdapter, publicationLock, null);
+        this(visibilityTracker, documentRegistry, null, writeLogAdapter, publicationLock);
     }
 
     /**
@@ -199,23 +164,6 @@ public class DocumentBatchPublisher {
      * Internal publication logic without lock handling.
      */
     private PublicationResult doPublish(DocumentBatchBuffer buffer, DocumentMetadata metadata) {
-        // Check backpressure from orchestrator if available
-        if (orchestrator != null && orchestrator.isBackpressured()) {
-            LOGGER.debug("Backpressure detected, waiting for release before publishing document: {}",
-                buffer.getDocumentId());
-
-            if (!orchestrator.awaitBackpressureRelease(DEFAULT_BACKPRESSURE_TIMEOUT_MS)) {
-                long queueDepth = orchestrator.getHnswQueueDepth();
-                int queueLimit = orchestrator.getHnswQueueDepthLimit();
-                throw new PublicationException(String.format(
-                    "HNSW queue backpressure timeout. Queue depth: %d, limit: %d",
-                    queueDepth, queueLimit));
-            }
-
-            LOGGER.debug("Backpressure released, proceeding with publication for document: {}",
-                buffer.getDocumentId());
-        }
-
         String documentId = buffer.getDocumentId();
         String sourceId = buffer.getSourceId();
         int chunkCount = buffer.getChunkCount();
@@ -315,22 +263,6 @@ public class DocumentBatchPublisher {
     private BulkPublicationResult doPublishBulk(
             List<DocumentBatchBuffer> buffers,
             List<DocumentMetadata> metadataList) {
-        // Check backpressure from orchestrator if available
-        if (orchestrator != null && orchestrator.isBackpressured()) {
-            LOGGER.debug("Backpressure detected, waiting for release before bulk publishing {} documents",
-                buffers.size());
-
-            if (!orchestrator.awaitBackpressureRelease(DEFAULT_BACKPRESSURE_TIMEOUT_MS)) {
-                long queueDepth = orchestrator.getHnswQueueDepth();
-                int queueLimit = orchestrator.getHnswQueueDepthLimit();
-                throw new PublicationException(String.format(
-                    "HNSW queue backpressure timeout during bulk publish. Queue depth: %d, limit: %d",
-                    queueDepth, queueLimit));
-            }
-
-            LOGGER.debug("Backpressure released, proceeding with bulk publication");
-        }
-
         int totalChunks = 0;
         for (DocumentBatchBuffer buffer : buffers) {
             totalChunks += buffer.getChunkCount();

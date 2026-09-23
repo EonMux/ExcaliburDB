@@ -38,7 +38,6 @@ public final class FixedBucketHistogram {
     
     private long[] buckets;
     private long totalEntries;
-    private volatile long currentEpoch;
 
     // Samples past the last bucket, kept as real numbers rather than clamped into it. The
     // clamp made a 45-second query and a ten-second one the same measurement, so a tail
@@ -69,19 +68,6 @@ public final class FixedBucketHistogram {
     }
     
     /**
-     * Records a measurement and associates it with the current epoch.
-     *
-     * @param latencyMs Latency in milliseconds
-     * @param epoch Current visibility epoch
-     */
-    public void record(long latencyMs, long epoch) {
-        synchronized (this) {
-            place(latencyMs);
-            this.currentEpoch = epoch;
-        }
-    }
-
-    /**
      * Files one sample, in a bucket or in the overflow tally. Caller holds the lock.
      */
     private void place(long latencyMs) {
@@ -94,17 +80,6 @@ public final class FixedBucketHistogram {
             buckets[getBucketIndex(latencyMs)]++;
         }
         totalEntries++;
-    }
-    
-    /**
-     * Sets the current epoch.
-     *
-     * @param epoch New epoch number
-     */
-    public void setEpoch(long epoch) {
-        synchronized (this) {
-            this.currentEpoch = epoch;
-        }
     }
     
     /**
@@ -202,18 +177,6 @@ public final class FixedBucketHistogram {
             if (lastBucket == -1) return 0;
             return (long) (lastBucket * 10000.0 / NUM_BUCKETS);
         }
-    }
-
-    /**
-     * Gets the epoch this histogram was last told about (instance method).
-     *
-     * <p>Moved by {@link #setEpoch(long)} and {@link #record(long, long)} alike. It is not the
-     * node's published visibility epoch - {@code Metrics.getCurrentEpoch()} owns that, and is
-     * what the epoch-bearing MBeans report, so that a query recording the epoch it read at
-     * cannot move the number an operator watches.</p>
-     */
-    public long getCurrentEpoch() {
-        return currentEpoch;
     }
 
     // Convenience methods for common percentiles (static for Metrics access)

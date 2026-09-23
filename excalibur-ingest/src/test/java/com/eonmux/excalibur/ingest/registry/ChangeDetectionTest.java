@@ -7,7 +7,6 @@ import com.eonmux.excalibur.ingest.source.SourceException;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.util.Iterator;
 import java.util.List;
 import java.util.stream.Stream;
 

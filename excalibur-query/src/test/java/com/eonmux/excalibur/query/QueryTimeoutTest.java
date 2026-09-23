@@ -2,13 +2,9 @@ package com.eonmux.excalibur.query;
 
 import com.eonmux.excalibur.query.executor.CancellationToken;
 import com.eonmux.excalibur.query.executor.QueryRegistry;
-import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.AfterEach;
 
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;

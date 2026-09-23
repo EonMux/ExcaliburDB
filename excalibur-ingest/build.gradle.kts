@@ -12,7 +12,7 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
 
-    // Phase 1 (Core primitives - TermExtractor for text processing)
+    // Core primitives: chunk identifiers, payload codec, hashing, stop signals
     implementation(project(":excalibur-core"))
 
     // A registration names the namespace its documents belong to, and NamespaceId is what makes

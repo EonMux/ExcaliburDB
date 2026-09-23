@@ -1,16 +1,12 @@
 package com.eonmux.excalibur.ingest.processor;
 
-import com.eonmux.excalibur.core.text.TermExtractor;
-
-import java.util.List;
 import java.util.Objects;
 
 /**
  * Represents a text chunk produced by the chunker.
  *
  * <h2>Thread Safety</h2>
- * <p>This class is immutable and thread-safe. Its {@linkplain #terms() terms} are worked out on
- * first use and kept.</p>
+ * <p>This class is immutable and thread-safe.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
@@ -29,9 +25,6 @@ public final class TextChunk {
     private final int startOffset;
     private final int endOffset;
     private final int chunkIndex;
-
-    /** The text's terms, once something has asked for them; see {@link #terms()}. */
-    private List<String> terms;
 
     public TextChunk(String documentId, String text, int tokenCount, int startOffset, int endOffset, int chunkIndex) {
         if (documentId == null || documentId.isEmpty()) {
@@ -86,25 +79,6 @@ public final class TextChunk {
 
     public int getCharLength() {
         return text.length();
-    }
-
-    /**
-     * The chunk's terms, as {@link TermExtractor#extractTerms(String)} finds them in its text:
-     * in order, with repetition.
-     *
-     * <p>A consumer that needs a chunk's terms reads them from here, so the text is tokenised
-     * once however often they are asked for.</p>
-     *
-     * <p>Worked out on first use and kept. Synchronized so that holds under concurrent first
-     * calls too; after the first, the cost is an uncontended lock.</p>
-     *
-     * @return The terms, unmodifiable; empty when the text holds none
-     */
-    public synchronized List<String> terms() {
-        if (terms == null) {
-            terms = List.copyOf(TermExtractor.extractTerms(text));
-        }
-        return terms;
     }
 
     @Override

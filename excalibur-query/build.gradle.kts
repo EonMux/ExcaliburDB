@@ -12,7 +12,7 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
 
-    // Phase 1 (Core primitives - TermExtractor for query text processing)
+    // Core primitives: chunk identifiers, payload codec, structured logging
     implementation(project(":excalibur-core"))
 
     // Configuration module

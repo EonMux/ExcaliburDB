@@ -1,6 +1,6 @@
 # ExcaliburDB
 
-A disk-backed search engine for large document corpora. Every node ranks with BM25 over its own inverted index; a node with an embedding model adds approximate nearest neighbor (ANN) vector search over memory-mapped segments with hierarchical filtering, fused with BM25 by reciprocal rank, and a node with a chat model can re-rank with LLM-based relevancy scoring.
+A disk-backed search engine for large document corpora. Every node ranks with BM25 over its own inverted index; a node with an embedding model adds approximate nearest neighbor (ANN) vector search over memory-mapped segments, fused with BM25 by reciprocal rank, and a node with a chat model can re-rank with LLM-based relevancy scoring.
 
 ## Overview
 
@@ -3237,8 +3237,7 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 - `TailScanIntegrationTest` - Tail scan for unindexed entries
 - `TailScanHandoffIntegrationTest` - Chunks written by the real pipeline are answerable from the write-ahead log before the graph absorbs them
 - `ConcurrentDeletionIntegrationTest` - Cuckoo filter deletes from several threads, alone and interleaved with inserts, leave exactly the expected set
-- `DeletionLifecycleIntegrationTest` - Insert, query, delete and re-query across flat and hierarchical filters, then again at stress volume
-- `HierarchicalDeletionPropagationIntegrationTest` - A delete reaches the corpus and segment levels of the hierarchical filter, including under concurrency
+- `DeletionLifecycleIntegrationTest` - Rounds of Cuckoo filter inserts and deletes at stress volume leave every live key present and every deleted one gone
 - `DocumentErasureIntegrationTest` - An erased document leaves storage, the lexical index's files and vector search, through the node's own erasure wiring
 - `GraphRouteIntegrationTest` - A document ingested from a directory, with extraction against a stand-in OpenAI-compatible chat endpoint, is built into the graph and answered from over HTTP as of a date after its fact began, and declined as of one before
 - `LshHnswEntryIdContractTest` - The LSH index returns ids in the HNSW graph's id space, so the candidates stage 2 measures are the nodes the buckets describe

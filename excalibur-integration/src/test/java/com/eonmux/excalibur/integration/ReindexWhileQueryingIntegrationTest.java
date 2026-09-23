@@ -1,9 +1,6 @@
 package com.eonmux.excalibur.integration;
 
-import com.eonmux.excalibur.ingest.pipeline.DocumentBatchBuffer;
-import com.eonmux.excalibur.ingest.pipeline.DocumentBatchPublisher;
 import com.eonmux.excalibur.ingest.processor.TextChunk;
-import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.query.IndexCoverage;
 import com.eonmux.excalibur.query.QueryRequest;
@@ -49,10 +46,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
 
 /**
  * Integration tests for re-indexing while querying.
@@ -95,7 +90,6 @@ class ReindexWhileQueryingIntegrationTest {
     private WriteLog writeLog;
     private AtomicDocumentWriter documentWriter;
     private DocumentRegistry documentRegistry;
-    private DocumentBatchPublisher publisher;
 
     @BeforeEach
     void setUp() throws IOException {
@@ -119,14 +113,6 @@ class ReindexWhileQueryingIntegrationTest {
         // Create ingestion infrastructure
         documentWriter = new AtomicDocumentWriter(writeLog);
         documentRegistry = new DocumentRegistry();
-        publisher = new DocumentBatchPublisher(
-            visibilityTracker,
-            documentRegistry,
-            // com.eonmux.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
-            // durability barrier is already satisfied before the adapter runs.
-            () -> { },
-            new ReentrantLock()
-        );
     }
 
     @AfterEach

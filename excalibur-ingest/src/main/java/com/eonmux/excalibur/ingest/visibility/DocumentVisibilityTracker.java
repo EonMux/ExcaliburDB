@@ -429,6 +429,17 @@ public class DocumentVisibilityTracker {
     }
 
     /**
+     * Whether this tracker knows about the document, committed or in flight.
+     *
+     * @param documentId The document identifier
+     * @return true when the document is tracked
+     */
+    public boolean isDocumentTracked(String documentId) {
+        Objects.requireNonNull(documentId, "documentId must not be null");
+        return documentVisibility.containsKey(documentId) || pendingChunks.containsKey(documentId);
+    }
+
+    /**
      * Checks if a document is fully visible at the specified query epoch.
      *
      * <p>A document is fully visible if:</p>
@@ -442,17 +453,6 @@ public class DocumentVisibilityTracker {
      * @param queryEpoch The epoch at which the query was started
      * @return true if the document is fully visible at the query epoch
      */
-    /**
-     * Whether this tracker knows about the document, committed or in flight.
-     *
-     * @param documentId The document identifier
-     * @return true when the document is tracked
-     */
-    public boolean isDocumentTracked(String documentId) {
-        Objects.requireNonNull(documentId, "documentId must not be null");
-        return documentVisibility.containsKey(documentId) || pendingChunks.containsKey(documentId);
-    }
-
     public boolean isDocumentFullyVisible(String documentId, long queryEpoch) {
         Objects.requireNonNull(documentId, "documentId must not be null");
 

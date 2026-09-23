@@ -3,12 +3,10 @@ package com.eonmux.excalibur.query.visibility;
 import com.eonmux.excalibur.query.QueryRequest;
 import com.eonmux.excalibur.query.QueryResponse;
 import com.eonmux.excalibur.query.executor.SegmentQueryTask;
-import com.eonmux.excalibur.store.LifecycleState;
 import com.eonmux.excalibur.store.Segment;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
 import com.eonmux.excalibur.vector.hnsw.HnswGraph;
-import com.eonmux.excalibur.vector.hnsw.HnswSearchResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

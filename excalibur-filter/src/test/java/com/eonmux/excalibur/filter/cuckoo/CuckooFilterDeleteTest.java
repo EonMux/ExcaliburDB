@@ -382,13 +382,13 @@ class CuckooFilterDeleteTest {
             }
         }
 
-        double expected = deletedCount * filter.estimateFpRate();
+        double expected = deletedCount * FalsePositiveModel.expectedRate(filter);
         int allowed = poissonUpperBound(expected, FP_BOUND_ALPHA);
 
         assertThat(stillReported)
             .as("deleted items still reported present (%d) must stay within the %.4f%% FP budget "
                     + "(expected %.3f, bound %d at seed 0x%X)",
-                stillReported, filter.estimateFpRate() * 100, expected, allowed, filter.seed())
+                stillReported, FalsePositiveModel.expectedRate(filter) * 100, expected, allowed, filter.seed())
             .isLessThanOrEqualTo(allowed);
     }
 
@@ -454,13 +454,13 @@ class CuckooFilterDeleteTest {
             }
         }
 
-        double expected = 128 * filter.estimateFpRate();
+        double expected = 128 * FalsePositiveModel.expectedRate(filter);
         int allowed = poissonUpperBound(expected, FP_BOUND_ALPHA);
 
         assertThat(stillReported)
             .as("deleted bytes still reported present (%d) must stay within the %.4f%% FP budget "
                     + "(expected %.3f, bound %d at seed 0x%X)",
-                stillReported, filter.estimateFpRate() * 100, expected, allowed, filter.seed())
+                stillReported, FalsePositiveModel.expectedRate(filter) * 100, expected, allowed, filter.seed())
             .isLessThanOrEqualTo(allowed);
     }
 

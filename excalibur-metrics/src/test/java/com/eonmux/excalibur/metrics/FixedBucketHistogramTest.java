@@ -109,17 +109,6 @@ class FixedBucketHistogramTest {
     }
 
     @Test
-    @DisplayName("setEpoch and an epoch-stamped latency both move the histogram's epoch")
-    void testEpochTracking() {
-        histogram.setEpoch(11L);
-        assertEquals(11L, histogram.getCurrentEpoch(), "setEpoch moves the epoch");
-
-        histogram.record(25, 12L);
-        assertEquals(12L, histogram.getCurrentEpoch(),
-            "an epoch-stamped latency also advances the histogram's own epoch");
-    }
-
-    @Test
     @DisplayName("reset() discards latencies")
     void testReset() {
         histogram.record(25);

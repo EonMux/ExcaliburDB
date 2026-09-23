@@ -1,9 +1,7 @@
 package com.eonmux.excalibur.integration;
 
 import com.eonmux.excalibur.ingest.pipeline.DocumentBatchBuffer;
-import com.eonmux.excalibur.ingest.pipeline.DocumentBatchPublisher;
 import com.eonmux.excalibur.ingest.processor.TextChunk;
-import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.query.IndexCoverage;
 import com.eonmux.excalibur.query.QueryRequest;
@@ -22,7 +20,6 @@ import com.eonmux.excalibur.vector.distance.CosineSimilarity;
 import com.eonmux.excalibur.vector.distance.DistanceFunction;
 import com.eonmux.excalibur.vector.hnsw.HnswConfig;
 import com.eonmux.excalibur.vector.hnsw.HnswGraph;
-import com.eonmux.excalibur.vector.hnsw.HnswSearchResult;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -33,8 +30,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -48,11 +43,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
 
 /**
  * Integration tests for the full pipeline: ingest → query → verify.
@@ -94,7 +86,6 @@ class FullPipelineIntegrationTest {
     private WriteLog writeLog;
     private AtomicDocumentWriter documentWriter;
     private DocumentRegistry documentRegistry;
-    private DocumentBatchPublisher publisher;
 
     @BeforeEach
     void setUp() throws IOException {
@@ -118,14 +109,6 @@ class FullPipelineIntegrationTest {
         // Create ingestion infrastructure
         documentWriter = new AtomicDocumentWriter(writeLog);
         documentRegistry = new DocumentRegistry();
-        publisher = new DocumentBatchPublisher(
-            visibilityTracker,
-            documentRegistry,
-            // com.eonmux.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
-            // durability barrier is already satisfied before the adapter runs.
-            () -> { },
-            new ReentrantLock()
-        );
     }
 
     @AfterEach

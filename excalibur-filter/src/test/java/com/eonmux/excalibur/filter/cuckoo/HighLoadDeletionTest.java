@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.filter.cuckoo;
 
 import com.eonmux.excalibur.filter.CuckooFilter;
+import com.eonmux.excalibur.filter.FalsePositiveModel;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -64,7 +65,7 @@ class HighLoadDeletionTest {
     void absentDeleteSucceedsOnlyOnFingerprintCollision() {
         CuckooFilter filter = CuckooFilter.create(50_000, FINGERPRINT_BITS, SEED);
         int resident = fill(filter, LOAD_FACTOR);
-        double fpRate = filter.estimateFpRate();
+        double fpRate = FalsePositiveModel.expectedRate(filter);
 
         int probes = 200_000;
         int collisions = 0;
@@ -106,7 +107,7 @@ class HighLoadDeletionTest {
         // deleted key visible: the rate is the lookup false positive rate at this load, not the
         // collision chance of the seven slots left beside the deleted entry, which a correct
         // filter exceeds at this load.
-        double rate = filter.estimateFpRate();
+        double rate = FalsePositiveModel.expectedRate(filter);
 
         int stillVisible = 0;
         for (int i = 0; i < resident; i++) {
