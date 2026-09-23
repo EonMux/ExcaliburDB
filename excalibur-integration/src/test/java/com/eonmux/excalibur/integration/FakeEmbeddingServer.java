@@ -26,6 +26,9 @@ import java.util.concurrent.Executors;
  * <p>{@code POST /v1/chat/completions} is answered with an empty completion, which every caller
  * on a node treats as the model having nothing to add, so a node configured against this endpoint
  * runs its embedding path for real and its chat features as though the model declined.</p>
+ *
+ * <p>USAGE.md's embedded example carries its own embeddings-only copy: its source set compiles
+ * against exactly the dependencies the example documents, and none of the test classes.</p>
  */
 final class FakeEmbeddingServer implements AutoCloseable {
 

@@ -263,8 +263,20 @@ class ChunkAttributionNodeTest {
         assertThat(condition.getAsBoolean()).as(what).isTrue();
     }
 
-    /** Asks the node a question and returns its results, text included. */
-    private List<Map<String, Object>> query(String question) throws Exception {
+    /**
+     * What the node answered: its results, and the body they came in, which is what a failed
+     * assertion about them has to show.
+     */
+    private record Answer(List<Map<String, Object>> results, String body) {
+
+        Map<String, Object> top() {
+            assertThat(results).as(body).isNotEmpty();
+            return results.getFirst();
+        }
+    }
+
+    /** Asks the node a question and returns its answer, text included. */
+    private Answer query(String question) throws Exception {
         Reply reply = send("POST", "/v1/query", "{\"query\":" + Json.write(question)
             + ",\"top_k\":10,\"enable_llm_scoring\":false,\"include_text\":true,"
             + "\"snippet\":true,\"timeout_ms\":30000}");
@@ -279,7 +291,30 @@ class ChunkAttributionNodeTest {
             Map<String, Object> item = (Map<String, Object>) result;
             results.add(item);
         }
-        return results;
+        return new Answer(results, reply.body());
+    }
+
+    /**
+     * Asks until the top result carries both signals, and returns the last answer either way.
+     *
+     * <p>A chunk is searchable by BM25 from the visibility epoch after the one its lexical
+     * segment was published in, and the epoch advances on the node's own tick, so a question put
+     * as soon as ingestion returns can be answered before the chunk is in the lexical half. The
+     * assertions made on the answer are the test; this only waits out that lag.</p>
+     */
+    private Answer queryBothSignals(String question) throws Exception {
+        long deadline = System.nanoTime() + WAIT.toNanos();
+        Answer answer = query(question);
+        while (!carriesBothSignals(answer) && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+            answer = query(question);
+        }
+        return answer;
+    }
+
+    private static boolean carriesBothSignals(Answer answer) {
+        return !answer.results().isEmpty()
+            && signalsOf(answer.results().getFirst()).containsAll(List.of("vector", "bm25"));
     }
 
     private static String idOf(Map<String, Object> result) {
@@ -312,15 +347,16 @@ class ChunkAttributionNodeTest {
             .containsExactlyInAnyOrder(SOURCE + ":tiering.md:chunk:0",
                 SOURCE + ":graphs.md:chunk:0");
 
-        List<Map<String, Object>> results =
-            query("which tiering policy moves cold segments onto cheaper disks");
+        Answer answer =
+            queryBothSignals("which tiering policy moves cold segments onto cheaper disks");
 
-        Map<String, Object> top = results.getFirst();
-        assertThat(idOf(top)).isEqualTo(SOURCE + ":tiering.md:chunk:0");
+        Map<String, Object> top = answer.top();
+        assertThat(idOf(top)).as(answer.body()).isEqualTo(SOURCE + ":tiering.md:chunk:0");
         assertThat(signalsOf(top))
-            .as("vector search and BM25 named the same chunk, so fusion merged them")
+            .as("vector search and BM25 named the same chunk, so fusion merged them: %s",
+                answer.body())
             .containsExactlyInAnyOrder((Object) "vector", "bm25");
-        assertThat(results).extracting(ChunkAttributionNodeTest::idOf)
+        assertThat(answer.results()).extracting(ChunkAttributionNodeTest::idOf)
             .as("a chunk is one result, and no result names a bare document")
             .doesNotHaveDuplicates()
             .allSatisfy(id -> assertThat(id).contains(":chunk:"));
@@ -350,7 +386,7 @@ class ChunkAttributionNodeTest {
             .containsExactlyInAnyOrder(SOURCE + ":notes.md:chunk:0",
                 SOURCE + ":graphs.md:chunk:0");
 
-        List<Map<String, Object>> results = query(earlier.substring(0, 200));
+        List<Map<String, Object>> results = query(earlier.substring(0, 200)).results();
         assertThat(results).extracting(ChunkAttributionNodeTest::idOf)
             .as("nothing ranks under a chunk the document no longer has")
             .noneMatch(id -> id.startsWith(SOURCE + ":notes.md:chunk:")
@@ -379,7 +415,7 @@ class ChunkAttributionNodeTest {
         assertThat(node.liveAttributions())
             .as("every chunk of the erased document has lost its vector")
             .containsExactly(SOURCE + ":graphs.md:chunk:0");
-        assertThat(query(secret.substring(0, 200))).extracting(ChunkAttributionNodeTest::idOf)
+        assertThat(query(secret.substring(0, 200)).results()).extracting(ChunkAttributionNodeTest::idOf)
             .noneMatch(id -> ChunkIdentifiers.documentKeyOfChunk(id)
                 .equals(SOURCE + ":secret.md"));
     }
@@ -406,10 +442,11 @@ class ChunkAttributionNodeTest {
         assertThat(node.liveAttributions()).containsExactlyInAnyOrder(
             SOURCE + ":tiering.md:chunk:0", SOURCE + ":graphs.md:chunk:0");
 
-        Map<String, Object> top =
-            query("which tiering policy moves cold segments onto cheaper disks").getFirst();
-        assertThat(idOf(top)).isEqualTo(SOURCE + ":tiering.md:chunk:0");
-        assertThat(signalsOf(top)).contains((Object) "vector", "bm25");
+        Answer answer =
+            queryBothSignals("which tiering policy moves cold segments onto cheaper disks");
+        Map<String, Object> top = answer.top();
+        assertThat(idOf(top)).as(answer.body()).isEqualTo(SOURCE + ":tiering.md:chunk:0");
+        assertThat(signalsOf(top)).as(answer.body()).contains((Object) "vector", "bm25");
 
         node.close();
         node = null;
