@@ -400,13 +400,17 @@ that is gone is marked purged, through the engine's own catalog code, rather tha
 write-ahead log that ends in a torn record — an append that never completed — has that record's
 opcode cleared, the same one-byte write the log itself makes when an append fails its fsync, so
 the log reads as ending before it. What it will not attempt matters as much as what it will: a
-damaged `catalog.dat`, a damaged `routing.dir`, a routing slot pointing at a missing segment, or
-a write-ahead log damaged in the middle are all reported under *needs an operator* and left
-alone. Which hash slot belongs to which segment after a split is not recoverable from file
-names — that is why the directory is written down — and the records behind damage in a log were
-fsynced and acknowledged, so trimming past them would destroy committed writes. A log damaged in
-the middle is not moved aside either, for the same reason: setting the file aside sets those
-records aside with it, and unlike an index, nothing rebuilds a log.
+damaged `catalog.dat`, a damaged `routing.dir`, a routing slot pointing at a missing segment, a
+write-ahead log damaged in the middle, or a damaged lexical store `manifest` are all reported under
+*needs an operator* and left alone. Which hash slot belongs to which segment after a split is not
+recoverable from file names — that is why the directory is written down — and the records behind
+damage in a log were fsynced and acknowledged, so trimming past them would destroy committed
+writes. A log damaged in the middle is not moved aside either, for the same reason: setting the
+file aside sets those records aside with it, and unlike an index, nothing rebuilds a log. Nor is a
+lexical manifest: a store without one opens as a new, empty index and deletes every segment the
+empty manifest does not name. A damaged lexical segment, by contrast, is moved aside like any
+damaged file — the node keeps it out of every query either way, and its next compaction rebuilds
+it from its key table and the stored text.
 
 Damaged files are moved into a timestamped directory beside the data directory unless
 `--quarantine-dir=<path>` names another. It takes the `--flag=value` form only. The default needs
@@ -917,7 +921,12 @@ manifest swap at the end takes the index exclusively, and that is a rename and s
 indexed, segments, live and erased chunk counts, and `oldestErasureAgeMs` — how long the oldest
 undischarged erasure request has been waiting, to compare against `lexical-max-latency-seconds`.
 Nothing else in that response would show a deadline going unmet, because nothing else in the node
-holds one.
+holds one. The same block counts what the index holds and cannot search: `unsearchableChunks` in
+`unreadableSegments` segments it could not open, each named under `unreadable` with whether a
+compaction can rebuild it, and `outdatedSegments` still in an older format. `/metrics` carries them
+as `excalibur_lexical_chunks{state="unsearchable"}`, `excalibur_lexical_unreadable_segments` and
+`excalibur_lexical_outdated_segments`. A damaged segment does not make the node unready: it keeps
+answering from the rest, the way it does with a segment that has no vector index.
 
 **What it does with damaged text.** The native index keeps postings, not text, so a compaction
 reads each surviving chunk's text back out of storage. Text whose stored entry fails its checksum
@@ -1799,6 +1808,8 @@ curl http://localhost:8080/v1/compact/status
     "segments_produced": 3,
     "chunks_removed": 1840,
     "groups_abandoned": 0,
+    "segments_rebuilt": 0,
+    "segments_upgraded": 0,
     "reason": "full rewrite"
   }
 }
@@ -1833,7 +1844,11 @@ than by interrupting it: the index's files are shared with every query, and inte
 in the middle of file I/O would close them underneath those queries. What the rewrite had built so
 far is discarded and nothing is published, so the index is exactly as it was; the run reads
 `cancelled`, and `lexical` reads `performed: false` with a `reason` beginning `stopped:`. The next
-compaction plans again from what is there.
+compaction plans again from what is there. `segments_rebuilt` and `segments_upgraded` are the rewritten segments chosen for what they were rather than for what they
+held: damaged ones that are searchable again, and ones written in an older format that are now in
+the current one. Every compaction takes these on, whatever its policy says — every rebuildable
+damaged segment, and up to the merge fan-in of older-format ones, oldest first — so a run that
+reports them can be due for no other reason.
 
 ### Stats Example
 
@@ -1871,7 +1886,8 @@ curl http://localhost:8080/v1/stats
     "engine": "native", "indexed": 15000000, "segments": 12,
     "liveChunks": 14980000, "erasedChunks": 20000, "erasedRatio": 0.0013,
     "erasureRequests": 3, "oldestErasureAgeMs": 412000, "compactionDue": false,
-    "unreadableChunksDropped": 0
+    "unreadableChunksDropped": 0, "unsearchableChunks": 0, "unreadableSegments": 0,
+    "outdatedSegments": 0
   },
   "graph": {
     "namespaces": {"open": 3, "maxOpen": 16, "evictions": 41},
@@ -2543,14 +2559,22 @@ The BM25 index is covered the same way. A lexical segment's `index.meta` carries
 CRC32C for each of its columns, plus one over itself, and a segment is verified before any column
 is mapped — the digests are taken after the columns are forced, so they describe what the device
 accepted rather than what the page cache was handed. A damaged segment is quarantined: left on
-disk, named in the store's unreadable list, kept out of every query, and counted, rather than
-allowed to look like a corpus that has quietly shrunk. A lexical segment is written once and
-never edited — erasure and compaction both produce a new segment — so there is no unsealed state
-for this format.
+disk, kept out of every query, and reported — its chunks count as `unsearchableChunks` rather than
+`liveChunks` on `/v1/stats`, and the segment is named under `lexical.unreadable` — rather than
+allowed to look like a corpus that has quietly shrunk. It is not left that way. A compaction reads
+nothing from a segment's postings: it rebuilds a segment from its key table and the chunk text in
+storage, so while the key table beside a damaged segment is intact the next compaction rebuilds
+it, and the sweep that enforces `lexical-max-latency-seconds` asks for that compaction on a node
+that is not ingesting. A segment whose key table is damaged too is reported as not rebuildable,
+and only reindexing its documents brings them back. A lexical segment is written once and never
+edited — erasure and compaction both produce a new segment — so there is no unsealed state for
+this format.
 
 Across all of these, an index written before its format carried checksums is read at its own
 version, left byte-for-byte alone, and reported *legacy, unprotected*. There is no migration step
-and nothing to undo; a file becomes protected the first time something rewrites it.
+and nothing to undo; a file becomes protected the first time something rewrites it. For the lexical
+index that happens without being asked: compaction treats a segment in an older format as owing a
+rewrite, and upgrades a few of them on each pass until none are left.
 
 The segment catalog beside them records which segment files this store owns and the lifecycle
 state, integrated offset, source and epochs of each. Its header is written to two slots in turn so

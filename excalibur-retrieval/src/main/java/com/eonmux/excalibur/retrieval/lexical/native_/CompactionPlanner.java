@@ -41,6 +41,19 @@ import java.util.Set;
  *       gigabyte to retire a megabyte's worth of overhead.</li>
  * </ul>
  *
+ * <h2>Segments rewritten for what they are</h2>
+ * <p>Two kinds of segment need rewriting whatever their tombstones say, and the policy - which
+ * judges only tombstones, age and segment count - would never pick either. A segment the store
+ * could not open is kept out of every query, so its documents are missing from every answer until
+ * something rebuilds it; when its key table is sound, a compaction can, since a rewrite reads each
+ * surviving document's text back from the caller rather than from the segment's postings. A
+ * segment written in an older format still answers exactly, but more slowly and without the
+ * checksums that let damage be detected. The store names both in {@link RequiredRewrites}, and
+ * every plan takes them on beside whatever else it chose: damaged segments all at once, because
+ * each is a wrong answer now, and older ones {@code mergeFanIn} at a time, oldest first, because
+ * an upgrade is a whole-corpus rewrite that is better spread across passes than taken in one.
+ * Each is rewritten alone, which keeps its epoch, so neither changes what any reader sees.</p>
+ *
  * <h2>The epoch floor</h2>
  * <p>Merging segments published at different epochs changes what a reader at an epoch between them
  * can see, so a merge is confined to segments at or below the oldest epoch any live reader may
@@ -68,6 +81,33 @@ public final class CompactionPlanner {
      * pass. What one pass leaves undone the next one finishes.</p>
      */
     public static final int DEFAULT_MERGE_FAN_IN = 8;
+
+    /**
+     * Segments a compaction must rewrite because of what they are, not what they hold.
+     *
+     * @param damaged  Segments the store could not open and can rebuild, from a key table that is
+     *                 still sound and the text the compaction is given
+     * @param outdated Segments written in an older format; a segment that is also damaged is
+     *                 counted there instead, since rebuilding it upgrades it too
+     */
+    public record RequiredRewrites(Set<String> damaged, Set<String> outdated) {
+
+        /** Nothing to rewrite beyond what the policy chooses. */
+        public static final RequiredRewrites NONE = new RequiredRewrites(Set.of(), Set.of());
+
+        public RequiredRewrites {
+            damaged = Set.copyOf(Objects.requireNonNull(damaged, "damaged must not be null"));
+            Set<String> older = new HashSet<>(
+                Objects.requireNonNull(outdated, "outdated must not be null"));
+            older.removeAll(damaged);
+            outdated = Set.copyOf(older);
+        }
+
+        /** Whether there is nothing to rewrite. */
+        public boolean isEmpty() {
+            return damaged.isEmpty() && outdated.isEmpty();
+        }
+    }
 
     private final CompactionPolicy policy;
     private final double tombstoneRatio;
@@ -149,15 +189,36 @@ public final class CompactionPlanner {
     public Optional<CompactionPlan> plan(List<SegmentManifest.Entry> segments,
                                          Optional<Instant> oldestOutstanding, Instant now,
                                          long floorEpoch) {
+        return plan(segments, oldestOutstanding, now, floorEpoch, RequiredRewrites.NONE);
+    }
+
+    /**
+     * Plans a compaction, or nothing when the policy declines and nothing has to be rewritten.
+     *
+     * @param segments          The store's segments
+     * @param oldestOutstanding When the longest-waiting erasure was promised, if any
+     * @param now               The current time
+     * @param floorEpoch        The oldest epoch any live reader may still query at
+     * @param required          Segments to rewrite whatever the policy decides; names the store
+     *                          no longer holds are ignored
+     */
+    public Optional<CompactionPlan> plan(List<SegmentManifest.Entry> segments,
+                                         Optional<Instant> oldestOutstanding, Instant now,
+                                         long floorEpoch, RequiredRewrites required) {
         Objects.requireNonNull(segments, "segments must not be null");
         Objects.requireNonNull(oldestOutstanding, "oldestOutstanding must not be null");
         Objects.requireNonNull(now, "now must not be null");
+        Objects.requireNonNull(required, "required must not be null");
         CompactionStats stats = stats(segments, oldestOutstanding);
-        if (!policy.shouldCompact(stats, now)) {
-            return Optional.empty();
+        if (policy.shouldCompact(stats, now)) {
+            boolean overdue = isOverdue(oldestOutstanding, now);
+            return Optional.of(withRequired(
+                select(segments, floorEpoch, overdue, describe(stats, overdue)),
+                segments, required, mergeFanIn));
         }
-        boolean overdue = isOverdue(oldestOutstanding, now);
-        return Optional.of(select(segments, floorEpoch, overdue, describe(stats, overdue)));
+        CompactionPlan rewrites = withRequired(CompactionPlan.nothingToRewrite(""), segments,
+            required, mergeFanIn);
+        return rewrites.rewritesNothing() ? Optional.empty() : Optional.of(rewrites);
     }
 
     /**
@@ -168,7 +229,22 @@ public final class CompactionPlanner {
      * segment above it holding a tombstone is purged.</p>
      */
     public CompactionPlan forcedPlan(List<SegmentManifest.Entry> segments, long floorEpoch) {
+        return forcedPlan(segments, floorEpoch, RequiredRewrites.NONE);
+    }
+
+    /**
+     * As {@link #forcedPlan(List, long)}, rewriting every required segment as well - every one,
+     * outdated segments included, since an operator forcing a compaction has already accepted
+     * its cost.
+     *
+     * @param segments   The store's segments
+     * @param floorEpoch The oldest epoch any live reader may still query at
+     * @param required   Segments to rewrite whatever else is chosen
+     */
+    public CompactionPlan forcedPlan(List<SegmentManifest.Entry> segments, long floorEpoch,
+                                     RequiredRewrites required) {
         Objects.requireNonNull(segments, "segments must not be null");
+        Objects.requireNonNull(required, "required must not be null");
         List<List<String>> groups = new ArrayList<>();
         List<SegmentManifest.Entry> mergeable = new ArrayList<>();
         for (SegmentManifest.Entry entry : segments) {
@@ -187,7 +263,65 @@ public final class CompactionPlanner {
             }
             groups.add(names(chunk));
         }
-        return new CompactionPlan(groups, "forced");
+        return withRequired(new CompactionPlan(groups, "forced"), segments, required,
+            Integer.MAX_VALUE);
+    }
+
+    /**
+     * Adds the required rewrites a plan does not already cover, each as a group of its own.
+     *
+     * @param plan            What was chosen on other grounds
+     * @param segments        The store's segments, in manifest order
+     * @param required        What has to be rewritten regardless
+     * @param outdatedPerPass How many outdated segments one pass may take on
+     * @return The plan with them added, and its reason saying so
+     */
+    private static CompactionPlan withRequired(CompactionPlan plan,
+                                               List<SegmentManifest.Entry> segments,
+                                               RequiredRewrites required, int outdatedPerPass) {
+        if (required.isEmpty()) {
+            return plan;
+        }
+        Set<String> covered = new HashSet<>();
+        plan.groups().forEach(covered::addAll);
+        List<List<String>> groups = new ArrayList<>(plan.groups());
+        int damaged = 0;
+        int outdated = 0;
+        int outdatedTotal = 0;
+        // Manifest order, which is publication order: the oldest outdated segments go first.
+        for (SegmentManifest.Entry entry : segments) {
+            String name = entry.name();
+            boolean isDamaged = required.damaged().contains(name);
+            boolean isOutdated = required.outdated().contains(name);
+            if (isOutdated) {
+                outdatedTotal++;
+            }
+            if (covered.contains(name)) {
+                continue;
+            }
+            if (isDamaged) {
+                groups.add(List.of(name));
+                damaged++;
+            } else if (isOutdated && outdated < outdatedPerPass) {
+                groups.add(List.of(name));
+                outdated++;
+            }
+        }
+        if (damaged == 0 && outdated == 0) {
+            return plan;
+        }
+        List<String> reasons = new ArrayList<>(3);
+        if (!plan.reason().isEmpty()) {
+            reasons.add(plan.reason());
+        }
+        if (damaged > 0) {
+            reasons.add("rebuilding " + damaged + " damaged segment(s)");
+        }
+        if (outdated > 0) {
+            reasons.add("upgrading " + outdated + " of " + outdatedTotal
+                + " segment(s) written in an older format");
+        }
+        return new CompactionPlan(groups, String.join("; ", reasons));
     }
 
     /**

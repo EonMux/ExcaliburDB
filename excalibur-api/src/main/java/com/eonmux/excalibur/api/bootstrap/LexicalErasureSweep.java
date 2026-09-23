@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.bootstrap;
 
 import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
+import com.eonmux.excalibur.ingest.lexical.ChunkIndexStats;
 import com.eonmux.excalibur.retrieval.lexical.native_.CompactionResult;
 
 import org.slf4j.Logger;
@@ -26,10 +27,17 @@ import java.util.function.Function;
  * something and then had nothing else asked of it kept the chunk indefinitely, so the promise
  * held exactly as long as the node stayed busy.</p>
  *
+ * <h2>The other work only a compaction does</h2>
+ * <p>Two more kinds of work wait on a compaction and are just as invisible on a quiet node: a
+ * damaged segment the index can rebuild from stored text, whose chunks no query finds until it
+ * is, and a segment still in an older format after an upgrade. Neither moves the policy's
+ * numbers, and a node that is not ingesting runs no other compaction, so the sweep asks for one
+ * when either is present - which is what lets both finish without an operator forcing it.</p>
+ *
  * <h2>What it costs when there is nothing to do</h2>
- * <p>An integer read. The index reports how many erasure requests it has accepted and not yet
- * discharged, and with none there is nothing any compaction could reclaim, so the planner is
- * never asked and no segment is touched.</p>
+ * <p>A read of the index's own report. With no erasure owed and nothing to rebuild or upgrade
+ * there is nothing any compaction could do, so the planner is never asked and no segment is
+ * touched.</p>
  *
  * <h2>Stopping</h2>
  * <p>A sweep can be in the middle of a rewrite of the whole index when the node shuts down, and
@@ -142,7 +150,7 @@ public final class LexicalErasureSweep implements AutoCloseable {
      */
     public boolean sweep() {
         try {
-            if (stopping || index.stats().erasureRequests() == 0) {
+            if (stopping || !hasWork(index.stats())) {
                 return false;
             }
             CompactionResult result = index.compactIfDue(storedText, () -> stopping);
@@ -157,6 +165,28 @@ public final class LexicalErasureSweep implements AutoCloseable {
             LOGGER.error("lexical erasure sweep failed; the next one will try again", e);
             return false;
         }
+    }
+
+    /**
+     * Whether a compaction now could do anything the index is waiting on.
+     *
+     * <p>An erasure owed, a damaged segment the index can rebuild, or a segment still in an older
+     * format. Not a damaged segment it cannot rebuild: no compaction changes that, and asking for
+     * one every sweep would only repeat the log line that already said so.</p>
+     *
+     * @param stats What the index says about itself
+     * @return true when a compaction is worth asking for
+     */
+    static boolean hasWork(ChunkIndexStats stats) {
+        if (stats.erasureRequests() > 0 || stats.outdatedSegments() > 0) {
+            return true;
+        }
+        for (ChunkIndexStats.UnreadableSegment segment : stats.unreadableSegments()) {
+            if (segment.rebuildable()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

@@ -511,10 +511,16 @@ public final class NativeChunkIndex implements ChunkIndex {
             long epoch = epochs.getAsLong();
             long floor = Math.max(0, epoch - readerLagEpochs);
             var compaction = store.compactionStats();
+            List<ChunkIndexStats.UnreadableSegment> unreadable = new ArrayList<>();
+            for (LexicalStore.DamagedSegment damaged : store.damagedSegments()) {
+                unreadable.add(new ChunkIndexStats.UnreadableSegment(damaged.name(),
+                    damaged.liveDocuments(), damaged.rebuildable(), damaged.reason()));
+            }
             return new ChunkIndexStats(engine(), indexed.get(), compaction.segmentCount(),
                 store.liveDocuments(epoch), compaction.tombstonedRecords(),
                 store.outstandingErasureRequests().size(), compaction.oldestOutstanding(),
-                store.planCompaction(floor).isPresent(), store.unreadableKeysDropped());
+                store.planCompaction(floor).isPresent(), store.unreadableKeysDropped(),
+                unreadable, store.outdatedSegments().size());
         } finally {
             lock.readLock().unlock();
         }

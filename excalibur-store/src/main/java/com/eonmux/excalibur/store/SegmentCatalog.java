@@ -803,20 +803,6 @@ public class SegmentCatalog {
         private final SegmentVisibilityWindow visibility = new SegmentVisibilityWindow();
 
         /**
-         * Reference to the Count-Min Sketch for term frequency estimation.
-         * This is an in-memory reference that provides quick access for the query planner.
-         * The actual sketch data is managed by the Segment object and may be persisted
-         * via memory-mapped files.
-         *
-         * <p>This reference is set when the sketch is attached to the segment during
-         * ingestion. It enables the query pipeline to access the sketch for selectivity
-         * estimation without dereferencing through the Segment object.</p>
-         *
-         * <p>Volatile to ensure visibility across threads after attachment.</p>
-         */
-        private volatile com.eonmux.excalibur.filter.sketch.CountMinSketch termFrequencySketch;
-
-        /**
          * Creates new segment metadata.
          *
          * @param segmentId Unique segment identifier
@@ -1358,39 +1344,6 @@ public class SegmentCatalog {
          */
         public void setTombstoneEpoch(long epoch) {
             visibility.tombstoneEpoch(epoch);
-        }
-
-        /**
-         * Gets the Count-Min Sketch for term frequency estimation.
-         *
-         * <p>The sketch provides approximate term frequency data for the segment,
-         * which is used by the query planner for selectivity estimation.</p>
-         *
-         * @return The Count-Min Sketch, or null if not attached
-         */
-        public com.eonmux.excalibur.filter.sketch.CountMinSketch getTermFrequencySketch() {
-            return termFrequencySketch;
-        }
-
-        /**
-         * Sets the Count-Min Sketch for term frequency estimation.
-         *
-         * <p>This method is typically called during ingestion when the sketch
-         * is created and attached to the segment.</p>
-         *
-         * @param sketch The Count-Min Sketch to attach (may be null)
-         */
-        public void setTermFrequencySketch(com.eonmux.excalibur.filter.sketch.CountMinSketch sketch) {
-            this.termFrequencySketch = sketch;
-        }
-
-        /**
-         * Checks if this segment has a term frequency sketch attached.
-         *
-         * @return true if a sketch is available, false otherwise
-         */
-        public boolean hasTermFrequencySketch() {
-            return termFrequencySketch != null;
         }
 
         /**

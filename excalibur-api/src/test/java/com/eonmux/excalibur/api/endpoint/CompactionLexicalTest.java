@@ -90,6 +90,7 @@ class CompactionLexicalTest {
                 .contains("\"lexical\": {\"performed\": true, \"segments_rewritten\": 12, "
                     + "\"segments_produced\": 2, \"chunks_removed\": 20000, "
                     + "\"groups_abandoned\": 0, "
+                    + "\"segments_rebuilt\": 0, \"segments_upgraded\": 0, "
                     + "\"reason\": \"full rewrite\"}");
         }
     }
@@ -105,6 +106,7 @@ class CompactionLexicalTest {
             assertThat(status(runner)).contains("\"lexical\": {\"performed\": false, "
                 + "\"segments_rewritten\": 0, \"segments_produced\": 0, \"chunks_removed\": 0, "
                 + "\"groups_abandoned\": 0, "
+                + "\"segments_rebuilt\": 0, \"segments_upgraded\": 0, "
                 + "\"reason\": \"not due: 1 of 200 chunk(s) tombstoned\"}");
         }
     }
@@ -157,7 +159,25 @@ class CompactionLexicalTest {
             assertThat(status(runner)).contains("\"lexical\": {\"performed\": false, "
                 + "\"segments_rewritten\": 0, \"segments_produced\": 0, \"chunks_removed\": 0, "
                 + "\"groups_abandoned\": 3, "
+                + "\"segments_rebuilt\": 0, \"segments_upgraded\": 0, "
                 + "\"reason\": \"nothing published: 3 group(s) abandoned\"}");
+        }
+    }
+
+    @Test
+    @DisplayName("segments rebuilt from damage and upgraded from an older format are reported")
+    void rebuiltAndUpgradedSegmentsAreReported() throws Exception {
+        try (CompactionRunner runner = new CompactionRunner((force, stop) -> STORAGE,
+                (force, stop) -> new CompactionResult(true, 3, 3, 0, 0, 1, 2,
+                    "rebuilding 1 damaged segment(s)"))) {
+            runner.start(false);
+            awaitFinished(runner);
+
+            assertThat(runner.snapshot().lexical().segmentsRebuilt()).isEqualTo(1);
+            assertThat(runner.snapshot().lexical().segmentsUpgraded()).isEqualTo(2);
+            assertThat(status(runner)).contains("\"groups_abandoned\": 0, "
+                + "\"segments_rebuilt\": 1, \"segments_upgraded\": 2, "
+                + "\"reason\": \"rebuilding 1 damaged segment(s)\"}");
         }
     }
 
@@ -200,6 +220,7 @@ class CompactionLexicalTest {
             assertThat(status(runner)).contains("\"lexical\": {\"performed\": false, "
                 + "\"segments_rewritten\": 0, \"segments_produced\": 0, \"chunks_removed\": 0, "
                 + "\"groups_abandoned\": 0, "
+                + "\"segments_rebuilt\": 0, \"segments_upgraded\": 0, "
                 + "\"reason\": \"the run was asked to stop before the chunk index was compacted\"}");
         }
     }

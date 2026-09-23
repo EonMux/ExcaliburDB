@@ -505,8 +505,18 @@ public final class MetricsEndpoint implements HttpHandler {
                 lexical.liveDocuments())
             .gauge("excalibur_lexical_chunks", help, Map.of("state", "erased"),
                 lexical.erasedDocuments())
+            // Held on disk in a segment that could not be opened, so matched by no query: the
+            // three states sum to everything the index holds.
+            .gauge("excalibur_lexical_chunks", help, Map.of("state", "unsearchable"),
+                lexical.unsearchableDocuments())
             .gauge("excalibur_lexical_segments", "Segments in the lexical index",
                 lexical.segments())
+            .gauge("excalibur_lexical_unreadable_segments",
+                "Lexical segments that could not be opened and are kept out of every query",
+                lexical.unreadableSegments().size())
+            .gauge("excalibur_lexical_outdated_segments",
+                "Lexical segments in an older format, awaiting rewrite by compaction",
+                lexical.outdatedSegments())
             .gauge("excalibur_lexical_erasure_requests",
                 "Erasure requests the index has not yet met", lexical.erasureRequests())
             .gauge("excalibur_lexical_oldest_erasure_age_seconds",

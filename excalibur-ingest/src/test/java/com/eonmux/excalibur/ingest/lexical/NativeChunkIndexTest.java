@@ -806,6 +806,88 @@ class NativeChunkIndexTest {
             }
         }
 
+        /** Flips one byte of a segment's postings, keeping the file its committed length. */
+        private static void damagePostings(Path dir, String segment) throws IOException {
+            Path postings = dir.resolve(segment).resolve("post.dat");
+            byte[] bytes = Files.readAllBytes(postings);
+            bytes[0] ^= 0x01;
+            Files.write(postings, bytes);
+        }
+
+        /** An index of two segments, one chunk in the first and two in the second. */
+        private static Map<String, String> twoSegments(Path dir) throws IOException {
+            Map<String, String> storage = new LinkedHashMap<>();
+            storage.put("kb:a.txt:chunk:0", "quorum replication latency");
+            storage.put("kb:b.txt:chunk:0", "quorum snapshot transfer");
+            storage.put("kb:b.txt:chunk:1", "quorum election timeout");
+            AtomicLong epoch = new AtomicLong(1);
+            try (NativeChunkIndex index =
+                     NativeChunkIndex.open(dir, epoch::get, 0, standard())) {
+                index.add("kb:a.txt:chunk:0", storage.get("kb:a.txt:chunk:0"));
+                index.refresh();
+                index.add("kb:b.txt:chunk:0", storage.get("kb:b.txt:chunk:0"));
+                index.add("kb:b.txt:chunk:1", storage.get("kb:b.txt:chunk:1"));
+                index.refresh();
+            }
+            return storage;
+        }
+
+        @Test
+        @DisplayName("a segment that cannot be opened is reported, and not counted as live")
+        void unreadableSegmentIsReported(@TempDir Path dir) throws Exception {
+            Map<String, String> storage = twoSegments(dir);
+            damagePostings(dir, "seg-1");
+
+            AtomicLong epoch = new AtomicLong(5);
+            try (NativeChunkIndex index =
+                     NativeChunkIndex.open(dir, epoch::get, 0, standard())) {
+                ChunkIndexStats stats = index.stats();
+
+                assertThat(stats.liveDocuments())
+                    .as("live is what a query can match")
+                    .isEqualTo(1);
+                assertThat(stats.unsearchableDocuments()).isEqualTo(2);
+                assertThat(stats.unreadableSegments()).singleElement().satisfies(segment -> {
+                    assertThat(segment.name()).isEqualTo("seg-1");
+                    assertThat(segment.chunks()).isEqualTo(2);
+                    assertThat(segment.rebuildable()).isTrue();
+                    assertThat(segment.reason()).contains("post.dat");
+                });
+                assertThat(stats.compactionDue())
+                    .as("a rebuildable segment is work the next compaction will do")
+                    .isTrue();
+
+                CompactionResult rebuilt = index.compactIfDue(storage::get);
+
+                assertThat(rebuilt.segmentsRebuilt()).isEqualTo(1);
+                ChunkIndexStats after = index.stats();
+                assertThat(after.unreadableSegments()).isEmpty();
+                assertThat(after.unsearchableDocuments()).isZero();
+                assertThat(after.liveDocuments()).isEqualTo(3);
+                assertThat(after.compactionDue()).isFalse();
+            }
+        }
+
+        @Test
+        @DisplayName("segments written in an older format are counted until they are upgraded")
+        void outdatedSegmentsAreCounted(@TempDir Path dir) throws Exception {
+            Map<String, String> storage = twoSegments(dir);
+            Path meta = dir.resolve("seg-0").resolve("index.meta");
+            byte[] legacy = java.util.Arrays.copyOf(Files.readAllBytes(meta), 40);
+            java.nio.ByteBuffer.wrap(legacy).putInt(12, 2);
+            Files.write(meta, legacy);
+
+            AtomicLong epoch = new AtomicLong(5);
+            try (NativeChunkIndex index =
+                     NativeChunkIndex.open(dir, epoch::get, 0, standard())) {
+                assertThat(index.stats().outdatedSegments()).isEqualTo(1);
+                assertThat(index.stats().liveDocuments()).isEqualTo(3);
+
+                assertThat(index.compactIfDue(storage::get).segmentsUpgraded()).isEqualTo(1);
+                assertThat(index.stats().outdatedSegments()).isZero();
+            }
+        }
+
         @Test
         @DisplayName("a due compaction is reported before it is run")
         void dueCompactionIsVisible(@TempDir Path dir) throws Exception {

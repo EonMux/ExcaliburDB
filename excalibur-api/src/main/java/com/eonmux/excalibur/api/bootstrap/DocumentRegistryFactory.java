@@ -5,6 +5,7 @@ import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Objects;
 
@@ -20,6 +21,14 @@ import java.util.Objects;
  * then reads every document as new, so it reingests the whole corpus and tombstones none of the old
  * chunks; and {@code POST /v1/erasure} reports every document as one this node never held. So the
  * registry is opened against a file under the data directory, beside the data it describes.</p>
+ *
+ * <h2>A registry in an older format</h2>
+ * <p>A registry written before the format carried a header and a record count is read, but a
+ * truncated copy of one cannot be told from a whole one. So it is rewritten in the current
+ * format as it is opened, through the same durable save every other change goes through, rather
+ * than at the first ingest or erasure - which on a node that is only queried after an upgrade
+ * might never come. A rewrite that fails is logged and left to the next save: every record was
+ * read, so the node has what it needs to start.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Stateless; the registry it returns is thread-safe.</p>
@@ -51,6 +60,28 @@ public final class DocumentRegistryFactory {
         Path file = dataDirectory.resolve(FILE);
         DocumentRegistry registry = new DocumentRegistry(file);
         LOGGER.info("Document registry opened at {} with {} document(s)", file, registry.size());
+        // Nothing has been registered yet, so a registry already owing a save is one the load
+        // itself marked for rewriting.
+        if (registry.isModified()) {
+            upgrade(registry, file);
+        }
         return registry;
+    }
+
+    /**
+     * Rewrites a registry loaded from an older format in the current one.
+     *
+     * @param registry The registry as loaded
+     * @param file     Its file, for the log
+     */
+    private static void upgrade(DocumentRegistry registry, Path file) {
+        try {
+            registry.persist();
+            LOGGER.info("Document registry at {} rewritten in the current format", file);
+        } catch (IOException e) {
+            LOGGER.warn("Could not rewrite the document registry at {} in the current format; "
+                + "it stays in the older one until the next save succeeds: {}",
+                file, e.getMessage());
+        }
     }
 }

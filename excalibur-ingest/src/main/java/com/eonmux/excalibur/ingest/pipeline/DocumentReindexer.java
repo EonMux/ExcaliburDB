@@ -13,7 +13,6 @@ import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
 import com.eonmux.excalibur.llm.client.LLMHttpClient;
 import com.eonmux.excalibur.store.SegmentCatalog;
-import com.eonmux.excalibur.store.SegmentLifecycleManager;
 import com.eonmux.excalibur.store.VisibilityTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -276,24 +275,11 @@ public class DocumentReindexer {
     }
 
     /**
-     * Creates a new DocumentReindexer with full segment lifecycle management for
-     * zero-downtime rolling replacement.
+     * Creates a new DocumentReindexer that can be asked for a rolling replacement.
      *
-     * <p>This constructor enables the complete rolling replacement workflow:</p>
-     * <ol>
-     *   <li>Creates new segments in BOOTSTRAPPING state</li>
-     *   <li>Old segments continue serving queries during reindexing</li>
-     *   <li>New segments progress through INDEXING → WARMING → ACTIVE</li>
-     *   <li>Old segments are tombstoned after new segments become ACTIVE</li>
-     * </ol>
-     *
-     * <p><strong>Domain Correctness:</strong></p>
-     * <ul>
-     *   <li>Segments are created with unique IDs and associated with sourceId</li>
-     *   <li>Segments start in BOOTSTRAPPING state (invisible to queries)</li>
-     *   <li>State transitions follow the lifecycle state machine</li>
-     *   <li>Old segments are tombstoned with proper epoch tracking</li>
-     * </ul>
+     * <p>The catalog is what a rolling run asks for a replacement segment, and the visibility
+     * tracker is what publishes the run's writes. What a run does with them - and why on a
+     * hash-routed engine it always rebuilds in place - is set out on {@link RollingReplacement}.</p>
      *
      * @param chunker Text chunker for splitting documents
      * @param llmClient Embeds the chunks this reindexer writes, or null on a node that
@@ -303,7 +289,6 @@ public class DocumentReindexer {
      * @param offsetAwareWriter Storage writer that returns write log offsets
      * @param batchPublisher Publisher for atomic batch publication
      * @param segmentCatalog Segment catalog for managing segment metadata
-     * @param lifecycleManager Lifecycle manager for state transitions
      * @param visibilityTracker Visibility tracker for epoch management
      * @throws NullPointerException if any required parameter is null
      */
@@ -314,7 +299,6 @@ public class DocumentReindexer {
                             OffsetAwareStorageWriter offsetAwareWriter,
                             DocumentBatchPublisher batchPublisher,
                             SegmentCatalog segmentCatalog,
-                            SegmentLifecycleManager lifecycleManager,
                             VisibilityTracker visibilityTracker) {
         this.chunker = Objects.requireNonNull(chunker, "chunker must not be null");
         this.llmClient = llmClient;
@@ -324,12 +308,6 @@ public class DocumentReindexer {
         this.offsetAwareWriter = Objects.requireNonNull(offsetAwareWriter, "offsetAwareWriter must not be null");
         this.batchPublisher = Objects.requireNonNull(batchPublisher, "batchPublisher must not be null");
         this.segmentCatalog = Objects.requireNonNull(segmentCatalog, "segmentCatalog must not be null");
-        // Validated but not held. The rolling replacement drives every transition through
-        // the catalog itself - beginIndexing, completeIndexing, tombstone - so a manager was
-        // never read after construction. The parameter and its contract stay: excalibur-api
-        // builds this reindexer by this signature, and a caller that has not got one has not
-        // got a node configured for rolling replacement either.
-        Objects.requireNonNull(lifecycleManager, "lifecycleManager must not be null");
         this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "visibilityTracker must not be null");
 
         LOG.info("DocumentReindexer configured with rolling replacement support (segment lifecycle enabled)");
@@ -417,7 +395,7 @@ public class DocumentReindexer {
      *
      * <p><strong>Prerequisites:</strong> This method requires rolling replacement
      * support to be enabled (see
-     * {@link #DocumentReindexer(TextChunker, LLMHttpClient, UpsertHandler, DocumentRegistry, OffsetAwareStorageWriter, DocumentBatchPublisher, SegmentCatalog, SegmentLifecycleManager, VisibilityTracker)}).
+     * {@link #DocumentReindexer(TextChunker, LLMHttpClient, UpsertHandler, DocumentRegistry, OffsetAwareStorageWriter, DocumentBatchPublisher, SegmentCatalog, VisibilityTracker)}).
      * If rolling replacement is not configured, falls back to regular reindexing.</p>
      *
      * @param source The source to re-index

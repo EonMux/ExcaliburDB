@@ -79,6 +79,51 @@ class LexicalErasureSweepTest {
             assertThat(index.compactions()).isEqualTo(1);
         }
 
+        /** An index owing nothing, holding one damaged segment and some outdated ones. */
+        private static RecordingIndex holding(boolean rebuildable, int outdated) {
+            return new RecordingIndex(new ChunkIndexStats("recording", 0, 3, 10, 0, 0,
+                Optional.empty(), true, 0,
+                java.util.List.of(new ChunkIndexStats.UnreadableSegment("seg-1", 4, rebuildable,
+                    "post.dat fails its checksum")), outdated));
+        }
+
+        @Test
+        @DisplayName("compacts a quiet node's damaged segment, which nothing else would rebuild")
+        void compactsARebuildableSegment() throws Exception {
+            RecordingIndex index = holding(true, 0);
+
+            try (LexicalErasureSweep sweep = sweepOver(index)) {
+                assertThat(sweep.sweep()).isTrue();
+            }
+
+            assertThat(index.compactions()).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("compacts a quiet node's outdated segments, so an upgrade finishes")
+        void compactsOutdatedSegments() throws Exception {
+            RecordingIndex index = new RecordingIndex(new ChunkIndexStats("recording", 0, 3, 10,
+                0, 0, Optional.empty(), true, 0, java.util.List.of(), 2));
+
+            try (LexicalErasureSweep sweep = sweepOver(index)) {
+                assertThat(sweep.sweep()).isTrue();
+            }
+
+            assertThat(index.compactions()).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("leaves alone a damaged segment no compaction can rebuild")
+        void skipsAnUnrebuildableSegment() throws Exception {
+            RecordingIndex index = holding(false, 0);
+
+            try (LexicalErasureSweep sweep = sweepOver(index)) {
+                assertThat(sweep.sweep()).isFalse();
+            }
+
+            assertThat(index.compactions()).isZero();
+        }
+
         @Test
         @DisplayName("survives a failed compaction, so the next sweep still runs")
         void survivesAFailure() throws Exception {
@@ -265,12 +310,17 @@ class LexicalErasureSweepTest {
     /** A chunk index that counts compactions and can be told to fail one. */
     private static final class RecordingIndex implements ChunkIndex {
 
-        private final int outstanding;
+        private final ChunkIndexStats reported;
         private final AtomicInteger compactions = new AtomicInteger();
         private volatile boolean failNext;
 
         RecordingIndex(int outstanding) {
-            this.outstanding = outstanding;
+            this(new ChunkIndexStats("recording", 0, 0, 0, 0, outstanding,
+                outstanding > 0 ? Optional.of(Instant.EPOCH) : Optional.empty(), false));
+        }
+
+        RecordingIndex(ChunkIndexStats reported) {
+            this.reported = reported;
         }
 
         void failNext() {
@@ -294,8 +344,7 @@ class LexicalErasureSweepTest {
 
         @Override
         public ChunkIndexStats stats() {
-            return new ChunkIndexStats("recording", 0, 0, 0, 0, outstanding,
-                outstanding > 0 ? Optional.of(Instant.EPOCH) : Optional.empty(), false);
+            return reported;
         }
 
         @Override
