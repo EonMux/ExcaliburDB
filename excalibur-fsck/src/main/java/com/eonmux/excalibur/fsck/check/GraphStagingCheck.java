@@ -58,7 +58,10 @@ import java.util.List;
  * still names. The node refuses that rather than give those ids to new labels, so it is
  * {@link CheckStatus#CORRUPT} here, asked of the same holders the node's tenant names; the
  * {@link CheckStatus#UNSEALED} verdict says how many intact labels the open would cut off with the
- * damage.</p>
+ * damage. A published dictionary that fails its checksum, or is missing from its graph, cannot
+ * say which ids it names, and the graph may be the only holder of some of them, so the node
+ * refuses the cut and this reports it {@link CheckStatus#CORRUPT} as well - naming the dictionary
+ * - while an interner with nothing to cut is judged without asking it.</p>
  *
  * <h2>Erasures naming an entity nothing was given</h2>
  * <p>An outstanding entity-scoped erasure records an id and nothing else. The node refuses one for

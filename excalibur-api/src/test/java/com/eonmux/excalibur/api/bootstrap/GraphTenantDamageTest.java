@@ -72,6 +72,7 @@ class GraphTenantDamageTest {
         Path file = switch (which) {
             case "column" -> directory.resolve(EdgeColumn.EDGES_FWD.fileName());
             case "dictionary" -> directory.resolve("entities.dat");
+            case "dictionary index" -> directory.resolve("entities.idx");
             case "lucene" -> luceneDataFile(directory.resolve(GraphRagFactory.DOCUMENT_INDEX));
             default -> throw new IllegalArgumentException(which);
         };
@@ -109,7 +110,7 @@ class GraphTenantDamageTest {
     }
 
     @ParameterizedTest(name = "damage in a {0}")
-    @ValueSource(strings = {"column", "dictionary", "lucene"})
+    @ValueSource(strings = {"column", "dictionary", "dictionary index", "lucene"})
     @DisplayName("is refused by the stack, and the tenant opens without serving it")
     void notServed(String which, @TempDir Path root) throws IOException {
         Path directory = root.resolve("graph");
@@ -135,6 +136,32 @@ class GraphTenantDamageTest {
     }
 
     @Test
+    @DisplayName("with a damaged dictionary keeps the namespace closed only while an interner has "
+        + "damage to cut that the dictionary alone could vouch for")
+    void aDamagedDictionaryRefusesOnlyAnUnvouchedCut(@TempDir Path root) throws IOException {
+        Path directory = root.resolve("graph");
+        try (GraphTenant tenant = open(directory)) {
+            GraphStagingStore staging = tenant.staging();
+            staging.append(ExtractedTriple.alwaysValid(
+                "Alice Quazzlethorpe", "knows", "Bob Ordinary", from(1)));
+            // Named by nothing staged: only the dictionary the build publishes holds its id.
+            staging.entityIdOf("Dora Graphonly");
+            staging.flush();
+            assertThat(tenant.buildService().build().published()).isTrue();
+        }
+        Files.write(directory.resolve("entities.idx"), new byte[16]);
+        Path interner = root.resolve("graph-staging").resolve(GraphStagingStore.ENTITY_LABELS);
+        byte[] labels = Files.readAllBytes(interner);
+        labels[labels.length - Integer.BYTES - 1] ^= 0x40;
+        Files.write(interner, labels);
+
+        assertThatThrownBy(() -> open(directory))
+            .isInstanceOf(com.eonmux.excalibur.graph.file.LogCorruptionException.class)
+            .hasMessageContaining("cannot be read")
+            .hasMessageContaining("not a label dictionary");
+    }
+
+    @Test
     @DisplayName("is replaced by the next build, which then serves a verified graph")
     void replacedByTheNextBuild(@TempDir Path root) throws IOException {
         Path directory = root.resolve("graph");
@@ -155,7 +182,7 @@ class GraphTenantDamageTest {
     }
 
     @ParameterizedTest(name = "damage in a {0}")
-    @ValueSource(strings = {"column", "dictionary", "lucene"})
+    @ValueSource(strings = {"column", "dictionary", "dictionary index", "lucene"})
     @DisplayName("is discarded by an erasure that cannot rewrite it, and staging is erased")
     void discardedByAnErasure(String which, @TempDir Path root) throws IOException {
         Path directory = root.resolve("graph");

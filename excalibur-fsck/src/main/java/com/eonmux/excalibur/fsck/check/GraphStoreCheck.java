@@ -2,8 +2,11 @@ package com.eonmux.excalibur.fsck.check;
 
 import com.eonmux.excalibur.core.integrity.IntegrityReport;
 import com.eonmux.excalibur.graph.erasure.EdgeStoreCompactor;
+import com.eonmux.excalibur.graph.file.LogInspection;
 import com.eonmux.excalibur.graph.integrity.ServedGraphIntegrity;
 import com.eonmux.excalibur.graph.staging.GraphBuilder;
+import com.eonmux.excalibur.graph.staging.GraphStagingStore;
+import com.eonmux.excalibur.graph.staging.LabelInterner;
 import com.eonmux.excalibur.retrieval.build.GraphDirectoryBuilder;
 import com.eonmux.excalibur.retrieval.lexical.LexicalIndexIntegrity;
 
@@ -143,6 +146,49 @@ public final class GraphStoreCheck {
             .filter(sibling -> !sibling.equals(directory.toAbsolutePath()))
             .filter(Files::isDirectory)
             .toList();
+    }
+
+    /**
+     * Returns the label interners in the namespace's staging directory whose open would have to
+     * cut damage off, and so would ask the graph's dictionaries whether it may.
+     *
+     * <p>The other thing that decides whether moving a graph directory away is safe. An interner
+     * with a damaged record is cut back to it by the node only when nothing holds an id at or
+     * past it, and a graph's dictionaries are one of those holders - sometimes the only one, and
+     * the record of the ids queries have answered with. With the graph gone the node would cut
+     * without asking it, and could give an id the graph named to a new label; so while any
+     * interner beside it has damage to cut, the graph stays where it is. An interner that cannot
+     * be read at all is counted too, since what its open would do cannot be told.</p>
+     *
+     * @param directory A graph directory, served or displaced
+     * @return The interners, entity labels first; empty when neither has anything to cut
+     * @throws NullPointerException if directory is null
+     */
+    public static List<Path> internersWithDamageBeside(Path directory) {
+        Objects.requireNonNull(directory, "directory");
+        Path namespace = directory.toAbsolutePath().getParent();
+        if (namespace == null) {
+            return List.of();
+        }
+        Path staging = namespace.resolve(GRAPH_DIRECTORY + GraphStagingCheck.DIRECTORY_SUFFIX);
+        List<Path> damaged = new ArrayList<>();
+        for (String name : List.of(GraphStagingStore.ENTITY_LABELS,
+                GraphStagingStore.RELATION_LABELS)) {
+            Path interner = staging.resolve(name);
+            if (!Files.isRegularFile(interner)) {
+                continue;
+            }
+            try {
+                LogInspection inspection = LabelInterner.inspect(interner);
+                // A creation cut short held no id, and its open asks nobody.
+                if (inspection.hasTornTail() && inspection.intactBytes() > 0) {
+                    damaged.add(interner);
+                }
+            } catch (IOException | RuntimeException e) {
+                damaged.add(interner);
+            }
+        }
+        return List.copyOf(damaged);
     }
 
     /**

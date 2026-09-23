@@ -130,6 +130,11 @@ public final class RepairPlanner {
      * obligation was discharged. Moving the damaged graph away would have the node restore and
      * serve it, so that is put to an operator instead.</p>
      *
+     * <p>Or unless a label interner in the namespace's staging directory has damage its open
+     * would cut off. The node cuts it only when nothing names an id at or past it, and the
+     * graph's dictionaries are one of the things it asks; see
+     * {@link GraphStoreCheck#internersWithDamageBeside}.</p>
+     *
      * @param scan     The survey
      * @param file     A corrupt or missing verdict on a file of the graph
      * @param actions  Where the move is collected
@@ -153,6 +158,19 @@ public final class RepairPlanner {
                 + "the erasure removed. Start the node once, which deletes the copy beside a "
                 + "served graph, or delete the copy yourself, and run the repair again - or "
                 + "POST /v1/graph/build, which replaces the damaged graph without either");
+            return;
+        }
+        List<Path> interners = GraphStoreCheck.internersWithDamageBeside(directory);
+        if (!interners.isEmpty()) {
+            operator.add(root + " is damaged: " + file.relative() + ": " + file.detail()
+                + ". It is not moved aside automatically while "
+                + interners.stream().map(each -> each.getFileName().toString()).toList()
+                + " beside it holds damage its open would cut off: the node cuts it only when "
+                + "nothing names an id at or past it, and this graph's dictionaries are what "
+                + "names the ids queries have answered with. Moved away, the graph could no "
+                + "longer refuse that cut, and one of those ids could be given to a new label. "
+                + "Resolve the staging interner first - restore the staging directory or this "
+                + "graph from a backup - and run the repair again");
             return;
         }
         actions.add(RepairAction.onFile(RepairKind.QUARANTINE_CORRUPT_FILE, directory, root,

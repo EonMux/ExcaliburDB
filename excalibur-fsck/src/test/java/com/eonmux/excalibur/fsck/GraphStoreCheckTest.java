@@ -371,6 +371,55 @@ class GraphStoreCheckTest {
     }
 
     @Test
+    @DisplayName("an interner counts as having damage to cut as its open would judge it")
+    void internersWithDamageAreJudgedAsTheOpenJudgesThem(@TempDir Path tempDir)
+            throws IOException {
+        Path dataDir = builtNamespace(tempDir);
+        Path graph = dataDir.resolve(GRAPH);
+        Path staging = dataDir.resolve(NAMESPACE + "/graph-staging");
+        assertThat(GraphStoreCheck.internersWithDamageBeside(graph)).isEmpty();
+
+        // A creation cut short held no id, and its open asks nobody.
+        Files.write(staging.resolve(GraphStagingStore.RELATION_LABELS),
+            Arrays.copyOf(com.eonmux.excalibur.graph.file.LogHeader.of(
+                com.eonmux.excalibur.graph.staging.LabelInterner.MAGIC,
+                com.eonmux.excalibur.graph.staging.LabelInterner.VERSION), 5));
+        assertThat(GraphStoreCheck.internersWithDamageBeside(graph)).isEmpty();
+
+        // Bytes that are not an interner at all: what its open would do cannot be told.
+        Files.writeString(staging.resolve(GraphStagingStore.ENTITY_LABELS),
+            "not a label interner, and longer than its header");
+        assertThat(GraphStoreCheck.internersWithDamageBeside(graph))
+            .containsExactly(staging.resolve(GraphStagingStore.ENTITY_LABELS).toAbsolutePath());
+    }
+
+    @Test
+    @DisplayName("the move is refused at the moment of acting if a staging interner beside the "
+        + "graph has since been found with damage to cut")
+    void refusedAtApplyTimeOverADamagedInterner(@TempDir Path tempDir) throws IOException {
+        Path dataDir = builtNamespace(tempDir);
+        flip(dataDir.resolve(GRAPH).resolve(EdgeColumn.EDGES_FWD.fileName()));
+        RepairPlan plan = RepairPlanner.plan(scan(dataDir));
+        Path interner = dataDir.resolve(NAMESPACE + "/graph-staging")
+            .resolve(GraphStagingStore.RELATION_LABELS);
+        byte[] labels = Files.readAllBytes(interner);
+        labels[labels.length - Integer.BYTES - 1] ^= 0x40;
+        Files.write(interner, labels);
+
+        List<RepairOutcome> outcomes;
+        try (PrintStream out = new PrintStream(new ByteArrayOutputStream(), true,
+                StandardCharsets.UTF_8)) {
+            outcomes = new RepairExecutor(new Quarantine(tempDir.resolve("q")), out).apply(plan);
+        }
+
+        assertThat(outcomes).singleElement().satisfies(outcome -> {
+            assertThat(outcome.applied()).isFalse();
+            assertThat(outcome.detail()).contains(GraphStagingStore.RELATION_LABELS);
+        });
+        assertThat(dataDir.resolve(GRAPH)).isDirectory();
+    }
+
+    @Test
     @DisplayName("scratch a build or a compaction left is recognised, unchecked and left alone")
     void scratch(@TempDir Path tempDir) throws IOException {
         Path dataDir = builtNamespace(tempDir);
