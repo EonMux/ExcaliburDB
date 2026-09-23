@@ -86,7 +86,7 @@ public final class TripleSubgraphSerializer implements SubgraphSerializer {
         SeedRelevance scores = relevance == null ? SeedRelevance.uniform() : relevance;
 
         if (subgraph.isEmpty() || budget.maxTokens() == 0) {
-            return new SerializedSubgraph("", 0, 0, subgraph.edgeCount(), NAME);
+            return new SerializedSubgraph("", 0, List.of(), subgraph.edgeCount(), NAME);
         }
 
         List<SubgraphEdge> ranked = rank(subgraph, scores);
@@ -97,7 +97,7 @@ public final class TripleSubgraphSerializer implements SubgraphSerializer {
         List<String> entityLines = new ArrayList<>();
 
         int tokens = budget.counter().count(ENTITY_HEADER + "\n" + FACT_HEADER + "\n");
-        int included = 0;
+        List<SubgraphEdge> included = new ArrayList<>();
 
         for (SubgraphEdge edge : ranked) {
             // An edge costs its own line plus a description for each endpoint not already
@@ -132,15 +132,15 @@ public final class TripleSubgraphSerializer implements SubgraphSerializer {
             }
 
             tokens += cost;
-            included++;
+            included.add(edge);
             describedEntities.add((long) edge.subject());
             describedEntities.add((long) edge.object());
             entityLines.addAll(newEntityLines);
             factLines.add(factLine);
         }
 
-        if (included == 0) {
-            return new SerializedSubgraph("", 0, 0, subgraph.edgeCount(), NAME);
+        if (included.isEmpty()) {
+            return new SerializedSubgraph("", 0, List.of(), subgraph.edgeCount(), NAME);
         }
 
         text.append(ENTITY_HEADER).append('\n');
@@ -156,7 +156,7 @@ public final class TripleSubgraphSerializer implements SubgraphSerializer {
         // Measured on the assembled text, not carried forward from the running total, so the
         // reported cost is the cost of what is actually being sent.
         return new SerializedSubgraph(rendered, budget.counter().count(rendered),
-            included, subgraph.edgeCount() - included, NAME);
+            included, subgraph.edgeCount() - included.size(), NAME);
     }
 
     /**
