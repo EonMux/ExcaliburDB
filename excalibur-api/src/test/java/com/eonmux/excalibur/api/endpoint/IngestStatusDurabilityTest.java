@@ -76,6 +76,19 @@ class IngestStatusDurabilityTest {
     }
 
     @Test
+    @DisplayName("what robots.txt kept a finished crawl out of reads the same after the restart")
+    void theDisallowedCountSurvives() {
+        IngestStatusEndpoint.IngestionStatus status = node().getOrCreate("site");
+        crawl(status, 80, 2);
+        status.setDisallowed(37);
+
+        IngestStatusEndpoint.IngestionStatus after = node().restore("site");
+
+        assertThat(after.entriesDisallowed()).isEqualTo(37);
+        assertThat(after.entriesSkipped()).isEqualTo(2);
+    }
+
+    @Test
     @DisplayName("a run the restart interrupted does not come back claiming to be running")
     void anInterruptedRunIsNotResumedOnPaper() {
         IngestStatusEndpoint.InMemoryIngestionStatusRegistry before = node();
@@ -185,7 +198,7 @@ class IngestStatusDurabilityTest {
     @DisplayName("a history in a state this build does not report is read as a finished run")
     void anUnknownStateIsNotReportedAsRunning() throws IOException {
         SourceStatusFile.open(dataDir).write(List.of(new SourceStatusFile.Entry(
-            "docs", "embedding", 0.4, 4, 6, 0, LONG_AGO, null)));
+            "docs", "embedding", 0.4, 4, 6, 0, 0, LONG_AGO, null)));
 
         IngestStatusEndpoint.IngestionStatus after = node().restore("docs");
 

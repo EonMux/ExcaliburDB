@@ -53,7 +53,8 @@ final class SourceConfigView {
         SourceFactory.INCLUDED_PATH_PATTERNS,
         SourceFactory.EXCLUDED_PATH_PATTERNS,
         SourceFactory.USER_AGENT,
-        SourceFactory.CRAWL_DELAY_MS);
+        SourceFactory.CRAWL_DELAY_MS,
+        SourceFactory.RESPECT_ROBOTS_TXT);
 
     private SourceConfigView() {
         throw new AssertionError("Utility class");

@@ -2,6 +2,7 @@ package com.eonmux.excalibur.ingest.registry;
 
 import com.eonmux.excalibur.ingest.source.DocumentNotFoundException;
 import com.eonmux.excalibur.ingest.source.DocumentValidators;
+import com.eonmux.excalibur.ingest.source.FetchDisallowedException;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.IncompleteCrawlException;
 import com.eonmux.excalibur.ingest.source.Source;
@@ -285,6 +286,11 @@ public class ChangeDetector {
      * unseen would tombstone a document that still exists, so the previous version is kept and
      * the failure is logged rather than silently recorded as "unchanged".</p>
      *
+     * <p>A {@link FetchDisallowedException} is not a failure but an answer: the publisher now
+     * forbids fetching the document - a robots.txt that disallows it, or the URL it redirects
+     * to. It is reported as unseen, exactly as it would be had the crawl left it out, so the
+     * index stops serving what the site has asked crawlers to leave alone.</p>
+     *
      * @return true if the document was accounted for, false if the source says it is gone
      */
     private boolean processDocument(Source source, String sourceId, String documentId,
@@ -303,6 +309,10 @@ public class ChangeDetector {
         } catch (DocumentNotFoundException e) {
             LOGGER.info("Document {} of source {} disappeared between crawl and fetch; treating as deleted",
                 documentId, sourceId);
+            return false;
+        } catch (FetchDisallowedException e) {
+            LOGGER.info("Document {} of source {} may no longer be fetched; treating as deleted: {}",
+                documentId, sourceId, e.getMessage());
             return false;
         } catch (SourceException e) {
             LOGGER.warn("Could not determine whether document {} of source {} changed: {}. "

@@ -504,7 +504,7 @@ public class IngestEndpoint implements HttpHandler {
         SourceFactory.MAX_DOCUMENTS, SourceFactory.MAX_RESPONSE_BYTES,
         SourceFactory.TIMEOUT_SECONDS, SourceFactory.INCLUDED_PATH_PATTERNS,
         SourceFactory.EXCLUDED_PATH_PATTERNS, SourceFactory.USER_AGENT,
-        SourceFactory.CRAWL_DELAY_MS);
+        SourceFactory.CRAWL_DELAY_MS, SourceFactory.RESPECT_ROBOTS_TXT);
 
     /**
      * Reads the settings that shape a filesystem walk.
@@ -561,6 +561,7 @@ public class IngestEndpoint implements HttpHandler {
         // factory takes the larger of the two, so this field can only ask a crawl to be gentler.
         putBounded(configJson, config, SourceFactory.CRAWL_DELAY_MS, 0,
             IngestConfig.MAX_CRAWL_DELAY_MS);
+        putFlag(configJson, config, SourceFactory.RESPECT_ROBOTS_TXT);
     }
 
     /**
@@ -586,7 +587,10 @@ public class IngestEndpoint implements HttpHandler {
         config.put(field, String.join(",", values));
     }
 
-    /** Copies a true/false setting across, absent staying absent. */
+    /**
+     * Copies a true/false setting across, absent - or an explicit null - staying absent, so
+     * the source's own default applies.
+     */
     private static void putFlag(String configJson, Map<String, String> config, String field) {
         if (JsonText.has(configJson, field)) {
             config.put(field, Boolean.toString(JsonText.booleanValue(configJson, field, false)));

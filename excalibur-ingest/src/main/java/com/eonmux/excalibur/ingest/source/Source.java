@@ -174,6 +174,23 @@ public interface Source extends Closeable {
     }
 
     /**
+     * How many documents the current run left alone because their publisher forbids fetching
+     * them - for an HTTP source, the URLs its origins' {@code robots.txt} disallows.
+     *
+     * <p>The current run is the one the most recent {@link #crawl()} began: the count covers the
+     * URLs that crawl did not list or request, and any document a fetch since then refused with a
+     * {@link FetchDisallowedException}, each URL once. It is a count of its own rather than a
+     * failure or a skipped document, because nothing went wrong and nothing was read: the site
+     * said no, and an operator asking why a page is missing from the index needs to be able to
+     * see that it was asked to be left out.</p>
+     *
+     * @return The count, zero for a source whose publisher has no say over what is fetched
+     */
+    default long getDisallowedCount() {
+        return 0;
+    }
+
+    /**
      * Returns the total number of documents in this source, if known.
      *
      * <p>Some sources can efficiently determine document count without

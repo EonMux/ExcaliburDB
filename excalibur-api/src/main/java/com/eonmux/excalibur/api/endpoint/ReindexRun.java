@@ -54,10 +54,12 @@ import java.util.Objects;
  * measured, and in units - chunks, in the total - that nothing else on the route used.</p>
  *
  * <h2>What the source's ingestion status is told</h2>
- * <p>One number: how many of the documents the crawl listed were passed over because they are
- * not text. A re-crawl applies that test exactly as the first crawl did, so a run that newly
- * skipped three hundred photographs has to be able to say so - and {@code entries_skipped} on
- * {@code GET /v1/ingest/status} is where the node says it. Nothing else on that status is
+ * <p>Two numbers: how many of the documents the crawl listed were passed over because they are
+ * not text, and how many documents the run left alone because their publisher forbids fetching
+ * them - a site's robots.txt. A re-crawl applies both tests exactly as the first crawl did, so a
+ * run that newly skipped three hundred photographs, or found a page newly disallowed, has to be
+ * able to say so - and {@code entries_skipped} and {@code entries_disallowed} on
+ * {@code GET /v1/ingest/status} are where the node says it. Nothing else on that status is
  * touched, because a reindex has its own readback for how far it got and how it ended.</p>
  *
  * <h2>Thread Safety</h2>
@@ -242,6 +244,27 @@ public final class ReindexRun {
     }
 
     /**
+     * Records on the source's ingestion status how many documents this run was forbidden.
+     *
+     * <p>Read from the source rather than from the reindexer's result, because the source is what
+     * was told no: the URLs the re-crawl never listed, which change detection only sees as
+     * documents that have gone, and any fetch refused after it. Reported when it is zero for the
+     * reason {@link #reportSkipped} gives.</p>
+     *
+     * @param sourceId The source that was reindexed
+     * @param source   The source, which counted what its run was forbidden
+     */
+    private void reportDisallowed(String sourceId, Source source) {
+        if (ingestionStatusRegistry == null) {
+            return;
+        }
+        IngestStatusEndpoint.IngestionStatus status = ingestionStatusRegistry.getStatus(sourceId);
+        if (status != null) {
+            status.setDisallowed(source.getDisallowedCount());
+        }
+    }
+
+    /**
      * Whether this run stopped because someone asked it to, rather than because it broke.
      *
      * <p>The run's own signal and the exception the reindexer ends a stopped run with are the
@@ -362,6 +385,7 @@ public final class ReindexRun {
             reindexer.reindexWithRollingReplacement(source, volumePath, progressFor(sourceId),
                 stop);
 
+        reportDisallowed(sourceId, source);
         return reportRolling(threadName, sourceId, result);
     }
 
@@ -423,6 +447,7 @@ public final class ReindexRun {
         DocumentReindexer.ReindexResult result =
             reindexer.reindexAll(source, progressFor(sourceId), stop);
 
+        reportDisallowed(sourceId, source);
         return reportStandard(threadName, sourceId, result);
     }
 

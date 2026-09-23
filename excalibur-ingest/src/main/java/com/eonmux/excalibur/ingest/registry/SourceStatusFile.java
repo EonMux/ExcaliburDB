@@ -40,10 +40,16 @@ import java.util.Objects;
  * <h2>Record format</h2>
  * <p>The catalog's conventions, deliberately, so the tools that check a data directory read both
  * the same way. A first line, {@code \#source-status|<version>}, names the format; one line per
- * source follows, {@code id|state|progress|ingested|pending|skipped|updated_ms[|error]}, escaped as
- * the catalog escapes; and a last line, {@code \#end|count}, closes the file, so a file that lost
- * its tail is told apart from a shorter history. The error field is absent rather than empty when
- * there is none: an empty message and no message are different answers.</p>
+ * source follows, {@code id|state|progress|ingested|pending|skipped|disallowed|updated_ms[|error]},
+ * escaped as the catalog escapes; and a last line, {@code \#end|count}, closes the file, so a file
+ * that lost its tail is told apart from a shorter history. The error field is absent rather than
+ * empty when there is none: an empty message and no message are different answers.</p>
+ *
+ * <p>Version 1 had no {@code disallowed} field, since nothing was left out of a crawl on a
+ * publisher's say-so before robots.txt was honoured; its records are still read, with that count
+ * as zero, and the next run to end rewrites the file in version 2. How many fields a record has
+ * is a property of the version its file declares, never guessed from the record, because a
+ * version 1 record carrying an error has as many fields as a version 2 record without one.</p>
  *
  * <h2>Reading an unreadable file</h2>
  * <p>A file with no header, a version this build does not know, a missing or disagreeing record
@@ -68,7 +74,13 @@ public final class SourceStatusFile {
     public static final String FILE = "source-status";
 
     /** The format this build writes. */
-    static final int FORMAT_VERSION = 1;
+    static final int FORMAT_VERSION = 2;
+
+    /** The oldest format this build still reads: the one written before the disallowed count. */
+    static final int OLDEST_READABLE_VERSION = 1;
+
+    /** The version that first carried the disallowed count. */
+    private static final int FIRST_DISALLOWED_VERSION = 2;
 
     /** Opens the first line, which names the format the rest of the file is in. */
     private static final String HEADER_MARKER = "\\#source-status";
@@ -82,8 +94,11 @@ public final class SourceStatusFile {
     /** Suffix of the sibling a rewrite is assembled in before it is published. */
     private static final String REPLACEMENT_SUFFIX = ".tmp";
 
-    /** Fields every record carries: id, state, progress, three counts and the time. */
-    private static final int FIXED_FIELDS = 7;
+    /** Fields every version 1 record carries: id, state, progress, three counts and the time. */
+    private static final int FIXED_FIELDS_V1 = 7;
+
+    /** Fields every record carries from version 2 on, the disallowed count among the counts. */
+    private static final int FIXED_FIELDS_V2 = 8;
 
     private final Path file;
     private final SourceCatalog.CatalogWriter writer;
@@ -99,11 +114,14 @@ public final class SourceStatusFile {
      * @param ingested      Entries it indexed
      * @param pending       Entries it left waiting
      * @param skipped       Documents it passed over because they are not text
+     * @param disallowed    Documents it left alone because their publisher forbids fetching
+     *                      them
      * @param lastUpdatedMs When it ended, epoch milliseconds
      * @param lastError     What went wrong, or null if nothing did
      */
     public record Entry(String sourceId, String state, double progress, long ingested,
-                        long pending, long skipped, long lastUpdatedMs, String lastError) {
+                        long pending, long skipped, long disallowed, long lastUpdatedMs,
+                        String lastError) {
 
         /**
          * Validates an entry.
@@ -115,7 +133,8 @@ public final class SourceStatusFile {
         public Entry {
             Objects.requireNonNull(sourceId, "sourceId must not be null");
             Objects.requireNonNull(state, "state must not be null");
-            if (ingested < 0 || pending < 0 || skipped < 0 || lastUpdatedMs < 0) {
+            if (ingested < 0 || pending < 0 || skipped < 0 || disallowed < 0
+                    || lastUpdatedMs < 0) {
                 throw new IllegalArgumentException("status counts must not be negative");
             }
             if (!(progress >= 0.0 && progress <= 1.0)) {
@@ -223,6 +242,7 @@ public final class SourceStatusFile {
             .append(entry.ingested()).append(FIELD_SEPARATOR)
             .append(entry.pending()).append(FIELD_SEPARATOR)
             .append(entry.skipped()).append(FIELD_SEPARATOR)
+            .append(entry.disallowed()).append(FIELD_SEPARATOR)
             .append(entry.lastUpdatedMs());
         if (entry.lastError() != null) {
             line.append(FIELD_SEPARATOR).append(SourceCatalog.escape(entry.lastError()));
@@ -256,9 +276,9 @@ public final class SourceStatusFile {
         } catch (NumberFormatException e) {
             return ignored("its first line names no format version this build reads: " + header);
         }
-        if (version != FORMAT_VERSION) {
-            return ignored("it is in format version " + version + " and this build reads version "
-                + FORMAT_VERSION);
+        if (version < OLDEST_READABLE_VERSION || version > FORMAT_VERSION) {
+            return ignored("it is in format version " + version + " and this build reads versions "
+                + OLDEST_READABLE_VERSION + " to " + FORMAT_VERSION);
         }
         List<String> records = lines.subList(1, Math.max(1, lines.size() - 1));
         int declared = lines.size() < 2 ? -1 : declaredCount(lines.get(lines.size() - 1));
@@ -270,14 +290,14 @@ public final class SourceStatusFile {
             return ignored("it declares " + declared + " record(s) and carries "
                 + records.size());
         }
-        return parseAll(records);
+        return parseAll(records, version);
     }
 
-    private Map<String, Entry> parseAll(List<String> records) {
+    private Map<String, Entry> parseAll(List<String> records, int version) {
         Map<String, Entry> entries = new LinkedHashMap<>();
         int skipped = 0;
         for (String line : records) {
-            Entry entry = parse(line);
+            Entry entry = parse(line, version);
             if (entry == null) {
                 skipped++;
             } else {
@@ -317,16 +337,21 @@ public final class SourceStatusFile {
     }
 
     /**
-     * Parses one record.
+     * Parses one record, in the format version the file declared.
      *
-     * @param line The record line
+     * @param line    The record line
+     * @param version The format the record was written in
      * @return The entry, or null when the line is malformed
      */
-    private static Entry parse(String line) {
+    private static Entry parse(String line, int version) {
         List<String> fields = SourceCatalog.splitEscaped(line, FIELD_SEPARATOR);
-        if (fields.size() != FIXED_FIELDS && fields.size() != FIXED_FIELDS + 1) {
+        boolean countsDisallowed = version >= FIRST_DISALLOWED_VERSION;
+        int fixed = countsDisallowed ? FIXED_FIELDS_V2 : FIXED_FIELDS_V1;
+        if (fields.size() != fixed && fields.size() != fixed + 1) {
             return null;
         }
+        // The fields after the skipped count shift by one where the disallowed count is present.
+        int time = countsDisallowed ? 7 : 6;
         try {
             return new Entry(
                 SourceCatalog.unescape(fields.get(0)),
@@ -335,8 +360,9 @@ public final class SourceStatusFile {
                 Long.parseLong(fields.get(3)),
                 Long.parseLong(fields.get(4)),
                 Long.parseLong(fields.get(5)),
-                Long.parseLong(fields.get(6)),
-                fields.size() > FIXED_FIELDS ? SourceCatalog.unescape(fields.get(7)) : null);
+                countsDisallowed ? Long.parseLong(fields.get(6)) : 0L,
+                Long.parseLong(fields.get(time)),
+                fields.size() > fixed ? SourceCatalog.unescape(fields.get(fixed)) : null);
         } catch (IllegalArgumentException e) {
             return null;
         }

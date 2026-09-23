@@ -10,6 +10,7 @@ import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
 import com.eonmux.excalibur.ingest.source.DocumentLimits;
 import com.eonmux.excalibur.ingest.source.FilesystemSource;
+import com.eonmux.excalibur.ingest.source.HttpSource;
 import com.eonmux.excalibur.ingest.source.SourceDescriptor;
 import com.eonmux.excalibur.tenancy.NamespaceId;
 import com.eonmux.excalibur.ingest.source.Source;
@@ -248,6 +249,8 @@ class IngestEndpointTest {
                 public void update(String state, double progress, long entriesIngested, long entriesPending) {}
                 @Override
                 public void setSkipped(long entriesSkipped) {}
+                @Override
+                public void setDisallowed(long entriesDisallowed) {}
                 @Override
                 public void setError(String error) {}
             }
@@ -590,6 +593,115 @@ class IngestEndpointTest {
         }
     }
 
+    /**
+     * The registration side of robots.txt: whether a crawl obeys it is the caller's to say, it
+     * is on unless they say otherwise, and what they said survives a restart.
+     *
+     * <p>Against an IP literal, which the allow-list check can see is public without asking DNS,
+     * so these tests build a real crawler without needing the network.</p>
+     */
+    @Nested
+    @DisplayName("respect_robots_txt")
+    class RespectRobotsTxt {
+
+        private static final String HOST = "93.184.215.14";
+
+        @Test
+        @DisplayName("a crawl registered without the setting obeys robots.txt")
+        void onByDefault() throws IOException {
+            Response response = crawl("");
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(registered().isRespectingRobotsTxt()).isTrue();
+        }
+
+        @Test
+        @DisplayName("false switches it off, and the catalog records that so a restart agrees")
+        void falseIsRecorded(@TempDir Path dataDir) throws IOException {
+            registry.setSourceCatalog(SourceCatalog.open(dataDir));
+
+            Response response = crawl(", \"respect_robots_txt\": false");
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(registered().isRespectingRobotsTxt()).isFalse();
+            assertThat(SourceCatalog.open(dataDir).all())
+                .singleElement()
+                .satisfies(descriptor -> assertThat(descriptor.get(
+                    SourceFactory.RESPECT_ROBOTS_TXT)).isEqualTo("false"));
+        }
+
+        @Test
+        @DisplayName("an explicit null is the default, not a way to switch it off")
+        void nullIsTheDefault(@TempDir Path dataDir) throws IOException {
+            // A client that serialises every unset option as null must get the crawl it would
+            // have got by leaving the field out.
+            registry.setSourceCatalog(SourceCatalog.open(dataDir));
+
+            Response response = crawl(", \"respect_robots_txt\": null");
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(registered().isRespectingRobotsTxt()).isTrue();
+            assertThat(SourceCatalog.open(dataDir).all())
+                .singleElement()
+                .satisfies(descriptor -> assertThat(descriptor.get(
+                    SourceFactory.RESPECT_ROBOTS_TXT))
+                    .as("recorded as unset, so a restore applies the same default")
+                    .isNull());
+        }
+
+        @Test
+        @DisplayName("a value that is not a boolean is refused rather than guessed at")
+        void aNonBooleanIsRefused() throws IOException {
+            Response response = crawl(", \"respect_robots_txt\": \"no\"");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("respect_robots_txt");
+            assertThat(registry.isRegistered("site")).isFalse();
+        }
+
+        @Test
+        @DisplayName("a filesystem walk refuses it, having no robots.txt to read")
+        void aWalkRefusesIt(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"respect_robots_txt\": false}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("respect_robots_txt");
+            assertThat(registry.isRegistered("docs")).isFalse();
+        }
+
+        @Test
+        @DisplayName("a registration recorded before the setting existed is restored obeying it")
+        void anOlderRecordRestoresObeying() {
+            SourceFactory factory = new SourceFactory(new IngestTargetValidator(security()));
+
+            Source restored = factory.create(new SourceDescriptor(SourceFactory.TYPE_HTTP,
+                "site", Map.of(SourceFactory.BASE_URL, "https://" + HOST + "/docs")));
+            Source optedOut = factory.create(new SourceDescriptor(SourceFactory.TYPE_HTTP,
+                "site", Map.of(SourceFactory.BASE_URL, "https://" + HOST + "/docs",
+                    SourceFactory.RESPECT_ROBOTS_TXT, "false")));
+
+            assertThat(((HttpSource) restored).isRespectingRobotsTxt()).isTrue();
+            assertThat(((HttpSource) optedOut).isRespectingRobotsTxt()).isFalse();
+        }
+
+        private Response crawl(String extraConfig) throws IOException {
+            return post(security(), null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://" + HOST + "/docs\"" + extraConfig + "}}", null);
+        }
+
+        private ApiSecurityConfig security() {
+            return ApiSecurityConfig.builder().allowIngestHost(HOST).build();
+        }
+
+        private HttpSource registered() {
+            assertThat(registry.get("site")).isInstanceOf(HttpSource.class);
+            return (HttpSource) registry.get("site");
+        }
+    }
+
     @Nested
     @DisplayName("Declared encoding")
     class DeclaredEncoding {
@@ -856,9 +968,17 @@ class IngestEndpointTest {
      */
     private Response post(Path root, InlineSourceIds supplied, String requestBody,
                           String namespace) throws IOException {
+        return post(ApiSecurityConfig.builder().allowIngestRoot(root).build(), supplied,
+            requestBody, namespace);
+    }
+
+    /**
+     * Posts {@code requestBody} to an endpoint enforcing {@code security}.
+     */
+    private Response post(ApiSecurityConfig security, InlineSourceIds supplied,
+                          String requestBody, String namespace) throws IOException {
         IngestEndpoint endpoint = new IngestEndpoint(registry, null, null,
-            new IngestTargetValidator(ApiSecurityConfig.builder().allowIngestRoot(root).build()),
-            supplied);
+            new IngestTargetValidator(security), supplied);
 
         HttpExchange exchange = mock(HttpExchange.class);
         ByteArrayOutputStream responseBody = new ByteArrayOutputStream();

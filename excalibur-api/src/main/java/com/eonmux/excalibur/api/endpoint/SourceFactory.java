@@ -86,6 +86,13 @@ public final class SourceFactory {
     /** Configuration key setting the gap a crawl leaves between requests to its host. */
     public static final String CRAWL_DELAY_MS = "crawl_delay_ms";
 
+    /**
+     * Configuration key deciding whether a crawl reads and obeys each origin's robots.txt.
+     * Absent means true, which is what every registration recorded before the key existed is
+     * read as.
+     */
+    public static final String RESPECT_ROBOTS_TXT = "respect_robots_txt";
+
     /** Deepest a crawl may be asked to descend. */
     public static final int MAX_CRAWL_DEPTH = 1000;
 
@@ -259,6 +266,10 @@ public final class SourceFactory {
         }
         builder.crawlDelayMillis(pacedDelayMillis(minCrawlDelayMillis,
             longValue(descriptor, CRAWL_DELAY_MS, 0, IngestConfig.MAX_CRAWL_DELAY_MS)));
+        Boolean respectRobotsTxt = boolValue(descriptor, RESPECT_ROBOTS_TXT);
+        if (respectRobotsTxt != null) {
+            builder.respectRobotsTxt(respectRobotsTxt);
+        }
 
         return builder.build();
     }

@@ -6,6 +6,7 @@ import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
 import com.eonmux.excalibur.ingest.source.DocumentNotFoundException;
+import com.eonmux.excalibur.ingest.source.FetchDisallowedException;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
@@ -124,6 +125,19 @@ public class IngestionOrchestrator {
          * @param entriesSkipped Documents listed whose bytes are not text; zero clears it
          */
         void setSkipped(long entriesSkipped);
+
+        /**
+         * Records how many documents this run left alone because their publisher forbids
+         * fetching them - the URLs an HTTP source's robots.txt disallows.
+         *
+         * <p>Apart from {@link #setSkipped}, which counts documents that were read and are not
+         * text: these were never read, and what an operator does about the two is different.
+         * Reported like it, when the crawl has listed the source and again when the run ends.</p>
+         *
+         * @param entriesDisallowed What {@link Source#getDisallowedCount()} reports for the run;
+         *                          zero clears it
+         */
+        void setDisallowed(long entriesDisallowed);
 
         /**
          * Sets an error state.
@@ -599,6 +613,9 @@ public class IngestionOrchestrator {
         // not go on reporting what the crawl before it skipped - and that includes a crawl that
         // lists nothing at all, which is where a root emptied since the last one ends up.
         status.setSkipped(0);
+        // What the crawl was forbidden is known now, and is the whole answer for a crawl that
+        // listed nothing because its site disallowed everything.
+        status.setDisallowed(source.getDisallowedCount());
 
         if (totalPending == 0) {
             status.update("idle", 1.0, 0, 0);
@@ -629,6 +646,7 @@ public class IngestionOrchestrator {
         int processedDocs = 0;
         int failedDocs = 0;
         int skippedDocs = 0;
+        int disallowedDocs = 0;
 
         for (String documentId : documentIds) {
             if (stopRequested(stop)) {
@@ -639,8 +657,10 @@ public class IngestionOrchestrator {
                     sourceId, processedDocs, totalPending);
                 finishStoppedRun(stop);
                 status.setSkipped(skippedDocs);
+                status.setDisallowed(source.getDisallowedCount());
                 status.setError("Ingestion stopped");
-                return new IngestionOutcome(processedDocs - failedDocs - skippedDocs,
+                return new IngestionOutcome(
+                    processedDocs - failedDocs - skippedDocs - disallowedDocs,
                     totalIngested, failedDocs, skippedDocs, true);
             }
 
@@ -669,6 +689,11 @@ public class IngestionOrchestrator {
                     // every crawl of an ordinary directory look broken.
                     skippedDocs++;
                 }
+            } catch (FetchDisallowedException e) {
+                // Not a failure: the publisher said no. The source counts it, and the count is
+                // reported below with what the crawl itself left out.
+                disallowedDocs++;
+                LOGGER.info("Not ingesting {}: {}", documentId, e.getMessage());
             } catch (DocumentNotFoundException e) {
                 failedDocs++;
                 LOGGER.warn("Document not found: {}", documentId);
@@ -700,12 +725,13 @@ public class IngestionOrchestrator {
 
         status.update("idle", 1.0, totalIngested, 0);
         status.setSkipped(skippedDocs);
+        status.setDisallowed(source.getDisallowedCount());
         reportSkippedDocuments(sourceId, skippedDocs, totalPending);
         reportDroppedDocuments(sourceId, status, failedDocs, totalPending);
+        int ingestedDocs = processedDocs - failedDocs - skippedDocs - disallowedDocs;
         LOGGER.info("Ingestion complete: {} chunks from {} of {} documents",
-            totalIngested, processedDocs - failedDocs - skippedDocs, totalPending);
-        return new IngestionOutcome(processedDocs - failedDocs - skippedDocs, totalIngested,
-            failedDocs, skippedDocs, false);
+            totalIngested, ingestedDocs, totalPending);
+        return new IngestionOutcome(ingestedDocs, totalIngested, failedDocs, skippedDocs, false);
     }
 
     /**

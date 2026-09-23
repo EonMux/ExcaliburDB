@@ -203,6 +203,40 @@ class IngestStatusEndpointHandlerTest {
         }
 
         @Test
+        @DisplayName("pages robots.txt kept out are counted apart from skipped, without errors")
+        void disallowedIsCountedApart() throws IOException {
+            IngestStatusEndpoint.InMemoryIngestionStatusRegistry registry = registryWith("site");
+            IngestStatusEndpoint.IngestionStatus status = registry.getStatus("site");
+            status.update("idle", 1.0, 80, 0);
+            status.setSkipped(3);
+            status.setDisallowed(37);
+
+            Object json = call(new IngestStatusEndpoint(registry),
+                "GET", "/v1/ingest/status?source_id=site").json();
+
+            assertThat(Json.at(json, "entries_disallowed")).isEqualTo(37L);
+            assertThat(Json.at(json, "entries_skipped")).isEqualTo(3L);
+            assertThat(Json.at(json, "last_error")).isNull();
+        }
+
+        @Test
+        @DisplayName("a negative disallowed count is reported as none, and a reset clears it")
+        void disallowedIsNeverNegativeAndResets() throws IOException {
+            IngestStatusEndpoint.InMemoryIngestionStatusRegistry registry = registryWith("site");
+            IngestStatusEndpoint.IngestionStatus status = registry.getStatus("site");
+            IngestStatusEndpoint endpoint = new IngestStatusEndpoint(registry);
+
+            status.setDisallowed(-2);
+            assertThat(Json.at(call(endpoint, "GET", "/v1/ingest/status?source_id=site").json(),
+                "entries_disallowed")).isEqualTo(0L);
+
+            status.setDisallowed(5);
+            status.setUnconfigured("no pipeline", 1);
+            assertThat(Json.at(call(endpoint, "GET", "/v1/ingest/status?source_id=site").json(),
+                "entries_disallowed")).isEqualTo(0L);
+        }
+
+        @Test
         @DisplayName("a negative skipped count is reported as none")
         void negativeSkippedIsZero() throws IOException {
             IngestStatusEndpoint.InMemoryIngestionStatusRegistry registry = registryWith("docs");

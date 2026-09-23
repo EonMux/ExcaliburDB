@@ -967,7 +967,7 @@ class McpToolsTest {
                 SourceFactory.MAX_DOCUMENTS, SourceFactory.MAX_RESPONSE_BYTES,
                 SourceFactory.TIMEOUT_SECONDS, SourceFactory.INCLUDED_PATH_PATTERNS,
                 SourceFactory.EXCLUDED_PATH_PATTERNS, SourceFactory.USER_AGENT,
-                SourceFactory.CRAWL_DELAY_MS);
+                SourceFactory.CRAWL_DELAY_MS, SourceFactory.RESPECT_ROBOTS_TXT);
     }
 
     @Test
@@ -1117,5 +1117,55 @@ class McpToolsTest {
             "crawl_delay_ms"), "description"))
             .as("a model asking for 0 to go faster has to know it gets the node's pace instead")
             .containsIgnoringCase("minimum");
+    }
+
+    @Test
+    @DisplayName("crawl_website forwards respect_robots_txt as sent, and nothing when absent")
+    void crawlForwardsTheRobotsSetting() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            tools.call(McpTools.CRAWL_WEBSITE, Map.of("source_id", "opted-out",
+                "base_url", "https://example.com", "respect_robots_txt", false));
+            tools.call(McpTools.CRAWL_WEBSITE, Map.of("source_id", "explicit",
+                "base_url", "https://example.com", "respect_robots_txt", true));
+            tools.call(McpTools.CRAWL_WEBSITE, Map.of("source_id", "plain",
+                "base_url", "https://example.com"));
+
+            List<StubNode.Received> requests = node.requests();
+            assertThat(requests).hasSize(3);
+            assertThat(sentConfig(requests.get(0)))
+                .as("false is the one value that changes the crawl: it must arrive")
+                .containsEntry("respect_robots_txt", false);
+            assertThat(sentConfig(requests.get(1))).containsEntry("respect_robots_txt", true);
+            assertThat(sentConfig(requests.get(2)))
+                .as("absent, so the node's default - obeying robots.txt - applies")
+                .doesNotContainKey("respect_robots_txt");
+        }
+    }
+
+    @Test
+    @DisplayName("crawl_website refuses a respect_robots_txt that is not a boolean")
+    void crawlRefusesAMistypedRobotsSetting() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            McpTools.ToolResult result = new McpTools(node.client(Map.of())).call(
+                McpTools.CRAWL_WEBSITE, Map.of("source_id", "s",
+                    "base_url", "https://example.com", "respect_robots_txt", "sometimes"));
+
+            assertThat(result.isError()).isTrue();
+            assertThat(result.text()).contains("respect_robots_txt");
+            assertThat(node.requests()).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("respect_robots_txt is typed and says what switching it off means")
+    void crawlDescribesTheRobotsSetting() {
+        Map<String, Object> property = Json.objectAt(properties(McpTools.CRAWL_WEBSITE),
+            "respect_robots_txt");
+
+        assertThat(property.get("type")).isEqualTo("boolean");
+        assertThat(Json.stringAt(property, "description")).contains("robots.txt")
+            .contains("entries_disallowed");
     }
 }

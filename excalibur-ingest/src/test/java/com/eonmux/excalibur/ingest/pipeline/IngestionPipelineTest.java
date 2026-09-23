@@ -67,6 +67,7 @@ class IngestionPipelineTest {
         private volatile long ingested;
         private volatile long pending;
         private volatile long skipped;
+        private volatile long disallowed;
         private volatile String error;
 
         @Override
@@ -81,6 +82,11 @@ class IngestionPipelineTest {
         @Override
         public void setSkipped(long skipped) {
             this.skipped = skipped;
+        }
+
+        @Override
+        public void setDisallowed(long disallowed) {
+            this.disallowed = disallowed;
         }
 
         @Override
@@ -115,6 +121,9 @@ class IngestionPipelineTest {
         private final AtomicInteger fetches = new AtomicInteger();
         private volatile boolean closed;
         private volatile SourceException crawlFailure;
+        /** URLs the crawl itself left out because their publisher forbids fetching them. */
+        private volatile long crawlDisallowed;
+        private final java.util.Set<String> fetchDisallowed = ConcurrentHashMap.newKeySet();
 
         FakeSource(String sourceId, Map<String, String> documents) {
             this.sourceId = sourceId;
@@ -169,8 +178,18 @@ class IngestionPipelineTest {
             if (text.equals("!fail")) {
                 throw new SourceException("cannot fetch " + documentId);
             }
+            if (text.equals("!disallowed")) {
+                fetchDisallowed.add(documentId);
+                throw new com.eonmux.excalibur.ingest.source.FetchDisallowedException(
+                    documentId, sourceId, "its publisher forbids it");
+            }
             return new FetchedDocument(documentId,
                 text.getBytes(StandardCharsets.UTF_8), "text/plain");
+        }
+
+        @Override
+        public long getDisallowedCount() {
+            return crawlDisallowed + fetchDisallowed.size();
         }
 
         @Override
@@ -592,6 +611,39 @@ class IngestionPipelineTest {
             assertThat(storedChunkExists("docs", "bad.txt", 0))
                 .as("a document that could not be fetched leaves nothing behind")
                 .isFalse();
+        }
+
+        @Test
+        @DisplayName("a document its publisher forbids fetching is counted as disallowed, not failed")
+        void disallowedDocumentsAreCountedApart() {
+            FakeSource source = new FakeSource("docs", Map.of(
+                "good.txt", "real text here",
+                "private.txt", "!disallowed"));
+            source.crawlDisallowed = 2;
+
+            RecordingStatus status = ingest(orchestrator(), source);
+
+            assertThat(status.error)
+                .as("the site said no; nothing failed")
+                .isNull();
+            assertThat(status.disallowed)
+                .as("two the crawl left out, and one refused when it was fetched")
+                .isEqualTo(3);
+            assertThat(status.skipped).isZero();
+            assertThat(storedChunkExists("docs", "good.txt", 0)).isTrue();
+            assertThat(storedChunkExists("docs", "private.txt", 0)).isFalse();
+        }
+
+        @Test
+        @DisplayName("a crawl that listed nothing still reports what it was forbidden")
+        void anEmptyCrawlReportsWhatWasDisallowed() {
+            FakeSource source = new FakeSource("docs", Map.of());
+            source.crawlDisallowed = 5;
+
+            RecordingStatus status = ingest(orchestrator(), source);
+
+            assertThat(status.disallowed).isEqualTo(5);
+            assertThat(status.error).isNull();
         }
 
         @Test

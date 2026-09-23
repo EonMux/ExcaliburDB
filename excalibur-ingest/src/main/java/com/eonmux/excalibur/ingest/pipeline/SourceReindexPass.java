@@ -6,6 +6,7 @@ import com.eonmux.excalibur.ingest.registry.ChangeSet;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
+import com.eonmux.excalibur.ingest.source.FetchDisallowedException;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
@@ -179,6 +180,10 @@ final class SourceReindexPass {
                     DocumentResult docResult =
                         documentStep.reindex(sourceId, newDocId, fetched, stop);
                     resultBuilder.addDocumentResult(docResult);
+                } catch (FetchDisallowedException e) {
+                    // The publisher said no, which is not a failure of this run; the source
+                    // counts it for the status it reports.
+                    LOG.info("Not indexing new document {}: {}", newDocId, e.getMessage());
                 } catch (SourceException e) {
                     ReindexCancellation.stopIfCancelled(stop, sourceId, documentsDone.get(),
                         documentsTotal, e);
@@ -211,6 +216,12 @@ final class SourceReindexPass {
                         documentStep.reindex(sourceId, changed.getDocumentId(), fetched, stop);
                     resultBuilder.addDocumentResult(docResult);
                     chunksTombstoned += retireReplacedVersion(changed, docResult);
+                } catch (FetchDisallowedException e) {
+                    // Change detection asked moments ago and was allowed, so only a redirect
+                    // that has since moved onto a disallowed URL gets here. The indexed version
+                    // stays until the next run, whose change detection reports it gone.
+                    LOG.info("Not re-indexing changed document {}: {}",
+                        changed.getDocumentId(), e.getMessage());
                 } catch (SourceException e) {
                     ReindexCancellation.stopIfCancelled(stop, sourceId, documentsDone.get(),
                         documentsTotal, e);

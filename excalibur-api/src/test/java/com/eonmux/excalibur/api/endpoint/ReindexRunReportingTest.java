@@ -266,6 +266,31 @@ class ReindexRunReportingTest {
         }
 
         @Test
+        @DisplayName("a re-crawl reports what the site's robots.txt kept it out of")
+        void disallowedDocumentsReachTheIngestionStatus() throws Exception {
+            // Read from the source, which was refused: a URL robots.txt disallows is never
+            // listed, so the reindexer only ever sees it as a document that has gone.
+            ingestionStatus.getOrCreate(SOURCE_ID).setDisallowed(9);
+            when(source.getDisallowedCount()).thenReturn(4L);
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(result(2));
+
+            run().execute(SOURCE_ID);
+
+            assertThat(ingestionStatus.getStatus(SOURCE_ID).entriesDisallowed()).isEqualTo(4);
+        }
+
+        @Test
+        @DisplayName("a re-crawl nothing was disallowed from clears what the last one reported")
+        void aRunWithNothingDisallowedClearsTheFigure() throws Exception {
+            ingestionStatus.getOrCreate(SOURCE_ID).setDisallowed(9);
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(result(2));
+
+            run().execute(SOURCE_ID);
+
+            assertThat(ingestionStatus.getStatus(SOURCE_ID).entriesDisallowed()).isZero();
+        }
+
+        @Test
         @DisplayName("a source with no ingestion status is not invented one")
         void anUnknownSourceIsLeftAlone() throws Exception {
             when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(resultSkipping(2, 3));
