@@ -1078,7 +1078,10 @@ curl http://localhost:8080/v1/reindex/status
 
 `state` is one of `crawling`, `embedding`, `indexing` while a run is in flight, `idle` at
 `progress: 1.0` once it finished, `cancelled` when someone stopped it, or `failed` with
-`last_error` set when it broke. `cancelled` and `failed` are different answers and the
+`last_error` set when it broke — which means it indexed nothing. A run that indexed some documents
+and failed on others finished, so it reads `idle`, with `last_error` counting what failed and what
+was indexed (`"Reindex completed with 3 errors; 400 documents indexed; see the node's log for the
+reason"`); a clean run is `idle` with `last_error: null`. `cancelled` and `failed` are different answers and the
 `cancelled` boolean says which without parsing `state`: a stopped run is the outcome you asked
 for, and reporting it as a crash sends an operator looking for a fault that is not there.
 `finished_at_ms` is when the run ended — `0` while one is still going — so how long it took, and

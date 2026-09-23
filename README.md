@@ -1695,12 +1695,15 @@ and `failed`, which the ingest status has no equivalent of. A run stopped throug
 parsing `state`: a stop that was asked for is not a crash, and reporting it as one sends an
 operator looking for a fault that is not there. `finished_at_ms` is when the run ended, `0`
 while one is still going, so how long it took and how stale its result is are both readable.
-A reindex that stops early leaves the old segments
-serving, and `last_error` says what kind of failure it was and how many documents it affected,
-pointing at the node's log for the reason itself — those reasons carry filesystem paths and
-embedding endpoint URLs, and this route answers any caller holding a read token. It is not
-reported as `idle`, because a failed run reported as idle-with-a-note reads as a run that
-finished.
+A run is `failed` only when it indexed nothing; it leaves the old segments serving, and
+`last_error` says what kind of failure it was and how many documents it affected. A run that
+indexed some documents and failed on others did finish, and reads `idle` at `progress: 1.0` with
+`last_error` counting the failures and the documents indexed (`"Reindex completed with 3 errors;
+400 documents indexed; ..."`), so a clean run is the one with `last_error: null`. Either way
+`last_error` points at the node's log for the reasons themselves — those carry filesystem paths
+and embedding endpoint URLs, and this route answers any caller holding a read token. A run that
+indexed nothing is not reported as `idle`, because a failed run reported as idle-with-a-note
+reads as a run that finished.
 
 A source that has never been reindexed is a 404 rather than an invented idle run: "nothing has
 been asked of it" and "it ran and did nothing" are different answers, and only the second means

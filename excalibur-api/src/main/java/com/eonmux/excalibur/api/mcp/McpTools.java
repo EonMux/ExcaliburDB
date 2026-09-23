@@ -356,8 +356,10 @@ public final class McpTools {
         tools.add(ToolSchema.tool(REINDEX_STATUS,
             "How a re-crawl is going, for one source or for all of them. 'state' is 'crawling', "
             + "'embedding' or 'indexing' while it runs, 'idle' once it finished, 'cancelled' if "
-            + "it was stopped on purpose, and 'failed' if it stopped early - only the last is a "
-            + "problem. 'documents_processed' and 'documents_total' count documents, and "
+            + "it was stopped on purpose, and 'failed' if it stopped early having indexed "
+            + "nothing. An 'idle' run with 'last_error' set finished but failed on some "
+            + "documents, and 'last_error' says how many. 'documents_processed' and "
+            + "'documents_total' count documents, and "
             + "'last_error' points at the server's log rather than quoting it. A source that "
             + "has never been re-crawled is a 404, which means nothing has been asked of it "
             + "rather than that it failed.",

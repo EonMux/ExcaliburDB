@@ -27,13 +27,14 @@ import java.util.Objects;
  * this class, and it is a judgement rather than a transcription.</p>
  *
  * <h2>What counts as a failure</h2>
- * <p>A run is failed only when it indexed nothing. Anything else is a completed run with a
- * warning in the log, because failing on any error at all reported a run that reindexed four
- * hundred documents and could not read one of them as a failed reindex - which is the opposite
- * of what an operator would do about it. Both the rolling and the standard branch apply that
- * same rule, deliberately: which of them ran is a property of how the node is deployed, not
- * something a caller asked for, and the two must not disagree about whether the same corpus
- * reindexed successfully.</p>
+ * <p>A run is failed only when it indexed nothing. Anything else is a completed run, because
+ * failing on any error at all reported a run that reindexed four hundred documents and could not
+ * read one of them as a failed reindex - which is the opposite of what an operator would do about
+ * it. A completed run that did lose documents still says so in {@code last_error}, with how many,
+ * because a readback that answered null for it could not be told from a clean run. Both the
+ * rolling and the standard branch apply that same rule, deliberately: which of them ran is a
+ * property of how the node is deployed, not something a caller asked for, and the two must not
+ * disagree about whether the same corpus reindexed successfully.</p>
  *
  * <h2>Cancelled is not failed</h2>
  * <p>{@code DELETE /v1/reindex} requests the run's {@link StopSignal} and tells the caller to
@@ -388,15 +389,18 @@ public final class ReindexRun {
         }
         if (result.hasErrors()) {
             LOGGER.warn("[reindex-{}] Rolling reindex completed with {} errors for source {}: "
-                    + "{} docs indexed, {} old segments tombstoned, new segment {}",
+                    + "{} docs indexed, {} old segments tombstoned, new segment {}: {}",
                 threadName, result.getErrorCount(), sourceId, result.getDocumentsIndexed(),
-                result.getTombstonedSegmentIds().size(), result.getNewSegmentId());
-        } else {
-            LOGGER.info("[reindex-{}] Rolling reindex completed successfully for source {}: "
-                    + "{} docs indexed, {} old segments tombstoned, new segment {}",
-                threadName, sourceId, result.getDocumentsIndexed(),
-                result.getTombstonedSegmentIds().size(), result.getNewSegmentId());
+                result.getTombstonedSegmentIds().size(), result.getNewSegmentId(),
+                errorDetail(result.getBasicResult().getErrors()));
+            statusRegistry.completeReindexWithErrors(sourceId,
+                countedPartialFailure(result.getErrorCount(), result.getDocumentsIndexed()));
+            return true;
         }
+        LOGGER.info("[reindex-{}] Rolling reindex completed successfully for source {}: "
+                + "{} docs indexed, {} old segments tombstoned, new segment {}",
+            threadName, sourceId, result.getDocumentsIndexed(),
+            result.getTombstonedSegmentIds().size(), result.getNewSegmentId());
         statusRegistry.completeReindex(sourceId);
         return true;
     }
@@ -425,8 +429,8 @@ public final class ReindexRun {
     /**
      * Records the verdict on an in-place run.
      *
-     * <p>Applies the same rule the rolling branch does - failed only when nothing was indexed -
-     * and reports the counts an operator compares against the previous run to see whether the
+     * <p>Applies the same rule the rolling branch does - failed only when nothing was indexed,
+     * finished with its failures counted when only some were - and reports the counts an operator compares against the previous run to see whether the
      * corpus actually changed.</p>
      *
      * @param threadName The worker thread, for the log
@@ -445,15 +449,18 @@ public final class ReindexRun {
         }
         if (result.hasErrors()) {
             LOGGER.warn("[reindex-{}] Reindex completed with {} errors for {}: {} docs "
-                    + "indexed, {} skipped, {} chunks created",
+                    + "indexed, {} skipped, {} chunks created: {}",
                 threadName, result.getErrorCount(), sourceId, result.getDocumentsIndexed(),
-                result.getDocumentsSkipped(), result.getChunksCreated());
-        } else {
-            LOGGER.info("[reindex-{}] Reindex completed successfully for {}: {} docs "
-                    + "indexed, {} skipped, {} chunks created",
-                threadName, sourceId, result.getDocumentsIndexed(),
-                result.getDocumentsSkipped(), result.getChunksCreated());
+                result.getDocumentsSkipped(), result.getChunksCreated(),
+                errorDetail(result.getErrors()));
+            statusRegistry.completeReindexWithErrors(sourceId,
+                countedPartialFailure(result.getErrorCount(), result.getDocumentsIndexed()));
+            return true;
         }
+        LOGGER.info("[reindex-{}] Reindex completed successfully for {}: {} docs "
+                + "indexed, {} skipped, {} chunks created",
+            threadName, sourceId, result.getDocumentsIndexed(),
+            result.getDocumentsSkipped(), result.getChunksCreated());
         statusRegistry.completeReindex(sourceId);
         return true;
     }
@@ -483,5 +490,20 @@ public final class ReindexRun {
      */
     private static String countedFailure(int errorCount) {
         return "Reindex failed completely with " + errorCount + " errors" + SEE_THE_LOG;
+    }
+
+    /**
+     * The readback text for a run that finished and lost some documents on the way.
+     *
+     * <p>The counts and nothing else, for the reason {@link #SEE_THE_LOG} gives: the messages
+     * name the documents and the paths and URLs they were read from.</p>
+     *
+     * @param errorCount How many documents failed
+     * @param indexed    How many were indexed
+     * @return What the caller is told
+     */
+    private static String countedPartialFailure(int errorCount, int indexed) {
+        return "Reindex completed with " + errorCount + " errors; " + indexed
+            + " documents indexed" + SEE_THE_LOG;
     }
 }
