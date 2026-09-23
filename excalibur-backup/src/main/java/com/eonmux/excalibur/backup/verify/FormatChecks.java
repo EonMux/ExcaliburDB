@@ -48,12 +48,13 @@ import java.util.Optional;
  *
  * <p>{@code excalibur-fsck}'s, through {@link FileInspector}, for everything else: the
  * write-ahead logs, whose records are replayed and their checksums compared; the routing
- * directory; the segments' term sketches, whose checker reads without writing and so needs
+ * directory, whose trailing checksum is compared with every byte before it; the segments'
+ * term sketches, whose checker reads without writing and so needs
  * no scratch copy; the document registry, the source catalog and the source status history,
  * which are checked against the header version and the record count their readers require; the
  * graph staging logs; and the native lexical store, which is
- * checked as a whole by {@link #withLexicalStore} because its manifest and the segments it
- * names are one structure. The same dispatch is what {@code excalibur-fsck} surveys a live
+ * checked as a whole by {@link #withLexicalStore} because its manifest - verified against the
+ * checksum on its end line - and the segments it names are one structure. The same dispatch is what {@code excalibur-fsck} surveys a live
  * directory with, so the two tools cannot disagree about which checker a file belongs to.</p>
  *
  * <p>That includes the pair an interrupted HNSW compaction stages,
@@ -67,9 +68,10 @@ import java.util.Optional;
  * pass the same directory - the disagreement one dispatch exists to rule out.</p>
  *
  * <h2>What "proven" means</h2>
- * <p>Some formats carry nothing a checker could prove: the routing directory has no
- * checksum, the in-flight ingest journal is truncation-tolerant by design, the lexical
- * store's sidecars have no verifier. Those are reported as checked and unproven - healthy,
+ * <p>Some files carry nothing a checker could prove: a routing directory or lexical store
+ * manifest an older build wrote before those formats carried a checksum, the in-flight ingest
+ * journal, which is truncation-tolerant by design, the lexical store's sidecars, which have no
+ * verifier. Those are reported as checked and unproven - healthy,
  * because nothing wrong was found, and not proven, because nothing could have been - rather
  * than left out, which would read as though nothing in the image went unverified.</p>
  *

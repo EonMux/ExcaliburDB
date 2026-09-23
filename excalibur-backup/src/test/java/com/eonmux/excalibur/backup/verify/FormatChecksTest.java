@@ -2,6 +2,8 @@ package com.eonmux.excalibur.backup.verify;
 
 import com.eonmux.excalibur.backup.testing.DataDirectoryFixture;
 import com.eonmux.excalibur.core.integrity.IndexChecksum;
+import com.eonmux.excalibur.retrieval.lexical.native_.SegmentManifest;
+import com.eonmux.excalibur.store.RoutingDirectory;
 import com.eonmux.excalibur.vector.hnsw.NodeDocumentMapping;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -312,13 +314,61 @@ class FormatChecksTest {
     }
 
     @Test
-    @DisplayName("a routing directory is well-formed, not proven: the format has no checksum")
-    void aRoutingDirectoryIsNotProven() throws IOException {
+    @DisplayName("a routing directory is proven by the checksum over the whole file")
+    void aRoutingDirectoryIsProven() throws IOException {
         ContentCheck check = check("routing.dir");
 
-        assertThat(check.healthy()).isTrue();
+        assertThat(check.healthy()).as(check.detail()).isTrue();
+        assertThat(check.proven()).as(check.detail()).isTrue();
+        assertThat(check.detail()).contains("INTACT");
+    }
+
+    @Test
+    @DisplayName("a routing directory with one slot changed fails its checksum")
+    void aRoutingDirectoryWithAFlippedSlotFails() throws IOException {
+        Path routing = dataDir.resolve("routing.dir");
+        byte[] bytes = Files.readAllBytes(routing);
+        bytes[RoutingDirectory.HEADER_BYTES + 2 * Integer.BYTES] ^= 1;
+        Files.write(routing, bytes);
+
+        ContentCheck check = check("routing.dir");
+
+        assertThat(check.healthy()).isFalse();
+        assertThat(check.proven()).isFalse();
+        assertThat(check.detail()).contains("CORRUPT").contains("checksum did not match");
+    }
+
+    @Test
+    @DisplayName("a routing directory an older build wrote is healthy and not proven")
+    void anUncheckedRoutingDirectoryIsNotProven() throws IOException {
+        Path routing = dataDir.resolve("routing.dir");
+        byte[] bytes = Files.readAllBytes(routing);
+        byte[] legacy = java.util.Arrays.copyOf(bytes, bytes.length - RoutingDirectory.CHECKSUM_BYTES);
+        ByteBuffer.wrap(legacy).order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(Long.BYTES, RoutingDirectory.UNCHECKSUMMED_VERSION);
+        Files.write(routing, legacy);
+
+        ContentCheck check = check("routing.dir");
+
+        assertThat(check.healthy()).as(check.detail()).isTrue();
         assertThat(check.proven()).isFalse();
         assertThat(check.detail()).contains("LEGACY_UNPROTECTED");
+    }
+
+    @Test
+    @DisplayName("a routing directory from a newer build fails as unreadable")
+    void aRoutingDirectoryFromANewerBuildFails() throws IOException {
+        Path routing = dataDir.resolve("routing.dir");
+        byte[] bytes = Files.readAllBytes(routing);
+        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(Long.BYTES, RoutingDirectory.VERSION + 1);
+        Files.write(routing, bytes);
+
+        ContentCheck check = check("routing.dir");
+
+        assertThat(check.healthy()).isFalse();
+        assertThat(check.detail()).contains("UNREADABLE")
+            .contains("format version " + (RoutingDirectory.VERSION + 1));
     }
 
     @Test
@@ -372,6 +422,76 @@ class FormatChecksTest {
             .allSatisfy(segment -> assertThat(segment.proven()).as(segment.detail()).isTrue());
         assertThat(folded).allSatisfy(each ->
             assertThat(each.healthy()).as("%s: %s", each.path(), each.detail()).isTrue());
+    }
+
+    @Test
+    @DisplayName("the lexical store's manifest is proven by the checksum on its end line")
+    void theLexicalManifestIsProven() throws IOException {
+        ContentCheck manifest = lexicalManifestCheck();
+
+        assertThat(manifest.healthy()).as(manifest.detail()).isTrue();
+        assertThat(manifest.proven()).as(manifest.detail()).isTrue();
+        assertThat(manifest.detail()).contains("INTACT");
+    }
+
+    @Test
+    @DisplayName("a lexical manifest with a changed byte fails its checksum")
+    void aLexicalManifestWithAFlippedByteFails() throws IOException {
+        Path manifest = dataDir.resolve("chunk-index").resolve("manifest");
+        byte[] bytes = Files.readAllBytes(manifest);
+        // The last digit of the first record's epoch, still a well-formed line.
+        int at = new String(bytes, java.nio.charset.StandardCharsets.UTF_8).indexOf('\n') + 1;
+        at = new String(bytes, java.nio.charset.StandardCharsets.UTF_8).indexOf('\t', at) + 1;
+        bytes[at] = (byte) (bytes[at] == '9' ? '8' : bytes[at] + 1);
+        Files.write(manifest, bytes);
+
+        ContentCheck check = lexicalManifestCheck();
+
+        assertThat(check.healthy()).isFalse();
+        assertThat(check.detail()).contains("CORRUPT").contains("checksum did not match");
+    }
+
+    @Test
+    @DisplayName("a counted lexical manifest an older build wrote is healthy and not proven")
+    void aCountedLexicalManifestIsNotProven() throws IOException {
+        Path manifest = dataDir.resolve("chunk-index").resolve("manifest");
+        List<String> lines = Files.readAllLines(manifest);
+        List<String> records = lines.subList(1, lines.size() - 1);
+        Files.writeString(manifest, "excalibur-lexical-store v2\n" + String.join("\n", records)
+            + (records.isEmpty() ? "" : "\n") + "#end\t" + records.size() + "\n");
+
+        ContentCheck check = lexicalManifestCheck();
+
+        assertThat(check.healthy()).as(check.detail()).isTrue();
+        assertThat(check.proven()).isFalse();
+        assertThat(check.detail()).contains("LEGACY_UNPROTECTED");
+    }
+
+    @Test
+    @DisplayName("a lexical manifest from a newer build fails as unreadable")
+    void aLexicalManifestFromANewerBuildFails() throws IOException {
+        Path manifest = dataDir.resolve("chunk-index").resolve("manifest");
+        List<String> lines = new ArrayList<>(Files.readAllLines(manifest));
+        lines.set(0, "excalibur-lexical-store v" + (SegmentManifest.VERSION + 1));
+        Files.writeString(manifest, String.join("\n", lines) + "\n");
+
+        ContentCheck check = lexicalManifestCheck();
+
+        assertThat(check.healthy()).isFalse();
+        assertThat(check.detail()).contains("UNREADABLE")
+            .contains("format version " + (SegmentManifest.VERSION + 1));
+    }
+
+    /**
+     * Folds the lexical store over nothing and returns the manifest's verdict.
+     *
+     * @return The verdict on {@code chunk-index/manifest}
+     */
+    private ContentCheck lexicalManifestCheck() {
+        return FormatChecks.withLexicalStore(dataDir, List.of()).stream()
+            .filter(each -> each.path().equals("chunk-index/manifest"))
+            .findFirst()
+            .orElseThrow();
     }
 
     @Test

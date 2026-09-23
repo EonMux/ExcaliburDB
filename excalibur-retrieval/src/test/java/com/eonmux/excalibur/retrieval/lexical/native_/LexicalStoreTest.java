@@ -829,6 +829,54 @@ class LexicalStoreTest {
         }
 
         @Test
+        @DisplayName("a manifest that fails its checksum stops the open and takes nothing with it")
+        void manifestFailingItsChecksumKeepsTheSegments(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "alpha oom"), 1);
+                store.add(docs("b", "beta oom"), 2);
+            }
+            List<String> before = segmentDirectories(dir);
+            // A segment name altered in place: still a well-formed record, still counted, and
+            // naming a directory that is not there - so seg-1 would read as an orphan.
+            String manifest = Files.readString(dir.resolve("manifest"));
+            Files.writeString(dir.resolve("manifest"), manifest.replace("seg-1\t", "seg-7\t"));
+
+            assertThatThrownBy(() -> LexicalStore.open(dir))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("checksum did not match");
+
+            assertThat(segmentDirectories(dir))
+                .as("a manifest that failed its checksum must never authorise a deletion")
+                .isEqualTo(before);
+        }
+
+        @Test
+        @DisplayName("a counted manifest without a checksum opens, sweeps, and is rewritten with one")
+        void countedManifestOpensAndIsUpgradedByTheNextWrite(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "alpha oom"), 1);
+            }
+            // What the build before the checksum wrote: the version 2 header, and an end line
+            // carrying the count alone.
+            List<String> lines = Files.readAllLines(dir.resolve("manifest"));
+            List<String> records = lines.subList(1, lines.size() - 1);
+            Files.writeString(dir.resolve("manifest"), "excalibur-lexical-store v2\n"
+                + String.join("\n", records) + "\n#end\t" + records.size() + "\n");
+            Files.createDirectories(dir.resolve("seg-99"));
+
+            try (LexicalStore reopened = LexicalStore.open(dir)) {
+                assertThat(reopened.search(new String[] {"alpha"}, ones(1), 10, 9))
+                    .extracting(LexicalStore.Hit::key)
+                    .containsExactly("a");
+                assertThat(Files.exists(dir.resolve("seg-99")))
+                    .as("a counted manifest is still trusted to sweep what it does not name")
+                    .isFalse();
+                reopened.add(docs("b", "beta oom"), 2);
+            }
+            assertThat(SegmentManifest.read(dir).version()).isEqualTo(SegmentManifest.VERSION);
+        }
+
+        @Test
         @DisplayName("a manifest with no count marker still opens and is not swept from")
         void legacyManifestOpensWithoutSweeping(@TempDir Path dir) throws Exception {
             try (LexicalStore store = LexicalStore.open(dir)) {

@@ -86,6 +86,55 @@ class RoutingDirectoryLossTest {
     }
 
     @Test
+    @DisplayName("a directory that fails its checksum after two splits refuses to start, saying so")
+    void aChecksumFailureAfterTwoSplitsRefusesToStart(@TempDir Path tempDir) throws Exception {
+        Path dataDir = storeWithTwoSplits(tempDir, "checksum");
+        Path directory = dataDir.resolve(RoutingDirectory.FILE_NAME);
+        byte[] bytes = Files.readAllBytes(directory);
+        // One slot now names another segment that exists: well-formed, and wrong.
+        bytes[RoutingDirectory.HEADER_BYTES + 19 * Integer.BYTES] ^= 1;
+        Files.write(directory, bytes);
+
+        try (StorageEngine engine = new StorageEngine(dataDir)) {
+            assertThatThrownBy(engine::start)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(RoutingDirectory.FILE_NAME)
+                .hasMessageContaining("checksum did not match");
+        }
+    }
+
+    @Test
+    @DisplayName("a directory an older build wrote is applied, and the next split adds a checksum")
+    void anUncheckedDirectoryIsAppliedAndUpgradedByTheNextSplit(@TempDir Path tempDir)
+            throws Exception {
+        Path dataDir = storeWithTwoSplits(tempDir, "upgraded");
+        Path directory = dataDir.resolve(RoutingDirectory.FILE_NAME);
+        int[] slots = RoutingDirectory.decode(Files.readAllBytes(directory)).canonicalPerSlot();
+        java.nio.ByteBuffer legacy = java.nio.ByteBuffer
+            .allocate(RoutingDirectory.HEADER_BYTES + slots.length * Integer.BYTES)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .putLong(RoutingDirectory.MAGIC)
+            .putInt(RoutingDirectory.UNCHECKSUMMED_VERSION)
+            .putInt(slots.length);
+        for (int slot : slots) {
+            legacy.putInt(slot);
+        }
+        Files.write(directory, legacy.array());
+
+        try (StorageEngine engine = new StorageEngine(dataDir)) {
+            engine.start();
+            for (int i = 0; i < 200; i++) {
+                assertThat(engine.get(("loss-key-" + i).getBytes(StandardCharsets.UTF_8)))
+                    .as("key %s, routed by the directory the older build wrote", i)
+                    .isNotNull();
+            }
+            splitAndAwait(engine, 5);
+        }
+        assertThat(RoutingDirectory.decode(Files.readAllBytes(directory)).version())
+            .isEqualTo(RoutingDirectory.VERSION);
+    }
+
+    @Test
     @DisplayName("the refusal does not destroy anything: restoring the directory restores the store")
     void restoringTheDirectoryRestoresTheStore(@TempDir Path tempDir) throws Exception {
         Path dataDir = storeWithTwoSplits(tempDir, "restorable");

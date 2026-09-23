@@ -13,8 +13,8 @@ import java.util.Objects;
  *
  * <h2>Two verdicts, not one</h2>
  * <p>{@code healthy} is whether the checker found anything wrong, and {@code proven} is
- * whether it could have. They differ for every format that carries no checksum - a routing
- * directory, a registry marked only with a record count, the in-flight ingest journal, a
+ * whether it could have. They differ for every file that carries no checksum - a routing
+ * directory an older build wrote, a registry marked only with a record count, the in-flight ingest journal, a
  * lexical store sidecar - and for a file sealed at a format version that predates its seal.
  * Such a file is healthy, because nothing was found, and unproven, because nothing could
  * have been. Reporting one verdict would make those files read as verified, which they were

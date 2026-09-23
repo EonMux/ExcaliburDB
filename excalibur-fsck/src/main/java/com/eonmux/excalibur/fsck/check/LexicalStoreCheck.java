@@ -15,10 +15,14 @@ import java.util.List;
  *
  * <p>The manifest is the store's commit record: a reader takes the set of live segments from
  * it, so a segment it names and the directory does not hold is an index that cannot be
- * opened. {@link SegmentManifest#read} is public and writes nothing, and it refuses a
- * manifest whose declared record count disagrees with its lines - which is the only
- * completeness evidence this format has. None of it is checksummed, and the verdict says
- * so.</p>
+ * opened. {@link SegmentManifest#read} is public and writes nothing, and it is the one
+ * judgement here: it refuses a manifest whose declared record count disagrees with its lines,
+ * or, at the current version, whose bytes do not match the checksum on its end line, and the
+ * store refuses exactly the same file. What it accepted is then reported by what its version
+ * could prove - intact at the current version, whose checksum covers every line; unprotected
+ * at version 2, whose count proves that no line was lost and nothing about the lines that are
+ * there; unchecked at version 1, which carries neither. A manifest a newer build wrote is
+ * unreadable rather than corrupt, since nothing shows its bytes are damaged.</p>
  *
  * <p>Each segment the manifest names is then verified by
  * {@link PostingsIndex#verifyIntegrity}, which streams every column past a digest without
@@ -58,6 +62,11 @@ public final class LexicalStoreCheck {
         SegmentManifest parsed;
         try {
             parsed = SegmentManifest.read(directory);
+        } catch (SegmentManifest.UnsupportedVersionException e) {
+            IntegrityReport unreadable = IntegrityReport.unsupportedVersion(manifest, FORMAT,
+                e.version(), SegmentManifest.OLDEST_VERSION, SegmentManifest.VERSION);
+            return new LexicalInspection(IntegrityReports.from(unreadable, manifest,
+                manifestRelative, "v" + e.version(), sizeOf(manifest)), List.of(), List.of());
         } catch (IOException e) {
             return new LexicalInspection(new FileCheck(manifest, manifestRelative, FORMAT, null,
                 CheckStatus.CORRUPT, e.getMessage(), sizeOf(manifest)),
@@ -80,16 +89,25 @@ public final class LexicalStoreCheck {
     private static FileCheck manifestVerdict(Path manifest, String relative,
                                              SegmentManifest parsed) {
         long size = sizeOf(manifest);
+        String version = "v" + parsed.version();
         if (!parsed.verified()) {
-            return new FileCheck(manifest, relative, FORMAT, "v1", CheckStatus.UNCHECKED,
+            return new FileCheck(manifest, relative, FORMAT, version, CheckStatus.UNCHECKED,
                 "this manifest predates the record count, so it cannot be shown to be all of "
                     + "itself: a segment it does not name and a segment named by a line that "
-                    + "is no longer there are indistinguishable", size);
+                    + "is no longer there are indistinguishable. The node rewrites it with a "
+                    + "count and a checksum at its next write", size);
         }
-        return new FileCheck(manifest, relative, FORMAT, "v2", CheckStatus.LEGACY_UNPROTECTED,
-            "the record count agrees with the " + parsed.entries().size() + " segments named, "
-                + "so no line was lost; the format carries no checksum, so the lines "
-                + "themselves are not verified", size);
+        if (parsed.version() < SegmentManifest.VERSION) {
+            return new FileCheck(manifest, relative, FORMAT, version,
+                CheckStatus.LEGACY_UNPROTECTED,
+                "the record count agrees with the " + parsed.entries().size() + " segments "
+                    + "named, so no line was lost; this version carries no checksum, so the "
+                    + "lines themselves are not verified. The node rewrites it with one at its "
+                    + "next write", size);
+        }
+        return new FileCheck(manifest, relative, FORMAT, version, CheckStatus.INTACT,
+            "the checksum on the end line matched every byte before it, and the record count "
+                + "agrees with the " + parsed.entries().size() + " segments named", size);
     }
 
     /**

@@ -1,10 +1,9 @@
 package com.eonmux.excalibur.fsck.check;
 
+import com.eonmux.excalibur.core.integrity.IntegrityReport;
 import com.eonmux.excalibur.store.RoutingDirectory;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Objects;
@@ -12,14 +11,17 @@ import java.util.Objects;
 /**
  * Reads {@code routing.dir}, which says which segment each hash slot belongs to.
  *
- * <p>The store's own reader answers null for a file that is absent and for a file that is
- * damaged alike, deliberately: to a node starting up those are the same situation. They are
- * not the same situation to an operator asking whether the data is intact, so the header is
- * parsed here instead, against the format's public constants.</p>
+ * <p>The store's own start-up answers "no directory" for a file that is absent and for a file
+ * that is damaged alike, deliberately: to a node starting up those are the same situation. They
+ * are not the same situation to an operator asking whether the data is intact, so the file is
+ * parsed here with {@link RoutingDirectory#decode}, the parser that start-up uses, and whatever
+ * it refuses is reported with its reason.</p>
  *
- * <p>Nothing in this format is checksummed. A file whose magic, version and width all agree
- * and whose length matches its width is well-formed, which is a weaker claim than intact and
- * is reported as such.</p>
+ * <p>From version 2 the file ends with a CRC32C of every byte before it, so a file the parser
+ * accepts at that version is intact: every slot is the one written. Version 1 carried no
+ * checksum; a version 1 file whose magic, width and length all agree is well-formed, which is
+ * a weaker claim than intact and is reported as legacy-unprotected. A file a newer build wrote
+ * is unreadable rather than corrupt, since nothing shows its bytes are damaged.</p>
  */
 public final class RoutingDirectoryCheck {
 
@@ -31,7 +33,7 @@ public final class RoutingDirectoryCheck {
     }
 
     /**
-     * Reads the routing directory's header and slot table.
+     * Reads the routing directory and verifies it.
      *
      * @param file     The routing directory file
      * @param relative Its path relative to the data directory
@@ -45,83 +47,43 @@ public final class RoutingDirectoryCheck {
             return new RoutingInspection(new FileCheck(file, relative, FORMAT, null,
                 CheckStatus.UNREADABLE, "the file could not be read: " + e, -1), new int[0]);
         }
-        if (bytes.length < RoutingDirectory.HEADER_BYTES) {
-            return corrupt(file, relative, bytes.length,
-                "the file is " + bytes.length + " bytes, too short to hold its "
-                    + RoutingDirectory.HEADER_BYTES + "-byte header");
+        RoutingDirectory.Contents contents;
+        try {
+            contents = RoutingDirectory.decode(bytes);
+        } catch (RoutingDirectory.UnsupportedVersionException e) {
+            IntegrityReport unreadable = IntegrityReport.unsupportedVersion(file, FORMAT,
+                e.version(), RoutingDirectory.UNCHECKSUMMED_VERSION, RoutingDirectory.VERSION);
+            return new RoutingInspection(IntegrityReports.from(unreadable, file, relative,
+                "v" + e.version(), bytes.length), new int[0]);
+        } catch (IOException e) {
+            return new RoutingInspection(new FileCheck(file, relative, FORMAT, null,
+                CheckStatus.CORRUPT, e.getMessage(), bytes.length), new int[0]);
         }
-        ByteBuffer buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
-        if (buffer.getLong(0) != RoutingDirectory.MAGIC) {
-            return corrupt(file, relative, bytes.length,
-                "the file does not begin with the routing directory's magic number, so it is "
-                    + "not one, or its first bytes were overwritten");
-        }
-        int version = buffer.getInt(8);
-        if (version != RoutingDirectory.VERSION) {
-            return corrupt(file, relative, bytes.length,
-                "the file is format version " + version + ", which this build cannot read; it "
-                    + "supports version " + RoutingDirectory.VERSION);
-        }
-        return withWidth(file, relative, bytes, buffer);
+        return new RoutingInspection(verdict(file, relative, contents, bytes.length),
+            contents.canonicalPerSlot());
     }
 
     /**
-     * Validates the width field and reads the slot table behind it.
+     * Phrases what reading an accepted file proved.
      *
      * @param file     The routing directory file
      * @param relative Its path relative to the data directory
-     * @param bytes    The whole file
-     * @param buffer   A little-endian view of it
-     * @return The verdict and the slot table
-     */
-    private static RoutingInspection withWidth(Path file, String relative, byte[] bytes,
-                                               ByteBuffer buffer) {
-        int width = buffer.getInt(12);
-        if (width <= 0 || Integer.bitCount(width) != 1) {
-            return corrupt(file, relative, bytes.length,
-                "the directory declares a width of " + width + ", and a routing width is "
-                    + "always a positive power of two");
-        }
-        long needed = RoutingDirectory.HEADER_BYTES + (long) width * Integer.BYTES;
-        if (bytes.length < needed) {
-            return corrupt(file, relative, bytes.length,
-                "the directory declares " + width + " slots, which need " + needed
-                    + " bytes, and the file is " + bytes.length);
-        }
-        int[] slots = new int[width];
-        for (int i = 0; i < width; i++) {
-            slots[i] = buffer.getInt(RoutingDirectory.HEADER_BYTES + i * Integer.BYTES);
-        }
-        return new RoutingInspection(new FileCheck(file, relative, FORMAT, "v" + version(buffer),
-            CheckStatus.LEGACY_UNPROTECTED,
-            "the header and all " + width + " slot entries are well-formed, but this format "
-                + "carries no checksum, so the slot values themselves cannot be verified",
-            bytes.length), slots);
-    }
-
-    /**
-     * Reads the version field.
-     *
-     * @param buffer A little-endian view of the file
-     * @return The version
-     */
-    private static int version(ByteBuffer buffer) {
-        return buffer.getInt(8);
-    }
-
-    /**
-     * Builds a corrupt verdict with no slot table.
-     *
-     * @param file     The routing directory file
-     * @param relative Its path relative to the data directory
+     * @param contents What the parser read
      * @param size     The file's size
-     * @param detail   What is wrong
-     * @return The inspection
+     * @return The verdict
      */
-    private static RoutingInspection corrupt(Path file, String relative, long size,
-                                             String detail) {
-        return new RoutingInspection(new FileCheck(file, relative, FORMAT, null,
-            CheckStatus.CORRUPT, detail, size), new int[0]);
+    private static FileCheck verdict(Path file, String relative,
+                                     RoutingDirectory.Contents contents, long size) {
+        int width = contents.canonicalPerSlot().length;
+        String version = "v" + contents.version();
+        if (contents.checksummed()) {
+            return new FileCheck(file, relative, FORMAT, version, CheckStatus.INTACT,
+                "the checksum matched the header and all " + width + " slot entries", size);
+        }
+        return new FileCheck(file, relative, FORMAT, version, CheckStatus.LEGACY_UNPROTECTED,
+            "the header and all " + width + " slot entries are well-formed, but this version "
+                + "carries no checksum, so the slot values themselves cannot be verified. The "
+                + "node rewrites it with one the next time the directory changes", size);
     }
 
     /**

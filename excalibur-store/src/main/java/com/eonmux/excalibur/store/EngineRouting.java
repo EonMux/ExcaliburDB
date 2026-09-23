@@ -101,14 +101,15 @@ final class EngineRouting {
         }
 
         // The directory as it actually was, when the previous run wrote it down.
-        if (applyPersistedRouting(width)) {
+        RoutingDirectory.Loaded persisted = RoutingDirectory.load(engine.dataDir);
+        if (applyPersistedRouting(persisted.canonicalPerSlot(), width)) {
             return;
         }
 
         // Otherwise the buddy heuristic -- but only where it is provably exact, which the
         // check below is responsible for. Beyond that point it is not a best effort, it is a
         // wrong answer that looks like a right one.
-        requireReconstructibleRouting(width);
+        requireReconstructibleRouting(width, persisted.problem());
 
         if (maxSegmentIndex < 0) {
             // A store with no segments has no directory because it has never needed one. What is
@@ -159,16 +160,20 @@ final class EngineRouting {
      * cause, and by the time one appears the two copies have diverged. Refusing is reversible -
      * restoring the file starts the store unharmed - and guessing is not.</p>
      *
-     * @param width The directory width implied by the segment files found on disk
+     * @param width   The directory width implied by the segment files found on disk
+     * @param problem Why a directory file that is present could not be used - cut short,
+     *                failing its checksum, from a newer build - or null when there is none
      * @throws IllegalStateException if the directory is unreadable and cannot be reconstructed
      */
-    private void requireReconstructibleRouting(int width) {
+    private void requireReconstructibleRouting(int width, String problem) {
         if (width <= StorageEngine.DEFAULT_INITIAL_SEGMENTS * 2) {
             return;
         }
+        String state = problem == null ? "is missing or unusable"
+            : "is present and cannot be used (" + problem + ")";
         throw new IllegalStateException(
-            "Cannot start: " + engine.dataDir.resolve(RoutingDirectory.FILE_NAME) + " is missing or "
-                + "unreadable, and this store has more than one segment split behind it (the "
+            "Cannot start: " + engine.dataDir.resolve(RoutingDirectory.FILE_NAME) + " " + state
+                + ", and this store has more than one segment split behind it (the "
                 + "segment files imply " + width + " routing slots, and only up to "
                 + (StorageEngine.DEFAULT_INITIAL_SEGMENTS * 2) + " can be reconstructed from their names). "
                 + "The bit each split partitioned on is recorded nowhere else, so starting "
@@ -185,11 +190,12 @@ final class EngineRouting {
      * that disagrees with the files on disk, or pointing at a segment that is no longer there,
      * describes a store this file was not written for.
      *
-     * @param width The width implied by the segment files found
+     * @param canonicalPerSlot The directory the previous run wrote, or null when there is no
+     *                         usable one
+     * @param width            The width implied by the segment files found
      * @return true when the persisted directory was applied
      */
-    private boolean applyPersistedRouting(int width) {
-        int[] canonicalPerSlot = RoutingDirectory.read(engine.dataDir);
+    private boolean applyPersistedRouting(int[] canonicalPerSlot, int width) {
         if (canonicalPerSlot == null) {
             return false;
         }

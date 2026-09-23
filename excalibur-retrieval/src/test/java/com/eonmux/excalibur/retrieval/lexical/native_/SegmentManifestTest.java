@@ -161,6 +161,167 @@ class SegmentManifestTest {
     }
 
     @Nested
+    @DisplayName("the checksum on the end line")
+    class Checksum {
+
+        private byte[] bytesOf(Path dir) throws IOException {
+            return Files.readAllBytes(manifestFile(dir));
+        }
+
+        @Test
+        @DisplayName("is written at the current version and covers every byte before the end line")
+        void coversEverythingBeforeTheEndLine(@TempDir Path dir) throws Exception {
+            of(new SegmentManifest.Entry("seg-0", 1, 10, 2)).write(dir);
+            List<String> lines = linesOf(dir);
+            byte[] bytes = bytesOf(dir);
+            String endLine = lines.get(lines.size() - 1);
+            int covered = bytes.length - endLine.length() - 1;
+            java.util.zip.CRC32C crc = new java.util.zip.CRC32C();
+            crc.update(bytes, 0, covered);
+
+            assertThat(lines.get(0)).isEqualTo("excalibur-lexical-store v" + SegmentManifest.VERSION);
+            assertThat(endLine).isEqualTo("#end\t1\t" + String.format("%08x", crc.getValue()));
+            assertThat(SegmentManifest.read(dir).version()).isEqualTo(SegmentManifest.VERSION);
+            assertThat(SegmentManifest.read(dir).verified()).isTrue();
+        }
+
+        @Test
+        @DisplayName("refuses a manifest one of whose bytes changed, naming the file and the mismatch")
+        void flippedByteIsRefused(@TempDir Path dir) throws Exception {
+            of(new SegmentManifest.Entry("seg-0", 1, 10, 2),
+                new SegmentManifest.Entry("seg-1", 4, 7, 0)).write(dir);
+            byte[] bytes = bytesOf(dir);
+            // The epoch of seg-1: still a well-formed record, so only the checksum can tell.
+            int at = new String(bytes, StandardCharsets.UTF_8).indexOf("seg-1\t4") + 6;
+            bytes[at] = '5';
+            Files.write(manifestFile(dir), bytes);
+
+            assertThatThrownBy(() -> SegmentManifest.read(dir))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining(manifestFile(dir).toString())
+                .hasMessageContaining("checksum did not match");
+        }
+
+        @Test
+        @DisplayName("refuses a manifest whose checksum field itself was altered")
+        void alteredChecksumIsRefused(@TempDir Path dir) throws Exception {
+            of(new SegmentManifest.Entry("seg-0", 1, 10, 2)).write(dir);
+            List<String> lines = new ArrayList<>(linesOf(dir));
+            lines.set(lines.size() - 1, "#end\t1\t00000000");
+            rewrite(dir, lines);
+
+            assertThatThrownBy(() -> SegmentManifest.read(dir))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("checksum did not match");
+        }
+
+        @Test
+        @DisplayName("refuses an end line that carries a count and no checksum")
+        void endLineWithoutChecksumIsRefused(@TempDir Path dir) throws Exception {
+            of(new SegmentManifest.Entry("seg-0", 1, 10, 2)).write(dir);
+            List<String> lines = new ArrayList<>(linesOf(dir));
+            lines.set(lines.size() - 1, "#end\t1");
+            rewrite(dir, lines);
+
+            assertThatThrownBy(() -> SegmentManifest.read(dir))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining(manifestFile(dir).toString());
+        }
+
+        @Test
+        @DisplayName("refuses a checksum that is not eight hexadecimal digits")
+        void malformedChecksumIsRefused(@TempDir Path dir) throws Exception {
+            of(new SegmentManifest.Entry("seg-0", 1, 10, 2)).write(dir);
+            List<String> lines = new ArrayList<>(linesOf(dir));
+            lines.set(lines.size() - 1, "#end\t1\tnot-hex!");
+            rewrite(dir, lines);
+
+            assertThatThrownBy(() -> SegmentManifest.read(dir))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("not-hex!");
+        }
+
+        @Test
+        @DisplayName("still refuses one cut short, which loses the end line with the checksum on it")
+        void truncationIsStillRefused(@TempDir Path dir) throws Exception {
+            of(new SegmentManifest.Entry("seg-0", 1, 10, 2),
+                new SegmentManifest.Entry("seg-1", 4, 7, 0)).write(dir);
+            byte[] bytes = bytesOf(dir);
+            Files.write(manifestFile(dir), java.util.Arrays.copyOf(bytes, bytes.length / 2));
+
+            assertThatThrownBy(() -> SegmentManifest.read(dir)).isInstanceOf(IOException.class);
+        }
+
+        @Test
+        @DisplayName("refuses a manifest from a newer build, naming the version it found")
+        void newerVersionIsRefused(@TempDir Path dir) throws Exception {
+            of(new SegmentManifest.Entry("seg-0", 1, 10, 2)).write(dir);
+            List<String> lines = new ArrayList<>(linesOf(dir));
+            lines.set(0, "excalibur-lexical-store v" + (SegmentManifest.VERSION + 1));
+            rewrite(dir, lines);
+
+            assertThatThrownBy(() -> SegmentManifest.read(dir))
+                .isInstanceOfSatisfying(SegmentManifest.UnsupportedVersionException.class,
+                    e -> assertThat(e.version()).isEqualTo(SegmentManifest.VERSION + 1))
+                .hasMessageContaining("version " + (SegmentManifest.VERSION + 1));
+        }
+    }
+
+    @Nested
+    @DisplayName("a manifest from a build that counted its records and did not checksum them")
+    class CountedWithoutChecksum {
+
+        private void writeCounted(Path dir, String... records) throws IOException {
+            StringBuilder text = new StringBuilder("excalibur-lexical-store v2\n");
+            for (String record : records) {
+                text.append(record).append('\n');
+            }
+            text.append("#end\t").append(records.length).append('\n');
+            Files.writeString(manifestFile(dir), text.toString(), StandardCharsets.UTF_8);
+        }
+
+        @Test
+        @DisplayName("is read as it always was, and is verified by its count")
+        void stillReads(@TempDir Path dir) throws Exception {
+            writeCounted(dir, "seg-0\t1\t10\t2", "seg-1\t4\t7\t0");
+
+            SegmentManifest read = SegmentManifest.read(dir);
+
+            assertThat(read.entries()).containsExactly(
+                new SegmentManifest.Entry("seg-0", 1, 10, 2),
+                new SegmentManifest.Entry("seg-1", 4, 7, 0));
+            assertThat(read.verified()).isTrue();
+            assertThat(read.version()).isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("is still refused when its count disagrees with its records")
+        void countStillChecked(@TempDir Path dir) throws Exception {
+            writeCounted(dir, "seg-0\t1\t10\t2", "seg-1\t4\t7\t0");
+            List<String> lines = new ArrayList<>(linesOf(dir));
+            lines.remove(1);
+            rewrite(dir, lines);
+
+            assertThatThrownBy(() -> SegmentManifest.read(dir)).isInstanceOf(IOException.class);
+        }
+
+        @Test
+        @DisplayName("is rewritten at the current version, with its checksum, by the next write")
+        void rewritingUpgradesIt(@TempDir Path dir) throws Exception {
+            writeCounted(dir, "seg-0\t1\t10\t2");
+
+            SegmentManifest.read(dir).write(dir);
+
+            assertThat(linesOf(dir).get(0))
+                .isEqualTo("excalibur-lexical-store v" + SegmentManifest.VERSION);
+            assertThat(linesOf(dir).get(linesOf(dir).size() - 1)).matches("#end\t1\t[0-9a-f]{8}");
+            assertThat(SegmentManifest.read(dir).version()).isEqualTo(SegmentManifest.VERSION);
+            assertThat(SegmentManifest.read(dir).entries())
+                .containsExactly(new SegmentManifest.Entry("seg-0", 1, 10, 2));
+        }
+    }
+
+    @Nested
     @DisplayName("a manifest from a build that had no count marker")
     class Legacy {
 
@@ -198,8 +359,17 @@ class SegmentManifestTest {
             SegmentManifest.read(dir).write(dir);
 
             assertThat(SegmentManifest.read(dir).verified()).isTrue();
+            assertThat(SegmentManifest.read(dir).version()).isEqualTo(SegmentManifest.VERSION);
             assertThat(SegmentManifest.read(dir).entries())
                 .containsExactly(new SegmentManifest.Entry("seg-0", 1, 10, 2));
+        }
+
+        @Test
+        @DisplayName("it reports the version it was read at")
+        void reportsItsVersion(@TempDir Path dir) throws Exception {
+            writeLegacy(dir, "seg-0\t1\t10\t2");
+
+            assertThat(SegmentManifest.read(dir).version()).isEqualTo(1);
         }
     }
 }
