@@ -48,6 +48,9 @@ class GraphStagingLogCheckTest {
 
     private static final Provenance DOCUMENT = Provenance.of(SourceType.DOCUMENT, 42, 0.9, 3);
 
+    /** Bytes of header every staging log begins with. */
+    private static final int HEADER_BYTES = 16;
+
     /** Where a tenant's staging logs live, relative to the data directory. */
     private static final String STAGING = "shared/graph-staging/";
 
@@ -165,16 +168,83 @@ class GraphStagingLogCheckTest {
     }
 
     @Test
-    @DisplayName("a staged fact that fails its checksum is corrupt, even the last one")
+    @DisplayName("a staged fact that fails its checksum under facts written after it is corrupt")
     void aDamagedFactIsCorrupt() throws IOException {
         Path file = staging.resolve(GraphStagingStore.TRIPLE_LOG);
-        flip(file, Files.size(file) - Integer.BYTES - 1);
+        long record = (Files.size(file) - HEADER_BYTES) / 3;
+        flip(file, HEADER_BYTES + record + 1);
 
         FileCheck result = check(GraphStagingStore.TRIPLE_LOG);
 
-        assertThat(result.status()).isEqualTo(CheckStatus.CORRUPT);
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.CORRUPT);
         assertThat(result.needsOperator()).isTrue();
-        assertThat(result.detail()).contains("corrupt record at fact 2");
+        assertThat(result.detail()).contains("corrupt record at fact 1");
+    }
+
+    @Test
+    @DisplayName("a last staged fact that fails its checksum is unsealed: no force finished it, "
+        + "so no document it came from was ever recorded as handled")
+    void aDamagedLastFactIsUnsealed() throws IOException {
+        Path file = staging.resolve(GraphStagingStore.TRIPLE_LOG);
+        long record = (Files.size(file) - HEADER_BYTES) / 3;
+        flip(file, Files.size(file) - Integer.BYTES - 1);
+        String before = fingerprint(file);
+
+        FileCheck result = check(GraphStagingStore.TRIPLE_LOG);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.UNSEALED);
+        assertThat(result.detail())
+            .contains("ends in " + record + " bytes")
+            .contains("keeping the 2 staged facts");
+        assertThat(fingerprint(file)).as("the check must not write").isEqualTo(before);
+        try (GraphStagingStore store = GraphStagingStore.open(staging)) {
+            assertThat(store.stagedCount()).as("the node agrees").isEqualTo(2);
+        }
+    }
+
+    @Test
+    @DisplayName("a damaged label with intact labels after it, none of whose ids anything "
+        + "holds, is unsealed, and the report says how many intact labels go with it")
+    void outOfOrderLabelsNothingHoldsAreUnsealed() throws IOException {
+        try (GraphStagingStore store = GraphStagingStore.open(staging)) {
+            store.entityIdOf("Carol");
+            store.entityIdOf("Dave");
+            store.entityIdOf("Eve");
+        }
+        Path file = staging.resolve(GraphStagingStore.ENTITY_LABELS);
+        // Carol's record is 13 bytes, ahead of Dave's 12 and Eve's 11.
+        flip(file, Files.size(file) - 11 - 12 - 13 + Integer.BYTES);
+
+        FileCheck result = check(GraphStagingStore.ENTITY_LABELS);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.UNSEALED);
+        assertThat(result.needsOperator()).isFalse();
+        assertThat(result.detail())
+            .contains("2 intact labels besides")
+            .contains("keeping the 4 before them");
+        try (GraphStagingStore store = GraphStagingStore.open(staging)) {
+            assertThat(store.entityCount()).as("the node agrees").isEqualTo(4);
+        }
+    }
+
+    @Test
+    @DisplayName("a damaged label before a label the published graph names is corrupt, however "
+        + "the labels between were written")
+    void outOfOrderLabelsTheGraphHoldsAreCorrupt() throws IOException {
+        try (GraphStagingStore store = GraphStagingStore.open(staging)) {
+            store.entityIdOf("Carol");
+            store.entityIdOf("Dave");
+            com.eonmux.excalibur.graph.staging.GraphBuilder.build(store,
+                dataDir.resolve("shared/graph"));
+        }
+        Path file = staging.resolve(GraphStagingStore.ENTITY_LABELS);
+        flip(file, Files.size(file) - 12 - 13 + Integer.BYTES);
+
+        FileCheck result = check(GraphStagingStore.ENTITY_LABELS);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.CORRUPT);
+        assertThat(result.detail()).contains("published graph").contains("id 5 is held by")
+            .contains("1 intact label(s) among them");
     }
 
     @Test

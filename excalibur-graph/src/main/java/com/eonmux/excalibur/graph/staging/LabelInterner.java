@@ -60,26 +60,34 @@ import java.util.zip.CRC32;
  *
  * <h2>What an open may cut off</h2>
  * <p>The file is read to the end on open. A record whose checksum does not match, or whose length
- * runs past the end of the file, ends the scan. When nothing readable follows it, it is the last
- * record, and a crash during {@link #intern} leaves exactly that - a record that never finished
- * being forced, whose id was therefore never returned. Cutting it off is what lets ingestion resume
- * after a crash instead of requiring the graph to be rebuilt from nothing.</p>
+ * runs past the end of the file, ends the replay, and the open cuts off everything from it to the
+ * end of the file - provided nothing holds an id that would be lost with it.</p>
  *
- * <p>A record that was forced and then damaged looks the same, though, and its id may be held
- * anywhere. So before cutting anything off, the open asks the holders it is given for the highest
- * id they refer to, and refuses when one of them refers to an id the interner is about to lose; see
- * {@link ReferencedLabels}. Handing that id to a new label would serve one entity under another's
- * name, the one outcome this class exists to prevent.</p>
+ * <p>A crash during {@link #intern} leaves records that were written and never forced, and their
+ * ids were never returned. Usually that is a last record cut short. But one force covers every
+ * record written while it waited, and the operating system writes the pages behind it back in
+ * whatever order it likes, so a crash before that force finished can equally leave one of those
+ * records as the bytes that were there before and a record appended after it intact. The intact
+ * one is no more anybody's than the damaged one: the force that would have made either durable
+ * never returned, so no id at or after the first damaged record was handed out. Cutting them off
+ * together is what lets ingestion resume after a crash instead of requiring the graph to be
+ * rebuilt from nothing.</p>
+ *
+ * <p>A record that was forced and then damaged looks the same, though, and its id - or the id of
+ * any intact record after it, forced by the same flush or a later one - may be held anywhere. So
+ * before cutting anything off, the open asks the holders it is given for the highest id they refer
+ * to, and refuses when one of them refers to an id at or past the first damaged record; see
+ * {@link ReferencedLabels}. That question is what tells the two apart where it matters: an id that
+ * was never handed out cannot be in any holder, and an id that was handed out and is still in use
+ * is. Were it given to a new label, every holder would go on describing the new label as the lost
+ * one - one entity served under another's name, the one outcome this class exists to prevent. What
+ * no holder can see is an id handed out and then lost with everything that recorded it, and
+ * handing that one out again misleads nothing.</p>
  *
  * <p>A file that is absent, or shorter than its header and the start of it, is a new interner: the
  * header is forced before any id is handed out, so neither ever held one. The holders are not
  * asked, because a graph published from somewhere else is served beside a staging directory that
  * starts empty, and its ids were never this interner's to lose.</p>
- *
- * <p>That tolerance holds only while nothing readable follows the damage. Labels lost from the
- * middle of the file would have their ids handed out again to different labels, while every
- * artifact built from an earlier state still maps those ids to the labels that were lost, so that
- * case fails the open whatever the holders say; see {@link TailIntegrity}.</p>
  *
  * <h2>Erasure</h2>
  * <p>{@link #tombstone} is the only way a label leaves this file. It rewrites the file in place of
@@ -206,8 +214,7 @@ public final class LabelInterner implements AutoCloseable {
      * @throws IOException if the file cannot be read or opened for appending, is too short to
      *                     hold a header and is not a torn creation of one, or is not an interner
      *                     this build reads
-     * @throws LogCorruptionException if damage has an intact label behind it, or the open would
-     *                                lose an id a holder refers to
+     * @throws LogCorruptionException if the open would lose an id a holder refers to
      */
     public static LabelInterner open(Path path, Holders holders) throws IOException {
         Objects.requireNonNull(path, "path must not be null");
@@ -228,17 +235,20 @@ public final class LabelInterner implements AutoCloseable {
                 truncate(path, 0);
             }
         } else {
-            Replay replay = readChecked(path);
+            Replay replay = readExisting(path);
             existing = replay.labels();
             long torn = replay.contents().length - replay.validBytes();
             if (torn > 0) {
                 // Truncated to the last record that read cleanly, before anything is appended.
                 // Left in place, every record written after it would sit behind a record the
                 // next replay stops at, and those labels would be read back as absent.
-                requireUnheld(path, existing.size(), torn, holders);
-                LOGGER.warn("truncating {} from {} to {} bytes: the tail was not readable, and "
-                    + "no id it could have held is referred to", path, replay.contents().length,
-                    replay.validBytes());
+                long cut = intactRecordsAfter(replay);
+                requireUnheld(path, existing.size(), torn, cut, holders);
+                LOGGER.warn("truncating {} from {} to {} bytes after {} label(s): the record "
+                    + "after them does not read cleanly, {} intact label(s) follow it, and "
+                    + "nothing refers to an id at or past {}, so none of them was handed out",
+                    path, replay.contents().length, replay.validBytes(), existing.size(), cut,
+                    existing.size());
                 truncate(path, replay.validBytes());
             }
         }
@@ -286,25 +296,25 @@ public final class LabelInterner implements AutoCloseable {
      *
      * <h3>What it refuses</h3>
      * <p>Everything {@link #open} refuses, on the same terms: a file that is not an interner, a
-     * version this build does not read, a record that fails its checksum with an intact record
-     * somewhere after it, and a damaged last record whose id a holder refers to - the last two as
-     * a {@link LogCorruptionException}, so that damage can be told apart from a file that merely
-     * could not be read. Counting the labels before such damage would be a wrong answer rather
-     * than a partial one: the open refuses the file, and a count that read as sound would say the
-     * node will start when it will not.</p>
+     * version this build does not read, and damage the open would cut off while a holder refers
+     * to an id at or past it - the last as a {@link LogCorruptionException}, so that damage can
+     * be told apart from a file that merely could not be read. Counting the labels before such
+     * damage would be a wrong answer rather than a partial one: the open refuses the file, and a
+     * count that read as sound would say the node will start when it will not.</p>
      *
-     * <p>A damaged last record nothing refers to is reported rather than refused, because the
-     * open treats it as a write cut short and trims it; see {@link LogInspection#hasTornTail()}.
-     * So is a file shorter than its header whose bytes begin the header this build writes: a
-     * creation cut short, which the open starts afresh.</p>
+     * <p>Damage nothing refers to an id at or past is reported rather than refused, because the
+     * open cuts it off, together with any intact label after it; see
+     * {@link LogInspection#hasTornTail()} and {@link LogInspection#intactRecordsCut()}. So is a
+     * file shorter than its header whose bytes begin the header this build writes: a creation cut
+     * short, which the open starts afresh.</p>
      *
      * @param path    The interner's file
      * @param holders What holds this interner's ids elsewhere
-     * @return How many labels matched their checksums, and where the file stops reading cleanly
+     * @return How many labels matched their checksums, where the file stops reading cleanly, and
+     *         how many intact labels after that the open cuts off
      * @throws IOException if the file is absent, too short to be even a torn interner, not an
      *                     interner of a version this build reads, or cannot be read
-     * @throws LogCorruptionException if damage has an intact label behind it, or the open would
-     *                                lose an id a holder refers to
+     * @throws LogCorruptionException if the open would lose an id a holder refers to
      * @throws NullPointerException if an argument is null
      */
     public static LogInspection inspect(Path path, Holders holders) throws IOException {
@@ -315,41 +325,77 @@ public final class LabelInterner implements AutoCloseable {
             LogHeader.requireTornCreation(path, WHAT, contents, MAGIC, VERSION);
             return LogHeader.tornCreation(VERSION, contents);
         }
-        Replay replay = readChecked(path);
+        Replay replay = readExisting(path);
         long torn = replay.contents().length - replay.validBytes();
+        long cut = 0;
         if (torn > 0) {
-            requireUnheld(path, replay.labels().size(), torn, holders);
+            cut = intactRecordsAfter(replay);
+            requireUnheld(path, replay.labels().size(), torn, cut, holders);
         }
         return new LogInspection(VERSION, replay.labels().size(), replay.validBytes(),
-            replay.contents().length);
+            replay.contents().length, cut);
     }
 
     /**
      * Refuses an open that would lose an id something refers to.
      *
+     * <p>Every id at or past {@code kept} is lost by the cut, the ids of intact labels after the
+     * damage among them, so one reference at or past it is enough to refuse. No reference is what
+     * makes the cut safe: a label is forced before its id is returned, so an id a holder names
+     * was handed out, and a damaged record at or before it was forced and damaged afterwards
+     * rather than cut short by a crash.</p>
+     *
      * @param path    The interner, named in the failure
      * @param kept    How many labels the open keeps; the next new label gets this id
      * @param torn    How many bytes the open cuts off
+     * @param cut     How many intact labels are among those bytes
      * @param holders What holds the interner's ids elsewhere
      * @throws IOException if a holder cannot be read
      * @throws LogCorruptionException if a holder refers to an id at or past {@code kept}
      */
-    private static void requireUnheld(Path path, int kept, long torn, Holders holders)
+    private static void requireUnheld(Path path, int kept, long torn, long cut, Holders holders)
             throws IOException {
         ReferencedLabels.Reference held = holders.highest();
         if (held.highestId() < kept) {
             return;
         }
+        String among = cut == 0 ? "" : ", " + cut + " intact label(s) among them,";
         throw new LogCorruptionException(WHAT + " " + path + " holds " + kept + " intact labels "
-            + "and then " + torn + " bytes that do not read as one, but id " + held.highestId()
-            + " is held by " + held.heldBy() + ". A label is forced to the device before its id "
-            + "is handed out, so this is not a write a crash cut short: a label whose id is in use "
-            + "was lost after it was written. Cutting it off would give id " + kept + " to the next "
-            + "new label, and " + held.heldBy() + " would go on to describe that label as the one "
-            + "that was lost - one entity served under another's name; this build refuses the "
-            + "interner instead. "
-            + "Restore the staging directory from a backup, or rebuild it from the source "
-            + "documents, before restarting.");
+            + "and then " + torn + " bytes that do not all read as labels" + among + " but id "
+            + held.highestId() + " is held by " + held.heldBy() + ". A label is forced to the "
+            + "device before its id is handed out, so this is not a write a crash cut short: a "
+            + "label whose id is in use, or one forced before it, was damaged after it was "
+            + "written. Cutting the damage off would give id " + kept + " to the next new label, "
+            + "and " + held.heldBy() + " would go on to describe that label as the one that was "
+            + "lost - one entity served under another's name; this build refuses to open the "
+            + "interner instead. Restore the staging directory from a backup, or rebuild it from "
+            + "the source documents, before restarting.");
+    }
+
+    /**
+     * How many intact labels follow the first record of a replay that did not read cleanly.
+     *
+     * <p>Found over byte offsets rather than frames, because a damaged record's length cannot be
+     * trusted to say where the next one starts. Reported only: the open cuts them off whatever
+     * the count, and the holders decide whether it may.</p>
+     *
+     * @param replay A replay that stopped before the end of the file
+     * @return The count
+     */
+    private static long intactRecordsAfter(Replay replay) {
+        byte[] contents = replay.contents();
+        long count = 0;
+        int from = (int) replay.validBytes() + 1;
+        while (true) {
+            int offset = TailIntegrity.firstIntactRecordFrom(contents, from,
+                LabelInterner::recordStartsAt);
+            if (offset < 0) {
+                return count;
+            }
+            count++;
+            int length = ByteBuffer.wrap(contents, offset, Integer.BYTES).getInt();
+            from = offset + Integer.BYTES + length + Integer.BYTES;
+        }
     }
 
     /**
@@ -688,8 +734,8 @@ public final class LabelInterner implements AutoCloseable {
     /**
      * Reads back the assignments a previous run recorded.
      *
-     * <p>Stops at the first record that does not read cleanly rather than failing; what that
-     * stop means is for {@link #readChecked} and the open to decide.
+     * <p>Stops at the first record that does not read cleanly rather than failing; whether the
+     * rest of the file may be cut off is for the holders to decide.
      *
      * @param path The file, holding at least a header
      * @return The labels, in id order
@@ -738,27 +784,6 @@ public final class LabelInterner implements AutoCloseable {
             }
         }
         return new Replay(labels, validBytes, all);
-    }
-
-    /**
-     * Reads back the assignments a previous run recorded, refusing damage that is not a tail.
-     *
-     * <p>The one judgement {@link #open} and {@link #inspect} share. Labels lost from the middle
-     * of the file would be reassigned to whatever is interned next, while the published
-     * {@code entities.idx} still maps those ids to the labels that were lost - one entity served
-     * under another's name, reported by nothing - so unreadable bytes are accepted only when
-     * nothing readable follows them.</p>
-     *
-     * @param path The file, holding at least a header
-     * @return The labels, in id order, and where they end
-     * @throws IOException if the file cannot be read or is not an interner this build reads
-     * @throws LogCorruptionException if damage has an intact label behind it
-     */
-    private static Replay readChecked(Path path) throws IOException {
-        Replay replay = readExisting(path);
-        TailIntegrity.requireTornTail(path, WHAT, replay.contents(),
-            replay.validBytes(), LabelInterner::recordStartsAt);
-        return replay;
     }
 
     /**

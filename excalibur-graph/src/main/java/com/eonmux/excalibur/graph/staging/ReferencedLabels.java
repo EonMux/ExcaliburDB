@@ -13,20 +13,22 @@ import java.util.Objects;
  * holds.
  *
  * <h2>Why a label interner has to ask</h2>
- * <p>An interner's file ends in a record that may fail its checksum. Usually that is a write a
- * crash cut short, and cutting it off is safe: {@link LabelInterner#intern} forces a record to
- * the device before it returns the id, so a record that never became durable held an id nobody
- * was ever given. But a record that did become durable, and then rotted, looks exactly the same,
- * and its id may be in any of the artifacts this names. Cutting it off would give that id to the
- * next new label, and every one of those artifacts would go on describing the new label as the
- * old one - one entity served under another's name, or an erasure applied to the wrong
- * entity.</p>
+ * <p>An interner's file may hold a record that fails its checksum. Usually that is a write a
+ * crash cut short - the last record, or one of several a single unfinished force was covering,
+ * whose pages reached the device out of order - and cutting it off, with everything after it, is
+ * safe: {@link LabelInterner#intern} forces a record to the device before it returns the id, so a
+ * record that never became durable held an id nobody was ever given, and so did every record
+ * written after it. But a record that did become durable, and then rotted, looks exactly the
+ * same, and its id, or the id of a record after it, may be in any of the artifacts this names.
+ * Cutting it off would give that id to the next new label, and every one of those artifacts would
+ * go on describing the new label as the old one - one entity served under another's name, or an
+ * erasure applied to the wrong entity.</p>
  *
  * <p>So before an interner gives up an id, the staging store asks every holder it knows of for
  * the highest id it holds, and refuses the open when one of them holds an id the interner is
  * about to lose. The staging store's own logs - staged facts and entity text - it reads itself;
  * this is how a caller names the holders that live elsewhere. It is asked only when an interner
- * actually has a damaged last record, so a clean open reads none of them.</p>
+ * actually has damage to cut off, so a clean open reads none of them.</p>
  *
  * @author ExcaliburDB
  */

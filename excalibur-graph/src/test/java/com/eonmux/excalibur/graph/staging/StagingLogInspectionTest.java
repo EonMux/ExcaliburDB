@@ -145,20 +145,42 @@ class StagingLogInspectionTest {
         }
 
         @Test
-        @DisplayName("damage with an intact label after it is refused, as the open refuses it")
+        @DisplayName("damage with an intact label after it whose id is held is refused, as the "
+            + "open refuses it")
         void damageInTheMiddleIsCorruption(@TempDir Path dir) throws IOException {
             Path file = write(dir, "Ada", "Grace", "Barbara");
             // The first label's text: header, then its length.
             flip(file, LabelInterner.HEADER_BYTES + Integer.BYTES);
             String before = fingerprint(file);
             Path copy = copyOf(file);
+            LabelInterner.Holders holdingBarbara =
+                () -> new ReferencedLabels.Reference(2, "a staged fact");
 
-            assertThatThrownBy(() -> LabelInterner.inspect(file))
+            assertThatThrownBy(() -> LabelInterner.inspect(file, holdingBarbara))
                 .isInstanceOf(LogCorruptionException.class)
-                .hasMessageContaining("further intact record");
+                .hasMessageContaining("id 2 is held by a staged fact");
             assertThat(fingerprint(file)).isEqualTo(before);
-            assertThatThrownBy(() -> LabelInterner.open(copy))
+            assertThatThrownBy(() -> LabelInterner.open(copy, holdingBarbara))
                 .isInstanceOf(LogCorruptionException.class);
+        }
+
+        @Test
+        @DisplayName("damage with intact labels after it nothing holds is a tail the open cuts, "
+            + "reported with the intact labels it loses")
+        void unheldDamageInTheMiddleIsATail(@TempDir Path dir) throws IOException {
+            Path file = write(dir, "Ada", "Grace", "Barbara");
+            flip(file, LabelInterner.HEADER_BYTES + Integer.BYTES);
+            Path copy = copyOf(file);
+
+            LogInspection inspection = LabelInterner.inspect(file);
+
+            assertThat(inspection.records()).isZero();
+            assertThat(inspection.intactRecordsCut()).isEqualTo(2);
+            assertThat(inspection.intactBytes()).isEqualTo(LabelInterner.HEADER_BYTES);
+            try (LabelInterner opened = LabelInterner.open(copy)) {
+                assertThat(opened.size()).isZero();
+            }
+            assertThat(Files.size(copy)).isEqualTo(inspection.intactBytes());
         }
 
         @Test
@@ -386,10 +408,11 @@ class StagingLogInspectionTest {
         }
 
         @Test
-        @DisplayName("a whole record failing its checksum is corruption, even the last one")
+        @DisplayName("a whole record failing its checksum with an intact one after it is "
+            + "corruption")
         void aDamagedWholeRecordIsCorruption(@TempDir Path dir) throws IOException {
-            Path file = write(dir, 2);
-            flip(file, Files.size(file) - Integer.BYTES - 1);
+            Path file = write(dir, 3);
+            flip(file, GraphStagingStore.HEADER_BYTES + 2L * GraphStagingStore.RECORD_BYTES - 5);
             String before = fingerprint(file);
 
             assertThatThrownBy(() -> GraphStagingStore.inspectTripleLog(file))
@@ -401,6 +424,23 @@ class StagingLogInspectionTest {
                     .as("the build's replay refuses the same record")
                     .isInstanceOf(LogCorruptionException.class);
             }
+            assertThat(fingerprint(file)).as("the open cut nothing off").isEqualTo(before);
+        }
+
+        @Test
+        @DisplayName("a last whole record failing its checksum is a tail the open cuts off")
+        void aDamagedLastRecordIsATail(@TempDir Path dir) throws IOException {
+            Path file = write(dir, 2);
+            flip(file, Files.size(file) - Integer.BYTES - 1);
+
+            LogInspection inspection = GraphStagingStore.inspectTripleLog(file);
+
+            assertThat(inspection.records()).isEqualTo(1);
+            assertThat(inspection.tornBytes()).isEqualTo(GraphStagingStore.RECORD_BYTES);
+            try (GraphStagingStore opened = GraphStagingStore.open(dir)) {
+                assertThat(opened.stagedCount()).isEqualTo(1);
+            }
+            assertThat(Files.size(file)).isEqualTo(inspection.intactBytes());
         }
 
         @Test

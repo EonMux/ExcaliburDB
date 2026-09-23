@@ -36,21 +36,28 @@ import java.nio.file.Path;
  * after them, is {@link CheckStatus#UNSEALED}: the node takes that for a write a crash cut short
  * and cuts it off when it next opens the log, keeping every record before it, so it is neither
  * damage nor proof - the same verdict a write-ahead log's torn tail gets, and like the node, the
- * repair plan leaves it alone. And damage the node refuses - a record that fails its checksum
- * with an intact record after it, or, in the fixed-width triple log, any whole record that fails
- * its checksum - is {@link CheckStatus#CORRUPT}, and put to an operator rather than into the
- * repair plan: every one of these logs is the only copy of what it holds, and the node opens a
- * missing one as empty, so moving a damaged one aside would lose outstanding erasures, reassign
- * entity ids or empty the next graph build rather than repair anything.</p>
+ * repair plan leaves it alone. Those bytes may be whole records that fail their checksums as well
+ * as a partial one: a crash between an append and the force that would have made it durable can
+ * leave any of the records that force was covering unreadable, and none of them was ever
+ * acknowledged. And damage the node refuses - a record that fails its checksum with an intact
+ * record after it, other than in a label interner as described below - is
+ * {@link CheckStatus#CORRUPT}, and put to an operator rather than into the repair plan: every one
+ * of these logs is the only copy of what it holds, and the node opens a missing one as empty, so
+ * moving a damaged one aside would lose outstanding erasures, reassign entity ids or empty the next
+ * graph build rather than repair anything.</p>
  *
- * <h2>A damaged last label</h2>
- * <p>An interner's last record failing its checksum is a tail the node trims only while no id it
- * could have held is referred to: the node forces a label before handing out its id, so a record
- * a crash cut short held an id nobody has, while one that rotted after being forced may hold an
- * id the staged facts, the entity text, the graph published beside the staging directory or an
- * outstanding erasure still names. The node refuses the second rather than give that id to a new
- * label, so it is {@link CheckStatus#CORRUPT} here, asked of the same holders the node's tenant
- * names.</p>
+ * <h2>Damaged labels</h2>
+ * <p>An interner's damaged record is a tail the node cuts off, together with every record after
+ * it, intact or not, only while no id at or past the damage is referred to: the node forces a
+ * label before handing out its id, and new labels that arrive together share one force, so a
+ * record that force never finished - whether the last one or one whose pages reached the device
+ * after those of labels behind it - held an id nobody was given, and so did every record after
+ * it. One that rotted after being forced may hold an id, or sit before ids, that the staged facts,
+ * the entity text, the graph published beside the staging directory or an outstanding erasure
+ * still names. The node refuses that rather than give those ids to new labels, so it is
+ * {@link CheckStatus#CORRUPT} here, asked of the same holders the node's tenant names; the
+ * {@link CheckStatus#UNSEALED} verdict says how many intact labels the open would cut off with the
+ * damage.</p>
  *
  * <h2>A file shorter than its header</h2>
  * <p>Each log is created by writing its header, so a file shorter than one whose bytes begin the
@@ -327,6 +334,18 @@ public final class GraphStagingCheck {
                     + "creates the log with and nothing more: its creation was cut short by a "
                     + "crash. It holds no " + records + ", and the node starts it afresh when it "
                     + "next opens it", size);
+        }
+        if (found.hasTornTail() && found.intactRecordsCut() > 0) {
+            return new FileCheck(file, relative, format, version, CheckStatus.UNSEALED,
+                "the record after the first " + found.records() + " " + records + " fails its "
+                    + "checksum, and the " + found.tornBytes() + " bytes from it to the end hold "
+                    + found.intactRecordsCut() + " intact " + records + " besides: the shape one "
+                    + "force a crash interrupted leaves when its pages reach the device out of "
+                    + "order. Nothing refers to an id at or past the damage, so none of them was "
+                    + "handed out, and the node cuts off all " + found.tornBytes() + " bytes, "
+                    + "including those " + found.intactRecordsCut() + " " + records + ", when it "
+                    + "next opens the log, keeping the " + found.records() + " before them"
+                    + rewritten, size);
         }
         if (found.hasTornTail()) {
             return new FileCheck(file, relative, format, version, CheckStatus.UNSEALED,

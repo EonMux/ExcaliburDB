@@ -5,6 +5,7 @@ import com.eonmux.excalibur.graph.file.Durability;
 import com.eonmux.excalibur.graph.file.LogCorruptionException;
 import com.eonmux.excalibur.graph.file.LogHeader;
 import com.eonmux.excalibur.graph.file.LogInspection;
+import com.eonmux.excalibur.graph.file.TailIntegrity;
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.store.RelationSelector;
@@ -19,6 +20,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -68,13 +70,20 @@ import java.util.zip.CRC32;
  * were made, and the day of the upgrade would be an invention. The order they were staged in
  * survives the rewrite, and it is what orders them.</p>
  *
- * <p>Fixed-width records, so a crash mid-append leaves a file whose length is not a whole number
- * of records. That partial record is cut off when the log is opened, which is the same tolerance
- * the interners apply and for the same reason: a crash during ingestion must cost the facts that
- * were in flight, not the graph.</p>
+ * <h2>What a crash leaves at the end</h2>
+ * <p>A crash during ingestion must cost the facts that were in flight, not the graph, so the open
+ * cuts off the end of the log a crash can leave unreadable, as the interners and the entity text
+ * log do. That is more than a partial last record. Appends are forced only by {@link #sync()},
+ * and a force that never finished leaves every record written since the last one that did at the
+ * mercy of the order the operating system wrote the pages back in: a record can reach the device
+ * whole in length and as zeros or garbage in content. Nothing in that stretch was acknowledged -
+ * the documents its facts came from are recorded as handled only after a sync returns, so they
+ * are extracted again - and so the open cuts off every record from the end back to the last one
+ * that matches its checksum, a partial one included. See {@link #trimTornTail}.</p>
  *
- * <p>A checksum that fails over a whole record is therefore not a torn tail - every record the
- * scan reaches was written whole - and both the replay and the erasure rewrite refuse the log
+ * <p>What it does not cut off is damage with an intact record after it. That record may have been
+ * forced and acknowledged, the damage before it may be rot rather than a write that never landed,
+ * and nothing in the log says which, so both the replay and the erasure rewrite refuse the log
  * rather than stopping at the damage. See {@link #forEach}.</p>
  *
  * <h2>Buffered, flushed and forced</h2>
@@ -94,11 +103,12 @@ import java.util.zip.CRC32;
  * that says who the id is. See {@link LabelInterner}.</p>
  *
  * <h2>Ids nothing may lose</h2>
- * <p>An interner whose last record is damaged is opened by cutting that record off, which is
- * only safe while nothing holds its id. So when one has, the open reads the highest id staged
- * facts and entity text refer to, together with whatever {@link ReferencedLabels} the caller
- * names - a published graph, an erasure log - and refuses rather than give an id that is held
- * to a new label. {@link #inspectLabels} asks the same question without opening anything.</p>
+ * <p>An interner with a damaged record is opened by cutting that record off, with everything
+ * after it, which is only safe while nothing holds an id it loses. So when one has, the open
+ * reads the highest id staged facts and entity text refer to, together with whatever
+ * {@link ReferencedLabels} the caller names - a published graph, an erasure log - and refuses
+ * rather than give an id that is held to a new label. {@link #inspectLabels} asks the same
+ * question without opening anything.</p>
  *
  * <h2>A log shorter than its header</h2>
  * <p>Each log is created by writing its header, so a file shorter than one is either that write
@@ -132,8 +142,8 @@ public final class GraphStagingStore implements AutoCloseable {
      * Bytes per staged triple.
      *
      * <p>Three ids, two interval bounds, the stated-on day, four provenance fields and a
-     * checksum: 4+4+4 + 4+4 + 4 + 1+1+2+8 + 4. Fixed width, so a torn tail is a file whose length
-     * is not a whole number of records.
+     * checksum: 4+4+4 + 4+4 + 4 + 1+1+2+8 + 4. Fixed width, so the records a crash leaves
+     * unreadable at the end can be found by reading back from it.
      */
     public static final int RECORD_BYTES = 40;
 
@@ -247,8 +257,8 @@ public final class GraphStagingStore implements AutoCloseable {
      * Opens the staging store in {@code directory}.
      *
      * <h3>What {@code holders} is for</h3>
-     * <p>An interner whose last record is damaged may be trimmed only when no id it could have
-     * held is held anywhere; see "Ids nothing may lose". The staged facts and entity text in this
+     * <p>An interner with a damaged record may be cut back to it only when no id at or past it is
+     * held anywhere; see "Ids nothing may lose". The staged facts and entity text in this
      * directory are always asked. {@code holders} names what lives elsewhere and refers to the
      * same ids - the graph published from this staging, and the erasure logs whose requests name
      * entities by id - and is read only when an interner would otherwise give an id up.</p>
@@ -291,8 +301,8 @@ public final class GraphStagingStore implements AutoCloseable {
                 // A header write cut short: truncated so the header is written at the start.
                 LOGGER.warn("starting {} afresh: its {} bytes are a header write a crash cut "
                     + "short", logPath, Files.size(logPath));
-                try (java.nio.channels.FileChannel channel =
-                         java.nio.channels.FileChannel.open(logPath, StandardOpenOption.WRITE)) {
+                try (FileChannel channel =
+                         FileChannel.open(logPath, StandardOpenOption.WRITE)) {
                     channel.truncate(0);
                 }
             }
@@ -301,11 +311,10 @@ public final class GraphStagingStore implements AutoCloseable {
             // width would misframe every record after the first append.
             upgradeIfEarlierVersion(logPath);
 
-            // Truncated to a whole number of records before anything is appended. A process
-            // killed mid-append leaves a partial record, and appending after it would put every
-            // later fact behind a record replay stops at - present on disk and invisible to every
-            // build from then on.
-            long existing = truncateToWholeRecords(logPath);
+            // Cut back to the last intact record before anything is appended. Appending after a
+            // record a crash left unreadable would put every later fact behind damage the replay
+            // refuses - present on disk, and failing every build from then on.
+            long existing = trimTornTail(logPath);
             out = openLog(logPath);
 
             text = EntityTextLog.open(directory.resolve(ENTITY_TEXT_LOG));
@@ -375,10 +384,12 @@ public final class GraphStagingStore implements AutoCloseable {
      *
      * <p>Reads the file rather than any in-memory copy, so only what has been flushed is seen.
      *
-     * <p>A damaged record ends the replay by failing it, not by stopping at it. The replay is
-     * what a build reads, and a build that stopped at the damage would publish a graph missing
-     * every fact after it and report success - the same condition {@link #erase} refuses, decided
-     * the same way. See {@link #corrupt}.
+     * <p>A damaged record with an intact one after it ends the replay by failing it, not by
+     * stopping at it. The replay is what a build reads, and a build that stopped at the damage
+     * would publish a graph missing every fact after it and report success - the same condition
+     * {@link #erase} refuses, decided the same way. See {@link #corrupt}. Damage with nothing
+     * intact after it is the end of a write that never finished, which the open cuts off; met
+     * here, the replay ends at it.
      *
      * @param visitor Receives each fact, with ids resolved
      * @return How many facts were replayed
@@ -422,17 +433,23 @@ public final class GraphStagingStore implements AutoCloseable {
             visitor.visit(cursor.subject, cursor.relation, cursor.object,
                 cursor.validFrom, cursor.validTo, cursor.statedOn, cursor.provenance);
         }
+        if (cursor.tornBytes() > 0) {
+            LOGGER.warn("triple log {} ends in {} unreadable byte(s) after {} fact(s); a write "
+                + "was cut short, and the next open of this log cuts them off", logPath,
+                cursor.tornBytes(), cursor.read);
+        }
         return cursor.read;
     }
 
     /**
-     * The one refusal both the replay and the erasure rewrite raise for a failed checksum.
+     * The one refusal both the replay and the erasure rewrite raise for damage with an intact
+     * record after it.
      *
-     * <h3>Why a failed checksum here is never a torn tail</h3>
-     * <p>The records are fixed width and a partial trailing one is cut off when the log is
-     * opened, so every record the scan reaches was written whole. A checksum that fails over a
-     * whole record is therefore rot or a device error, and the facts after it were written and
-     * acknowledged to whoever staged them.
+     * <h3>Why this is not a torn tail</h3>
+     * <p>A write that never finished leaves damage with nothing intact after it, which the open
+     * cuts off. An intact record after the damage may be one that was forced and acknowledged,
+     * and the damage before it rot or a device error in a record that was too; nothing in the log
+     * can say it was not.
      *
      * <h3>Why both paths refuse rather than stop</h3>
      * <p>Neither of the two alternatives is honest. Building from the facts before the damage
@@ -446,12 +463,12 @@ public final class GraphStagingStore implements AutoCloseable {
      */
     private static LogCorruptionException corrupt(Path logPath, long factsBefore) {
         return new LogCorruptionException("triple log " + logPath + " has a corrupt record at fact "
-            + factsBefore + ". The records are fixed width and a partial trailing one is trimmed "
-            + "when the log is opened, so this is rot rather than a write cut short, and the "
-            + "facts after it were written and acknowledged. Building from the facts before it "
-            + "would publish a partial graph and report success, and erasing around it would "
-            + "report an obligation discharged that had not reached them; this build refuses the "
-            + "log instead. Recover or quarantine the file before restarting.");
+            + factsBefore + ", and an intact record after it, so this is damage rather than the "
+            + "end of a write a crash cut short, and the facts after it may have been written "
+            + "and acknowledged. Building from the facts before it would publish a partial graph "
+            + "and report success, and erasing around it would report an obligation discharged "
+            + "that had not reached them; this build refuses the log instead. Recover or "
+            + "quarantine the file before restarting.");
     }
 
     /**
@@ -470,6 +487,8 @@ public final class GraphStagingStore implements AutoCloseable {
 
         private long read;
         private int start;
+        /** Where the last record that read cleanly ends; the header's end before any has. */
+        private int end;
         private int subject;
         private int relation;
         private int object;
@@ -490,19 +509,38 @@ public final class GraphStagingStore implements AutoCloseable {
             // records after it are little-endian like every other column this system stores.
             // Reading the header through the record view turns the magic into its own reversal.
             this.buffer = readHeader(all, path, "triple log").order(ByteOrder.LITTLE_ENDIAN);
+            this.end = buffer.position();
+        }
+
+        /**
+         * How many bytes at the end were not read as records: a partial record, or damage with
+         * nothing intact after it.
+         *
+         * @return The count, meaningful once {@link #next} has returned false
+         */
+        long tornBytes() {
+            return all.length - end;
         }
 
         /**
          * Decodes the next record.
          *
-         * @return false once the log is exhausted
-         * @throws IOException if a record's checksum does not match
+         * @return false once the log is exhausted, or ends in damage with nothing intact after it
+         * @throws LogCorruptionException if a record's checksum does not match and an intact
+         *                                record follows it
          */
         boolean next() throws IOException {
             if (buffer.remaining() < RECORD_BYTES) {
                 return false;
             }
             start = buffer.position();
+            if (!recordStartsAt(all, start)) {
+                if (TailIntegrity.firstIntactRecordFrom(all, start + 1,
+                        GraphStagingStore::recordStartsAt) >= 0) {
+                    throw corrupt(path, read);
+                }
+                return false;
+            }
             subject = buffer.getInt();
             relation = buffer.getInt();
             object = buffer.getInt();
@@ -513,18 +551,48 @@ public final class GraphStagingStore implements AutoCloseable {
             byte confidence = buffer.get();
             short extractorVersion = buffer.getShort();
             long sourceId = buffer.getLong();
-            int stored = buffer.getInt();
-
-            CRC32 crc = new CRC32();
-            crc.update(all, start, RECORD_PAYLOAD_BYTES);
-            if (stored != (int) crc.getValue()) {
-                throw corrupt(path, read);
-            }
+            buffer.getInt();
             provenance = new Provenance(SourceType.fromByte(sourceType), sourceId,
                 Byte.toUnsignedInt(confidence), extractorVersion);
             read++;
+            end = buffer.position();
             return true;
         }
+    }
+
+    /**
+     * Whether a whole, checksum-clean current-version record begins at {@code offset}.
+     *
+     * @param contents The whole log
+     * @param offset   Where to look
+     * @return true when a record starts exactly there
+     */
+    private static boolean recordStartsAt(byte[] contents, int offset) {
+        return offset >= HEADER_BYTES && wholeRecordAt(contents, offset, RECORD_BYTES);
+    }
+
+    /** As {@link #recordStartsAt}, for the version 1 framing. */
+    private static boolean legacyRecordStartsAt(byte[] contents, int offset) {
+        return offset >= HEADER_BYTES && wholeRecordAt(contents, offset, LEGACY_RECORD_BYTES);
+    }
+
+    /**
+     * Whether {@code width} bytes lie at {@code offset} and end in the checksum of those before.
+     *
+     * @param bytes  Any stretch of a log
+     * @param offset Where the record would begin in it
+     * @param width  Bytes per record, checksum included
+     * @return true when the record is whole and its checksum matches
+     */
+    private static boolean wholeRecordAt(byte[] bytes, int offset, int width) {
+        if (offset < 0 || offset + width > bytes.length) {
+            return false;
+        }
+        CRC32 crc = new CRC32();
+        crc.update(bytes, offset, width - Integer.BYTES);
+        int stored = ByteBuffer.wrap(bytes, offset + width - Integer.BYTES, Integer.BYTES)
+            .order(ByteOrder.LITTLE_ENDIAN).getInt();
+        return stored == (int) crc.getValue();
     }
 
     /**
@@ -697,7 +765,8 @@ public final class GraphStagingStore implements AutoCloseable {
      * earlier version in place, and a status read must not write. Reads the sixteen-byte header
      * for the version, since the record width depends on it, and measures the file. A trailing
      * partial record is not counted: it is a process killed mid-append, and the next open trims
-     * it.</p>
+     * it. Whole records are counted without being read, so a crash that left some of them
+     * unreadable is counted high until the next open cuts them off.</p>
      *
      * @param log The triple log
      * @return The whole records it holds, or zero if it does not exist or has no complete header
@@ -724,12 +793,12 @@ public final class GraphStagingStore implements AutoCloseable {
     /**
      * Rewrites a log written before records carried the day they were stated, once.
      *
-     * <p>Every whole record is carried across, in order and otherwise byte for byte, with
-     * {@link TemporalFilter#UNDATED} as its stated-on day and a checksum over the new layout. A
-     * partial record at the end is dropped, as opening trims one in any version. A record whose
-     * checksum fails refuses the upgrade and leaves the file as it was, for the reason
-     * {@link #corrupt} gives: the facts after it were written and acknowledged, and neither
-     * dropping them nor carrying damage into a freshly checksummed record is honest.</p>
+     * <p>Every intact record is carried across, in order and otherwise byte for byte, with
+     * {@link TemporalFilter#UNDATED} as its stated-on day and a checksum over the new layout.
+     * Damage with nothing intact after it is dropped, as opening cuts it off in any version.
+     * Damage with an intact record after it refuses the upgrade and leaves the file as it was,
+     * for the reason {@link #corrupt} gives: the facts after it may have been acknowledged, and
+     * neither dropping them nor carrying damage into a freshly checksummed record is honest.</p>
      *
      * <p>Swapped in by a forced rename, so a crash leaves either the old log whole or the new one
      * whole, and the next open finishes the job or finds nothing to do.</p>
@@ -783,31 +852,34 @@ public final class GraphStagingStore implements AutoCloseable {
     }
 
     /**
-     * Walks every whole record of a version 1 log, refusing one whose checksum fails.
+     * Walks every intact record of a version 1 log, refusing damage with an intact record after
+     * it.
      *
      * <p>Shared by the upgrade, which carries each record across as it is reached, and by
      * {@link #inspectTripleLog}, which counts them, so the two cannot disagree about which
-     * records an old log holds. A partial record at the end is not reached: the upgrade drops
-     * it, as opening trims one in any version.</p>
+     * records an old log holds. The walk ends at damage with nothing intact after it - a partial
+     * record, or whole ones a crash left unreadable - which the upgrade drops, as opening cuts
+     * it off in any version.</p>
      *
      * @param logPath The log, named in any failure
      * @param all     The whole log as read
      * @param visitor Receives each record
-     * @return How many whole records the log holds
+     * @return How many intact records precede the end, or the damage the walk stopped at
      * @throws IOException if the visitor fails
-     * @throws LogCorruptionException if a whole record's checksum fails; see {@link #corrupt}
+     * @throws LogCorruptionException if a record's checksum fails with an intact record after it;
+     *                                see {@link #corrupt}
      */
     private static long walkLegacy(Path logPath, byte[] all, LegacyRecordVisitor visitor)
             throws IOException {
         long read = 0;
         for (int start = HEADER_BYTES; start + LEGACY_RECORD_BYTES <= all.length;
              start += LEGACY_RECORD_BYTES) {
-            CRC32 crc = new CRC32();
-            crc.update(all, start, LEGACY_RECORD_BYTES - Integer.BYTES);
-            int stored = ByteBuffer.wrap(all, start + LEGACY_RECORD_BYTES - Integer.BYTES,
-                Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN).getInt();
-            if (stored != (int) crc.getValue()) {
-                throw corrupt(logPath, read);
+            if (!legacyRecordStartsAt(all, start)) {
+                if (TailIntegrity.firstIntactRecordFrom(all, start + 1,
+                        GraphStagingStore::legacyRecordStartsAt) >= 0) {
+                    throw corrupt(logPath, read);
+                }
+                break;
             }
             visitor.visit(start);
             read++;
@@ -828,20 +900,20 @@ public final class GraphStagingStore implements AutoCloseable {
      * version 1 log is reported at the version it is, since that is what is on disk.</p>
      *
      * <h3>What it refuses, and what it reports</h3>
-     * <p>A record whose checksum fails is refused, as a {@link LogCorruptionException}, wherever
-     * it is in the log - including the last whole record. The records are fixed width, so every
-     * whole record was written whole, and a failed checksum over one is rot rather than a write
-     * cut short; the node refuses such a log in its build and its erasure (and, at version 1, in
-     * its upgrade, so the store does not open at all). See {@link #corrupt}. What is reported
-     * rather than refused is a trailing partial record, which the open trims; see
-     * {@link LogInspection#hasTornTail()}. So is a file shorter than its header whose bytes begin
-     * the header this build writes: a creation cut short, which the open starts afresh.</p>
+     * <p>A record whose checksum fails with an intact record somewhere after it is refused, as a
+     * {@link LogCorruptionException}: the node refuses such a log in its build and its erasure
+     * (and, at version 1, in its upgrade, so the store does not open at all). See
+     * {@link #corrupt}. What is reported rather than refused is damage with nothing intact after
+     * it - a partial record, or whole records a crash left unreadable - which the open cuts off;
+     * see {@link LogInspection#hasTornTail()}. So is a file shorter than its header whose bytes
+     * begin the header this build writes: a creation cut short, which the open starts
+     * afresh.</p>
      *
      * @param log The triple log
-     * @return How many facts matched their checksums, and where the whole records end
+     * @return How many facts matched their checksums, and where they end
      * @throws IOException if the file is absent, too short to be even a torn triple log, not a
      *                     triple log of a version this build reads, or cannot be read
-     * @throws LogCorruptionException if a whole record's checksum fails
+     * @throws LogCorruptionException if a record's checksum fails with an intact record after it
      * @throws NullPointerException if {@code log} is null
      */
     public static LogInspection inspectTripleLog(Path log) throws IOException {
@@ -950,7 +1022,7 @@ public final class GraphStagingStore implements AutoCloseable {
      * @param log The triple log; need not exist
      * @return The highest ids, held by the log
      * @throws IOException if the log is not a triple log this build reads
-     * @throws LogCorruptionException if a whole record's checksum fails
+     * @throws LogCorruptionException if a record's checksum fails with an intact record after it
      */
     private static ReferencedLabels.Reach highestInTripleLog(Path log) throws IOException {
         if (!Files.isRegularFile(log) || Files.size(log) < HEADER_BYTES) {
@@ -1310,35 +1382,119 @@ public final class GraphStagingStore implements AutoCloseable {
     }
 
     /**
-     * Trims a partial trailing record and reports how many whole ones remain.
+     * Cuts off what a crash left unreadable at the end of the log, and reports how many records
+     * remain.
      *
-     * <p>The records are fixed width, so a file whose length is not a whole number of them ends in
-     * a record that was being written when the process died. Cutting it here is what keeps the
-     * next append contiguous with the ones replay can read.
+     * <h3>What is cut</h3>
+     * <p>Everything after the last record that matches its checksum: a partial record, and whole
+     * records whose bytes never reached the device. Appends are forced only by {@link #sync()},
+     * and a crash before a force finished can leave any record written since the last one that
+     * did as zeros or garbage of full length, because the pages behind it are written back in no
+     * particular order. None of those records was acknowledged: the documents their facts came
+     * from are recorded as handled only once a sync has returned, and are extracted again. Left
+     * in place, the next append would put every later fact behind damage the replay refuses.</p>
      *
-     * @param logPath The triple log
-     * @return How many whole records the file holds
-     * @throws IOException if the file cannot be trimmed
+     * <h3>What is not</h3>
+     * <p>A record that matches its checksum is never cut, and neither is anything before it. So a
+     * log with an intact record anywhere after its first damage - aligned or not, found by a scan
+     * over byte offsets - is left exactly as it is, for the replay to refuse. Rot in the middle of
+     * the log, and the record a write that failed part way left with appends after it, both look
+     * like that, and cutting either would destroy facts that may have been acknowledged.</p>
+     *
+     * <p>Read from the end backwards, so an intact log costs the read of its last record rather
+     * than of the whole file.</p>
+     *
+     * @param logPath The triple log, at the current version
+     * @return How many records the log holds once the open is done with it
+     * @throws IOException if the file cannot be read, trimmed or forced
      */
-    private static long truncateToWholeRecords(Path logPath) throws IOException {
+    private static long trimTornTail(Path logPath) throws IOException {
         if (!Files.exists(logPath)) {
             return 0;
         }
-        long size = Files.size(logPath);
-        if (size < HEADER_BYTES) {
-            return 0;
+        try (FileChannel channel = FileChannel.open(logPath, StandardOpenOption.READ,
+                StandardOpenOption.WRITE)) {
+            long size = channel.size();
+            if (size < HEADER_BYTES) {
+                return 0;
+            }
+            long whole = HEADER_BYTES + (size - HEADER_BYTES) / RECORD_BYTES * RECORD_BYTES;
+            long intact = endOfLastIntactRecord(channel, whole);
+            if (intact == size) {
+                return (size - HEADER_BYTES) / RECORD_BYTES;
+            }
+
+            // The first byte of the tail is the start of a record that failed its checksum, or of
+            // a partial one, so an intact record that follows it starts at 1 or later.
+            byte[] tail = readAt(channel, intact, Math.toIntExact(size - intact));
+            int following = TailIntegrity.firstIntactRecordFrom(tail, 1,
+                (bytes, offset) -> wholeRecordAt(bytes, offset, RECORD_BYTES));
+            if (following >= 0) {
+                LOGGER.error("triple log {} holds an unreadable record at byte {} and an intact "
+                    + "one after it, at byte {}; left as it is, and every build and erasure will "
+                    + "refuse it until it is recovered", logPath, intact, intact + following);
+                return (whole - HEADER_BYTES) / RECORD_BYTES;
+            }
+
+            channel.truncate(intact);
+            // Forced before anything is appended: records written after a cut the device never
+            // saw could be read back behind the garbage the cut removed.
+            channel.force(true);
+            LOGGER.warn("trimming {} from {} to {} bytes: {} whole record(s) and {} byte(s) of a "
+                + "partial one at the end did not match their checksums, with nothing intact "
+                + "after them - facts a crash caught before they were forced", logPath, size,
+                intact, (whole - intact) / RECORD_BYTES, size - whole);
+            return (intact - HEADER_BYTES) / RECORD_BYTES;
         }
-        long records = (size - HEADER_BYTES) / RECORD_BYTES;
-        long whole = HEADER_BYTES + records * RECORD_BYTES;
-        if (size != whole) {
-            LOGGER.warn("trimming {} from {} to {} bytes: the last record was incomplete",
-                logPath, size, whole);
-            try (java.nio.channels.FileChannel channel =
-                     java.nio.channels.FileChannel.open(logPath, StandardOpenOption.WRITE)) {
-                channel.truncate(whole);
+    }
+
+    /** Records read per step of the backward scan. */
+    private static final int RECORDS_PER_READ = 1024;
+
+    /**
+     * Where the last whole record that matches its checksum ends, scanning back from the end.
+     *
+     * @param channel The log
+     * @param whole   Where its whole records end
+     * @return The end of that record, or the end of the header when none matches
+     * @throws IOException if the log cannot be read
+     */
+    private static long endOfLastIntactRecord(FileChannel channel, long whole)
+            throws IOException {
+        long end = whole;
+        while (end > HEADER_BYTES) {
+            int records = (int) Math.min(RECORDS_PER_READ, (end - HEADER_BYTES) / RECORD_BYTES);
+            long from = end - (long) records * RECORD_BYTES;
+            byte[] chunk = readAt(channel, from, records * RECORD_BYTES);
+            for (int record = records - 1; record >= 0; record--) {
+                if (wholeRecordAt(chunk, record * RECORD_BYTES, RECORD_BYTES)) {
+                    return from + (long) (record + 1) * RECORD_BYTES;
+                }
+            }
+            end = from;
+        }
+        return HEADER_BYTES;
+    }
+
+    /**
+     * Reads {@code length} bytes of a file at {@code position}.
+     *
+     * @param channel  The file
+     * @param position Where to start
+     * @param length   How many bytes, all of which lie within the file
+     * @return The bytes
+     * @throws IOException if they cannot be read
+     */
+    private static byte[] readAt(FileChannel channel, long position, int length)
+            throws IOException {
+        ByteBuffer buffer = ByteBuffer.allocate(length);
+        while (buffer.hasRemaining()) {
+            if (channel.read(buffer, position + buffer.position()) < 0) {
+                throw new IOException("unexpected end of file reading " + length + " bytes at "
+                    + position);
             }
         }
-        return records;
+        return buffer.array();
     }
 
     private static void closeQuietly(AutoCloseable closeable) {

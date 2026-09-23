@@ -10,6 +10,8 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.eonmux.excalibur.graph.file.LogCorruptionException;
+
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -167,8 +169,8 @@ class LabelInternerTest {
         }
 
         @Test
-        @DisplayName("a corrupt record with intact labels after it fails the open rather than "
-            + "silently renumbering them")
+        @DisplayName("a corrupt record with intact labels after it whose ids are held fails the "
+            + "open rather than silently renumbering them")
         void midFileCorruptionFailsTheOpen(@TempDir Path dir) throws IOException {
             // Truncating here would hand ids 1.. to whatever is interned next while the published
             // entities.idx still maps them to the labels that were lost - entity 1 served under a
@@ -182,13 +184,33 @@ class LabelInternerTest {
             }
             corruptLabelAt(path, frameOffsets(path).get(1));
 
-            assertThatThrownBy(() -> LabelInterner.open(path))
-                .isInstanceOf(IOException.class)
-                .hasMessageContaining("entities.labels");
+            assertThatThrownBy(() -> LabelInterner.open(path, holding(3)))
+                .isInstanceOf(LogCorruptionException.class)
+                .hasMessageContaining("entities.labels")
+                .hasMessageContaining("2 intact label(s) among them");
         }
 
         @Test
-        @DisplayName("a corrupt record misaligning everything after it still fails the open")
+        @DisplayName("a corrupt record with intact labels after it, none of whose ids are held, is "
+            + "cut off with them: one unfinished force wrote them all")
+        void unheldMidFileDamageIsCutOff(@TempDir Path dir) throws IOException {
+            Path path = file(dir);
+            try (LabelInterner interner = LabelInterner.open(path)) {
+                interner.intern("zero");
+                interner.intern("one");
+                interner.intern("two");
+                interner.intern("three");
+            }
+            corruptLabelAt(path, frameOffsets(path).get(1));
+
+            try (LabelInterner reopened = LabelInterner.open(path, holding(0))) {
+                assertThat(reopened.labels()).containsExactly("zero");
+                assertThat(reopened.intern("two")).isEqualTo(1);
+            }
+        }
+
+        @Test
+        @DisplayName("a corrupt record misaligning everything after it is judged the same way")
         void misalignedRecordsAfterCorruptionFailTheOpen(@TempDir Path dir) throws IOException {
             // The partial-write case rather than the bit-rot one: a record cut short leaves the
             // records appended after it at offsets nothing is looking at, so the scan for intact
@@ -207,8 +229,15 @@ class LabelInternerTest {
             ByteBuffer.wrap(spliced).putInt(second, 64);
             Files.write(path, spliced);
 
-            assertThatThrownBy(() -> LabelInterner.open(path))
-                .isInstanceOf(IOException.class);
+            assertThatThrownBy(() -> LabelInterner.open(path, holding(2)))
+                .isInstanceOf(LogCorruptionException.class)
+                .hasMessageContaining("2 intact label(s) among them");
+            assertThat(LabelInterner.inspect(path).intactRecordsCut()).isEqualTo(2);
+        }
+
+        /** Something outside the interner holding every id up to {@code highest}. */
+        private static LabelInterner.Holders holding(long highest) {
+            return () -> new ReferencedLabels.Reference(highest, "a test holder");
         }
     }
 }

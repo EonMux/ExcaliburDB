@@ -15,22 +15,29 @@ package com.eonmux.excalibur.graph.file;
  * <p>Only logs the open would accept are reported at all: damage the open refuses, and a version
  * it does not read, are thrown by the inspection as they are by the open. What remains is one of
  * two shapes. Every byte after the header belongs to a record that matched its checksum, or the
- * log ends in bytes that do not read as a record with nothing readable after them - the shape a
- * process killed mid-append leaves, which the open cuts off, keeping every record before it. The
- * second is {@link #hasTornTail()}.</p>
+ * log ends in bytes the open cuts off, keeping every record before them - the second is
+ * {@link #hasTornTail()}. Those bytes are usually unreadable throughout, the shape a process killed
+ * mid-append leaves. A label interner may also cut off intact records that follow the damage,
+ * when they are what one unfinished group commit left and nothing holds their ids; how many is
+ * {@link #intactRecordsCut()}.</p>
  *
- * @param version     The format version in the log's header, which may be an earlier one the open
- *                    would rewrite
- * @param records     How many records matched their checksums
- * @param intactBytes Where the last of those records ends: the length the open leaves the file at
- * @param fileBytes   The file's length as read
+ * @param version          The format version in the log's header, which may be an earlier one
+ *                         the open would rewrite
+ * @param records          How many records matched their checksums before the first that did not
+ * @param intactBytes      Where the last of those records ends: the length the open leaves the
+ *                         file at
+ * @param fileBytes        The file's length as read
+ * @param intactRecordsCut How many records after the damage matched their checksums and are cut
+ *                         off with it; zero for every log but a label interner
  * @author ExcaliburDB
  */
-public record LogInspection(int version, long records, long intactBytes, long fileBytes) {
+public record LogInspection(int version, long records, long intactBytes, long fileBytes,
+                            long intactRecordsCut) {
 
     /**
-     * @throws IllegalArgumentException if a count is negative, or the intact records run past the
-     *                                  end of the file
+     * @throws IllegalArgumentException if a count is negative, the intact records run past the
+     *                                  end of the file, or intact records are cut from a file
+     *                                  that has nothing to cut
      */
     public LogInspection {
         if (records < 0) {
@@ -40,6 +47,22 @@ public record LogInspection(int version, long records, long intactBytes, long fi
             throw new IllegalArgumentException("intact bytes " + intactBytes
                 + " must lie within the file's " + fileBytes);
         }
+        if (intactRecordsCut < 0 || (intactRecordsCut > 0 && intactBytes == fileBytes)) {
+            throw new IllegalArgumentException("intact records cut must be zero, or lie in bytes "
+                + "the open cuts off, got " + intactRecordsCut);
+        }
+    }
+
+    /**
+     * A walk that cut no intact record off.
+     *
+     * @param version     The format version in the log's header
+     * @param records     How many records matched their checksums
+     * @param intactBytes Where the last of those records ends
+     * @param fileBytes   The file's length as read
+     */
+    public LogInspection(int version, long records, long intactBytes, long fileBytes) {
+        this(version, records, intactBytes, fileBytes, 0);
     }
 
     /**
