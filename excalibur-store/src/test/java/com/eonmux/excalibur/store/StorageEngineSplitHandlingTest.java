@@ -280,69 +280,22 @@ class StorageEngineSplitHandlingTest {
     }
 
     @Nested
-    @DisplayName("Segment Pre-Allocation")
-    class SegmentPreAllocationTests {
+    @DisplayName("Base Segments")
+    class BaseSegmentTests {
 
         @Test
-        @DisplayName("Should pre-allocate segment at index")
-        void shouldPreAllocateSegmentAtIndex() throws IOException {
+        @DisplayName("start() creates every base segment, and nothing beyond the directory")
+        void startCreatesEveryBaseSegment() throws IOException {
             try (Arena arena = Arena.ofShared()) {
                 StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
-                    int initialCount = engine.getSegmentCount();
-
-                    // Pre-allocate a segment at a much higher index (beyond current count)
-                    // This should add exactly one new segment to the registry
-                    int newIndex = initialCount + 10;
-                    engine.preAllocateSegment(newIndex);
-
-                    // Physical segment count (in the map) should increase by 1.
-                    // Note: getSegmentCount() returns the routing count (power-of-2),
-                    // which doesn't change when adding segments at arbitrary indices.
-                    assertThat(engine.getSegments().size()).isEqualTo(initialCount + 1);
-
-                    // The new segment should be accessible
-                    assertThat(engine.getSegment(newIndex)).isNotNull();
-                } finally {
-                    engine.close();
-                }
-            }
-        }
-
-        @Test
-        @DisplayName("Should allow pre-allocation of existing segment index")
-        void shouldAllowPreAllocationOfExistingSegmentIndex() throws IOException {
-            try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena);
-                try {
-                    engine.start();
-
-                    // Pre-allocate index 0 (should already exist)
-                    assertThatCode(() -> engine.preAllocateSegment(0))
-                        .doesNotThrowAnyException();
-                } finally {
-                    engine.close();
-                }
-            }
-        }
-
-        @Test
-        @DisplayName("Should be able to get pre-allocated segment")
-        void shouldBeAbleToGetPreAllocatedSegment() throws IOException {
-            try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena);
-                try {
-                    engine.start();
-
-                    // Pre-allocate a segment at index 20
-                    int newSegmentIndex = 20;
-                    engine.preAllocateSegment(newSegmentIndex);
-
-                    // Should be able to get the segment
-                    Segment segment = engine.getSegment(newSegmentIndex);
-                    assertThat(segment).isNotNull();
+                    for (long i = 0; i < StorageEngine.DEFAULT_INITIAL_SEGMENTS; i++) {
+                        assertThat(engine.getSegment(i)).as("base segment %d", i).isNotNull();
+                    }
+                    assertThat(engine.getSegment(StorageEngine.DEFAULT_INITIAL_SEGMENTS)).isNull();
+                    assertThat(engine.getSegments()).hasSize(StorageEngine.DEFAULT_INITIAL_SEGMENTS);
                 } finally {
                     engine.close();
                 }

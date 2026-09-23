@@ -999,23 +999,6 @@ public class StorageEngine implements AutoCloseable {
     // ==================== Segment Management ====================
 
     /**
-     * Pre-allocates a segment at the specified index.
-     *
-     * <p>This is used during startup to reduce contention during high-throughput
-     * workloads. Pre-allocated segments are available for immediate use.</p>
-     *
-     * <p><strong>Important:</strong> The segmentIndex is used as the directory key,
-     * ensuring hash-based routing works correctly. Pre-allocation shares the single
-     * creation path with lazy creation, so a pre-allocated segment gets its write log,
-     * its catalog entry and its HNSW graph exactly like any other.</p>
-     *
-     * @param segmentIndex Index of the segment to pre-allocate
-     */
-    public void preAllocateSegment(int segmentIndex) {
-        registry.createSegment(segmentIndex);
-    }
-
-    /**
      * Gets the segment at the specified index.
      *
      * @param segmentIndex The segment index

@@ -19,8 +19,7 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * <p>These tests verify that:
  * <ul>
- *   <li>Segments created at runtime via createSegment() have WriteLog attached</li>
- *   <li>Segments created via preAllocateSegment() have WriteLog attached</li>
+ *   <li>Every segment start() creates has a WriteLog attached</li>
  *   <li>Data written to newly created segments survives a simulated crash</li>
  *   <li>WAL files are created with correct naming convention</li>
  * </ul>
@@ -89,18 +88,14 @@ class StorageEngineWriteLogTest {
         }
 
         @Test
-        @DisplayName("Pre-allocated segments should have WriteLog attached")
-        void testPreAllocatedSegmentHasWriteLog() throws IOException {
+        @DisplayName("Base segments created by start() should have WriteLog attached")
+        void testBaseSegmentHasWriteLog() throws IOException {
             engine = new StorageEngine(dataDir, arena);
             engine.start();
 
-            // Pre-allocate a segment
-            engine.preAllocateSegment(5);
-
-            // Get the pre-allocated segment
             Segment segment = engine.getSegment(5L);
-            assertNotNull(segment, "Pre-allocated segment should exist");
-            assertNotNull(segment.writeLog(), "Pre-allocated segment should have WriteLog attached");
+            assertNotNull(segment, "Base segment should exist");
+            assertNotNull(segment.writeLog(), "Base segment should have WriteLog attached");
             assertFalse(segment.writeLog().isClosed(), "WriteLog should be open");
         }
 
@@ -120,17 +115,14 @@ class StorageEngineWriteLogTest {
         }
 
         @Test
-        @DisplayName("Pre-allocated segment WAL file should be created on disk")
-        void testPreAllocatedWalFileCreatedOnDisk() throws IOException {
+        @DisplayName("Base segment WAL file should be created on disk at start()")
+        void testBaseSegmentWalFileCreatedOnDisk() throws IOException {
             engine = new StorageEngine(dataDir, arena);
             engine.start();
 
-            // Pre-allocate segment
-            engine.preAllocateSegment(3);
-
             // Verify WAL file exists
             Path walPath = dataDir.resolve("segment_3.wal");
-            assertTrue(Files.exists(walPath), "WAL file should be created on disk for pre-allocated segment");
+            assertTrue(Files.exists(walPath), "WAL file should be created on disk for a base segment");
         }
     }
 
@@ -185,20 +177,18 @@ class StorageEngineWriteLogTest {
         }
 
         @Test
-        @DisplayName("Data written to pre-allocated segment should survive crash")
-        void testPreAllocatedSegmentDataSurvivesCrash() throws IOException {
-            // First session: pre-allocate and write
+        @DisplayName("Data written directly to a base segment should survive crash")
+        void testBaseSegmentDataSurvivesCrash() throws IOException {
+            // First session: write to a base segment
             engine = new StorageEngine(dataDir, arena);
             engine.start();
 
-            engine.preAllocateSegment(10);
-
-            byte[] key = "prealloc-crash-key".getBytes();
-            byte[] value = "prealloc-crash-value".getBytes();
+            byte[] key = "base-crash-key".getBytes();
+            byte[] value = "base-crash-value".getBytes();
 
             // Get the segment and write directly
             Segment segment = engine.getSegment(10L);
-            assertNotNull(segment, "Pre-allocated segment should exist");
+            assertNotNull(segment, "Base segment should exist");
             segment.put(key, value);
 
             // Simulate crash
@@ -228,11 +218,6 @@ class StorageEngineWriteLogTest {
             engine = new StorageEngine(dataDir, arena);
             engine.start();
 
-            // Pre-allocate multiple segments
-            for (int i = 0; i < 5; i++) {
-                engine.preAllocateSegment(i);
-            }
-
             // Verify all have WriteLog
             for (int i = 0; i < 5; i++) {
                 Segment segment = engine.getSegment((long) i);
@@ -260,8 +245,7 @@ class StorageEngineWriteLogTest {
             engine = new StorageEngine(dataDir, arena);
             engine.start();
 
-            // Pre-allocate segment 0 and write directly to ensure data goes there
-            engine.preAllocateSegment(0);
+            // Base segment 0 exists once start() returns; write to it directly
             Segment segment = engine.getSegment(0L);
 
             segment.put("log-key-1".getBytes(), "log-value-1".getBytes());
@@ -280,8 +264,7 @@ class StorageEngineWriteLogTest {
             engine = new StorageEngine(dataDir, arena);
             engine.start();
 
-            // Pre-allocate segment 0 and write directly to ensure data goes there
-            engine.preAllocateSegment(0);
+            // Base segment 0 exists once start() returns; write to it directly
             Segment segment = engine.getSegment(0L);
 
             byte[] key = "delete-key".getBytes();
@@ -299,8 +282,7 @@ class StorageEngineWriteLogTest {
             engine = new StorageEngine(dataDir, arena);
             engine.start();
 
-            // Pre-allocate segment 0 and write directly
-            engine.preAllocateSegment(0);
+            // Base segment 0 exists once start() returns; write to it directly
             Segment segment = engine.getSegment(0L);
             segment.put("path-key".getBytes(), "path-value".getBytes());
 
@@ -323,8 +305,7 @@ class StorageEngineWriteLogTest {
             engine = new StorageEngine(dataDir, arena);
             engine.start();
 
-            // Pre-allocate segment 0 and write directly
-            engine.preAllocateSegment(0);
+            // Base segment 0 exists once start() returns; write to it directly
             Segment segment = engine.getSegment(0L);
 
             // Write multiple entries directly to segment 0
@@ -350,10 +331,6 @@ class StorageEngineWriteLogTest {
             engine = new StorageEngine(dataDir, arena);
             engine.start();
 
-            // Pre-allocate two segments
-            engine.preAllocateSegment(0);
-            engine.preAllocateSegment(1);
-
             // Write to both segments
             Segment segment0 = engine.getSegment(0L);
             Segment segment1 = engine.getSegment(1L);
@@ -374,8 +351,7 @@ class StorageEngineWriteLogTest {
             engine = new StorageEngine(dataDir, arena);
             engine.start();
 
-            // Pre-allocate segment 0 and write directly
-            engine.preAllocateSegment(0);
+            // Base segment 0 exists once start() returns; write to it directly
             Segment segment = engine.getSegment(0L);
             segment.put("timestamp-key".getBytes(), "timestamp-value".getBytes());
 
@@ -406,8 +382,7 @@ class StorageEngineWriteLogTest {
             engine = new StorageEngine(dataDir, arena);
             engine.start();
 
-            // Pre-allocate segment 0 and write directly
-            engine.preAllocateSegment(0);
+            // Base segment 0 exists once start() returns; write to it directly
             Segment segment1 = engine.getSegment(0L);
             segment1.put("restart-key".getBytes(), "restart-value".getBytes());
 
@@ -423,7 +398,6 @@ class StorageEngineWriteLogTest {
             engine.start();
 
             // Write more data to segment 0
-            engine.preAllocateSegment(0);
             Segment segment2 = engine.getSegment(0L);
             segment2.put("restart-key-2".getBytes(), "restart-value-2".getBytes());
 
@@ -442,8 +416,7 @@ class StorageEngineWriteLogTest {
                 largeValue[i] = (byte) (i % 256);
             }
 
-            // Pre-allocate segment 0 and write directly
-            engine.preAllocateSegment(0);
+            // Base segment 0 exists once start() returns; write to it directly
             Segment segment = engine.getSegment(0L);
             segment.put("large-key".getBytes(), largeValue);
 
