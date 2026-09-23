@@ -703,12 +703,12 @@ class DocumentReindexerTest {
         void deletedDocumentsAreReclaimed() throws Exception {
             try (NativeChunkIndex index = openIndex()) {
                 DocumentReindexer reindexer = reindexerWith(index);
-                MockSource source = new MockSource("test-source");
+                MockSource source = new MockSource("test-source").modifiedAt(1_000L);
                 source.addDocument("doc-gone", "confidential incident postmortem. ".repeat(20));
                 source.addDocument("doc-stays", "routine capacity planning. ".repeat(20));
                 reindex(reindexer, source);
 
-                MockSource without = new MockSource("test-source");
+                MockSource without = new MockSource("test-source").modifiedAt(1_000L);
                 without.addDocument("doc-stays", "routine capacity planning. ".repeat(20));
                 reindex(reindexer, without);
 
@@ -717,6 +717,42 @@ class DocumentReindexerTest {
                     "The erasure the reindex accepted should have been discharged by its own "
                         + "compaction, not left for whatever ingests next");
                 assertEquals(0, stats.erasedDocuments());
+            }
+        }
+
+        @Test
+        @DisplayName("a deleted document beside one the run re-published leaves once readers "
+            + "have caught up")
+        void deletedBesideARepublishedDocumentIsReclaimedOnceReadersCatchUp() throws Exception {
+            // The run re-publishes doc-stays, whose previous copy shares a segment with doc-gone.
+            // A reader still at the epoch the run started from cannot see the new copy, so the
+            // old one has to stay searchable for it, and rewriting the segment would drop it: the
+            // rewrite reads text back from storage, which holds only the new version. So the
+            // erasure waits for the reader floor to pass the republication - which the node's
+            // clock does on its next tick - and the next compaction, the erasure sweep's on a
+            // quiet node, discharges it.
+            try (NativeChunkIndex index = openIndex()) {
+                DocumentReindexer reindexer = reindexerWith(index);
+                MockSource source = new MockSource("test-source").modifiedAt(1_000L);
+                source.addDocument("doc-gone", "confidential incident postmortem. ".repeat(20));
+                source.addDocument("doc-stays", "routine capacity planning. ".repeat(20));
+                reindex(reindexer, source);
+
+                MockSource without = new MockSource("test-source").modifiedAt(2_000L);
+                without.addDocument("doc-stays", "routine capacity planning. ".repeat(20));
+                reindex(reindexer, without);
+
+                assertEquals(0, hits(index, "postmortem"),
+                    "the deleted document stops answering at once, whatever its bytes wait for");
+                assertEquals(1, index.stats().erasureRequests(),
+                    "precondition: the segment still holds a copy a reader behind the run needs");
+
+                index.compactIfDue(storageWriter::textOf);
+
+                ChunkIndexStats stats = index.stats();
+                assertEquals(0, stats.erasureRequests());
+                assertEquals(0, stats.erasedDocuments());
+                assertTrue(hits(index, "capacity") > 0);
             }
         }
 
@@ -899,9 +935,17 @@ class DocumentReindexerTest {
         private final String sourceId;
         private final Map<String, String> documents = new HashMap<>();
         private final Set<String> failingDocuments = new HashSet<>();
+        /** The modification time every fetch reports, or 0 to report the time of the fetch. */
+        private long lastModifiedMillis;
 
         MockSource(String sourceId) {
             this.sourceId = sourceId;
+        }
+
+        /** Reports every document as last modified at the given time, as an unchanged file is. */
+        MockSource modifiedAt(long lastModifiedMillis) {
+            this.lastModifiedMillis = lastModifiedMillis;
+            return this;
         }
 
         void addDocument(String docId, String content) {
@@ -937,8 +981,8 @@ class DocumentReindexerTest {
                 throw new SourceException("Document not found: " + documentId);
             }
             byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
-            return new FetchedDocument(documentId, bytes, "text/plain", 
-                System.currentTimeMillis());
+            return new FetchedDocument(documentId, bytes, "text/plain",
+                lastModifiedMillis > 0 ? lastModifiedMillis : System.currentTimeMillis());
         }
 
         @Override

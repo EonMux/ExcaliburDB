@@ -15,6 +15,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * What ingestion hands the graph about a published document, and in what order.
@@ -49,6 +50,11 @@ class GraphReporterTest {
         public void onDocumentReplaced(String documentKey, String text,
                                        long lastModifiedMillis) {
             record("replace", documentKey, text, lastModifiedMillis);
+        }
+
+        @Override
+        public void onDocumentRemoved(String documentKey) {
+            record("remove", documentKey, null, 0L);
         }
 
         void record(String kind, String documentKey, String text, long lastModifiedMillis) {
@@ -138,6 +144,60 @@ class GraphReporterTest {
     }
 
     @Test
+    @DisplayName("reports a removal, ordered with the document's publications")
+    void reportsARemovalInOrder() {
+        RecordingSink sink = new RecordingSink();
+        GraphReporter reporter = new GraphReporter();
+        reporter.setSink(sink);
+
+        publishAndReport(reporter, "docs:ada.md", false, document("Ada runs Acme.", 1L));
+        GraphReporter.Publication removal = reporter.removed("docs:ada.md");
+        assertThat(removal.removal()).isTrue();
+        assertThat(removal.replacedEarlierVersion()).isFalse();
+        reporter.report(removal, null);
+        assertThat(sink.calls).containsExactly("publish docs:ada.md", "remove docs:ada.md");
+
+        GraphReporter.Publication late = reporter.published("docs:ada.md", true);
+        GraphReporter.Publication removedAgain = reporter.removed("docs:ada.md");
+        reporter.report(removedAgain, null);
+        reporter.report(late, document("Ada left Acme.", 2L));
+        assertThat(sink.calls)
+            .as("a version removed before its report ran must not stage facts about it")
+            .containsExactly("publish docs:ada.md", "remove docs:ada.md", "remove docs:ada.md");
+
+        GraphReporter.Publication stale = reporter.removed("docs:ada.md");
+        publishAndReport(reporter, "docs:ada.md", false, document("Ada is back.", 3L));
+        reporter.report(stale, null);
+        assertThat(sink.calls).last()
+            .as("a removal a later version superseded must not withdraw that version's facts")
+            .isEqualTo("publish docs:ada.md");
+    }
+
+    @Test
+    @DisplayName("refuses to report a published version without its document")
+    void refusesAPublicationWithoutItsDocument() {
+        GraphReporter reporter = new GraphReporter();
+        GraphReporter.Publication publication = reporter.published("docs:ada.md", false);
+
+        assertThatThrownBy(() -> reporter.report(publication, null))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("docs:ada.md");
+    }
+
+    @Test
+    @DisplayName("counts a removal the graph refused, and never lets the failure out")
+    void countsARefusedRemoval() {
+        GraphReporter reporter = new GraphReporter();
+        RecordingSink sink = new RecordingSink();
+        sink.failure = new IllegalStateException("graph staging store is closed");
+        reporter.setSink(sink);
+
+        assertThatCode(() -> reporter.report(reporter.removed("docs:ada.md"), null))
+            .doesNotThrowAnyException();
+        assertThat(reporter.failures()).isEqualTo(1);
+    }
+
+    @Test
     @DisplayName("runs one document's reports one at a time, and other documents' alongside")
     void serialisesOneDocumentsReports() throws Exception {
         CountDownLatch firstEntered = new CountDownLatch(1);
@@ -145,7 +205,7 @@ class GraphReporterTest {
         RecordingSink sink = new RecordingSink() {
             @Override
             void record(String kind, String documentKey, String text, long lastModifiedMillis) {
-                if (text.equals("slow")) {
+                if ("slow".equals(text)) {
                     firstEntered.countDown();
                     try {
                         assertThat(releaseFirst.await(30, TimeUnit.SECONDS)).isTrue();

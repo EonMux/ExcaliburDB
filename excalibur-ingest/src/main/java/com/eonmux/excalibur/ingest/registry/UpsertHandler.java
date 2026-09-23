@@ -228,6 +228,27 @@ public class UpsertHandler {
     }
 
     /**
+     * Tombstones one document that disappeared from its source and removes its registry entry.
+     *
+     * <p>What {@link #processDeletions(ChangeSet)} does for each deleted document, for a caller
+     * that has to remove them one at a time: under each document's lock, having first checked
+     * that the entry it is removing is still the one change detection read. Removing a batch
+     * without that lock removes whatever a concurrent re-post has since written under the same
+     * deterministic chunk ids, along with its registry entry.</p>
+     *
+     * @param metadata The registry entry of the document to remove
+     * @return Result containing counts of successful operations and any errors
+     * @throws NullPointerException if metadata is null
+     */
+    public UpsertResult removeDocument(DocumentMetadata metadata) {
+        Objects.requireNonNull(metadata, "metadata must not be null");
+
+        UpsertResult.Builder result = UpsertResult.builder();
+        processDeletedDocument(metadata, result);
+        return result.build();
+    }
+
+    /**
      * Tombstones the chunks of a document's previous version that its new version did not
      * overwrite.
      *

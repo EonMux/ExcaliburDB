@@ -366,11 +366,31 @@ public class IngestionOrchestrator {
     }
 
     /**
-     * How many published documents the graph sink refused outright.
+     * Has a reindexer report to the graph through this orchestrator.
+     *
+     * <p>A re-crawl publishes new versions of the documents this orchestrator ingested and
+     * removes the ones their source dropped, and the graph has to hear of both, through the sink
+     * set by {@link #setGraphSink} or whichever replaces it. Through this orchestrator's reporter
+     * rather than one of the reindexer's own, because the reporter is what orders one document's
+     * reports: a re-crawl and a client's re-post of the same document can publish moments apart,
+     * and two reporters would each take their own version for the latest.</p>
+     *
+     * @param reindexer The reindexer serving the same corpus
+     * @throws NullPointerException if reindexer is null
+     */
+    public void shareGraphReporting(DocumentReindexer reindexer) {
+        Objects.requireNonNull(reindexer, "reindexer must not be null")
+            .reportGraphThrough(graphReporter);
+    }
+
+    /**
+     * How many changes the graph sink refused outright.
      *
      * <p>Beside whatever the sink counts itself: this is what a sink that threw - rather than
-     * logging and counting as it is meant to - cost, and those documents are published and will
-     * not be offered to the graph again unless they change.</p>
+     * logging and counting as it is meant to - cost. A document published but refused will not be
+     * offered to the graph again unless it changes, and one removed but refused keeps its facts
+     * staged until it is erased. A reindexer that shares this orchestrator's reporting is counted
+     * here too.</p>
      *
      * @return The count since this orchestrator was created
      */

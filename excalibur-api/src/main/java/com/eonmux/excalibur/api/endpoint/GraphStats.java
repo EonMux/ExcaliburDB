@@ -153,9 +153,9 @@ public record GraphStats(NamespaceStats namespaces, BudgetStats budget, BuildSta
      * @param tenantFailures      Documents whose namespace's graph could not be opened
      * @param sinkRefusals        Documents the sink threw on rather than counting under one of
      *                            the reasons above
-     * @param withdrawalFailures  Replaced documents whose earlier version's staged facts could
+     * @param withdrawalFailures  Replaced or removed documents whose earlier staged facts could
      *                            not be withdrawn, so the next build publishes them beside the
-     *                            new version's
+     *                            new version's, or for a document that is gone
      */
     public record IngestStats(long documentsSeen, long factsStaged, long unresolvedDocuments,
                               long extractionFailures, long tenantFailures, long sinkRefusals,

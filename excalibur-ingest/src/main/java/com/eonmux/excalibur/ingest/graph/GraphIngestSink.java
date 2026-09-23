@@ -15,14 +15,15 @@ import java.util.List;
  * because a fact staged for a document whose publication then failed would be a fact about
  * something the corpus does not contain.</p>
  *
- * <h2>Replacing a version</h2>
+ * <h2>Replacing and removing a version</h2>
  * <p>A document published over a version this node already held is reported through
  * {@link #onDocumentReplaced} rather than {@link #onDocumentPublished}. Everything staged from a
  * document carries the same source id whatever version it was extracted from, so the earlier
  * version's facts and snippets stay staged beside the new ones unless they are withdrawn - and
  * the next graph build then publishes what the document used to say as though it still said it.
  * Two methods rather than a flag, so a sink that stages anything has to say what replacing a
- * version means to it.</p>
+ * version means to it. A document removed outright - its source no longer lists it - is reported
+ * through {@link #onDocumentRemoved}, which withdraws the same way and stages nothing.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Implementations must be safe for concurrent use: one virtual thread per document.</p>
@@ -70,6 +71,22 @@ public interface GraphIngestSink {
     void onDocumentReplaced(String documentKey, String text, long lastModifiedMillis);
 
     /**
+     * Withdraws whatever was staged from a document this node no longer holds.
+     *
+     * <p>Called when a re-crawl finds that a source has stopped listing a document and removes
+     * it. What was extracted from it describes text the corpus no longer contains, exactly as an
+     * earlier version's facts do once it is replaced, so it is withdrawn the same way; only a
+     * new version is missing, and so nothing is staged in its place.</p>
+     *
+     * <p>Must not throw, for the reason {@link #onDocumentPublished} must not: the document is
+     * already removed by the time this runs. The caller orders it with the document's
+     * publications, so a removal cannot withdraw a later version's facts.</p>
+     *
+     * @param documentKey The source-qualified document key
+     */
+    void onDocumentRemoved(String documentKey);
+
+    /**
      * Records a published document whose date is unknown.
      *
      * @param documentKey The source-qualified document key
@@ -114,6 +131,11 @@ public interface GraphIngestSink {
         public void onDocumentReplaced(String documentKey, String text,
                                        long lastModifiedMillis) {
             // Nothing was staged from the earlier version, so there is nothing to withdraw.
+        }
+
+        @Override
+        public void onDocumentRemoved(String documentKey) {
+            // Nothing was staged from the document, so there is nothing to withdraw.
         }
     }
 

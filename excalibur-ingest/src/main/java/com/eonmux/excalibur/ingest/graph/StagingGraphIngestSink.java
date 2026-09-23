@@ -29,7 +29,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * is already published and searchable by vector, and failing it here would report a loss that did
  * not happen.</p>
  *
- * <h2>Replacing a version</h2>
+ * <h2>Replacing and removing a version</h2>
  * <p>A replaced document's earlier facts and snippets are withdrawn from staging exactly as an
  * erasure of the document withdraws them: by the source-scoped match on
  * {@link LlmRelationExtractor#sourceIdOf} of its key, which is the id every fact and snippet
@@ -39,8 +39,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * built with until the next build, which replays staging and so no longer holds the earlier
  * version.</p>
  *
+ * <p>A document removed outright is withdrawn the same way, with nothing staged after it.</p>
+ *
  * <p>The withdrawal rewrites the staging logs, reading them whole, and holds the staging store's
- * append lock while it does. That is paid once per replaced document that had facts staged -
+ * append lock while it does. That is paid once per replaced or removed document -
  * a log with nothing to remove is scanned and left alone - and never for a document seen for the
  * first time.</p>
  *
@@ -114,6 +116,21 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
     }
 
     /**
+     * Withdraws what was staged from a document this node no longer holds.
+     *
+     * <p>A failed withdrawal is counted and logged, as a replacement's is.</p>
+     *
+     * @param documentKey The source-qualified document key
+     */
+    @Override
+    public void onDocumentRemoved(String documentKey) {
+        if (documentKey == null || documentKey.isBlank()) {
+            return;
+        }
+        withdraw(documentKey);
+    }
+
+    /**
      * Removes every staged fact and snippet extracted from a document, whatever its version.
      *
      * @param documentKey The document
@@ -126,16 +143,16 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
                     LlmRelationExtractor.sourceIdOf(documentKey))));
             recordsWithdrawn.addAndGet(result.removed());
             if (result.removed() > 0) {
-                LOGGER.debug("withdrew {} fact(s) and {} snippet(s) staged from the previous "
-                    + "version of {}", result.factsRemoved(), result.snippetsRemoved(),
+                LOGGER.debug("withdrew {} fact(s) and {} snippet(s) staged from earlier "
+                    + "versions of {}", result.factsRemoved(), result.snippetsRemoved(),
                     documentKey);
             }
             return result.removed();
         } catch (IOException | RuntimeException e) {
             withdrawalFailures.incrementAndGet();
-            LOGGER.warn("could not withdraw the facts staged from the previous version of {}; "
-                + "the next graph build will publish them beside the new version's: {}",
-                documentKey, e.toString());
+            LOGGER.warn("could not withdraw the facts staged from earlier versions of {}; "
+                + "the next graph build will publish them as though the document still said "
+                + "them: {}", documentKey, e.toString());
             return -1;
         }
     }
@@ -322,7 +339,8 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
     }
 
     /**
-     * How many staged facts and snippets were withdrawn because their document was replaced.
+     * How many staged facts and snippets were withdrawn because their document was replaced or
+     * removed.
      *
      * @return The count
      */
@@ -331,10 +349,10 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
     }
 
     /**
-     * How many replaced documents' earlier facts could not be withdrawn.
+     * How many replaced or removed documents' earlier facts could not be withdrawn.
      *
-     * <p>Each one leaves what an earlier version said staged beside what the document says now,
-     * for the next build to publish.</p>
+     * <p>Each one leaves what an earlier version said staged for the next build to publish, beside
+     * what the document says now or in place of a document that is gone.</p>
      *
      * @return The count
      */

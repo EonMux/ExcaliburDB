@@ -313,7 +313,7 @@ public final class MetricsEndpoint implements HttpHandler {
             .counter("excalibur_graph_ingest_failures_total", failures,
                 Map.of("reason", "sink_refused"), ingest.sinkRefusals())
             .counter("excalibur_graph_ingest_withdrawal_failures_total",
-                "Replaced documents whose earlier version's staged facts could not be withdrawn",
+                "Replaced or removed documents whose earlier staged facts could not be withdrawn",
                 ingest.withdrawalFailures());
     }
 
@@ -534,7 +534,8 @@ public final class MetricsEndpoint implements HttpHandler {
             // A counter, because each drop is permanent: the chunk is gone from keyword search
             // until its document is reindexed, and any increase means storage holds damage.
             .counter("excalibur_lexical_unreadable_chunks_dropped_total",
-                "Chunks a lexical compaction dropped because their stored text was corrupt",
+                "Chunks the lexical index dropped because their stored text or their segment was "
+                    + "damaged beyond recovery",
                 lexical.unreadableChunksDropped());
     }
 }

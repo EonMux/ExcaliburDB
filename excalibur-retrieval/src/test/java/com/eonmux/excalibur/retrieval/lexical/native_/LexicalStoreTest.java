@@ -409,6 +409,77 @@ class LexicalStoreTest {
         }
 
         @Test
+        @DisplayName("a reader before the replacement's epoch keeps the old copy, never both")
+        void oldCopyAnswersUntilTheReplacementIsVisible(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("chunk:1", "shared handshake"), 1);
+                store.add(docs("chunk:1", "shared certificate"), 5);
+
+                assertThat(store.search(new String[] {"handshake"}, ones(1), 10, 4))
+                    .as("a reader still before the replacement answers from the old copy")
+                    .singleElement().satisfies(h -> assertThat(h.key()).isEqualTo("chunk:1"));
+                assertThat(store.search(new String[] {"certificate"}, ones(1), 10, 4)).isEmpty();
+                assertThat(store.search(new String[] {"shared"}, ones(1), 10, 4)).hasSize(1);
+                assertThat(store.liveDocuments(4)).isEqualTo(1);
+
+                assertThat(store.search(new String[] {"handshake"}, ones(1), 10, 5)).isEmpty();
+                assertThat(store.search(new String[] {"certificate"}, ones(1), 10, 5))
+                    .singleElement().satisfies(h -> assertThat(h.key()).isEqualTo("chunk:1"));
+                assertThat(store.search(new String[] {"shared"}, ones(1), 10, 5)).hasSize(1);
+                assertThat(store.liveDocuments(5)).isEqualTo(1);
+            }
+        }
+
+        @Test
+        @DisplayName("a segment wholly replaced still answers readers before its replacement")
+        void whollyReplacedSegmentStillAnswersEarlierReaders(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "alpha", "b", "alpha beta"), 1);
+                store.add(docs("a", "gamma", "b", "gamma delta"), 3);
+
+                assertThat(store.search(new String[] {"alpha"}, ones(1), 10, 2))
+                    .extracting(LexicalStore.Hit::key).containsExactlyInAnyOrder("a", "b");
+                assertThat(store.search(new String[] {"alpha"}, ones(1), 10, 3)).isEmpty();
+            }
+        }
+
+        @Test
+        @DisplayName("an erasure hides the old copy from every reader at once")
+        void erasureOverridesAPendingReplacement(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "alpha"), 1);
+                store.add(docs("a", "beta"), 5);
+
+                store.erase(Set.of("a"));
+
+                assertThat(store.search(new String[] {"alpha"}, ones(1), 10, 4)).isEmpty();
+                assertThat(store.search(new String[] {"beta"}, ones(1), 10, 9)).isEmpty();
+            }
+        }
+
+        @Test
+        @DisplayName("a copy a reader may still need is not compacted away beneath it")
+        void compactionWaitsForReadersBeforeTheReplacement(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "alpha", "b", "unrelated"), 1);
+                store.add(docs("a", "beta"), 5);
+                Map<String, String> now = docs("a", "beta", "b", "unrelated");
+
+                store.compactNow(now::get, 4);
+                assertThat(store.search(new String[] {"alpha"}, ones(1), 10, 4))
+                    .as("a reader at epoch 4 still has only the old copy to answer from")
+                    .hasSize(1);
+
+                store.compactNow(now::get, 5);
+                assertThat(anyFileContains(dir, "alpha"))
+                    .as("once no reader precedes the replacement the old copy leaves disk")
+                    .isFalse();
+                assertThat(store.search(new String[] {"beta"}, ones(1), 10, 9)).hasSize(1);
+                assertThat(store.search(new String[] {"unrelated"}, ones(1), 10, 9)).hasSize(1);
+            }
+        }
+
+        @Test
         @DisplayName("a replaced copy is counted for compaction but owed to nobody")
         void supersessionIsNotAnErasure(@TempDir Path dir) throws Exception {
             try (LexicalStore store = LexicalStore.open(dir)) {

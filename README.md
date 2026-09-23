@@ -433,7 +433,8 @@ it from its key table and the stored text.
 Damaged files are moved into a timestamped directory beside the data directory unless
 `--quarantine-dir=<path>` names another. It takes the `--flag=value` form only. The default needs
 the data directory's parent to be writable; a quarantine on another filesystem works too, by a
-copy that is forced and compared before the original is removed, since a rename cannot cross.
+copy that is forced and compared before the original is removed, since a rename cannot cross — a
+lexical segment's directory included, copied whole and compared file by file.
 
 Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself
 failed, so nothing is known about the directory — which is not the same claim as `0`.
@@ -842,11 +843,16 @@ few thousand probes rather than a pass over every identifier in the store. A rep
 counted as dead weight for compaction but is owed to nobody: it is a previous version, not a
 promise, and giving every re-crawl an erasure deadline would make routine indexing urgent.
 
-Retiring a copy is not epoch-scoped, because the mechanism it shares with erasure is deliberately
-not: hiding has to be immediate or erasure is not erasure. So a query already running when a chunk
-is republished sees neither version of it — the old one is retired and the new one is published at a
-later epoch than the query is reading at. That costs one chunk from one in-flight query for the
-length of that query, which is the price of erasure taking effect the moment it is asked for.
+Retiring a copy is epoch-scoped where erasing one is not. The new copy is published at a later
+epoch than a query already running is reading at, so a query before that epoch goes on matching the
+old copy and a query at or after it matches only the new one — a republished chunk is always
+findable by one version of its text and never by both. Erasure is the opposite, deliberately:
+hiding has to be immediate or erasure is not erasure, so an erased chunk disappears from every
+query at once, including one that could still see an earlier copy. A compaction leaves a replaced
+copy on disk until no query can be reading from before its replacement, which is at most a query
+timeout: it rewrites a segment from the text in storage, which holds only the new version. An
+erasure owed in the same segment waits with it, and the next compaction — the erasure sweep's, on a
+quiet node — discharges it.
 
 **Erasure.** Two parts, deliberately. The obligation is appended to a log and forced to disk before
 the call returns, and the chunks are tombstoned so no query returns them. Physical removal happens
@@ -906,7 +912,9 @@ the promise while the document was readable again.
 **Reindexing.** A reindex is the one operation that removes content a query could still be matching:
 a deleted document's chunks, and the tail chunks a shortened document no longer has. Both are erased
 from the index as they are tombstoned in storage, and the reindex settles its own erasures at the end
-of its run rather than leaving them for whatever ingests next. A node that only ever reindexes still
+of its run rather than leaving them for whatever ingests next — except in a segment that also holds
+the previous copy of a document the same run re-published, which waits for readers to catch up as
+described under Reingestion, and is then settled by the sweep. A node that only ever reindexes still
 meets the erasure deadline.
 
 **Compaction.** Checked at the end of an ingestion run, at the end of a reindex, when an erasure
@@ -2710,7 +2718,11 @@ nothing from a segment's postings: it rebuilds a segment from its key table and 
 storage, so while the key table beside a damaged segment is intact the next compaction rebuilds
 it, and the sweep that enforces `lexical-max-latency-seconds` asks for that compaction on a node
 that is not ingesting. A segment whose key table is damaged too is reported as not rebuildable,
-and only reindexing its documents brings them back. A lexical segment is written once and never
+and only reindexing its documents brings them back. It stays on disk only while no erasure is owed:
+its names are the only record of what it holds, so no erasure can be shown to have reached it, and
+recording one — or opening with one owed — removes the segment, logs it at ERROR and counts its
+chunks in `lexical.unreadableChunksDropped`, rather than leaving every erasure owed for as long as
+the damaged files remain. A lexical segment is written once and never
 edited — erasure and compaction both produce a new segment — so there is no unsealed state for
 this format.
 

@@ -140,6 +140,25 @@ class StagingGraphIngestSinkTest {
     }
 
     @Test
+    @DisplayName("a removed document's facts and snippets are withdrawn, and nothing is staged")
+    void aRemovalWithdrawsTheDocument(@TempDir Path dir) throws IOException {
+        try (GraphStagingStore staging = GraphStagingStore.open(dir)) {
+            StagingGraphIngestSink sink = new StagingGraphIngestSink(staging, lineExtractor());
+            sink.onDocumentPublished("docs:ada.md", "Ada runs Acme", 1L);
+            sink.onDocumentPublished("docs:babbage.md", "Babbage runs Initech", 1L);
+
+            sink.onDocumentRemoved("docs:ada.md");
+
+            assertThat(stagedFacts(staging)).containsExactly("Babbage Initech");
+            List<String> snippets = new ArrayList<>();
+            staging.forEachEntityText((entityId, snippet) -> snippets.add(snippet));
+            assertThat(snippets).doesNotContain("Ada runs Acme").contains("Babbage runs Initech");
+            assertThat(sink.recordsWithdrawn()).isEqualTo(3);
+            assertThat(sink.factsStaged()).as("the two publications only").isEqualTo(2);
+        }
+    }
+
+    @Test
     @DisplayName("a withdrawal that fails is counted, and the new version is staged regardless")
     void aFailedWithdrawalIsCounted() throws IOException {
         GraphStagingStore store = mock(GraphStagingStore.class);
@@ -149,8 +168,9 @@ class StagingGraphIngestSinkTest {
         sink.onDocumentReplaced("docs:ada.md", "Ada runs Globex", 2L);
         sink.onDocumentReplaced(null, "Ada runs Globex", 2L);
         sink.onDocumentReplaced(" ", "Ada runs Globex", 2L);
+        sink.onDocumentRemoved("docs:babbage.md");
 
-        assertThat(sink.withdrawalFailures()).isEqualTo(1);
+        assertThat(sink.withdrawalFailures()).isEqualTo(2);
         assertThat(sink.factsStaged()).isEqualTo(1);
         assertThat(sink.withdraw("docs:ada.md")).isEqualTo(-1);
     }

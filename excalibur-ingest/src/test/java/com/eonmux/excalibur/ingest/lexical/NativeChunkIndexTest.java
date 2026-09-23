@@ -120,6 +120,35 @@ class NativeChunkIndexTest {
         }
 
         @Test
+        @DisplayName("a republished chunk matches its old text until its new text is visible")
+        void aReplacedChunkIsNeverUnsearchable(@TempDir Path dir) throws Exception {
+            AtomicLong epoch = new AtomicLong(5);
+            try (NativeChunkIndex index =
+                     NativeChunkIndex.open(dir, epoch::get, 4, standard())) {
+                Ranker ranker = index.ranker(QueryExpander.identity());
+                index.add("kb:a.txt:chunk:0", "the handshake failed");
+                index.refresh();
+                epoch.incrementAndGet();
+
+                index.add("kb:a.txt:chunk:0", "the certificate expired");
+                index.refresh();
+
+                assertThat(namesOf(index, ranker.rank(RetrievalQuery.ofText("handshake"), 5)))
+                    .as("until the epoch turns, the old copy is the chunk")
+                    .containsExactly("kb:a.txt:chunk:0");
+                assertThat(ranker.rank(RetrievalQuery.ofText("certificate"), 5).documents())
+                    .isEmpty();
+
+                epoch.incrementAndGet();
+
+                assertThat(ranker.rank(RetrievalQuery.ofText("handshake"), 5).documents())
+                    .isEmpty();
+                assertThat(namesOf(index, ranker.rank(RetrievalQuery.ofText("certificate"), 5)))
+                    .containsExactly("kb:a.txt:chunk:0");
+            }
+        }
+
+        @Test
         @DisplayName("a run's chunks appear together even when the buffer spills mid-run")
         void aSpilledRunStillPublishesAtOneEpoch(@TempDir Path dir) throws Exception {
             // The buffer holds two chunks, so five chunks spill three times. Every one of them

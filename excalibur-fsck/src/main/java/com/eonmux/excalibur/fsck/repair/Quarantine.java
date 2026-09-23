@@ -4,12 +4,16 @@ import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
+import java.util.List;
 import java.util.Objects;
+import java.util.stream.Stream;
 
 /**
  * Moves a file out of the way without ever destroying it.
@@ -34,6 +38,13 @@ import java.util.Objects;
  * with the original byte for byte, and renamed onto its final name; only then is the
  * original removed. A crash anywhere in that sequence leaves the original in place, and at
  * worst a second copy beside it: never neither.</p>
+ *
+ * <p>A directory - a lexical segment is one - crosses the same way, as a whole: every file in it
+ * is copied into a staged tree and forced, the tree is compared with the original - the same
+ * entries, and each file equal byte for byte - and only then is it renamed onto its final name
+ * and the original tree removed. A directory holding anything other than files and directories
+ * is refused before anything is copied, because a link or a device node has no bytes a
+ * comparison could prove equal.</p>
  *
  * <h2>Durability</h2>
  * <p>A move is finished when both of its directory entries are on the device, not when the
@@ -134,7 +145,11 @@ public final class Quarantine {
         try {
             renamer.rename(file, destination);
         } catch (AtomicMoveNotSupportedException e) {
-            copyThenRemove(file, destination);
+            if (Files.isDirectory(file, LinkOption.NOFOLLOW_LINKS)) {
+                copyTreeThenRemove(file, destination);
+            } else {
+                copyThenRemove(file, destination);
+            }
             return destination;
         }
         try {
@@ -250,6 +265,182 @@ public final class Quarantine {
             throw new PartialQuarantineException(destination, "moved to " + destination
                 + ", but the removal of the original could not be forced to the device, so a "
                 + "crash before its directory is next written may bring it back: " + e, e);
+        }
+    }
+
+    /**
+     * Moves a directory to another filesystem without a moment at which no whole copy of it
+     * exists.
+     *
+     * <p>The sequence {@link #copyThenRemove} follows for one file, over a tree: the copy is
+     * staged under a name of its own, every file in it forced as that method forces one and
+     * every directory in it forced for the entries it holds, and the whole of it compared with
+     * the original before one rename publishes it. Only then is the original removed, deepest
+     * entries first, so a removal cut short leaves the original's own name in place, never a
+     * name that has gone while part of what was under it has not.</p>
+     *
+     * @param tree        The original directory
+     * @param destination Its free name in quarantine
+     * @throws PartialQuarantineException if the copy was published in quarantine and a later
+     *                                    step did not complete
+     * @throws IOException                if the tree holds something other than files and
+     *                                    directories, or the copy cannot be written, forced or
+     *                                    shown to be equal; the original is then untouched and
+     *                                    the staged copy removed
+     */
+    private void copyTreeThenRemove(Path tree, Path destination) throws IOException {
+        List<Path> entries = entriesOf(tree);
+        Path staged = destination.resolveSibling(destination.getFileName() + STAGING_SUFFIX);
+        try {
+            // A staged tree left by a run that crashed mid-copy was never published, so it is
+            // nobody's evidence; the copy starts again from the original.
+            deleteTree(staged);
+            copyTree(tree, entries, staged);
+            verifyTree(tree, entries, staged);
+            Files.move(staged, destination, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException | RuntimeException e) {
+            try {
+                deleteTree(staged);
+            } catch (IOException cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            throw e;
+        }
+        try {
+            sync.force(destination.getParent());
+        } catch (IOException e) {
+            throw new PartialQuarantineException(destination, "a verified copy is at "
+                + destination + " but could not be forced to the device, so the original was "
+                + "kept where it was: " + e, e);
+        }
+        try {
+            deleteTree(tree);
+        } catch (IOException e) {
+            throw new PartialQuarantineException(destination, "a verified copy is at "
+                + destination + ", but the original could not be removed entirely and what is "
+                + "left of it is still in place: " + e, e);
+        }
+        try {
+            sync.force(containingDirectory(tree));
+        } catch (IOException e) {
+            throw new PartialQuarantineException(destination, "moved to " + destination
+                + ", but the removal of the original could not be forced to the device, so a "
+                + "crash before its directory is next written may bring it back: " + e, e);
+        }
+    }
+
+    /**
+     * Lists a tree's entries, parents before children, refusing anything that is neither a file
+     * nor a directory.
+     *
+     * @param tree The directory
+     * @return Every entry beneath it, the directory itself excluded
+     * @throws IOException if it cannot be listed, or holds a link or a special file
+     */
+    private static List<Path> entriesOf(Path tree) throws IOException {
+        List<Path> entries = new ArrayList<>();
+        try (Stream<Path> walk = Files.walk(tree)) {
+            for (Path entry : (Iterable<Path>) walk::iterator) {
+                if (entry.equals(tree)) {
+                    continue;
+                }
+                if (!Files.isRegularFile(entry, LinkOption.NOFOLLOW_LINKS)
+                        && !Files.isDirectory(entry, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new IOException(entry + " is neither a file nor a directory, so no "
+                        + "copy of it could be proven equal; " + tree + " was kept where it was");
+                }
+                entries.add(entry);
+            }
+        }
+        return entries;
+    }
+
+    /**
+     * Copies a tree into a staged directory and forces all of it to the device.
+     *
+     * @param tree    The original directory
+     * @param entries Its entries, parents first
+     * @param staged  Where the copy is built
+     * @throws IOException if any part of it cannot be written or forced
+     */
+    private void copyTree(Path tree, List<Path> entries, Path staged) throws IOException {
+        Files.createDirectory(staged);
+        List<Path> directories = new ArrayList<>();
+        directories.add(staged);
+        for (Path entry : entries) {
+            Path copy = staged.resolve(tree.relativize(entry).toString());
+            if (Files.isDirectory(entry, LinkOption.NOFOLLOW_LINKS)) {
+                Files.createDirectory(copy);
+                directories.add(copy);
+                continue;
+            }
+            Files.copy(entry, copy, StandardCopyOption.COPY_ATTRIBUTES,
+                LinkOption.NOFOLLOW_LINKS);
+            // Through a read-only channel, for the reason copyThenRemove gives.
+            try (FileChannel channel = FileChannel.open(copy, StandardOpenOption.READ)) {
+                channel.force(true);
+            }
+        }
+        // Deepest first, so a directory's entries are on the device before the entry naming it
+        // in its parent is.
+        for (int at = directories.size() - 1; at >= 0; at--) {
+            sync.force(directories.get(at));
+        }
+    }
+
+    /**
+     * Proves a staged copy holds exactly what the original tree holds.
+     *
+     * @param tree    The original directory
+     * @param entries Its entries
+     * @param staged  The copy
+     * @throws IOException if an entry is missing, of the wrong kind or unequal, or the copy
+     *                     holds one the original does not
+     */
+    private static void verifyTree(Path tree, List<Path> entries, Path staged)
+            throws IOException {
+        for (Path entry : entries) {
+            Path copy = staged.resolve(tree.relativize(entry).toString());
+            if (Files.isDirectory(entry, LinkOption.NOFOLLOW_LINKS)) {
+                if (!Files.isDirectory(copy, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new IOException("The copy of " + tree + " made for quarantine has no "
+                        + "directory " + copy + ", so the original was kept");
+                }
+                continue;
+            }
+            long firstDifference = Files.mismatch(entry, copy);
+            if (firstDifference != -1) {
+                throw new IOException("The copy of " + entry + " made for quarantine differs "
+                    + "from it at byte " + firstDifference + ", so the original was kept");
+            }
+        }
+        long copied;
+        try (Stream<Path> walk = Files.walk(staged)) {
+            copied = walk.count() - 1;
+        }
+        if (copied != entries.size()) {
+            throw new IOException("The copy of " + tree + " made for quarantine holds " + copied
+                + " entries where the original holds " + entries.size()
+                + ", so the original was kept");
+        }
+    }
+
+    /**
+     * Removes a tree, deepest entries first, doing nothing when it does not exist.
+     *
+     * @param tree The directory
+     * @throws IOException if any entry cannot be removed
+     */
+    private static void deleteTree(Path tree) throws IOException {
+        if (!Files.exists(tree, LinkOption.NOFOLLOW_LINKS)) {
+            return;
+        }
+        List<Path> all;
+        try (Stream<Path> walk = Files.walk(tree)) {
+            all = walk.toList();
+        }
+        for (int at = all.size() - 1; at >= 0; at--) {
+            Files.delete(all.get(at));
         }
     }
 

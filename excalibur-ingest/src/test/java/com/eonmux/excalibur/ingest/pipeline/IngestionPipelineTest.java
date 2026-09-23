@@ -1098,6 +1098,7 @@ class IngestionPipelineTest {
             final Path registryFile;
             final List<String> published = new CopyOnWriteArrayList<>();
             final List<String> replaced = new CopyOnWriteArrayList<>();
+            final List<String> removed = new CopyOnWriteArrayList<>();
             final List<Boolean> registryOnDiskAtSync = new CopyOnWriteArrayList<>();
 
             RegistryWatchingSink(Path registryFile) {
@@ -1114,6 +1115,11 @@ class IngestionPipelineTest {
             public void onDocumentReplaced(String documentKey, String text,
                                            long lastModifiedMillis) {
                 replaced.add(documentKey + "=" + text);
+            }
+
+            @Override
+            public void onDocumentRemoved(String documentKey) {
+                removed.add(documentKey);
             }
 
             @Override
@@ -1142,6 +1148,36 @@ class IngestionPipelineTest {
                 .as("the first version replaced nothing, so there is nothing to withdraw")
                 .containsExactly("docs:a.txt");
             assertThat(sink.replaced).containsExactly("docs:a.txt=Ada left Acme");
+        }
+
+        @Test
+        @DisplayName("a reindexer sharing the orchestrator's reporting reports through its sink")
+        void aSharingReindexerReportsThroughTheSink() throws Exception {
+            // The sink is set on the orchestrator alone, which is how the node wires it; a
+            // reindexer reporting through a reporter of its own would reach no sink at all.
+            Path registryFile = tempDir.resolve("shared-registry.dat");
+            com.eonmux.excalibur.ingest.registry.DocumentRegistry documents =
+                new com.eonmux.excalibur.ingest.registry.DocumentRegistry(registryFile);
+            IngestionOrchestrator orchestrator = new IngestionOrchestrator(new TextChunker(),
+                embeddings, storage, index, registry,
+                new com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker(documents));
+            RegistryWatchingSink sink = new RegistryWatchingSink(registryFile);
+            orchestrator.setGraphSink(sink);
+            DocumentReindexer reindexer = new DocumentReindexer(new TextChunker(), null,
+                new com.eonmux.excalibur.ingest.registry.UpsertHandler(documents,
+                    com.eonmux.excalibur.filter.CuckooFilter.create(1_000), key -> true),
+                documents, (chunkId, content, embedding) -> true);
+            orchestrator.shareGraphReporting(reindexer);
+
+            orchestrator.ingestNow(new FakeSource("docs", Map.of("a.txt", "Ada runs Acme")));
+            reindexer.reindexAll(new FakeSource("docs", Map.of("a.txt", "Ada left Acme")));
+            reindexer.reindexAll(new FakeSource("docs", Map.of()));
+
+            assertThat(sink.published).containsExactly("docs:a.txt");
+            assertThat(sink.replaced).containsExactly("docs:a.txt=Ada left Acme");
+            assertThat(sink.removed).containsExactly("docs:a.txt");
+            assertThatThrownBy(() -> orchestrator.shareGraphReporting(null))
+                .isInstanceOf(NullPointerException.class);
         }
 
         @Test

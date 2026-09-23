@@ -27,6 +27,14 @@ import java.util.concurrent.locks.ReentrantLock;
  * per-document lock of this reporter's and is skipped outright when a later version has been
  * published meanwhile: that version's own report replaces whatever this one would have
  * staged. Reports of different documents never wait for each other.</p>
+ *
+ * <h2>Every path that changes a document</h2>
+ * <p>A document is published by its first ingestion, by a client posting it again, and by a
+ * re-crawl that finds it new or changed; a re-crawl that finds it gone removes it. All of them
+ * report through one reporter - the orchestrator hands its own to the reindexer - because the
+ * ordering above holds only among changes one reporter has numbered: a re-crawl and a re-post of
+ * the same document can publish moments apart, and two reporters would each take their own
+ * version for the latest.</p>
  */
 final class GraphReporter {
 
@@ -75,22 +83,32 @@ final class GraphReporter {
         int pending;
     }
 
+    /** What happened to a document, which decides what its report asks of the sink. */
+    private enum Change {
+        /** A version was published and the node held none before it. */
+        PUBLISHED,
+        /** A version was published over one the node already held. */
+        REPLACED,
+        /** The document was removed, and no version of it remains. */
+        REMOVED
+    }
+
     /**
-     * A published document version waiting to be reported to the graph.
+     * A change to a document waiting to be reported to the graph: a version published, or the
+     * document removed.
      *
-     * <p>Obtained from {@link #published} under the document's lock, and handed to
-     * {@link #report} exactly once.</p>
+     * <p>Obtained from {@link #published} or {@link #removed} under the document's lock, and
+     * handed to {@link #report} exactly once.</p>
      */
     static final class Publication {
         private final String documentKey;
-        private final boolean replacedEarlierVersion;
+        private final Change change;
         private final long number;
         private final Reports reports;
 
-        private Publication(String documentKey, boolean replacedEarlierVersion, long number,
-                            Reports reports) {
+        private Publication(String documentKey, Change change, long number, Reports reports) {
             this.documentKey = documentKey;
-            this.replacedEarlierVersion = replacedEarlierVersion;
+            this.change = change;
             this.number = number;
             this.reports = reports;
         }
@@ -102,7 +120,12 @@ final class GraphReporter {
 
         /** Whether this version replaced one the node already held. */
         boolean replacedEarlierVersion() {
-            return replacedEarlierVersion;
+            return change == Change.REPLACED;
+        }
+
+        /** Whether this records the document's removal rather than a version of it. */
+        boolean removal() {
+            return change == Change.REMOVED;
         }
     }
 
@@ -132,6 +155,27 @@ final class GraphReporter {
      * @return The publication to report
      */
     Publication published(String documentKey, boolean replacedEarlierVersion) {
+        return numbered(documentKey, replacedEarlierVersion ? Change.REPLACED : Change.PUBLISHED);
+    }
+
+    /**
+     * Records that a document has been removed, for a report to follow.
+     *
+     * <p>Called under the document's lock, like {@link #published}, and numbered in the same
+     * sequence: the removal is the latest thing to have happened to the document until a version
+     * is published over it, and a report of an earlier version still in flight is then skipped
+     * rather than staging facts about text the corpus no longer holds. The publication obtained
+     * here must be passed to {@link #report}.</p>
+     *
+     * @param documentKey The source-qualified document key
+     * @return The removal to report
+     */
+    Publication removed(String documentKey) {
+        return numbered(documentKey, Change.REMOVED);
+    }
+
+    /** Numbers a change to a document and holds it outstanding until it is reported. */
+    private Publication numbered(String documentKey, Change change) {
         Objects.requireNonNull(documentKey, "documentKey must not be null");
         long number = publications.incrementAndGet();
         Reports reports = outstanding.compute(documentKey, (key, existing) -> {
@@ -140,7 +184,7 @@ final class GraphReporter {
             held.latest = number;
             return held;
         });
-        return new Publication(documentKey, replacedEarlierVersion, number, reports);
+        return new Publication(documentKey, change, number, reports);
     }
 
     /**
@@ -154,11 +198,17 @@ final class GraphReporter {
      * <p>A version a later one has already superseded is not reported at all; see the class
      * documentation.</p>
      *
-     * @param publication What {@link #published} returned for this version
-     * @param doc         The fetched document, decoded with the encoding its source declared
+     * @param publication What {@link #published} or {@link #removed} returned
+     * @param doc         The fetched document, decoded with the encoding its source declared;
+     *                    null for a removal, which has no content
+     * @throws IllegalArgumentException if a published version comes without its document
      */
     void report(Publication publication, FetchedDocument doc) {
         Objects.requireNonNull(publication, "publication must not be null");
+        if (doc == null && !publication.removal()) {
+            throw new IllegalArgumentException("a published version of "
+                + publication.documentKey + " must be reported with its document");
+        }
         Reports reports = publication.reports;
         reports.lock.lock();
         try {
@@ -187,16 +237,24 @@ final class GraphReporter {
         try {
             // With the document's own date, which is what its facts are ordered by when a later
             // document gives a single-valued relation a different value.
-            if (publication.replacedEarlierVersion) {
-                sink.onDocumentReplaced(documentKey, doc.getText(), doc.getLastModifiedMillis());
-            } else {
-                sink.onDocumentPublished(documentKey, doc.getText(), doc.getLastModifiedMillis());
+            switch (publication.change) {
+                case PUBLISHED -> sink.onDocumentPublished(documentKey, doc.getText(),
+                    doc.getLastModifiedMillis());
+                case REPLACED -> sink.onDocumentReplaced(documentKey, doc.getText(),
+                    doc.getLastModifiedMillis());
+                case REMOVED -> sink.onDocumentRemoved(documentKey);
             }
         } catch (RuntimeException e) {
             long failed = failures.incrementAndGet();
-            LOGGER.error("The graph did not take the facts of {}, which is published and will not "
-                + "be extracted again unless it changes ({} such document(s) so far): {}",
-                documentKey, failed, e.toString(), e);
+            if (publication.removal()) {
+                LOGGER.error("The graph did not withdraw the facts of {}, which is removed; they "
+                    + "stay staged until the document is erased with /v1/erasure ({} such "
+                    + "report(s) so far): {}", documentKey, failed, e.toString(), e);
+            } else {
+                LOGGER.error("The graph did not take the facts of {}, which is published and will "
+                    + "not be extracted again unless it changes ({} such report(s) so far): {}",
+                    documentKey, failed, e.toString(), e);
+            }
         }
     }
 
