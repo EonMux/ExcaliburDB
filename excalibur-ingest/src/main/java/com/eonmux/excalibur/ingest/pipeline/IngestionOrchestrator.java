@@ -426,8 +426,8 @@ public class IngestionOrchestrator {
      * @param source The source to ingest
      * @return What the run did
      * @throws NullPointerException  if source is null
-     * @throws IllegalStateException if the node is shutting down, or this source is already
-     *                               being ingested
+     * @throws ShuttingDownException if the node is shutting down
+     * @throws IllegalStateException if this source is already being ingested
      * @throws IngestionFailedException if the run could not complete
      */
     public IngestionOutcome ingestNow(Source source) {
@@ -435,7 +435,7 @@ public class IngestionOrchestrator {
 
         String sourceId = source.getSourceId();
         if (shutdown.get()) {
-            throw new IllegalStateException("The node is shutting down and is not ingesting");
+            throw new ShuttingDownException();
         }
         // The same claim a background run takes, for the same reason: two runs over one source
         // id would race on the same document identifiers. Refusing lets the caller retry, where
@@ -457,7 +457,7 @@ public class IngestionOrchestrator {
             synchronousIngestions.remove(sourceId, run);
             activeIngestions.remove(sourceId);
             run.ended().countDown();
-            throw new IllegalStateException("The node is shutting down and is not ingesting");
+            throw new ShuttingDownException();
         }
 
         IngestionStatus status = statusRegistry.getOrCreate(sourceId);
@@ -511,6 +511,24 @@ public class IngestionOrchestrator {
 
         /** A run over a source that listed no documents. */
         static final IngestionOutcome NOTHING = new IngestionOutcome(0, 0, 0, 0, false);
+    }
+
+    /**
+     * A synchronous run refused because the node is shutting down.
+     *
+     * <p>A subtype of the refusal a busy source gets, so a caller that treats both as "not now"
+     * still does, and a distinct type because the two are not the same "not now": a busy source
+     * is free again when its run ends, a stopping node is not coming back in this process, and a
+     * request handler has to tell its caller which without reading the message.</p>
+     */
+    public static final class ShuttingDownException extends IllegalStateException {
+
+        private static final long serialVersionUID = 1L;
+
+        /** Creates the refusal. */
+        public ShuttingDownException() {
+            super("The node is shutting down and is not ingesting");
+        }
     }
 
     /** A synchronous ingestion run that could not complete. */

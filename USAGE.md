@@ -1320,12 +1320,16 @@ they were published, and a version already superseded when its turn comes is ski
 with no `document_id`, no `text` or text that is not text, or the same `document_id` twice in one
 request.
 
-**Error — `409 Conflict`** — either the `source_id` is a registered crawl source, or a run over
-that source is already in flight. The first is refused because documents recorded under a crawl's
-id are removed the next time that crawl is reindexed — the crawl does not list them, and
-reindexing removes what a source has stopped listing. Use a `source_id` of your own.
+**Error — `409 Conflict`** — either the `source_id` is a registered crawl source
+(`source_kind_conflict`), or a run over that source is already in flight (`conflict`). The first
+is refused because documents recorded under a crawl's id are removed the next time that crawl is
+reindexed — the crawl does not list them, and reindexing removes what a source has stopped
+listing. Use a `source_id` of your own.
 
 **Error — `413 Payload Too Large`** — the body is over 1 MB. Split the batch.
+
+**Error — `503 Service Unavailable`** — `shutting_down`: the node is stopping and ingests nothing
+more. Send the batch to another node, or resend once this one is back.
 
 **Error — `405 Method Not Allowed`** — a method other than `GET` or `POST` on `/v1/documents`.
 Unauthenticated and charged against the read budget, for the same reason as the other two-method
