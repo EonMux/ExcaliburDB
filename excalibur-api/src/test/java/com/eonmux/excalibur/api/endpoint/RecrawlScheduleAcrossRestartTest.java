@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.shard.worker.SegmentReindexScheduler;
@@ -56,6 +57,10 @@ class RecrawlScheduleAcrossRestartTest {
         final InMemorySourceRegistry registry = new InMemorySourceRegistry();
 
         Node() {
+            // A pipeline that runs nothing, as the test reports each crawl itself. Without one,
+            // a registration probes the source on a thread of its own, which would report on the
+            // same status as the test and write the history while the test reads it.
+            registry.setIngestionOrchestrator(mock(IngestionOrchestrator.class));
             statuses.persistTo(SourceStatusFile.open(dataDir));
             registry.setStatusRegistry(statuses);
             registry.setReindexScheduler(scheduler, INTERVAL_MS);
@@ -88,7 +93,7 @@ class RecrawlScheduleAcrossRestartTest {
         Node before = new Node();
         before.registry.register(source("docs"));
         crawlToTheEnd(before.statuses.getStatus("docs"));
-        long finishedAt = before.statuses.getStatus("docs").lastUpdatedMs();
+        long finishedAt = before.statuses.getStatus("docs").lastCompletedMs();
 
         Node after = new Node();
         after.registry.restore(source("docs"));
@@ -148,7 +153,7 @@ class RecrawlScheduleAcrossRestartTest {
         Node before = new Node();
         before.registry.register(source("docs"));
         crawlToTheEnd(before.statuses.getStatus("docs"));
-        long finishedAt = before.statuses.getStatus("docs").lastUpdatedMs();
+        long finishedAt = before.statuses.getStatus("docs").lastCompletedMs();
         Thread.sleep(5);
         // A re-crawl stopped by the shutdown reports what it passed over as it stops, which is
         // written down with a later time; it did not run to its end.
@@ -182,9 +187,9 @@ class RecrawlScheduleAcrossRestartTest {
     @Test
     @DisplayName("a history from before the completed time was recorded is due once")
     void aHistoryWithoutTheCompletedTimeIsDue() throws IOException {
-        long anHourAgo = System.currentTimeMillis() - Duration.ofMinutes(30).toMillis();
+        long halfAnHourAgo = System.currentTimeMillis() - Duration.ofMinutes(30).toMillis();
         SourceStatusFile.open(dataDir).write(List.of(new SourceStatusFile.Entry(
-            "docs", "idle", 1.0, 20, 0, 1, 0, 0, anHourAgo, 0L, null)));
+            "docs", "idle", 1.0, 20, 0, 1, 0, 0, halfAnHourAgo, 0L, null)));
 
         Node after = new Node();
         after.registry.restore(source("docs"));
