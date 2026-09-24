@@ -61,7 +61,14 @@ public final class ListenPort {
         Objects.requireNonNull(properties, "properties must not be null");
         Objects.requireNonNull(environment, "environment must not be null");
 
-        Integer fromEnv = parse(environment.get(ENV_PORT), ENV_PORT);
+        String variable = environment.get(ENV_PORT);
+        if (variable != null && variable.isBlank()) {
+            // Unset, as an empty override of any other setting is, and said so for the same
+            // reason: a compose file interpolating a variable unset on the host delivers this.
+            LOGGER.warn("{} is set but empty; it is ignored, and {} or the default decides the "
+                + "port", ENV_PORT, KEY_PORT);
+        }
+        Integer fromEnv = parse(variable, ENV_PORT);
         if (fromEnv != null) {
             LOGGER.info("listening on port {} from {}", fromEnv, ENV_PORT);
             return fromEnv;

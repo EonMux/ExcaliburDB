@@ -772,12 +772,14 @@ export EXCALIBUR_PORT=9090
 ```
 
 A variable that is set but empty, or only whitespace, overrides nothing: it is ignored with a
-warning naming it, and the file's value (or the default) stands. That is what a compose file
-delivers when it interpolates a variable unset on the host - `EXCALIBUR_API_AUTH_TOKEN: ${TOKEN}`
-with no `TOKEN` - and copied through it would switch off the authentication the file turns on.
+warning naming it and the setting it would have overridden, and the file's value (or the default)
+stands. That is what a compose file delivers when it interpolates a variable unset on the host -
+`EXCALIBUR_API_AUTH_TOKEN: ${TOKEN}` with no `TOKEN` - and copied through it would switch off the
+authentication the file turns on.
 
 Three variables are read directly rather than as property overrides, because deployments already
-spell them this way:
+spell them this way. `EXCALIBUR_PORT` and `EXCALIBUR_DATA_DIR` set but empty, or only whitespace,
+count as unset in the same way, with a warning naming the variable:
 
 | Variable | Meaning |
 |----------|---------|

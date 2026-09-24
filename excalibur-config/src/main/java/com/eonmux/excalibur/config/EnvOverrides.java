@@ -40,8 +40,8 @@ import org.slf4j.LoggerFactory;
  * ambient environment (HOME, PATH, LANG, ...) never pollutes the properties map.</p>
  *
  * <h2>An empty variable overrides nothing</h2>
- * <p>A variable that is set to nothing, or to whitespace, is skipped with a warning naming it,
- * and the file's value stands. Copied through, it would replace that value with a blank, and a
+ * <p>A variable that is set to nothing, or to whitespace, is skipped, and the file's value
+ * stands; when it spells a key this module reads, a warning names it and the key. Copied through, it would replace that value with a blank, and a
  * blank reads as absent - so the shipped default would win over a file that said otherwise. The
  * usual source is a compose file interpolating a variable that is unset on the host:
  * <code>EXCALIBUR_API_AUTH_TOKEN: ${TOKEN}</code> arrives as an empty string, and copying it
@@ -54,6 +54,16 @@ final class EnvOverrides {
     private static final Logger LOGGER = LoggerFactory.getLogger(EnvOverrides.class);
 
     private static final String ENV_PREFIX = "EXCALIBUR_";
+
+    /**
+     * The prefix of the settings another module reads from the effective properties.
+     *
+     * <p>{@link ConfigKeys} does not list them, for the reason it gives, so their spelling cannot
+     * be judged here. A variable under it is still the override of a setting, though - most
+     * visibly <code>EXCALIBUR_API_AUTH_TOKEN</code> - and an empty one is an override being
+     * ignored like any other.</p>
+     */
+    private static final String API_PREFIX = "excalibur.api.";
 
     private EnvOverrides() {
         // Utility class
@@ -76,20 +86,43 @@ final class EnvOverrides {
             return result;
         }
 
-        // Sorted, so the warnings for several empty variables come out in the same order on
-        // every start.
-        for (Map.Entry<String, String> entry : prefixed(envOverrides).entrySet()) {
-            String envKey = entry.getKey();
-            String value = entry.getValue();
-            if (value == null || value.isBlank()) {
-                LOGGER.warn("{} is set but empty; it is ignored, and {} keeps the value from the"
-                    + " configuration file or its default", envKey, toPropertyKey(envKey));
-                continue;
-            }
-            result.put(toPropertyKey(envKey), value);
+        for (String envKey : ignoredEmptyOverrides(envOverrides)) {
+            LOGGER.warn("{} is set but empty; it is ignored, and {} keeps the value from the"
+                + " configuration file or its default", envKey, toPropertyKey(envKey));
         }
+        prefixed(envOverrides).forEach((envKey, value) -> {
+            if (value != null && !value.isBlank()) {
+                result.put(toPropertyKey(envKey), value);
+            }
+        });
 
         return result;
+    }
+
+    /**
+     * The empty variables that would have overridden a key, in name order.
+     *
+     * <p>What {@link #apply} warns about. Only a variable that spells a setting is listed - a key
+     * this module reads, or one under {@link #API_PREFIX} - since the warning says that key keeps
+     * its value, and for any other variable there is no key to name. A variable read by name rather than as an override -
+     * <code>EXCALIBUR_DATA_DIR</code>, <code>EXCALIBUR_PORT</code>, the MCP client's
+     * <code>EXCALIBUR_URL</code> - is answered for by whatever reads it, which treats a blank
+     * value as unset; a blank variable that spells no key at all overrides nothing either way,
+     * and set to a value it would be reported by {@link #unrecognisedVariables}.</p>
+     *
+     * @param environment Environment variables, keyed by variable name
+     * @return The names of the empty variables that spell a setting
+     */
+    static List<String> ignoredEmptyOverrides(Map<String, String> environment) {
+        List<String> ignored = new ArrayList<>();
+        prefixed(environment).forEach((name, value) -> {
+            String key = toPropertyKey(name);
+            if ((value == null || value.isBlank())
+                    && (ConfigKeys.isKnown(key) || key.startsWith(API_PREFIX))) {
+                ignored.add(name);
+            }
+        });
+        return ignored;
     }
 
     /**

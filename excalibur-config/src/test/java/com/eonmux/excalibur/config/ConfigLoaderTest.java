@@ -395,6 +395,30 @@ class ConfigLoaderTest {
                 .isEmpty();
         }
 
+        /**
+         * The warning names the key that keeps its value. For a variable read by name - the data
+         * directory, the port, the MCP client's URL - there is no such key, and a warning that
+         * {@code excalibur.data.dir} keeps the file's value names a setting that does not exist;
+         * the reader of that variable answers for a blank one itself.
+         */
+        @Test
+        @DisplayName("only an empty variable that overrides a key is reported as ignored")
+        void onlyAnEmptyOverrideIsReportedAsIgnored() {
+            Map<String, String> environment = new HashMap<>();
+            environment.put("EXCALIBUR_API_AUTH_TOKEN", "");
+            environment.put("EXCALIBUR_QUERY_CACHE_ENABLED", " ");
+            environment.put("EXCALIBUR_QUERY_TOP_K_DEFAULT", "7");
+            for (String directlyRead : List.of("EXCALIBUR_PORT", "EXCALIBUR_DATA_DIR",
+                    "EXCALIBUR_LOG_LEVEL", "EXCALIBUR_URL", "EXCALIBUR_NAMESPACE",
+                    "EXCALIBUR_MCP_TIMEOUT_SECONDS", "EXCALIBUR_HEALTHCHECK_TIMEOUT")) {
+                environment.put(directlyRead, "  ");
+            }
+            environment.put("EXCALIBUR_LLM_NO_SUCH_KEY", "");
+
+            assertThat(com.eonmux.excalibur.config.EnvOverrides.ignoredEmptyOverrides(environment))
+                .containsExactly("EXCALIBUR_API_AUTH_TOKEN", "EXCALIBUR_QUERY_CACHE_ENABLED");
+        }
+
         @Test
         @DisplayName("an empty variable is not also reported as a typo")
         void anEmptyVariableIsNotAlsoATypo() {
