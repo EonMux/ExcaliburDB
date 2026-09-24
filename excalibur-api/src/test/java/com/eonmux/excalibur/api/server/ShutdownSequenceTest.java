@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.server;
 
 import com.eonmux.excalibur.api.endpoint.CompactionRunner;
+import com.eonmux.excalibur.api.endpoint.GraphAutoBuilder;
 import com.eonmux.excalibur.api.endpoint.GraphBuildRunner;
 import com.eonmux.excalibur.api.endpoint.QueryEndpoint;
 import com.eonmux.excalibur.api.endpoint.ReindexEndpoint;
@@ -63,6 +64,7 @@ class ShutdownSequenceTest {
     private ReindexEndpoint reindex;
     private CompactionRunner compaction;
     private GraphBuildRunner graphBuild;
+    private GraphAutoBuilder autoBuild;
     private QueryEndpoint query;
     private QueryPipeline pipeline;
     private StorageEngine storage;
@@ -98,9 +100,12 @@ class ShutdownSequenceTest {
         when(reindex.drain(any())).thenReturn(true);
         when(compaction.drain(any())).thenReturn(CompactionRunner.Drained.CLEAN);
         when(graphBuild.drain(any())).thenReturn(true);
+        autoBuild = mock(GraphAutoBuilder.class);
+        when(autoBuild.drain(any())).thenReturn(true);
         query = mock(QueryEndpoint.class);
         when(query.shutdown(any())).thenReturn(true);
-        endpoints = new EndpointRegistrar.Endpoints(query, reindex, compaction, graphBuild, null);
+        endpoints = new EndpointRegistrar.Endpoints(query, reindex, compaction, graphBuild,
+            autoBuild, null);
     }
 
     @Test
@@ -196,6 +201,16 @@ class ShutdownSequenceTest {
     }
 
     @Test
+    @DisplayName("an automatic graph build still running holds the graph tenants alone")
+    void graphAutoBuildStillRunning() {
+        when(autoBuild.drain(any())).thenReturn(false);
+
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, budget()))
+            .isEqualTo(new ShutdownSequence.Drained(true, true, false));
+        verify(graphBuild).drain(any());
+    }
+
+    @Test
     @DisplayName("a step that throws does not skip the rest, and is rethrown")
     void aThrowingStepStillRunsTheRest() {
         doThrow(new IllegalStateException("reindex executor is wedged"))
@@ -206,6 +221,7 @@ class ShutdownSequenceTest {
             .hasMessageContaining("reindex executor is wedged");
         verify(compaction).drain(any());
         verify(graphBuild).drain(any());
+        verify(autoBuild).drain(any());
         verify(ingestion).shutdown(any());
         verify(indexOrchestrator).close(any());
     }
