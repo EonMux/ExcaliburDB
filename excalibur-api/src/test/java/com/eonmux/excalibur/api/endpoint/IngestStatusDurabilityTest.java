@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
 import com.eonmux.excalibur.ingest.source.Source;
 
@@ -271,6 +272,9 @@ class IngestStatusDurabilityTest {
         statuses.remove("docs");
         InMemorySourceRegistry registry = new InMemorySourceRegistry();
         registry.setStatusRegistry(statuses);
+        // A pipeline that runs nothing: without one, the registration probes the mocked source on
+        // a thread of its own, which reports on this status and writes the history as it does.
+        registry.setIngestionOrchestrator(mock(IngestionOrchestrator.class));
         Source source = mock(Source.class);
         when(source.getSourceId()).thenReturn("docs");
 
