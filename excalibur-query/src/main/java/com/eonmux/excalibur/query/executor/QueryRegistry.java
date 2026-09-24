@@ -48,13 +48,43 @@ import java.util.stream.Collectors;
 public final class QueryRegistry {
 
     /**
+     * Which kind of search a registered query is.
+     *
+     * <p>Both are listed and cancelled the same way; the kind only tells whoever reads the list
+     * which route the query came in on, and so what a long-running one is doing.</p>
+     */
+    public enum Kind {
+        /** A search of the document corpus, {@code POST /v1/query}. */
+        CORPUS("corpus"),
+
+        /** A question answered from the knowledge graph, {@code POST /v1/graph/query}. */
+        GRAPH("graph");
+
+        private final String wireName;
+
+        Kind(String wireName) {
+            this.wireName = wireName;
+        }
+
+        /**
+         * The kind as the API spells it.
+         *
+         * @return the lower-case name
+         */
+        public String wireName() {
+            return wireName;
+        }
+    }
+
+    /**
      * Internal record for tracking active query information.
      */
     public record ActiveQuery(
         String queryId,
         CancellationToken token,
         Instant startTime,
-        String correlationId
+        String correlationId,
+        Kind kind
     ) {
         /**
          * Returns the duration in milliseconds since the query started.
@@ -72,7 +102,8 @@ public final class QueryRegistry {
         String correlationId,
         long startTimeMs,
         long durationMs,
-        boolean cancelled
+        boolean cancelled,
+        Kind kind
     ) {
         /**
          * Creates ActiveQueryInfo from an ActiveQuery.
@@ -83,7 +114,8 @@ public final class QueryRegistry {
                 query.correlationId(),
                 query.startTime().toEpochMilli(),
                 query.durationMs(),
-                query.token().isCancelled()
+                query.token().isCancelled(),
+                query.kind()
             );
         }
     }
@@ -145,14 +177,31 @@ public final class QueryRegistry {
      * @throws NullPointerException if queryId or token is null
      */
     public boolean register(String queryId, CancellationToken token, String correlationId) {
+        return register(queryId, token, correlationId, Kind.CORPUS);
+    }
+
+    /**
+     * Registers a new query of the given kind.
+     *
+     * @param queryId The unique query identifier
+     * @param token The cancellation token for this query
+     * @param correlationId Optional correlation ID for logging/tracing
+     * @param kind Which kind of search the query is
+     * @return true if registration succeeded, false if query ID already exists
+     * @throws NullPointerException if queryId, token or kind is null
+     */
+    public boolean register(String queryId, CancellationToken token, String correlationId,
+                            Kind kind) {
         Objects.requireNonNull(queryId, "queryId cannot be null");
         Objects.requireNonNull(token, "token cannot be null");
+        Objects.requireNonNull(kind, "kind cannot be null");
 
         ActiveQuery query = new ActiveQuery(
             queryId,
             token,
             Instant.now(),
-            correlationId != null ? correlationId : queryId.substring(0, Math.min(8, queryId.length()))
+            correlationId != null ? correlationId : queryId.substring(0, Math.min(8, queryId.length())),
+            kind
         );
 
         ActiveQuery existing = activeQueries.putIfAbsent(queryId, query);
