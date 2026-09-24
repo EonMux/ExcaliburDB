@@ -562,7 +562,6 @@ below, because new specific codes may be added.
 | `invalid_namespace` | 400 | `X-Excalibur-Namespace`, or a namespace in a path, is not a legal namespace id |
 | `namespace_not_accepted` | 400 | `X-Excalibur-Namespace` named a tenant on a route that serves the shared corpus |
 | `unauthorized` | 401 | Missing or wrong bearer token |
-| `forbidden` | 403 | Understood and not permitted. The default for `403` |
 | `target_not_allowed` | 403 | An ingest `root_path` or `base_url` outside the allow-lists |
 | `not_found` | 404 | No such path, or nothing under the name the request gave. The default for `404` |
 | `source_not_found` | 404 | No source is registered under that `source_id` |
@@ -572,7 +571,6 @@ below, because new specific codes may be added.
 | `fact_not_found` | 404 | No asserted fact in the namespace has that `fact_id`, or states that subject, relation and object |
 | `erasure_not_found` | 404 | No erasure receipt or graph erasure request has that id - never issued, or older than the receipts kept |
 | `method_not_allowed` | 405 | The path exists and does not serve this method; the `Allow` header lists the ones it does |
-| `timeout` | 408, 504 | The work did not finish within the time it was given |
 | `conflict` | 409 | The request conflicts with the node's current state. The default for `409` |
 | `source_exists` | 409 | A source is already registered under that `source_id` |
 | `source_kind_conflict` | 409 | The `source_id` belongs to the other kind of source — a crawl versus documents supplied directly |
