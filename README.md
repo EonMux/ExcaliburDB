@@ -670,7 +670,7 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.api.port` | 8080 | Port to listen on; `EXCALIBUR_PORT` overrides it |
 | `excalibur.api.shutdown-timeout-seconds` | 30 | How long a stop may take, from the signal to the last file closed. Every drain shares this one deadline. The last 10 seconds are kept for publishing buffered chunks, forcing staged graph facts and persisting the registry. Work still running when the drains' share runs out is reported and left for the next start to recover. Set the supervisor's stop timeout to at least this plus 10 (see [Stopping the node](#stopping-the-node)). 15 to 3600; any other value stops startup |
 | `excalibur.visibility.epoch-tick-ms` | 100 | Visibility epoch tick interval (ms). 10 to 10000 |
-| `excalibur.visibility.query-timeout-ms` | 30000 | Query timeout (ms) for a request that names none. Must not exceed `excalibur.api.max-query-timeout-ms`, or the node refuses to start: every such request would be refused. 1000 to 300000 |
+| `excalibur.visibility.query-timeout-ms` | 30000 | Query timeout (ms) for a `/v1/query` or `/v1/graph/query` request that names none. Must not exceed `excalibur.api.max-query-timeout-ms`, or the node refuses to start: every such request would be refused. 1000 to 300000 |
 | `excalibur.query.top-k-default` | 100 | Default number of results. Must not exceed `excalibur.api.max-top-k`, or the node refuses to start, for the same reason. 1 to 10000 |
 | `excalibur.query.threshold` | 0.0 | Score floor for requests that omit `threshold`; a request's own `threshold` overrides it. 0 disables filtering. 0.0 to 1.0 |
 | `excalibur.query.vector-dimensions` | 1536 | Vector dimensionality. 128 to 4096, and must equal `excalibur.llm.embeddings-dimensions` |
@@ -756,7 +756,7 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.api.rate-limit-max-clients` | 10000 | Clients tracked before eviction. 1 to 2147483647 |
 | `excalibur.api.trusted-proxies` | _(empty)_ | Addresses and CIDR ranges whose `X-Forwarded-For` is believed, so callers behind a proxy are rate-limited individually instead of sharing the proxy's budget. Empty means only the peer address is ever metered |
 | `excalibur.api.max-top-k` | 1000 | Largest `top_k` a query may request. At most 2147483647, like every count limit under `excalibur.api.*`; a larger value is refused at startup |
-| `excalibur.api.max-query-timeout-ms` | 60000 | Largest query timeout a request may ask for. At least 1 |
+| `excalibur.api.max-query-timeout-ms` | 60000 | Largest `timeout_ms` a `/v1/query` or `/v1/graph/query` request may ask for. At least 1 |
 | `excalibur.api.max-query-chars` | 8192 | Longest `query` text a request may send. It is embedded, and on the lexical path expanded, so its size is an outbound call the caller picks. 1 to 2147483647 |
 | `excalibur.api.max-oversampling-factor` | 16 | Largest `oversampling_factor` a request may ask for. It multiplies `top_k` into the HNSW beam width, so it is what decides how much of a segment a search walks. 1 to 2147483647 |
 | `excalibur.api.max-result-text-chars` | 4096 | Longest text returned for one chunk, by `include_text` on a query or by `/v1/documents`. Past it the text is clipped and `text_truncated` says so. 1 to 2147483647 |
@@ -775,6 +775,8 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.graph.erasure-max-latency-seconds` | 3600 | Longest an erasure obligation waits before a compaction runs regardless. Checked every tenth of it by a sweep over **every namespace on disk**, so the bound holds on an idle node and on an evicted tenant nobody is querying. The sweep reads each non-resident namespace's erasure log — a small append-only file, not a served store — and reopens only the tenants whose oldest obligation has passed the bound, at most four per pass, oldest first; a longer backlog is logged at WARN, because the node is then not meeting its deadline. At least 1 |
 | `excalibur.graph.top-k` | 10 | Documents each retrieval signal contributes before fusion. At least 1 |
 | `excalibur.graph.rerank-over-fetch` | 4 | Candidates the full-precision reranker reads per result it returns. Reranking can only reorder what it is given, so this is what lets an entity that term overlap ranked poorly be rescued by its vector. At least 1 |
+| `excalibur.graph.max-frontier` | 1000 | Most new entities one hop of a graph walk admits. When a hop reaches more, it keeps those reached along the strongest edge — highest extraction confidence, then latest valid-time start, then lowest entity id — so a hub cannot make one question read the graph, and a capped answer is the same every time. The entities the question named are always admitted. At least 1 |
+| `excalibur.graph.max-walk-facts` | 10000 | Most facts one graph walk collects. When it passes more, it keeps those touching the named entities first, then the most confident, then the latest start. At least 1 |
 | `excalibur.graph.context-token-budget` | 2000 | Tokens of serialised subgraph an answer may carry. At least 1 |
 | `excalibur.graph.min-score` | 0.05 | Smallest relevance the entity the question named must reach to be answered, on the unit scale: its share of the question's BM25 weight, counting only words the graph holds, or its vector similarity. 0.0 to 1.0 |
 | `excalibur.graph.min-separation` | 0.01 | Smallest gap, as a fraction of the best, between the two best entities sharing the name the question used before the result is ambiguous. 0.0 to 1.0 |
@@ -1247,7 +1249,7 @@ separate so a burst of writes cannot starve ordinary reads.
 | `GET` | `/v1/version` | bearer | read | Which build and JVM this process is running |
 | `POST` | `/v1/drain` | bearer | mutate | Report unready so a load balancer stops choosing this node, while it keeps serving. A mutation: an anonymous caller able to drain a node is a one-request outage |
 | `DELETE` | `/v1/drain` | bearer | mutate | Report ready again |
-| `GET` | `/v1/query/status` | bearer | read | Queries in flight, longest-running first, with the ids `DELETE /v1/query/{query_id}` takes |
+| `GET` | `/v1/query/status` | bearer | read | Queries in flight — `/v1/query` and `/v1/graph/query`, told apart by `kind` — longest-running first, with the ids `DELETE /v1/query/{query_id}` takes |
 | `POST` | `/v1/query` | bearer | read | Search the corpus: BM25, vector, or the two fused |
 | `DELETE` | `/v1/query/{query_id}` | bearer | mutate | Cancel an in-progress query |
 | `GET` | `/v1/documents` | bearer | read | Read one chunk's text, named by `document_id` |
@@ -2313,26 +2315,52 @@ curl -X POST http://localhost:8080/v1/graph/query \
   "truncated": true,
   "format": "triples-v1",
   "plan": "lookup",
+  "walk": {"truncated": false, "entities_dropped": 0, "facts_dropped": 0},
+  "query_id": "5b0f1c2e-8d4a-4f7e-9a61-0c3d2e1f4b6a",
+  "timed_out": false,
+  "cancelled": false,
   "timings_ms": {"plan": 0.412, "link": 4.211, "traverse": 12.008,
                  "rank": 26.894, "serialize": 1.077, "total": 44.602}
 }
 ```
 
-Three statuses, and a client has to tell them apart:
+A client has to tell the statuses apart:
 
 | Status | Meaning |
 |--------|---------|
 | `answered` | Context to put in a prompt, with a calibrated confidence |
 | `needs_input` | The question did not say which entity it meant. Carries `reason` — one of `unbound_pronoun`, `ambiguous_pronoun`, `no_entity_mention` or `ambiguous_entity` (a name several entities share, which the evidence could not tell apart) — plus `question` and `candidates`; send the chosen one back in `context_entities` with the same query. Entities that share a name are offered as the name followed by ` #` and the entity id (`Ada #12`), so the one sent back names exactly one of them. Returned as 200 — the request was well-formed and the system did what it should |
-| `declined` | The evidence does not support an answer. `reason` is one of `no_match`, `below_confidence_threshold`, `low_provenance_confidence` or `unresolved_reference`. Deliberately not an empty `answered`, which a client would render as "nothing found" |
+| `declined` | The evidence does not support an answer. `reason` is one of `no_match`, `below_confidence_threshold`, `low_provenance_confidence`, `unresolved_reference` or `timed_out` (the deadline passed before the graph was walked, so there was nothing to judge). Deliberately not an empty `answered`, which a client would render as "nothing found" |
+| `cancelled` | `DELETE /v1/query/{query_id}` withdrew the question while it ran. No context, whatever it had reached; `cancelled` is `true` |
 
 `tokens`, `facts_included`, `facts_dropped`, `truncated` and `format` come with the serialised
 context, so they are absent on an `answered` response that carries none — read `context` and treat
 the five as optional rather than assuming a shape. `format` names the serializer that produced the
 context, so an A/B test can attribute an outcome to it. `timings_ms` carries only the stages that actually ran, drawn from a fixed set — `plan`, `link`,
-`traverse`, `rank`, `serialize` — plus `total`. It comes back on all three
-statuses, because a refusal that took two seconds is as much a performance question as an answer
+`traverse`, `rank`, `serialize` — plus `total`. It comes back on every
+status, because a refusal that took two seconds is as much a performance question as an answer
 that did.
+
+`timeout_ms` bounds the question, validated exactly as `/v1/query` validates it: positive, at most
+`excalibur.api.max-query-timeout-ms`, and `excalibur.visibility.query-timeout-ms` when absent. The
+deadline reaches every stage that can wait — the walk, the question's embedding and the LLM rerank —
+and a model call is waited for only until it passes, not for the client's own timeout times its
+retries; the call is then interrupted and not counted against the circuit breaker. What had been
+gathered by then is judged as usual and answered with `"timed_out": true`, so an `answered` or
+`declined` response with it set may be missing what more time would have found. A deadline that
+passes before the walk leaves nothing to judge, and is `declined` with reason `timed_out`.
+
+Every question is registered while it runs: `GET /v1/query/status` lists it with `"kind": "graph"`,
+and `DELETE /v1/query/{query_id}` withdraws it — the walk stops and any model call in flight is
+interrupted — after which it answers `"status": "cancelled"`. Every response carries its
+`query_id`.
+
+`walk` comes back whenever the graph was walked. `truncated` is true when
+`excalibur.graph.max-frontier` or `excalibur.graph.max-walk-facts` left something out, and
+`entities_dropped` and `facts_dropped` say how much: facts and entities the walk never collected,
+unlike `facts_dropped` beside `context`, which counts facts it found that the token budget could not
+carry. A truncated answer is still a real answer, from the strongest part of the neighbourhood; a
+caller that needs the rest can ask a narrower question.
 
 `context_entities` is the conversation the question is asked in, which is what a pronoun in it
 binds to. The node keeps no session, so the client sends it with every question. Two spellings:
