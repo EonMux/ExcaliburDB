@@ -335,6 +335,36 @@ class BackupCliTest {
     }
 
     @Test
+    @DisplayName("an --out that reaches the data directory through a link is refused like one under it")
+    void aSnapshotLinkedIntoItsSourceIsAUsageError() throws IOException {
+        Path dataDir = DataDirectoryFixture.syntheticDirectory(tempDir.resolve("data"));
+        Path link = Files.createSymbolicLink(tempDir.resolve("backups"), dataDir);
+
+        Run run = run("snapshot", "--data-dir", dataDir.toString(),
+            "--out", link.resolve("backup").toString());
+
+        assertThat(run.code()).isEqualTo(ExitCode.USAGE.code());
+        assertThat(run.err()).contains("inside the data directory")
+            .doesNotContain("unanticipated failure:");
+        assertThat(dataDir.resolve("backup")).doesNotExist();
+    }
+
+    @Test
+    @DisplayName("a --target that reaches the snapshot through a link is refused like one under it")
+    void aRestoreLinkedIntoItsSnapshotIsAUsageError() throws IOException {
+        Path image = Files.createDirectories(tempDir.resolve("image"));
+        Path link = Files.createSymbolicLink(tempDir.resolve("restores"), image);
+
+        Run run = run("restore", "--snapshot", image.toString(),
+            "--target", link.resolve("node").toString());
+
+        assertThat(run.code()).isEqualTo(ExitCode.USAGE.code());
+        assertThat(run.err()).contains("cannot write into the snapshot")
+            .doesNotContain("unanticipated failure:");
+        assertThat(image.resolve("node")).doesNotExist();
+    }
+
+    @Test
     @DisplayName("a restore into the snapshot it reads is a usage error, not a crash")
     void aRestoreInsideItsSnapshotIsAUsageError() {
         Run run = run("restore", "--snapshot", tempDir.toString(),

@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.backup.snapshot;
 
+import com.eonmux.excalibur.core.datadir.ResolvedPath;
+
 import java.nio.file.Path;
 import java.util.Objects;
 
@@ -24,8 +26,10 @@ public record SnapshotOptions(Path dataDir, Path destination, boolean includeDer
     public SnapshotOptions {
         Objects.requireNonNull(dataDir, "dataDir");
         Objects.requireNonNull(destination, "destination");
-        Path source = dataDir.toAbsolutePath().normalize();
-        Path target = destination.toAbsolutePath().normalize();
+        // Where the image would really land, not how its path is spelled: an --out reaching the
+        // data directory through a symbolic link is as inside it as one spelled under it.
+        Path source = ResolvedPath.canonicalArgument(dataDir);
+        Path target = ResolvedPath.canonicalArgument(destination);
         if (target.startsWith(source)) {
             throw new IllegalArgumentException("A snapshot cannot be written inside the data "
                 + "directory it is copying: " + target + " is under " + source);

@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.fsck;
 
+import com.eonmux.excalibur.core.datadir.ResolvedPath;
+
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -115,7 +117,7 @@ public final class FsckOptionsParser {
     private static Path defaultQuarantine(Path dataDirectory) {
         Path real;
         try {
-            real = QuarantineLocation.canonical(dataDirectory);
+            real = ResolvedPath.canonical(dataDirectory);
         } catch (IOException e) {
             // Unresolvable - a link loop, an unreadable directory on the way. The run reports
             // that about the data directory itself; the path as spelled serves until then.

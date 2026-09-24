@@ -1,4 +1,4 @@
-package com.eonmux.excalibur.fsck;
+package com.eonmux.excalibur.core.datadir;
 
 import java.io.IOException;
 import java.nio.file.FileSystemException;
@@ -8,22 +8,21 @@ import java.util.ArrayDeque;
 import java.util.Deque;
 
 /**
- * Where a quarantine directory really is, and whether that is inside the data directory.
+ * Where a path really is, and whether that is inside another.
  *
- * <p>A quarantine inside the data directory defeats the point of one. The files moved there are
- * still in the directory being checked, so the next check reports them again, and the next
- * backup, disk-usage alarm and recursive copy all carry the damaged files along. So the question has to
+ * <p>The tools that write beside a data directory - a quarantine, a snapshot's output, a
+ * restore's target - each refuse a destination inside what they read from. That question has to
  * be answered about the directory the files would actually land in, not about how its path is
  * spelled: a path that reads as a sibling can reach the data directory through a symbolic link,
  * and a {@code ..} after a link climbs from where the link points, not from where it sits.</p>
  *
- * <p>The quarantine usually does not exist yet, so {@link Path#toRealPath} cannot answer on its
+ * <p>The destination usually does not exist yet, so {@link Path#toRealPath} cannot answer on its
  * own. The path is resolved one name at a time instead, the way the kernel resolves it when the
  * directory is created: every link met is replaced by its target, including one whose target is
  * missing, and whatever lies past the last existing name is taken as spelled, since a name that
  * does not exist cannot be a link.</p>
  */
-final class QuarantineLocation {
+public final class ResolvedPath {
 
     /**
      * How many links one resolution may follow before it is taken to be a loop - the limit
@@ -31,21 +30,38 @@ final class QuarantineLocation {
      */
     private static final int MAX_LINKS = 40;
 
-    private QuarantineLocation() {
+    private ResolvedPath() {
         throw new AssertionError("Utility class");
     }
 
     /**
-     * Reports whether the quarantine lies inside the data directory, or is it.
+     * Reports whether a path lies inside a directory, or is it.
      *
-     * @param dataDirectory The directory being checked
-     * @param quarantine    Where damaged files would be moved
-     * @return true if files moved to the quarantine would still be inside the data directory
+     * @param directory The directory
+     * @param path      The path asked about, which need not exist
+     * @return true if what is written at {@code path} would land inside {@code directory}
      * @throws IOException if either path cannot be resolved - a link loop, or a directory on
      *                     the way that cannot be read
      */
-    static boolean isInside(Path dataDirectory, Path quarantine) throws IOException {
-        return canonical(quarantine).startsWith(canonical(dataDirectory));
+    public static boolean isInside(Path directory, Path path) throws IOException {
+        return canonical(path).startsWith(canonical(directory));
+    }
+
+    /**
+     * Resolves a path given on a command line, for a check that refuses the arguments when the
+     * resolution fails.
+     *
+     * @param path The path as given
+     * @return The path {@link #canonical} resolves it to
+     * @throws IllegalArgumentException if it cannot be resolved - a link loop, or a directory on
+     *                                  the way that cannot be read
+     */
+    public static Path canonicalArgument(Path path) {
+        try {
+            return canonical(path);
+        } catch (IOException e) {
+            throw new IllegalArgumentException("cannot resolve " + path + ": " + e.getMessage(), e);
+        }
     }
 
     /**
@@ -55,7 +71,7 @@ final class QuarantineLocation {
      * @return The absolute path with every link and {@code .} or {@code ..} resolved
      * @throws IOException if a link loop is met, or a directory on the way cannot be read
      */
-    static Path canonical(Path path) throws IOException {
+    public static Path canonical(Path path) throws IOException {
         Path absolute = path.toAbsolutePath();
         Path resolved = absolute.getRoot();
         Deque<String> remaining = new ArrayDeque<>();

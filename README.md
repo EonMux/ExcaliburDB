@@ -394,8 +394,8 @@ with no shorter limit of their own:
    half and the vector pipeline's segment searches), a compaction, a graph build and an ingestion
    run.
 3. The segment workers, once nothing is left that could hand them work: HNSW integration,
-   warming, graph and segment compaction, reindex scheduling, the segment sync sweep and the term
-   filter rebuilds, one after another out of the same remainder.
+   warming, graph and segment compaction, reindex scheduling and the segment sync sweep, one after
+   another out of the same remainder.
 4. The storage engine's own splits and segment lifecycle checks, once the segment workers can no
    longer start one.
 5. The lexical erasure sweep.
@@ -600,7 +600,7 @@ nothing beside it, so there the quarantine has to be named.
 live node, and a node cannot start underneath it: a directory another process holds is refused
 with exit code `4`, naming the holder, and nothing is checked or repaired. A check without
 `--repair` writes nothing, so it goes ahead against a held directory, with a warning that what it
-reads may be changing. The lock file is reported `NOT_DATA`. A restore that was interrupted —
+reads may be changing. The lock file is the node's, not data, and is left out of the report. A restore that was interrupted —
 its journal, `.excalibur-restore`, still in the directory — is reported as damage and put to the
 operator: running the same `excalibur-backup restore` again finishes it.
 
@@ -734,7 +734,7 @@ apiece, so a node holding 50 MB of data occupies 50 GB apparent; a copy that did
 holes would turn that into a 50 GB backup. Checksums still cover every logical byte.
 
 Exit codes: `0` done, `2` bad command line — including an `--out` inside `--data-dir`, a
-`--target` inside `--snapshot`, and a path the platform cannot name — `3` the image did not verify
+`--target` inside `--snapshot` (inside where the path really leads, through any symbolic link), and a path the platform cannot name — `3` the image did not verify
 and nothing was restored, `4` the restore target or the snapshot's `--out` is not empty, `5` the data directory
 moved while being copied, `6` a file could not be read or written — or a copy did not read back as
 what was written — `7` another process holds the data directory or the restore target, and

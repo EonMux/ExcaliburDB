@@ -3,6 +3,7 @@ package com.eonmux.excalibur.fsck;
 import com.eonmux.excalibur.core.datadir.DataDirectoryLock;
 import com.eonmux.excalibur.core.datadir.DataDirectoryLockedException;
 import com.eonmux.excalibur.core.datadir.LockHolder;
+import com.eonmux.excalibur.core.datadir.ResolvedPath;
 import com.eonmux.excalibur.fsck.check.DataDirectoryScan;
 import com.eonmux.excalibur.fsck.check.DataDirectoryScanner;
 import com.eonmux.excalibur.fsck.report.FsckReport;
@@ -114,12 +115,12 @@ public final class ExcaliburFsck {
     private static OptionalInt refusesQuarantine(FsckOptions options, PrintStream err) {
         Path quarantine = options.quarantineDirectory();
         try {
-            if (!QuarantineLocation.isInside(options.dataDirectory(), quarantine)) {
+            if (!ResolvedPath.isInside(options.dataDirectory(), quarantine)) {
                 return OptionalInt.empty();
             }
             err.println("The quarantine directory " + quarantine + " resolves to "
-                + QuarantineLocation.canonical(quarantine) + ", inside the data directory "
-                + QuarantineLocation.canonical(options.dataDirectory()) + ". Files moved there "
+                + ResolvedPath.canonical(quarantine) + ", inside the data directory "
+                + ResolvedPath.canonical(options.dataDirectory()) + ". Files moved there "
                 + "would still be in the directory being checked, so nothing was checked. Name "
                 + "one outside it with --quarantine-dir=<path>.");
             return OptionalInt.of(FsckExit.USAGE);

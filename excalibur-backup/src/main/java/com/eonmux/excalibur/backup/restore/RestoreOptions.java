@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.backup.restore;
 
 import com.eonmux.excalibur.backup.verify.VerifyDepth;
+import com.eonmux.excalibur.core.datadir.ResolvedPath;
 
 import java.nio.file.Path;
 import java.util.Objects;
@@ -27,8 +28,10 @@ public record RestoreOptions(Path snapshotDir, Path target, boolean overwriteNon
         Objects.requireNonNull(snapshotDir, "snapshotDir");
         Objects.requireNonNull(target, "target");
         Objects.requireNonNull(depth, "depth");
-        Path image = snapshotDir.toAbsolutePath().normalize();
-        Path destination = target.toAbsolutePath().normalize();
+        // As for a snapshot's --out: a target reaching into the image through a symbolic link is
+        // as inside it as one spelled under it.
+        Path image = ResolvedPath.canonicalArgument(snapshotDir);
+        Path destination = ResolvedPath.canonicalArgument(target);
         if (destination.startsWith(image)) {
             throw new IllegalArgumentException("A restore cannot write into the snapshot it "
                 + "is reading: " + destination + " is under " + image);
