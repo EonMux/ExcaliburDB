@@ -439,13 +439,21 @@ A method a registered path does not serve is answered `405` on every path, and i
 before authentication: the `405` is a routing answer, decided by the path and the method alone, so
 it tells an anonymous caller nothing a token would protect — the route table above already says
 which methods each path takes. It is still charged, against the read budget, so an anonymous
-caller cannot spend routing decisions at line rate for free. That holds for the single-method
-routes as much as for the ones that answer two or three methods: `GET /v1/stats`, `GET /metrics`,
-`GET /v1/version`, `GET /v1/query/status`, `DELETE /v1/ingest/run`, `GET /v1/ingest/status`,
-`GET /v1/documents/list`, `GET /v1/reindex/status`, `POST /v1/erasure`, `GET /v1/compact/status`,
-`POST /v1/graph/query`, `GET /v1/graph/build/status` and `POST /v1/graph/erasure` each answer any
-other method with `405` rather than `401`, and a wrong method on a mutating route costs a read, not
-a mutation. A path that is not registered at all is `404`.
+caller cannot spend routing decisions at line rate for free. Every `405` carries an `Allow` header
+naming the methods the path does serve, and `"code": "method_not_allowed"`. That holds for the
+single-method routes as much as for the ones that answer two or three methods: `GET /health`,
+`GET /health/ready`, `GET /v1/stats`, `GET /metrics`, `GET /v1/version`, `GET /v1/query/status`,
+`DELETE /v1/ingest/run`, `GET /v1/ingest/status`, `GET /v1/documents/list`,
+`GET /v1/reindex/status`, `POST /v1/erasure`, `GET /v1/compact/status`, `POST /v1/graph/query`,
+`GET /v1/graph/build/status` and `POST /v1/graph/erasure` each answer any other method with `405`
+rather than `401`, and a wrong method on a mutating route costs a read, not a mutation. A
+collection and its members are separate paths with separate methods: `/v1/query` serves `POST`
+and `/v1/query/{query_id}` serves `DELETE`, so `DELETE /v1/query` with no id is a `405` naming
+`POST`; `/v1/graph/namespaces` serves `GET` and `/v1/graph/namespaces/{namespace}` serves
+`DELETE`, so a `DELETE` of the collection or a `GET` of one namespace is a `405` as well. A
+path that is not registered at all — including anything deeper than one segment beneath a
+collection — is `404`. `HEAD` is not served on any route and is answered `405` like any other
+method a path does not take.
 
 Three routes that change what is registered — `POST /v1/ingest`, `DELETE /v1/ingest` and
 `POST /v1/erasure` — answer `503` when the change could not be recorded in the source catalog.
@@ -2075,7 +2083,7 @@ Carries a `Retry-After` header. Reads and mutations have separate budgets.
 **`405 Method Not Allowed` — a method other than POST or DELETE**
 
 ```json
-{"error": "Method Not Allowed - Use POST for queries or DELETE for cancellation", "code": "method_not_allowed"}
+{"error": "Method Not Allowed - Use POST for queries, or DELETE /v1/query/{query_id} for cancellation", "code": "method_not_allowed"}
 ```
 
 Unauthenticated, and charged against the read budget: which handler serves a request is decided
@@ -2223,11 +2231,14 @@ curl -X DELETE http://localhost:8080/v1/query/b3d9f4a0-1e2c-4a7b-9c3d-5e6f7a8b9c
 {"error": "Query not found or already completed", "code": "query_not_found"}
 ```
 
-**Response — `400 Bad Request`** (missing query ID in path)
+**Response — `405 Method Not Allowed`** (no query ID in the path)
 
 ```json
-{"error": "Bad Request - Query ID is required in path (e.g., /v1/query/{query_id})"}
+{"error": "Method Not Allowed - Use POST for queries, or DELETE /v1/query/{query_id} for cancellation", "code": "method_not_allowed"}
 ```
+
+`DELETE /v1/query` names the collection, which serves only `POST`, so it is answered by the routing
+before authentication, with `Allow: POST`.
 
 Use the `query_id` returned in the original query response. Cancellation is cooperative and
 propagates through all query pipeline stages, both signals of a hybrid query, and the relevancy

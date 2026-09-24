@@ -15,6 +15,7 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeSet;
 
 /**
  * The combinators every route on this node is built from.
@@ -68,27 +69,44 @@ final class HttpRouting {
     }
 
     /**
-     * Serves a context for its own path and for the paths directly beneath it.
+     * Serves a collection and its members: the context's own path, and one segment beneath it.
      *
-     * <p>For {@code /v1/query}, whose cancel route carries the query id in the path. Anything
-     * deeper than one segment, or under a longer prefix that merely starts the same way, is
-     * still 404.</p>
+     * <p>For {@code /v1/query}, whose cancel route carries the query id in the path, and
+     * {@code /v1/graph/namespaces}, whose members are the namespaces. The two are separate paths
+     * with separate method tables, so each answers a method it does not serve with its own 405
+     * and {@code Allow} - a DELETE of the collection or a GET of a member is refused by the
+     * routing, before the guard, rather than reaching a handler that can only refuse it after
+     * authentication. An empty member segment, anything deeper than one segment, and a longer
+     * prefix that merely starts the same way are 404.</p>
      *
-     * @param context  The path this context is registered under
-     * @param delegate What serves the path and its children
-     * @param notFound What answers every other path reaching this context
-     * @return A handler that answers 404 for paths outside the context
+     * @param context    The path this context is registered under
+     * @param collection What serves the context's own path
+     * @param member     What serves {@code context/{segment}}
+     * @param notFound   What answers every other path reaching this context
+     * @return A handler dispatching on which of the two paths a request names
      */
-    static HttpHandler pathOrChild(String context, HttpHandler delegate,
-                                   HttpHandler notFound) {
+    static HttpHandler collectionAndMember(String context, HttpHandler collection,
+                                           HttpHandler member, HttpHandler notFound) {
         return exchange -> {
             String path = exchange.getRequestURI().getPath();
-            if (isExactly(context, path) || path.startsWith(context + "/")) {
-                delegate.handle(exchange);
+            if (isExactly(context, path)) {
+                collection.handle(exchange);
+            } else if (isMember(context, path)) {
+                member.handle(exchange);
             } else {
                 notFound.handle(exchange);
             }
         };
+    }
+
+    /** Whether a path names exactly one non-empty segment beneath a context. */
+    private static boolean isMember(String context, String path) {
+        String prefix = context + "/";
+        if (!path.startsWith(prefix)) {
+            return false;
+        }
+        String segment = path.substring(prefix.length());
+        return !segment.isEmpty() && segment.indexOf('/') < 0;
     }
 
     /** Whether a request path is a context's own path, with or without one trailing slash. */
@@ -164,6 +182,10 @@ final class HttpRouting {
      * {@link RequestGuard} decision, including the fall-through, so a method the route does not
      * serve is still charged for.</p>
      *
+     * <p>The fall-through is handed the exchange with {@code Allow} already set to the methods
+     * this router serves, as RFC 9110 requires of a 405: the table is the one place that knows
+     * them, so no route has to repeat its method list in a header it could let drift.</p>
+     *
      * @param handlers  The handler for each method, keyed by method name
      * @param otherwise The handler for every other method
      * @return A handler that dispatches on the request method
@@ -176,10 +198,17 @@ final class HttpRouting {
         Map<String, HttpHandler> byMethod = new HashMap<>();
         handlers.forEach((method, handler) -> byMethod.put(
             method.toUpperCase(Locale.ROOT), Objects.requireNonNull(handler, method)));
+        Objects.requireNonNull(otherwise, "otherwise cannot be null");
+        String allow = String.join(", ", new TreeSet<>(byMethod.keySet()));
         return exchange -> {
             HttpHandler handler = byMethod.get(
                 exchange.getRequestMethod().toUpperCase(Locale.ROOT));
-            (handler == null ? otherwise : handler).handle(exchange);
+            if (handler == null) {
+                exchange.getResponseHeaders().set("Allow", allow);
+                otherwise.handle(exchange);
+                return;
+            }
+            handler.handle(exchange);
         };
     }
 

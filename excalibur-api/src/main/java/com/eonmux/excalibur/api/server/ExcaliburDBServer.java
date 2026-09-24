@@ -36,6 +36,7 @@ import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
@@ -980,5 +981,17 @@ public class ExcaliburDBServer {
         EndpointRegistrar.Endpoints registered = endpoints;
         return SourceNamespaceLookup.namespaceOf(wiring.ingestSourceRegistry(),
             registered == null ? null : registered.suppliedSources(), sourceId);
+    }
+
+    /**
+     * Every context path {@link #start()} registered, which is the route table the HTTP
+     * contract - 405 for a method a path does not serve, 404 for a path it does not register - is
+     * stated over.
+     *
+     * @return The paths in registration order, or empty before the server has started
+     */
+    List<String> registeredPaths() {
+        EndpointRegistrar.Endpoints registered = endpoints;
+        return registered == null ? List.of() : registered.paths();
     }
 }

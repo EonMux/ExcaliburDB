@@ -1275,7 +1275,9 @@ separate so a burst of writes cannot starve ordinary reads.
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | mutate | Remove a namespace entirely. Irreversible, and `409` for `shared` |
 
 A method a registered path does not serve answers 405, on every path, unauthenticated and charged
-against the read budget. Unauthenticated because a 405 is a routing answer rather than a resource:
+against the read budget, with an `Allow` header naming the methods it does serve. A collection and
+its members are separate paths: `DELETE /v1/query` without an id, a `DELETE` of
+`/v1/graph/namespaces` and a `GET` of one namespace are all 405s, not 401s. Unauthenticated because a 405 is a routing answer rather than a resource:
 nothing about the corpus is in it. Charged because leaving it uncharged would let an anonymous
 caller spend a routing decision per request at line rate, and charged as a read rather than a
 mutation because nothing was mutated. Anything else answers 404. The graph routes are registered on every

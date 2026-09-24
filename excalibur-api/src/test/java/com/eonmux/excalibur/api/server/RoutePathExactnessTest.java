@@ -93,14 +93,17 @@ class RoutePathExactnessTest {
     @Test
     @DisplayName("cancellation still reaches its query id under the query route")
     void cancellationKeepsItsSubPath() throws IOException {
-        // DELETE /v1/query/{id} is the one documented route with something after the context,
-        // so exactness must not close it. An id nobody registered is 404 from the handler,
-        // which is a different 404 from the route not existing - the bare path proves the
-        // handler was reached.
-        assertThat(send("DELETE", "/v1/query", TOKEN).status())
-            .as("the handler answers 400 for a missing id, so it was reached")
-            .isEqualTo(400);
-        assertThat(send("DELETE", "/v1/query/unknown-id", TOKEN).status()).isEqualTo(404);
+        // DELETE /v1/query/{id} carries something after the context, so exactness must not
+        // close it. An id nobody registered is the handler's 404, whose code says so - a
+        // different answer from the route not existing. The collection itself serves POST only,
+        // so a DELETE with no id is a method it does not serve, and deeper paths are not routes.
+        Response unknown = send("DELETE", "/v1/query/unknown-id", TOKEN);
+        assertThat(unknown.status()).isEqualTo(404);
+        assertThat(unknown.body()).contains("\"code\": \"query_not_found\"");
+        assertThat(send("DELETE", "/v1/query", TOKEN).status()).isEqualTo(405);
+        Response deeper = send("DELETE", "/v1/query/unknown-id/more", TOKEN);
+        assertThat(deeper.status()).isEqualTo(404);
+        assertThat(deeper.body()).contains("\"code\": \"not_found\"");
     }
 
     @Test
