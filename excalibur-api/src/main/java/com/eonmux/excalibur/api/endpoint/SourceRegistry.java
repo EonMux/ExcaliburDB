@@ -109,8 +109,9 @@ public interface SourceRegistry extends AutoCloseable {
      * configuration before the live source is swapped, and starts no crawl: the next scheduled
      * re-crawl, or {@code POST /v1/reindex}, crawls with the new configuration.</p>
      *
-     * <p>The default refuses. A registry that cannot swap a source in one step must not
-     * approximate it with the two-step sequence above.</p>
+     * <p>Every registry implements it: {@code PUT /v1/ingest} is a documented route on every
+     * node, and a registry that could only approximate it with the two-step sequence above, or
+     * refuse it, would give callers an answer they cannot act on.</p>
      *
      * @param source     The crawler built from the new configuration
      * @param descriptor What the source is now registered as
@@ -118,12 +119,8 @@ public interface SourceRegistry extends AutoCloseable {
      *                                       namespace differs, a crawl or reindex of it is
      *                                       running, or the node is shutting down
      * @throws SourceCatalogException        if the new configuration cannot be recorded
-     * @throws UnsupportedOperationException if this registry cannot replace a registration
      */
-    default void replace(Source source, SourceDescriptor descriptor) {
-        throw new UnsupportedOperationException(
-            "This source registry cannot replace a registration in one step");
-    }
+    void replace(Source source, SourceDescriptor descriptor);
 
     /**
      * Replaces what a registered source is configured as, once {@code admission} lets it.
@@ -132,22 +129,15 @@ public interface SourceRegistry extends AutoCloseable {
      * makes has passed and before the new configuration is recorded; when it throws, the
      * registration is left as it was. See {@link Admission}.</p>
      *
-     * <p>The default refuses, as {@link #replace(Source, SourceDescriptor)} does, and without
-     * asking: a replacement that cannot happen must not admit anything first.</p>
-     *
      * @param source     The crawler built from the new configuration
      * @param descriptor What the source is now registered as
      * @param admission  What the replacement must still pass
      * @throws SourceRegistrationException   as {@link #replace(Source, SourceDescriptor)}
      * @throws SourceCatalogException        if the new configuration cannot be recorded
      * @throws IOException                   if the admission failed
-     * @throws UnsupportedOperationException if this registry cannot replace a registration
      */
-    default void replace(Source source, SourceDescriptor descriptor, Admission admission)
-            throws IOException {
-        throw new UnsupportedOperationException(
-            "This source registry cannot replace a registration in one step");
-    }
+    void replace(Source source, SourceDescriptor descriptor, Admission admission)
+        throws IOException;
 
     /**
      * Checks if a source ID is already registered.

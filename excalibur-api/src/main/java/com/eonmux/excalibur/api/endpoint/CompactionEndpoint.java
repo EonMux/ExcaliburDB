@@ -32,7 +32,9 @@ import java.util.Objects;
  * {"force": false}
  * }</pre>
  *
- * <p>{@code force} is optional and defaults to false, which applies exactly the thresholds the
+ * <p>The body may be empty. When it is not, it must be one well-formed object whose only
+ * member is {@code force}; anything else is a 400 rather than a run the caller did not ask for.
+ * {@code force} is optional and defaults to false, which applies exactly the thresholds the
  * background workers apply and so brings forward work that would have happened anyway. Forced,
  * every live segment is rewritten and every graph rebuilt whether or not there is dead weight
  * in them, and every live segment of the chunk index is rewritten too, dropping any chunk the
@@ -125,14 +127,29 @@ public final class CompactionEndpoint implements HttpHandler {
      * answering 202 to a run that will rewrite almost none of them tells them the opposite of
      * what happened.</p>
      *
+     * <p>A body that is not one well-formed object, or that carries a member other than
+     * {@code force}, is refused for the same reason. Every accessor reads a document it cannot
+     * walk, and a misspelled name, as one without the field, so {@code garbage} or
+     * {@code {"forse": true}} would otherwise start the light run and answer 202. An empty body
+     * is not that mistake: it is the request with nothing optional in it.</p>
+     *
      * @param body The request body, possibly empty
      * @return Whether to ignore the compaction thresholds
-     * @throws IllegalArgumentException if force is present with a non-boolean value,
-     *                                  which {@link JsonText#booleanValue} refuses
+     * @throws IllegalArgumentException if the body is not blank and is not a single well-formed
+     *                                  object, carries a member other than force, or carries
+     *                                  force with a non-boolean value
      */
     private static boolean parseForce(String body) {
         if (body == null || body.isBlank()) {
             return false;
+        }
+        for (String name : JsonText.memberNames(body,
+                "The request body must be empty or a single well-formed JSON object")) {
+            if (!FORCE.equals(name)) {
+                throw new IllegalArgumentException("Unknown field '" + name
+                    + "': a compaction request takes only force. Correct the name, or remove "
+                    + "the field.");
+            }
         }
         return JsonText.booleanValue(body, FORCE, false);
     }

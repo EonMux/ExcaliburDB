@@ -28,6 +28,7 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
+import java.util.Map;
 
 /**
  * Main entry point for ExcaliburDB server.
@@ -80,6 +81,9 @@ public final class ExcaliburApplication {
      * Default data directory for storage.
      */
     public static final String DEFAULT_DATA_DIR = "data";
+
+    /** The variable naming the data directory. */
+    static final String DATA_DIR_VARIABLE = "EXCALIBUR_DATA_DIR";
 
     private final Config config;
 
@@ -421,15 +425,7 @@ public final class ExcaliburApplication {
      * @throws IOException if directory cannot be created
      */
     private Path initializeDataDirectory() throws IOException {
-        // The environment is the only source. Deployments already spell this as a variable, and a
-        // properties key beside it would give the same node two answers with no rule for which
-        // wins - which is how a restart quietly starts serving from an empty directory.
-        String dataDirPath = System.getenv("EXCALIBUR_DATA_DIR");
-        if (dataDirPath == null || dataDirPath.isEmpty()) {
-            dataDirPath = DEFAULT_DATA_DIR;
-        }
-
-        Path dataDir = Paths.get(dataDirPath).toAbsolutePath();
+        Path dataDir = dataDirectory(System.getenv());
 
         if (!Files.exists(dataDir)) {
             LOGGER.info("Creating data directory: {}", dataDir);
@@ -440,6 +436,36 @@ public final class ExcaliburApplication {
         return dataDir;
     }
 
+
+    /**
+     * Where the node keeps its files: {@code EXCALIBUR_DATA_DIR}, else {@link #DEFAULT_DATA_DIR}
+     * under the working directory.
+     *
+     * <p>The environment is the only source. Deployments already spell this as a variable, and a
+     * properties key beside it would give the same node two answers with no rule for which wins -
+     * which is how a restart quietly starts serving from an empty directory.</p>
+     *
+     * <p>A variable set to nothing or to whitespace is unset, as an empty override of any other
+     * setting is, and is named in a warning. Read as a path, whitespace is a directory with a
+     * blank name under the working directory - the empty directory beside the real one that the
+     * rule above exists to keep a node from serving.</p>
+     *
+     * @param environment The environment, normally {@code System.getenv()}
+     * @return The directory, absolute
+     */
+    static Path dataDirectory(Map<String, String> environment) {
+        String configured = environment.get(DATA_DIR_VARIABLE);
+        Path fallback = Paths.get(DEFAULT_DATA_DIR).toAbsolutePath();
+        if (configured == null) {
+            return fallback;
+        }
+        if (configured.isBlank()) {
+            LOGGER.warn("{} is set but empty; it is ignored, and the data directory is the "
+                + "default {}", DATA_DIR_VARIABLE, fallback);
+            return fallback;
+        }
+        return Paths.get(configured).toAbsolutePath();
+    }
 
     /**
      * Runs the application.

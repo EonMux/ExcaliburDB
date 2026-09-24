@@ -148,6 +148,42 @@ class DocumentUpsertEndpointTest {
         }
 
         /**
+         * Every other route answers a stopping node 503 {@code shutting_down}. A 409 would tell
+         * the caller to wait for a run over its source to finish and resend to this node, when
+         * what it should do is send the batch to another one.
+         */
+        @Test
+        @DisplayName("answers 503 shutting_down when the node is stopping")
+        void reportsShutdown() throws IOException {
+            when(orchestrator.ingestNow(any(Source.class)))
+                .thenThrow(new IngestionOrchestrator.ShuttingDownException());
+
+            HttpExchange exchange = post("{\"source_id\": \"notes\", \"documents\": ["
+                + "{\"document_id\": \"a.md\", \"text\": \"alpha\"}]}");
+
+            endpoint.handle(exchange);
+
+            verify(exchange).sendResponseHeaders(eq(503), anyLong());
+            assertThat(body.toString(StandardCharsets.UTF_8))
+                .contains("\"code\": \"shutting_down\"");
+        }
+
+        @Test
+        @DisplayName("names a concurrent run as a conflict")
+        void namesAConcurrentRunAsAConflict() throws IOException {
+            when(orchestrator.ingestNow(any(Source.class)))
+                .thenThrow(new IllegalStateException("Ingestion is already running for source: notes"));
+
+            HttpExchange exchange = post("{\"source_id\": \"notes\", \"documents\": ["
+                + "{\"document_id\": \"a.md\", \"text\": \"alpha\"}]}");
+
+            endpoint.handle(exchange);
+
+            assertThat(body.toString(StandardCharsets.UTF_8))
+                .contains("\"code\": \"conflict\"");
+        }
+
+        /**
          * A run that failed outright is not a run that ingested nothing, and answering 200 with
          * zero counts would make the two look the same to a caller.
          */

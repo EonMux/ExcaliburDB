@@ -1331,12 +1331,16 @@ they were published, and a version already superseded when its turn comes is ski
 with no `document_id`, a `document_id` over 512 characters, no `text` or text that is not text, or
 the same `document_id` twice in one request.
 
-**Error — `409 Conflict`** — either the `source_id` is a registered crawl source, or a run over
-that source is already in flight. The first is refused because documents recorded under a crawl's
-id are removed the next time that crawl is reindexed — the crawl does not list them, and
-reindexing removes what a source has stopped listing. Use a `source_id` of your own.
+**Error — `409 Conflict`** — either the `source_id` is a registered crawl source
+(`source_kind_conflict`), or a run over that source is already in flight (`conflict`). The first
+is refused because documents recorded under a crawl's id are removed the next time that crawl is
+reindexed — the crawl does not list them, and reindexing removes what a source has stopped
+listing. Use a `source_id` of your own.
 
 **Error — `413 Payload Too Large`** — the body is over 1 MB. Split the batch.
+
+**Error — `503 Service Unavailable`** — `shutting_down`: the node is stopping and ingests nothing
+more. Send the batch to another node, or resend once this one is back.
 
 **Error — `405 Method Not Allowed`** — a method other than `GET` or `POST` on `/v1/documents`.
 Unauthenticated and charged against the read budget, for the same reason as the other two-method
@@ -1513,8 +1517,12 @@ curl http://localhost:8080/v1/reindex/status
 
 `state` is one of `crawling`, `embedding`, `indexing` while a run is in flight, `idle` at
 `progress: 1.0` once it finished, `cancelled` when someone stopped it, or `failed` with
-`last_error` set when it broke — which means it failed on documents and neither indexed any nor
-confirmed any current. A document the source confirmed unchanged counts as work done, so a
+`last_error` set when it stopped without finishing: it failed on documents and neither indexed
+any nor confirmed any current, or it could not run at all — the source could no longer be found
+(`"Source not found: ..."`), no volume had room for the rolling replacement (`"No volume available
+for reindex"`), the run raised an exception (`"Reindex failed (<type>); see the node's log ..."`),
+or it could not be started (`"Reindex could not be started"`). A document the source confirmed
+unchanged counts as work done, so a
 re-crawl of a source that has barely moved, with one page timing out, has not failed. A run that
 indexed or confirmed some documents and failed on others finished, so it reads `idle`, with `last_error` counting what failed and what
 was indexed (`"Reindex completed with 3 errors; 400 documents indexed; see the node's log for the
@@ -1867,7 +1875,15 @@ curl http://localhost:8080/v1/erasure/0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11
 | `incomplete` | A document the request named is still held — the request answered `500`. Repeat it |
 | `pending` | A graph obligation it queued has not been discharged yet |
 | `applied` | Out of storage, the index and the graph, but the lexical index still keeps the removed chunks' bytes on disk until a compaction reclaims them |
-| `discharged` | Nothing the request removed remains anywhere the node keeps it. `discharged_at_ms` says when |
+| `discharged` | Nothing the request removed remains anywhere the node keeps it. `discharged_at_ms` says when, where the node can know (below) |
+
+`discharged_at_ms` is null until the state is `discharged`, and is then the latest time a graph
+obligation the request queued was discharged — or `requested_at_ms` when it queued none. It stays
+null, for good, when that time is not recorded anywhere: when the request left a lexical
+reclamation owed (the index drops an obligation once it is reclaimed and does not keep when), when
+a namespace it queued obligations in has been dropped since, or when a graph obligation's completion
+has fallen out of the 1024 its namespace's log keeps in full. Read it as "discharged, time unknown",
+not as "not yet".
 
 `remaining` counts what is still owed; `graph` lists each namespace the request queued graph
 obligations in. A namespace dropped since (`DELETE /v1/graph/namespaces/{namespace}`) took
@@ -2415,15 +2431,22 @@ Only on a node with no embedding client: BM25 is its only signal, and every perm
 concurrent BM25 search is taken. Retry with backoff. A node that also has vector search sheds the
 BM25 half instead and answers from vectors.
 
-**`503 Service Unavailable` — the query service is not available, or was interrupted**
+**`503 Service Unavailable` — the query service is not available**
 
 ```json
 {"error": "Query service is not available", "code": "unavailable"}
 ```
 
 The embedding came back unusable and BM25 could not answer in its place, or the node is not ready
-to search. `"Query interrupted"` is the same status for a request the node stopped while shutting
-down. Retry against a node that is up.
+to search. Retry against a node that is up.
+
+**`503 Service Unavailable` — the query was interrupted by shutdown**
+
+```json
+{"error": "Query interrupted", "code": "shutting_down"}
+```
+
+The node stopped the request while shutting down. Retry against another node.
 
 **`401 Unauthorized` — missing or wrong bearer token**
 
@@ -3029,8 +3052,11 @@ Queries and ingestion continue throughout. A segment is rewritten beside its ori
 in at the end, under the same lock the background worker takes, so a manual run and a scheduled
 one can never rewrite the same segment twice.
 
-A body that is not JSON or a `force` that is not a boolean is a `400`, a body over the request size
-limit a `413`, and any method but `POST` or `DELETE` a `405`.
+The body may be empty. Otherwise it must be one well-formed JSON object whose only member is
+`force`: a body that is not, a misspelled or unknown member, or a `force` that is not a boolean
+is a `400` `invalid_request` and nothing runs — each would otherwise read as "no `force`" and
+start the light run. A body over the request size limit is a `413`, and any method but `POST` or
+`DELETE` a `405`.
 
 ### Stop a compaction
 

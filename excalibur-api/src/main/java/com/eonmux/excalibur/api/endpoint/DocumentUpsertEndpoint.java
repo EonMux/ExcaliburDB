@@ -149,12 +149,16 @@ try {
                     // the counts alone read as a complete run over a smaller batch.
                     + "\"stopped\": " + outcome.stopped()
                     + "}");
-        } catch (IllegalStateException e) {
-            // The source is already being ingested, or the node is stopping. Both are states the
-            // same request succeeds in once they pass, which is what 409 tells a caller.
+        } catch (IngestionOrchestrator.ShuttingDownException e) {
+            // The answer every route gives a stopping node. Not 409: that tells the caller to
+            // resend here once a run over its source ends, and this node is not coming back.
             LOGGER.warn("Refused a document batch for {}: {}", sourceId, e.getMessage());
-            ResponseBody.sendJson(exchange, 409,
-                "{\"error\": \"" + JsonText.escape(e.getMessage()) + "\"}");
+            ResponseBody.sendError(exchange, 503, ErrorCode.SHUTTING_DOWN, e.getMessage());
+        } catch (IllegalStateException e) {
+            // The source is already being ingested: the same request succeeds once that run
+            // ends, which is what 409 tells a caller.
+            LOGGER.warn("Refused a document batch for {}: {}", sourceId, e.getMessage());
+            ResponseBody.sendError(exchange, 409, ErrorCode.CONFLICT, e.getMessage());
         } catch (IngestionOrchestrator.IngestionFailedException e) {
             // Not 200 with zero counts: a run that failed outright and a run that ingested
             // nothing are different outcomes, and the caller acts differently on each.

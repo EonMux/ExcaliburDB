@@ -120,7 +120,9 @@ class McpParityToolsTest {
 
                 assertThat(missing.isError()).isTrue();
                 assertThat(wrong.isError()).isTrue();
-                assertThat(wrong.text()).contains("confirm").contains("notes");
+                assertThat(wrong.text()).contains("confirm").contains("source_id")
+                    .as("the refusal says what is required without handing over the value")
+                    .doesNotContain("notes");
                 assertThat(nearly.isError()).as("a confirmation is exact").isTrue();
                 assertThat(node.requests()).isEmpty();
             }
@@ -464,6 +466,23 @@ class McpParityToolsTest {
                 assertThat(requests.get(1).headers().get(ExcaliburClient.NAMESPACE_HEADER))
                     .isEqualTo("beta");
             }
+        }
+
+        /**
+         * The route stops the namespace's automatic build as well as one build_graph started,
+         * and defers the next automatic attempt. A model told it stops only its own build would
+         * not reach for it to stop the node's, and one not told about the deferral would read
+         * 'deferred' as a fault and call build_graph to clear it.
+         */
+        @Test
+        @DisplayName("cancel_graph_build and graph_build_status describe stopping an automatic build")
+        void describesStoppingAnAutomaticBuild() {
+            assertThat(Json.stringAt(tool(McpTools.CANCEL_GRAPH_BUILD), "description"))
+                .contains("automatic").contains("'explicit'").contains("'automatic'")
+                .contains("'deferred'");
+            assertThat(Json.stringAt(tool(McpTools.GRAPH_BUILD_STATUS), "description"))
+                .contains("'deferred'").contains("next_attempt_at_ms")
+                .contains(McpTools.CANCEL_GRAPH_BUILD);
         }
 
         @Test

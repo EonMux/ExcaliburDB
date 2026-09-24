@@ -36,8 +36,7 @@ import java.util.Objects;
  * <h2>Thread Safety</h2>
  * <p>The record is immutable; the components it holds carry their own guarantees.</p>
  *
- * @param arena              Shared arena backing memory-mapped segments, or null on the
- *                           ByteBuffer fallback
+ * @param arena              Shared arena backing memory-mapped segments
  * @param storageEngine      The started storage engine
  * @param volumeManager      Volume manager registered with the data directory
  * @param indexOrchestrator  Orchestrator tracking every registered segment
@@ -63,10 +62,9 @@ public record CoreComponents(Arena arena,
         Objects.requireNonNull(dataDir, "dataDir cannot be null");
         Objects.requireNonNull(hnswConfigFactory, "hnswConfigFactory cannot be null");
 
-        boolean panamaAvailable = MemorySegmentFactory.isPanamaAvailable();
-        Arena arena = panamaAvailable ? Arena.ofShared() : null;
-        LOGGER.info("Using {} memory implementation",
-            panamaAvailable ? "Panama FFM" : "ByteBuffer fallback");
+        requirePanama(MemorySegmentFactory.isPanamaAvailable());
+        Arena arena = Arena.ofShared();
+        LOGGER.info("Using Panama FFM memory implementation");
 
         StorageEngine storageEngine = createStorageEngine(config, dataDir, arena, hnswConfigFactory);
         VolumeManager volumeManager = createVolumeManager(storageEngine);
@@ -90,6 +88,28 @@ public record CoreComponents(Arena arena,
     }
 
     /**
+     * Refuses to assemble a node on a JVM whose segments would be ByteBuffer-backed.
+     *
+     * <p>The storage engine maps every segment and the write log through Panama FFM and has no
+     * ByteBuffer implementation, so a node on the fallback cannot start. It is refused here, in
+     * one line naming both ways a JVM lands there - the {@code com.eonmux.excalibur.useFallback}
+     * property, which forces the fallback, and native access denied to the probe - rather than
+     * by the engine's constructor after a startup line announcing the fallback as the
+     * implementation in use.</p>
+     *
+     * @param panamaAvailable Whether {@link MemorySegmentFactory#isPanamaAvailable()} said yes
+     * @throws IllegalStateException if it did not
+     */
+    static void requirePanama(boolean panamaAvailable) {
+        if (!panamaAvailable) {
+            throw new IllegalStateException("ExcaliburDB requires Panama FFM memory and cannot "
+                + "run on the ByteBuffer fallback: remove -Dcom.eonmux.excalibur.useFallback=true "
+                + "if it is set, and otherwise start the JVM with --enable-native-access="
+                + "ALL-UNNAMED so native memory access is granted");
+        }
+    }
+
+    /**
      * Creates the storage engine.
      *
      * <p>The engine is configured but not started: {@link #create} installs the segment
@@ -103,11 +123,7 @@ public record CoreComponents(Arena arena,
                                                     HnswConfigFactory hnswConfigFactory) {
         LOGGER.info("Initializing storage engine...");
 
-        // Use fallback constructor when Arena is null (ByteBuffer-based implementation)
-        // Use Arena constructor when Panama FFM is available
-        StorageEngine engine = (arena != null)
-            ? new StorageEngine(dataDir, arena)
-            : new StorageEngine(dataDir);
+        StorageEngine engine = new StorageEngine(dataDir, arena);
 
         // excalibur.shard.segment-load-factor was documented but reached nothing: the store has no
         // config dependency, so the value has to be handed to it here. Set before start(), which
@@ -273,7 +289,7 @@ public record CoreComponents(Arena arena,
                 DistanceFunctions.byName(config.query().getDistanceMetric()),
                 dimension,
                 com.eonmux.excalibur.store.HnswInitializer.DEFAULT_MAX_NODES,
-                arena  // May be null for ByteBuffer fallback
+                arena
             );
 
         LOGGER.info("HNSW initializer created: dimension={}, maxNodes={}, metric={}",

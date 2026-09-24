@@ -952,6 +952,22 @@ class IngestionPipelineTest {
                 .isEqualTo(1);
         }
 
+        /**
+         * A caller answers "shutting down" and "this source is busy" differently - one is over
+         * when the node is back, the other when the run ends - so the refusal has to say which it
+         * is by type, not only in its message.
+         */
+        @Test
+        @DisplayName("a run refused because the node is stopping says so by its type")
+        void refusesWithADistinctTypeOnceShutdownHasBegun() {
+            IngestionOrchestrator orchestrator = orchestrator();
+            orchestrator.shutdown(Duration.ofSeconds(1));
+
+            assertThatThrownBy(() -> orchestrator.ingestNow(
+                    new FakeSource("docs", Map.of("a.txt", "some text"))))
+                .isInstanceOf(IngestionOrchestrator.ShuttingDownException.class);
+        }
+
         @Test
         @DisplayName("a run that was interrupted hands its thread back with the flag cleared")
         void clearsTheInterruptBeforeReturning() {

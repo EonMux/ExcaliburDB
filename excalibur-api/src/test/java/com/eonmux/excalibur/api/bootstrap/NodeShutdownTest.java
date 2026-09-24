@@ -410,8 +410,7 @@ class NodeShutdownTest {
     @Test
     @DisplayName("a node with no arena still runs every step of the shutdown")
     void runsWithoutAnArena() throws IOException {
-        // There is no arena when the node fell back to ByteBuffer-backed segments, which
-        // -Dcom.eonmux.excalibur.useFallback=true selects and a failed Panama probe forces. A bound method
+        // The shutdown accepts a null arena, as there being none to close. A bound method
         // reference on a null receiver throws while the argument list is being evaluated, before
         // the step is even registered - so the whole sequence would fail to build and not one
         // step would run. That is the shutdown where the damage is permanent: the listener never

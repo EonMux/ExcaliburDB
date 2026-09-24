@@ -22,7 +22,7 @@ ExcaliburDB is built on Java 21's Panama Foreign Function & Memory API for zero-
 - **Erasure that removes data** - `POST /v1/graph/erasure` records an obligation durably, and a compaction rewrites the tombstoned edges out of the store and out of the staged facts it was built from, driven by the oldest outstanding request and not only by how much has accumulated. Erasing only the store would leave the next `POST /v1/graph/build` free to replay the staging log and restore exactly what was erased. Nor is a request discharged while a copy a crash left beside the graph could still hold what it covers: a build's or a compaction's scratch, a graph a publish set aside, a staging rewrite that never finished
 - **Per-namespace knowledge graphs** - the graph is partitioned by namespace (documents, vectors and search are one corpus per node, behind one credential; see [Namespaces](#namespaces)): one graph directory per namespace, selected by a request header, with mapping-count and descriptor budgets - `vm.max_map_count` and `RLIMIT_NOFILE`, read from the running process - counted against the whole process rather than the graphs alone — segments, vector indexes and the JVM share the same limits — that evict the least recently used graph before either limit is reached; a request holds a lease, so eviction never unmaps a graph out from under a reader. Ingestion routes by the same header: a source registered with it stages its facts into that tenant, one registered without it into `shared`, and the binding is written into the source catalog so a re-crawl after a restart stages where it did before
 - **A graph the node builds** - with `excalibur.graph.extraction-enabled=true` and a chat model, ingestion extracts facts from the documents it publishes and stages them; `POST /v1/graph/build` turns everything staged into the edge store, the dictionaries and the two Lucene indexes, and serves the result without a restart. Extraction is off by default because it is one chat-model call per document, the most expensive thing ingestion can do, and it has to be on *before* the documents are ingested - a build after the fact finds nothing staged
-- **An MCP server** - the ingest, search, read-back, build, graph-query and cancellation calls exposed as tools, with document erasure behind an explicit confirmation, so a model can be pointed at a directory and then question what was built from it without any adapter code
+- **An MCP server** - the node's whole working surface as tools: registering, crawling, supplying, re-indexing and deregistering sources; searching and reading documents back; building the graph, asking it questions, browsing its entities, edges and relations, and asserting facts into it; creating and listing namespaces; compacting; reading the node's status; and stopping any of that work in flight. Every tool declares MCP behaviour hints, and the two that destroy data - document erasure and namespace deletion - also require an explicit confirmation, so a model can be pointed at a directory and then question what was built from it without any adapter code
 - **Retrieval without embedding the corpus** - every ingested chunk is indexed into the engine's own inverted index, and a node with no embedding endpoint answers `POST /v1/query` from BM25 instead of refusing the query
 - **Hybrid retrieval on the document route** - a node with an embedding model runs BM25 and vector search concurrently on `POST /v1/query` and fuses their rankings by reciprocal rank, so the inverted index it maintains anyway is read rather than merely paid for; `excalibur.query.hybrid-retrieval=false` restores vector-only ranking
 - **Query-side semantic expansion** - a chat model turns one question into the vocabulary a matching document would contain (`out of RAM` becomes `OOM killer`, `ENOMEM`, `SIGKILL`, `cgroup memory limit`) and weights each formulation itself, so the semantic work is paid for once per query instead of once per chunk of the corpus. It runs on a node that has a chat model and does not embed its corpus, which is where it replaces work the embeddings would otherwise have done; a node doing both takes it with `excalibur.query.expand-hybrid-queries=true`
@@ -785,12 +785,14 @@ export EXCALIBUR_PORT=9090
 ```
 
 A variable that is set but empty, or only whitespace, overrides nothing: it is ignored with a
-warning naming it, and the file's value (or the default) stands. That is what a compose file
-delivers when it interpolates a variable unset on the host - `EXCALIBUR_API_AUTH_TOKEN: ${TOKEN}`
-with no `TOKEN` - and copied through it would switch off the authentication the file turns on.
+warning naming it and the setting it would have overridden, and the file's value (or the default)
+stands. That is what a compose file delivers when it interpolates a variable unset on the host -
+`EXCALIBUR_API_AUTH_TOKEN: ${TOKEN}` with no `TOKEN` - and copied through it would switch off the
+authentication the file turns on.
 
 Three variables are read directly rather than as property overrides, because deployments already
-spell them this way:
+spell them this way. `EXCALIBUR_PORT` and `EXCALIBUR_DATA_DIR` set but empty, or only whitespace,
+count as unset in the same way, with a warning naming the variable:
 
 | Variable | Meaning |
 |----------|---------|
@@ -1050,7 +1052,7 @@ above; nothing resolves them from the file or the environment.
 
 | Property | Default | Effect |
 | --- | --- | --- |
-| `com.eonmux.excalibur.useFallback` | false | Forces the ByteBuffer implementation instead of Panama FFM. For a JVM or a sandbox where native access is unavailable; slower, and the node says so at startup |
+| `com.eonmux.excalibur.useFallback` | false | Forces the core memory library's ByteBuffer segments instead of Panama FFM. The server cannot run on them: the storage engine maps its segments and write log only through Panama FFM, so a node started with this set - or on a JVM that denies native access - refuses to start, in one line naming this property and `--enable-native-access=ALL-UNNAMED`. Leave it unset |
 | `com.eonmux.excalibur.enableNativeAccessLog` | true | Whether the Panama detection result is logged. Affects logging only |
 | `com.eonmux.excalibur.graph.pageSize` | *(the platform's page size; 4096 where it cannot be read)* | Page size the graph's `madvise` hints are aligned to, overriding the one `getpagesize` reports. A positive power of two; any other value — zero, a negative, `3000`, text — is ignored with one `WARN` at startup and the platform's page size used, since a hint is an optimisation and never worth a graph that will not open |
 
@@ -1214,7 +1216,9 @@ where that erasure stands, after the response and after a restart. The answer is
 a document the request named is still held (repeat the request), `pending` while a graph erasure
 it queued has not been discharged, `applied` while the lexical index still keeps the removed
 content's bytes awaiting a compaction, and `discharged` once nothing the request removed remains
-anywhere the node keeps it, with `discharged_at_ms`. `remaining` counts what is still owed and
+anywhere the node keeps it, with `discharged_at_ms` — null when that time is recorded nowhere: a
+lexical reclamation was owed, a namespace it queued work in was dropped, or a graph completion has
+aged out of its log. `remaining` counts what is still owed and
 `graph` lists each namespace's queued requests. What backs it is `<data dir>/erasure-receipts`: the
 source, the scope, the per-document counts and the graph request ids of the 1024 most recent
 erasures — never a document id, a name or any content. An older request is `404`; a receipt that
@@ -2577,9 +2581,11 @@ and `failed`, which the ingest status has no equivalent of. A run stopped throug
 parsing `state`: a stop that was asked for is not a crash, and reporting it as one sends an
 operator looking for a fault that is not there. `finished_at_ms` is when the run ended, `0`
 while one is still going, so how long it took and how stale its result is are both readable.
-A run is `failed` only when it failed on documents and neither indexed any nor confirmed any
-current; it leaves the old segments serving, and `last_error` says what kind of failure it was and
-how many documents it affected. A document the source confirmed unchanged counts as work done, so
+A run is `failed` when it stopped without finishing: it failed on documents and neither indexed
+any nor confirmed any current, or it could not run at all — the source could no longer be found,
+no volume had room for the rolling replacement, the run raised an exception, or it could not be
+started. It leaves the old segments serving, and `last_error` says what kind of failure it was and,
+for failed documents, how many it affected. A document the source confirmed unchanged counts as work done, so
 a re-crawl of a source that has barely moved, with one page timing out, is not a failed run. A run
 that indexed or confirmed some documents and failed on others did finish, and reads `idle` at `progress: 1.0` with
 `last_error` counting the failures and the documents indexed (`"Reindex completed with 3 errors;
@@ -3369,7 +3375,7 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 |------|-----------|--------------|
 | `ingest_documents` | **`source_id`**, **`root_path`**, `included_extensions`, `excluded_directories`, `max_depth`, `follow_symlinks`, `include_hidden`, `max_file_bytes`, `charset`, `namespace` | Registers a directory and starts indexing it. Every setting a filesystem registration accepts over HTTP is here, with the same meaning and bounds — see the config fields under [Ingest Example](#ingest-example). An optional `charset` names the encoding its files are read in when they carry no byte-order mark (UTF-8 when omitted); a file with a mark is read in the encoding the mark names, and the node refuses an encoding it does not know |
 | `crawl_website` | **`source_id`**, **`base_url`**, `max_depth`, `max_documents`, `max_response_bytes`, `timeout_seconds`, `included_path_patterns`, `excluded_path_patterns`, `user_agent`, `crawl_delay_ms`, `respect_robots_txt`, `namespace` | Registers an HTTP source and starts crawling it. Every setting an HTTP registration accepts is here, with the same meaning and bounds; `crawl_delay_ms` can only slow a crawl below the node's own `excalibur.ingest.crawl-delay-ms` pace, never speed it up, and `respect_robots_txt` (on unless `false`) obeys the site's [robots.txt](#robotstxt) |
-| `add_documents` | **`source_id`**, **`documents`** (each **`document_id`**, **`text`**) | Indexes documents sent in the call itself, for content the model is holding |
+| `add_documents` | **`source_id`**, **`documents`** (each **`document_id`**, **`text`**, `content_type`, `last_modified_millis`) | Indexes documents sent in the call itself, for content the model is holding. `content_type` `text/html` or `application/xhtml+xml` indexes the text the markup shows; `last_modified_millis` dates the facts extracted from the document — `POST /v1/documents` |
 | `ingestion_status` | `source_id` | How far indexing has got, with `entries_skipped` (not text) and `entries_disallowed` (kept out by robots.txt) counted apart from errors |
 | `reindex_source` | **`source_id`** | Re-reads a registered source and replaces what changed |
 | `reindex_status` | `source_id` | How far a reindex has got, and whether it finished, failed or was cancelled |
@@ -3389,7 +3395,7 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `cancel_compaction` | | Stops the compaction in progress, keeping what it had reclaimed |
 | `build_graph` | `namespace` | Publishes the staged facts as the served graph |
 | `graph_build_status` | `namespace` | How far a build has got, and what the last one published |
-| `cancel_graph_build` | `namespace` | Stops a build; it publishes nothing and the staged facts are kept |
+| `cancel_graph_build` | `namespace` | Stops the namespace's build, whether `build_graph` or the node's automatic build started it; it publishes nothing and the staged facts are kept, and a stopped automatic build is `deferred` until `next_attempt_at_ms` — `DELETE /v1/graph/build` |
 | `list_namespaces` | `limit`, `cursor` | The graph namespaces on the node, a page at a time |
 | `create_namespace` | **`namespace`** | Creates a namespace — the only way to on a node with `excalibur.graph.require-explicit-namespaces` on |
 | `erase_documents` | **`source_id`**, `document_ids`, `scope`, `compact`, **`confirm`** | Permanently erases the named documents, or with `scope` `source` everything the source holds, from the corpus and the graph. `confirm` must repeat `source_id` |
@@ -3444,9 +3450,13 @@ conversation.
 Two tools do destroy data, `erase_documents` and `delete_namespace`, and both are gated the same
 way. Each requires a `confirm` argument that repeats exactly what it destroys — the `source_id`,
 or the namespace — and the adapter refuses the call without sending anything when it is absent or
-differs, so a model cannot erase by filling in a plausible-looking argument it was never given.
-Their descriptions say the call is irreversible and is to be made only when the user explicitly
-asked for it. `delete_namespace` never falls back on `EXCALIBUR_NAMESPACE`, and every namespace a
+differs. What that guarantees is that the destruction was asked for twice in one call: a model
+that reached for the wrong tool with the right identifier, or filled the identifier in from a
+default, is refused rather than obeyed. It cannot tell a value the user gave from one the model
+made up - the confirmation repeats another argument of the same call - so the refusal says what
+has to be repeated without quoting the value, and tells the model to ask the user rather than
+retry. Their descriptions say the call is irreversible and is to be made only when the user
+explicitly asked for it. `delete_namespace` never falls back on `EXCALIBUR_NAMESPACE`, and every namespace a
 tool puts in a path is checked against the node's naming rule first, so `..` or a `/` cannot turn
 it into a different route; the ids `cancel_query` and `erasure_status` put in a path are held to
 the shape the node issues them in, for the same reason. Graph erasure (`POST /v1/graph/erasure`)
@@ -3509,6 +3519,27 @@ An argument `ingest_documents` or `crawl_website` does not declare — a misspel
 the arguments the tool takes, and nothing is sent. Dropped, it would register the source without
 the setting the model believes it made, as the node's `400` for an unknown `config` field exists
 to prevent over HTTP.
+
+The objects inside `add_documents`' `documents` and `assert_graph_facts`' `facts` are checked the
+same way, against the members the schema declares for one element: an element that is not an
+object, a member it does not declare, a required one missing, or a value of the wrong type is a
+tool error naming the element and the member, and nothing is sent. Both routes ignore a member
+they do not read, so a misspelt `"valid_until"` would otherwise stage a fact that still holds, and
+`"last_modified"` date a document's facts on the day they are staged. An integer member accepts
+`5`, `5.0` or `"5"` and a number member `"0.5"`, as a top-level argument does, and is sent as a
+number; an explicit `null` on an optional member is sent as written, which is how a fact says it
+has no known start or still holds.
+
+Every tool carries MCP `annotations` stating all four behaviour hints rather than leaving them to
+the specification's worst-case defaults: `readOnlyHint` for the eighteen that only read,
+`openWorldHint` for `crawl_website` and `reindex_source`, which fetch from the web, and
+`idempotentHint` for everything a repeat leaves unchanged — not `assert_graph_facts`, which stages
+another fact each time, nor `erase_documents`, whose scope `source` erases at most 1000 documents
+a call. `destructiveHint` follows the specification's meaning, anything more than additive, so
+besides the two confirmation-gated tools it marks `add_documents` and `reindex_source`, which
+replace documents they find changed; neither takes a confirmation, because replacing is what they
+exist to do. The hints are sent under every protocol revision the adapter speaks: the 2024-11-05
+tool schema does not close its members, and a client of it ignores one it does not know.
 
 ### Without MCP
 
