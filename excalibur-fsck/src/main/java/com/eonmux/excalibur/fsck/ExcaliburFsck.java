@@ -1,5 +1,8 @@
 package com.eonmux.excalibur.fsck;
 
+import com.eonmux.excalibur.core.datadir.DataDirectoryLock;
+import com.eonmux.excalibur.core.datadir.DataDirectoryLockedException;
+import com.eonmux.excalibur.core.datadir.LockHolder;
 import com.eonmux.excalibur.fsck.check.DataDirectoryScan;
 import com.eonmux.excalibur.fsck.check.DataDirectoryScanner;
 import com.eonmux.excalibur.fsck.report.FsckReport;
@@ -18,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Optional;
 import java.util.OptionalInt;
 
 /**
@@ -40,8 +44,19 @@ import java.util.OptionalInt;
  * rather than cut out, and a torn log tail is disclaimed by the same one-byte write the
  * log makes for itself. Anything that would need a guess is reported as needing an
  * operator instead.</p>
+ *
+ * <h2>A directory in use</h2>
+ * <p>A repair takes the data directory's lock ({@link DataDirectoryLock}) for as long as it
+ * runs, and is refused with {@link FsckExit#IN_USE} while a node or another tool holds it:
+ * moving a file a running node has mapped, or rewriting a log it is appending to, would corrupt
+ * what the repair set out to fix. A check writes nothing, so it runs on a held directory too -
+ * it is often the first thing run against a node that is misbehaving - and says on stderr that
+ * the files it read may have been changing.</p>
  */
 public final class ExcaliburFsck {
+
+    /** What a repair calls itself in the data directory's lock file. */
+    static final String REPAIR_LOCK_HOLDER = "excalibur-fsck --repair";
 
     private ExcaliburFsck() {
         throw new AssertionError("Utility class");
@@ -136,7 +151,8 @@ public final class ExcaliburFsck {
     }
 
     /**
-     * Surveys the directory, reports, and repairs if asked.
+     * Takes the lock a repair needs, or warns that a check is reading a held directory, and
+     * then surveys it.
      *
      * @param options What was asked for
      * @param out     Where the report is written
@@ -144,6 +160,69 @@ public final class ExcaliburFsck {
      * @return The process exit code
      */
     private static int execute(FsckOptions options, PrintStream out, PrintStream err) {
+        if (!options.repair()) {
+            warnIfHeld(options.dataDirectory(), err);
+            return survey(options, out, err);
+        }
+        DataDirectoryLock lock;
+        try {
+            lock = DataDirectoryLock.acquire(options.dataDirectory(), REPAIR_LOCK_HOLDER);
+        } catch (DataDirectoryLockedException e) {
+            err.println(e.getMessage() + " Nothing was checked or repaired.");
+            return FsckExit.IN_USE;
+        } catch (IOException | RuntimeException e) {
+            err.println("Could not take the lock on the data directory " + options.dataDirectory()
+                + ", so nothing was repaired: a repair never runs without knowing that no node "
+                + "is using the directory. " + e);
+            return FsckExit.FAILED;
+        }
+        try {
+            return survey(options, out, err);
+        } finally {
+            try {
+                lock.close();
+            } catch (IOException e) {
+                err.println("Could not release the lock on " + options.dataDirectory()
+                    + "; it is released when this process exits: " + e);
+            }
+        }
+    }
+
+    /**
+     * Says so when a process holds the directory a check is about to read.
+     *
+     * <p>A warning and not a refusal: a check writes nothing, and a node that is misbehaving is
+     * exactly the one an operator wants checked. But what it reads can change underneath it - a
+     * segment caught between an append and its checksum reads as corrupt - so the report has to
+     * be read as a snapshot of a moving directory.</p>
+     *
+     * @param dataDirectory The directory
+     * @param err           Where the warning goes
+     */
+    private static void warnIfHeld(Path dataDirectory, PrintStream err) {
+        Optional<LockHolder> holder;
+        try {
+            holder = DataDirectoryLock.probe(dataDirectory);
+        } catch (IOException | RuntimeException e) {
+            err.println("Warning: could not tell whether a node holds " + dataDirectory + " ("
+                + e + "). If one is running, files may be changing while they are read.");
+            return;
+        }
+        holder.ifPresent(found -> err.println("Warning: " + dataDirectory + " is held by "
+            + found.describe() + ". A live node may be changing files while they are read, so "
+            + "damage reported below may be a write caught part-way; stop the node and check "
+            + "again before acting on it."));
+    }
+
+    /**
+     * Surveys the directory, reports, and repairs if asked.
+     *
+     * @param options What was asked for
+     * @param out     Where the report is written
+     * @param err     Where operational failures are written
+     * @return The process exit code
+     */
+    private static int survey(FsckOptions options, PrintStream out, PrintStream err) {
         DataDirectoryScan scan;
         try {
             scan = new DataDirectoryScanner(options.dataDirectory()).scan();

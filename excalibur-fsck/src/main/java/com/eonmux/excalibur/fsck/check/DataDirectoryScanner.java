@@ -1,5 +1,8 @@
 package com.eonmux.excalibur.fsck.check;
 
+import com.eonmux.excalibur.core.datadir.InterruptedRestore;
+import com.eonmux.excalibur.core.datadir.ReservedNames;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -29,11 +32,22 @@ public final class DataDirectoryScanner {
 
     private final Path dataDirectory;
 
+    /** The kind of the finding an interrupted restore's journal raises. */
+    public static final String INTERRUPTED_RESTORE = "interrupted-restore";
+
+    /** The kind of the finding a restore's scratch directory with no journal raises. */
+    public static final String RESTORE_SCRATCH = "restore-scratch";
+
     /**
      * Prepares a scan of one directory.
      *
-     * <p>Nothing inside the directory is skipped: the quarantine is refused anywhere within
-     * it, so every file here is state the node reads.</p>
+     * <p>Nothing the node reads is skipped: the quarantine is refused anywhere within the
+     * directory, so every file here is state. The entries that are not state are the ones
+     * {@link ReservedNames} names - the lock file, and a restore's journal and scratch - and
+     * those are left out of the per-file report: the lock describes a process, and a restore's
+     * scratch is a second copy of a data directory, each of whose files would otherwise be
+     * judged as though the node read it. What a restore left behind is reported instead as one
+     * finding about the restore.</p>
      *
      * @param dataDirectory The directory to survey
      */
@@ -53,6 +67,7 @@ public final class DataDirectoryScanner {
         List<CatalogRecord> catalogRows = List.of();
         int[] routingSlots = new int[0];
 
+        findings.addAll(restoreFindings());
         for (Path file : listFiles()) {
             FileInspection inspection =
                 FileInspector.inspect(file, FileClassifier.relativise(dataDirectory, file));
@@ -103,20 +118,63 @@ public final class DataDirectoryScanner {
     }
 
     /**
-     * Lists every regular file under the data directory.
+     * Lists every regular file under the data directory that holds data.
      *
-     * @return The files, in walk order
+     * @return The files, in walk order, less the reserved entries
      * @throws IOException if the tree cannot be walked
      */
     private List<Path> listFiles() throws IOException {
         List<Path> files = new ArrayList<>();
         try (var stream = Files.walk(dataDirectory)) {
             for (Path path : stream.toList()) {
-                if (Files.isRegularFile(path)) {
+                if (Files.isRegularFile(path) && !ReservedNames.isReserved(
+                        FileClassifier.relativise(dataDirectory, path))) {
                     files.add(path);
                 }
             }
         }
         return files;
+    }
+
+    /**
+     * Reports what a restore left in the directory.
+     *
+     * <p>A journal is damage: it is written before a restore stages anything and removed only
+     * once the restore is complete, so its presence means the directory may be any mixture of
+     * its old contents and the image, and the node refuses to start on it until the restore is
+     * run again. Scratch with no journal beside it is only disk: the journal is removed after the
+     * scratch, so this is scratch whose removal failed, or a journal someone deleted by hand -
+     * in either case nothing reads it.</p>
+     *
+     * @return One finding per entry a restore left, in name order
+     * @throws IOException if the directory cannot be listed
+     */
+    private List<ConsistencyFinding> restoreFindings() throws IOException {
+        boolean journal = InterruptedRestore.journalIn(dataDirectory).isPresent();
+        List<ConsistencyFinding> findings = new ArrayList<>();
+        if (journal) {
+            findings.add(new ConsistencyFinding(INTERRUPTED_RESTORE,
+                InterruptedRestore.JOURNAL_FILE_NAME, FindingSeverity.DAMAGE,
+                "an excalibur-backup restore into this directory did not finish, so its files "
+                    + "may be a mixture of what was here and the image being restored, and the "
+                    + "node refuses to start on it. Run excalibur-backup restore into this "
+                    + "directory again: it completes the interrupted restore from the journal. "
+                    + "The restore's scratch directories are not checked here"));
+        }
+        try (var entries = Files.list(dataDirectory)) {
+            for (Path entry : entries.sorted().toList()) {
+                String name = entry.getFileName().toString();
+                boolean scratch = name.startsWith(InterruptedRestore.STAGING_PREFIX)
+                    || name.startsWith(InterruptedRestore.DISPLACED_PREFIX);
+                if (scratch && !journal) {
+                    findings.add(new ConsistencyFinding(RESTORE_SCRATCH, name,
+                        FindingSeverity.WARNING,
+                        "a restore's scratch directory with no journal beside it: the restore "
+                            + "finished or was unwound and its scratch was not removed. Nothing "
+                            + "reads it and it is not checked; delete it to reclaim the disk"));
+                }
+            }
+        }
+        return findings;
     }
 }

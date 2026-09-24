@@ -237,7 +237,12 @@ public final class GraphStoreCheck {
             return List.of();
         }
         try (Stream<Path> listing = Files.list(dataDirectory)) {
-            return listing.filter(Files::isDirectory).sorted().toList();
+            // A restore's scratch is a copy of a whole data directory, not a namespace, and is
+            // reported as the restore's by the scan.
+            return listing.filter(Files::isDirectory)
+                .filter(path -> !com.eonmux.excalibur.core.datadir.ReservedNames.isReserved(
+                    path.getFileName().toString()))
+                .sorted().toList();
         } catch (IOException | UncheckedIOException e) {
             return List.of();
         }
