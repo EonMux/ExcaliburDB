@@ -329,15 +329,42 @@ docker run --rm -v excalibur-data:/var/lib/excalibur \
   snapshot --data-dir /var/lib/excalibur --out /var/lib/excalibur-backups/2026-09-22
 ```
 
-CI runs all three against a node the image started and stopped.
+A restore is the same shape the other way. `/var/lib/excalibur` is a mount point in a root-owned
+`/var/lib`, so it can be neither renamed nor replaced; `restore` works inside it instead, and
+`--force` is needed when the volume already holds a data directory:
+
+```bash
+docker run --rm -v excalibur-data:/var/lib/excalibur \
+  -v excalibur-backups:/var/lib/excalibur-backups \
+  --entrypoint excalibur-backup excalibur \
+  restore --snapshot /var/lib/excalibur-backups/2026-09-22 --target /var/lib/excalibur --force
+```
+
+All four take the data directory's lock, so none of them can run against a volume a node is
+running on: a repair exits `4` and a snapshot or restore `7`, naming the node's pid, and nothing
+is written. A check without `--repair` goes ahead with a warning. CI runs all four against a node
+the image started and stopped, and runs the repair once more with the node up to see it refused.
 
 Nothing is baked in. The API binds `127.0.0.1` by default and binding anything else requires a
 bearer token and either TLS or an explicit `EXCALIBUR_API_ALLOW_PLAINTEXT=true` where something in
 front of the process terminates it — so the container ships with none of those set, because a
 default that listened on every interface unauthenticated is the one mistake that policy exists to
-prevent. `HEALTHCHECK` points at `/health/ready`, not `/health`: readiness answers 200 or 503 on
-whether this node can serve a query, where liveness answers 200 while it is still opening
-segments.
+prevent.
+
+`HEALTHCHECK` probes liveness, `/health`, not readiness. A container health check is what a
+supervisor restarts or replaces a container on, and a node that is drained, or still recovering
+its segments, is alive — restarting it would throw away the recovery it is part-way through.
+Readiness, `/health/ready`, is for whatever routes traffic. The probe finds the node where the
+node actually is: once its listener is bound, the node writes its liveness URL into the data
+directory's lock file (`health-url=` in `/var/lib/excalibur/.excalibur-lock`) — `https` when TLS
+is on, the port it took however that was configured, the interface it bound, loopback for a
+wildcard — and `/opt/excalibur/bin/excalibur-healthcheck` reads it from there and asks it with
+`curl`. So no setting is repeated in the image, and none can disagree with the node's. The
+certificate is not verified: the probe talks to the node's own socket, sends no credential and
+reads only a status code. A node that requires client certificates (`tls-client-auth=need`)
+needs the probe given one, with `EXCALIBUR_HEALTHCHECK_CLIENT_CERT` and
+`EXCALIBUR_HEALTHCHECK_CLIENT_KEY`. A tool container started with `--entrypoint` inherits the
+check as well; pass it `--no-healthcheck`, or ignore its health.
 
 ### Stopping the node
 
@@ -534,8 +561,17 @@ read, check or repair alike. Symbolic links and `..` are followed as the filesys
 so a path that only reads as outside is refused too. A data directory at a filesystem root has
 nothing beside it, so there the quarantine has to be named.
 
+`--repair` takes the data directory's lock before it reads anything, so it cannot run under a
+live node, and a node cannot start underneath it: a directory another process holds is refused
+with exit code `4`, naming the holder, and nothing is checked or repaired. A check without
+`--repair` writes nothing, so it goes ahead against a held directory, with a warning that what it
+reads may be changing. The lock file is reported `NOT_DATA`. A restore that was interrupted —
+its journal, `.excalibur-restore`, still in the directory — is reported as damage and put to the
+operator: running the same `excalibur-backup restore` again finishes it.
+
 Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself
-failed, so nothing is known about the directory — which is not the same claim as `0`.
+failed, so nothing is known about the directory — which is not the same claim as `0` — and `4`
+`--repair` was refused because another process holds the directory.
 
 ### Snapshots — `excalibur-backup`
 
@@ -575,16 +611,37 @@ about which checker a file belongs to. The report counts how many structures wer
 a checksum or seal and lists every one that was not, with the reason: a format that carries
 nothing to prove it by is reported as checked and unproven rather than left out, which would read
 as though nothing went unverified. `restore` verifies before it writes anything, to the same default depth and to
-the deeper one with `restore --deep`, then builds the new tree beside the target and renames it on
-in one move; an image that does not verify is refused with the target untouched, and a target that
-already holds something needs `--force`.
+the deeper one with `restore --deep`; an image that does not verify is refused with the target
+untouched, and a target that already holds something needs `--force`.
 
-**The node must be stopped.** Nothing in this engine orders one file against another and nothing
-locks the directory, so a clean shutdown is the only moment at which every file describes the
-same instant. The directory is fingerprinted before and after the copy and a snapshot whose
-source moved underneath it is refused. That check is one-sided — it can prove a node *was*
-running, never that one was not — so `--allow-live` downgrades the refusal to a warning and
-records the image as `LIVE_UNSAFE` rather than claiming a consistency it cannot establish. There
+A restore works inside its target and never renames the target itself, so the target can be a
+mount point — a container volume, say — and only the target needs to be writable. It takes the
+target's lock, copies the image into a staging directory inside the target and forces it to disk,
+then moves the target's previous entries into a second scratch directory and the staged entries
+into place, one rename each. That is a sequence, not one atomic step, so each phase is journaled
+(`.excalibur-restore` in the target) before it begins, and what it guarantees is this:
+
+- The previous contents are never deleted until every entry of the image is in place; until then
+  they are in the target or, whole, in the scratch directory.
+- A rename that fails is unwound on the spot, and the target is left as it was.
+- A crash leaves the journal. A node refuses to start on a directory holding one, so a mixture of
+  old and new entries is never served, and `excalibur-fsck` reports it as damage. The next
+  `restore` into that directory first finishes the interrupted one — forward to its image once the
+  image was fully staged, back to the previous contents when it was unwinding — and says which.
+  Re-running the same restore is therefore the recovery.
+
+**The node must be stopped.** Nothing in this engine orders one file against another, so a clean
+shutdown is the only moment at which every file describes the same instant. A node holds an
+exclusive operating-system lock on its data directory (`.excalibur-lock`, taken with
+`FileChannel.tryLock` before anything is read) for as long as it runs, and a second node on the
+same directory fails at startup, naming the directory and the holder's pid. A snapshot takes the
+same lock for the length of the copy, so a directory a node holds is refused with exit `7`, and a
+node cannot start underneath the copy. The directory is also fingerprinted before and after the
+copy and a snapshot whose source moved underneath it is refused with exit `5`, which still catches
+a writer that does not take the lock — an older build, or a filesystem whose locks do not reach
+across hosts. `--allow-live` downgrades both refusals to a warning and records the image as
+`LIVE_UNSAFE` rather than claiming a consistency it cannot establish. The lock file itself records
+only who last held the directory; it is never copied, restored, or reported as data. There
 is no online-backup mode, and a half-barrier that stopped the background workers while the write
 path kept accepting writes would be worse than none: it would look like a consistent image and
 not be one.
@@ -617,7 +674,9 @@ Exit codes: `0` done, `2` bad command line — including an `--out` inside `--da
 `--target` inside `--snapshot`, and a path the platform cannot name — `3` the image did not verify
 and nothing was restored, `4` the restore target or the snapshot's `--out` is not empty, `5` the data directory
 moved while being copied, `6` a file could not be read or written — or a copy did not read back as
-what was written — and `70` something this build did not anticipate, reported rather than hidden.
+what was written — `7` another process holds the data directory or the restore target, and
+nothing was written, and `70` something this build did not anticipate, reported rather than
+hidden.
 
 ## Configuration
 
@@ -3300,12 +3359,17 @@ question, answered on a machine whose clock you trust.
 
 **Image.** Builds the container image from the repository's `Dockerfile`, as `docker build .`
 does, starts it with the bind address, plaintext opt-in and token the image needs to come up,
-waits for `/health/ready`, and stops it the way a scheduler would. An image that builds and never
-reports ready fails here. Then it runs the two container commands [In a
+waits for `/health/ready` and for Docker to report the container `healthy` from its own
+`HEALTHCHECK`, checks that an `excalibur-fsck --repair` run against the live volume is refused
+with exit `4`, and stops the node the way a scheduler would. An image that builds and never
+reports ready or healthy fails here. Then it runs the container commands [In a
 container](#in-a-container) documents against the stopped node's volume: an `excalibur-fsck
 --repair` into a mounted quarantine volume, after planting a staged file for it to set aside — it
 must arrive in the quarantine and be gone from the data directory, which must then check clean —
-and an `excalibur-backup snapshot` into a backup volume, verified `--deep` from a second container.
+an `excalibur-backup snapshot` into a backup volume, verified `--deep` from a second container,
+and an `excalibur-backup restore` of that image both over the node's own volume with `--force`
+and into a fresh volume, each of which must then check clean and start a node that reports
+healthy.
 
 ## FAQ
 

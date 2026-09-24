@@ -92,9 +92,10 @@ LABEL org.opencontainers.image.title="ExcaliburDB" \
       org.opencontainers.image.source="https://github.com/EonMux/ExcaliburDB" \
       org.opencontainers.image.licenses="Apache-2.0"
 
-# curl is the HEALTHCHECK's only dependency (docker/excalibur-healthcheck). The Temurin JRE already carries every module the
-# node needs - jdk.httpserver for the API, java.net.http for the LLM client, java.management
-# for the JMX metrics, jdk.incubator.vector for the SIMD kernels - so nothing else is added.
+# curl is the HEALTHCHECK's only dependency (docker/excalibur-healthcheck). The Temurin JRE
+# already carries every module the node needs - jdk.httpserver for the API, java.net.http for
+# the LLM client, java.management for the JMX metrics, jdk.incubator.vector for the SIMD
+# kernels - so nothing else is added.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl \
  && rm -rf /var/lib/apt/lists/*
@@ -128,9 +129,20 @@ COPY --from=build --chown=root:root \
      /workspace/excalibur-fsck/build/install/excalibur-fsck /opt/excalibur-fsck
 
 # The backup tool, for the same reason: a snapshot is taken with the node stopped, and this
-# image is where the JVM flags it needs are already right. `docker run --entrypoint
-# excalibur-backup <image> snapshot --data-dir /var/lib/excalibur --out
-# /var/lib/excalibur-backups/<name>`, with the node's volume and a backup volume mounted.
+# image is where the JVM flags it needs are already right. With the node's volume and a backup
+# volume mounted:
+#
+#   docker run --rm -v excalibur-data:/var/lib/excalibur \
+#     -v excalibur-backups:/var/lib/excalibur-backups --entrypoint excalibur-backup <image> \
+#     snapshot --data-dir /var/lib/excalibur --out /var/lib/excalibur-backups/<name>
+#
+#   docker run --rm -v excalibur-data:/var/lib/excalibur \
+#     -v excalibur-backups:/var/lib/excalibur-backups --entrypoint excalibur-backup <image> \
+#     restore --snapshot /var/lib/excalibur-backups/<name> --target /var/lib/excalibur [--force]
+#
+# /var/lib/excalibur is a mount point in its root-owned parent, so it can be neither renamed
+# nor replaced; restore works inside it, under the directory's lock, journaling each step. A
+# volume a node is running on is refused (exit 7) by both, as by excalibur-fsck --repair (exit 4).
 COPY --from=build --chown=root:root \
      /workspace/excalibur-backup/build/install/excalibur-backup /opt/excalibur-backup
 ENV PATH="/opt/excalibur-fsck/bin:/opt/excalibur-backup/bin:${PATH}"
@@ -166,7 +178,9 @@ EXPOSE 8080
 # health check drives restarts, and a drained or still-recovering node is alive; readiness is
 # for whatever routes traffic. /health is unauthenticated by policy, so the probe needs no token.
 # The start period covers segment recovery on a large data directory. See the script for TLS
-# client certificates.
+# client certificates. A container started with --entrypoint for one of the tools above inherits
+# the check too, and reports unhealthy if it outlives the start period: pass --no-healthcheck
+# to such a run, or ignore its health.
 COPY --chown=root:root --chmod=755 docker/excalibur-healthcheck \
      /opt/excalibur/bin/excalibur-healthcheck
 HEALTHCHECK --interval=15s --timeout=5s --start-period=90s --retries=3 \
