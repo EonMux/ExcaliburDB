@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.store;
 
+import com.eonmux.excalibur.store.format.WriteLogHeader;
+
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -110,7 +112,7 @@ class WriteLogReopenScanTest {
         }
         // The opcode stays valid and a byte of the payload changes, which is what a damaged
         // entry looks like: written, then no longer what was written.
-        corruptByteAt(40);
+        corruptByteAt(WriteLogHeader.SIZE + 40);
         warnings.clear();
 
         try (WriteLog reopened = new WriteLog(logFile)) {
