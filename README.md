@@ -26,7 +26,7 @@ ExcaliburDB is built on Java 21's Panama Foreign Function & Memory API for zero-
 - **Retrieval without embedding the corpus** - every ingested chunk is indexed into the engine's own inverted index, and a node with no embedding endpoint answers `POST /v1/query` from BM25 instead of refusing the query
 - **Hybrid retrieval on the document route** - a node with an embedding model runs BM25 and vector search concurrently on `POST /v1/query` and fuses their rankings by reciprocal rank, so the inverted index it maintains anyway is read rather than merely paid for; `excalibur.query.hybrid-retrieval=false` restores vector-only ranking
 - **Query-side semantic expansion** - a chat model turns one question into the vocabulary a matching document would contain (`out of RAM` becomes `OOM killer`, `ENOMEM`, `SIGKILL`, `cgroup memory limit`) and weights each formulation itself, so the semantic work is paid for once per query instead of once per chunk of the corpus. It runs on a node that has a chat model and does not embed its corpus, which is where it replaces work the embeddings would otherwise have done; a node doing both takes it with `excalibur.query.expand-hybrid-queries=true`
-- **Text, and only text** - a crawl with no extension filter lists every file under its root, and a file's content type is guessed from its name, so what a document actually holds is decided by decoding it: anything whose decoded characters carry a U+0000, or run a third or more replacement characters, is passed over before it is chunked rather than indexed as several kilobytes of mojibake and paid for at the embedding endpoint. Skipped files are counted into `entries_skipped` on the source's status and are deliberately not errors - a directory holding photographs beside its documents is the ordinary case. There are no format parsers: a PDF or a `.docx` is skipped, not extracted
+- **Text, and only text** - a crawl with no extension filter lists every file under its root, and a file's content type is guessed from its name, so what a document actually holds is decided by decoding it: anything whose decoded characters carry a U+0000, or run a third or more replacement characters, is passed over before it is chunked rather than indexed as several kilobytes of mojibake and paid for at the embedding endpoint. Skipped files are counted into `entries_skipped` on the source's status and are deliberately not errors - a directory holding photographs beside its documents is the ordinary case. HTML and XHTML are the one markup the node reads through: a page is indexed by the text it shows, with its tags, scripts and stylesheets stripped and its character references decoded. There are no other format parsers: a PDF or a `.docx` is skipped, not extracted
 - **One copy of the corpus** - the chunk index stores postings and not text, reading a chunk's text back from the storage engine on the rare occasion a compaction needs it, so indexing does not double what a corpus costs on disk
 - **Erasure that removes chunks too** - a rolled-back or erased chunk is recorded durably, hidden immediately, and physically rewritten out of the index by a compaction driven by the oldest outstanding obligation rather than by accumulated volume
 
@@ -2261,8 +2261,19 @@ over nothing, including one whose root lists no documents at all, sets it back t
 to the run that wrote it, because a reindex reports how far it got through
 `/v1/reindex/status`.
 
-There are no format parsers. A PDF, a `.docx` or an image is skipped, not extracted; the node
-indexes documents you can already read as text. `included_extensions` is still worth setting on a
+A document that passes is chunked as it reads, with one exception: a document whose content type
+is `text/html` or `application/xhtml+xml` — an HTTP response that says so, a `.html`, `.htm` or
+`.xhtml` file, or a `POST /v1/documents` entry with that `content_type` — is indexed by the text a
+reader of it sees. Its tags and comments are removed, the contents of its `script` and `style`
+elements are dropped whole, and character references are decoded, so `Caf&eacute;` is found by
+`Café`. Block-level elements and `<br>` become line breaks, so the last word of one list item or
+table cell is not fused to the first word of the next, and the indentation the markup was laid out
+with is collapsed. The text test above is applied before the markup goes, so a binary file with an
+`.html` name is still passed over. The same extracted text is what the graph extracts facts from.
+Every other type keeps its angle brackets: in XML, Markdown or source code they are content.
+
+There are no other format parsers. A PDF, a `.docx` or an image is skipped, not extracted; the
+node indexes documents you can already read as text. `included_extensions` is still worth setting on a
 mixed root, because it stops those files being read at all rather than read and discarded.
 
 #### robots.txt

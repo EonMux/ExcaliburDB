@@ -102,7 +102,7 @@ final class EvaluationCorpus {
                 if (fetched.getContentLength() > DocumentLimits.MAX_DOCUMENT_BYTES) {
                     continue;
                 }
-                String text = TextContent.decode(fetched.getContent(), fetched.getCharset());
+                String text = TextContent.decode(fetched);
                 if (text == null) {
                     continue;
                 }

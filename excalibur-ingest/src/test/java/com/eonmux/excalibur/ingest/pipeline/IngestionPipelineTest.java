@@ -2024,4 +2024,29 @@ class IngestionPipelineTest {
             assertThat(storedChunkExists("docs", "utf16.txt", 0)).isTrue();
         }
     }
+
+    @Nested
+    @DisplayName("an HTML document")
+    class HtmlDocument {
+
+        @Test
+        @DisplayName("is indexed by the text it shows, not by its markup")
+        void markupIsNotIndexed() {
+            String page = "<html><head><style>body { margin: 0 }</style>"
+                + "<script>window.analytics = 'tracker';</script></head>"
+                + "<body><h1>Engines</h1><p>Babbage&rsquo;s <b>difference</b> engine</p></body></html>";
+            FakeSource source = new FakeSource("docs", Map.of())
+                .withRaw("engines.html", page.getBytes(StandardCharsets.UTF_8), "text/html");
+
+            IngestionOrchestrator lexical =
+                new IngestionOrchestrator(new TextChunker(), null, storage, index, registry);
+            ingest(lexical, source);
+
+            byte[] value = storedChunk("docs", "engines.html", 0);
+            assertThat(value).as("chunk was written").isNotNull();
+            String text = com.eonmux.excalibur.core.codec.ChunkPayloadCodec.textOf(value);
+            assertThat(text).contains("Engines", "Babbage\u2019s difference engine");
+            assertThat(text).doesNotContain("<", "analytics", "margin");
+        }
+    }
 }

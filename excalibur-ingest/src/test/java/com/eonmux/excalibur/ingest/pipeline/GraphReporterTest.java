@@ -287,4 +287,20 @@ class GraphReporterTest {
         sink.syncFailure = new IOException("device gone");
         assertThat(reporter.sync()).isFalse();
     }
+
+    @Test
+    @DisplayName("hands over an HTML document's text rather than its markup")
+    void reportsTheTextOfMarkup() {
+        RecordingSink sink = new RecordingSink();
+        GraphReporter reporter = new GraphReporter();
+        reporter.setSink(sink);
+        FetchedDocument page = new FetchedDocument("ada.html",
+            "<p>Ada <i>runs</i> Acme.</p><script>track()</script>".getBytes(StandardCharsets.UTF_8),
+            "text/html", 5L);
+
+        publishAndReport(reporter, "docs:ada.html", false, page);
+
+        assertThat(sink.reported).containsExactly(
+            new Reported("publish", "docs:ada.html", "Ada runs Acme.", 5L));
+    }
 }

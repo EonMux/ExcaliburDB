@@ -63,6 +63,10 @@ class HttpSourceFetchPolicyTest {
         server.createContext("/undeclared.html", exchange ->
             respond(exchange, "text/html", "Café Ada", StandardCharsets.UTF_8));
 
+        server.createContext("/page.xhtml", exchange -> respond(exchange,
+            "application/xhtml+xml", "<html xmlns=\"http://www.w3.org/1999/xhtml\"><p>Ada</p></html>",
+            StandardCharsets.UTF_8));
+
         server.createContext("/binary.bin", exchange ->
             respond(exchange, "application/octet-stream", "not text", StandardCharsets.UTF_8));
 
@@ -153,6 +157,17 @@ class HttpSourceFetchPolicyTest {
             assertThatThrownBy(() -> source.fetch(baseUrl + "/binary.bin"))
                 .isInstanceOf(SourceException.class)
                 .hasMessageContaining("Content type not accepted");
+        }
+    }
+
+    @Test
+    @DisplayName("an XHTML page is fetched when no filter is configured")
+    void xhtmlIsAcceptedByDefault() throws Exception {
+        // XHTML is followed for links and reduced to its text like HTML, so refusing it by
+        // default would leave the pages the walk reached through it unindexed.
+        try (HttpSource source = source(b -> b)) {
+            assertThat(source.fetch(baseUrl + "/page.xhtml").getContentType())
+                .isEqualTo("application/xhtml+xml");
         }
     }
 

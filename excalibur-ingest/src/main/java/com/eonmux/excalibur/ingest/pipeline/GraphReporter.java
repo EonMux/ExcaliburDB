@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
 import com.eonmux.excalibur.ingest.graph.GraphIngestSink;
+import com.eonmux.excalibur.ingest.processor.TextContent;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -199,8 +200,8 @@ final class GraphReporter {
      * documentation.</p>
      *
      * @param publication What {@link #published} or {@link #removed} returned
-     * @param doc         The fetched document, decoded with the encoding its source declared;
-     *                    null for a removal, which has no content
+     * @param doc         The fetched document, whose text is decoded the way it was for
+     *                    chunking; null for a removal, which has no content
      * @throws IllegalArgumentException if a published version comes without its document
      */
     void report(Publication publication, FetchedDocument doc) {
@@ -236,11 +237,13 @@ final class GraphReporter {
         String documentKey = publication.documentKey;
         try {
             // With the document's own date, which is what its facts are ordered by when a later
-            // document gives a single-valued relation a different value.
+            // document gives a single-valued relation a different value. The text is the one
+            // that was chunked, markup stripped, so facts are extracted from what the document
+            // says rather than from its tags.
             switch (publication.change) {
-                case PUBLISHED -> sink.onDocumentPublished(documentKey, doc.getText(),
+                case PUBLISHED -> sink.onDocumentPublished(documentKey, TextContent.decode(doc),
                     doc.getLastModifiedMillis());
-                case REPLACED -> sink.onDocumentReplaced(documentKey, doc.getText(),
+                case REPLACED -> sink.onDocumentReplaced(documentKey, TextContent.decode(doc),
                     doc.getLastModifiedMillis());
                 case REMOVED -> sink.onDocumentRemoved(documentKey);
             }

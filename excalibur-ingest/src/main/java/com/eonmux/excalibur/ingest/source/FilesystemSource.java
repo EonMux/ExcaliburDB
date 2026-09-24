@@ -78,6 +78,7 @@ public class FilesystemSource implements Source {
         Map.entry(".md", "text/markdown"),
         Map.entry(".html", "text/html"),
         Map.entry(".htm", "text/html"),
+        Map.entry(".xhtml", "application/xhtml+xml"),
         Map.entry(".css", "text/css"),
         Map.entry(".csv", "text/csv"),
         Map.entry(".json", "application/json"),

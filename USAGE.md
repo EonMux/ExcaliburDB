@@ -1096,6 +1096,11 @@ crawl root holding those beside its documents is ordinary, not broken. A source 
 fewer documents than the directory holds, with `last_error` null, is answered by this number.
 Narrow `included_extensions` if you want those files never read in the first place.
 
+An HTML or XHTML document — a response served as `text/html` or `application/xhtml+xml`, or a
+`.html`, `.htm` or `.xhtml` file — is indexed by the text it shows: tags and comments are removed,
+`script` and `style` contents dropped, character references decoded, and block boundaries kept as
+line breaks so neighbouring words do not run together. Every other type is indexed as it reads.
+
 Every run rewrites it, including a re-crawl — the scheduled one and `POST /v1/reindex` alike — so
 it describes what the root holds now and not what it held the first time the node walked it. A
 run that lists no documents at all sets it back to zero too.
@@ -1190,7 +1195,7 @@ registration to record a namespace in. `POST /v1/erasure` withdraws them from th
 | `documents` | array | yes | 1 to 256 documents |
 | `documents[].document_id` | string | yes | Names the document within its source. Posting the same id again replaces what the node holds under it; see below |
 | `documents[].text` | string | yes | The document's text. Empty is refused rather than indexed, because it would produce no chunks and be reported as ingested while being unfindable. Text that is not text — one carrying U+0000, which a crawl treats as the mark of a binary file — is refused for the same reason |
-| `documents[].content_type` | string | no | Defaults to `text/plain` |
+| `documents[].content_type` | string | no | Defaults to `text/plain`. `text/html` or `application/xhtml+xml` indexes the text the markup shows rather than the markup — tags, scripts and styles stripped, character references decoded — the same as for a crawled page |
 | `documents[].last_modified_millis` | int | no | Epoch millis; `0` when unknown |
 
 Re-posting a `document_id` is how a supplied document is updated. The new version is written and

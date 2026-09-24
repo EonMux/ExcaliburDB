@@ -262,7 +262,8 @@ public class HttpSource implements Source {
         this.includedPathPatterns = Set.copyOf(builder.includedPathPatterns);
         this.excludedPathPatterns = Set.copyOf(builder.excludedPathPatterns);
         this.includedContentTypes = builder.includedContentTypes.isEmpty()
-            ? Set.of("text/html", "text/plain", "text/markdown", "application/json", "application/xml")
+            ? Set.of("text/html", "application/xhtml+xml", "text/plain", "text/markdown",
+                "application/json", "application/xml")
             : Set.copyOf(normalizeContentTypes(builder.includedContentTypes));
         this.maxDepth = Math.max(0, builder.maxDepth);
         this.maxDocuments = Math.max(1, builder.maxDocuments);

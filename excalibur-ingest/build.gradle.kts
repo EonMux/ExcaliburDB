@@ -35,4 +35,8 @@ dependencies {
     // Lucene BM25 over ingested chunks. Retrieval owns the Lucene wrapper; ingestion
     // writes into it as documents are stored.
     api(project(":excalibur-retrieval"))
+    // HTML and XHTML documents are indexed by the text they show. Lucene's HTML char filter
+    // parses markup to the specification, drops script and style bodies and decodes character
+    // references, which a pattern over the raw page does not.
+    implementation("org.apache.lucene:lucene-analysis-common:10.5.1")
 }

@@ -181,6 +181,24 @@ class DocumentReindexerTest {
         }
 
         @Test
+        @DisplayName("A re-crawled HTML page is indexed by its text, not its markup")
+        void htmlIsReindexedAsText() {
+            DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
+                upsertHandler, registry, storageWriter);
+            FetchedDocument fetched = new FetchedDocument("page.html",
+                ("<html><head><script>beacon()</script></head>"
+                    + "<body><p>Lovelace &amp; Babbage</p></body></html>")
+                    .getBytes(StandardCharsets.UTF_8),
+                "text/html", System.currentTimeMillis());
+
+            DocumentReindexer.DocumentResult result = reindexer.reindexDocument(
+                "test-source", "page.html", fetched);
+
+            assertTrue(result.isSuccess());
+            assertEquals(List.of("Lovelace & Babbage"), List.copyOf(storageWriter.chunks.values()));
+        }
+
+        @Test
         @DisplayName("Should handle empty document content")
         void testEmptyContent() {
             DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient, 

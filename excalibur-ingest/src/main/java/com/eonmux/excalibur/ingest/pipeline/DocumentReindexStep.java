@@ -295,7 +295,8 @@ final class DocumentReindexStep {
         // The same gate the first crawl applies. Without it a re-crawl is the way binary
         // content gets into an index that refused it once: a source is crawled by
         // DocumentIngestor only the first time, and by this step on every pass after it.
-        String text = TextContent.decode(content, fetched.getCharset());
+        String text = TextContent.decode(content, fetched.getCharset(),
+            fetched.getContentType());
         if (text == null) {
             LOG.info("Skipping document {}: its {} bytes are not text in {}",
                 documentId, content.length, fetched.getCharset());

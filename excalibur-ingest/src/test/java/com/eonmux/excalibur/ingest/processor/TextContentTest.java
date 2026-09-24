@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.ingest.processor;
 
+import com.eonmux.excalibur.ingest.source.FetchedDocument;
+
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -73,6 +75,62 @@ class TextContentTest {
 
             assertThat(decoded).isNotNull();
             assertThat(decoded).contains("Gen").contains("ve.");
+        }
+    }
+
+    @Nested
+    @DisplayName("Markup is reduced to its text")
+    class MarkupIsReduced {
+
+        private static final String PAGE =
+            "<html><head><script>track()</script></head><body><p>Ada &amp; Charles</p></body></html>";
+
+        @Test
+        @DisplayName("An HTML document is indexed by its words, not its tags")
+        void htmlIsExtracted() {
+            byte[] content = PAGE.getBytes(StandardCharsets.UTF_8);
+
+            assertThat(TextContent.decode(content, StandardCharsets.UTF_8, "text/html; charset=utf-8"))
+                .isEqualTo("Ada & Charles");
+        }
+
+        @Test
+        @DisplayName("An XHTML document is too")
+        void xhtmlIsExtracted() {
+            byte[] content = PAGE.getBytes(StandardCharsets.UTF_8);
+
+            assertThat(TextContent.decode(content, StandardCharsets.UTF_8, "application/xhtml+xml"))
+                .isEqualTo("Ada & Charles");
+        }
+
+        @Test
+        @DisplayName("A fetched document is decoded by its own content type and encoding")
+        void fetchedDocumentIsExtracted() {
+            FetchedDocument document = new FetchedDocument("page.html",
+                "<p>Café</p>".getBytes(StandardCharsets.ISO_8859_1), "text/html",
+                StandardCharsets.ISO_8859_1, 0L);
+
+            assertThat(TextContent.decode(document)).isEqualTo("Café");
+        }
+
+        @Test
+        @DisplayName("Any other type keeps its angle brackets: they are its content")
+        void otherTypesAreLeftAlone() {
+            byte[] content = PAGE.getBytes(StandardCharsets.UTF_8);
+
+            assertThat(TextContent.decode(content, StandardCharsets.UTF_8, "text/plain"))
+                .isEqualTo(PAGE);
+            assertThat(TextContent.decode(content, StandardCharsets.UTF_8, "application/xml"))
+                .isEqualTo(PAGE);
+        }
+
+        @Test
+        @DisplayName("Binary named HTML is still binary")
+        void binaryUnderAnHtmlTypeIsRefused() {
+            // Judged before the markup is stripped: stripping would drop the angle brackets a
+            // PNG happens to contain and could leave too little behind for either rule to see.
+            assertThat(TextContent.decode(PNG_PREFIX, StandardCharsets.UTF_8, "text/html"))
+                .isNull();
         }
     }
 

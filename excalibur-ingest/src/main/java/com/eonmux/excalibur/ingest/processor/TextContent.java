@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.ingest.processor;
 
+import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.TextEncoding;
 
 import java.nio.charset.Charset;
@@ -36,6 +37,13 @@ import java.util.Objects;
  * text that is about to be chunked, embedded and written, and a prefix window would pass a text
  * header with a blob appended to it - which is exactly what most binary formats are.</p>
  *
+ * <h2>Markup</h2>
+ * <p>A document whose content type is HTML or XHTML is reduced to the text it shows once it has
+ * passed both rules; see {@link HtmlText}. The rules are applied to the characters as decoded,
+ * before the markup goes, because stripping first would remove the angle brackets a binary file
+ * happens to contain and judge what little was left. Every other type is indexed as it reads,
+ * angle brackets included: in XML, Markdown or source code they are content.</p>
+ *
  * @author ExcaliburDB
  */
 public final class TextContent {
@@ -59,7 +67,9 @@ public final class TextContent {
      * Decodes a document's bytes as text, or reports that they are not text.
      *
      * <p>A byte-order mark the content opens with is dropped rather than kept as the first
-     * character; see {@link TextEncoding#decode}.</p>
+     * character; see {@link TextEncoding#decode}. The characters are returned as they read,
+     * markup included; a document with a content type goes through
+     * {@link #decode(byte[], Charset, String)}.</p>
      *
      * @param content The bytes the source handed back
      * @param charset The encoding the source declared them to be in
@@ -73,6 +83,40 @@ public final class TextContent {
 
         String text = TextEncoding.decode(content, charset);
         return isText(text) ? text : null;
+    }
+
+    /**
+     * Decodes a document's bytes as text, reducing HTML and XHTML to the text they show.
+     *
+     * <p>This is how every source's documents become the text that is chunked: the encoding is
+     * the one the source declared, the rules are the ones the class describes, and markup is
+     * stripped for the content types {@link HtmlText#isMarkup} names.</p>
+     *
+     * @param content     The bytes the source handed back
+     * @param charset     The encoding the source declared them to be in
+     * @param contentType The content type the source reported, or null when it reported none
+     * @return The document's text, or {@code null} when {@code content} is not text in
+     *         {@code charset}
+     * @throws NullPointerException if content or charset is null
+     */
+    public static String decode(byte[] content, Charset charset, String contentType) {
+        String text = decode(content, charset);
+        if (text == null || !HtmlText.isMarkup(contentType)) {
+            return text;
+        }
+        return HtmlText.extract(text);
+    }
+
+    /**
+     * Decodes a fetched document by the encoding and content type its source reported.
+     *
+     * @param document What the source handed back
+     * @return The document's text, or {@code null} when it is not text
+     * @throws NullPointerException if document is null
+     */
+    public static String decode(FetchedDocument document) {
+        Objects.requireNonNull(document, "document must not be null");
+        return decode(document.getContent(), document.getCharset(), document.getContentType());
     }
 
     /**

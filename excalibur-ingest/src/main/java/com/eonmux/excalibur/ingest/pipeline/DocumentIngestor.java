@@ -174,8 +174,9 @@ final class DocumentIngestor {
         // lists every file under its root, so this is also where a PNG is told from a document:
         // decoded leniently it is kilobytes of replacement characters, and left unchecked those
         // are chunked, term-indexed, paid for at the embedding endpoint and returned as a search
-        // result.
-        String text = TextContent.decode(doc.getContent(), doc.getCharset());
+        // result. An HTML page is reduced to the text it shows here too, so its tags and scripts
+        // are not indexed as though they were its words.
+        String text = TextContent.decode(doc);
         if (text == null) {
             LOGGER.info("Skipping document {}: its {} bytes are not text in {}",
                 documentId, doc.getContentLength(), doc.getCharset());
