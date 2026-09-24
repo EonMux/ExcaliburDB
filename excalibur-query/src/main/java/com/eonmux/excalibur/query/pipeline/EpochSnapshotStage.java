@@ -16,12 +16,14 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 
 /**
  * Stage 0: Capture visibility epoch and resolve queryable segments.
  *
- * <p>This stage captures a consistent snapshot of segment visibility
- * at the current epoch using {@link QuerySnapshot#capture}. All subsequent
+ * <p>This stage captures a consistent snapshot of segment visibility at the current epoch using
+ * {@link QuerySnapshot#capture}, or at the epoch the request fixed
+ * ({@link QueryRequest#readEpoch()}) using {@link QuerySnapshot#atEpoch}. All subsequent
  * stages operate on this snapshot.</p>
  */
 final class EpochSnapshotStage {
@@ -52,8 +54,13 @@ final class EpochSnapshotStage {
 
         LOGGER.trace("Stage 0: Capturing epoch snapshot");
 
-        // Capture visibility snapshot using QuerySnapshot
-        QuerySnapshot snapshot = QuerySnapshot.capture(visibilityTracker, storageEngine.getCatalog(), storageEngine);
+        // At the epoch the caller fixed, when it answers from another index beside this one and
+        // both halves have to read the same moment; otherwise at the epoch current now.
+        OptionalLong pinned = request.readEpoch();
+        QuerySnapshot snapshot = pinned.isPresent()
+            ? QuerySnapshot.atEpoch(pinned.getAsLong(), visibilityTracker,
+                storageEngine.getCatalog(), storageEngine)
+            : QuerySnapshot.capture(visibilityTracker, storageEngine.getCatalog(), storageEngine);
 
         Admissions admissions = admitVisibleSegments(snapshot, request);
 

@@ -24,6 +24,7 @@ import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -50,7 +51,7 @@ class QueryResultCacheEndpointTest {
     @BeforeEach
     void setUp() {
         queryPipeline = mock(QueryPipeline.class);
-        when(queryPipeline.corpusVersion()).thenReturn(V1);
+        when(queryPipeline.corpusVersion(anyLong())).thenReturn(V1);
         when(queryPipeline.execute(any(QueryRequest.class), any(CancellationToken.class)))
             .thenAnswer(invocation -> CompletableFuture.completedFuture(healthy()));
 
@@ -96,7 +97,7 @@ class QueryResultCacheEndpointTest {
     @DisplayName("a repeated query is not served once the corpus has moved")
     void corpusChangeSendsTheQueryBackToThePipeline() throws IOException {
         endpoint.handle(exchange("{\"query\": \"compaction\", \"top_k\": 5}"));
-        when(queryPipeline.corpusVersion()).thenReturn(V2);
+        when(queryPipeline.corpusVersion(anyLong())).thenReturn(V2);
         endpoint.handle(exchange("{\"query\": \"compaction\", \"top_k\": 5}"));
 
         verify(queryPipeline, times(2))
@@ -106,7 +107,7 @@ class QueryResultCacheEndpointTest {
     @Test
     @DisplayName("a corpus that cannot be fingerprinted is never answered from cache")
     void unreadableCorpusDisablesTheCache() throws IOException {
-        when(queryPipeline.corpusVersion()).thenReturn(CorpusVersion.UNREADABLE);
+        when(queryPipeline.corpusVersion(anyLong())).thenReturn(CorpusVersion.UNREADABLE);
         endpoint.handle(exchange("{\"query\": \"compaction\", \"top_k\": 5}"));
         endpoint.handle(exchange("{\"query\": \"compaction\", \"top_k\": 5}"));
 
@@ -174,7 +175,7 @@ class QueryResultCacheEndpointTest {
         QueryEndpoint uncached = new QueryEndpoint(plain, null, null, null, embeddings);
         uncached.handle(exchange("{\"query\": \"compaction\", \"top_k\": 5}"));
 
-        verify(plain, never()).corpusVersion();
+        verify(plain, never()).corpusVersion(anyLong());
     }
 
     @Test

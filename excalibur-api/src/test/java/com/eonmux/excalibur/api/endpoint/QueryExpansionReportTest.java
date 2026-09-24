@@ -29,6 +29,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -70,7 +71,7 @@ class QueryExpansionReportTest {
         endpoint.setLexicalQueryService(new LexicalQueryService(index, expander, List.of()));
         endpoint.setChunkText(Map.of(CHUNK_ID, PASSAGE)::get);
         endpoint.setQueryResultCache(cache);
-        when(queryPipeline.corpusVersion()).thenReturn(new CorpusVersion(3L, 0xABCDL, 2));
+        when(queryPipeline.corpusVersion(anyLong())).thenReturn(new CorpusVersion(3L, 0xABCDL, 2));
         return endpoint;
     }
 

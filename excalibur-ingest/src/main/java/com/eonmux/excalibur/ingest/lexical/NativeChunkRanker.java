@@ -20,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.LongSupplier;
 import java.util.function.Predicate;
 
 /**
@@ -43,6 +44,12 @@ import java.util.function.Predicate;
  * the same dictionaries the search reads rather than against an approximate filter. The user's own
  * query is never gated: it is what was asked, and a query for words the corpus lacks must return
  * nothing rather than quietly become a different query.</p>
+ *
+ * <h2>One epoch per ranking</h2>
+ * <p>The gate and the search read the corpus at one epoch, read once per ranking - or fixed for
+ * every ranking of a search, when the ranker came from a {@link ChunkIndex.View} - so a
+ * formulation is never kept because a term was published between the two reads, and a deeper
+ * ranking reads the postings the first one read.</p>
  */
 public final class NativeChunkRanker implements Ranker {
 
@@ -56,14 +63,15 @@ public final class NativeChunkRanker implements Ranker {
     /** Whether a chunk, by its id, may be returned; null admits every chunk. */
     private final Predicate<String> admits;
 
-    NativeChunkRanker(NativeChunkIndex index, QueryExpander expander) {
-        this(index, expander, null);
-    }
+    /** The visibility epoch a ranking reads at, read once as it starts. */
+    private final LongSupplier epoch;
 
-    NativeChunkRanker(NativeChunkIndex index, QueryExpander expander, Predicate<String> admits) {
+    NativeChunkRanker(NativeChunkIndex index, QueryExpander expander, Predicate<String> admits,
+                      LongSupplier epoch) {
         this.index = Objects.requireNonNull(index, "index must not be null");
         this.expander = expander == null ? QueryExpander.identity() : expander;
         this.admits = admits;
+        this.epoch = Objects.requireNonNull(epoch, "epoch must not be null");
     }
 
     @Override
@@ -90,8 +98,9 @@ public final class NativeChunkRanker implements Ranker {
             return RankedList.empty(NAME);
         }
 
+        long readEpoch = epoch.getAsLong();
         try {
-            Map<String, Double> weighted = flatten(formulations);
+            Map<String, Double> weighted = flatten(formulations, readEpoch);
             if (weighted.isEmpty()) {
                 return RankedList.empty(NAME);
             }
@@ -104,7 +113,7 @@ public final class NativeChunkRanker implements Ranker {
                 at++;
             }
 
-            List<LexicalStore.Hit> hits = index.search(terms, weights, limit, admits);
+            List<LexicalStore.Hit> hits = index.search(terms, weights, limit, readEpoch, admits);
             List<ScoredDocument> results = new ArrayList<>(hits.size());
             for (LexicalStore.Hit hit : hits) {
                 results.add(new ScoredDocument(index.remember(hit.key()), hit.score()));
@@ -116,9 +125,10 @@ public final class NativeChunkRanker implements Ranker {
     }
 
     /** Turns formulations into one weighted term set, dropping generated ones the corpus lacks. */
-    private Map<String, Double> flatten(List<SearchFormulation> formulations) throws IOException {
+    private Map<String, Double> flatten(List<SearchFormulation> formulations, long readEpoch)
+            throws IOException {
         List<SearchFormulation> searchable =
-            ExpansionWeights.bounded(corpusKnows(formulations), Tokens::of);
+            ExpansionWeights.bounded(corpusKnows(formulations, readEpoch), Tokens::of);
         Map<String, Double> weighted = new LinkedHashMap<>();
         for (SearchFormulation formulation : searchable) {
             for (String token : Tokens.of(formulation.text())) {
@@ -137,17 +147,18 @@ public final class NativeChunkRanker implements Ranker {
      * against.</p>
      *
      * @param formulations What the expander produced, the original first
+     * @param readEpoch    The epoch whose published segments the terms are looked up in
      * @return The survivors, the original still first
      * @throws IOException if the term dictionary cannot be read
      */
-    private List<SearchFormulation> corpusKnows(List<SearchFormulation> formulations)
+    private List<SearchFormulation> corpusKnows(List<SearchFormulation> formulations, long readEpoch)
             throws IOException {
         List<SearchFormulation> kept = new ArrayList<>(formulations.size());
         kept.add(formulations.get(0));
         for (int i = 1; i < formulations.size(); i++) {
             SearchFormulation formulation = formulations.get(i);
             List<String> tokens = Tokens.of(formulation.text());
-            if (tokens.isEmpty() || !anyKnown(tokens)) {
+            if (tokens.isEmpty() || !anyKnown(tokens, readEpoch)) {
                 LOGGER.debug("Dropping '{}': no term of it occurs in the corpus",
                     formulation.text());
                 continue;
@@ -157,9 +168,9 @@ public final class NativeChunkRanker implements Ranker {
         return kept;
     }
 
-    private boolean anyKnown(List<String> tokens) throws IOException {
+    private boolean anyKnown(List<String> tokens, long readEpoch) throws IOException {
         for (String token : tokens) {
-            if (index.knowsTerm(token)) {
+            if (index.knowsTerm(token, readEpoch)) {
                 return true;
             }
         }

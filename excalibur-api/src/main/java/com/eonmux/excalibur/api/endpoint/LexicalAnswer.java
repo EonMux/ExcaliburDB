@@ -250,8 +250,11 @@ final class LexicalAnswer {
         // Fingerprinted before the search and stored against afterwards, for the same reason
         // the vector route does: a chunk published while this query ran must not make a
         // pre-publication answer look current.
+        // And at one epoch, which the search reads at too, so the fingerprint describes the
+        // postings the answer was ranked from.
+        long epoch = queryPipeline.captureEpoch();
         QueryCacheLookup lookup = QueryCacheLookup.of(cache, queryPipeline, lexical,
-            QueryResponseJson.LEXICAL, parsed, context, exchange);
+            QueryResponseJson.LEXICAL, epoch, parsed, context, exchange);
         LexicalResponse held = lookup.hit(LexicalResponse.class);
         if (held != null) {
             send(exchange, held.withQueryId(queryId)
@@ -268,7 +271,7 @@ final class LexicalAnswer {
         boolean withdrawn;
         try {
             reply = searchAndScore(lexical, lookup, requestBody, parsed, context, plan, queryId,
-                withdrawal.token(), startTime);
+                withdrawal.token(), startTime, epoch);
         } finally {
             withdrawn = withdrawal.close();
         }
@@ -358,19 +361,21 @@ final class LexicalAnswer {
      * @param queryId     The identifier the running query is registered under
      * @param token       Cancels the search and the scoring when the caller withdraws
      * @param startTime   {@link System#nanoTime()} value the request's budget runs from
+     * @param epoch       The visibility epoch the search reads at
      * @return The answer, or the refusal when the search could not produce one
      */
     private QueryReply searchAndScore(LexicalQueryService lexical, QueryCacheLookup lookup,
                                       String requestBody, QueryRequestParser.ParsedQuery parsed,
                                       QueryContext context, RelevancyScoring.Plan plan,
                                       String queryId, CancellationToken token,
-                                      long startTime) {
+                                      long startTime, long epoch) {
         long deadlineNanos = startTime + TimeUnit.MILLISECONDS.toNanos(parsed.timeoutMs());
         int depth = context.depth();
         int candidates = plan.candidates(depth);
         Duration budget = Duration.ofMillis(
             plan.retrievalBudgetMs(Deadline.remainingMillis(deadlineNanos)));
-        Outcome outcome = search(lexical, parsed, candidates, budget, token, deadlineNanos);
+        Outcome outcome = search(lexical, parsed, candidates, budget, epoch, token,
+            deadlineNanos);
         if (outcome.refusal() != null) {
             return outcome.refusal();
         }
@@ -433,11 +438,13 @@ final class LexicalAnswer {
      * @param scope   The sources the search is confined to
      * @param limit   How deep the search ranks
      * @param budget  How long the search has, its query expansion included
+     * @param epoch   The visibility epoch the search reads at
      * @return The running search, or null when it could not be started
      */
     private Future<LexicalQueryService.Ranking> start(LexicalQueryService lexical,
                                                       String query, SourceScope scope,
-                                                      int limit, Duration budget) {
+                                                      int limit, Duration budget,
+                                                      long epoch) {
         // The same node-wide bound the hybrid route takes. This route is the whole answer on a
         // node that does not embed its corpus, so a bound held only by the other route leaves
         // that deployment with none: a BM25 search outlives the request's deadline, and at the
@@ -449,7 +456,7 @@ final class LexicalAnswer {
         try {
             return executorService.submit(() -> {
                 try {
-                    return lexical.retrieve(query, limit, scope, budget);
+                    return lexical.retrieve(query, limit, scope, budget, epoch);
                 } finally {
                     // Released when the search stops, not when the request stops waiting for
                     // it. Releasing at the call site would let abandoned searches pile up
@@ -476,15 +483,16 @@ final class LexicalAnswer {
      * @param parsed        The validated request
      * @param limit         How deep the search ranks
      * @param budget        How long the search has, its query expansion included
+     * @param epoch         The visibility epoch the search reads at
      * @param token         Cancels the search when the caller withdraws the request
      * @param deadlineNanos {@link System#nanoTime()} value the request must finish by
      * @return What the search produced, or the refusal when it produced nothing to answer with
      */
     private Outcome search(LexicalQueryService lexical, QueryRequestParser.ParsedQuery parsed,
-                           int limit, Duration budget, CancellationToken token,
+                           int limit, Duration budget, long epoch, CancellationToken token,
                            long deadlineNanos) {
         Future<LexicalQueryService.Ranking> pending = start(lexical, parsed.query(),
-            parsed.sourceScope(), limit, budget);
+            parsed.sourceScope(), limit, budget, epoch);
         if (pending == null) {
             return Outcome.refused(QueryReply.error(503, ErrorCode.SATURATED,
                 "Query service is saturated"));

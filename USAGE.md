@@ -2148,9 +2148,11 @@ fingerprint move exactly when an answer would.
 Vector, hybrid and lexical answers are all cached, after relevancy scoring, keyed on everything
 that changes the answer — the query, the route, the depth and every scoring and filtering field.
 A lexical or hybrid answer is fingerprinted twice: the segments as above, and the lexical index as
-a search started now would see it — the manifest entries visible at the query epoch on the native
-engine, the reader version on Lucene — so an epoch crossing a manifest entry discards it like any
-other change.
+the search sees it — the manifest entries visible at the query's epoch on the native engine, the
+reader version on Lucene — so an epoch crossing a manifest entry discards it like any other change.
+The query captures one epoch when it arrives, and the fingerprints, the vector half and every BM25
+ranking all read at it, so an answer is stored under the corpus it was computed from even when a
+publication lands while it runs.
 
 Three things are deliberately never cached:
 

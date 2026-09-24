@@ -31,7 +31,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -65,7 +67,7 @@ class QueryEndpointRelevancyTest extends QueryEndpointTestBase {
     @BeforeEach
     void setUpLexical() {
         lexical = mock(LexicalQueryService.class);
-        when(lexical.retrieve(anyString(), anyInt(), any(), any())).thenAnswer(invocation -> {
+        when(lexical.retrieve(anyString(), anyInt(), any(), any(), anyLong())).thenAnswer(invocation -> {
             int limit = invocation.getArgument(1);
             searchedDepths.add(limit);
             List<LexicalQueryService.Hit> hits = new ArrayList<>();
@@ -76,8 +78,8 @@ class QueryEndpointRelevancyTest extends QueryEndpointTestBase {
         });
         when(lexical.stats()).thenReturn(STATS);
         when(lexical.rrfK()).thenReturn(60);
-        when(lexical.searchVersion()).thenReturn(OptionalLong.of(1L));
-        when(queryPipeline.corpusVersion()).thenReturn(V1);
+        when(lexical.searchVersion(anyLong())).thenReturn(OptionalLong.of(1L));
+        when(queryPipeline.corpusVersion(anyLong())).thenReturn(V1);
     }
 
     /** A model that judges the candidates it has a verdict for and leaves the rest alone. */
@@ -227,7 +229,7 @@ class QueryEndpointRelevancyTest extends QueryEndpointTestBase {
             node.setQueryResultCache(new QueryResultCache(16));
 
             ask(node, "{\"query\": \"q\", \"top_k\": 2}");
-            when(lexical.searchVersion()).thenReturn(OptionalLong.of(2L));
+            when(lexical.searchVersion(anyLong())).thenReturn(OptionalLong.of(2L));
             String second = ask(node, "{\"query\": \"q\", \"top_k\": 2}");
 
             assertThat(searchedDepths).hasSize(2);
@@ -237,7 +239,7 @@ class QueryEndpointRelevancyTest extends QueryEndpointTestBase {
         @Test
         @DisplayName("is never cached by an index that cannot say what it would read")
         void neverCachedWithoutAVersion() throws IOException {
-            when(lexical.searchVersion()).thenReturn(OptionalLong.empty());
+            when(lexical.searchVersion(anyLong())).thenReturn(OptionalLong.empty());
             QueryEndpoint node = lexicalNode(null);
             node.setQueryResultCache(new QueryResultCache(16));
 
@@ -250,7 +252,7 @@ class QueryEndpointRelevancyTest extends QueryEndpointTestBase {
         @Test
         @DisplayName("is never cached by an index whose version cannot be read at all")
         void neverCachedWhenTheVersionThrows() throws IOException {
-            when(lexical.searchVersion()).thenThrow(new IllegalStateException("closed"));
+            when(lexical.searchVersion(anyLong())).thenThrow(new IllegalStateException("closed"));
             QueryEndpoint node = lexicalNode(null);
             node.setQueryResultCache(new QueryResultCache(16));
 
@@ -323,7 +325,7 @@ class QueryEndpointRelevancyTest extends QueryEndpointTestBase {
             node.setQueryResultCache(new QueryResultCache(16));
 
             ask(node, "{\"query\": \"q\", \"top_k\": 2}");
-            when(lexical.searchVersion()).thenReturn(OptionalLong.of(7L));
+            when(lexical.searchVersion(anyLong())).thenReturn(OptionalLong.of(7L));
             ask(node, "{\"query\": \"q\", \"top_k\": 2}");
 
             verify(queryPipeline, times(2))
@@ -335,7 +337,7 @@ class QueryEndpointRelevancyTest extends QueryEndpointTestBase {
             + "and not cached under the fused key")
         void vectorAloneWhenBm25Fails() throws IOException {
             ArgumentCaptor<QueryRequest> asked = pipelineAnswersAsAsked();
-            when(lexical.retrieve(anyString(), anyInt(), any(), any()))
+            when(lexical.retrieve(anyString(), anyInt(), any(), any(), anyLong()))
                 .thenThrow(new IllegalStateException("index closed"));
             QueryEndpoint node = hybridNode(judging(Map.of("d4", 0.97f)));
             node.setQueryResultCache(new QueryResultCache(16));
@@ -450,6 +452,50 @@ class QueryEndpointRelevancyTest extends QueryEndpointTestBase {
 
             assertThat(json).contains("\"llm_scored\": false")
                 .contains("\"ignored_fields\": [\"enable_llm_scoring\"]");
+        }
+    }
+
+    /**
+     * A fused answer puts two rankings side by side, and a cached one is replayed against a
+     * fingerprint: all of it describes one answer only if every part read one moment of the
+     * corpus. The epoch is captured once, and every reader is handed that epoch rather than
+     * reading the clock again.
+     */
+    @Nested
+    @DisplayName("one epoch per request")
+    class OneEpoch {
+
+        private static final long EPOCH = 42L;
+
+        @Test
+        @DisplayName("the vector half, the BM25 half and the fingerprint read the same epoch")
+        void aFusedAnswerReadsOneEpoch() throws IOException {
+            when(queryPipeline.captureEpoch()).thenReturn(EPOCH);
+            ArgumentCaptor<QueryRequest> asked = pipelineAnswersAsAsked();
+            QueryEndpoint node = hybridNode(null);
+            node.setQueryResultCache(new QueryResultCache(16));
+
+            ask(node, "{\"query\": \"q\", \"top_k\": 2}");
+
+            assertThat(asked.getValue().readEpoch()).hasValue(EPOCH);
+            verify(lexical).retrieve(anyString(), anyInt(), any(), any(), eq(EPOCH));
+            verify(queryPipeline).corpusVersion(EPOCH);
+            verify(lexical).searchVersion(EPOCH);
+            verify(queryPipeline, times(1)).captureEpoch();
+        }
+
+        @Test
+        @DisplayName("a BM25 answer and its fingerprint read the same epoch")
+        void aLexicalAnswerReadsOneEpoch() throws IOException {
+            when(queryPipeline.captureEpoch()).thenReturn(EPOCH);
+            QueryEndpoint node = lexicalNode(null);
+            node.setQueryResultCache(new QueryResultCache(16));
+
+            ask(node, "{\"query\": \"q\", \"top_k\": 2}");
+
+            verify(lexical).retrieve(anyString(), anyInt(), any(), any(), eq(EPOCH));
+            verify(queryPipeline).corpusVersion(EPOCH);
+            verify(lexical).searchVersion(EPOCH);
         }
     }
 }

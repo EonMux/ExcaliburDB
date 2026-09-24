@@ -67,11 +67,13 @@ public final class LexicalSignal {
      *                 returned, and the service already over-fetches internally so the list is
      *                 not thinned by hits whose ids no longer resolve.
      * @param budget   How long the request leaves the search, its query expansion included
+     * @param epoch    The visibility epoch the search reads the index at - the one the vector
+     *                 half reads at, so both halves of the answer read one corpus
      * @return The running search, or null when only the other signal will answer
      */
     public static LexicalSignal start(LexicalQueryService service, ExecutorService executor,
                                       String query, SourceScope scope, int limit,
-                                      Duration budget) {
+                                      Duration budget, long epoch) {
         if (service == null || executor == null) {
             return null;
         }
@@ -82,7 +84,7 @@ public final class LexicalSignal {
         try {
             return new LexicalSignal(service, executor.submit(() -> {
                 try {
-                    return service.retrieve(query, limit, scope, budget);
+                    return service.retrieve(query, limit, scope, budget, epoch);
                 } finally {
                     LexicalSearchPermits.release();
                 }

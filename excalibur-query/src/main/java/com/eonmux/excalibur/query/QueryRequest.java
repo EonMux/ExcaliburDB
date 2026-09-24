@@ -5,6 +5,7 @@ import com.eonmux.excalibur.core.text.SourceScope;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.OptionalLong;
 
 /**
  * Request object for executing ANN queries.
@@ -55,6 +56,9 @@ public final class QueryRequest {
      * results is far beyond any realistic top-k query.</p>
      */
     public static final int MAX_TOP_K = 10_000;
+
+    /** The read epoch of a request whose caller fixed none. */
+    private static final long UNPINNED = -1L;
 
     // ==================== Instance Fields ====================
 
@@ -131,6 +135,12 @@ public final class QueryRequest {
      */
     private final SourceScope sourceScope;
 
+    /**
+     * The visibility epoch the search reads at, or {@code UNPINNED} to read at the epoch
+     * current when it starts.
+     */
+    private final long readEpoch;
+
     // ==================== Constructors ====================
 
     private QueryRequest(Builder builder) {
@@ -149,6 +159,7 @@ public final class QueryRequest {
         this.requireNamedResults = builder.requireNamedResults;
         this.maxSearchDepth = builder.maxSearchDepth;
         this.sourceScope = builder.sourceScope;
+        this.readEpoch = builder.readEpoch;
 
         validate();
     }
@@ -400,6 +411,20 @@ public final class QueryRequest {
         return sourceScope;
     }
 
+    /**
+     * The visibility epoch this search reads at, when its caller fixed one.
+     *
+     * <p>A caller answering one question from more than one index - the vector pipeline and the
+     * chunk index beside it - captures one epoch and hands it to both, so the two halves of the
+     * answer read the same moment of the corpus, and so does the fingerprint its cache entry is
+     * stored under. Unset, the search captures the epoch current when it starts.</p>
+     *
+     * @return The epoch, or empty to read at the epoch current when the search starts
+     */
+    public OptionalLong readEpoch() {
+        return readEpoch == UNPINNED ? OptionalLong.empty() : OptionalLong.of(readEpoch);
+    }
+
     // ==================== Object Methods ====================
 
     @Override
@@ -417,6 +442,7 @@ public final class QueryRequest {
             requireNamedResults == that.requireNamedResults &&
             maxSearchDepth == that.maxSearchDepth &&
             sourceScope.equals(that.sourceScope) &&
+            readEpoch == that.readEpoch &&
             Objects.equals(queryText, that.queryText) &&
             Arrays.equals(queryVector, that.queryVector) &&
             Objects.equals(correlationId, that.correlationId);
@@ -426,7 +452,8 @@ public final class QueryRequest {
     public int hashCode() {
         int result = Objects.hash(queryText, topK, timeoutMs,
             includePartialSegments, threshold, enableLlmScoring, llmThreshold,
-            oversamplingFactor, correlationId, requireNamedResults, maxSearchDepth, sourceScope);
+            oversamplingFactor, correlationId, requireNamedResults, maxSearchDepth, sourceScope,
+            readEpoch);
         result = 31 * result + Arrays.hashCode(queryVector);
         return result;
     }
@@ -459,6 +486,7 @@ public final class QueryRequest {
         private boolean requireNamedResults;
         private int maxSearchDepth = MAX_TOP_K;
         private SourceScope sourceScope = SourceScope.ALL;
+        private long readEpoch = UNPINNED;
 
         private Builder() {}
 
@@ -640,6 +668,22 @@ public final class QueryRequest {
          */
         public Builder sourceScope(SourceScope sourceScope) {
             this.sourceScope = Objects.requireNonNull(sourceScope, "sourceScope must not be null");
+            return this;
+        }
+
+        /**
+         * Fixes the visibility epoch the search reads at.
+         *
+         * @param epoch The epoch, as the node's visibility tracker captured it
+         * @return This builder
+         * @throws IllegalArgumentException if epoch is negative
+         * @see QueryRequest#readEpoch()
+         */
+        public Builder readEpoch(long epoch) {
+            if (epoch < 0) {
+                throw new IllegalArgumentException("readEpoch must be non-negative: " + epoch);
+            }
+            this.readEpoch = epoch;
             return this;
         }
 

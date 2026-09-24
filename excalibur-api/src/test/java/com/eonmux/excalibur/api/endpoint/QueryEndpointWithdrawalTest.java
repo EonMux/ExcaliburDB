@@ -65,7 +65,7 @@ class QueryEndpointWithdrawalTest extends QueryEndpointTestBase {
     void setUpRegistryAndLexical() {
         registry = new QueryRegistry();
         lexical = mock(LexicalQueryService.class);
-        when(lexical.retrieve(anyString(), anyInt(), any(), any())).thenAnswer(invocation -> {
+        when(lexical.retrieve(anyString(), anyInt(), any(), any(), anyLong())).thenAnswer(invocation -> {
             int limit = invocation.getArgument(1);
             List<LexicalQueryService.Hit> hits = new ArrayList<>();
             for (int i = 0; i < Math.min(limit, 5); i++) {
@@ -75,7 +75,7 @@ class QueryEndpointWithdrawalTest extends QueryEndpointTestBase {
         });
         when(lexical.stats()).thenReturn(STATS);
         when(lexical.rrfK()).thenReturn(60);
-        when(lexical.searchVersion()).thenReturn(OptionalLong.of(1L));
+        when(lexical.searchVersion(anyLong())).thenReturn(OptionalLong.of(1L));
     }
 
     private static QueryResponse dense(int count) {
@@ -179,7 +179,7 @@ class QueryEndpointWithdrawalTest extends QueryEndpointTestBase {
         void lexicalRoute() throws IOException {
             AtomicBoolean searched = new AtomicBoolean();
             AtomicBoolean confirmed = new AtomicBoolean();
-            when(lexical.retrieve(anyString(), anyInt(), any(), any())).thenAnswer(invocation -> {
+            when(lexical.retrieve(anyString(), anyInt(), any(), any(), anyLong())).thenAnswer(invocation -> {
                 searched.set(true);
                 return new LexicalQueryService.Ranking(
                     List.of(new LexicalQueryService.Hit("c0", 0.5)), null);
@@ -275,7 +275,7 @@ class QueryEndpointWithdrawalTest extends QueryEndpointTestBase {
         void failsWhenBm25CannotAnswer() throws IOException {
             when(embeddingClient.embed(anyString(), anyString()))
                 .thenThrow(new LLMException("breaker open", LLMException.ErrorType.CIRCUIT_OPEN));
-            when(lexical.retrieve(anyString(), anyInt(), any(), any()))
+            when(lexical.retrieve(anyString(), anyInt(), any(), any(), anyLong()))
                 .thenThrow(new IllegalStateException("index closed"));
 
             Answer answer = ask(hybridNode(fusionOff()), "{\"query\": \"q\"}");
@@ -307,7 +307,7 @@ class QueryEndpointWithdrawalTest extends QueryEndpointTestBase {
 
             assertThat(answer.json()).contains("\"retrieval\": \"vector\"")
                 .contains("\"timed_out\": true");
-            verify(lexical, never()).retrieve(anyString(), anyInt(), any(), any());
+            verify(lexical, never()).retrieve(anyString(), anyInt(), any(), any(), anyLong());
         }
     }
 

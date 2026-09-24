@@ -68,6 +68,12 @@ public final class ExpandedLexicalRanker implements Ranker {
     /** Whether a document, by its stored key, may be returned; null admits every document. */
     private final Predicate<String> admits;
 
+    /**
+     * The reader every ranking searches, held by the caller for a whole search; null to lease
+     * the reader current when each ranking starts.
+     */
+    private final LexicalIndex.Lease pinned;
+
     public ExpandedLexicalRanker(LexicalIndex index, QueryExpander expander) {
         this(index, expander, "lexical-expanded", VocabularyGate.permissive());
     }
@@ -87,14 +93,17 @@ public final class ExpandedLexicalRanker implements Ranker {
         this.name = Objects.requireNonNull(name, "name must not be null");
         this.vocabulary = Objects.requireNonNull(vocabulary, "vocabulary must not be null");
         this.admits = null;
+        this.pinned = null;
     }
 
-    private ExpandedLexicalRanker(ExpandedLexicalRanker base, Predicate<String> admits) {
+    private ExpandedLexicalRanker(ExpandedLexicalRanker base, Predicate<String> admits,
+                                  LexicalIndex.Lease pinned) {
         this.index = base.index;
         this.expander = base.expander;
         this.name = base.name;
         this.vocabulary = base.vocabulary;
         this.admits = admits;
+        this.pinned = pinned;
     }
 
     /**
@@ -109,7 +118,23 @@ public final class ExpandedLexicalRanker implements Ranker {
      * @return A ranker sharing this one's index, expander, name and gate
      */
     public ExpandedLexicalRanker admitting(Predicate<String> admits) {
-        return admits == this.admits ? this : new ExpandedLexicalRanker(this, admits);
+        return admits == this.admits ? this : new ExpandedLexicalRanker(this, admits, pinned);
+    }
+
+    /**
+     * This ranker, searching only the reader a lease holds.
+     *
+     * <p>For a search that ranks more than once - deeper, past hits it withholds - and must read
+     * one published state throughout: a refresh between two rankings would otherwise fill the
+     * deeper page from a reader the first page was not ranked against. The lease stays the
+     * caller's to close, after the last ranking.</p>
+     *
+     * @param lease The reader to search, open for as long as this ranker is used
+     * @return A ranker sharing this one's index, expander, name, gate and filter
+     */
+    public ExpandedLexicalRanker reading(LexicalIndex.Lease lease) {
+        return new ExpandedLexicalRanker(this, admits,
+            Objects.requireNonNull(lease, "lease must not be null"));
     }
 
     @Override
@@ -245,20 +270,34 @@ public final class ExpandedLexicalRanker implements Ranker {
             return RankedList.empty(name);
         }
 
+        Query scored = builder.build();
+        if (pinned != null) {
+            return search(pinned.searcher(), scored, limit);
+        }
         java.util.Optional<LexicalIndex.Lease> leased = index.tryAcquire();
         if (leased.isEmpty()) {
             return RankedList.empty(name);
         }
         try (LexicalIndex.Lease lease = leased.get()) {
-            IndexSearcher searcher = lease.searcher();
-            Query scored = builder.build();
-            if (admits != null) {
-                scored = new BooleanQuery.Builder()
-                    .add(scored, BooleanClause.Occur.MUST)
-                    .add(new StoredKeyFilterQuery(admits), BooleanClause.Occur.FILTER)
-                    .build();
-            }
-            TopDocs top = searcher.search(scored, limit);
+            return search(lease.searcher(), scored, limit);
+        }
+    }
+
+    /**
+     * Runs the assembled query against one reader, confined to what the filter admits.
+     *
+     * @param searcher The reader to search
+     * @param scored   The boosted query
+     * @param limit    Most documents to return
+     * @return The ranking
+     */
+    private RankedList search(IndexSearcher searcher, Query scored, int limit) {
+        Query confined = admits == null ? scored : new BooleanQuery.Builder()
+            .add(scored, BooleanClause.Occur.MUST)
+            .add(new StoredKeyFilterQuery(admits), BooleanClause.Occur.FILTER)
+            .build();
+        try {
+            TopDocs top = searcher.search(confined, limit);
             StoredFields storedFields = searcher.storedFields();
             List<ScoredDocument> results = new ArrayList<>(top.scoreDocs.length);
             for (ScoreDoc hit : top.scoreDocs) {

@@ -773,9 +773,42 @@ public class QueryPipeline {
      * @return The current corpus fingerprint, never null
      */
     public com.eonmux.excalibur.query.cache.CorpusVersion corpusVersion() {
-        com.eonmux.excalibur.query.cache.CorpusVersion corpus = corpusFingerprint.current();
+        return withVisibilityGeneration(corpusFingerprint.current());
+    }
+
+    /**
+     * A fingerprint of everything a query reading at {@code epoch} would read.
+     *
+     * <p>As {@link #corpusVersion()}, for a request that fixed the epoch it reads at - see
+     * {@link com.eonmux.excalibur.query.QueryRequest#readEpoch()} - so the entry its answer is
+     * stored under describes the corpus the answer was computed from rather than whatever an
+     * epoch advancing in between made visible.</p>
+     *
+     * @param epoch The epoch the request reads at, as {@link #captureEpoch()} returned it
+     * @return The corpus fingerprint at that epoch, never null
+     */
+    public com.eonmux.excalibur.query.cache.CorpusVersion corpusVersion(long epoch) {
+        return withVisibilityGeneration(corpusFingerprint.at(epoch));
+    }
+
+    private com.eonmux.excalibur.query.cache.CorpusVersion withVisibilityGeneration(
+            com.eonmux.excalibur.query.cache.CorpusVersion corpus) {
         DocumentVisibilityChecker checker = visibilityChecker;
         return checker == null ? corpus : corpus.alongside(checker.visibilityGeneration());
+    }
+
+    /**
+     * Captures the visibility epoch a query starting now reads at.
+     *
+     * <p>For a caller that reads more than this pipeline for one answer - the chunk index a
+     * hybrid query fuses with, the fingerprint its cache entry is stored under - and hands the
+     * same epoch to each through {@link com.eonmux.excalibur.query.QueryRequest#readEpoch()}, so
+     * every part of the answer reads one moment of the corpus.</p>
+     *
+     * @return The current epoch
+     */
+    public long captureEpoch() {
+        return visibilityTracker.captureEpoch();
     }
 
     // ==================== Inner Classes ====================

@@ -258,10 +258,12 @@ public final class QueryRequestParser {
          * @param maxDepth      The deepest the pipeline may rank to fill the answer past
          *                      documents it withholds - the node's {@code max-top-k}, the bound
          *                      on how deep any page may reach
+         * @param readEpoch     The visibility epoch the search reads at, shared with the BM25
+         *                      half and the cache fingerprint of the same request
          * @return The pipeline request
          */
         public QueryRequest toRequest(float[] vector, String correlationId, long budgetMs,
-                                      int maxDepth) {
+                                      int maxDepth, long readEpoch) {
             return QueryRequest.builder()
                 .queryText(query)
                 .queryVector(vector)
@@ -278,6 +280,7 @@ public final class QueryRequestParser {
                 .requireNamedResults(true)
                 .sourceScope(sourceScope)
                 .maxSearchDepth(Math.min(maxDepth, QueryRequest.MAX_TOP_K))
+                .readEpoch(readEpoch)
                 .build();
         }
     }

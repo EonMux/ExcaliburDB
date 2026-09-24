@@ -102,6 +102,38 @@ class LexicalQueryServiceTest {
             }
         }
 
+        /**
+         * The query route hands the vector half and this search one epoch. A chunk published
+         * after it is not part of that corpus, however far the epoch has moved by the time the
+         * search runs, and the fingerprint at that epoch describes what the search read.
+         */
+        @Test
+        @DisplayName("a search at a fixed epoch reads that epoch's corpus and version")
+        void aFixedEpochIsRead(@TempDir Path dir) throws Exception {
+            java.util.concurrent.atomic.AtomicLong epoch =
+                new java.util.concurrent.atomic.AtomicLong(1);
+            try (com.eonmux.excalibur.ingest.lexical.NativeChunkIndex index =
+                     nativeIndexed(dir, epoch)) {
+                LexicalQueryService service = new LexicalQueryService(index, null, List.of());
+                long pinned = epoch.get();
+                java.util.OptionalLong version = service.searchVersion(pinned);
+
+                index.add("kb:tls2.txt:chunk:0", "a second certificate chain was verified");
+                index.refresh();
+                epoch.incrementAndGet();
+
+                List<LexicalQueryService.Hit> atPinned = service.retrieve(
+                    "certificate chain verified", 5, SourceScope.ALL, Duration.ofSeconds(1),
+                    pinned).hits();
+
+                assertThat(atPinned).extracting(LexicalQueryService.Hit::chunkId)
+                    .containsExactly("kb:tls.txt:chunk:0");
+                assertThat(service.search("certificate chain verified", 5)).hasSize(2);
+                assertThat(service.searchVersion(pinned)).isEqualTo(version);
+                assertThat(service.searchVersion()).isNotEqualTo(version);
+            }
+        }
+
         @Test
         @DisplayName("a query for words the corpus lacks returns nothing, not something")
         void absentWordsFindNothing(@TempDir Path dir) throws Exception {

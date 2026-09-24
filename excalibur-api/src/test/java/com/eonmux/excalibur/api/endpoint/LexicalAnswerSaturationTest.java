@@ -25,6 +25,7 @@ import java.util.concurrent.Executors;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -97,14 +98,14 @@ class LexicalAnswerSaturationTest {
         assertThat(status.getValue())
             .as("a saturated node refuses rather than piling another search on")
             .isEqualTo(503);
-        verify(lexical, never()).retrieve(anyString(), anyInt(), any(), any());
+        verify(lexical, never()).retrieve(anyString(), anyInt(), any(), any(), anyLong());
     }
 
     @Test
     @DisplayName("the permit is returned once the search has finished")
     void releasesThePermit() throws IOException {
         LexicalQueryService lexical = mock(LexicalQueryService.class);
-        when(lexical.retrieve(anyString(), anyInt(), any(), any())).thenReturn(new LexicalQueryService.Ranking(List.of(), null));
+        when(lexical.retrieve(anyString(), anyInt(), any(), any(), anyLong())).thenReturn(new LexicalQueryService.Ranking(List.of(), null));
         when(lexical.stats()).thenReturn(null);
 
         int before = LexicalSearchPermits.available();

@@ -1096,6 +1096,13 @@ crawl that runs for days is searchable as it goes rather than only when it finis
 stopped run published is searchable once it stops. Publication is at the epoch *after* the current
 one, so a query already running does not acquire results halfway through.
 
+A query captures its epoch once, when it arrives, and every part of the answer reads at it: the
+vector pipeline's segments, every BM25 ranking — including the deeper ones a search runs to fill a
+page past documents it withholds — and the fingerprint its cache entry is stored under. The two
+halves of a hybrid answer therefore rank one corpus, and a cached answer is filed under the corpus
+it was computed from. The Lucene engine publishes at a refresh rather than at an epoch; its
+equivalent is the reader a search holds from its first ranking to its last.
+
 **Reingestion.** A chunk identifier names one chunk, so indexing it again is a new version rather
 than a second copy: publication retires the copy the store already held under that name. Without
 that, a source re-crawled on its timer would return the same chunk twice, count it twice in fusion
@@ -1315,8 +1322,9 @@ the same accessors the query path uses.
 
 Every route's answer is cached, after relevancy scoring: vector, hybrid and lexical. A lexical or
 hybrid answer is also fingerprinted on the lexical index — the manifest entries visible at the
-query epoch, or the Lucene reader version — so an epoch crossing a manifest entry discards it like
-any other change. Result text, snippets and explanations are read from storage on every answer, so
+query's epoch, or the Lucene reader version — so an epoch crossing a manifest entry discards it like
+any other change. Both fingerprints are taken at the epoch the query captured and searches at, so
+a publication landing while the query runs cannot file its answer under the wrong corpus. Result text, snippets and explanations are read from storage on every answer, so
 quoted text can never be stale. An answer that is the product of a moment's trouble is never
 stored, so that trouble cannot be replayed as a persistent fault: a vector or hybrid answer that is
 degraded, timed out, cancelled or whose relevancy scoring fell back; a lexical or hybrid answer

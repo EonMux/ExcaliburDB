@@ -76,6 +76,13 @@ import java.util.OptionalLong;
  * deeper grows with the hits withheld, at least doubling each time, so the extra work is bounded by
  * how much of the corpus is being written at that moment and never by the size of the corpus.</p>
  *
+ * <p>Every ranking of one search reads the same state of the index: a {@link ChunkIndex.View}
+ * opened once per search, fixed at the visibility epoch the caller hands in or, without one, at
+ * the state current when the search starts. A deeper ranking that read a later epoch would fill
+ * the page from postings the first ranking never saw, and judge them against a different moment
+ * from the one its withheld hits were judged at. The caller that fuses this search with the
+ * vector pipeline hands both the same epoch, so the two halves of one answer read one corpus.</p>
+ *
  * <h2>Searching some sources</h2>
  * <p>A search scoped to some sources ({@link #search(String, int, SourceScope)}) hands the index a
  * filter on chunk ids, which it applies where its ranking is decided, so the scoped page is
@@ -129,7 +136,6 @@ public final class LexicalQueryService {
     }
 
     private final ChunkIndex chunks;
-    private final HybridRetriever retriever;
     private final int rrfK;
 
     /** The expander each search is widened with, the identity when none was given. */
@@ -183,18 +189,16 @@ public final class LexicalQueryService {
         this.reportsExpansion = expander != null;
         this.extra = extra == null ? List.of() : List.copyOf(extra);
         this.perSignalOverFetch = perSignalOverFetch;
-        this.retriever = retrieverOver(null);
         this.visibility = null;
         this.sources = null;
         LOGGER.info("Lexical query service ready with {} signal(s) over the {} engine "
             + "(rrf k={}, per-signal over-fetch={})",
-            retriever.rankers().size(), chunks.engine(), rrfK, perSignalOverFetch);
+            1 + this.extra.size(), chunks.engine(), rrfK, perSignalOverFetch);
     }
 
     private LexicalQueryService(LexicalQueryService base, DocumentVisibilityChecker visibility,
                                 ChunkSources sources) {
         this.chunks = base.chunks;
-        this.retriever = base.retriever;
         this.rrfK = base.rrfK;
         this.widening = base.widening;
         this.reportsExpansion = base.reportsExpansion;
@@ -205,17 +209,19 @@ public final class LexicalQueryService {
     }
 
     /**
-     * The fusion of the index's own signal, over the chunks a filter admits, with the others.
+     * The fusion of one view's signal, over the chunks a filter admits, with the others.
      *
+     * @param view   The index as this search reads it
      * @param admits Whether a chunk may be returned, or null for every chunk
      * @return The retriever
      */
-    private HybridRetriever retrieverOver(java.util.function.Predicate<String> admits) {
+    private HybridRetriever retrieverOver(ChunkIndex.View view,
+                                          java.util.function.Predicate<String> admits) {
         List<Ranker> rankers = new ArrayList<>(1 + extra.size());
         // The index supplies its own signal: the two engines search differently enough that
         // asking either to expose the other's query type would mean writing a translation layer
         // whose only job is to be wrong somewhere.
-        rankers.add(chunks.ranker(widening, admits));
+        rankers.add(view.ranker(widening, admits));
         rankers.addAll(extra);
         // Reciprocal rank fusion: signals score on scales that are not comparable, so their
         // ranks are fused rather than their scores.
@@ -277,6 +283,20 @@ public final class LexicalQueryService {
      */
     public OptionalLong searchVersion() {
         return chunks.searchVersion();
+    }
+
+    /**
+     * Which state of the index a search reading at a visibility epoch would read.
+     *
+     * <p>As {@link #searchVersion()}, for a search fixed at that epoch - see
+     * {@link #retrieve(String, int, SourceScope, Duration, long)} - so the fingerprint a cached
+     * answer is stored under describes the state the answer was computed from.</p>
+     *
+     * @param epoch The visibility epoch the search reads at
+     * @return The version, or empty when this index cannot say
+     */
+    public OptionalLong searchVersion(long epoch) {
+        return chunks.searchVersion(epoch);
     }
 
     /**
@@ -342,6 +362,34 @@ public final class LexicalQueryService {
      *                               attribute chunks with - see {@link #withChunkSources}
      */
     public Ranking retrieve(String queryText, int limit, SourceScope scope, Duration budget) {
+        return retrieve(queryText, limit, scope, budget, OptionalLong.empty());
+    }
+
+    /**
+     * As {@link #retrieve(String, int, SourceScope, Duration)}, reading the index at a fixed
+     * visibility epoch.
+     *
+     * <p>For a search that must read the same moment of the corpus as something else: the vector
+     * half of a hybrid answer, and the fingerprint its cache entry is stored under. Every ranking
+     * of the search reads the index as of {@code epoch}, and documents are withheld as a search
+     * that began at that epoch withholds them.</p>
+     *
+     * @param queryText The user's query
+     * @param limit     Most hits to return
+     * @param scope     The sources to answer from, {@link SourceScope#ALL} for every source
+     * @param budget    How long the request leaves this search, its expansion included
+     * @param epoch     The visibility epoch every ranking of the search reads at
+     * @return The hits, best first, and the expansion searched
+     * @throws IllegalStateException if the search is scoped and this service has nothing to
+     *                               attribute chunks with - see {@link #withChunkSources}
+     */
+    public Ranking retrieve(String queryText, int limit, SourceScope scope, Duration budget,
+                            long epoch) {
+        return retrieve(queryText, limit, scope, budget, OptionalLong.of(epoch));
+    }
+
+    private Ranking retrieve(String queryText, int limit, SourceScope scope, Duration budget,
+                             OptionalLong epoch) {
         Objects.requireNonNull(scope, "scope must not be null");
         Objects.requireNonNull(budget, "budget must not be null");
         if (queryText == null || queryText.isBlank() || limit <= 0) {
@@ -354,7 +402,13 @@ public final class LexicalQueryService {
         Expansion expansion = widening.expand(queryText, expansionBudget(budget));
         RetrievalQuery query = RetrievalQuery.ofText(queryText)
             .expandedTo(expansion.formulations());
-        return new Ranking(ranked(query, limit, scope), reportsExpansion ? expansion : null);
+        // Opened after the expansion, which reads no index: a Lucene reader is held no longer
+        // than the rankings that search it.
+        try (ChunkIndex.View view = epoch.isPresent()
+                ? chunks.view(epoch.getAsLong()) : chunks.view()) {
+            return new Ranking(ranked(query, limit, scope, view, epoch),
+                reportsExpansion ? expansion : null);
+        }
     }
 
     /**
@@ -374,16 +428,20 @@ public final class LexicalQueryService {
      * @param query The query, carrying its formulations
      * @param limit Most hits to return
      * @param scope The sources to answer from
+     * @param view  The index as every ranking of this search reads it
+     * @param epoch The epoch the search reads at, or empty for one begun now
      * @return Hits, best first; fewer than {@code limit} only when no more visible ones match
      */
-    private List<Hit> ranked(RetrievalQuery query, int limit, SourceScope scope) {
+    private List<Hit> ranked(RetrievalQuery query, int limit, SourceScope scope,
+                             ChunkIndex.View view, OptionalLong epoch) {
         java.util.function.Predicate<String> admits = scope.admitting(sources);
-        HybridRetriever scoped = admits == null ? retriever : retrieverOver(admits);
+        HybridRetriever scoped = retrieverOver(view, admits);
         DocumentVisibilityChecker checker = visibility;
         boolean atomic = DocumentAtomicityFilter.appliesTo(checker);
         DocumentAtomicityFilter filter = atomic ? new DocumentAtomicityFilter(checker) : null;
         long bound = atomic
-            ? DocumentAtomicityFilter.boundFor(checker, checker.currentEpoch()) : 0L;
+            ? DocumentAtomicityFilter.boundFor(checker, epoch.orElseGet(checker::currentEpoch))
+            : 0L;
         if (filter == null && admits == null) {
             return visible(scoped.retrieve(query, limit), limit, null, 0L, null, new HashMap<>())
                 .hits();

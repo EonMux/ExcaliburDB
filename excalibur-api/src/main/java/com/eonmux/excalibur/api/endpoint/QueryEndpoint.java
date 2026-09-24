@@ -491,16 +491,21 @@ public class QueryEndpoint implements HttpHandler {
                 // the way does not change which answer was asked for.
                 String route = hybridRetrieval && lexical != null
                     ? QueryResponseJson.HYBRID : QueryResponseJson.VECTOR;
+                // One epoch for the whole answer: the vector half, the BM25 half and the
+                // fingerprint below all read the corpus as of this moment, so a publication
+                // landing mid-query cannot put two corpora into one fused ranking, or store an
+                // answer under a fingerprint of a corpus it was not computed from.
+                long epoch = queryPipeline.captureEpoch();
                 Request request = new Request(queryId, correlationId, startTime, requestBody,
                     parsed, context, route, lexical, lexicalAnswer.plan(parsed),
-                    parsed.enableLlmScoring() && queryPipeline.getLlmScorer() != null);
+                    parsed.enableLlmScoring() && queryPipeline.getLlmScorer() != null, epoch);
                 // Fingerprinted before the search and stored against afterwards. Taking the
                 // fingerprint again at store time would let a document ingested while this
                 // query ran make a pre-ingest answer look like a post-ingest one. Looked up
                 // before either signal starts, so a held answer costs no embedding call, no
                 // segment fan-out, no BM25 search and no relevancy model.
                 QueryCacheLookup lookup = QueryCacheLookup.of(resultCache, queryPipeline,
-                    lexical, route, parsed, context, exchange);
+                    lexical, route, epoch, parsed, context, exchange);
                 if (answeredFromCache(exchange, lookup, request)) {
                     return;
                 }
@@ -582,12 +587,13 @@ public class QueryEndpoint implements HttpHandler {
      * @param plan           How an answer the pipeline does not score is scored
      * @param scoringPlanned Whether this request's answer is to be scored by anything - the
      *                       pipeline's Stage 4 or {@link RelevancyScoring}
+     * @param epoch          The visibility epoch every part of the answer reads at
      */
     private record Request(String queryId, String correlationId, long startTime,
                            String requestBody, QueryRequestParser.ParsedQuery parsed,
                            QueryContext context, String route,
                            com.eonmux.excalibur.api.retrieval.LexicalQueryService lexical,
-                           RelevancyScoring.Plan plan, boolean scoringPlanned) {
+                           RelevancyScoring.Plan plan, boolean scoringPlanned, long epoch) {
 
         long deadlineNanos() {
             return startTime + TimeUnit.MILLISECONDS.toNanos(parsed.timeoutMs());
@@ -750,7 +756,8 @@ public class QueryEndpoint implements HttpHandler {
             long retrievalDeadlineNanos = System.nanoTime()
                 + TimeUnit.MILLISECONDS.toNanos(budgetMs);
             QueryRequest pipelineRequest = pipelineQuery(context, parsed, plan, candidates)
-                .toRequest(vector, request.correlationId(), budgetMs, limits.maxTopK());
+                .toRequest(vector, request.correlationId(), budgetMs, limits.maxTopK(),
+                    request.epoch());
             CompletableFuture<QueryResponse> future =
                 queryPipeline.execute(pipelineRequest, pipelineToken);
 
@@ -1027,7 +1034,8 @@ public class QueryEndpoint implements HttpHandler {
                 && Deadline.remainingMillis(deadlineNanos) > 0) {
             signal = com.eonmux.excalibur.api.retrieval.LexicalSignal.start(request.lexical(),
                 executorService, request.parsed().query(), request.parsed().sourceScope(),
-                plan.candidates(request.context().depth()), lexicalBudget(request, plan));
+                plan.candidates(request.context().depth()), lexicalBudget(request, plan),
+                request.epoch());
             startedHere = signal != null;
             if (startedHere) {
                 withdrawal.addListener(signal::cancel);
@@ -1081,7 +1089,7 @@ public class QueryEndpoint implements HttpHandler {
         }
         return com.eonmux.excalibur.api.retrieval.LexicalSignal.start(request.lexical(),
             executorService, request.parsed().query(), request.parsed().sourceScope(), depth,
-            lexicalBudget(request, request.plan()));
+            lexicalBudget(request, request.plan()), request.epoch());
     }
 
     /**
