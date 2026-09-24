@@ -3119,7 +3119,7 @@ environment rather than by the properties file:
 |----------|---------|---------|
 | `EXCALIBUR_URL` | Base URL of the node | `http://127.0.0.1:8080` |
 | `EXCALIBUR_API_AUTH_TOKEN` | Bearer token, when the node requires one | none |
-| `EXCALIBUR_NAMESPACE` | Default namespace for the tools that take one: the graph tools (`build_graph`, `graph_build_status`, `search_graph`, `cancel_graph_build`), and `ingest_documents` and `crawl_website`, which fix a source's namespace at registration. A call's own `namespace` argument overrides it. `create_namespace` and `delete_namespace` never use it — they act on the namespace the call names, so a drop cannot fall on one the model never mentioned — and `list_namespaces` lists them all. Every other tool serves the whole corpus and sends no namespace, since those routes refuse one | the shared one |
+| `EXCALIBUR_NAMESPACE` | Default namespace for the tools that take one: the graph tools (`build_graph`, `graph_build_status`, `search_graph`, `cancel_graph_build`, `find_graph_entities`, `graph_entity`, `graph_entity_edges`, `list_graph_relations`, `assert_graph_facts`), and `ingest_documents` and `crawl_website`, which fix a source's namespace at registration. A call's own `namespace` argument overrides it. `create_namespace` and `delete_namespace` never use it — they act on the namespace the call names, so a drop cannot fall on one the model never mentioned — and `list_namespaces` lists them all. Every other tool serves the whole corpus and sends no namespace, since those routes refuse one | the shared one |
 | `EXCALIBUR_MCP_TIMEOUT_SECONDS` | Per-request timeout | 60 |
 
 The flags are the ones the node itself runs with — the server lives in the same jar, and the
