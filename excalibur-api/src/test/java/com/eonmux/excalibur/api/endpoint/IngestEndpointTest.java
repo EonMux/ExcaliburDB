@@ -1329,43 +1329,21 @@ class IngestEndpointTest {
             assertThat(registry.get("docs")).isSameAs(original);
         }
 
+        /**
+         * {@code PUT /v1/ingest} is answered by whatever registry the node was built with, and a
+         * registry that could not replace would turn the documented route into a 501 that no
+         * caller can act on. So none may be written without saying how it replaces.
+         */
         @Test
-        @DisplayName("a registry that cannot replace in one step answers 501")
-        void aRegistryWithoutReplacementIs501(@TempDir Path root) throws IOException {
-            AtomicReference<Source> offered = new AtomicReference<>();
-            SourceRegistry legacy = new SourceRegistry() {
-                @Override
-                public void register(Source source) {
-                    offered.set(source);
-                }
-
-                @Override
-                public boolean isRegistered(String sourceId) {
-                    return true;
-                }
-
-                @Override
-                public Source get(String sourceId) {
-                    return null;
-                }
-
-                @Override
-                public boolean remove(String sourceId) {
-                    return false;
-                }
-
-                @Override
-                public java.util.Set<String> getAllSourceIds() {
-                    return java.util.Set.of();
-                }
-            };
-
-            Response response = send("PUT", legacy,
-                ApiSecurityConfig.builder().allowIngestRoot(root).build(), null,
-                body(root, "docs"), null);
-
-            assertThat(response.status()).isEqualTo(501);
-            assertThat(offered.get()).as("nothing was registered in its place").isNull();
+        @DisplayName("every registry says how it replaces a registration")
+        void replacementIsNotOptional() throws NoSuchMethodException {
+            assertThat(SourceRegistry.class.getMethod("replace",
+                    Source.class, SourceDescriptor.class)
+                .isDefault()).isFalse();
+            assertThat(SourceRegistry.class.getMethod("replace",
+                    Source.class, SourceDescriptor.class,
+                    SourceRegistry.Admission.class)
+                .isDefault()).isFalse();
         }
 
         private Response put(Path root, String requestBody, String namespace)

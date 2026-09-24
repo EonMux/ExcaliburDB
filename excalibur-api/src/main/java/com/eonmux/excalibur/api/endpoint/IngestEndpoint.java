@@ -447,10 +447,6 @@ public class IngestEndpoint implements HttpHandler {
                     ResponseBody.sendError(exchange, SourceCatalogException.STATUS_CODE,
                         ErrorCode.CATALOG_UNAVAILABLE, SourceCatalogException.CLIENT_MESSAGE);
                     return;
-                } catch (UnsupportedOperationException e) {
-                    closeQuietly(source);
-                    sendError(exchange, 501, e.getMessage());
-                    return;
                 } catch (IOException | RuntimeException e) {
                     closeQuietly(source);
                     throw e;

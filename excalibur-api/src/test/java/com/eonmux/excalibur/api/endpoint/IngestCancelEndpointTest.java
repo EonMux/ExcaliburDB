@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import com.eonmux.excalibur.ingest.source.Source;
+import com.eonmux.excalibur.ingest.source.SourceDescriptor;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -169,6 +170,16 @@ class IngestCancelEndpointTest {
         @Override
         public void register(Source source) {
             sources.add(source.getSourceId());
+        }
+
+        @Override
+        public void replace(Source source, SourceDescriptor descriptor) {
+            throw new AssertionError("stopping a run must not replace the source");
+        }
+
+        @Override
+        public void replace(Source source, SourceDescriptor descriptor, Admission admission) {
+            throw new AssertionError("stopping a run must not replace the source");
         }
 
         @Override
