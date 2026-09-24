@@ -179,6 +179,110 @@ class FilesystemSourceTest {
     }
 
     @Test
+    @Timeout(30)
+    void anExcludedDirectoryIsNotDescendedInto() throws IOException, SourceException {
+        // A cycle the walk would abort on if it entered the directory at all. Filtering what
+        // the walk lists afterwards is too late: it has already been inside.
+        Path modules = Files.createDirectories(testRoot.resolve("node_modules/pkg"));
+        Files.writeString(modules.resolve("index.txt"), "vendored");
+        linkOrSkip(modules.resolve("loop"), testRoot.resolve("node_modules"));
+
+        try (FilesystemSource following = FilesystemSource.builder()
+                .sourceId("following-source")
+                .rootPath(testRoot)
+                .followSymlinks(true)
+                .excludedDirectories("node_modules")
+                .build();
+             Stream<String> ids = following.crawl()) {
+
+            assertThat(ids.toList()).containsExactlyInAnyOrderElementsOf(FILES_IN_ROOT);
+        }
+    }
+
+    @Test
+    void anExcludedNameAtAnyDepthIsSkipped() throws IOException, SourceException {
+        Path build = Files.createDirectories(testRoot.resolve("subdir/BUILD"));
+        Files.writeString(build.resolve("out.txt"), "generated");
+
+        source.close();
+        source = FilesystemSource.builder()
+            .sourceId("test-source")
+            .rootPath(testRoot)
+            .excludedDirectories("build")
+            .build();
+
+        try (Stream<String> ids = source.crawl()) {
+            assertThat(ids.toList()).containsExactlyInAnyOrderElementsOf(FILES_IN_ROOT);
+        }
+        assertThat(source.getDocumentCount()).isEqualTo(FILES_IN_ROOT.size());
+    }
+
+    @Test
+    void anExcludedNameOnlyExcludesDirectories() throws IOException, SourceException {
+        // The list names directories. A file that happens to share a name with one is a file.
+        Files.writeString(testRoot.resolve("subdir/build"), "a build script");
+
+        source.close();
+        source = FilesystemSource.builder()
+            .sourceId("test-source")
+            .rootPath(testRoot)
+            .excludedDirectories("build")
+            .build();
+
+        try (Stream<String> ids = source.crawl()) {
+            assertThat(ids.toList()).contains("subdir/build");
+        }
+    }
+
+    @Test
+    void aHiddenDirectoryIsNotCrawled() throws IOException, SourceException {
+        Path config = Files.createDirectories(testRoot.resolve(".config/app"));
+        Files.writeString(config.resolve("notes.md"), "Hidden with its directory");
+        Files.writeString(testRoot.resolve("subdir/.cache"), "a hidden file");
+        Files.createDirectories(testRoot.resolve("subdir/.git"));
+        Files.writeString(testRoot.resolve("subdir/.git/HEAD"), "ref: refs/heads/main");
+
+        try (Stream<String> ids = source.crawl()) {
+            assertThat(ids.toList()).containsExactlyInAnyOrderElementsOf(FILES_IN_ROOT);
+        }
+        assertThat(source.getDocumentCount()).isEqualTo(FILES_IN_ROOT.size());
+    }
+
+    @Test
+    void aHiddenDirectoryIsCrawledWhenHiddenFilesAreIncluded() throws IOException, SourceException {
+        Path config = Files.createDirectories(testRoot.resolve(".config"));
+        Files.writeString(config.resolve("notes.md"), "Hidden with its directory");
+
+        source.close();
+        source = FilesystemSource.builder()
+            .sourceId("test-source")
+            .rootPath(testRoot)
+            .includeHidden(true)
+            .build();
+
+        try (Stream<String> ids = source.crawl()) {
+            assertThat(ids.toList()).contains(".config/notes.md");
+        }
+    }
+
+    @Test
+    void aHiddenRootIsStillCrawled() throws IOException, SourceException {
+        // Hidden is judged below the root. An operator who registers ~/.notes asked for it.
+        Path hiddenRoot = Files.createDirectories(tempDir.resolve(".notes/inner"));
+        Files.writeString(hiddenRoot.getParent().resolve("today.md"), "Today");
+        Files.writeString(hiddenRoot.resolve("deeper.md"), "Deeper");
+
+        try (FilesystemSource hidden = FilesystemSource.builder()
+                .sourceId("hidden-root")
+                .rootPath(hiddenRoot.getParent())
+                .build();
+             Stream<String> ids = hidden.crawl()) {
+
+            assertThat(ids.toList()).containsExactlyInAnyOrder("today.md", "inner/deeper.md");
+        }
+    }
+
+    @Test
     void crawl_withMaxDepth_limitsRecursion() throws IOException, SourceException {
         source.close();
         source = FilesystemSource.builder()

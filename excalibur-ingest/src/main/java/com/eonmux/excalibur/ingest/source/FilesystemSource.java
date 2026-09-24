@@ -7,7 +7,6 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.Charset;
 import java.nio.file.FileSystemLoopException;
-import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -45,7 +44,9 @@ import java.util.stream.StreamSupport;
  *       downwards)</li>
  *   <li>Symlinks are not followed by default (configurable). When they are followed, a path
  *       whose real location lies outside the root is not part of the source</li>
- *   <li>Hidden files are excluded by default (configurable)</li>
+ *   <li>Hidden files are excluded by default (configurable), and so is everything under a
+ *       hidden directory below the root</li>
+ *   <li>An excluded directory name is matched at any depth, and the walk does not enter it</li>
  * </ul>
  *
  * <h2>Encoding</h2>
@@ -375,19 +376,38 @@ public class FilesystemSource implements Source {
      * <p>The crawl, the document count and the size estimate all have to describe the same set
      * of files, so they all come through here rather than each deciding for itself whether links
      * are part of the tree.</p>
+     *
+     * <p>Excluded and hidden directories are pruned rather than filtered: the walk never opens
+     * them, so an excluded {@code node_modules} costs nothing however large it is, and a link
+     * cycle inside one cannot abort a crawl that was never going to list its contents.</p>
      */
     private Stream<Path> walk() throws IOException {
-        FileVisitOption[] visitOptions = followSymlinks
-            ? new FileVisitOption[]{FileVisitOption.FOLLOW_LINKS}
-            : new FileVisitOption[0];
-        return abortingClearly(Files.walk(rootPath, maxDepth, visitOptions));
+        return abortingClearly(PrunedWalk.of(rootPath, maxDepth, followSymlinks,
+            this::shouldDescend));
+    }
+
+    /**
+     * Decides whether the walk enters a directory below the root.
+     *
+     * <p>The root itself is never asked about: an operator who registers a hidden directory, or
+     * one whose name is on the exclusion list, asked for exactly that directory.</p>
+     *
+     * @param directory A directory below the root
+     * @return Whether anything under it can be a document of this source
+     */
+    private boolean shouldDescend(Path directory) {
+        Path name = directory.getFileName();
+        if (name != null && excludedDirectories.contains(normalizeName(name.toString()))) {
+            return false;
+        }
+        return includeHidden || !isHidden(directory);
     }
 
     /**
      * Wraps a walk so a failure that surfaces while it is being consumed arrives as one clear
      * error instead of an anonymous one from wherever the stream happened to be pulled.
      *
-     * <p>{@code Files.walk} is lazy, and with links followed it reports a symlink cycle as an
+     * <p>The walk is lazy, and with links followed it reports a symlink cycle as an
      * {@link UncheckedIOException} raised mid-traversal rather than from the call that started
      * the walk. The walk must still fail: a caller handed a short listing would take every
      * document the walk never reached as deleted and tombstone it. So the error is re-thrown,
@@ -527,10 +547,6 @@ public class FilesystemSource implements Source {
                 return false;
             }
 
-            if (isInExcludedDirectory(path)) {
-                return false;
-            }
-
             if (!includedExtensions.isEmpty()) {
                 String extension = getExtension(path);
                 if (!includedExtensions.contains(extension)) {
@@ -562,17 +578,6 @@ public class FilesystemSource implements Source {
                 + "cannot read is not a file that has been deleted.", path, e.getMessage());
             return true;
         }
-    }
-
-    private boolean isInExcludedDirectory(Path path) {
-        Path relative = rootPath.relativize(path);
-        for (int i = 0; i < relative.getNameCount(); i++) {
-            String name = relative.getName(i).toString();
-            if (excludedDirectories.contains(normalizeName(name))) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private boolean isHidden(Path path) {

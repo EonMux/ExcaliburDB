@@ -688,10 +688,10 @@ curl -X POST http://localhost:8080/v1/ingest \
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `included_extensions` | array of string | _(all)_ | Only files with one of these extensions are indexed |
-| `excluded_directories` | array of string | `.git`, `.svn`, `.hg`, `node_modules`, `target`, `build`, `.idea`, `.vscode` | Directory names skipped anywhere under the root. Supplying this **replaces** the default list |
+| `excluded_directories` | array of string | `.git`, `.svn`, `.hg`, `node_modules`, `target`, `build`, `.idea`, `.vscode` | Directory names the walk does not enter, anywhere under the root, compared without regard to case. Nothing inside one is read, so its size costs nothing and a link cycle in it cannot abort the crawl. It names directories only: a file called `build` is still indexed. Supplying this **replaces** the default list |
 | `max_depth` | integer | 100 | Directory levels below the root to descend, 1 to 1000 |
 | `follow_symlinks` | bool | `false` | Whether the walk descends through symbolic links. A link whose real target lies outside the root is skipped whatever this is set to, so a link cannot be used to read a directory the allow-list does not permit |
-| `include_hidden` | bool | `false` | Whether dot-files are indexed |
+| `include_hidden` | bool | `false` | Whether dot-files are indexed. While `false`, the walk does not enter a dot-directory either, so `.config/notes.md` is left out with its directory. The root itself is never judged: registering `~/.notes` indexes what is in it |
 | `max_file_bytes` | integer | 104857600 | Largest single file read, 1 byte to 100 MiB — the [largest document the node indexes](#document-size-limits). A larger file is never listed or read, so it is neither indexed nor truncated |
 | `charset` | string | UTF-8 | The encoding a file is read in when it carries no byte-order mark, by any name or alias the JVM knows (`windows-1252`, `latin1`, `UTF-16LE`). A file that does carry a mark is read in the encoding the mark names, whatever is declared here: the mark was written by the program that encoded that file, the declaration by someone describing the whole directory. An unknown name is a `400`, never a quiet fall-back to UTF-8, and the name is stored and read back in its canonical form |
 

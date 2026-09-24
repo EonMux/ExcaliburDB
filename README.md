@@ -2117,9 +2117,9 @@ rather than a silent clamp:
 | Field | Applies to | Bound | What it does |
 |-------|-----------|-------|--------------|
 | `included_extensions` | filesystem | — | Only these file extensions are read |
-| `excluded_directories` | filesystem | — | Directory names the walk does not descend into |
+| `excluded_directories` | filesystem | — | Directory names the walk does not descend into, matched at any depth below the root. The walk never opens them, so a large `node_modules` costs nothing and a link cycle inside one cannot abort the crawl. A file that shares a name with one is still a file |
 | `follow_symlinks` | filesystem | — | Whether the walk descends through symbolic links. A link out of the allowed root is still refused: the real path is what is checked |
-| `include_hidden` | filesystem | — | Whether dot-files are read |
+| `include_hidden` | filesystem | — | Whether dot-files are read, and whether the walk enters dot-directories — `.config/notes.md` is hidden with its directory. The root itself may be hidden |
 | `max_file_bytes` | filesystem | 1 – 100 MiB | Largest single file the walk will read; 100 MiB when absent. A larger file is never listed. The ceiling is the largest document the node indexes (see below) |
 | `charset` | filesystem | any encoding the JVM supports | The encoding a file without a byte-order mark is read in; UTF-8 when absent. A name the node cannot decode is a 400, not a silent fall-back to UTF-8. Recorded under its canonical name, which is what `GET /v1/ingest` shows. Refused on an HTTP crawl, whose responses each name their own encoding — see [What gets indexed](#what-gets-indexed) |
 | `included_path_patterns` | http | — | Substrings a URL path must contain to be crawled |
