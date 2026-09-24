@@ -111,11 +111,15 @@ import java.util.Optional;
  * {@code current}; {@code pending} while the graph is behind and waits for staging to be quiet
  * for {@code debounce_seconds} or for its oldest change to reach {@code max_delay_seconds};
  * {@code running}; {@code backing_off} after a failed automatic build, or after several in a row
- * were superseded, until {@code next_attempt_at_ms}; and {@code withheld}.
+ * were superseded, until {@code next_attempt_at_ms}; {@code deferred} after
+ * {@code DELETE /v1/graph/build} stopped an automatic build, until {@code next_attempt_at_ms} -
+ * {@code max_delay_seconds} after it stopped - when the changes it would have published are
+ * built; and {@code withheld}.
  * {@code last_started_at_ms}, {@code last_finished_at_ms}, {@code last_result}
- * ({@code completed}, {@code unchanged}, {@code failed}, {@code cancelled} or
- * {@code superseded}) and {@code last_error} describe the last automatic build of the
- * namespace, {@code consecutive_failures} how many in a row have failed, and
+ * ({@code completed}, {@code unchanged}, {@code failed}, {@code cancelled} - stopped by that
+ * route or by shutdown - or {@code superseded}) and {@code last_error} describe the last
+ * automatic build of the namespace, {@code consecutive_failures} how many in a row have
+ * failed (a stopped build neither adds to that count nor resets it), and
  * {@code consecutive_supersessions} how many in a row an erasure overtook. A superseded build is
  * not a failure: its publish was refused because an erasure was recorded while it ran, and the
  * namespace is due again on the next pass, the new erasure left out. Only from the second in a

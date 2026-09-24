@@ -546,12 +546,129 @@ class GraphAutoBuilderTest {
         }
     }
 
+    @Nested
+    @DisplayName("Stopped by an operator")
+    class Stopped {
+
+        /** Starts ACME's build and waits until it is inside, spinning for a stop. */
+        private void startStoppable() throws InterruptedException {
+            namespaces.put(ACME, behind(T0, T0));
+            namespaces.stopOnCancel = true;
+            builder();
+            clock.advance(Duration.ofSeconds(120));
+            assertThat(builder.runPass()).containsExactly(ACME);
+            assertThat(namespaces.entered.await(10, TimeUnit.SECONDS)).isTrue();
+        }
+
+        @Test
+        @DisplayName("the build in progress is asked to stop, and ends cancelled")
+        void stopsTheBuild() throws InterruptedException {
+            startStoppable();
+
+            assertThat(builder.cancel(ACME)).isTrue();
+            GraphAutoBuilder.Memory memory = awaitFinished(ACME);
+
+            assertThat(memory.lastResult()).isEqualTo(GraphAutoBuilder.RESULT_CANCELLED);
+            assertThat(memory.lastError()).isNull();
+            assertThat(builder.counts().cancelled()).isOne();
+            assertThat(builder.counts().failed()).as("a stop asked for is not a failure").isZero();
+            assertThat(builder.counts().running()).isZero();
+            assertThat(namespaces.builds).as("nothing was published").isEmpty();
+        }
+
+        @Test
+        @DisplayName("the namespace is deferred by the maximum delay, then built")
+        void deferredThenBuilt() throws InterruptedException {
+            startStoppable();
+            builder.cancel(ACME);
+            GraphAutoBuilder.Memory memory = awaitFinished(ACME);
+            namespaces.stopOnCancel = false;
+
+            assertThat(memory.retryAtMs())
+                .as("the stop holds for the longest an unpublished change is meant to wait")
+                .isEqualTo(memory.lastFinishedAtMs() + Duration.ofSeconds(600).toMillis());
+            assertThat(builder.status(ACME).state()).isEqualTo(GraphAutoBuilder.STATE_DEFERRED);
+            assertThat(builder.runPass()).as("not restarted on the next pass").isEmpty();
+
+            clock.advance(Duration.ofSeconds(599));
+            assertThat(builder.runPass()).as("still inside the deferral").isEmpty();
+
+            clock.advance(Duration.ofSeconds(1));
+            assertThat(builder.runPass())
+                .as("the staged changes are still owed a build").containsExactly(ACME);
+            assertThat(awaitFinished(ACME).lastResult())
+                .isEqualTo(GraphAutoBuilder.RESULT_COMPLETED);
+            assertThat(namespaces.builds).containsExactly(ACME);
+        }
+
+        @Test
+        @DisplayName("a stop neither ends nor extends a failure streak")
+        void failureStreakKept() throws InterruptedException {
+            namespaces.put(ACME, behind(T0, T0));
+            namespaces.failFor = ACME;
+            builder();
+            clock.advance(Duration.ofSeconds(120));
+            assertThat(builder.runPass()).containsExactly(ACME);
+            assertThat(awaitFinished(ACME).consecutiveFailures()).isOne();
+
+            namespaces.failFor = null;
+            namespaces.stopOnCancel = true;
+            clock.advance(Duration.ofSeconds(60));
+            assertThat(builder.runPass()).containsExactly(ACME);
+            awaitRunning(ACME);
+            assertThat(builder.cancel(ACME)).isTrue();
+
+            GraphAutoBuilder.Memory memory = awaitFinished(ACME);
+            assertThat(memory.lastResult()).isEqualTo(GraphAutoBuilder.RESULT_CANCELLED);
+            assertThat(memory.consecutiveFailures()).isOne();
+        }
+
+        @Test
+        @DisplayName("nothing is stopped for a namespace with no automatic build in progress")
+        void nothingToStop() throws InterruptedException {
+            assertThat(builder().cancel(ACME)).isFalse();
+
+            namespaces.put(BETA, behind(T0, T0));
+            namespaces.gate = new CountDownLatch(1);
+            clock.advance(Duration.ofSeconds(120));
+            assertThat(builder.runPass()).containsExactly(BETA);
+
+            assertThat(builder.cancel(ACME))
+                .as("another namespace's build is not this one's to stop").isFalse();
+            namespaces.gate.countDown();
+            assertThat(awaitFinished(BETA).lastResult())
+                .isEqualTo(GraphAutoBuilder.RESULT_COMPLETED);
+        }
+
+        @Test
+        @DisplayName("a stop at shutdown defers nothing, since the node is going away")
+        void shutdownDefersNothing() throws InterruptedException {
+            startStoppable();
+
+            assertThat(builder.drain(Duration.ofSeconds(10))).isTrue();
+
+            GraphAutoBuilder.Memory memory = builder.status(ACME).memory();
+            assertThat(memory.lastResult()).isEqualTo(GraphAutoBuilder.RESULT_CANCELLED);
+            assertThat(memory.retryAtMs()).isZero();
+        }
+
+        /** Waits until the namespace's build has been handed to a pool thread and entered. */
+        private void awaitRunning(NamespaceId id) throws InterruptedException {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (namespaces.inside.get() == 0 && System.nanoTime() < deadline) {
+                Thread.sleep(5);
+            }
+            assertThat(builder.status(id).memory().running()).isTrue();
+        }
+    }
+
     /** Namespaces that report a set freshness and record the builds asked of them. */
     private static final class FakeNamespaces implements GraphAutoBuilder.Namespaces {
 
         private final Map<NamespaceId, GraphFreshness> freshness = new ConcurrentHashMap<>();
         final List<NamespaceId> builds = Collections.synchronizedList(new ArrayList<>());
         final CountDownLatch entered = new CountDownLatch(1);
+        final AtomicInteger inside = new AtomicInteger();
         volatile IOException failWith;
         volatile NamespaceId failFor;
         volatile NamespaceId unreadable;
@@ -587,6 +704,7 @@ class GraphAutoBuilderTest {
                 NamespaceId id, BooleanSupplier cancelRequested) throws IOException {
             entered.countDown();
             if (stopOnCancel) {
+                inside.incrementAndGet();
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
                 while (!cancelRequested.getAsBoolean() && System.nanoTime() < deadline) {
                     Thread.onSpinWait();

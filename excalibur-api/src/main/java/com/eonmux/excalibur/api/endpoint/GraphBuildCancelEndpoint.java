@@ -13,7 +13,8 @@ import java.io.IOException;
 import java.util.Objects;
 
 /**
- * {@code DELETE /v1/graph/build} - stops the graph build in progress.
+ * {@code DELETE /v1/graph/build} - stops the namespace's graph build in progress, whichever
+ * started it.
  *
  * <p>The counterpart to {@code POST /v1/graph/build}, and the same relationship
  * {@code DELETE /v1/compact} has to the compaction that started one. A build replays every
@@ -21,6 +22,14 @@ import java.util.Objects;
  * minutes of saturated I/O and a bill at an embedding endpoint, and one started in the wrong
  * window has to be stoppable without stopping the node - which is the more dangerous of the two
  * acts, since shutdown closes the mappings the graph is served out of.</p>
+ *
+ * <h2>Explicit and automatic builds alike</h2>
+ * <p>Most builds on a node that ingests are not asked for: the {@link GraphAutoBuilder} starts
+ * one whenever a namespace's graph falls behind its staging. The cost an operator wants to stop
+ * is the same whichever started it, so this stops both - the build {@code POST} started, and an
+ * automatic one - and says which it found. An automatic build so stopped is not restarted on the
+ * next pass: the namespace is deferred by {@code excalibur.graph.auto-build-max-delay-seconds}
+ * and then built, since what it would have published is still staged and still owed.</p>
  *
  * <h2>Response</h2>
  * <pre>{@code
@@ -30,13 +39,18 @@ import java.util.Objects;
  * HTTP/1.1 200 OK
  * Content-Type: application/json
  *
- * {"cancelled": true, "message": "The graph build was asked to stop; poll
- *  /v1/graph/build/status for when it has"}
+ * {"cancelled": true, "explicit": false, "automatic": true,
+ *  "message": "The graph build was asked to stop; poll /v1/graph/build/status for when it
+ *  has. Nothing it had assembled is published. The staged changes stay staged and are built
+ *  automatically no sooner than 900s after it stops, or at once by POST /v1/graph/build."}
  * }</pre>
  *
- * <p>200 whether or not a build was running. An operator clearing a build wants to know whether
- * there was one, and "nothing was running" is an answer rather than an error: the state they
- * were asking for is the state they now have.</p>
+ * <p>{@code cancelled} is whether any build of the namespace was asked to stop,
+ * {@code explicit} whether one started by {@code POST /v1/graph/build} was, and
+ * {@code automatic} whether an automatic one was. 200 whether or not a build was running. An
+ * operator clearing a build wants to know whether there was one, and "nothing was running" is
+ * an answer rather than an error: the state they were asking for is the state they now
+ * have.</p>
  *
  * <h2>What a stopped build leaves behind</h2>
  * <p>The graph that was already being served, untouched. A build assembles into a scratch
@@ -46,18 +60,20 @@ import java.util.Objects;
  * still answering from the graph it had.</p>
  *
  * <p>Stopping is a request. The build ends at the next staged fact, the next snippet or the
- * next embedded entity, so the readback is {@code GET /v1/graph/build/status}, which reports
- * {@code cancelled} once it has.</p>
+ * next embedded entity, so the readback is {@code GET /v1/graph/build/status}: its top-level
+ * {@code state} reports {@code cancelled} once an explicit build has stopped, and its
+ * {@code automatic} block a {@code last_result} of {@code cancelled}, with {@code state}
+ * {@code deferred} until {@code next_attempt_at_ms}, once an automatic one has.</p>
  *
  * <h2>Scoped to the namespace</h2>
- * <p>Only the build of the namespace in the {@value GraphTenants#NAMESPACE_HEADER} header is
+ * <p>Only the builds of the namespace in the {@value GraphTenants#NAMESPACE_HEADER} header are
  * stopped. A caller holding one tenant's header must not be able to end another tenant's build
  * by sending a DELETE at the right moment, so a request that names a namespace with nothing
  * running is answered {@code "cancelled": false} even while the node is building something
  * else.</p>
  *
  * <h2>Thread Safety</h2>
- * <p>Thread-safe; the runner it delegates to owns the state.</p>
+ * <p>Thread-safe; the runner and the automatic build it delegates to own the state.</p>
  *
  * @see GraphBuildEndpoint
  * @see GraphBuildStatusEndpoint
@@ -66,15 +82,18 @@ import java.util.Objects;
 public final class GraphBuildCancelEndpoint implements HttpHandler {
 
     private final GraphBuildRunner runner;
+    private final GraphAutoBuilder autoBuilder;
 
     /**
-     * Creates the endpoint over a runner.
+     * Creates the endpoint over the runner explicit builds go through and the automatic build.
      *
-     * @param runner The runner holding the build in progress
-     * @throws NullPointerException if runner is null
+     * @param runner      The runner holding the explicit build in progress
+     * @param autoBuilder The automatic build, holding the automatic builds in progress
+     * @throws NullPointerException if either is null
      */
-    public GraphBuildCancelEndpoint(GraphBuildRunner runner) {
+    public GraphBuildCancelEndpoint(GraphBuildRunner runner, GraphAutoBuilder autoBuilder) {
         this.runner = Objects.requireNonNull(runner, "runner cannot be null");
+        this.autoBuilder = Objects.requireNonNull(autoBuilder, "autoBuilder cannot be null");
     }
 
     @Override
@@ -95,14 +114,36 @@ public final class GraphBuildCancelEndpoint implements HttpHandler {
             return;
         }
 
-        boolean cancelled = runner.cancel(namespace);
-        ResponseBody.sendJson(exchange, 200,
-            "{\"cancelled\": " + cancelled + ", \"message\": \""
-                + (cancelled
-                    ? "The graph build was asked to stop; poll /v1/graph/build/status for when "
-                        + "it has. Nothing it had assembled is published."
-                    : "No graph build is running for namespace '"
-                        + JsonText.escape(namespace.value()) + "'")
-                + "\"}");
+        // Both asked, not the first that answers: an automatic build can be waiting on the
+        // namespace's replacement lock behind an explicit one, and stopping only the explicit
+        // build would hand the lock straight to the build the caller also wanted gone.
+        boolean explicit = runner.cancel(namespace);
+        boolean automatic = autoBuilder.cancel(namespace);
+        ResponseBody.sendJson(exchange, 200, "{\"cancelled\": " + (explicit || automatic)
+            + ", \"explicit\": " + explicit + ", \"automatic\": " + automatic
+            + ", \"message\": \"" + message(namespace, explicit, automatic) + "\"}");
+    }
+
+    /**
+     * What the caller is told, already escaped for a JSON string.
+     *
+     * @param namespace Whose builds were asked about
+     * @param explicit  Whether an explicit build was asked to stop
+     * @param automatic Whether an automatic build was asked to stop
+     * @return The message
+     */
+    private String message(NamespaceId namespace, boolean explicit, boolean automatic) {
+        if (!explicit && !automatic) {
+            return "No graph build is running for namespace '"
+                + JsonText.escape(namespace.value()) + "'";
+        }
+        String stopped = "The graph build was asked to stop; poll /v1/graph/build/status for "
+            + "when it has. Nothing it had assembled is published.";
+        if (!automatic) {
+            return stopped;
+        }
+        return stopped + " The staged changes stay staged and are built automatically no "
+            + "sooner than " + autoBuilder.deferral().toSeconds() + "s after it stops, or at "
+            + "once by POST /v1/graph/build.";
     }
 }

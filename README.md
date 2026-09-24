@@ -920,7 +920,7 @@ it does read.
 | `excalibur.graph.auto-build-max-delay-seconds` | 900 | Longest an unpublished change waits however busy staging stays: past it the namespace is rebuilt without waiting for quiet. At least 1 |
 | `excalibur.graph.auto-build-max-concurrent` | 1 | Most automatic builds at once across the node. At least 1 |
 | `excalibur.graph.auto-build-failure-backoff-seconds` | 60 | Wait after a failed automatic build before the namespace is tried again, doubling with each further failure. At least 1 |
-| `excalibur.graph.auto-build-max-failure-backoff-seconds` | 3600 | Longest that wait grows to. At least `excalibur.graph.auto-build-failure-backoff-seconds` |
+| `excalibur.graph.auto-build-max-failure-backoff-seconds` | 3600 | Longest that wait grows to. At least `excalibur.graph.auto-build-failure-backoff-seconds`: set below it, the node refuses to start; unset, it is 3600 or that first wait, whichever is larger |
 | `excalibur.graph.top-k` | 10 | Documents each retrieval signal contributes before fusion. At least 1 |
 | `excalibur.graph.rerank-over-fetch` | 4 | Candidates the full-precision reranker reads per result it returns. Reranking can only reorder what it is given, so this is what lets an entity that term overlap ranked poorly be rescued by its vector. At least 1 |
 | `excalibur.graph.max-frontier` | 1000 | Most new entities one hop of a graph walk admits. When a hop reaches more, it keeps those reached along the strongest edge — highest extraction confidence, then latest valid-time start, then lowest entity id — so a hub cannot make one question read the graph, and a capped answer is the same every time. The entities the question named are always admitted. At least 1 |
@@ -1039,7 +1039,7 @@ above; nothing resolves them from the file or the environment.
 | --- | --- | --- |
 | `com.eonmux.excalibur.useFallback` | false | Forces the ByteBuffer implementation instead of Panama FFM. For a JVM or a sandbox where native access is unavailable; slower, and the node says so at startup |
 | `com.eonmux.excalibur.enableNativeAccessLog` | true | Whether the Panama detection result is logged. Affects logging only |
-| `com.eonmux.excalibur.graph.pageSize` | 4096 | Page size the graph's `madvise` hints are aligned to. Set it where the platform's pages are not 4 KiB |
+| `com.eonmux.excalibur.graph.pageSize` | *(the platform's page size; 4096 where it cannot be read)* | Page size the graph's `madvise` hints are aligned to, overriding the one `getpagesize` reports. A positive power of two; any other value — zero, a negative, `3000`, text — is ignored with one `WARN` at startup and the platform's page size used, since a hint is an optimisation and never worth a graph that will not open |
 
 
 ### Chunk lexical index
@@ -1535,7 +1535,7 @@ separate so a burst of writes cannot starve ordinary reads.
 | `GET` | `/v1/compact/status` | bearer | read | What the last compaction examined, reclaimed and failed on. The readback for the 202 `/v1/compact` returns |
 | `POST` | `/v1/graph/query` | bearer | read | Answer a question from the graph. A walk that returns context, so it is charged as a read |
 | `POST` | `/v1/graph/build` | bearer | mutate | Start publishing the facts ingestion has staged as the served graph. Answers `202`; the build runs behind the response |
-| `DELETE` | `/v1/graph/build` | bearer | mutate | Stop the build in progress. It publishes nothing, and the namespace keeps serving the graph it had |
+| `DELETE` | `/v1/graph/build` | bearer | mutate | Stop the namespace's build in progress, whether `POST` or the node's automatic build started it. It publishes nothing, and the namespace keeps serving the graph it had; a stopped automatic build is deferred, not dropped |
 | `GET` | `/v1/graph/build/status` | bearer | read | What the build is doing, and what the last one published |
 | `POST` | `/v1/graph/erasure` | bearer | mutate | Record an obligation to erase, and compact when it is due |
 | `GET` | `/v1/graph/erasure` | bearer | read | The obligations of the namespace `X-Excalibur-Namespace` names — every outstanding one and the 1024 most recently discharged, narrowed by `state`, paged by `limit` and `cursor` |
@@ -1619,6 +1619,12 @@ counts toward no backoff, and the namespace is due again on the next pass, the n
 out. From the second refusal in a row the next attempt waits — the debounce (or the pass interval
 with no debounce), doubling up to `excalibur.graph.auto-build-max-delay-seconds` — so a namespace
 erased faster than it can be built is not rebuilt, and its embeddings paid for, on every pass.
+An automatic build stopped with `DELETE /v1/graph/build` has not failed either, and is not
+restarted on the next pass, which would overrule the stop: the namespace is deferred by
+`excalibur.graph.auto-build-max-delay-seconds` from the stop — the status reads `deferred` until
+`next_attempt_at_ms` — and then built, since what the stopped build would have published is still
+staged. The failure streak is left as it was, and a second stop defers by the same amount.
+`POST /v1/graph/build` publishes the changes sooner.
 An erasure compaction is not a change to publish: it rewrites staging and the served graph alike.
 A build that finds every staged fact withdrawn — its documents all removed — stops serving the
 graph they built rather than going on answering from it.
@@ -2824,9 +2830,10 @@ is behind what the namespace has staged — `behind_staging`, with `staged_chang
 `last_staged_change_ms` when it is — and `automatic` what the node is doing about it: `state` is
 `current`, `pending` (waiting for the debounce or the maximum delay), `running`, `backing_off`
 (after a failure, or after several builds in a row were superseded, until `next_attempt_at_ms`),
+`deferred` (after `DELETE /v1/graph/build` stopped an automatic build, until `next_attempt_at_ms`),
 `paused` (with `paused_reason`, while extraction is `missing_api_key`, `chat_disabled` or
 `unavailable` — the three states that carry a `warning`), `withheld` or `disabled`; `last_result` is `completed`, `unchanged` (an explicit build got there first),
-`failed` (with `last_error`), `cancelled`, or `superseded` — an erasure was recorded while it ran,
+`failed` (with `last_error`), `cancelled` (stopped by `DELETE /v1/graph/build` or shutdown), or `superseded` — an erasure was recorded while it ran,
 so its publish was refused and the next pass builds again without it; nothing failed.
 `consecutive_failures` and `consecutive_supersessions` count each in a row. `withheld_facts` on the
 top-level build is described above. See [Keeping the graph current](#keeping-the-graph-current).
@@ -2841,15 +2848,21 @@ one would turn every question into a refusal. Its status says so and why, from `
  "published": false, "edges": 0, "staged_facts": 0, ...}
 ```
 
-`DELETE /v1/graph/build` stops one started at the wrong moment:
+`DELETE /v1/graph/build` stops one started at the wrong moment — the namespace's build in
+progress, whether `POST /v1/graph/build` started it or the node did by itself:
 
 ```bash
 curl -X DELETE http://localhost:8080/v1/graph/build
 ```
 
 ```json
-{"cancelled": true, "message": "The graph build was asked to stop; poll /v1/graph/build/status for when it has. Nothing it had assembled is published."}
+{"cancelled": true, "explicit": true, "automatic": false, "message": "The graph build was asked to stop; poll /v1/graph/build/status for when it has. Nothing it had assembled is published."}
 ```
+
+`explicit` and `automatic` say which build was asked to stop, and `cancelled` whether either was.
+A stopped automatic build is deferred rather than restarted on the next pass: the `automatic`
+block reads `"state": "deferred"` until `next_attempt_at_ms`, and the changes it would have
+published stay staged and are built then (see [Keeping the graph current](#keeping-the-graph-current)).
 
 Cancellation is cooperative, never an interrupt, and it is asymmetric on purpose. The build
 assembles everything in a directory beside the served one and publishes by renaming it over the
@@ -4504,7 +4517,8 @@ means the node rebuilds once staging has been quiet for
 active (`missing_api_key`, `chat_disabled` or `unavailable`) and nothing — asserted facts and
 retractions included — is built automatically until it is; `backing_off` means the last automatic build failed, and
 `last_error` says why — or, with `last_result` `superseded`, that erasures keep arriving while it
-builds, and the attempts are being spaced out; `disabled` means
+builds, and the attempts are being spaced out; `deferred` means `DELETE /v1/graph/build` stopped
+the last automatic build, and the next waits until `next_attempt_at_ms`; `disabled` means
 `excalibur.graph.auto-build-enabled=false`.
 `POST /v1/graph/build` publishes it now in every case.
 

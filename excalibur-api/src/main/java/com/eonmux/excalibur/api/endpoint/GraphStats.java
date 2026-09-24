@@ -136,7 +136,8 @@ public record GraphStats(NamespaceStats namespaces, BudgetStats budget, BuildSta
      *                   withdrawn
      * @param unchanged  Builds that found the graph already current once they held its lock
      * @param failed     Builds that raised an error and published nothing
-     * @param cancelled  Builds stopped by the node shutting down
+     * @param cancelled  Builds stopped by {@code DELETE /v1/graph/build} or by the node shutting
+     *                   down
      * @param superseded Builds whose publish an erasure recorded meanwhile refused
      */
     public record AutomaticBuildStats(boolean enabled, int running, long completed,

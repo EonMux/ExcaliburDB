@@ -202,7 +202,12 @@ public final class GraphConfig {
     /** How long an automatic build that failed waits before the next attempt, doubling each time. */
     public static final long DEFAULT_AUTO_BUILD_FAILURE_BACKOFF_SECONDS = 60L;
 
-    /** The longest the wait after repeated failures grows to. */
+    /**
+     * The longest the wait after repeated failures grows to, when that is not set.
+     *
+     * <p>Unless the first wait is set longer: an unset ceiling is never below the first step,
+     * so it is this or {@link #getAutoBuildFailureBackoffSeconds()}, whichever is larger.</p>
+     */
     public static final long DEFAULT_AUTO_BUILD_MAX_FAILURE_BACKOFF_SECONDS = 3600L;
 
     private final String path;
@@ -286,12 +291,20 @@ public final class GraphConfig {
         this.autoBuildFailureBackoffSeconds = ConfigBounds.atLeastLong(
             props, "excalibur.graph.auto-build-failure-backoff-seconds",
             DEFAULT_AUTO_BUILD_FAILURE_BACKOFF_SECONDS, 1);
-        // At least the first step, or the doubling would start above its own ceiling.
-        this.autoBuildMaxFailureBackoffSeconds = ConfigBounds.atLeastLong(
+        // At least the first step, or the doubling would start above its own ceiling. Unset,
+        // it follows a first step raised past 3600 rather than refusing a key nobody wrote;
+        // set, a value below the first step is a contradiction the operator has to resolve.
+        this.autoBuildMaxFailureBackoffSeconds = PropertyParser.parseLong(
             props, "excalibur.graph.auto-build-max-failure-backoff-seconds",
             Math.max(DEFAULT_AUTO_BUILD_MAX_FAILURE_BACKOFF_SECONDS,
-                autoBuildFailureBackoffSeconds),
-            autoBuildFailureBackoffSeconds);
+                autoBuildFailureBackoffSeconds));
+        if (autoBuildMaxFailureBackoffSeconds < autoBuildFailureBackoffSeconds) {
+            throw new IllegalArgumentException(
+                "excalibur.graph.auto-build-max-failure-backoff-seconds ("
+                    + autoBuildMaxFailureBackoffSeconds + ") must be at least "
+                    + "excalibur.graph.auto-build-failure-backoff-seconds ("
+                    + autoBuildFailureBackoffSeconds + "), the wait it grows from");
+        }
         if (extractorVersion < Short.MIN_VALUE || extractorVersion > Short.MAX_VALUE) {
             throw new IllegalArgumentException(
                 "excalibur.graph.extractor-version must fit in a short, got "
@@ -604,7 +617,8 @@ public final class GraphConfig {
     /**
      * The longest the wait after repeated automatic build failures grows to.
      *
-     * @return The ceiling in seconds, at least the first wait
+     * @return The ceiling in seconds, at least the first wait: when unset, 3600 or the first
+     *         wait, whichever is larger
      */
     public long getAutoBuildMaxFailureBackoffSeconds() {
         return autoBuildMaxFailureBackoffSeconds;

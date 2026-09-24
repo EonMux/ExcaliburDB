@@ -86,6 +86,18 @@ import java.util.function.Supplier;
  *       the next attempt waits: the debounce (or the pass interval, with no debounce), doubling
  *       with each further refusal, up to the maximum delay - the longest the configuration says
  *       an unpublished change should wait.</li>
+ *   <li>Restart a build an operator stopped with {@code DELETE /v1/graph/build} on the next
+ *       pass. The stop is a judgement that now is the wrong time - the disk or the embedding
+ *       endpoint is wanted for something else - and an automatic build that came straight back
+ *       on the next pass would overrule it. Nor is it forgotten: what the build would have
+ *       published is still staged, the graph is still behind, and a stop that dropped it would
+ *       leave the graph answering from replaced documents until something else changed. So the
+ *       namespace is deferred by {@code excalibur.graph.auto-build-max-delay-seconds} - the
+ *       longest the configuration says an unpublished change should wait - and is built on the
+ *       first pass after that, or sooner by {@code POST /v1/graph/build}. It is not a failure
+ *       either: the failure streak and its backoff are left as they were, since a stop says
+ *       nothing about whether the build works, and a second stop defers by the same amount
+ *       rather than doubling, because each is its own decision.</li>
  *   <li>Build while extraction is unavailable - asked for, but with no API key or no pipeline
  *       to feed it. A replaced document's old facts are withdrawn whether or not its new ones
  *       could be extracted, so a build then would publish a graph that has lost facts nothing
@@ -130,6 +142,15 @@ public final class GraphAutoBuilder implements AutoCloseable {
      */
     public static final String STATE_BACKING_OFF = "backing_off";
 
+    /**
+     * The last automatic build was stopped by {@code DELETE /v1/graph/build}, and the next waits
+     * out the maximum delay.
+     *
+     * <p>Its own state rather than {@code backing_off}, which an operator reads as something
+     * going wrong: a deferral is what they asked for.</p>
+     */
+    public static final String STATE_DEFERRED = "deferred";
+
     /** The graph is withheld until an interrupted erasure is applied, which comes first. */
     public static final String STATE_WITHHELD = "withheld";
 
@@ -142,7 +163,7 @@ public final class GraphAutoBuilder implements AutoCloseable {
     /** A build that raised an error and published nothing. */
     public static final String RESULT_FAILED = "failed";
 
-    /** A build stopped by the node shutting down. */
+    /** A build stopped by {@code DELETE /v1/graph/build} or by the node shutting down. */
     public static final String RESULT_CANCELLED = "cancelled";
 
     /**
@@ -315,7 +336,8 @@ public final class GraphAutoBuilder implements AutoCloseable {
      * @param completed How many published or retired a graph
      * @param unchanged How many found nothing left to build
      * @param failed     How many failed
-     * @param cancelled  How many were stopped by the node shutting down
+     * @param cancelled  How many were stopped, by {@code DELETE /v1/graph/build} or by the node
+     *                   shutting down
      * @param superseded How many had their publish refused by an erasure recorded meanwhile
      */
     public record Counts(int running, long completed, long unchanged, long failed,
@@ -330,10 +352,23 @@ public final class GraphAutoBuilder implements AutoCloseable {
     private final ScheduledExecutorService scheduler;
     private final ExecutorService builds;
     private final ConcurrentHashMap<NamespaceId, Memory> remembered = new ConcurrentHashMap<>();
-    private final Set<NamespaceId> inFlight = ConcurrentHashMap.newKeySet();
 
     /**
-     * Read by every automatic build at its boundaries; set only when the node shuts down.
+     * The namespaces with an automatic build in progress, each with the flag that asks that one
+     * build to stop.
+     *
+     * <p>The flag is the build's own, created in the same step that claims the namespace, so a
+     * stop can never land on a build it was not meant for: one arriving after a build finished
+     * finds no entry rather than setting a flag the next build of that namespace would inherit,
+     * and one arriving after the claim but before a pool thread picks the build up is read at
+     * the build's first boundary.</p>
+     */
+    private final ConcurrentHashMap<NamespaceId, AtomicBoolean> inFlight =
+        new ConcurrentHashMap<>();
+
+    /**
+     * Read by every automatic build at its boundaries, beside its own flag; set only when the
+     * node shuts down.
      *
      * <p>Never an interrupt, for the reason {@link GraphBuildRunner} gives: a build publishes
      * by renaming a directory over the served one, and an interrupt inside that window leaves a
@@ -508,7 +543,7 @@ public final class GraphAutoBuilder implements AutoCloseable {
         // memory read first that still says running is never paired with a free slot and a
         // backoff not yet recorded.
         Memory memory = remembered.getOrDefault(id, Memory.NONE);
-        if (memory.running() || inFlight.contains(id) || explicitBuildRunning.test(id)) {
+        if (memory.running() || inFlight.containsKey(id) || explicitBuildRunning.test(id)) {
             return Optional.empty();
         }
         if (memory.retryAtMs() > now.toEpochMilli()) {
@@ -544,7 +579,8 @@ public final class GraphAutoBuilder implements AutoCloseable {
      * @return true if it was started
      */
     private boolean submit(NamespaceId id) {
-        if (!inFlight.add(id)) {
+        AtomicBoolean stop = new AtomicBoolean();
+        if (inFlight.putIfAbsent(id, stop) != null) {
             return false;
         }
         long startedAtMs = clock.millis();
@@ -555,7 +591,7 @@ public final class GraphAutoBuilder implements AutoCloseable {
                 0);
         });
         try {
-            builds.execute(() -> build(id, startedAtMs));
+            builds.execute(() -> build(id, startedAtMs, stop));
             return true;
         } catch (RejectedExecutionException e) {
             // The node is shutting down between the pass's check and the submit.
@@ -569,17 +605,52 @@ public final class GraphAutoBuilder implements AutoCloseable {
     }
 
     /**
+     * Asks a namespace's automatic build to stop, if one is in progress.
+     *
+     * <p>A request, read at the build's own boundaries, for the reasons
+     * {@link GraphBuildRunner#cancel} gives: what a stopped build loses is its own scratch
+     * work, and the namespace goes on serving the graph it had. How the namespace is scheduled
+     * afterwards is in the class description: deferred by the maximum delay, then built.</p>
+     *
+     * <p>Scoped to the one namespace, like every graph route.</p>
+     *
+     * @param id Whose automatic build to stop
+     * @return true if one was in progress and has been asked to stop
+     * @throws NullPointerException if id is null
+     */
+    public boolean cancel(NamespaceId id) {
+        Objects.requireNonNull(id, "id must not be null");
+        AtomicBoolean stop = inFlight.get(id);
+        if (stop == null) {
+            return false;
+        }
+        stop.set(true);
+        LOGGER.info("automatic graph build of namespace {} was asked to stop", id);
+        return true;
+    }
+
+    /**
+     * How long an automatic build stopped by {@link #cancel} defers the namespace's next one.
+     *
+     * @return The maximum delay
+     */
+    public Duration deferral() {
+        return settings.maxDelay();
+    }
+
+    /**
      * Builds one namespace and records how it ended.
      *
      * @param id          The namespace
      * @param startedAtMs When the pass started it
+     * @param stop        This build's own stop flag
      */
-    private void build(NamespaceId id, long startedAtMs) {
+    private void build(NamespaceId id, long startedAtMs, AtomicBoolean stop) {
         try {
             LOGGER.info("automatic graph build of namespace {} started: its graph is behind "
                 + "its staging", id);
-            Optional<GraphBuildService.BuildOutcome> outcome =
-                namespaces.buildIfBehind(id, cancelRequested::get);
+            Optional<GraphBuildService.BuildOutcome> outcome = namespaces.buildIfBehind(id,
+                () -> cancelRequested.get() || stop.get());
             if (outcome.isPresent()) {
                 completed.incrementAndGet();
                 finish(id, startedAtMs, RESULT_COMPLETED, null, outcome.get(), 0, 0, 0);
@@ -593,10 +664,7 @@ public final class GraphAutoBuilder implements AutoCloseable {
             }
         } catch (IOException | RuntimeException | Error e) {
             if (isCancellation(e)) {
-                cancelled.incrementAndGet();
-                finish(id, startedAtMs, RESULT_CANCELLED, null, null, 0, 0, 0);
-                LOGGER.info("automatic graph build of namespace {} stopped before publishing",
-                    id);
+                stopped(id, startedAtMs);
                 return;
             }
             Optional<PublishRefusedException> refusal = refusalIn(e);
@@ -618,6 +686,33 @@ public final class GraphAutoBuilder implements AutoCloseable {
             // One pool thread runs many builds; a flag left set by anything would kill the
             // next build at its first channel operation.
             Thread.interrupted();
+        }
+    }
+
+    /**
+     * Records a build that stopped because it was asked to, and when the next may start.
+     *
+     * <p>The streaks are carried over rather than reset: a stop is neither a failure nor a
+     * success, and resetting them would let an operator's stop wipe out the backoff a failing
+     * namespace had earned. A stop the node's shutdown asked for defers nothing - there is no
+     * next pass on this node to defer, and nothing here outlives the process.</p>
+     *
+     * @param id          The namespace
+     * @param startedAtMs When the pass started the build
+     */
+    private void stopped(NamespaceId id, long startedAtMs) {
+        cancelled.incrementAndGet();
+        Memory last = remembered.getOrDefault(id, Memory.NONE);
+        long retryAtMs = cancelRequested.get()
+            ? 0 : clock.millis() + settings.maxDelay().toMillis();
+        finish(id, startedAtMs, RESULT_CANCELLED, null, null, last.consecutiveFailures(),
+            last.consecutiveSupersessions(), retryAtMs);
+        if (retryAtMs == 0) {
+            LOGGER.info("automatic graph build of namespace {} stopped before publishing", id);
+        } else {
+            LOGGER.info("automatic graph build of namespace {} stopped before publishing, as "
+                + "asked; its staged changes are built automatically no sooner than {}s from "
+                + "now", id, settings.maxDelay().toSeconds());
         }
     }
 
@@ -745,7 +840,7 @@ public final class GraphAutoBuilder implements AutoCloseable {
      */
     private void forgetDropped(List<NamespaceId> onDisk) {
         Set<NamespaceId> present = new HashSet<>(onDisk);
-        remembered.keySet().removeIf(id -> !present.contains(id) && !inFlight.contains(id));
+        remembered.keySet().removeIf(id -> !present.contains(id) && !inFlight.containsKey(id));
     }
 
     /**
@@ -799,7 +894,8 @@ public final class GraphAutoBuilder implements AutoCloseable {
             return STATE_WITHHELD;
         }
         if (memory.retryAtMs() > clock.millis()) {
-            return STATE_BACKING_OFF;
+            return RESULT_CANCELLED.equals(memory.lastResult())
+                ? STATE_DEFERRED : STATE_BACKING_OFF;
         }
         return STATE_PENDING;
     }
