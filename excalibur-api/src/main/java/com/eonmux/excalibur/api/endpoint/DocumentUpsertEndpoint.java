@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.audit.AuditLog;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.protocol.JsonText;
@@ -107,6 +108,7 @@ public final class DocumentUpsertEndpoint implements HttpHandler {
         try {
             String body = RequestBody.read(exchange);
             sourceId = requireSourceId(body);
+            AuditLog.target(exchange, "source_id", sourceId);
             source = InlineSource.of(sourceId, documentsFrom(body));
         } catch (RequestBody.TooLargeException e) {
             ResponseBody.sendJson(exchange, 413, "{\"error\": \"Request body too large\"}");

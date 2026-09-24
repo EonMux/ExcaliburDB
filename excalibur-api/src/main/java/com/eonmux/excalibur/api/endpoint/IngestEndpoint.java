@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.audit.AuditLog;
 import java.util.Locale;
 
 import com.eonmux.excalibur.api.protocol.RequestBody;
@@ -306,6 +307,9 @@ public class IngestEndpoint implements HttpHandler {
                 // Parse request body
                 String requestBody = readRequestBody(exchange);
                 SourceDescriptor request = parseRequest(requestBody, namespace);
+                AuditLog.target(exchange, "source_id", request.sourceId());
+                AuditLog.target(exchange, "source_type", request.sourceType());
+                AuditLog.target(exchange, "namespace", request.namespace().value());
 
                 // Set source ID in MDC for per-source logging
                 StructuredLoggingHelper.setSourceId(request.sourceId());

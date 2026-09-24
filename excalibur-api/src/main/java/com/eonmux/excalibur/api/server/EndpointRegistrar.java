@@ -2,6 +2,7 @@ package com.eonmux.excalibur.api.server;
 
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
+import com.eonmux.excalibur.api.audit.AuditLog;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.bootstrap.NamespaceRoutingGraphIngestSink;
 import com.eonmux.excalibur.api.bootstrap.SourceRestoration;
@@ -690,7 +691,23 @@ final class EndpointRegistrar {
      * @param guarded The path's handler, already guarded
      * @return A handler dispatching {@code method} to the route and refusing the rest
      */
+    /**
+     * Records every request reaching a mutating route in the audit trail.
+     *
+     * <p>Outside the guard, so a request it refuses - unauthenticated, or over the mutate budget -
+     * is recorded as the attempt it was. Every route that changes what this node holds or how it
+     * behaves goes through here; see {@link AuditLog}.</p>
+     *
+     * @param action  The action the route performs, as the audit event names it
+     * @param guarded The route, already guarded
+     * @return The audited route
+     */
+    private static HttpHandler audited(String action, HttpHandler guarded) {
+        return AuditLog.audited(action, guarded);
+    }
+
     private HttpHandler onlyMethod(String method, HttpHandler guarded) {
+
         return createMethodRouter(Map.of(method, guarded),
             guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                 "Method Not Allowed - Use " + method)));
@@ -752,8 +769,8 @@ final class EndpointRegistrar {
         // 405 is charged rather than served below it.
         DrainEndpoint drain = new DrainEndpoint(readiness);
         target.createContext("/v1/drain", wrapHandler(exactPath("/v1/drain", createMethodRouter(
-            "POST", guard.protect(RequestGuard.Access.MUTATE, drain),
-            "DELETE", guard.protect(RequestGuard.Access.MUTATE, drain),
+            "POST", audited("node.drain", guard.protect(RequestGuard.Access.MUTATE, drain)),
+            "DELETE", audited("node.undrain", guard.protect(RequestGuard.Access.MUTATE, drain)),
             guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                 "Method Not Allowed - Use POST to drain or DELETE to undrain"))), notFound)));
     }
@@ -825,7 +842,8 @@ final class EndpointRegistrar {
         target.createContext("/v1/query", wrapHandler(pathOrChild("/v1/query", createMethodRouter(
             "POST", exactPath("/v1/query",
                 corpusRoute(RequestGuard.Access.READ, queryHandler), notFound),
-            "DELETE", corpusRoute(RequestGuard.Access.MUTATE, queryCancelEndpoint),
+            "DELETE", audited("query.cancel",
+                corpusRoute(RequestGuard.Access.MUTATE, queryCancelEndpoint)),
             exactPath("/v1/query", guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                 "Method Not Allowed - Use POST for queries or DELETE for cancellation")),
                 notFound)), notFound)));
@@ -845,7 +863,8 @@ final class EndpointRegistrar {
                                 IngestEndpoint ingestEndpoint) {
         target.createContext("/v1/ingest", wrapHandler(exactPath("/v1/ingest", createMethodRouter(
             Map.of(
-                "POST", guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint),
+                "POST", audited("source.register",
+                    guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint)),
                 // The read budget, like every other read-back: an operator asking what a source
                 // was registered as is not changing anything, and charging it against the
                 // mutate budget would let a status poll starve an ingestion.
@@ -857,14 +876,15 @@ final class EndpointRegistrar {
                 // source belonging to tenant B, with nothing in the answer to say so.
                 "GET", corpusRoute(RequestGuard.Access.READ,
                     new SourceListEndpoint(in.ingestSourceRegistry(), in.sourceCatalog())),
-                "DELETE", corpusRoute(RequestGuard.Access.MUTATE,
-                    new SourceDeregisterEndpoint(in.ingestSourceRegistry()))),
+                "DELETE", audited("source.deregister", corpusRoute(RequestGuard.Access.MUTATE,
+                    new SourceDeregisterEndpoint(in.ingestSourceRegistry())))),
             guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                 "Method Not Allowed - Use GET to read the registrations, POST to register a "
                     + "source or DELETE to stop crawling one"))), notFound)));
         target.createContext("/v1/ingest/run",
-            wrapHandler(exactPath("/v1/ingest/run", onlyMethod("DELETE", corpusRoute(RequestGuard.Access.MUTATE,
-                new IngestCancelEndpoint(in.ingestSourceRegistry()))), notFound)));
+            wrapHandler(exactPath("/v1/ingest/run", onlyMethod("DELETE", audited("ingest.cancel",
+                corpusRoute(RequestGuard.Access.MUTATE,
+                    new IngestCancelEndpoint(in.ingestSourceRegistry())))), notFound)));
         target.createContext("/v1/ingest/status",
             wrapHandler(exactPath("/v1/ingest/status", onlyMethod("GET", corpusRoute(RequestGuard.Access.READ,
                 new IngestStatusEndpoint(in.ingestionStatus()))), notFound)));
@@ -935,15 +955,15 @@ final class EndpointRegistrar {
             // anonymous caller while a node that does have a pipeline answers 401 - which
             // tells a prober which deployment it is looking at, and describes it.
             return createMethodRouter("GET", read,
-                "POST", corpusRoute(RequestGuard.Access.MUTATE, unavailable(
-                    "Supplying documents directly requires an ingestion pipeline, "
-                        + "which this node was started without")),
+                "POST", audited("documents.supply", corpusRoute(RequestGuard.Access.MUTATE,
+                    unavailable("Supplying documents directly requires an ingestion pipeline, "
+                        + "which this node was started without"))),
                 wrongMethod);
         }
         return createMethodRouter("GET", read,
-            "POST", corpusRoute(RequestGuard.Access.MUTATE,
+            "POST", audited("documents.supply", corpusRoute(RequestGuard.Access.MUTATE,
                 new DocumentUpsertEndpoint(in.ingestionOrchestrator(), in.ingestSourceRegistry(),
-                    suppliedSources, MAX_SUPPLIED_DOCUMENTS)),
+                    suppliedSources, MAX_SUPPLIED_DOCUMENTS))),
             wrongMethod);
     }
 
@@ -957,8 +977,10 @@ final class EndpointRegistrar {
                                  ReindexEndpoint reindexHandler) {
         target.createContext("/v1/reindex", wrapHandler(exactPath("/v1/reindex",
             createMethodRouter(
-                "POST", corpusRoute(RequestGuard.Access.MUTATE, reindexHandler),
-                "DELETE", corpusRoute(RequestGuard.Access.MUTATE, reindexHandler),
+                "POST", audited("reindex.start",
+                    corpusRoute(RequestGuard.Access.MUTATE, reindexHandler)),
+                "DELETE", audited("reindex.cancel",
+                    corpusRoute(RequestGuard.Access.MUTATE, reindexHandler)),
                 guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                     "Method Not Allowed - Use POST to start a reindex or DELETE to stop one"))),
             notFound)));
@@ -978,9 +1000,9 @@ final class EndpointRegistrar {
             return;
         }
         target.createContext("/v1/erasure", wrapHandler(exactPath("/v1/erasure",
-            onlyMethod("POST", corpusRoute(RequestGuard.Access.MUTATE,
+            onlyMethod("POST", audited("erasure.documents", corpusRoute(RequestGuard.Access.MUTATE,
                 new DocumentErasureEndpoint(in.documentErasure(), in.ingestSourceRegistry(),
-                    suppliedSources, in.graphTenants()))), notFound)));
+                    suppliedSources, in.graphTenants())))), notFound)));
     }
 
     /**
@@ -997,11 +1019,12 @@ final class EndpointRegistrar {
                                     CompactionRunner runner) {
         target.createContext("/v1/compact", wrapHandler(exactPath("/v1/compact",
             createMethodRouter(
-                "POST", corpusRoute(RequestGuard.Access.MUTATE, new CompactionEndpoint(runner)),
+                "POST", audited("compaction.start",
+                    corpusRoute(RequestGuard.Access.MUTATE, new CompactionEndpoint(runner))),
                 // A mutation too: it ends a rewrite of the served data. An anonymous caller
                 // able to stop every compaction is a node that never reclaims anything.
-                "DELETE", corpusRoute(RequestGuard.Access.MUTATE,
-                    new CompactionCancelEndpoint(runner)),
+                "DELETE", audited("compaction.cancel", corpusRoute(RequestGuard.Access.MUTATE,
+                    new CompactionCancelEndpoint(runner))),
                 guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                     "Method Not Allowed - Use POST to start a compaction or DELETE to stop "
                         + "the one in progress"))),
@@ -1031,10 +1054,11 @@ final class EndpointRegistrar {
             // build is a node whose graph never changes.
             target.createContext("/v1/graph/build", wrapHandler(exactPath("/v1/graph/build",
                 createMethodRouter(
-                    "POST", guard.protect(RequestGuard.Access.MUTATE,
-                        new GraphBuildEndpoint(graphBuildRunner)),
-                    "DELETE", guard.protect(RequestGuard.Access.MUTATE,
-                        new GraphBuildCancelEndpoint(graphBuildRunner)),
+                    "POST", audited("graph.build.start", guard.protect(RequestGuard.Access.MUTATE,
+                        new GraphBuildEndpoint(graphBuildRunner))),
+                    "DELETE", audited("graph.build.cancel",
+                        guard.protect(RequestGuard.Access.MUTATE,
+                            new GraphBuildCancelEndpoint(graphBuildRunner))),
                     guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                         "Method Not Allowed - Use POST to start a graph build or DELETE to "
                             + "stop the one in progress"))),
@@ -1047,8 +1071,8 @@ final class EndpointRegistrar {
                 exactPath("/v1/graph/build/status", onlyMethod("GET", guard.protect(RequestGuard.Access.READ,
                     new GraphBuildStatusEndpoint(graphBuildRunner))), notFound)));
             target.createContext("/v1/graph/erasure", wrapHandler(exactPath("/v1/graph/erasure",
-                onlyMethod("POST", guard.protect(RequestGuard.Access.MUTATE,
-                    new GraphErasureEndpoint(in.graphTenants()))), notFound)));
+                onlyMethod("POST", audited("erasure.graph", guard.protect(RequestGuard.Access.MUTATE,
+                    new GraphErasureEndpoint(in.graphTenants())))), notFound)));
             // The namespace inventory and the drop. One context with pathOrChild, because the
             // collection is a GET and its members carry the namespace in the path. Registered
             // only where graphTenants is: a node serving somebody else's pipeline has no
@@ -1060,8 +1084,9 @@ final class EndpointRegistrar {
                             new GraphNamespacesEndpoint(in.graphTenants()), notFound)),
                     // A mutation, and the most destructive one this node offers: it removes a
                     // tenant's graph, its staged facts and the log of what it still owed.
-                    "DELETE", guard.protect(RequestGuard.Access.MUTATE,
-                        new GraphNamespaceDeleteEndpoint(in.graphTenants())),
+                    "DELETE", audited("graph.namespace.delete",
+                        guard.protect(RequestGuard.Access.MUTATE,
+                            new GraphNamespaceDeleteEndpoint(in.graphTenants()))),
                     guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                         "Method Not Allowed - Use GET /v1/graph/namespaces to list them or "
                             + "DELETE /v1/graph/namespaces/{namespace} to drop one"))),

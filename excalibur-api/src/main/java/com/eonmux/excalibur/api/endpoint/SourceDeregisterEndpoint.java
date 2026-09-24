@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.audit.AuditLog;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.protocol.JsonText;
@@ -89,6 +90,7 @@ public class SourceDeregisterEndpoint implements HttpHandler {
             return;
         }
 
+        AuditLog.target(exchange, "source_id", sourceId);
         boolean removed;
         try {
             removed = sourceRegistry.remove(sourceId);
