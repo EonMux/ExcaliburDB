@@ -500,8 +500,9 @@ reads it too, and refuses with `409` a replacement that names a namespace other 
 source was registered in. A node holds one
 corpus, so every other `/v1` route answers `400` when a request names a namespace rather than
 quietly serving the shared index — set the header to `shared` or leave it off. The probes and node-level routes (`/health`, `/health/ready`, `/metrics`,
-`/v1/version`, `/v1/drain`) ignore it. See
-[Namespaces](README.md#namespaces) for what a namespace holds.
+`/v1/version`, `/v1/drain`) ignore it. A namespace is not a security boundary: the node has one
+bearer token, which reaches every namespace and the whole corpus, so tenants that must not see each
+other belong on separate nodes. See [Namespaces](README.md#namespaces) for what a namespace holds.
 
 The `/v1/graph/*` routes are documented in the README, under
 [Graph Examples](README.md#graph-examples) for the request and response shapes. They are named
