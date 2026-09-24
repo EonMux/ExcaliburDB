@@ -120,7 +120,9 @@ class McpParityToolsTest {
 
                 assertThat(missing.isError()).isTrue();
                 assertThat(wrong.isError()).isTrue();
-                assertThat(wrong.text()).contains("confirm").contains("notes");
+                assertThat(wrong.text()).contains("confirm").contains("source_id")
+                    .as("the refusal says what is required without handing over the value")
+                    .doesNotContain("notes");
                 assertThat(nearly.isError()).as("a confirmation is exact").isTrue();
                 assertThat(node.requests()).isEmpty();
             }

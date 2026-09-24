@@ -3324,7 +3324,7 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 |------|-----------|--------------|
 | `ingest_documents` | **`source_id`**, **`root_path`**, `included_extensions`, `excluded_directories`, `max_depth`, `follow_symlinks`, `include_hidden`, `max_file_bytes`, `charset`, `namespace` | Registers a directory and starts indexing it. Every setting a filesystem registration accepts over HTTP is here, with the same meaning and bounds — see the config fields under [Ingest Example](#ingest-example). An optional `charset` names the encoding its files are read in when they carry no byte-order mark (UTF-8 when omitted); a file with a mark is read in the encoding the mark names, and the node refuses an encoding it does not know |
 | `crawl_website` | **`source_id`**, **`base_url`**, `max_depth`, `max_documents`, `max_response_bytes`, `timeout_seconds`, `included_path_patterns`, `excluded_path_patterns`, `user_agent`, `crawl_delay_ms`, `respect_robots_txt`, `namespace` | Registers an HTTP source and starts crawling it. Every setting an HTTP registration accepts is here, with the same meaning and bounds; `crawl_delay_ms` can only slow a crawl below the node's own `excalibur.ingest.crawl-delay-ms` pace, never speed it up, and `respect_robots_txt` (on unless `false`) obeys the site's [robots.txt](#robotstxt) |
-| `add_documents` | **`source_id`**, **`documents`** (each **`document_id`**, **`text`**) | Indexes documents sent in the call itself, for content the model is holding |
+| `add_documents` | **`source_id`**, **`documents`** (each **`document_id`**, **`text`**, `content_type`, `last_modified_millis`) | Indexes documents sent in the call itself, for content the model is holding. `content_type` `text/html` or `application/xhtml+xml` indexes the text the markup shows; `last_modified_millis` dates the facts extracted from the document — `POST /v1/documents` |
 | `ingestion_status` | `source_id` | How far indexing has got, with `entries_skipped` (not text) and `entries_disallowed` (kept out by robots.txt) counted apart from errors |
 | `reindex_source` | **`source_id`** | Re-reads a registered source and replaces what changed |
 | `reindex_status` | `source_id` | How far a reindex has got, and whether it finished, failed or was cancelled |
@@ -3399,9 +3399,13 @@ conversation.
 Two tools do destroy data, `erase_documents` and `delete_namespace`, and both are gated the same
 way. Each requires a `confirm` argument that repeats exactly what it destroys — the `source_id`,
 or the namespace — and the adapter refuses the call without sending anything when it is absent or
-differs, so a model cannot erase by filling in a plausible-looking argument it was never given.
-Their descriptions say the call is irreversible and is to be made only when the user explicitly
-asked for it. `delete_namespace` never falls back on `EXCALIBUR_NAMESPACE`, and every namespace a
+differs. What that guarantees is that the destruction was asked for twice in one call: a model
+that reached for the wrong tool with the right identifier, or filled the identifier in from a
+default, is refused rather than obeyed. It cannot tell a value the user gave from one the model
+made up - the confirmation repeats another argument of the same call - so the refusal says what
+has to be repeated without quoting the value, and tells the model to ask the user rather than
+retry. Their descriptions say the call is irreversible and is to be made only when the user
+explicitly asked for it. `delete_namespace` never falls back on `EXCALIBUR_NAMESPACE`, and every namespace a
 tool puts in a path is checked against the node's naming rule first, so `..` or a `/` cannot turn
 it into a different route; the ids `cancel_query` and `erasure_status` put in a path are held to
 the shape the node issues them in, for the same reason. Graph erasure (`POST /v1/graph/erasure`)
@@ -3464,6 +3468,27 @@ An argument `ingest_documents` or `crawl_website` does not declare — a misspel
 the arguments the tool takes, and nothing is sent. Dropped, it would register the source without
 the setting the model believes it made, as the node's `400` for an unknown `config` field exists
 to prevent over HTTP.
+
+The objects inside `add_documents`' `documents` and `assert_graph_facts`' `facts` are checked the
+same way, against the members the schema declares for one element: an element that is not an
+object, a member it does not declare, a required one missing, or a value of the wrong type is a
+tool error naming the element and the member, and nothing is sent. Both routes ignore a member
+they do not read, so a misspelt `"valid_until"` would otherwise stage a fact that still holds, and
+`"last_modified"` date a document's facts on the day they are staged. An integer member accepts
+`5`, `5.0` or `"5"` and a number member `"0.5"`, as a top-level argument does, and is sent as a
+number; an explicit `null` on an optional member is sent as written, which is how a fact says it
+has no known start or still holds.
+
+Every tool carries MCP `annotations` stating all four behaviour hints rather than leaving them to
+the specification's worst-case defaults: `readOnlyHint` for the eighteen that only read,
+`openWorldHint` for `crawl_website` and `reindex_source`, which fetch from the web, and
+`idempotentHint` for everything a repeat leaves unchanged — not `assert_graph_facts`, which stages
+another fact each time, nor `erase_documents`, whose scope `source` erases at most 1000 documents
+a call. `destructiveHint` follows the specification's meaning, anything more than additive, so
+besides the two confirmation-gated tools it marks `add_documents` and `reindex_source`, which
+replace documents they find changed; neither takes a confirmation, because replacing is what they
+exist to do. The hints are sent under every protocol revision the adapter speaks: the 2024-11-05
+tool schema does not close its members, and a client of it ignores one it does not know.
 
 ### Without MCP
 

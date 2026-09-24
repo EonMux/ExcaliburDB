@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.mcp;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -302,5 +303,118 @@ final class ToolArguments {
                 + String.join(", ", new TreeSet<>(accepted))
                 + ". Correct the name, or leave it out.");
         }
+    }
+
+    /**
+     * Checks the objects of an array argument against the schema one element is declared with,
+     * and returns them ready to forward.
+     *
+     * <p>For the arrays whose elements the node reads member by member - a supplied document, an
+     * asserted fact. Those routes ignore a member they do not read, so a misspelt one would reach
+     * the node as an absent one and the call would succeed without it: {@code "valid_until"}
+     * stages a fact that still holds, {@code "last_modified"} dates a document's facts on the day
+     * they are staged. Every member is therefore checked here, as {@link #requireKnown} checks a
+     * tool's own arguments: that it is declared, that a required one is present, and that its
+     * value has the declared type.</p>
+     *
+     * <p>A value is forwarded as written, with one exception: a whole number given as
+     * {@code 5.0} or {@code "5"} is sent as {@code 5}, and a number given as {@code "0.5"} as
+     * {@code 0.5}, the tolerance {@link #wholeLong} and {@link #number} give a top-level
+     * argument - forwarded as written, either would be refused by a node that reads the member
+     * as a number. An explicit null on an optional member is kept: it is how a fact says it has
+     * no known start or still holds.</p>
+     *
+     * @param field      The array argument, for the message
+     * @param elements   Its elements, as {@link #optionalList} read them
+     * @param itemSchema The JSON Schema one element is declared with: an object schema with
+     *                   {@code properties} and {@code required}
+     * @return New element objects, in order, holding the members as they are to be sent
+     * @throws IllegalArgumentException if an element is not an object, names a member the schema
+     *                                  does not declare, lacks a required one, or holds a value
+     *                                  of the wrong type
+     */
+    static List<Object> declaredElements(String field, List<Object> elements,
+                                         Map<String, Object> itemSchema) {
+        Map<String, Object> properties = Json.objectAt(itemSchema, "properties");
+        List<?> required = (List<?>) itemSchema.get("required");
+        List<Object> checked = new ArrayList<>(elements.size());
+        for (int i = 0; i < elements.size(); i++) {
+            String which = "Argument '" + field + "' element " + i;
+            if (!(elements.get(i) instanceof Map<?, ?> element)) {
+                throw new IllegalArgumentException(which + " must be an object, got: "
+                    + elements.get(i));
+            }
+            Map<String, Object> members = new LinkedHashMap<>();
+            element.forEach((name, value) -> members.put(String.valueOf(name), value));
+            requireDeclaredMembers(which, members, properties);
+            for (Object name : required) {
+                if (members.get(name) == null) {
+                    throw new IllegalArgumentException(which + " needs '" + name + "'.");
+                }
+            }
+            Map<String, Object> sent = new LinkedHashMap<>();
+            for (Map.Entry<String, Object> member : members.entrySet()) {
+                sent.put(member.getKey(), typedMember(which, members, member.getKey(),
+                    Json.stringAt(properties.get(member.getKey()), "type")));
+            }
+            checked.add(sent);
+        }
+        return checked;
+    }
+
+    private static void requireDeclaredMembers(String which, Map<String, Object> members,
+                                               Map<String, Object> properties) {
+        List<String> unknown = new ArrayList<>();
+        for (String name : members.keySet()) {
+            if (!properties.containsKey(name)) {
+                unknown.add("'" + name + "'");
+            }
+        }
+        if (!unknown.isEmpty()) {
+            unknown.sort(null);
+            throw new IllegalArgumentException(which + " has " + String.join(", ", unknown)
+                + ", which " + (unknown.size() == 1 ? "is" : "are") + " not taken: each element "
+                + "takes " + String.join(", ", properties.keySet())
+                + ". Correct the name, or leave it out.");
+        }
+    }
+
+    /**
+     * One member's value as it is to be sent, after checking it has the declared type.
+     *
+     * @param which   The element, for the message
+     * @param members The element's members
+     * @param name    The member
+     * @param type    Its declared JSON type
+     * @return The value to send; null when it is null
+     */
+    private static Object typedMember(String which, Map<String, Object> members, String name,
+                                      String type) {
+        Object value = members.get(name);
+        if (value == null) {
+            return null;
+        }
+        if ("string".equals(type)) {
+            if (value instanceof String) {
+                return value;
+            }
+            throw mistyped(which, name, "a string", value, null);
+        }
+        try {
+            return switch (type) {
+                case "integer" -> wholeLong(members, name);
+                case "number" -> number(members, name);
+                default -> value;
+            };
+        } catch (IllegalArgumentException e) {
+            throw mistyped(which, name, "integer".equals(type) ? "a whole number" : "a number",
+                value, e);
+        }
+    }
+
+    private static IllegalArgumentException mistyped(String which, String name, String expected,
+                                                     Object value, Throwable cause) {
+        return new IllegalArgumentException(which + " has '" + name + "' that is not " + expected
+            + ", got: " + value, cause);
     }
 }

@@ -216,7 +216,8 @@ public final class McpTools {
     /**
      * The catalogue, as MCP {@code tools/list} returns it.
      *
-     * @return One descriptor per tool, each with its name, description and input schema
+     * @return One descriptor per tool, each with its name, description, input schema and the
+     *         behaviour hints {@link ToolHints} declares for it
      */
     public static List<Object> catalogue() {
         List<Object> tools = new ArrayList<>();
@@ -434,7 +435,18 @@ public final class McpTools {
                     ToolSchema.required("document_id", "string",
                         "Names the document within its source. Sending the same one again "
                         + "replaces what is indexed under it."),
-                    ToolSchema.required("text", "string", "The document's text. Must not be empty.")))));
+                    ToolSchema.required("text", "string", "The document's text. Must not be empty."),
+                    ToolSchema.optional("content_type", "string",
+                        "What the text is. Omit for 'text/plain'. Send 'text/html' or "
+                        + "'application/xhtml+xml' for markup: the node then indexes the text the "
+                        + "page shows, with tags, scripts and styles stripped, where as plain text "
+                        + "the markup itself would be indexed and searched.", null),
+                    ToolSchema.optionalInteger("last_modified_millis",
+                        "When the document was last written, in milliseconds since the epoch. "
+                        + "Facts extracted from it are recorded as stated on that date, which "
+                        + "decides which of two documents' conflicting values for the same fact "
+                        + "is the newer. Omit when unknown, and they are dated the day they are "
+                        + "indexed.", 0)))));
 
         tools.add(ToolSchema.tool(INGESTION_STATUS,
             "How far indexing has got, for one source or for all of them. 'idle' with no error "
@@ -695,6 +707,11 @@ public final class McpTools {
         MaintenanceTools.addTo(tools);
         addStoppingTools(tools);
         addDestructiveTools(tools);
+        for (Object described : tools) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> tool = (Map<String, Object>) described;
+            tool.put("annotations", ToolHints.of(Json.stringAt(tool, "name")));
+        }
         return tools;
     }
 
@@ -1115,6 +1132,11 @@ public final class McpTools {
     /**
      * Refuses a destructive call whose confirmation does not repeat what it destroys.
      *
+     * <p>The refusal says what {@code confirm} has to repeat without quoting the value. Quoted,
+     * it turns the refusal into the next call's argument: a model that sent no confirmation,
+     * or the wrong one, could copy it across and retry without the user ever being asked, which
+     * is the step the confirmation is there to put back in.</p>
+     *
      * @param args     The call's arguments
      * @param expected What {@code confirm} has to say
      * @param field    The argument it repeats, for the message
@@ -1124,8 +1146,9 @@ public final class McpTools {
                                             String field) {
         if (!expected.equals(ToolArguments.optionalString(args, CONFIRM))) {
             throw new IllegalArgumentException("This call is irreversible, so '" + CONFIRM
-                + "' must repeat the " + field + " exactly: \"" + expected + "\". Nothing was "
-                + "sent. Make this call only if the user explicitly asked for it.");
+                + "' must repeat this call's " + field + " exactly, as the user gave it. "
+                + "Nothing was sent. Make this call only if the user explicitly asked for it; "
+                + "if they did not, ask them rather than retrying.");
         }
     }
 
@@ -1258,7 +1281,8 @@ public final class McpTools {
             return ToolResult.error(
                 "'documents' is required and must carry at least one document.");
         }
-        body.put("documents", documents);
+        body.put("documents", ToolArguments.declaredElements("documents", documents,
+            itemsOf(ADD_DOCUMENTS, "documents")));
         return answer(client.post("/v1/documents", Json.write(body), null));
     }
 
@@ -1281,6 +1305,31 @@ public final class McpTools {
             }
         }
         throw new IllegalStateException("The catalogue describes no tool named " + tool);
+    }
+
+    /**
+     * The schema one element of a tool's array argument is declared with.
+     *
+     * <p>Read from the catalogue for the reason {@link #argumentsOf} gives: what an element may
+     * hold is then exactly what the schema tells the model it may hold.</p>
+     *
+     * @param tool  The tool name
+     * @param field The array argument
+     * @return Its {@code items} schema
+     * @throws IllegalStateException if the catalogue has no such tool or argument
+     */
+    static Map<String, Object> itemsOf(String tool, String field) {
+        for (Object described : catalogue()) {
+            if (tool.equals(Json.stringAt(described, "name"))) {
+                Map<String, Object> items = Json.objectAt(Json.objectAt(Json.objectAt(
+                    Json.objectAt(described, "inputSchema"), "properties"), field), "items");
+                if (items != null) {
+                    return items;
+                }
+            }
+        }
+        throw new IllegalStateException("The catalogue declares no array of objects " + field
+            + " on " + tool);
     }
 
     private ToolResult ingestionStatus(Map<String, Object> args)
@@ -1407,15 +1456,17 @@ public final class McpTools {
 
     private ToolResult assertGraphFacts(Map<String, Object> args)
             throws IOException, InterruptedException {
-        // Forwarded as written, as add_documents forwards its documents: the node cleans and
-        // bounds each fact exactly as it does an extracted one, and answers the first it refuses
-        // naming the fact and the field.
+        // Each fact's members are checked against the schema here, since the route ignores one it
+        // does not read. What they say is the node's to judge: it cleans and bounds each fact
+        // exactly as it does an extracted one, and answers the first it refuses naming the fact
+        // and the field.
         List<Object> facts = ToolArguments.optionalList(args, "facts");
         if (facts == null || facts.isEmpty()) {
             return ToolResult.error("'facts' is required and must carry at least one fact.");
         }
         Map<String, Object> body = Json.object();
-        body.put("facts", facts);
+        body.put("facts", ToolArguments.declaredElements("facts", facts,
+            itemsOf(ASSERT_GRAPH_FACTS, "facts")));
         return answer(client.post("/v1/graph/facts", Json.write(body), scope(args)));
     }
 
