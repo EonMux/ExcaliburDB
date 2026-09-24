@@ -3777,6 +3777,7 @@ its target, and a standard run without `--capture` exits `1` on one too.
 | `runHnswRecallBenchmark` | `HnswRecallBenchmark` | HNSW recall@10 (target ≥ 99%) |
 | `runMappedFileBenchmark` | `MappedFileBenchmark` | Memory-mapped I/O throughput |
 | `runPointLookupBenchmark` | `PointLookupBenchmark` | Point lookup throughput (target ≥ 10M ops/sec) |
+| `runBenchmark --args='segment'` | `SegmentBenchmark` | Lookups through a whole segment - lock, hash and checksums - sequential, random, batched, with the epoch that keeps a zero-copy slice valid, ten under one read lock, and for absent keys (target ≥ 10M ops/sec for sequential and random) |
 | `runTailScanBenchmark` | `TailScanBenchmark` | Brute-force scan throughput at varying tail sizes |
 
 To compare two builds rather than measure one, `runBenchmarkComparison` runs
@@ -3808,7 +3809,8 @@ run that measured nothing), `3` a combination errored and so was never measured 
 Results are matched to their baseline by benchmark, mode and `@Param` values, so each parameter
 combination is compared with its own baseline rather than with a sibling's.
 
-`CuckooFilterInsertBenchmark` has no task of its own; reach it with
+`SegmentBenchmark` and `CuckooFilterInsertBenchmark` have no task of their own; reach them with
+`./gradlew :excalibur-bench:runBenchmark --args='segment'` and
 `./gradlew :excalibur-bench:runBenchmark --args='cuckoo-insert'` — the runner matches one
 argument against `segment`, `cuckoo` and `cuckoo`+`insert`, so the two words have to arrive as one
 token.
