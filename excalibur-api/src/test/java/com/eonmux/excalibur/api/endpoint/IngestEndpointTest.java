@@ -17,7 +17,6 @@ import com.eonmux.excalibur.ingest.source.SourceDescriptor;
 import com.eonmux.excalibur.tenancy.NamespaceId;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.shard.worker.SegmentReindexScheduler;
-import com.eonmux.excalibur.store.SegmentCatalog;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.BeforeEach;
@@ -139,12 +138,9 @@ class IngestEndpointTest {
 
     @Test
     @DisplayName("InMemorySourceRegistry should register source with scheduler when configured")
-    void testSchedulerRegistrationWhenSourceRegistered(@TempDir Path tempDir) {
-        // Create a mock catalog and scheduler
-        SegmentCatalog catalog = new SegmentCatalog(tempDir.resolve("catalog.dat"));
+    void testSchedulerRegistrationWhenSourceRegistered() {
         AtomicBoolean reindexTriggered = new AtomicBoolean(false);
         SegmentReindexScheduler scheduler = new SegmentReindexScheduler(
-            catalog,
             sourceId -> {
                 reindexTriggered.set(true);
                 return true;
@@ -168,11 +164,8 @@ class IngestEndpointTest {
 
     @Test
     @DisplayName("InMemorySourceRegistry should schedule a source under the name it was given")
-    void testNonNumericSourceIdWithScheduler(@TempDir Path tempDir) {
-        // Create a mock catalog and scheduler
-        SegmentCatalog catalog = new SegmentCatalog(tempDir.resolve("catalog.dat"));
+    void testNonNumericSourceIdWithScheduler() {
         SegmentReindexScheduler scheduler = new SegmentReindexScheduler(
-            catalog,
             sourceId -> true
         );
 
@@ -195,12 +188,9 @@ class IngestEndpointTest {
 
     @Test
     @DisplayName("InMemorySourceRegistry should use configured reindex interval")
-    void testCustomReindexInterval(@TempDir Path tempDir) {
-        // Create a mock catalog and scheduler
-        SegmentCatalog catalog = new SegmentCatalog(tempDir.resolve("catalog.dat"));
+    void testCustomReindexInterval() {
         long customIntervalMs = 1800000L; // 30 minutes
         SegmentReindexScheduler scheduler = new SegmentReindexScheduler(
-            catalog,
             sourceId -> true
         );
 

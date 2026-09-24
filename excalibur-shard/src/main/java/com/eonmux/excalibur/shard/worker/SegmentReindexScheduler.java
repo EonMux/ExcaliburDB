@@ -1,7 +1,5 @@
 package com.eonmux.excalibur.shard.worker;
 
-import com.eonmux.excalibur.store.LifecycleState;
-import com.eonmux.excalibur.store.SegmentCatalog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -17,22 +15,22 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Virtual thread scheduler for stale segment re-crawl scheduling.
+ * Re-crawls each registered source on its own interval.
  *
- * <p>This worker schedules and triggers re-indexing of segments based on
- * configurable per-source intervals. Re-indexing ensures that stale data
- * is refreshed and the index remains up-to-date.</p>
+ * <h2>What is scheduled</h2>
+ * <p>Sources, not segments. A source is the unit a re-crawl reads, compares and rewrites, while a
+ * segment holds chunks of whichever sources wrote into it with nothing that maps it back to them
+ * - so a segment's age names no source to re-crawl, and every segment's content is refreshed
+ * anyway by the re-crawls of the sources that wrote it. Each check hands every source whose
+ * interval has elapsed to {@link ReindexListener#onReindexNeeded(String)}, which runs the
+ * re-crawl and reports back through {@link #markReindexComplete(String)} or
+ * {@link #markReindexFailed(String, String)}.</p>
  *
- * <h2>Re-indexing Strategy</h2>
- * <p>Each data source can have a configurable re-index interval. When the
- * interval elapses, the scheduler triggers a re-index via the existing
- * ingestion pipeline:</p>
- * <ol>
- *   <li>Identify segments that need re-indexing based on age</li>
- *   <li>Trigger re-index via {@link ReindexListener#onReindexNeeded(String)}</li>
- *   <li>Track re-index progress and completion</li>
- *   <li>Report statistics for monitoring</li>
- * </ol>
+ * <h2>One re-crawl at a time</h2>
+ * <p>The listener is called on the scheduler's single thread and the re-crawl runs there, so the
+ * sources due at one check are re-crawled one after another, never together. That is also what
+ * keeps a node that comes up with many sources overdue from starting all of their crawls at once:
+ * they queue behind each other on this thread.</p>
  *
  * <h2>Thread Safety</h2>
  * <p><strong>This class is fully thread-safe.</strong></p>
@@ -52,7 +50,6 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * @author ExcaliburDB
  * @since 5.0
- * @see SegmentCatalog
  */
 public class SegmentReindexScheduler {
 
@@ -95,7 +92,6 @@ public class SegmentReindexScheduler {
 
     // ==================== Instance Fields ====================
 
-    private final SegmentCatalog catalog;
     private final ReindexListener listener;
     private final Map<String, SourceSchedule> sourceSchedules;
     private volatile ScheduledExecutorService scheduler;
@@ -116,29 +112,24 @@ public class SegmentReindexScheduler {
     /**
      * Creates a new SegmentReindexScheduler with default configuration.
      *
-     * @param catalog  The segment catalog for metadata access
      * @param listener Callback for re-index events
-     * @throws NullPointerException if catalog or listener is null
+     * @throws NullPointerException if listener is null
      */
-    public SegmentReindexScheduler(SegmentCatalog catalog, ReindexListener listener) {
-        this(catalog, listener, DEFAULT_CHECK_INTERVAL_MS, DEFAULT_REINDEX_INTERVAL_MS);
+    public SegmentReindexScheduler(ReindexListener listener) {
+        this(listener, DEFAULT_CHECK_INTERVAL_MS, DEFAULT_REINDEX_INTERVAL_MS);
     }
 
     /**
      * Creates a new SegmentReindexScheduler with custom configuration.
      *
-     * @param catalog                 The segment catalog
      * @param listener                Callback for re-index events
      * @param checkIntervalMs         Interval between scheduler checks (ms)
      * @param defaultReindexIntervalMs Default re-index interval for sources (ms)
-     * @throws NullPointerException    if catalog or listener is null
+     * @throws NullPointerException    if listener is null
      * @throws IllegalArgumentException if configuration values are invalid
      */
-    public SegmentReindexScheduler(SegmentCatalog catalog, ReindexListener listener,
+    public SegmentReindexScheduler(ReindexListener listener,
                                     long checkIntervalMs, long defaultReindexIntervalMs) {
-        if (catalog == null) {
-            throw new NullPointerException("Catalog cannot be null");
-        }
         if (listener == null) {
             throw new NullPointerException("Listener cannot be null");
         }
@@ -146,7 +137,6 @@ public class SegmentReindexScheduler {
         validateCheckInterval(checkIntervalMs);
         validateReindexInterval(defaultReindexIntervalMs);
 
-        this.catalog = catalog;
         this.listener = listener;
         this.sourceSchedules = new ConcurrentHashMap<>();
 
@@ -191,11 +181,8 @@ public class SegmentReindexScheduler {
     /**
      * Starts the background re-index scheduler.
      *
-     * <p>After starting, the scheduler will periodically check for:
-     * <ul>
-     *   <li>Sources that need re-indexing based on their interval</li>
-     *   <li>Segments that are stale and need refreshing</li>
-     * </ul>
+     * <p>After starting, the scheduler checks once per check interval for the sources whose
+     * re-index interval has elapsed.</p>
      *
      * <p>If the scheduler is already running, this method does nothing.</p>
      *
@@ -455,35 +442,8 @@ public class SegmentReindexScheduler {
                 }
             }
 
-            // Also check for stale segments in the catalog
-            checkForStaleSegments();
-
         } catch (Exception e) {
             LOGGER.error("Error during scheduler check", e);
-        }
-    }
-
-    /**
-     * Checks for stale segments that may need re-indexing.
-     */
-    private void checkForStaleSegments() {
-        // Get all ACTIVE segments
-        java.util.List<Long> activeSegments = catalog.getSegmentsByState(LifecycleState.ACTIVE);
-
-        for (Long segmentId : activeSegments) {
-            SegmentCatalog.SegmentMetadata metadata = catalog.get(segmentId);
-            if (metadata == null) {
-                continue;
-            }
-
-            // Check if segment hasn't been updated in a while
-            long timeSinceCreation = System.currentTimeMillis() - metadata.getCreationTime();
-
-            // If segment is very old (e.g., older than 24 hours), consider for re-index
-            if (timeSinceCreation > MAX_REINDEX_INTERVAL_MS) {
-                LOGGER.debug("Segment {} is potentially stale (age: {}ms)", segmentId, timeSinceCreation);
-                // Note: Actual re-index triggering would depend on source mapping
-            }
         }
     }
 

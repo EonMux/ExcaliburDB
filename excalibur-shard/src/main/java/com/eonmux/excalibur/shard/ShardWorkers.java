@@ -87,9 +87,8 @@ final class ShardWorkers {
         // "healthy" cannot be reported at the moment writes are being refused.
         com.eonmux.excalibur.metrics.Metrics.setHnswQueueLimit(tuning.hnswQueueDepthLimit());
 
-        this.reindex = new SegmentReindexScheduler(catalog,
-            listeners.reindex(),
-            tuning.reindexCheckIntervalMs(), 3600000);
+        this.reindex = new SegmentReindexScheduler(listeners.reindex(),
+            tuning.reindexCheckIntervalMs(), SegmentReindexScheduler.DEFAULT_REINDEX_INTERVAL_MS);
 
         // Background tombstone cleanup, allocating replacement segments out of the storage
         // engine's Arena. See the segmentCompaction field for why no other Arena will do.
