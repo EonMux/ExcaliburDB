@@ -146,12 +146,6 @@ public final class ExcaliburApplication {
      */
     private final DocumentVisibilityChecker documentVisibilityChecker;
 
-    /**
-     * Metrics registry for JMX MBean management.
-     * All JMX MBeans are registered through this registry for observability.
-     */
-    private final MetricsRegistry metricsRegistry;
-
     private volatile boolean shutdownRequested = false;
 
     /** Where segments, indexes and the lexical index live. */
@@ -341,18 +335,18 @@ public final class ExcaliburApplication {
         // Load configuration
         this.config = loadConfiguration(configSource);
 
-        // Initialize metrics registry and register JMX MBeans
-        // This enables observability for query latency, queue depth, coverage, etc.
-        this.metricsRegistry = new MetricsRegistry();
+        // Register the JMX MBeans: query latency, queue depth, coverage, epoch, throughput.
         try {
-            Metrics.registerAll(metricsRegistry);
+            Metrics.registerAll(new MetricsRegistry());
             LOGGER.info("JMX MBeans registered successfully");
         } catch (Exception e) {
             LOGGER.warn("Failed to register JMX MBeans: {}. Metrics will not be available via JMX.", e.getMessage());
         }
-        // Initialize health score and coverage to sensible defaults
-        Metrics.setHealthScore(0.5);
+        // Nothing has been measured as visible yet. The health score is the coverage (the epoch
+        // tick and the health endpoint both publish it), so it starts where coverage does and
+        // the node reads unhealthy until a measurement says otherwise.
         Metrics.setEstimatedCoverage(0.0);
+        Metrics.setHealthScore(0.0);
         Metrics.recordEpoch(0);
 
         // Initialize HNSW config factory from ShardConfig settings
@@ -831,24 +825,5 @@ public final class ExcaliburApplication {
      */
     public DocumentVisibilityChecker getDocumentVisibilityChecker() {
         return documentVisibilityChecker;
-    }
-
-    /**
-     * Gets the metrics registry for JMX MBean management.
-     *
-     * <p>The metrics registry provides access to all registered JMX MBeans
-     * for observability and monitoring:</p>
-     * <ul>
-     *   <li>Query latency (p50, p90, p95, p99)</li>
-     *   <li>System health score</li>
-     *   <li>Ingestion queue depth</li>
-     *   <li>Visibility epoch</li>
-     *   <li>HNSW queue depth</li>
-     * </ul>
-     *
-     * @return The metrics registry
-     */
-    public MetricsRegistry getMetricsRegistry() {
-        return metricsRegistry;
     }
 }

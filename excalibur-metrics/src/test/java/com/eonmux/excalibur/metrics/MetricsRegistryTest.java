@@ -1,155 +1,128 @@
 package com.eonmux.excalibur.metrics;
 
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import javax.management.InstanceAlreadyExistsException;
 import javax.management.MBeanServer;
+import javax.management.MalformedObjectNameException;
 import javax.management.ObjectName;
 import java.lang.management.ManagementFactory;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Tests that every {@link MetricsRegistry} accessor reads the quantity it names.
+ * Tests that {@link MetricsRegistry} puts beans on the platform MBean server and records
+ * exactly what the server accepted.
  *
- * <p>Two failure modes are covered. First, cross-wiring: coverage and health are both
- * doubles in [0.0, 1.0] published by the same MBean, so returning one where the other was
- * asked for is invisible until someone acts on it. Every test here therefore sets the two
- * to different values. Second, dead fallbacks: when no MBean is registered the accessors
- * must fall back to the global {@link Metrics} state that production records into, not to a
- * registry-local copy that nothing ever writes.</p>
+ * <p>Every name used here is unique to the test that uses it: the platform server is
+ * process-wide and refuses a duplicate name, so a fixed name would make these tests depend on
+ * the order they ran in relative to the other JMX tests.</p>
  *
  * @author ExcaliburDB
  */
 class MetricsRegistryTest {
 
-    private static final String[] MBEAN_NAMES = {
-        "com.eonmux.excalibur:type=QueryLatency",
-        "com.eonmux.excalibur:type=SystemHealth",
-        "com.eonmux.excalibur:type=IngestionQueue",
-        "com.eonmux.excalibur:type=VisibilityEpoch",
-        "com.eonmux.excalibur:type=HnswQueueDepth",
-        "com.eonmux.excalibur:type=IngestionThroughput"
-    };
+    private static final AtomicInteger UNIQUE = new AtomicInteger();
 
-    private MBeanServer mbeanServer;
-    private MetricsRegistry registry;
-
-    @BeforeEach
-    void setUp() throws Exception {
-        mbeanServer = ManagementFactory.getPlatformMBeanServer();
-        unregisterAll();
-        registry = new MetricsRegistry();
-    }
+    private final MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+    private final List<String> toUnregister = new ArrayList<>();
 
     @AfterEach
-    void tearDown() throws Exception {
-        unregisterAll();
-    }
-
-    private void unregisterAll() throws Exception {
-        for (String name : MBEAN_NAMES) {
+    void unregister() throws Exception {
+        for (String name : toUnregister) {
             ObjectName objectName = new ObjectName(name);
-            if (mbeanServer.isRegistered(objectName)) {
-                mbeanServer.unregisterMBean(objectName);
+            if (server.isRegistered(objectName)) {
+                server.unregisterMBean(objectName);
             }
         }
     }
 
-    @Test
-    @DisplayName("Coverage and health are distinct values, through the MBeans")
-    void coverageAndHealthAreNotInterchangeableViaMBean() throws Exception {
-        Metrics.registerAll(registry);
-
-        Metrics.setEstimatedCoverage(0.25);
-        Metrics.setHealthScore(0.75);
-
-        assertEquals(0.25, registry.getCoverageFromMBean(), 1e-9,
-            "getCoverageFromMBean must report coverage");
-        assertEquals(0.75, registry.getHealthScoreFromMBean(), 1e-9,
-            "getHealthScoreFromMBean must report health");
-        assertNotEquals(registry.getCoverageFromMBean(), registry.getHealthScoreFromMBean(),
-            "the two accessors must not resolve to the same underlying value");
+    private String uniqueName(String type) {
+        String name = "excalibur.registrytest:type=" + type + ",run=" + UNIQUE.incrementAndGet();
+        toUnregister.add(name);
+        return name;
     }
 
     @Test
-    @DisplayName("Coverage and health are distinct values, through the fallbacks")
-    void coverageAndHealthAreNotInterchangeableViaFallback() {
-        // No MBeans registered: every accessor takes its fallback path.
-        Metrics.setEstimatedCoverage(0.4);
-        Metrics.setHealthScore(0.9);
+    @DisplayName("A registered bean is on the platform server and remembered under its name")
+    void registrationReachesThePlatformServer() throws Exception {
+        MetricsRegistry registry = new MetricsRegistry();
+        String name = uniqueName("SystemHealth");
 
-        assertEquals(0.4, registry.getCoverageFromMBean(), 1e-9,
-            "the coverage fallback must read the coverage metric");
-        assertEquals(0.9, registry.getHealthScoreFromMBean(), 1e-9,
-            "the health fallback must read the health metric");
+        registry.registerMBean(Metrics.getSystemHealthMBean(), name);
+
+        assertTrue(server.isRegistered(new ObjectName(name)),
+            "the bean must be visible to JMX consoles");
+        assertSame(Metrics.getSystemHealthMBean(), registry.getMBean(name));
+        assertEquals(List.of(name), registry.getRegisteredMBeanNames());
     }
 
     @Test
-    @DisplayName("Latency fallbacks read the histogram production records into")
-    void latencyFallbacksReadTheProductionHistogram() {
-        Metrics.QueryLatency().reset();
-        for (int i = 0; i < 20; i++) {
-            Metrics.recordQueryLatency(120);
-        }
+    @DisplayName("A console's read through the server reaches the bean's live value")
+    void serverReadsTheLiveValue() throws Exception {
+        MetricsRegistry registry = new MetricsRegistry();
+        String name = uniqueName("VisibilityEpoch");
+        registry.registerMBean(Metrics.getVisibilityEpochMBean(), name);
 
-        assertEquals(20, registry.getLatencyCount(),
-            "the count fallback must see recorded latencies");
-        assertTrue(registry.getLatencyPercentile(50) > 0,
-            "the percentile fallback must see recorded latencies");
-        assertEquals(Metrics.QueryLatency().getPercentile(50), registry.getLatencyPercentile(50),
-            "the fallback and the production histogram must agree");
-        assertSame(Metrics.QueryLatency(), registry.getQueryLatency(),
-            "getQueryLatency must hand out the production histogram");
+        Metrics.recordEpoch(4242L);
+
+        assertEquals(4242L, server.getAttribute(new ObjectName(name), "epoch"));
     }
 
     @Test
-    @DisplayName("Epoch and queue depth fallbacks read the recorded values")
-    void epochAndQueueDepthFallbacksReadRecordedValues() {
-        Metrics.recordEpoch(77L);
-        Metrics.recordHnswDepth(4321L);
+    @DisplayName("A name the server refuses leaves no trace in the registry")
+    void refusedRegistrationIsNotRemembered() throws Exception {
+        MetricsRegistry first = new MetricsRegistry();
+        MetricsRegistry second = new MetricsRegistry();
+        String name = uniqueName("HnswQueueDepth");
+        first.registerMBean(Metrics.getHnswQueueDepthMBean(), name);
 
-        assertEquals(77L, registry.getEpochFromMBean(),
-            "the epoch fallback must read the recorded epoch");
-        assertEquals(4321L, registry.getQueueDepthFromMBean(),
-            "the queue depth fallback must read the recorded depth");
+        assertThrows(InstanceAlreadyExistsException.class,
+            () -> second.registerMBean(Metrics.getHnswQueueDepthMBean(), name));
+
+        assertNull(second.getMBean(name));
+        assertTrue(second.getRegisteredMBeanNames().isEmpty());
     }
 
     @Test
-    @DisplayName("The registry keeps no metric state of its own")
-    void registryHasNoShadowState() {
-        Metrics.setEstimatedCoverage(0.6);
-        assertEquals(0.6, registry.getEstimatedCoverage(), 1e-9,
-            "the registry must expose the global coverage, not a private copy");
+    @DisplayName("A malformed name is refused before anything is registered")
+    void malformedNameIsRefused() {
+        MetricsRegistry registry = new MetricsRegistry();
 
-        registry.setEstimatedCoverage(0.2);
-        assertEquals(0.2, Metrics.getEstimatedCoverage(), 1e-9,
-            "writing through the registry must update the global coverage");
+        assertThrows(MalformedObjectNameException.class,
+            () -> registry.registerMBean(Metrics.getQueryLatencyMBean(), "not a jmx name"));
 
-        registry.setCurrentEpoch(99L);
-        assertEquals(99L, Metrics.getCurrentEpoch(),
-            "writing through the registry must update the global epoch");
-        assertEquals(99L, registry.getCurrentEpoch(),
-            "reading back through the registry must see the same epoch");
+        assertTrue(registry.getRegisteredMBeanNames().isEmpty());
     }
 
     @Test
-    @DisplayName("clear() empties the recorded measurements without rewinding the epoch")
-    void clearEmptiesMeasurements() {
-        Metrics.recordQueryLatency(500);
-        Metrics.setEstimatedCoverage(0.8);
-        Metrics.recordEpoch(1234L);
+    @DisplayName("An unknown name reads as absent, and a fresh registry holds nothing")
+    void unknownNameIsAbsent() {
+        MetricsRegistry registry = new MetricsRegistry();
 
-        registry.clear();
+        assertNull(registry.getMBean("no-such-mbean"));
+        assertTrue(registry.getRegisteredMBeanNames().isEmpty());
+    }
 
-        assertEquals(0, Metrics.QueryLatency().getTotalCount(), "latencies are cleared");
-        assertEquals(0.0, Metrics.getEstimatedCoverage(), 0.0, "coverage is cleared");
-        assertEquals(1234L, Metrics.getCurrentEpoch(),
-            "the visibility epoch is monotone state and must survive a metrics clear");
+    @Test
+    @DisplayName("The name list is a snapshot the caller cannot use to change the registry")
+    void nameListIsASnapshot() throws Exception {
+        MetricsRegistry registry = new MetricsRegistry();
+        String name = uniqueName("IngestionQueue");
+        registry.registerMBean(Metrics.getIngestionQueueMBean(), name);
+
+        List<String> names = registry.getRegisteredMBeanNames();
+
+        assertThrows(UnsupportedOperationException.class, () -> names.add("other"));
+        assertEquals(List.of(name), registry.getRegisteredMBeanNames());
     }
 }

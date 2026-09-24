@@ -80,9 +80,9 @@ class HealthEndpointTest {
         @Test
         @DisplayName("the health MBean follows what the endpoint measured")
         void theHealthScoreMBeanIsPublished() throws IOException {
-            // Nothing else writes it: the score is set once at startup and the latency-based
-            // updater has no caller, so a JMX client would watch a constant.
-            com.eonmux.excalibur.metrics.Metrics.setHealthScore(0.5);
+            // Seeded with a value the endpoint would not compute here, so the assertion can
+            // only pass if the endpoint published what it measured.
+            com.eonmux.excalibur.metrics.Metrics.setHealthScore(0.9);
             addActiveSegment(segmentCatalog, 1);
             addBootstrappingSegment(segmentCatalog, 2);
             HealthEndpoint endpoint = new HealthEndpoint(visibilityTracker, segmentCatalog, 0.5);

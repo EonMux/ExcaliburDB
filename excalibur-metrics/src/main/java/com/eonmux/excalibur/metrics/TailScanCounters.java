@@ -119,15 +119,6 @@ final class TailScanCounters {
     }
 
     /**
-     * Gets the total number of tail scan operations performed.
-     *
-     * @return Total count of tail scan operations
-     */
-    long totalCount() {
-        return totalCount.get();
-    }
-
-    /**
      * Gets the total number of entries scanned across all tail scan operations.
      *
      * @return Total entries scanned across all operations

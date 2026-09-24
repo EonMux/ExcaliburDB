@@ -276,11 +276,11 @@ public class HealthEndpoint implements HttpHandler {
     /**
      * Publishes what this endpoint just measured to the {@code SystemHealth} MBean.
      *
-     * <p>The MBean's score is otherwise the 0.5 the process starts at and never leaves, and
-     * its {@code isHealthy} attribute is derived from that score - so a JMX client watching a
-     * node through a total loss of its corpus sees a health score that never moves and a flag
-     * that never falls. Nothing else writes it: the latency-based updater it was designed
-     * around has no caller.</p>
+     * <p>The score has two writers, both publishing coverage: the epoch tick, which keeps it
+     * current with nobody watching, and this endpoint, which republishes the value it has just
+     * measured so a JMX client reading the MBean right after a {@code /health} call sees the
+     * same number the response carried. Until the first of them runs the score is 0.0, which is
+     * the coverage of a node that has not yet measured anything as visible.</p>
      *
      * <p>The score is the coverage, which is the one health signal this endpoint measures on a
      * scale the MBean can carry. The MBean's own threshold for {@code isHealthy} is a fixed

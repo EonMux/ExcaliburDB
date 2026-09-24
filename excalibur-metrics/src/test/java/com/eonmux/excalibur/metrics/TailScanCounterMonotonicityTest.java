@@ -42,12 +42,15 @@ class TailScanCounterMonotonicityTest {
     @Test
     @DisplayName("a scan is still counted when one of its numbers is unusable")
     void theScanItselfIsStillCounted() {
-        long scans = Metrics.getTotalTailScanCount();
+        TailScanCounters counters = new TailScanCounters();
+
+        counters.record(-1, 4);
+        counters.record(100, 0);
+
+        assertEquals(50, counters.averageEntries(),
+            "the scan happened, whatever its report said, so it counts toward the average");
 
         Metrics.recordTailScanMetrics(-1, 4);
-
-        assertEquals(scans + 1, Metrics.getTotalTailScanCount(),
-            "the scan happened, whatever its report said");
         assertTrue(Metrics.getAverageTailScanEntries() >= 0,
             "the average stays defined and non-negative");
     }
