@@ -629,6 +629,12 @@ public class QueryPipeline {
         context = rerankStage.rerank(context, token);
         partialContext.set(context);
 
+        // Stages 2 and 3 again, deeper, while withheld documents left the answer short
+        context = VisibilityRefill.fill(context, token, deadline,
+            deepened -> rerankStage.rerank(hnswSearchStage.search(deepened, token, deadline), token),
+            partialContext::set);
+        partialContext.set(context);
+
         // Stage 4: LLM Relevancy Scoring (optional)
         context = llmScoringStage.score(context, token);
         partialContext.set(context);

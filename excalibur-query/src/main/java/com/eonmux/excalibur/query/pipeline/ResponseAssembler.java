@@ -133,7 +133,9 @@ final class ResponseAssembler {
             false,
             false
         ).withLlmScored(context.llmScored)
-            .withRetrievalExhausted(context.retrievalExhausted);
+            .withRetrievalExhausted(context.retrievalExhausted)
+            // A refill the deadline stopped answered with less than it could have found.
+            .withTimedOut(context.refillCut);
 
         // DOMAIN CORRECTNESS VALIDATION:
         // Validate the response meets all domain correctness constraints

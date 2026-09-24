@@ -49,7 +49,8 @@ import java.util.stream.Collectors;
  * <p><strong>Document Atomicity:</strong> After merging results, this stage
  * applies the DocumentAtomicityFilter to ensure queries never see partially-
  * ingested documents. All chunks from a visible document are included; none
- * from partial documents.</p>
+ * from partial documents. The stage reports how many it withheld, and when that leaves the
+ * answer short with more to find, {@link VisibilityRefill} runs Stages 2 and 3 again deeper.</p>
  */
 final class RerankStage {
 
@@ -94,10 +95,11 @@ final class RerankStage {
         LOGGER.trace("Stage 3: Running full vector rerank");
 
         // Step 1: Aggregate results from Stage 2 to get candidates
-        // Oversample so reranking and filtering have spare candidates to work with.
-        // topK is client-supplied, so widen before multiplying and saturate instead of
-        // wrapping to a negative candidate count.
-        int candidateCount = rerankCandidateCount(context.request.topK());
+        // Oversample so reranking and filtering have spare candidates to work with, from the
+        // depth this round searched to - the request's topK, or deeper on a refill. Both are
+        // client-bounded, so widen before multiplying and saturate instead of wrapping to a
+        // negative candidate count.
+        int candidateCount = rerankCandidateCount(context.searchDepth);
         ResultAggregator aggregator = new ResultAggregator(
             candidateCount,
             context.request.threshold(),
@@ -106,11 +108,13 @@ final class RerankStage {
 
         List<QueryResultItem> candidates = aggregator.mergeAndRankWithNormalization(
             context.segmentResults, distanceFunction);
-        // A merge that came back shallower than it was asked had nothing further to give, so
-        // however this ranking is narrowed afterwards - by a relevancy threshold included -
+        // A merge that came back shallower than it was asked, over segments that each came back
+        // shallower than they were asked, had nothing further to give, so however this ranking
+        // is narrowed afterwards - by the atomicity filter or a relevancy threshold included -
         // nothing past it was left unconsidered. That is what lets a short answer's total be
-        // exact once Stage 4 has shortened it.
-        boolean exhausted = candidates.size() < candidateCount;
+        // exact. The merge alone cannot say it: each segment answers with at most the depth, so
+        // on a corpus of one segment the merge is always shallower than twice the depth.
+        boolean exhausted = candidates.size() < candidateCount && context.segmentsRanDry;
 
         if (candidates.isEmpty()) {
             LOGGER.debug("Stage 3: No candidates to rerank");
@@ -130,6 +134,7 @@ final class RerankStage {
         // whenever a partial document happened to rank inside the first topK, even though
         // enough valid candidates were available.
         rerankedResults = applyAtomicityFilter(rerankedResults, context.epoch);
+        int withheld = beforeAtomicityFilter - rerankedResults.size();
 
         // Before truncation, for the same reason as the atomicity filter: a dropped result is
         // replaced by the next named one rather than leaving the page short.
@@ -150,7 +155,7 @@ final class RerankStage {
         LOGGER.debug("Stage 3: Reranked {} candidates to {} results (atomicity filtered from {})",
             candidates.size(), rerankedResults.size(), beforeAtomicityFilter);
 
-        return context.withRanking(rerankedResults, exhausted, unnamedDropped);
+        return context.withRanking(rerankedResults, exhausted, unnamedDropped, withheld);
     }
 
     /**

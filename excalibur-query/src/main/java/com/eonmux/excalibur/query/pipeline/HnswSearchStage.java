@@ -106,14 +106,14 @@ final class HnswSearchStage {
 
         if (context.candidates.isEmpty()) {
             LOGGER.debug("Stage 2: No candidates to search");
-            return context.withSegmentResults(List.of(), 0, 0);
+            return context.withSegmentResults(List.of(), 0, 0, true);
         }
 
         float[] queryVector = context.request.queryVectorUnsafe();
 
         long startTime = System.nanoTime();
 
-        QueryOptions options = fanOutOptions(context.request, deadline);
+        QueryOptions options = fanOutOptions(context.request, context.searchDepth, deadline);
 
         List<ParallelQueryDispatcher.SegmentInfo> segmentsToSearch = segmentsToSearch(context);
 
@@ -134,6 +134,9 @@ final class HnswSearchStage {
         List<SegmentQueryTask.SegmentQueryResult> segmentResults = dispatchResult.segmentResults();
         long totalTailScanEntries = dispatchResult.tailScanEntries();
         int segmentsTimedOut = dispatchResult.segmentsTimedOut();
+        // Read before the epoch filter below thins the answers: a segment that filled its
+        // depth may hold more, whatever the filter then removed from it.
+        boolean ranDry = PipelineContext.ranDry(segmentResults, context.searchDepth);
 
         // Apply epoch isolation filtering to HNSW results to prevent torn reads
         // Filter out nodes that were inserted after the query's captured epoch
@@ -145,7 +148,8 @@ final class HnswSearchStage {
         LOGGER.debug("Stage 2: Search completed - {} segments, {} tail scan entries, {}ms",
             segmentResults.size(), totalTailScanEntries, durationMs);
 
-        return context.withSegmentResults(segmentResults, totalTailScanEntries, segmentsTimedOut);
+        return context.withSegmentResults(segmentResults, totalTailScanEntries, segmentsTimedOut,
+            ranDry);
     }
 
     /**
@@ -157,13 +161,20 @@ final class HnswSearchStage {
      * timeout means the pipeline is abandoned first and every segment that did answer is
      * thrown away, which is how a partial result becomes an empty one.</p>
      *
+     * <p>Each segment is asked for the search depth rather than the request's topK: they differ
+     * when the answer is being refilled past documents the atomicity filter withheld. The beam
+     * a segment searches with widens with it - the graph searches at least as wide as the
+     * oversampled depth - and the depth never passes {@link QueryRequest#maxSearchDepth()}, so
+     * neither does the beam.</p>
+     *
      * @param request The query request, for the shape of the search it asked for
+     * @param depth How deep each segment ranks
      * @param deadline When this query is abandoned
      * @return The options to dispatch the segment searches with
      */
-    private QueryOptions fanOutOptions(QueryRequest request, QueryDeadline deadline) {
+    private QueryOptions fanOutOptions(QueryRequest request, int depth, QueryDeadline deadline) {
         return QueryOptions.builder()
-            .topK(request.topK())
+            .topK(depth)
             .oversamplingFactor(request.oversamplingFactor())
             .timeout(deadline.budgetHoldingBack(searchShareHeldBack(request)))
             .includePartialSegments(request.includePartialSegments())

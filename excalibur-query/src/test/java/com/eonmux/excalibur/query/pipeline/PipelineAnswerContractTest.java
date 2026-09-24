@@ -155,6 +155,17 @@ class PipelineAnswerContractTest {
         }
 
         @Test
+        @DisplayName("is not reported when a segment filled the depth it was asked for")
+        void aSegmentThatFilledItsDepthIsNotExhausted() {
+            // A segment answers with at most the depth, so one segment filling it leaves the
+            // merge shallower than twice the depth although that segment may hold more.
+            PipelineContext ranked = stage().rerank(searched(request(5, true), named(5)),
+                new CancellationToken());
+
+            assertThat(ranked.retrievalExhausted).isFalse();
+        }
+
+        @Test
         @DisplayName("is not claimed by an answer a deadline cut short")
         void neverClaimedOnTimeout() {
             PipelineContext ranked = stage().rerank(searched(request(5, true), named(3)),

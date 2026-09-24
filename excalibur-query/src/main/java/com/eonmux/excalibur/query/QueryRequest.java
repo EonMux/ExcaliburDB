@@ -119,6 +119,11 @@ public final class QueryRequest {
      */
     private final boolean requireNamedResults;
 
+    /**
+     * The deepest the search may rank to fill {@link #topK()} past withheld documents.
+     */
+    private final int maxSearchDepth;
+
     // ==================== Constructors ====================
 
     private QueryRequest(Builder builder) {
@@ -135,6 +140,7 @@ public final class QueryRequest {
         this.oversamplingFactor = builder.oversamplingFactor;
         this.correlationId = builder.correlationId;
         this.requireNamedResults = builder.requireNamedResults;
+        this.maxSearchDepth = builder.maxSearchDepth;
 
         validate();
     }
@@ -165,6 +171,10 @@ public final class QueryRequest {
         }
         if (oversamplingFactor < 1) {
             throw new IllegalStateException("oversamplingFactor must be at least 1: " + oversamplingFactor);
+        }
+        if (maxSearchDepth <= 0 || maxSearchDepth > MAX_TOP_K) {
+            throw new IllegalStateException("maxSearchDepth must be in [1, " + MAX_TOP_K + "]: "
+                + maxSearchDepth);
         }
     }
 
@@ -350,6 +360,22 @@ public final class QueryRequest {
         return requireNamedResults;
     }
 
+    /**
+     * The deepest the search may rank to fill the answer past documents it withholds.
+     *
+     * <p>A search that withholds the chunks of documents being written ranks deeper to fill
+     * {@link #topK()} from below them, and this bounds how deep: the per-segment beam, the
+     * candidates reranked and the LSH-named nodes measured all grow with the depth, so the
+     * depth is the request's work bound. Never less than {@code topK}, which a search always
+     * ranks to; {@link #MAX_TOP_K} unless the caller sets a tighter bound, as the HTTP route does
+     * with {@code excalibur.api.max-top-k}.</p>
+     *
+     * @return The ceiling on the search depth, at least {@link #topK()}
+     */
+    public int maxSearchDepth() {
+        return Math.max(topK, maxSearchDepth);
+    }
+
     // ==================== Object Methods ====================
 
     @Override
@@ -365,6 +391,7 @@ public final class QueryRequest {
             Float.compare(that.llmThreshold, llmThreshold) == 0 &&
             oversamplingFactor == that.oversamplingFactor &&
             requireNamedResults == that.requireNamedResults &&
+            maxSearchDepth == that.maxSearchDepth &&
             Objects.equals(queryText, that.queryText) &&
             Arrays.equals(queryVector, that.queryVector) &&
             Objects.equals(correlationId, that.correlationId);
@@ -374,7 +401,7 @@ public final class QueryRequest {
     public int hashCode() {
         int result = Objects.hash(queryText, topK, timeoutMs,
             includePartialSegments, threshold, enableLlmScoring, llmThreshold,
-            oversamplingFactor, correlationId, requireNamedResults);
+            oversamplingFactor, correlationId, requireNamedResults, maxSearchDepth);
         result = 31 * result + Arrays.hashCode(queryVector);
         return result;
     }
@@ -403,6 +430,7 @@ public final class QueryRequest {
         private int oversamplingFactor = QueryOptions.DEFAULT_OVERSAMPLING_FACTOR;
         private String correlationId;
         private boolean requireNamedResults;
+        private int maxSearchDepth = MAX_TOP_K;
 
         private Builder() {}
 
@@ -553,6 +581,24 @@ public final class QueryRequest {
          */
         public Builder requireNamedResults(boolean requireNamedResults) {
             this.requireNamedResults = requireNamedResults;
+            return this;
+        }
+
+        /**
+         * Sets the deepest the search may rank to fill the answer past withheld documents.
+         *
+         * @param maxSearchDepth The ceiling, in [1, {@link #MAX_TOP_K}]; a value below the
+         *                       request's topK is read as topK
+         * @return This builder
+         * @throws IllegalArgumentException if maxSearchDepth is not in [1, {@link #MAX_TOP_K}]
+         * @see QueryRequest#maxSearchDepth()
+         */
+        public Builder maxSearchDepth(int maxSearchDepth) {
+            if (maxSearchDepth <= 0 || maxSearchDepth > MAX_TOP_K) {
+                throw new IllegalArgumentException("maxSearchDepth must be in [1, " + MAX_TOP_K
+                    + "]: " + maxSearchDepth);
+            }
+            this.maxSearchDepth = maxSearchDepth;
             return this;
         }
 
