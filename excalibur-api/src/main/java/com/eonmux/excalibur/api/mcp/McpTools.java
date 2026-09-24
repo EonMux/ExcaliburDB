@@ -296,6 +296,12 @@ public final class McpTools {
                     + "it), 'both' for either. Omit for both, which is right unless the "
                     + "direction of the relation is the point of the question.",
                     directionNames()),
+                ToolSchema.optional("timeout_ms", "integer",
+                    "Longest the question may take, in milliseconds. A question that runs out "
+                    + "is judged on what was gathered by then and answered with 'timed_out' "
+                    + "true, so an 'answered' or 'declined' reply with it set may be missing what "
+                    + "more time would have found. The node caps it (60000 by default) and "
+                    + "refuses more. Omit for the server's default.", null),
                 ToolSchema.optional("namespace", "string",
                     "Namespace to query. Omit for the configured default, or the shared one.",
                     null))));
@@ -1156,6 +1162,7 @@ public final class McpTools {
         if (direction != null) {
             body.put("direction", TraversalDirection.parse(direction).wireName());
         }
+        putWholeNumber(args, body, "timeout_ms");
         return answer(client.post("/v1/graph/query", Json.write(body), scope(args)));
     }
 

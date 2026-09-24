@@ -445,6 +445,23 @@ class McpToolsTest {
     }
 
     @Test
+    @DisplayName("search_graph forwards timeout_ms as a whole number, and only when given")
+    void searchGraphForwardsItsDeadline() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            tools.call(McpTools.SEARCH_GRAPH, Map.of("query", "anything", "timeout_ms", 2500.0));
+            tools.call(McpTools.SEARCH_GRAPH, Map.of("query", "anything"));
+
+            assertThat(((Number) Json.at(Json.parse(node.requests().get(0).body()), "timeout_ms"))
+                .longValue()).isEqualTo(2500L);
+            assertThat(Json.at(Json.parse(node.requests().get(1).body()), "timeout_ms")).isNull();
+            assertThat(Json.objectAt(Json.objectAt(tool(McpTools.SEARCH_GRAPH), "inputSchema"),
+                "properties")).containsKey("timeout_ms");
+        }
+    }
+
+    @Test
     @DisplayName("an empty context_entities is forwarded as the empty array it is")
     void emptyContextEntitiesAreForwarded() throws IOException {
         try (StubNode node = StubNode.start()) {
