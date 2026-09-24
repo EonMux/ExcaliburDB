@@ -426,10 +426,11 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `POST` | `/v1/query` | bearer | Search the corpus: BM25, vector, or the two fused, depending on what the node holds |
 | `GET` | `/v1/documents` | bearer | Read one chunk's text, by `document_id` |
 | `POST` | `/v1/documents/fetch` | bearer | Read the text of a page of chunks |
-| `GET` | `/v1/documents/list` | bearer | Which documents this node holds, with their chunk ids. `404` on a node that keeps no document registry |
+| `GET` | `/v1/documents/list` | bearer | Which documents this node holds, with their chunk ids; with `document_id`, one document's chunks in order. `404` on a node that keeps no document registry |
 | `POST` | `/v1/documents` | bearer | Index documents supplied in the request. `503` on a node with no ingestion pipeline |
 | `DELETE` | `/v1/query/{query_id}` | bearer | Cancel an in-progress query, from `/v1/query` or `/v1/graph/query` |
 | `POST` | `/v1/ingest` | bearer | Register an ingestion source |
+| `PUT` | `/v1/ingest` | bearer | Replace a registered source's configuration, keeping its history and documents |
 | `GET` | `/v1/ingest` | bearer | Read back what every source was registered as |
 | `DELETE` | `/v1/ingest` | bearer | Stop crawling a source, keeping its documents |
 | `DELETE` | `/v1/ingest/run` | bearer | Stop the ingestion run in flight, keeping the source registered |
@@ -438,6 +439,7 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `DELETE` | `/v1/reindex` | bearer | Ask a running re-index to stop |
 | `GET` | `/v1/reindex/status` | bearer | Per-source re-index status |
 | `POST` | `/v1/erasure` | bearer | Remove named documents from the corpus, and withdraw what was extracted from them into the graph |
+| `GET` | `/v1/erasure/{request_id}` | bearer | Where one document erasure stands, from its receipt |
 | `POST` | `/v1/compact` | bearer | Reclaim the space tombstoned entries still hold, now rather than on the next sweep |
 | `DELETE` | `/v1/compact` | bearer | Ask the compaction in progress to stop |
 | `GET` | `/v1/compact/status` | bearer | What the last compaction examined, reclaimed and failed on |
@@ -451,6 +453,7 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `DELETE` | `/v1/graph/build` | bearer | Stop the build in progress. It publishes nothing; the namespace keeps the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | What the build is doing, what the last one published, whether the served graph is behind what is staged, and what the node's automatic build is doing about it |
 | `POST` | `/v1/graph/erasure` | bearer | Record an obligation to erase, and compact when it is due. `404` for an entity, by name or `entity_id`, that nothing in the namespace holds, and nothing is recorded |
+| `GET` | `/v1/graph/erasure/{request_id}` | bearer | Where one graph erasure obligation stands, in the namespace the header names |
 | `GET` | `/v1/graph/namespaces` | bearer | Every namespace on disk: whether it is open, whether it has built a graph, what it has staged, whether its graph is behind that, and what it still owes |
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | Remove a namespace entirely - its graph, its staged facts and its erasure log. Irreversible; `409` for `shared` |
 
@@ -466,14 +469,16 @@ which methods each path takes. It is still charged, against the read budget, so 
 caller cannot spend routing decisions at line rate for free. That holds for the single-method
 routes as much as for the ones that answer two or three methods: `GET /v1/stats`, `GET /metrics`,
 `GET /v1/version`, `GET /v1/query/status`, `DELETE /v1/ingest/run`, `GET /v1/ingest/status`,
-`GET /v1/documents/list`, `GET /v1/reindex/status`, `POST /v1/erasure`, `GET /v1/compact/status`,
-`POST /v1/graph/query`, `GET /v1/graph/entities`, `GET /v1/graph/build/status` and
-`POST /v1/graph/erasure` each answer any
+`GET /v1/documents/list`, `GET /v1/reindex/status`, `POST /v1/erasure`,
+`GET /v1/erasure/{request_id}`, `GET /v1/compact/status`, `POST /v1/graph/query`,
+`GET /v1/graph/entities`, `GET /v1/graph/build/status`, `POST /v1/graph/erasure` and
+`GET /v1/graph/erasure/{request_id}` each answer any
 other method with `405` rather than `401`, and a wrong method on a mutating route costs a read, not
 a mutation. A path that is not registered at all is `404`.
 
-Three routes that change what is registered — `POST /v1/ingest`, `DELETE /v1/ingest` and
-`POST /v1/erasure` — answer `503` when the change could not be recorded in the source catalog.
+Four routes that change what is registered — `POST /v1/ingest`, `PUT /v1/ingest`,
+`DELETE /v1/ingest` and `POST /v1/erasure` — answer `503` when the change could not be recorded
+in the source catalog.
 The registration itself is refused in that case rather than applied in memory alone: a source
 this node is crawling and has no record of is one that silently stops being crawled at the next
 restart.
@@ -490,7 +495,9 @@ optional value.
 
 `X-Excalibur-Namespace` names the graph namespace a request belongs to. It is read by the
 `/v1/graph/*` routes and by `POST /v1/ingest`, which binds the registered source to that namespace
-for the life of the registration — every document it crawls is staged there. A node holds one
+for the life of the registration — every document it crawls is staged there. `PUT /v1/ingest`
+reads it too, and refuses with `409` a replacement that names a namespace other than the one the
+source was registered in. A node holds one
 corpus, so every other `/v1` route answers `400` when a request names a namespace rather than
 quietly serving the shared index — set the header to `shared` or leave it off. The probes and node-level routes (`/health`, `/health/ready`, `/metrics`,
 `/v1/version`, `/v1/drain`) ignore it. See
@@ -883,6 +890,48 @@ it; an HTTP source with no `respect_robots_txt` obeys robots.txt. Any other key 
 in a source's configuration is secret today, but a read-back that echoes whatever it finds
 becomes a way out for the first setting that is — a header, a cookie, a signed URL — and that
 change would be made in the registration code, not here.
+
+### Replace a source's configuration
+
+Changes what a registered source crawls — a narrower root, a new filter, a gentler crawl delay —
+without deregistering it. The body is the one `POST /v1/ingest` takes, validated the same way:
+the same required fields, the same bounds, the same allow-lists.
+
+```bash
+curl -X PUT http://localhost:8080/v1/ingest \
+  -H "Content-Type: application/json" \
+  -d '{"source_type": "filesystem", "config": {"source_id": "project-docs",
+       "root_path": "/data/docs/handbook", "included_extensions": [".md"]}}'
+```
+
+**Response — `200 OK`**
+
+```json
+{"source_id": "project-docs", "source_type": "filesystem", "status": "updated"}
+```
+
+The source keeps its id, its namespace, its `/v1/ingest/status` history, its place in the
+re-crawl schedule and every document it already indexed. The new configuration is recorded in the
+source catalog before the running source is swapped, so `GET /v1/ingest` and every later restart
+show it; a catalog that cannot be written leaves the old configuration in force. No crawl is
+started: the next scheduled re-crawl uses the new configuration, or `POST /v1/reindex` runs one
+now. The whole configuration is replaced, not merged — a setting left out of the body goes back
+to its default. `source_type` may change too; the next crawl then removes whatever the old
+configuration indexed that the new one does not find.
+
+**Error — `404 Not Found`** — no source is running under that id. A catalog record the node could
+not start at boot (`registered: false` on `GET /v1/ingest`) is not running either; register it
+again with `POST`.
+
+**Error — `409 Conflict`** — a crawl or re-index of the source is running, and would carry on with
+the configuration it started with; send the replacement again once it has finished, or stop it —
+a crawl with `DELETE /v1/ingest/run`, a re-index with `DELETE /v1/reindex`. Also `409` when `X-Excalibur-Namespace` names a namespace other than
+the one the source was registered in: its documents' facts are already staged there, and moving a
+source is a deregistration and a new registration.
+
+**Error — `400 Bad Request`**, **`403 Forbidden`**, **`413 Payload Too Large`** — as for
+`POST /v1/ingest`. **`503 Service Unavailable`** — the catalog could not be written, or the node is
+shutting down; nothing was changed.
 
 ### Check progress
 
@@ -1558,6 +1607,69 @@ graph obligation — is a bare `500` with the detail in the log.
 registered. Not the same as a document that does not exist, which is a `200` with
 `documents_not_found`.
 
+### Where an erasure stands
+
+Every `POST /v1/erasure` answer begins with a `request_id`. That id reads the erasure back — after
+the response, after the graph half is compacted, after a restart:
+
+```bash
+curl http://localhost:8080/v1/erasure/0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11
+```
+
+```json
+{
+  "request_id": "0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11",
+  "state": "pending",
+  "requested_at_ms": 1757808123456,
+  "discharged_at_ms": null,
+  "source_id": "project-docs",
+  "scope": "document",
+  "documents_erased": 1,
+  "documents_incomplete": 0,
+  "documents_not_found": 0,
+  "documents_remaining": 0,
+  "source_deregistered": false,
+  "remaining": {"graph_requests_pending": 1, "lexical_reclamation_pending": false, "documents_incomplete": 0},
+  "graph": [{"namespace": "shared", "requests": 1, "pending": 1, "discharged": 0, "namespace_dropped": false}]
+}
+```
+
+`state` is the first of these that holds:
+
+| State | Meaning |
+|---|---|
+| `incomplete` | A document the request named is still held — the request answered `500`. Repeat it |
+| `pending` | A graph obligation it queued has not been discharged yet |
+| `applied` | Out of storage, the index and the graph, but the lexical index still keeps the removed chunks' bytes on disk until a compaction reclaims them |
+| `discharged` | Nothing the request removed remains anywhere the node keeps it. `discharged_at_ms` says when |
+
+`remaining` counts what is still owed; `graph` lists each namespace the request queued graph
+obligations in. A namespace dropped since (`DELETE /v1/graph/namespaces/{namespace}`) took
+everything in it along, so its requests count as discharged and it reports
+`namespace_dropped: true`. The lexical half is judged by time: the erasure counts as reclaimed once
+the index holds no outstanding erasure recorded at or before it. An `applied` state can therefore
+outlast its own reclamation while an older erasure still waits for a compaction, but it never
+reports a reclamation that has not happened.
+
+What answers is a receipt in `<data dir>/erasure-receipts`: the id, the time, the source, the scope,
+the counts and the graph request ids — never a document id, a name, or any content, so asking
+where an erasure stands can never bring back what it removed. The 1024 most recent receipts are
+kept; an older id is `404`, as is an id the node never issued. A receipt that could not be written
+does not undo the erasure: the answer still reports it, with `request_id: null`, and the failure is
+in the log.
+
+**Error — `400 Bad Request`** — the id is not one this node could have issued. **`405`** — any
+method but `GET`. **`503 Service Unavailable`** — the node keeps no receipts (an embedded server
+wired without them).
+
+The graph route has its own readback, `GET /v1/graph/erasure/{request_id}`, for obligations recorded
+with `POST /v1/graph/erasure`. It reads the namespace `X-Excalibur-Namespace` names — request ids
+are per namespace — and answers `pending` or `discharged`, with `requested_at_ms`,
+`discharged_at_ms`, the scope by id, and `remaining` while pending. The most recent 1024 completed
+requests of each namespace keep that detail; an older one still answers `discharged`, with its
+scope and timestamps null and `detail_retained: false`. An id the namespace never issued, or a
+namespace that does not exist, is `404`.
+
 ---
 
 ## Querying
@@ -2167,7 +2279,46 @@ limit it asked for would otherwise skip the documents it never received.
 **Error — `404 Not Found`** — the node keeps no document registry, so it has no record to read
 back. An empty listing would be indistinguishable from an empty corpus.
 
+### Read one document whole
+
+`document_id`, with the `source_id` it belongs to, turns the listing into a read of that one
+document: its fields and its chunks in the order it was chunked.
+
+```bash
+curl -G http://localhost:8080/v1/documents/list \
+  -H "Authorization: Bearer $EXCALIBUR_API_AUTH_TOKEN" \
+  --data-urlencode "source_id=notes" \
+  --data-urlencode "document_id=handbook.md" \
+  --data-urlencode "include_text=true"
+```
+
+```json
+{"source_id": "notes", "document_id": "handbook.md", "chunk_count": 2,
+ "content_length": 8241, "content_hash": "771002914",
+ "last_modified_ms": 1757807000000, "indexed_at_ms": 1757808123999,
+ "chunks": [
+   {"position": 0, "chunk_id": "notes:handbook.md:chunk:0", "text": "# Handbook ...", "text_truncated": false},
+   {"position": 1, "chunk_id": "notes:handbook.md:chunk:1", "text": "## Leave ...", "text_truncated": false}],
+ "returned": 2, "next_cursor": null}
+```
+
+`limit` counts chunks. Without `include_text` a page carries ids only, defaults to 100 and is
+capped at 1000. With it, each chunk also carries its text — clipped at
+`excalibur.api.max-result-text-chars` with `text_truncated` saying so, and `null` for a chunk the
+node no longer holds — and a page is capped at `excalibur.api.max-top-k`, the bound on one
+`POST /v1/documents/fetch`, because it is the same read.
+
+Page with `next_cursor` as above. The cursor carries the document's content hash: a document
+re-ingested between two pages has different chunks, and continuing it by position would splice two
+versions, so the old cursor is refused with **`409 Conflict`** and the read starts again.
+
+**Error — `400 Bad Request`** — `document_id` without `source_id` (a document id is unique only
+within its source), `include_text` that is neither `true` nor `false` or given without
+`document_id`, a limit over the cap, or a cursor issued for the listing rather than for a document.
+**`404 Not Found`** — the source holds no such document.
+
 ### Cancel a query
+
 
 **Request**
 
@@ -2695,7 +2846,73 @@ curl http://localhost:8080/v1/compact/status
 
 Only the most recent run is kept; the next one replaces it.
 
+### Audit log
+
+Every request that changes what the node holds or how it behaves leaves exactly one event on the
+`excalibur.audit` logger — whether it succeeded, was refused, was unauthenticated or was rate
+limited, because the guard runs inside the audit and not before it. Reads are not audited.
+
+```json
+{"timestamp": "2026-09-23T22:17:29.114-0300", "logger": "excalibur.audit", "level": "INFO",
+ "message": "audit erasure.documents accepted status=202 request_id=op-42 client=203.0.113.7 targets={...}",
+ "audit_action": "erasure.documents", "audit_outcome": "accepted", "http_status": 202,
+ "request_id": "op-42", "client_address": "203.0.113.7",
+ "http_method": "POST", "http_path": "/v1/erasure",
+ "audit_targets": {"source_id": "project-docs", "scope": "document", "documents_named": 1,
+                   "request_id": "0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11"}}
+```
+
+| Action | Route |
+|---|---|
+| `source.register`, `source.update`, `source.deregister` | `POST`, `PUT`, `DELETE /v1/ingest` |
+| `ingest.cancel` | `DELETE /v1/ingest/run` |
+| `documents.supply` | `POST /v1/documents` |
+| `reindex.start`, `reindex.cancel` | `POST`, `DELETE /v1/reindex` |
+| `erasure.documents` | `POST /v1/erasure` |
+| `erasure.graph` | `POST /v1/graph/erasure` |
+| `compaction.start`, `compaction.cancel` | `POST`, `DELETE /v1/compact` |
+| `graph.build.start`, `graph.build.cancel` | `POST`, `DELETE /v1/graph/build` |
+| `graph.facts.assert`, `graph.facts.retract` | `POST /v1/graph/facts`, `DELETE /v1/graph/facts/{fact_id}` |
+| `graph.namespace.delete` | `DELETE /v1/graph/namespaces/{namespace}` |
+| `query.cancel` | `DELETE /v1/query/{query_id}` |
+| `node.drain`, `node.undrain` | `POST`, `DELETE /v1/drain` |
+
+`audit_outcome` is `success`, `accepted` (a `202`: recorded, finishing in the background),
+`rejected` (other `4xx`), `unauthenticated` (`401`), `rate_limited` (`429`), `failed` (`5xx`) or
+`error` (the handler threw before answering). `request_id` is the caller's `X-Request-Id` when it
+is 1–128 characters of `[A-Za-z0-9._:-]`, otherwise one the node generates; either way it comes
+back in the `X-Request-Id` response header, so a caller can quote it. `client_address` is resolved
+as rate limiting resolves it: the peer, or the `X-Forwarded-For` hop `excalibur.api.trusted-proxies`
+vouches for. The event's timestamp is when the request finished.
+
+`audit_targets` names identifiers and counts, never content. A graph erasure asked by name records
+`"entity_by": "name"` and the `request_id` it was given, not the name; a document erasure records
+its source and `documents_named`, not which documents. An audit trail is kept longer and read more
+widely than the data it describes, and copying an erased name into it would undo the erasure it
+records.
+
+The logger is pinned at `INFO` in the shipped `logback.xml`, so `EXCALIBUR_LOG_LEVEL=WARN` quiets
+the node without silencing its audit trail, and its events go to the same JSON stream as the rest.
+To keep them apart — a separate file, a separate retention, a separate shipper — copy the shipped
+`logback.xml`, give the logger its own appender with `additivity="false"`, and start the node with
+`-Dlogback.configurationFile` pointing at the copy:
+
+```xml
+<appender name="AUDIT_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>/var/log/excalibur/audit.json</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+        <fileNamePattern>/var/log/excalibur/audit.%d{yyyy-MM-dd}.json</fileNamePattern>
+        <maxHistory>365</maxHistory>
+    </rollingPolicy>
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
+</appender>
+<logger name="excalibur.audit" level="INFO" additivity="false">
+    <appender-ref ref="AUDIT_FILE"/>
+</logger>
+```
+
 ### Metrics
+
 
 `GET /metrics` serves the Prometheus text exposition format. A scrape config needs the bearer
 token, which every scraper supports:
@@ -3123,6 +3340,10 @@ Three files are judged by what the node does with them rather than by name alone
   lookup tables under `corruptRebuiltOnOpen` rather than as damage, and moved aside by the repair
   plan — what is lost either way is the history, never indexed data. As with a lookup table, one
   the operating system will not read is `UNREADABLE` and fails the run.
+- **`erasure-receipts`, what each recent document erasure did**, is checked and excused the same
+  way: its format is the same count-marked, checksummed layout, and the node discards a set it
+  cannot read. What is lost is the readback, `GET /v1/erasure/{request_id}` answering `404` for the
+  erasures it described — never the erasures, which were carried out when they were requested.
 - **`segment_<N>.hnsw.compact.docmap`, a compaction's staged mapping**, means one of two things.
   Beside `segment_<N>.hnsw.compact`, the compaction never swapped its graph in: both are staging
   leftovers the node would discard, and the repair moves the mapping aside before the graph —
@@ -3420,6 +3641,11 @@ carry no checksum, are read as before, and are rewritten at version 3 when the n
 older build does not read version 3: it logs the file as unreadable and starts with no history, so
 rolling back loses the record of each source's last run, never indexed data, unless a
 pre-upgrade image is restored.
+
+**`<data dir>/erasure-receipts` — no step required.** A build older than the file never wrote it;
+the first `POST /v1/erasure` after the upgrade creates it, and erasures made before then have no
+receipt, so their `GET /v1/erasure/{request_id}` is `404`. An older build ignores the file, and a
+backup keeps it as authoritative.
 
 **`<namespace>/graph/` — no step required, but a rollback needs one.** A built graph now carries a
 checksum for every file: `edgestore.meta` is version 2, recording each column's length and CRC32C

@@ -133,6 +133,31 @@ class DocumentListRouteTest {
     }
 
     @Test
+    @DisplayName("reads one document's chunks in order, text and all")
+    void readsOneDocumentOverHttp() throws Exception {
+        startWithRegistry();
+        ingest("docs", "handbook.md", 3);
+        ingest("docs", "appendix.md", 1);
+
+        Response response = get("?source_id=docs&document_id=handbook.md&include_text=true",
+            TOKEN);
+
+        assertThat(response.status()).isEqualTo(200);
+        JsonNode body = new ObjectMapper().readTree(response.body());
+        assertThat(body.get("document_id").asText()).isEqualTo("handbook.md");
+        assertThat(body.get("chunk_count").asInt()).isEqualTo(3);
+        assertThat(body.get("chunks")).hasSize(3);
+        for (int i = 0; i < 3; i++) {
+            assertThat(body.get("chunks").get(i).get("position").asInt()).isEqualTo(i);
+            assertThat(body.get("chunks").get(i).get("chunk_id").asText())
+                .isEqualTo("docs:handbook.md:chunk:" + i);
+            assertThat(body.get("chunks").get(i).has("text")).isTrue();
+        }
+        assertThat(get("?source_id=docs&document_id=missing.md", TOKEN).status())
+            .isEqualTo(404);
+    }
+
+    @Test
     @DisplayName("requires a bearer token like every other read")
     void requiresAToken() throws Exception {
         startWithRegistry();

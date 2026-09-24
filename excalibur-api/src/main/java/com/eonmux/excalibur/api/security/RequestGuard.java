@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Locale;
@@ -55,6 +56,18 @@ public final class RequestGuard {
      */
     private static final String FORWARDED_FOR_HEADER = "X-Forwarded-For";
     private static final String BEARER_PREFIX = "bearer ";
+
+    /**
+     * The exchange attribute holding the calling client's address, as {@link #allow} resolved
+     * it.
+     *
+     * <p>Resolved once, by the same rule the rate limiter keys on - the peer, or the origin a
+     * trusted proxy forwarded for - so that whatever records who made a request names the
+     * client the guard charged rather than re-deciding which forwarding header to believe.
+     * Unlike the rate-limit key it is the whole address: an IPv6 client is metered by its /64,
+     * and an audit record naming only the network would not name the client.</p>
+     */
+    public static final String CLIENT_ADDRESS_ATTRIBUTE = "excalibur.client_address";
 
     private final ApiSecurityConfig config;
     private final ClientRateLimiter rateLimiter;
@@ -134,7 +147,9 @@ public final class RequestGuard {
      * @throws IOException if the refusal response cannot be written
      */
     public boolean allow(HttpExchange exchange, Access access) throws IOException {
-        String clientKey = clientKey(exchange, config.trustedProxies());
+        byte[] origin = originOf(exchange, config.trustedProxies());
+        String clientKey = ClientAddressKey.ofBytes(origin);
+        exchange.setAttribute(CLIENT_ADDRESS_ATTRIBUTE, addressText(origin));
         ClientRateLimiter.Decision decision = rateLimiter.check(clientKey, access.isMutating());
         if (!decision.allowed()) {
             LOGGER.warn("Rate limit exceeded for {} on {}", clientKey, exchange.getRequestURI().getPath());
@@ -206,16 +221,65 @@ public final class RequestGuard {
      * @return A stable key for the calling client
      */
     static String clientKey(HttpExchange exchange, TrustedProxies trustedProxies) {
+        return ClientAddressKey.ofBytes(originOf(exchange, trustedProxies));
+    }
+
+    /**
+     * The calling client's address, as the guard resolved it for this exchange.
+     *
+     * <p>Read from {@link #CLIENT_ADDRESS_ATTRIBUTE} when the exchange has passed through
+     * {@link #allow}, and otherwise the peer address, which is what the guard would have
+     * resolved on a node with no trusted proxy.</p>
+     *
+     * @param exchange The exchange
+     * @return The address as text, or {@code unknown} when the exchange carries none
+     */
+    public static String clientAddress(HttpExchange exchange) {
+        Object resolved = exchange.getAttribute(CLIENT_ADDRESS_ATTRIBUTE);
+        if (resolved instanceof String address) {
+            return address;
+        }
         InetSocketAddress remote = exchange.getRemoteAddress();
         InetAddress peer = remote == null ? null : remote.getAddress();
-        if (peer == null || trustedProxies.isEmpty() || !trustedProxies.trusts(peer)) {
-            return ClientAddressKey.of(peer);
+        return addressText(peer == null ? null : peer.getAddress());
+    }
+
+    /**
+     * The address a request came from: the peer, or - behind a trusted proxy - the origin its
+     * forwarding header names.
+     *
+     * @param exchange       The exchange
+     * @param trustedProxies The hops whose forwarding header may be believed
+     * @return Four or sixteen address bytes, or null when the exchange carries no peer
+     */
+    private static byte[] originOf(HttpExchange exchange, TrustedProxies trustedProxies) {
+        InetSocketAddress remote = exchange.getRemoteAddress();
+        InetAddress peer = remote == null ? null : remote.getAddress();
+        if (peer == null) {
+            return null;
+        }
+        if (trustedProxies.isEmpty() || !trustedProxies.trusts(peer)) {
+            return peer.getAddress();
         }
         List<String> forwarded = exchange.getRequestHeaders().get(FORWARDED_FOR_HEADER);
-        byte[] origin = trustedProxies.originBehind(
+        return trustedProxies.originBehind(
             forwarded == null ? List.of() : forwarded, peer.getAddress());
-        return ClientAddressKey.ofBytes(origin);
     }
+
+    /** An address's textual form, or {@code unknown} for none. */
+    private static String addressText(byte[] address) {
+        if (address == null) {
+            return ClientAddressKey.UNKNOWN;
+        }
+        try {
+            return InetAddress.getByAddress(address).getHostAddress();
+        } catch (UnknownHostException e) {
+            // Only thrown for a length that is neither four nor sixteen, which no path here
+            // produces.
+            return ClientAddressKey.UNKNOWN;
+        }
+    }
+
 
     private static void sendJson(HttpExchange exchange, int statusCode, String message) throws IOException {
         byte[] body = ("{\"error\": \"" + message + "\"}").getBytes(StandardCharsets.UTF_8);

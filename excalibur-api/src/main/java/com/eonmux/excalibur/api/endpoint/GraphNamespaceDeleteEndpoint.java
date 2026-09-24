@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.audit.AuditLog;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 
@@ -116,6 +117,7 @@ public class GraphNamespaceDeleteEndpoint implements HttpHandler {
         NamespaceId id;
         try {
             id = NamespaceId.of(requested);
+            AuditLog.target(exchange, "namespace", id.value());
         } catch (IllegalArgumentException e) {
             // The segment becomes a directory name. Refused here rather than sanitised: there
             // is no correct repair for a name that tried to leave the graph root.

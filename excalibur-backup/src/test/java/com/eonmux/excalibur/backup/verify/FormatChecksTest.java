@@ -418,8 +418,11 @@ class FormatChecksTest {
             "\\#source-catalog|3", "filesystem|a|shared|root_path=/a"), 1));
         Files.writeString(dataDir.resolve("source-status"), sealed(List.of(
             "\\#source-status|3", "a|idle|1.0|3|0|1|0|1000"), 1));
+        Files.writeString(dataDir.resolve("erasure-receipts"), sealed(List.of(
+            "\\#erasure-receipts|1", "r-1|1000|docs|document|1|0|0|0|0|0|shared=1+1"), 1));
 
-        for (String name : List.of("document-registry", "source-catalog", "source-status")) {
+        for (String name : List.of("document-registry", "source-catalog", "source-status",
+                "erasure-receipts")) {
             ContentCheck check = check(name);
             assertThat(check.healthy()).as(check.detail()).isTrue();
             assertThat(check.proven()).as(check.detail()).isTrue();

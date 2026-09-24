@@ -165,6 +165,24 @@ class DocumentErasureServiceTest {
         }
 
         @Test
+        @DisplayName("says when the oldest reclamation the index still owes was accepted, and "
+            + "nothing once it is done")
+        void reportsTheOldestOutstandingReclamation() throws IOException {
+            open(never());
+            ingest("docs", "a.md", "alpha content");
+            ingest("docs", "b.md", "beta content");
+            DocumentErasureService service = service();
+
+            assertThat(service.oldestOutstandingErasure()).isEmpty();
+            service.erase("docs", List.of("a.md"), false);
+            assertThat(service.oldestOutstandingErasure()).isPresent();
+            service.erase("docs", List.of("b.md"), true);
+            assertThat(service.oldestOutstandingErasure()).isEmpty();
+            assertThat(new DocumentErasureService(registry, adapter, null, storage::get)
+                .oldestOutstandingErasure()).isEmpty();
+        }
+
+        @Test
         @DisplayName("does not name a document this node never held")
         void doesNotNameAnAbsentDocument() {
             DocumentErasureService.Outcome outcome =

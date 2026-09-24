@@ -14,11 +14,13 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 
@@ -648,6 +650,22 @@ public final class DocumentErasureService {
      */
     public void requestStop() {
         stopRequested = true;
+    }
+
+    /**
+     * When the oldest erasure the lexical index still owes a reclamation for was accepted.
+     *
+     * <p>The index records its obligations by time, not by who asked, so this is what says
+     * whether one erasure's reclamation is done: nothing accepted at or before it is still owed.
+     * That is conservative - an older obligation still outstanding keeps a later erasure
+     * reported as owed - and never the other way round.</p>
+     *
+     * @return The time, or empty when the index owes nothing or this node keeps no index
+     */
+    public Optional<Instant> oldestOutstandingErasure() {
+        return lexicalIndex == null
+            ? Optional.empty()
+            : lexicalIndex.stats().oldestErasureRequest();
     }
 
     /** Erasure requests accepted and not yet discharged. */

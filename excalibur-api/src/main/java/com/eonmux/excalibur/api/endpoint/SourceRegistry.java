@@ -47,6 +47,32 @@ public interface SourceRegistry extends AutoCloseable {
     }
 
     /**
+     * Replaces what a registered source is configured as, keeping everything else about it.
+     *
+     * <p>One step, not a removal followed by a registration. A removal clears the source's status
+     * history and takes it off the re-crawl schedule, and the pair leaves a moment in which the id
+     * is free for another caller to claim. A replacement keeps the id, the namespace, the status
+     * history, the place in the schedule and every document already indexed, records the new
+     * configuration before the live source is swapped, and starts no crawl: the next scheduled
+     * re-crawl, or {@code POST /v1/reindex}, crawls with the new configuration.</p>
+     *
+     * <p>The default refuses. A registry that cannot swap a source in one step must not
+     * approximate it with the two-step sequence above.</p>
+     *
+     * @param source     The crawler built from the new configuration
+     * @param descriptor What the source is now registered as
+     * @throws SourceRegistrationException   if no source is registered under the id, the
+     *                                       namespace differs, a crawl or reindex of it is
+     *                                       running, or the node is shutting down
+     * @throws SourceCatalogException        if the new configuration cannot be recorded
+     * @throws UnsupportedOperationException if this registry cannot replace a registration
+     */
+    default void replace(Source source, SourceDescriptor descriptor) {
+        throw new UnsupportedOperationException(
+            "This source registry cannot replace a registration in one step");
+    }
+
+    /**
      * Checks if a source ID is already registered.
      *
      * @param sourceId The source ID to check

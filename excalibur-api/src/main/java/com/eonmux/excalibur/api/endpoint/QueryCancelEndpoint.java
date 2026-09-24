@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.audit.AuditLog;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.sun.net.httpserver.HttpExchange;
@@ -98,6 +99,7 @@ public class QueryCancelEndpoint implements HttpHandler {
             return;
         }
 
+        AuditLog.target(exchange, "query_id", queryId);
         LOGGER.debug("Attempting to cancel query: {}", queryId);
 
         try {

@@ -111,6 +111,7 @@ public final class FileClassifier {
             case "document-registry.in-flight" -> FileKind.IN_FLIGHT_JOURNAL;
             case "source-catalog" -> FileKind.SOURCE_CATALOG;
             case "source-status" -> FileKind.SOURCE_STATUS;
+            case "erasure-receipts" -> FileKind.ERASURE_RECEIPTS;
             default -> null;
         };
     }

@@ -23,9 +23,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
@@ -1255,6 +1257,57 @@ public final class GraphTenants implements AutoCloseable {
             }
         }
         return ErasureLog.inspect(GraphTenant.erasureLogOf(graphDirectoryOf(id)));
+    }
+
+    /**
+     * Where one erasure request of a namespace stands, without creating or opening anything.
+     *
+     * <p>From the resident tenant where there is one, for the reason {@link #pendingErasures}
+     * gives; otherwise read from the namespace's log, so asking about a request never costs an
+     * open slot or a mapping. A namespace that does not exist on disk has handed out no ids, and
+     * answers empty exactly as an id it never handed out does - so the answer cannot be used to
+     * learn which namespaces exist.</p>
+     *
+     * @param id        The namespace
+     * @param requestId The id {@code POST /v1/graph/erasure} answered with
+     * @return Its status, or empty when the namespace never handed that id out
+     * @throws IOException if the namespace's log exists and cannot be read
+     */
+    public Optional<ErasureLog.RequestStatus> erasureStatus(NamespaceId id, long requestId)
+            throws IOException {
+        Objects.requireNonNull(id, "id must not be null");
+        Optional<NamespaceRegistry.Lease<GraphTenant>> resident = registry.borrowResident(id);
+        if (resident.isPresent()) {
+            try (NamespaceRegistry.Lease<GraphTenant> held = resident.get()) {
+                return held.resource().erasureService().status(requestId);
+            }
+        }
+        return ErasureLog.statusOf(GraphTenant.erasureLogOf(graphDirectoryOf(id)), requestId);
+    }
+
+    /**
+     * Where several erasure requests of a namespace stand, read once, without creating or
+     * opening anything.
+     *
+     * @param id         The namespace
+     * @param requestIds Ids the namespace handed out
+     * @return The status of each id the namespace handed out; the others, and every id of a
+     *         namespace that does not exist, are absent
+     * @throws IOException if the namespace's log exists and cannot be read
+     * @see #erasureStatus(NamespaceId, long)
+     */
+    public Map<Long, ErasureLog.RequestStatus> erasureStatuses(NamespaceId id,
+                                                               Collection<Long> requestIds)
+            throws IOException {
+        Objects.requireNonNull(id, "id must not be null");
+        Objects.requireNonNull(requestIds, "requestIds must not be null");
+        Optional<NamespaceRegistry.Lease<GraphTenant>> resident = registry.borrowResident(id);
+        if (resident.isPresent()) {
+            try (NamespaceRegistry.Lease<GraphTenant> held = resident.get()) {
+                return held.resource().erasureService().statuses(requestIds);
+            }
+        }
+        return ErasureLog.statusesOf(GraphTenant.erasureLogOf(graphDirectoryOf(id)), requestIds);
     }
 
     /**

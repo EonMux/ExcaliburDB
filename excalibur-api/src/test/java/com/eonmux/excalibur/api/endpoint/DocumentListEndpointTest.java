@@ -360,6 +360,151 @@ class DocumentListEndpointTest {
     }
 
     @Nested
+    @DisplayName("One document, whole")
+    class OneDocument {
+
+        private final java.util.Map<String, String> texts = new java.util.HashMap<>();
+
+        @BeforeEach
+        void readable() {
+            endpoint = new DocumentListEndpoint(registry,
+                com.eonmux.excalibur.api.retrieval.ChunkTextResolver.over(texts::get, 5), 2);
+        }
+
+        private record Answer(int status, String body) {
+        }
+
+        private Answer read(String query) throws IOException {
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            HttpExchange exchange = get(query, body);
+            endpoint.handle(exchange);
+            org.mockito.ArgumentCaptor<Integer> status =
+                org.mockito.ArgumentCaptor.forClass(Integer.class);
+            verify(exchange).sendResponseHeaders(status.capture(), anyLong());
+            return new Answer(status.getValue(), body.toString(StandardCharsets.UTF_8));
+        }
+
+        private String cursorOf(String json) {
+            int at = json.indexOf("\"next_cursor\": ");
+            String tail = json.substring(at + "\"next_cursor\": ".length());
+            return tail.startsWith("null") ? null : tail.substring(1, tail.indexOf('"', 1));
+        }
+
+        @Test
+        @DisplayName("returns the document's chunks in the order it was chunked, with its fields")
+        void chunksInOrder() throws IOException {
+            hold("src", "guide.md", List.of("src:guide.md:0", "src:guide.md:1", "src:guide.md:2"));
+            hold("src", "other.md", List.of("src:other.md:0"));
+
+            Answer answer = read("?source_id=src&document_id=guide.md");
+
+            assertThat(answer.status()).isEqualTo(200);
+            assertThat(answer.body())
+                .startsWith("{\"source_id\": \"src\", \"document_id\": \"guide.md\", "
+                    + "\"chunk_count\": 3, \"content_length\": 42, \"content_hash\": \"7\"")
+                .contains("\"chunks\": [{\"position\": 0, \"chunk_id\": \"src:guide.md:0\"}, "
+                    + "{\"position\": 1, \"chunk_id\": \"src:guide.md:1\"}, "
+                    + "{\"position\": 2, \"chunk_id\": \"src:guide.md:2\"}]")
+                .contains("\"returned\": 3, \"next_cursor\": null")
+                .doesNotContain("other.md").doesNotContain("\"text\"");
+        }
+
+        @Test
+        @DisplayName("pages through the chunks with a cursor, text included and clipped")
+        void pagesWithText() throws IOException {
+            hold("src", "guide.md", List.of("c0", "c1", "c2"));
+            texts.put("c0", "alpha");
+            texts.put("c1", "bravo-charlie");
+
+            Answer first = read("?source_id=src&document_id=guide.md&include_text=true");
+            Answer second = read("?source_id=src&document_id=guide.md&include_text=true&cursor="
+                + cursorOf(first.body()));
+
+            assertThat(first.body())
+                .as("the page stops at the text limit, one fetch's worth")
+                .contains("{\"position\": 0, \"chunk_id\": \"c0\", \"text\": \"alpha\", "
+                    + "\"text_truncated\": false}")
+                .contains("{\"position\": 1, \"chunk_id\": \"c1\", \"text\": \"bravo\", "
+                    + "\"text_truncated\": true}")
+                .contains("\"returned\": 2");
+            assertThat(cursorOf(first.body())).isNotNull();
+            assertThat(second.body())
+                .contains("{\"position\": 2, \"chunk_id\": \"c2\", \"text\": null, "
+                    + "\"text_truncated\": false}")
+                .contains("\"returned\": 1, \"next_cursor\": null");
+        }
+
+        @Test
+        @DisplayName("ids alone page up to the listing's own limit")
+        void idsAloneTakeTheWholeLimit() throws IOException {
+            hold("src", "guide.md", List.of("c0", "c1", "c2"));
+
+            assertThat(read("?source_id=src&document_id=guide.md&limit=3").body())
+                .contains("\"returned\": 3");
+            assertThat(read("?source_id=src&document_id=guide.md&include_text=true&limit=3")
+                .status()).as("above one fetch's worth of text").isEqualTo(400);
+        }
+
+        @Test
+        @DisplayName("a document re-ingested mid-read refuses the old cursor")
+        void aChangedDocumentIsAConflict() throws IOException {
+            hold("src", "guide.md", List.of("c0", "c1", "c2"));
+            String cursor = cursorOf(read("?source_id=src&document_id=guide.md&limit=1").body());
+            registry.register(DocumentMetadata.builder().sourceId("src").documentId("guide.md")
+                .chunkIds(List.of("d0", "d1")).contentLength(42).contentHash(8)
+                .lastModifiedMillis(1_000L).indexTimeMillis(3_000L).build());
+
+            Answer answer = read("?source_id=src&document_id=guide.md&cursor=" + cursor);
+
+            assertThat(answer.status()).isEqualTo(409);
+            assertThat(answer.body()).contains("re-ingested");
+        }
+
+        @Test
+        @DisplayName("an unknown document is 404; a document without its source is refused")
+        void refusals() throws IOException {
+            hold("src", "guide.md", List.of("c0"));
+            String listingCursor = "c3JjIGd1aWRlLm1k";
+
+            assertThat(read("?source_id=src&document_id=missing.md").status()).isEqualTo(404);
+            assertThat(read("?source_id=other&document_id=guide.md").status()).isEqualTo(404);
+            assertThat(read("?document_id=guide.md").body()).contains("needs source_id");
+            assertThat(read("?source_id=src&document_id=guide.md&include_text=maybe").status())
+                .isEqualTo(400);
+            assertThat(read("?source_id=src&document_id=guide.md&cursor=" + listingCursor)
+                .status()).as("a listing cursor does not continue a document").isEqualTo(400);
+            assertThat(read("?source_id=src&document_id=guide.md&cursor=!!").status())
+                .isEqualTo(400);
+            assertThat(read("?source_id=src&include_text=true").status())
+                .as("text belongs to one document's chunks").isEqualTo(400);
+        }
+
+        @Test
+        @DisplayName("a chunk cursor does not continue the listing")
+        void aChunkCursorIsNotAListingCursor() throws IOException {
+            hold("src", "guide.md", List.of("c0", "c1"));
+            String cursor = cursorOf(read("?source_id=src&document_id=guide.md&limit=1").body());
+
+            assertThat(read("?cursor=" + cursor).status()).isEqualTo(400);
+        }
+
+        @Test
+        @DisplayName("a node that cannot read text says so")
+        void noTextResolver() throws IOException {
+            endpoint = new DocumentListEndpoint(registry);
+            hold("src", "guide.md", List.of("c0"));
+
+            Answer answer = read("?source_id=src&document_id=guide.md&include_text=true");
+
+            assertThat(answer.status()).isEqualTo(400);
+            assertThat(answer.body()).contains("cannot read chunk text");
+            assertThat(read("?source_id=src&document_id=guide.md").status()).isEqualTo(200);
+            assertThatThrownBy(() -> new DocumentListEndpoint(registry, null, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    @Nested
     @DisplayName("Method")
     class Method {
 

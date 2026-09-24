@@ -9,6 +9,7 @@ import com.eonmux.excalibur.ingest.erasure.SegmentVectorEraser;
 import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
 import com.eonmux.excalibur.ingest.lexical.StoredChunkText;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
+import com.eonmux.excalibur.ingest.registry.ErasureReceiptFile;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
 import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker;
@@ -222,6 +223,9 @@ public final class NodeAssembly {
             StoredChunkText.of(core.storageEngine()),
             tracker,
             SegmentVectorEraser.of(core.storageEngine())));
+        // Beside the source catalog, so an erasure's caller can still ask about it after a
+        // restart; see GET /v1/erasure/{request_id}.
+        server.withErasureReceipts(ErasureReceiptFile.open(dataDir));
 
         // The same registry the erasure service resolves documents through, read-only.
         server.withDocumentRegistry(tracker.getRegistry());

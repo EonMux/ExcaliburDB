@@ -61,6 +61,11 @@ dependencies {
     testImplementation("com.fasterxml.jackson.core:jackson-databind:2.18.1")
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
+    // The audit trail is a contract about what reaches the log - its logger name, and the
+    // fields the shipped JSON encoder writes - so its tests read the events logback produced
+    // and encode them the way logback.xml does.
+    testImplementation("ch.qos.logback:logback-classic:1.5.12")
+    testImplementation("net.logstash.logback:logstash-logback-encoder:8.0")
 
     // Phase 1 (core primitives) - for memory segment abstraction
     implementation(project(":excalibur-core"))

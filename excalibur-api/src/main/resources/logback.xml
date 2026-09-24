@@ -120,6 +120,33 @@
     <logger name="org.slf4j" level="WARN" />
     <logger name="ch.qos.logback" level="WARN" />
 
+    <!--
+        The audit trail: one event per mutating or administrative request - erasures, source
+        registration, update and removal, supplied documents, drains, reindexes, compactions,
+        graph builds, namespace drops and cancellations - whatever its outcome. Each carries
+        audit_action, audit_outcome, http_status, request_id, client_address, http_method,
+        http_path and audit_targets as top-level JSON fields; see
+        com.eonmux.excalibur.api.audit.AuditLog. Never the content an erasure removes.
+
+        Pinned at INFO so that raising EXCALIBUR_LOG_LEVEL to WARN to quieten the node does not
+        silence the record of who changed it. It goes to the same JSON stream as everything
+        else; a deployment that keeps audit records apart points -Dlogback.configurationFile at
+        its own copy of this file with a dedicated appender and additivity turned off, e.g.
+
+            <appender name="AUDIT_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+                <file>/var/log/excalibur/audit.json</file>
+                <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+                    <fileNamePattern>/var/log/excalibur/audit.%d{yyyy-MM-dd}.json</fileNamePattern>
+                    <maxHistory>365</maxHistory>
+                </rollingPolicy>
+                <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
+            </appender>
+            <logger name="excalibur.audit" level="INFO" additivity="false">
+                <appender-ref ref="AUDIT_FILE"/>
+            </logger>
+    -->
+    <logger name="excalibur.audit" level="INFO" />
+
     <!-- Root logger configuration -->
     <root level="${LOG_LEVEL}">
         <appender-ref ref="ASYNC_JSON" />

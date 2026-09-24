@@ -18,7 +18,9 @@ import java.util.Objects;
  * {@code segment_N.hnsw} and {@code segment_N.hnsw.docmap} per segment, with {@code segment_N.hnsw.compact.docmap} beside a graph whose compaction was
  * interrupted; {@code routing.dir}; {@code document-registry}; {@code source-catalog};
  * {@code source-status}, how each source's last crawl ended, which exists nowhere else and so is
- * kept like the catalog beside it; {@code chunk-index/}; and a directory per tenant namespace
+ * kept like the catalog beside it; {@code erasure-receipts}, what each document erasure asked
+ * for and which graph requests it queued, so that where it stands can still be answered after a
+ * restore; {@code chunk-index/}; and a directory per tenant namespace
  * holding {@code graph-staging/} and, once a build has run, {@code graph/}. A directory an
  * earlier build wrote may also hold {@code segment_N.tfs}, a term sketch this build has no use
  * for; it is {@link Inclusion#OBSOLETE} and never copied.</p>

@@ -80,6 +80,16 @@ public enum FileKind {
      */
     SOURCE_STATUS,
 
+    /**
+     * {@code erasure-receipts}: what each recent document erasure did, for its caller to ask
+     * about later.
+     *
+     * <p>A report like the status history: the node reads one it cannot trust as holding no
+     * receipts, and the obligations the receipts pointed at are in the erasure logs, which
+     * losing it does not touch. See {@link #discardedOnOpen()}.</p>
+     */
+    ERASURE_RECEIPTS,
+
     /** A log inside a tenant's {@code graph-staging} directory. */
     GRAPH_STAGING_LOG,
 
@@ -215,10 +225,14 @@ public enum FileKind {
      * build does not read - is logged and treated as empty, each source reports from its next
      * run, and the file is rewritten when the first run ends. What is lost is the history, never data.</p>
      *
+     * <p>The erasure receipts are the same kind of record: one the node will not take is logged
+     * and read as holding no receipts, so the erasures it described answer as unknown, and it is
+     * rewritten at the next erasure. The obligations themselves live in the erasure logs.</p>
+     *
      * @return true for a kind the node discards, rather than refuses to start on, when damaged
      */
     public boolean discardedOnOpen() {
-        return this == SOURCE_STATUS;
+        return this == SOURCE_STATUS || this == ERASURE_RECEIPTS;
     }
 
     /**

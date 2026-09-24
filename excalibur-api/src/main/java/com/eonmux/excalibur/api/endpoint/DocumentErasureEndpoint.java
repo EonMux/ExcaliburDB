@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.audit.AuditLog;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphErasureService;
@@ -9,6 +10,7 @@ import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.RequestBody;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
+import com.eonmux.excalibur.ingest.registry.ErasureReceiptFile;
 import com.eonmux.excalibur.core.text.ChunkIdentifiers;
 import com.eonmux.excalibur.tenancy.NamespaceId;
 import com.eonmux.excalibur.tenancy.NamespaceRegistry;
@@ -17,11 +19,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * {@code POST /v1/erasure} - removes named documents from the corpus.
@@ -101,6 +105,14 @@ import java.util.Optional;
  * {@code documents_remaining} reaches zero has to watch this too, or it will loop forever over
  * documents the node keeps failing to erase.</p>
  *
+ * <h3>Asking later</h3>
+ * <p>Every answered request carries a {@code request_id}: a receipt recorded durably beside the
+ * data, which {@code GET /v1/erasure/{request_id}} reads back to say whether the graph half and the
+ * lexical reclamation have since finished - see {@link DocumentErasureStatusEndpoint}. The receipt
+ * holds the counts and the graph obligations, never the document ids. A receipt that could not be
+ * written does not undo an erasure that happened: the reply still reports it, with
+ * {@code request_id} null.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Stateless; the service it calls is safe for concurrent use.</p>
  */
@@ -137,6 +149,11 @@ public class DocumentErasureEndpoint implements HttpHandler {
      * discharged.
      */
     private final GraphTenants graphTenants;
+
+    /** Where each answered erasure leaves its receipt, or null for none. */
+    private final ErasureReceiptFile receipts;
+
+    private final Clock clock;
 
     /**
      * Creates the endpoint.
@@ -196,11 +213,35 @@ public class DocumentErasureEndpoint implements HttpHandler {
                                    SourceRegistry sourceRegistry,
                                    InlineSourceIds suppliedSources,
                                    GraphTenants graphTenants) {
+        this(erasureService, sourceRegistry, suppliedSources, graphTenants, null,
+            Clock.systemUTC());
+    }
+
+    /**
+     * Creates the endpoint, leaving a receipt for every erasure it answers.
+     *
+     * @param erasureService  The service that performs the removal
+     * @param sourceRegistry  The registered ingestion sources, or null on a node that keeps none
+     * @param suppliedSources The ids documents have been supplied directly under, or null
+     * @param graphTenants    The namespaces whose graphs hold what was extracted, or null
+     * @param receipts        Where receipts are recorded, or null to answer without a
+     *                        {@code request_id}
+     * @param clock           What a receipt's time is read from
+     * @throws NullPointerException if the service or the clock is null
+     */
+    public DocumentErasureEndpoint(DocumentErasureService erasureService,
+                                   SourceRegistry sourceRegistry,
+                                   InlineSourceIds suppliedSources,
+                                   GraphTenants graphTenants,
+                                   ErasureReceiptFile receipts,
+                                   Clock clock) {
         this.erasureService = Objects.requireNonNull(erasureService,
             "erasureService cannot be null");
         this.sourceRegistry = sourceRegistry;
         this.suppliedSources = suppliedSources;
         this.graphTenants = graphTenants;
+        this.receipts = receipts;
+        this.clock = Objects.requireNonNull(clock, "clock cannot be null");
     }
 
     @Override
@@ -235,6 +276,13 @@ public class DocumentErasureEndpoint implements HttpHandler {
                 "{\"error\": \"" + JsonText.escape(e.getMessage()) + "\"}");
             return;
         }
+        // How many documents, never which: the audit trail outlives the erasure, and the ids
+        // are the erased content's names.
+        AuditLog.target(exchange, "source_id", sourceId);
+        AuditLog.target(exchange, "scope", scope);
+        if (SCOPE_DOCUMENT.equals(scope)) {
+            AuditLog.target(exchange, "documents_named", documentIds.size());
+        }
 
         try {
             // Resolved before anything is removed: a source-scoped erasure deregisters the
@@ -264,8 +312,12 @@ public class DocumentErasureEndpoint implements HttpHandler {
                 outcome = erasureService.erase(sourceId, documentIds, compactNow);
             }
 
-            sendOutcome(exchange, sourceId, scope, deregistered, outcome,
-                eraseFromGraph(namespace, sourceId, outcome.erasedDocumentIds(), compactNow));
+            GraphHalf graph =
+                eraseFromGraph(namespace, sourceId, outcome.erasedDocumentIds(), compactNow);
+            String receiptId = recordReceipt(sourceId, scope, deregistered, outcome, graph);
+            AuditLog.target(exchange, "request_id", receiptId);
+            sendOutcome(exchange, receiptId, sourceId, scope, deregistered, outcome,
+                graph.outcome());
         } catch (SourceCatalogException e) {
             // Nothing has been erased: the source comes off the crawl before its documents go,
             // and that is the step that failed. A 500 would be true and would not say that the
@@ -305,18 +357,18 @@ public class DocumentErasureEndpoint implements HttpHandler {
      * @param sourceId    The source the documents belong to
      * @param documentIds The documents this node no longer holds any part of
      * @param compactNow  Rewrite the served graph now rather than leaving it to the policy
-     * @return What the graph half did
+     * @return What the graph half did, and the obligations it submitted to each namespace
      * @throws IOException if an obligation cannot be recorded or the compaction fails
      */
-    private GraphErasureService.DocumentGraphOutcome eraseFromGraph(
+    private GraphHalf eraseFromGraph(
             Optional<NamespaceId> namespace, String sourceId, List<String> documentIds,
             boolean compactNow) throws IOException {
         if (graphTenants == null) {
-            return GraphErasureService.DocumentGraphOutcome.NO_GRAPH;
+            return new GraphHalf(GraphErasureService.DocumentGraphOutcome.NO_GRAPH, List.of());
         }
         if (documentIds.isEmpty()) {
-            return GraphErasureService.DocumentGraphOutcome.none(
-                "no document was erased, so the graph holds nothing more of one");
+            return new GraphHalf(GraphErasureService.DocumentGraphOutcome.none(
+                "no document was erased, so the graph holds nothing more of one"), List.of());
         }
         List<String> keys = new ArrayList<>(documentIds.size());
         for (String documentId : documentIds) {
@@ -327,6 +379,7 @@ public class DocumentErasureEndpoint implements HttpHandler {
             : graphTenants.namespacesOnDisk();
 
         List<GraphErasureService.DocumentGraphOutcome> parts = new ArrayList<>(targets.size());
+        List<ErasureReceiptFile.GraphRequests> submitted = new ArrayList<>(targets.size());
         for (NamespaceId target : targets) {
             // Never created here. A namespace with no directory has had nothing staged into it,
             // so it holds nothing of these documents - and borrowing one would create it.
@@ -345,14 +398,66 @@ public class DocumentErasureEndpoint implements HttpHandler {
                     graphTenants.recost(target);
                 }
                 parts.add(outcome);
+                if (!outcome.requestIds().isEmpty()) {
+                    submitted.add(new ErasureReceiptFile.GraphRequests(target.value(),
+                        outcome.requestIds()));
+                }
             }
         }
         if (parts.isEmpty()) {
-            return GraphErasureService.DocumentGraphOutcome.none(
+            return new GraphHalf(GraphErasureService.DocumentGraphOutcome.none(
                 "no namespace on this node has had anything staged into it, so none holds "
-                    + "anything extracted from these documents");
+                    + "anything extracted from these documents"), List.of());
         }
-        return GraphErasureService.DocumentGraphOutcome.combine(parts);
+        return new GraphHalf(GraphErasureService.DocumentGraphOutcome.combine(parts), submitted);
+    }
+
+    /**
+     * What the graph half of one erasure did.
+     *
+     * @param outcome  Its counts, across every namespace it reached
+     * @param requests The obligations it submitted, per namespace, for the receipt
+     */
+    private record GraphHalf(GraphErasureService.DocumentGraphOutcome outcome,
+                             List<ErasureReceiptFile.GraphRequests> requests) {
+    }
+
+    /**
+     * Records the receipt a caller asks about later.
+     *
+     * <p>After the erasure, and never in the way of its answer: the documents are already gone
+     * and the obligations already durable, so a receipt that cannot be written costs the caller
+     * the handle and nothing else. A 500 here would be read as "nothing happened" and invite a
+     * retry that finds nothing to erase.</p>
+     *
+     * @param sourceId     The source the request named
+     * @param scope        What it asked to erase
+     * @param deregistered Whether the source was taken out of the crawl
+     * @param outcome      What the corpus half did
+     * @param graph        What the graph half did
+     * @return The receipt id, or null when no receipt was recorded
+     */
+    private String recordReceipt(String sourceId, String scope, boolean deregistered,
+                                 DocumentErasureService.Outcome outcome, GraphHalf graph) {
+        if (receipts == null) {
+            return null;
+        }
+        String id = UUID.randomUUID().toString();
+        // Whether a reclamation is owed for these chunks at all, read after the erasure: the
+        // status route later asks whether the index still owes anything this old.
+        boolean lexicalOwed = outcome.chunksUnindexed() > 0 && !outcome.compacted()
+            && erasureService.oldestOutstandingErasure().isPresent();
+        try {
+            receipts.record(new ErasureReceiptFile.Receipt(id, clock.millis(), sourceId, scope,
+                outcome.documentsErased(), outcome.documentsIncomplete(),
+                outcome.documentsNotFound(), outcome.documentsRemaining(), deregistered,
+                lexicalOwed, graph.requests()));
+            return id;
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("Erasure of source {} was carried out, but its receipt could not be "
+                + "recorded; the reply carries no request_id", sourceId, e);
+            return null;
+        }
     }
 
     /**
@@ -365,6 +470,7 @@ public class DocumentErasureEndpoint implements HttpHandler {
      * documentation for why that is a failure rather than a partial success.</p>
      *
      * @param exchange     The request to answer
+     * @param receiptId    The receipt the caller can ask about later, or null for none
      * @param sourceId     The source the request named
      * @param scope        What it asked to erase
      * @param deregistered Whether the source was taken out of the crawl
@@ -372,7 +478,8 @@ public class DocumentErasureEndpoint implements HttpHandler {
      * @param graph        What the graph half of the erasure managed
      * @throws IOException if the response cannot be written
      */
-    private static void sendOutcome(HttpExchange exchange, String sourceId, String scope,
+    private static void sendOutcome(HttpExchange exchange, String receiptId, String sourceId,
+                                    String scope,
                                     boolean deregistered,
                                     DocumentErasureService.Outcome outcome,
                                     GraphErasureService.DocumentGraphOutcome graph)
@@ -392,7 +499,10 @@ public class DocumentErasureEndpoint implements HttpHandler {
             "{"
                 + (incomplete ? "\"error\": \"Some documents could not be fully erased; "
                     + "repeat the request\", " : "")
+                + "\"request_id\": " + (receiptId == null ? "null" : "\"" + receiptId + "\"")
+                + ", "
                 + "\"source_id\": \"" + JsonText.escape(sourceId) + "\", "
+
                 + "\"scope\": \"" + scope + "\", "
                 + "\"documents_erased\": " + outcome.documentsErased() + ", "
                 + "\"documents_incomplete\": " + outcome.documentsIncomplete() + ", "

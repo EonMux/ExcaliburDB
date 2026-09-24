@@ -2,6 +2,7 @@ package com.eonmux.excalibur.api.server;
 
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
+import com.eonmux.excalibur.api.audit.AuditLog;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.bootstrap.NamespaceRoutingGraphIngestSink;
 import com.eonmux.excalibur.api.bootstrap.SourceRestoration;
@@ -10,6 +11,8 @@ import com.eonmux.excalibur.api.endpoint.CompactionEndpoint;
 import com.eonmux.excalibur.api.endpoint.CompactionRunner;
 import com.eonmux.excalibur.api.endpoint.CompactionStatusEndpoint;
 import com.eonmux.excalibur.api.endpoint.DocumentErasureEndpoint;
+import com.eonmux.excalibur.api.endpoint.DocumentErasureStatusEndpoint;
+
 import com.eonmux.excalibur.api.endpoint.DocumentFetchEndpoint;
 import com.eonmux.excalibur.api.endpoint.DocumentListEndpoint;
 import com.eonmux.excalibur.api.endpoint.DocumentUpsertEndpoint;
@@ -21,6 +24,7 @@ import com.eonmux.excalibur.api.endpoint.GraphBuildRunner;
 import com.eonmux.excalibur.api.endpoint.GraphBuildStatusEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphEntitiesEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphErasureEndpoint;
+import com.eonmux.excalibur.api.endpoint.GraphErasureStatusEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphFactsEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespaceDeleteEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespacesEndpoint;
@@ -59,6 +63,7 @@ import com.eonmux.excalibur.ingest.lexical.StoredChunkText;
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
+import com.eonmux.excalibur.ingest.registry.ErasureReceiptFile;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
 import com.eonmux.excalibur.ingest.source.SourceResolver;
 import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
@@ -79,6 +84,7 @@ import com.eonmux.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Clock;
 import java.util.Objects;
 import java.util.function.DoubleSupplier;
 import java.util.function.Function;
@@ -172,6 +178,8 @@ final class EndpointRegistrar {
      * @param graphIngestSink      What ingestion stages facts through, or null
      * @param graphPipeline        A graph pipeline somebody else owns, or null
      * @param documentRegistry     What this node has ingested, or null
+     * @param erasureReceipts      Where each document erasure leaves the receipt
+     *                             {@code GET /v1/erasure/{request_id}} reads, or null for none
      */
     record Inputs(ApiSecurityConfig security,
                   Config config,
@@ -196,7 +204,8 @@ final class EndpointRegistrar {
                   GraphTenants graphTenants,
                   NamespaceRoutingGraphIngestSink graphIngestSink,
                   GraphRagPipeline graphPipeline,
-                  DocumentRegistry documentRegistry) {
+                  DocumentRegistry documentRegistry,
+                  ErasureReceiptFile erasureReceipts) {
     }
 
     /**
@@ -704,7 +713,23 @@ final class EndpointRegistrar {
      * @param guarded The path's handler, already guarded
      * @return A handler dispatching {@code method} to the route and refusing the rest
      */
+    /**
+     * Records every request reaching a mutating route in the audit trail.
+     *
+     * <p>Outside the guard, so a request it refuses - unauthenticated, or over the mutate budget -
+     * is recorded as the attempt it was. Every route that changes what this node holds or how it
+     * behaves goes through here; see {@link AuditLog}.</p>
+     *
+     * @param action  The action the route performs, as the audit event names it
+     * @param guarded The route, already guarded
+     * @return The audited route
+     */
+    private static HttpHandler audited(String action, HttpHandler guarded) {
+        return AuditLog.audited(action, guarded);
+    }
+
     private HttpHandler onlyMethod(String method, HttpHandler guarded) {
+
         return createMethodRouter(Map.of(method, guarded),
             guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                 "Method Not Allowed - Use " + method)));
@@ -766,8 +791,8 @@ final class EndpointRegistrar {
         // 405 is charged rather than served below it.
         DrainEndpoint drain = new DrainEndpoint(readiness);
         target.createContext("/v1/drain", wrapHandler(exactPath("/v1/drain", createMethodRouter(
-            "POST", guard.protect(RequestGuard.Access.MUTATE, drain),
-            "DELETE", guard.protect(RequestGuard.Access.MUTATE, drain),
+            "POST", audited("node.drain", guard.protect(RequestGuard.Access.MUTATE, drain)),
+            "DELETE", audited("node.undrain", guard.protect(RequestGuard.Access.MUTATE, drain)),
             guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                 "Method Not Allowed - Use POST to drain or DELETE to undrain"))), notFound)));
     }
@@ -839,15 +864,16 @@ final class EndpointRegistrar {
         target.createContext("/v1/query", wrapHandler(pathOrChild("/v1/query", createMethodRouter(
             "POST", exactPath("/v1/query",
                 corpusRoute(RequestGuard.Access.READ, queryHandler), notFound),
-            "DELETE", corpusRoute(RequestGuard.Access.MUTATE, queryCancelEndpoint),
+            "DELETE", audited("query.cancel",
+                corpusRoute(RequestGuard.Access.MUTATE, queryCancelEndpoint)),
             exactPath("/v1/query", guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                 "Method Not Allowed - Use POST for queries or DELETE for cancellation")),
                 notFound)), notFound)));
     }
 
     /**
-     * Registers {@code /v1/ingest}: POST registers a source, GET reads the registrations back,
-     * DELETE stops crawling one.
+     * Registers {@code /v1/ingest}: POST registers a source, PUT replaces its configuration, GET
+     * reads the registrations back, DELETE stops crawling one.
      *
      * <p>The two that mutate are charged against the mutate budget and the read-back against the
      * read one; the same shape {@code /v1/query} uses for query and cancel.
@@ -859,7 +885,13 @@ final class EndpointRegistrar {
                                 IngestEndpoint ingestEndpoint) {
         target.createContext("/v1/ingest", wrapHandler(exactPath("/v1/ingest", createMethodRouter(
             Map.of(
-                "POST", guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint),
+                "POST", audited("source.register",
+                    guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint)),
+                // The same endpoint and the same namespace-honouring guard as POST: a replacement
+                // is validated exactly as a registration is, and the header is how it proves it
+                // is not moving the source to another tenant.
+                "PUT", audited("source.update",
+                    guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint)),
                 // The read budget, like every other read-back: an operator asking what a source
                 // was registered as is not changing anything, and charging it against the
                 // mutate budget would let a status poll starve an ingestion.
@@ -871,14 +903,16 @@ final class EndpointRegistrar {
                 // source belonging to tenant B, with nothing in the answer to say so.
                 "GET", corpusRoute(RequestGuard.Access.READ,
                     new SourceListEndpoint(in.ingestSourceRegistry(), in.sourceCatalog())),
-                "DELETE", corpusRoute(RequestGuard.Access.MUTATE,
-                    new SourceDeregisterEndpoint(in.ingestSourceRegistry()))),
+                "DELETE", audited("source.deregister", corpusRoute(RequestGuard.Access.MUTATE,
+                    new SourceDeregisterEndpoint(in.ingestSourceRegistry())))),
             guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                 "Method Not Allowed - Use GET to read the registrations, POST to register a "
-                    + "source or DELETE to stop crawling one"))), notFound)));
+                    + "source, PUT to replace its configuration or DELETE to stop crawling it"))),
+            notFound)));
         target.createContext("/v1/ingest/run",
-            wrapHandler(exactPath("/v1/ingest/run", onlyMethod("DELETE", corpusRoute(RequestGuard.Access.MUTATE,
-                new IngestCancelEndpoint(in.ingestSourceRegistry()))), notFound)));
+            wrapHandler(exactPath("/v1/ingest/run", onlyMethod("DELETE", audited("ingest.cancel",
+                corpusRoute(RequestGuard.Access.MUTATE,
+                    new IngestCancelEndpoint(in.ingestSourceRegistry())))), notFound)));
         target.createContext("/v1/ingest/status",
             wrapHandler(exactPath("/v1/ingest/status", onlyMethod("GET", corpusRoute(RequestGuard.Access.READ,
                 new IngestStatusEndpoint(in.ingestionStatus()))), notFound)));
@@ -926,7 +960,11 @@ final class EndpointRegistrar {
             target.createContext("/v1/documents/list",
                 wrapHandler(exactPath("/v1/documents/list",
                     onlyMethod("GET", corpusRoute(RequestGuard.Access.READ,
-                        new DocumentListEndpoint(in.documentRegistry()))), notFound)));
+                        // A document read with its text is the same read the batch fetch is,
+                        // so it is clipped and bounded the same way.
+                        new DocumentListEndpoint(in.documentRegistry(),
+                            ChunkTextResolver.over(chunkText, in.security().maxResultTextChars()),
+                            in.security().maxTopK()))), notFound)));
         }
     }
 
@@ -949,15 +987,15 @@ final class EndpointRegistrar {
             // anonymous caller while a node that does have a pipeline answers 401 - which
             // tells a prober which deployment it is looking at, and describes it.
             return createMethodRouter("GET", read,
-                "POST", corpusRoute(RequestGuard.Access.MUTATE, unavailable(
-                    "Supplying documents directly requires an ingestion pipeline, "
-                        + "which this node was started without")),
+                "POST", audited("documents.supply", corpusRoute(RequestGuard.Access.MUTATE,
+                    unavailable("Supplying documents directly requires an ingestion pipeline, "
+                        + "which this node was started without"))),
                 wrongMethod);
         }
         return createMethodRouter("GET", read,
-            "POST", corpusRoute(RequestGuard.Access.MUTATE,
+            "POST", audited("documents.supply", corpusRoute(RequestGuard.Access.MUTATE,
                 new DocumentUpsertEndpoint(in.ingestionOrchestrator(), in.ingestSourceRegistry(),
-                    suppliedSources, MAX_SUPPLIED_DOCUMENTS)),
+                    suppliedSources, MAX_SUPPLIED_DOCUMENTS))),
             wrongMethod);
     }
 
@@ -971,8 +1009,10 @@ final class EndpointRegistrar {
                                  ReindexEndpoint reindexHandler) {
         target.createContext("/v1/reindex", wrapHandler(exactPath("/v1/reindex",
             createMethodRouter(
-                "POST", corpusRoute(RequestGuard.Access.MUTATE, reindexHandler),
-                "DELETE", corpusRoute(RequestGuard.Access.MUTATE, reindexHandler),
+                "POST", audited("reindex.start",
+                    corpusRoute(RequestGuard.Access.MUTATE, reindexHandler)),
+                "DELETE", audited("reindex.cancel",
+                    corpusRoute(RequestGuard.Access.MUTATE, reindexHandler)),
                 guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                     "Method Not Allowed - Use POST to start a reindex or DELETE to stop one"))),
             notFound)));
@@ -991,10 +1031,25 @@ final class EndpointRegistrar {
         if (in.documentErasure() == null) {
             return;
         }
-        target.createContext("/v1/erasure", wrapHandler(exactPath("/v1/erasure",
-            onlyMethod("POST", corpusRoute(RequestGuard.Access.MUTATE,
-                new DocumentErasureEndpoint(in.documentErasure(), in.ingestSourceRegistry(),
-                    suppliedSources, in.graphTenants()))), notFound)));
+        // One context for the collection and its members: POST on the collection erases, GET on
+        // a member reads back where an erasure stands. The readback is a read, so polling it is
+        // not rationed against the mutate budget. A node wired without receipts answers it 503,
+        // naming what it lacks, rather than 404 for a route the API has.
+        HttpHandler status = onlyMethod("GET", corpusRoute(RequestGuard.Access.READ,
+            in.erasureReceipts() == null
+                ? unavailable("Service Unavailable - this node keeps no erasure receipts, so "
+                    + "it cannot say where an erasure stands")
+                : new DocumentErasureStatusEndpoint(in.erasureReceipts(), in.documentErasure(),
+                    in.graphTenants())));
+        target.createContext("/v1/erasure", wrapHandler(pathOrChild("/v1/erasure",
+            exactPath("/v1/erasure",
+                onlyMethod("POST", audited("erasure.documents",
+                    corpusRoute(RequestGuard.Access.MUTATE,
+                        new DocumentErasureEndpoint(in.documentErasure(),
+                            in.ingestSourceRegistry(), suppliedSources, in.graphTenants(),
+                            in.erasureReceipts(), Clock.systemUTC())))),
+                status),
+            notFound)));
     }
 
     /**
@@ -1011,11 +1066,12 @@ final class EndpointRegistrar {
                                     CompactionRunner runner) {
         target.createContext("/v1/compact", wrapHandler(exactPath("/v1/compact",
             createMethodRouter(
-                "POST", corpusRoute(RequestGuard.Access.MUTATE, new CompactionEndpoint(runner)),
+                "POST", audited("compaction.start",
+                    corpusRoute(RequestGuard.Access.MUTATE, new CompactionEndpoint(runner))),
                 // A mutation too: it ends a rewrite of the served data. An anonymous caller
                 // able to stop every compaction is a node that never reclaims anything.
-                "DELETE", corpusRoute(RequestGuard.Access.MUTATE,
-                    new CompactionCancelEndpoint(runner)),
+                "DELETE", audited("compaction.cancel", corpusRoute(RequestGuard.Access.MUTATE,
+                    new CompactionCancelEndpoint(runner))),
                 guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                     "Method Not Allowed - Use POST to start a compaction or DELETE to stop "
                         + "the one in progress"))),
@@ -1059,10 +1115,11 @@ final class EndpointRegistrar {
             // build is a node whose graph never changes.
             target.createContext("/v1/graph/build", wrapHandler(exactPath("/v1/graph/build",
                 createMethodRouter(
-                    "POST", guard.protect(RequestGuard.Access.MUTATE,
-                        new GraphBuildEndpoint(graphBuildRunner)),
-                    "DELETE", guard.protect(RequestGuard.Access.MUTATE,
-                        new GraphBuildCancelEndpoint(graphBuildRunner)),
+                    "POST", audited("graph.build.start", guard.protect(RequestGuard.Access.MUTATE,
+                        new GraphBuildEndpoint(graphBuildRunner))),
+                    "DELETE", audited("graph.build.cancel",
+                        guard.protect(RequestGuard.Access.MUTATE,
+                            new GraphBuildCancelEndpoint(graphBuildRunner))),
                     guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                         "Method Not Allowed - Use POST to start a graph build or DELETE to "
                             + "stop the one in progress"))),
@@ -1075,9 +1132,17 @@ final class EndpointRegistrar {
                 exactPath("/v1/graph/build/status", onlyMethod("GET", guard.protect(RequestGuard.Access.READ,
                     new GraphBuildStatusEndpoint(graphBuildRunner, graphAutoBuilder))),
                 notFound)));
-            target.createContext("/v1/graph/erasure", wrapHandler(exactPath("/v1/graph/erasure",
-                onlyMethod("POST", guard.protect(RequestGuard.Access.MUTATE,
-                    new GraphErasureEndpoint(in.graphTenants()))), notFound)));
+            // One context for the collection and its members: POST on the collection records an
+            // obligation, GET on a member reads back where one stands. The readback is a read, so
+            // polling a deadline is not rationed against the mutate budget.
+            target.createContext("/v1/graph/erasure", wrapHandler(pathOrChild("/v1/graph/erasure",
+                exactPath("/v1/graph/erasure",
+                    onlyMethod("POST", audited("erasure.graph",
+                        guard.protect(RequestGuard.Access.MUTATE,
+                            new GraphErasureEndpoint(in.graphTenants())))),
+                    onlyMethod("GET", guard.protect(RequestGuard.Access.READ,
+                        new GraphErasureStatusEndpoint(in.graphTenants())))),
+                notFound)));
             // The served graph read by entity: a read like the query it sits beside, over the
             // same lease, and answered 503 exactly where the query is.
             target.createContext(GraphEntitiesEndpoint.PATH, wrapHandler(
@@ -1089,8 +1154,10 @@ final class EndpointRegistrar {
             GraphFactsEndpoint facts = new GraphFactsEndpoint(in.graphTenants());
             target.createContext(GraphFactsEndpoint.PATH, wrapHandler(
                 pathOrChild(GraphFactsEndpoint.PATH, createMethodRouter(
-                    "POST", guard.protect(RequestGuard.Access.MUTATE, facts),
-                    "DELETE", guard.protect(RequestGuard.Access.MUTATE, facts),
+                    "POST", audited("graph.facts.assert",
+                        guard.protect(RequestGuard.Access.MUTATE, facts)),
+                    "DELETE", audited("graph.facts.retract",
+                        guard.protect(RequestGuard.Access.MUTATE, facts)),
                     guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                         "Method Not Allowed - Use POST /v1/graph/facts to assert facts or "
                             + "DELETE /v1/graph/facts/{fact_id} to retract one"))),
@@ -1106,8 +1173,9 @@ final class EndpointRegistrar {
                             new GraphNamespacesEndpoint(in.graphTenants()), notFound)),
                     // A mutation, and the most destructive one this node offers: it removes a
                     // tenant's graph, its staged facts and the log of what it still owed.
-                    "DELETE", guard.protect(RequestGuard.Access.MUTATE,
-                        new GraphNamespaceDeleteEndpoint(in.graphTenants())),
+                    "DELETE", audited("graph.namespace.delete",
+                        guard.protect(RequestGuard.Access.MUTATE,
+                            new GraphNamespaceDeleteEndpoint(in.graphTenants()))),
                     guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                         "Method Not Allowed - Use GET /v1/graph/namespaces to list them or "
                             + "DELETE /v1/graph/namespaces/{namespace} to drop one"))),

@@ -5,6 +5,7 @@ import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.QueryParams;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
+import com.eonmux.excalibur.api.retrieval.ChunkTextResolver;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 
@@ -80,6 +81,39 @@ import java.util.PriorityQueue;
  * thousands of chunks - so a page ends at whichever of the two limits comes first, and the
  * cursor carries on from there.</p>
  *
+ * <h2>One document, whole</h2>
+ * <p>{@code document_id}, with the {@code source_id} it belongs to, turns the listing into a
+ * read of that one document: its chunks, in the order the document was chunked, paged the same
+ * way. A document id is unique only within its source, so naming one without its source is
+ * refused, and a document the registry does not hold is {@code 404}.</p>
+ * <pre>{@code
+ * GET /v1/documents/list?source_id=my-docs&document_id=guide.md&include_text=true&limit=2
+ * {
+ *   "source_id": "my-docs",
+ *   "document_id": "guide.md",
+ *   "chunk_count": 3,
+ *   "content_length": 8241,
+ *   "content_hash": "913472233",
+ *   "last_modified_ms": 1757808000000,
+ *   "indexed_at_ms": 1757808123456,
+ *   "chunks": [
+ *     {"position": 0, "chunk_id": "my-docs:guide.md:0", "text": "...", "text_truncated": false},
+ *     {"position": 1, "chunk_id": "my-docs:guide.md:1", "text": "...", "text_truncated": false}
+ *   ],
+ *   "returned": 2,
+ *   "next_cursor": "..."
+ * }
+ * }</pre>
+ * <p>{@code limit} counts chunks here. Without {@code include_text} a page carries ids only and
+ * may run to {@link #MAX_LIMIT}; with it each chunk also carries its text, clipped at
+ * {@code excalibur.api.max-result-text-chars} and flagged when clipped, and a page may carry no
+ * more chunks than one {@code POST /v1/documents/fetch} may name, because it is the same read.
+ * {@code text} is null for a chunk whose text this node no longer holds.</p>
+ * <p>The cursor carries the document's content hash as well as the position. A document
+ * re-ingested between two pages has a different chunking, and continuing it by position would
+ * stitch the start of one version to the end of another; that continuation is refused with
+ * {@code 409}, and the read starts again.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Stateless; the registry it reads is thread-safe. A page is a view of the registry as the
  * walk saw it rather than a snapshot, which is what the cursor is for: a document added behind
@@ -119,15 +153,40 @@ public class DocumentListEndpoint implements HttpHandler {
 
     private final DocumentRegistry documentRegistry;
 
+    /** Reads a chunk's text for {@code include_text}, or null on a node that cannot. */
+    private final ChunkTextResolver text;
+
+    /** Most chunks one page may carry with their text. */
+    private final int maxTextChunks;
+
     /**
-     * Creates the endpoint.
+     * Creates the endpoint, without the text of a document's chunks.
      *
      * @param documentRegistry What the node holds, and the only thing that knows it
      * @throws NullPointerException if documentRegistry is null
      */
     public DocumentListEndpoint(DocumentRegistry documentRegistry) {
+        this(documentRegistry, null, 1);
+    }
+
+    /**
+     * Creates the endpoint.
+     *
+     * @param documentRegistry What the node holds, and the only thing that knows it
+     * @param text             Reads a chunk's text, or null on a node that cannot
+     * @param maxTextChunks    Most chunks one page may carry with their text
+     * @throws NullPointerException     if documentRegistry is null
+     * @throws IllegalArgumentException if maxTextChunks is not positive
+     */
+    public DocumentListEndpoint(DocumentRegistry documentRegistry, ChunkTextResolver text,
+                                int maxTextChunks) {
         this.documentRegistry = Objects.requireNonNull(documentRegistry,
             "documentRegistry cannot be null");
+        if (maxTextChunks <= 0) {
+            throw new IllegalArgumentException("maxTextChunks must be positive: " + maxTextChunks);
+        }
+        this.text = text;
+        this.maxTextChunks = maxTextChunks;
     }
 
     @Override
@@ -140,6 +199,9 @@ public class DocumentListEndpoint implements HttpHandler {
 
         try {
             sendListing(exchange, exchange.getRequestURI().getRawQuery());
+        } catch (DocumentChanged changed) {
+            ResponseBody.sendJson(exchange, 409,
+                "{\"error\": \"" + JsonText.escape(changed.getMessage()) + "\"}");
         } catch (IllegalArgumentException refused) {
             ResponseBody.sendJson(exchange, 400,
                 "{\"error\": \"" + JsonText.escape(refused.getMessage()) + "\"}");
@@ -159,10 +221,117 @@ public class DocumentListEndpoint implements HttpHandler {
      */
     private void sendListing(HttpExchange exchange, String rawQuery) throws IOException {
         String sourceId = sourceFilter(rawQuery);
+        String documentId = QueryParams.value(rawQuery, "document_id");
+        if (documentId != null && !documentId.isBlank()) {
+            sendDocument(exchange, rawQuery, sourceId, documentId);
+            return;
+        }
+        if (QueryParams.value(rawQuery, "include_text") != null) {
+            throw new IllegalArgumentException("include_text reads one document's chunks; "
+                + "name the document with document_id and source_id");
+        }
         int limit = boundedInt(rawQuery, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT);
         Cursor after = Cursor.decode(QueryParams.value(rawQuery, "cursor"));
 
         ResponseBody.sendJson(exchange, 200, render(walk(sourceId, after, limit)));
+    }
+
+    /**
+     * Writes one page of a single document's chunks.
+     *
+     * @param exchange   The exchange to answer on
+     * @param rawQuery   The undecoded query string
+     * @param sourceId   The source the document belongs to, or null when none was named
+     * @param documentId The document
+     * @throws IOException              if the response cannot be written
+     * @throws IllegalArgumentException if a parameter is outside what the endpoint accepts
+     * @throws DocumentChanged          if the cursor was issued for another version of it
+     */
+    private void sendDocument(HttpExchange exchange, String rawQuery, String sourceId,
+                              String documentId) throws IOException {
+        if (sourceId == null) {
+            throw new IllegalArgumentException("document_id needs source_id: a document id is "
+                + "unique only within the source it came from");
+        }
+        boolean includeText = flag(rawQuery, "include_text");
+        if (includeText && text == null) {
+            throw new IllegalArgumentException(
+                "include_text is not available: this node cannot read chunk text");
+        }
+        int maximum = includeText ? Math.min(maxTextChunks, MAX_LIMIT) : MAX_LIMIT;
+        int limit = boundedInt(rawQuery, "limit", Math.min(DEFAULT_LIMIT, maximum), 1, maximum);
+        ChunkCursor after = ChunkCursor.decode(QueryParams.value(rawQuery, "cursor"));
+
+        DocumentMetadata metadata = documentRegistry.get(sourceId, documentId);
+        if (metadata == null) {
+            ResponseBody.sendJson(exchange, 404, "{\"error\": \"No document '"
+                + JsonText.escape(echo(documentId)) + "' in source '"
+                + JsonText.escape(sourceId) + "'\"}");
+            return;
+        }
+        int from = after == null ? 0 : after.resume(metadata);
+        ResponseBody.sendJson(exchange, 200, renderDocument(metadata, from, limit, includeText));
+    }
+
+    /**
+     * Renders a page of one document's chunks.
+     *
+     * @param metadata    What the registry holds about the document
+     * @param from        The position of the first chunk on this page
+     * @param limit       Most chunks this page may carry
+     * @param includeText Whether each chunk carries its text
+     * @return The JSON body
+     */
+    private String renderDocument(DocumentMetadata metadata, int from, int limit,
+                                  boolean includeText) {
+        List<String> chunkIds = metadata.getChunkIds();
+        int to = Math.min(chunkIds.size(), from + limit);
+        StringBuilder body = new StringBuilder(256).append('{')
+            .append(documentFields(metadata))
+            .append(", \"chunks\": [");
+        for (int position = from; position < to; position++) {
+            if (position > from) {
+                body.append(", ");
+            }
+            String chunkId = chunkIds.get(position);
+            body.append("{\"position\": ").append(position)
+                .append(", \"chunk_id\": \"").append(JsonText.escape(chunkId)).append('"');
+            if (includeText) {
+                ChunkTextResolver.Resolved resolved = text.resolve(chunkId);
+                body.append(", \"text\": ").append(resolved.text() == null ? "null"
+                        : "\"" + JsonText.escape(resolved.text()) + "\"")
+                    .append(", \"text_truncated\": ").append(resolved.truncated());
+            }
+            body.append('}');
+        }
+        return body.append("], \"returned\": ").append(Math.max(0, to - from))
+            .append(", \"next_cursor\": ")
+            .append(to < chunkIds.size()
+                ? "\"" + new ChunkCursor(to, metadata.getContentHash()).encode() + "\""
+                : "null")
+            .append('}')
+            .toString();
+    }
+
+    /**
+     * Reads a true/false parameter, absent meaning false.
+     *
+     * @param rawQuery The undecoded query string
+     * @param name     The parameter name
+     * @return Its value
+     * @throws IllegalArgumentException if it is present and neither true nor false
+     */
+    private static boolean flag(String rawQuery, String name) {
+        String raw = QueryParams.value(rawQuery, name);
+        if (raw == null || raw.isBlank()) {
+            return false;
+        }
+        return switch (raw.trim().toLowerCase(java.util.Locale.ROOT)) {
+            case "true" -> true;
+            case "false" -> false;
+            default -> throw new IllegalArgumentException(
+                name + " must be true or false, got: " + echo(raw));
+        };
     }
 
     /**
@@ -333,16 +502,23 @@ public class DocumentListEndpoint implements HttpHandler {
             }
             chunks.append('"').append(JsonText.escape(chunkIds.get(i))).append('"');
         }
-        return "{"
-            + "\"source_id\": \"" + JsonText.escape(metadata.getSourceId()) + "\", "
+        return "{" + documentFields(metadata) + ", \"chunk_ids\": " + chunks.append(']') + "}";
+    }
+
+    /**
+     * The fields that describe a document, without its chunks.
+     *
+     * @param metadata What the registry holds about it
+     * @return The fields, without the surrounding braces
+     */
+    private static String documentFields(DocumentMetadata metadata) {
+        return "\"source_id\": \"" + JsonText.escape(metadata.getSourceId()) + "\", "
             + "\"document_id\": \"" + JsonText.escape(metadata.getDocumentId()) + "\", "
             + "\"chunk_count\": " + metadata.getChunkCount() + ", "
-            + "\"chunk_ids\": " + chunks.append(']') + ", "
             + "\"content_length\": " + metadata.getContentLength() + ", "
             + "\"content_hash\": \"" + metadata.getContentHash() + "\", "
             + "\"last_modified_ms\": " + metadata.getLastModifiedMillis() + ", "
-            + "\"indexed_at_ms\": " + metadata.getIndexTimeMillis()
-            + "}";
+            + "\"indexed_at_ms\": " + metadata.getIndexTimeMillis();
     }
 
     /**
@@ -398,8 +574,9 @@ public class DocumentListEndpoint implements HttpHandler {
             } catch (IllegalArgumentException notBase64) {
                 throw new IllegalArgumentException(UNREADABLE);
             }
+            // At zero is a chunk cursor, which begins with the separator: no source id is empty.
             int separator = decoded.indexOf(CURSOR_SEPARATOR);
-            if (separator < 0) {
+            if (separator <= 0) {
                 throw new IllegalArgumentException(UNREADABLE);
             }
             return new Cursor(decoded.substring(0, separator),
@@ -424,4 +601,89 @@ public class DocumentListEndpoint implements HttpHandler {
                 : documentId.compareTo(metadata.getDocumentId()) < 0;
         }
     }
+
+    /**
+     * Where a page of one document's chunks ended, and which version of the document it was.
+     *
+     * <p>Begins with the separator, which no listing cursor does, so neither kind is mistaken
+     * for the other.</p>
+     *
+     * @param position    The position of the first chunk the next page carries
+     * @param contentHash The content hash of the document the page was read from
+     */
+    private record ChunkCursor(int position, long contentHash) {
+
+        /** What a value that is not a chunk cursor this node issued is answered with. */
+        private static final String UNREADABLE =
+            "cursor is not one this node issued for a document's chunks; start the read again "
+                + "without it";
+
+        /**
+         * Reads a cursor off a request.
+         *
+         * @param encoded What the request carried, or null when it carried none
+         * @return The cursor, or null to start at the first chunk
+         * @throws IllegalArgumentException if the value is not a chunk cursor this node issued
+         */
+        static ChunkCursor decode(String encoded) {
+            if (encoded == null || encoded.isBlank()) {
+                return null;
+            }
+            try {
+                String decoded = new String(Base64.getUrlDecoder().decode(encoded.trim()),
+                    StandardCharsets.UTF_8);
+                if (decoded.isEmpty() || decoded.charAt(0) != CURSOR_SEPARATOR) {
+                    throw new IllegalArgumentException(UNREADABLE);
+                }
+                int separator = decoded.indexOf(CURSOR_SEPARATOR, 1);
+                if (separator < 0) {
+                    throw new IllegalArgumentException(UNREADABLE);
+                }
+                int position = Integer.parseInt(decoded.substring(1, separator));
+                long hash = Long.parseLong(decoded.substring(separator + 1));
+                if (position <= 0) {
+                    throw new IllegalArgumentException(UNREADABLE);
+                }
+                return new ChunkCursor(position, hash);
+            } catch (IllegalArgumentException unreadable) {
+                // NumberFormatException included: whatever part of it failed, it is not ours.
+                throw new IllegalArgumentException(UNREADABLE);
+            }
+        }
+
+        /** @return the cursor as it travels, opaque to the caller */
+        String encode() {
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(
+                (CURSOR_SEPARATOR + Integer.toString(position) + CURSOR_SEPARATOR + contentHash)
+                    .getBytes(StandardCharsets.UTF_8));
+        }
+
+        /**
+         * Where the next page of a document starts.
+         *
+         * @param metadata The document as the registry holds it now
+         * @return The position to resume from
+         * @throws DocumentChanged if the document is not the version the cursor was issued for
+         */
+        int resume(DocumentMetadata metadata) {
+            if (metadata.getContentHash() != contentHash
+                    || position > metadata.getChunkIds().size()) {
+                throw new DocumentChanged("Document '" + echo(metadata.getDocumentId())
+                    + "' was re-ingested since this read began; its chunks are no longer the "
+                    + "ones the cursor counted. Start the read again without a cursor.");
+            }
+            return position;
+        }
+    }
+
+    /** A chunk cursor was issued for another version of the document it continues. */
+    private static final class DocumentChanged extends RuntimeException {
+
+        private static final long serialVersionUID = 1L;
+
+        DocumentChanged(String message) {
+            super(message, null, false, false);
+        }
+    }
 }
+
