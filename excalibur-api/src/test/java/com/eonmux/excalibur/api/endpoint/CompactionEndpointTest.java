@@ -158,6 +158,59 @@ class CompactionEndpointTest {
         }
 
         /**
+         * Every accessor reads a body it cannot walk as one with no {@code force} in it, so a
+         * body that is not JSON at all would start an unforced run and answer 202.
+         */
+        @Test
+        @DisplayName("a body that is not a JSON object is refused and nothing runs")
+        void aBodyThatIsNotAnObjectIsRefused() throws Exception {
+            for (String body : new String[] {"garbage", "[true]", "{\"force\": true",
+                    "{\"force\": true} trailing", "true"}) {
+                try (CompactionRunner runner = new CompactionRunner((force, stop) -> A_RUN)) {
+                    Response response = call(new CompactionEndpoint(runner), "POST", body);
+
+                    assertThat(response.status()).as(body).isEqualTo(400);
+                    assertThat(response.body()).as(body)
+                        .contains("\"code\": \"invalid_request\"");
+                    assertThat(runner.snapshot().state()).as(body).isEqualTo("idle");
+                }
+            }
+        }
+
+        /**
+         * A misspelled {@code force} reads as absent, so {@code {"forse": true}} would start the
+         * light run and answer 202 to a caller who asked for everything to be rewritten.
+         */
+        @Test
+        @DisplayName("a member the route does not read is refused, naming it")
+        void anUnknownMemberIsRefused() throws Exception {
+            try (CompactionRunner runner = new CompactionRunner((force, stop) -> A_RUN)) {
+                Response response = call(new CompactionEndpoint(runner), "POST",
+                    "{\"forse\": true}");
+
+                assertThat(response.status()).isEqualTo(400);
+                assertThat(response.body()).contains("forse").contains("force");
+                assertThat(runner.snapshot().state()).isEqualTo("idle");
+            }
+        }
+
+        @Test
+        @DisplayName("an empty body starts an unforced run")
+        void anEmptyBodyIsAnUnforcedRun() throws Exception {
+            AtomicBoolean forced = new AtomicBoolean(true);
+            try (CompactionRunner runner = new CompactionRunner((force, stop) -> {
+                forced.set(force);
+                return A_RUN;
+            })) {
+                Response response = call(new CompactionEndpoint(runner), "POST", "  ");
+
+                assertThat(response.status()).isEqualTo(202);
+                awaitIdle(runner);
+                assertThat(forced).isFalse();
+            }
+        }
+
+        /**
          * Every other route refuses an oversized body with 413. Reading a prefix instead would
          * silently drop whatever the caller wrote past it, so a truncated {@code force} reads
          * as absent and the run goes ahead unforced.

@@ -3010,8 +3010,11 @@ Queries and ingestion continue throughout. A segment is rewritten beside its ori
 in at the end, under the same lock the background worker takes, so a manual run and a scheduled
 one can never rewrite the same segment twice.
 
-A body that is not JSON or a `force` that is not a boolean is a `400`, a body over the request size
-limit a `413`, and any method but `POST` or `DELETE` a `405`.
+The body may be empty. Otherwise it must be one well-formed JSON object whose only member is
+`force`: a body that is not, a misspelled or unknown member, or a `force` that is not a boolean
+is a `400` `invalid_request` and nothing runs — each would otherwise read as "no `force`" and
+start the light run. A body over the request size limit is a `413`, and any method but `POST` or
+`DELETE` a `405`.
 
 ### Stop a compaction
 
