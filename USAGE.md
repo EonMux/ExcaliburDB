@@ -2806,8 +2806,10 @@ the copy verifies faithfully without it:
   the seal a clean close writes. A node mapping names each node's chunk at version 3 and its
   document at versions 1 and 2; one at a version this build does not read fails the image.
 - Everything else goes to `excalibur-fsck`'s checkers, read-only, where the file lies — the same
-  dispatch `excalibur-fsck` surveys a live directory with. Write-ahead logs have every record
-  replayed against its checksum; `routing.dir` is checked against the CRC32C that ends it; the
+  dispatch `excalibur-fsck` surveys a live directory with. Write-ahead logs have their header's
+  CRC and format version checked and every record replayed against its checksum — a log with no
+  header, which an older build wrote, is healthy and unproven, and one a newer build wrote fails
+  the image; `routing.dir` is checked against the CRC32C that ends it; the
   lexical store is checked as one structure — its manifest against the CRC32C on its last line,
   every column of every segment the manifest names, each named segment's key table against
   `seg-N.keysum` and its tombstones against their CRC32C, and every line of `erasure.log`
@@ -3077,7 +3079,9 @@ the tool writes, stating each write before it makes it, and **no repair ever del
   place, through the engine's own catalog code — rather than cut out.
 - A write-ahead log ending in a torn record, an append that never completed, has that record's
   opcode cleared in place: the one-byte write the log itself makes when an append fails its fsync,
-  after which the log reads as ending before it.
+  after which the log reads as ending before it. A log whose header was torn as it was created,
+  with nothing written behind it, has the header's first byte cleared the same way; the node writes
+  a fresh header when it next opens the log, as it would have without the repair.
 
 The quarantine is a timestamped directory beside the data directory unless
 `--quarantine-dir=<path>` names another; the default needs the data directory's parent to be
@@ -3098,12 +3102,13 @@ quarantine and the original directory removed. What it refuses to attempt matter
 | A damaged `catalog.dat` | Segment files are rediscovered on start-up, but lifecycle state, integrated offsets, source ids and epochs live only there. A node that starts without them looks like a first start |
 | A damaged `routing.dir`, or a slot pointing at a missing segment | Which hash slot belongs to which segment after a split is not derivable from file names. That is why the directory is written down |
 | A write-ahead log damaged in the middle | The records behind the damage were fsynced and acknowledged. Trimming past them would destroy committed writes, and so would moving the file aside — nothing rebuilds a log the way a reindex rebuilds an index |
+| A write-ahead log whose header is damaged, with records behind it | The version the header names cannot be believed, and the records behind it were acknowledged. It is damage, not a newer build's log — whose header's checksum would match — so restore the segment from a backup or a replica |
 | A damaged `segment_<N>.hnsw.compact.docmap` with no `.hnsw.compact` beside it | The graph already holds the compacted numbering, and without this mapping it would be served through the pre-compaction one — wrong documents rather than an error. Restore the graph and both mappings together, or reindex the segment |
 | A damaged lexical store `manifest` | A store without its manifest opens as a new, empty index and deletes every segment the empty manifest does not name. Restore the manifest from a backup, or remove the whole `chunk-index` directory and reindex |
 | A damaged built graph with a `graph.previous` or `graph.retired` beside it | With the graph moved away the node would restore that copy and serve it, and a copy an erasure compaction replaced still holds what the erasure removed. Start the node once, which deletes the copy beside a served graph, or delete the copy, then repair again — or `POST /v1/graph/build`, which replaces the damaged graph without either. The move is checked again as it is made |
 | A damaged built graph beside a damaged label interner | The graph's dictionary may be all that still names the ids past the interner's damage. Moved away, the node would cut those ids off and hand them to new labels, serving one entity under another's name. Restore the namespace's `graph-staging` directory and graph from a backup. The move is checked again as it is made |
 | A damaged graph staging log | Nothing rebuilds one, and the node opens a missing one as empty. Moved aside, a label interner hands its ids out again under the published graph, so entities are served under other entities' names; `triples.log` empties the next graph build; `entity_text.log` leaves entities nothing to be ranked or embedded by; `erasure.log` and `withdrawals.log` forget what is still owed. Restore the namespace's `graph-staging` directory from a backup, all its logs together, since they refer to one another by id |
-| Anything `UNREADABLE` | A device or permission problem, or a header naming a format version a newer build wrote. Either way nothing is known about the contents, and a newer build's file is not damaged |
+| Anything `UNREADABLE` | A device or permission problem, or a header naming a format version a newer build wrote. Either way nothing is known about the contents, and a newer build's file is not damaged. A newer build's write-ahead log is never trimmed, and is not moved aside even when its segment is gone |
 
 Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself failed — which says nothing about the directory and must not be read as `0`.
 
@@ -3272,6 +3277,30 @@ A version 1 or 2 log is read exactly as before, reported *legacy, unprotected* b
 and rewritten at version 3 before anything is next appended to it or settled from it. An older
 build refuses a version 3 log, so the lexical store it would open does not; going back from a node
 that has recorded or settled an erasure under this build needs an image taken before the upgrade.
+
+**`segment_<N>.wal` — no step required; rollback needs an image.** A segment's write-ahead log is
+version 2, which begins with a 16-byte header: the magic `EXWL`, the format version and a CRC-32
+over both. Every record already carried its own checksum; what the header adds is a way to tell a
+log a newer build wrote from a damaged one. A log whose sound header names a version this build
+does not read is refused and left untouched — not replayed, not truncated — and the node does not
+start, naming the file and the versions it reads; `excalibur-fsck` reports it `UNREADABLE` and puts
+it to an operator. A log whose header fails its CRC is damage: the start is refused as for a log
+damaged in the middle, and `excalibur-fsck` reports it `CORRUPT`.
+
+A log an older build wrote has no header and is version 1. It is replayed and appended to exactly
+as before, and `excalibur-fsck` reports it *legacy, unprotected* — its records are still checked,
+but nothing in the file names their format. It is not rewritten in place: a header would have to
+go where its first record is, which would move every record and invalidate the integrated offset
+the catalog and the graph keep against it. It is replaced instead by a version 2 log when a
+compaction or a split next gives its segment a fresh one. A version 1 log with no record in it —
+every segment an older build compacted and nothing has been written to since — is given its
+header as soon as the node opens it, since nothing has to move.
+
+An older build reads the header as a damaged record. A log with records behind its header is
+refused as damaged in the middle and that build does not start — it neither replays nor
+overwrites anything — so a node that has written to a segment under this build cannot go back
+without restoring an image taken before the upgrade. A log that holds only its header is read by
+an older build as ending at offset 0, and its first append writes over the header; nothing is lost.
 
 **`<data dir>/routing.dir` — no step required; rollback depends on splits.** The routing directory
 is version 2, which ends with a CRC32C of every byte before it. Every slot value is a plausible

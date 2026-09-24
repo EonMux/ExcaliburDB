@@ -419,7 +419,12 @@ version field altered — is `UNREADABLE`: the node refuses to open it, so it fa
 is put to an operator rather than moved aside, since nothing shows its bytes are damaged. An HNSW
 node mapping, for instance, is read at versions 1 to 3 — its entries name each node's document at
 versions 1 and 2 and its chunk at version 3 — and a version 4 mapping is reported unreadable, not
-checked as if it were version 3.
+checked as if it were version 3. A write-ahead log is judged the same way: one whose header names a
+version this build does not read is `UNREADABLE`, and is never trimmed or moved aside — not even
+when its segment is gone; one whose header is damaged is `CORRUPT` and put to an operator, since
+records behind it were acknowledged; and one with no header at all, which a build before the
+header wrote, has its records weighed against their checksums as always and is reported
+`LEGACY_UNPROTECTED`, because nothing in the file says which format they are in.
 
 Two files are judged by what the node does with them rather than by their name alone. A lexical
 segment's lookup table, `chunk-index/seg-N.keymap`, is a derived file the node rebuilds by itself
@@ -559,7 +564,7 @@ already there when it was copied verifies faithfully:
 | segments, `catalog.dat` | the storage engine, on a scratch copy | every entry's checksum, and the header and record CRCs |
 | HNSW graphs and their node mappings, quantiser codebooks, LSH tables | the vector and filter modules, on a scratch copy | the seal a clean close writes. A mapping names each node's chunk at version 3 and its document at versions 1 and 2; one at a version the node does not read fails the image |
 | a compaction's staged pair (`segment_<N>.hnsw.compact`, `.hnsw.compact.docmap`) | `excalibur-fsck`, read-only | nothing, while both are there: the compaction never swapped, the node discards the pair on open, and a torn pair does not fail the image. A staged mapping alone is the only mapping the swapped graph matches, and is verified against its seal like any mapping |
-| write-ahead logs | `excalibur-fsck`'s checkers, read-only | every record replayed against its checksum |
+| write-ahead logs | `excalibur-fsck`'s checkers, read-only | the header's CRC and the format version it names, then every record replayed against its checksum. A log with no header, which an older build wrote, has its records checked and is reported unproven; a newer build's fails the image |
 | graph staging logs | `excalibur-fsck`, read-only | every record of the label, triple, entity text, erasure and withdrawal logs against its CRC, walked by the graph module's own replay without opening the log. One ending in a write cut short is healthy and unproven: the node trims it on open. Damage the node refuses fails the image |
 | a tenant's built graph (`<namespace>/graph/`) | `excalibur-fsck`, read-only, as one structure | the edge store's descriptor against its CRC32C, every column against the length and CRC32C the descriptor records, both dictionaries against their trailers, the entity vectors against the CRC32Cs in their header, and every file of both Lucene indexes against its footer. Damage fails the image. A graph an older build wrote is reported unproven; a newer build's fails the image. Scratch and a copy the node deletes on open are reported unchecked |
 | the lexical store | `excalibur-fsck`, read-only, as one structure | the manifest against the CRC32C on its end line; every column of every segment it names; each named segment's key table against the checksums in `seg-N.keysum` and its tombstones against their trailing CRC32C; and every line of `erasure.log` against its own CRC32C. A manifest an older build wrote carries only a record count, and a key table, tombstone file or erasure log it wrote carries nothing: each is held to its structure and not proven |
@@ -2843,6 +2848,16 @@ reported as unverifiable rather than as sound, and a file gains protection the f
 compaction or a split rewrites it. `excalibur-fsck` finds a damaged slot in an older file anyway,
 by comparing each slot against the record it names — the record keeps its own copy of the key
 hash, under the record's own checksum.
+
+A segment's write-ahead log, `segment_<N>.wal`, begins with a 16-byte header — the magic `EXWL`, a
+format version and a CRC-32 over both — so a node can tell a log a newer build wrote from a
+damaged one. A log whose header is sound and names a version this build does not read is refused
+and left exactly as it was: not replayed, not truncated, not given a header of this build's, and
+the node does not start on it. A damaged header is refused as damage, the same way a log damaged
+in the middle is. A log an older build wrote has no header; it is replayed and appended to exactly
+as before, and keeps its format until a compaction or a split gives its segment a fresh log, since
+writing a header into it would move every record and every offset recorded against them. One with
+no record in it is given a header as soon as it is opened.
 
 The same standard covers the index files beside the segments: the HNSW graph, its
 node-to-chunk map, the PQ codebook and the LSH tables each carry a CRC32C over their payload
