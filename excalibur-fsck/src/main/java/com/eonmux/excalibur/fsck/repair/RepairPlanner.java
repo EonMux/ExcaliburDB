@@ -12,6 +12,7 @@ import com.eonmux.excalibur.fsck.check.FileKind;
 import com.eonmux.excalibur.fsck.check.GraphStagingCheck;
 import com.eonmux.excalibur.fsck.check.GraphStoreCheck;
 import com.eonmux.excalibur.fsck.check.LexicalStoreCheck;
+import com.eonmux.excalibur.graph.staging.FactIdFloor;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.retrieval.lexical.native_.DocumentErasureLog;
 import com.eonmux.excalibur.retrieval.lexical.native_.LexicalSidecars;
@@ -301,6 +302,10 @@ public final class RepairPlanner {
                 "this is the text entities are ranked by and embedded from, so the next build "
                     + "would rank every entity with none, and an erasure aimed at the prose in it "
                     + "would find nothing to erase while the moved copy still held it";
+            case FactIdFloor.FILE_NAME ->
+                "the node would number fact ids from the highest asserted fact still staged and "
+                    + "the clock, so once the newest assertions have been erased and the clock "
+                    + "set back it could hand out an id a client still holds";
             case GraphStagingCheck.WITHDRAWAL_LOG ->
                 "it records the staged facts of replaced and removed documents that are still "
                     + "to be withdrawn, so those facts would stay in the graph with nothing left "
