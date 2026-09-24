@@ -3971,7 +3971,9 @@ What each call does:
   that before any query is made. The limits are the server's: `excalibur.api.max-query-chars`,
   `max-top-k` and `max-query-timeout-ms`, and `query(text, topK, timeout)` sets a budget below the
   default, and `query(text, topK, timeout, sourceIds)` searches only the documents of those
-  sources, as `source_ids` does on the route. Each `SearchHit` carries the chunk id, its score,
+  sources, as `source_ids` does on the route — and refuses, with `IllegalArgumentException`, the
+  lists the route refuses: empty, more than 1000 ids, or an id that is null, blank or longer than
+  256 characters. Each `SearchHit` carries the chunk id, its score,
   the signals that found it and the chunk's text; `timedOut()` on the answer says the budget ran
   out and the hits are what was found before it did.
 - **`fetch(chunkId)`** reads a chunk's text back. **`documents()`** and **`documents(sourceId)`**
