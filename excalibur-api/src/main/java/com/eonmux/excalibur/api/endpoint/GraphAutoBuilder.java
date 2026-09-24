@@ -6,6 +6,7 @@ import com.eonmux.excalibur.api.bootstrap.GraphFreshness;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.config.GraphConfig;
 import com.eonmux.excalibur.graph.build.BuildCancelledException;
+import com.eonmux.excalibur.graph.staging.PublishRefusedException;
 import com.eonmux.excalibur.tenancy.NamespaceId;
 
 import org.slf4j.Logger;
@@ -75,6 +76,16 @@ import java.util.function.Supplier;
  *   <li>Retry a namespace whose build failed before its backoff has passed: from
  *       {@code excalibur.graph.auto-build-failure-backoff-seconds}, doubling with each further
  *       failure up to {@code excalibur.graph.auto-build-max-failure-backoff-seconds}.</li>
+ *   <li>Count a build an erasure overtook as a failure. An obligation recorded while a build
+ *       runs refuses its publish, because the build read staging before the obligation existed;
+ *       nothing is wrong, and the next build leaves the new obligation out. So that build is
+ *       {@code superseded} and is due again on the next pass - still once staging has been
+ *       quiet for the debounce, or its oldest change has waited the maximum delay. A namespace
+ *       erased faster than it can be built would otherwise be rebuilt on every pass, each build
+ *       spending a whole graph's embeddings to be refused, so from the second refusal in a row
+ *       the next attempt waits: the debounce (or the pass interval, with no debounce), doubling
+ *       with each further refusal, up to the maximum delay - the longest the configuration says
+ *       an unpublished change should wait.</li>
  *   <li>Build while extraction is unavailable - asked for, but with no API key or no pipeline
  *       to feed it. A replaced document's old facts are withdrawn whether or not its new ones
  *       could be extracted, so a build then would publish a graph that has lost facts nothing
@@ -113,7 +124,10 @@ public final class GraphAutoBuilder implements AutoCloseable {
     /** An automatic build of this namespace is in progress. */
     public static final String STATE_RUNNING = "running";
 
-    /** The last automatic build failed, and the next waits for its backoff. */
+    /**
+     * The last automatic build failed, or several in a row were superseded, and the next waits
+     * out its backoff.
+     */
     public static final String STATE_BACKING_OFF = "backing_off";
 
     /** The graph is withheld until an interrupted erasure is applied, which comes first. */
@@ -130,6 +144,12 @@ public final class GraphAutoBuilder implements AutoCloseable {
 
     /** A build stopped by the node shutting down. */
     public static final String RESULT_CANCELLED = "cancelled";
+
+    /**
+     * A build whose publish was refused because an erasure was recorded while it ran; the next
+     * one leaves that erasure out.
+     */
+    public static final String RESULT_SUPERSEDED = "superseded";
 
     /**
      * How the automatic build is configured.
@@ -257,16 +277,17 @@ public final class GraphAutoBuilder implements AutoCloseable {
      * @param lastResult          One of the {@code RESULT_*} constants, or null before the first
      * @param lastError           Why the last build failed, or null
      * @param lastOutcome         What the last build that ran published, or null
-     * @param consecutiveFailures Failures since the last build that did not fail
-     * @param retryAtMs           When a namespace backing off may be built again, or 0
+     * @param consecutiveFailures      Failures since the last build that did not fail
+     * @param consecutiveSupersessions Builds in a row an erasure overtook
+     * @param retryAtMs                When a namespace backing off may be built again, or 0
      */
     public record Memory(boolean running, long lastStartedAtMs, long lastFinishedAtMs,
                          String lastResult, String lastError,
                          GraphBuildService.BuildOutcome lastOutcome, int consecutiveFailures,
-                         long retryAtMs) {
+                         int consecutiveSupersessions, long retryAtMs) {
 
         /** A namespace nothing has been built for. */
-        static final Memory NONE = new Memory(false, 0, 0, null, null, null, 0, 0);
+        static final Memory NONE = new Memory(false, 0, 0, null, null, null, 0, 0, 0);
     }
 
     /**
@@ -293,11 +314,12 @@ public final class GraphAutoBuilder implements AutoCloseable {
      * @param running   How many are in progress now
      * @param completed How many published or retired a graph
      * @param unchanged How many found nothing left to build
-     * @param failed    How many failed
-     * @param cancelled How many were stopped by the node shutting down
+     * @param failed     How many failed
+     * @param cancelled  How many were stopped by the node shutting down
+     * @param superseded How many had their publish refused by an erasure recorded meanwhile
      */
     public record Counts(int running, long completed, long unchanged, long failed,
-                         long cancelled) {
+                         long cancelled, long superseded) {
     }
 
     private final Settings settings;
@@ -326,6 +348,7 @@ public final class GraphAutoBuilder implements AutoCloseable {
     private final AtomicLong unchanged = new AtomicLong();
     private final AtomicLong failed = new AtomicLong();
     private final AtomicLong cancelled = new AtomicLong();
+    private final AtomicLong superseded = new AtomicLong();
 
     /**
      * Creates the automatic build. Nothing runs until {@link #start()}.
@@ -528,7 +551,8 @@ public final class GraphAutoBuilder implements AutoCloseable {
         remembered.compute(id, (key, memory) -> {
             Memory last = memory == null ? Memory.NONE : memory;
             return new Memory(true, startedAtMs, 0, last.lastResult(), last.lastError(),
-                last.lastOutcome(), last.consecutiveFailures(), 0);
+                last.lastOutcome(), last.consecutiveFailures(), last.consecutiveSupersessions(),
+                0);
         });
         try {
             builds.execute(() -> build(id, startedAtMs));
@@ -538,7 +562,8 @@ public final class GraphAutoBuilder implements AutoCloseable {
             inFlight.remove(id);
             remembered.computeIfPresent(id, (key, memory) -> new Memory(false,
                 memory.lastStartedAtMs(), clock.millis(), RESULT_CANCELLED, null,
-                memory.lastOutcome(), memory.consecutiveFailures(), 0));
+                memory.lastOutcome(), memory.consecutiveFailures(),
+                memory.consecutiveSupersessions(), 0));
             return false;
         }
     }
@@ -557,21 +582,26 @@ public final class GraphAutoBuilder implements AutoCloseable {
                 namespaces.buildIfBehind(id, cancelRequested::get);
             if (outcome.isPresent()) {
                 completed.incrementAndGet();
-                finish(id, startedAtMs, RESULT_COMPLETED, null, outcome.get(), 0, 0);
+                finish(id, startedAtMs, RESULT_COMPLETED, null, outcome.get(), 0, 0, 0);
                 LOGGER.info("automatic graph build of namespace {} finished: {}", id,
                     outcome.get());
             } else {
                 unchanged.incrementAndGet();
-                finish(id, startedAtMs, RESULT_UNCHANGED, null, null, 0, 0);
+                finish(id, startedAtMs, RESULT_UNCHANGED, null, null, 0, 0, 0);
                 LOGGER.info("automatic graph build of namespace {} found nothing to build",
                     id);
             }
         } catch (IOException | RuntimeException | Error e) {
             if (isCancellation(e)) {
                 cancelled.incrementAndGet();
-                finish(id, startedAtMs, RESULT_CANCELLED, null, null, 0, 0);
+                finish(id, startedAtMs, RESULT_CANCELLED, null, null, 0, 0, 0);
                 LOGGER.info("automatic graph build of namespace {} stopped before publishing",
                     id);
+                return;
+            }
+            Optional<PublishRefusedException> refusal = refusalIn(e);
+            if (refusal.isPresent()) {
+                superseded(id, startedAtMs, refusal.get());
                 return;
             }
             failed.incrementAndGet();
@@ -579,7 +609,7 @@ public final class GraphAutoBuilder implements AutoCloseable {
             Duration wait = backoff(failures);
             long retryAtMs = clock.millis() + wait.toMillis();
             finish(id, startedAtMs, RESULT_FAILED, String.valueOf(e.getMessage()), null,
-                failures, retryAtMs);
+                failures, 0, retryAtMs);
             LOGGER.error("automatic graph build of namespace {} failed ({} in a row); the "
                 + "next attempt waits {}s", id, failures, wait.toSeconds(), e);
         } finally {
@@ -592,20 +622,68 @@ public final class GraphAutoBuilder implements AutoCloseable {
     }
 
     /**
+     * Records a build whose publish an erasure refused, and when the next may start.
+     *
+     * <p>Not a failure, so the failure streak ends here - the build got as far as its publish -
+     * and no backoff is owed for it. The first refusal in a row leaves the namespace due on
+     * the next pass; later ones space the attempts out by {@link #supersededWait(int)}.</p>
+     *
+     * @param id          The namespace
+     * @param startedAtMs When the pass started the build
+     * @param refusal     Which obligation overtook it
+     */
+    private void superseded(NamespaceId id, long startedAtMs, PublishRefusedException refusal) {
+        superseded.incrementAndGet();
+        int inARow = remembered.getOrDefault(id, Memory.NONE).consecutiveSupersessions() + 1;
+        Duration wait = supersededWait(inARow);
+        long retryAtMs = wait.isZero() ? 0 : clock.millis() + wait.toMillis();
+        finish(id, startedAtMs, RESULT_SUPERSEDED, null, null, 0, inARow, retryAtMs);
+        if (wait.isZero()) {
+            LOGGER.info("automatic graph build of namespace {} was superseded: {}; it is built "
+                + "again, without that erasure, once it is next due", id, refusal.getMessage());
+        } else {
+            LOGGER.warn("automatic graph build of namespace {} was superseded {} times in a row, "
+                + "most recently: {}; the next attempt waits {}s", id, inARow,
+                refusal.getMessage(), wait.toSeconds());
+        }
+    }
+
+    /**
+     * How long a namespace waits after its {@code inARow}-th consecutive superseded build.
+     *
+     * @param inARow Consecutive superseded builds, at least 1
+     * @return Nothing after the first; then the debounce, or the pass interval where there is
+     *         no debounce, doubled for each further refusal, up to the maximum delay
+     */
+    Duration supersededWait(int inARow) {
+        if (inARow <= 1) {
+            return Duration.ZERO;
+        }
+        Duration first = settings.debounce().isZero() ? settings.interval() : settings.debounce();
+        Duration ceiling = settings.maxDelay().compareTo(first) < 0 ? first : settings.maxDelay();
+        Duration wait = first;
+        for (int i = 2; i < inARow && wait.compareTo(ceiling) < 0; i++) {
+            wait = wait.multipliedBy(2);
+        }
+        return wait.compareTo(ceiling) > 0 ? ceiling : wait;
+    }
+
+    /**
      * Records how a build ended, and frees its slot in the same step.
      *
      * <p>Together, so nothing sees the build finished and its namespace still in flight - a pass
      * would skip it - or free and its backoff not yet recorded - a pass would retry at once.</p>
      */
     private void finish(NamespaceId id, long startedAtMs, String result, String error,
-                        GraphBuildService.BuildOutcome outcome, int failures, long retryAtMs) {
+                        GraphBuildService.BuildOutcome outcome, int failures,
+                        int supersessions, long retryAtMs) {
         long finishedAtMs = clock.millis();
         remembered.compute(id, (key, memory) -> {
             GraphBuildService.BuildOutcome kept = outcome != null ? outcome
                 : memory == null ? null : memory.lastOutcome();
             inFlight.remove(id);
             return new Memory(false, startedAtMs, finishedAtMs, result, error, kept, failures,
-                retryAtMs);
+                supersessions, retryAtMs);
         });
     }
 
@@ -640,6 +718,24 @@ public final class GraphAutoBuilder implements AutoCloseable {
             }
         }
         return false;
+    }
+
+    /**
+     * The refusal a failure reports, if it is one: an erasure recorded while the build ran.
+     *
+     * @param failure What the build threw
+     * @return The refusal, wherever in the cause chain it is
+     */
+    private static Optional<PublishRefusedException> refusalIn(Throwable failure) {
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (cause instanceof PublishRefusedException refusal) {
+                return Optional.of(refusal);
+            }
+            if (cause.getCause() == cause) {
+                break;
+            }
+        }
+        return Optional.empty();
     }
 
     /**
@@ -724,7 +820,7 @@ public final class GraphAutoBuilder implements AutoCloseable {
      */
     public Counts counts() {
         return new Counts(inFlight.size(), completed.get(), unchanged.get(), failed.get(),
-            cancelled.get());
+            cancelled.get(), superseded.get());
     }
 
     /**

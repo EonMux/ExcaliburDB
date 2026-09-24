@@ -299,12 +299,18 @@ public final class McpTools {
             + "'running', 'completed', 'cancelled' or 'failed'. A completed build reports how "
             + "many edges, entities and relations were published, and 'staged_facts': when that "
             + "is 0 nothing was extracted, which usually means ingestion has not finished or the "
-            + "server has extraction disabled. A cancelled build published nothing and the "
+            + "server has extraction disabled. 'withheld_facts' counts staged facts left out "
+            + "because an erasure is still owed for them; they are never published, and that is "
+            + "not an error. A cancelled build published nothing and the "
             + "namespace is still serving the graph it had. 'freshness.behind_staging' says "
             + "whether ingested changes are not yet in the graph search_graph reads, and "
             + "'automatic.state' what the server is doing about it: 'pending' until it rebuilds "
             + "by itself, 'running', 'current', or 'paused', 'backing_off' or 'disabled' when "
-            + "it will not without " + BUILD_GRAPH + ".",
+            + "it will not without " + BUILD_GRAPH + ". 'automatic.last_result' is how the last "
+            + "automatic build ended: 'completed', 'unchanged', 'failed', 'cancelled', or "
+            + "'superseded' when an erasure arrived while it ran - nothing failed, and the server "
+            + "builds again without the erased facts, so there is no need to call "
+            + BUILD_GRAPH + ".",
             ToolSchema.object(
                 ToolSchema.optional("namespace", "string",
                     "Namespace whose build to report on. Omit for the configured default, or "

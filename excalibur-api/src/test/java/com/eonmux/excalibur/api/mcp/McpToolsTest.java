@@ -656,6 +656,17 @@ class McpToolsTest {
     }
 
     @Test
+    @DisplayName("graph_build_status explains withheld facts and a superseded automatic build")
+    void graphBuildStatusDescribesErasureOutcomes() {
+        // Both are outcomes a model would otherwise read as trouble: facts missing from a build
+        // that published, and an automatic build that ended without publishing.
+        String description = Json.stringAt(tool(McpTools.GRAPH_BUILD_STATUS), "description");
+
+        assertThat(description).contains("withheld_facts").contains("superseded")
+            .contains("automatic.last_result");
+    }
+
+    @Test
     @DisplayName("graph_build_status reads the build's outcome, scoped to the namespace")
     void graphBuildStatusReadsTheOutcome() throws IOException {
         try (StubNode node = StubNode.start()) {
