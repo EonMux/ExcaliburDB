@@ -6,6 +6,7 @@ import com.eonmux.excalibur.ingest.source.DocumentValidators;
 import com.eonmux.excalibur.ingest.source.FetchDisallowedException;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.IncompleteCrawlException;
+import com.eonmux.excalibur.ingest.source.ListingGaps;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
 import org.slf4j.Logger;
@@ -58,6 +59,14 @@ import java.util.stream.Stream;
  * {@link IncompleteCrawlException} - abandons the detection rather than deleting everything the
  * crawl had not reached.</p>
  *
+ * <p>A crawl that ran to its end can still report that its listing has
+ * {@linkplain Source#getListingGaps() gaps}: places it could not read, such as a web page whose
+ * server failed, so that whatever lies only behind them is missing from the listing without
+ * having gone anywhere. Every listed document is still classified as usual - what the listing
+ * does hold is sound - but no registered document it missed is taken as deleted. Each is kept
+ * as it is indexed and reported in {@link ChangeSet#getKeptUnlistedDocuments()}, beside the
+ * gaps, and the next crawl whose listing is complete settles it.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>This class is NOT thread-safe. Each detection operation should be performed from
  * a single thread. Create a new instance for each crawl operation.</p>
@@ -98,28 +107,50 @@ public class ChangeDetector {
         builder.totalRegistered(registry.size(sourceId));
         
         Set<String> seenDocumentIds = new HashSet<>();
-        
+        // Listed and then found gone or forbidden: the source answered for these, so they are
+        // deleted whether or not the listing as a whole could see everything.
+        Set<String> answeredGone = new HashSet<>();
+
         try (Stream<String> crawl = source.crawl()) {
             crawl.forEach(documentId -> {
                 if (processDocument(source, sourceId, documentId, builder)) {
                     seenDocumentIds.add(documentId);
+                } else {
+                    answeredGone.add(documentId);
                 }
             });
         } catch (IncompleteCrawlException e) {
             throw truncated(sourceId, e);
         }
-        
+
+        // Read once the listing has been consumed: a lazy crawl meets its gaps as it goes.
+        ListingGaps gaps = source.getListingGaps();
+        builder.listingGaps(gaps);
         for (String registeredDocId : registry.getDocumentIds(sourceId)) {
-            if (!seenDocumentIds.contains(registeredDocId)) {
-                DocumentMetadata metadata = registry.get(sourceId, registeredDocId);
-                if (metadata != null) {
-                    builder.addDeleted(metadata);
-                }
+            if (seenDocumentIds.contains(registeredDocId)) {
+                continue;
+            }
+            DocumentMetadata metadata = registry.get(sourceId, registeredDocId);
+            if (metadata == null) {
+                continue;
+            }
+            if (gaps.isComplete() || answeredGone.contains(registeredDocId)) {
+                builder.addDeleted(metadata);
+            } else {
+                builder.addKeptUnlisted(registeredDocId);
             }
         }
-        
+
         builder.totalCrawled(seenDocumentIds.size());
-        return builder.build();
+        ChangeSet changes = builder.build();
+        if (!gaps.isComplete()) {
+            LOGGER.warn("The listing of source {} is incomplete: {}. {} registered document(s) "
+                    + "it did not list are kept rather than removed; the first: {}", sourceId,
+                gaps.describe(), changes.getKeptUnlistedCount(),
+                changes.getKeptUnlistedDocuments().stream()
+                    .limit(ListingGaps.SAMPLE_SIZE).toList());
+        }
+        return changes;
     }
 
     /**
@@ -259,6 +290,10 @@ public class ChangeDetector {
      * forbids fetching the document - a robots.txt that disallows it, or the URL it redirects
      * to. It is reported as unseen, exactly as it would be had the crawl left it out, so the
      * index stops serving what the site has asked crawlers to leave alone.</p>
+     *
+     * <p>Both answers are about the one document, and neither depends on the listing being
+     * whole: the source said so of this document. So both are deleted even from a listing with
+     * gaps, unlike a document the listing merely missed.</p>
      *
      * @return true if the document was accounted for, false if the source says it is gone
      */

@@ -73,6 +73,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  * would be. Passed over as unchanged, a source that times out on every request would report a
  * clean run that looked at nothing.</p>
  *
+ * <h2>A listing with gaps</h2>
+ * <p>A source whose listing could not see everything - a page whose links could not be read -
+ * has change detection keep the registered documents it missed rather than list them as deleted,
+ * so this pass removes only what the source answered for as gone. The gaps and the count kept
+ * are carried on the result and told to the listener before the first document; they are not
+ * failures, because nothing was asked of those documents.</p>
+ *
  * <h2>When its writes become searchable</h2>
  * <p>The lexical index is refreshed between documents once the interval ingestion uses has
  * passed, in every phase, and once more when the pass ends; see {@link ReindexLexicalIndex}.
@@ -235,6 +242,14 @@ final class SourceReindexPass {
             LOG.warn("Reindex of {} could not check {} document(s), whose indexed versions are "
                     + "kept; the first: {}", sourceId, changeSet.getUncheckedCount(),
                 resultBuilder.getUncheckedSample());
+        }
+        // Not failures: nothing was asked of the documents the listing missed. The run says its
+        // listing fell short, and where, so the documents it kept can be told from ones current.
+        resultBuilder.listingIncomplete(changeSet.getListingGaps(),
+            changeSet.getKeptUnlistedCount());
+        if (!changeSet.getListingGaps().isComplete()) {
+            progress.listingIncomplete(changeSet.getListingGaps(),
+                changeSet.getKeptUnlistedCount());
         }
 
         // Published before the first document rather than after it: the size of the run is the

@@ -830,6 +830,20 @@ The switch is per registration and there is no node-level one. The hosts a crawl
 already the operator's choice, through `excalibur.ingest.allowed-hosts`, and ignoring one site's
 robots.txt is a decision about that site. `GET /v1/ingest` shows it for a registration that set it.
 
+#### Pages whose links cannot be read
+
+The crawl finds pages by reading links, so a page it cannot read hides whatever only it links to.
+A page that answers `5xx`, `408`, `429`, `401`, `403` or `407`, times out, or is larger than
+`max_response_bytes` does not fail the crawl, and is not taken for a page with no links either: it
+is a gap in the listing. The crawl goes on and lists what it can reach, and the run's `last_error`
+says the listing was incomplete and names the first ten pages it could not read, with what each
+answered (`"... 1 place(s) could not be read: https://docs.example.com/guide/ (links not read:
+HTTP 503)"`). On a first crawl that is the only effect: the pages behind a gap are not indexed
+until a crawl reads it. On a re-crawl it decides what is removed — see
+[Re-index a source](#re-index-a-source) below. A page that answers `404`, `410` or any other
+`4xx`, redirects somewhere the crawl does not follow, or is not HTML did answer, links to nothing,
+and is no gap.
+
 Settings that belong to the other source type are refused here with a `400` rather than accepted
 and ignored, in both directions: `included_extensions`, `excluded_directories`,
 `follow_symlinks`, `include_hidden`, `max_file_bytes` and `charset` on a crawl — whose
@@ -1219,6 +1233,10 @@ states in words, and those documents are not searchable. It is the count `POST /
 answers with under the same name. It belongs to the ingestion run that wrote it; a reindex counts
 its own failures on `GET /v1/reindex/status`.
 
+A crawl that could not read every page for links finishes `idle` with `last_error` set even when
+`documents_failed` is 0, saying the listing is incomplete and naming the pages; see
+[Pages whose links cannot be read](#pages-whose-links-cannot-be-read).
+
 **Response — `404 Not Found`** (unknown source)
 
 ```json
@@ -1479,6 +1497,17 @@ validators, which names no version at all. Its indexed version stays, it is coun
 `documents_unchecked` on the reindex status below, with the first ten named in
 `unchecked_sample`, and the next re-crawl asks again. The reason for each is in the node's log.
 
+A page the re-crawl drops is removed because it is no longer listed, so a removal is only made
+over a listing that saw the whole source. When the crawl could not read a page for links
+([above](#pages-whose-links-cannot-be-read)), every indexed page it did not list is kept as it is,
+counted in `documents_kept_unlisted` on the reindex status below, and the gaps are named in
+`last_error`; the next re-crawl whose listing is complete removes what has really gone. A `503`
+from a hub page therefore removes nothing below it, and a `503` from the base URL — which is itself
+a listed page — does not empty the source. A page that answered `404` or `410`, or that the site's
+`robots.txt` now disallows, is still removed, because the site answered for that page. A filesystem
+re-crawl keeps a file the same way when it cannot read its attributes or real location, such as a
+link into a directory the node may not search.
+
 ### Re-index status
 
 `POST /v1/reindex` answers 202 and works in the background, so this is how the run's verdict
@@ -1501,6 +1530,7 @@ curl "http://localhost:8080/v1/reindex/status?source_id=project-docs"
   "documents_failed": 1,
   "documents_unchecked": 1,
   "unchecked_sample": ["https://docs.example.com/guide/install"],
+  "documents_kept_unlisted": 0,
   "started_at_ms": 1730000000000,
   "finished_at_ms": 0,
   "last_error": null
@@ -1514,7 +1544,7 @@ curl http://localhost:8080/v1/reindex/status
 ```
 
 ```json
-{"sources": [{"source_id": "project-docs", "state": "idle", "cancelled": false, "progress": 1.0000, "documents_processed": 100, "documents_total": 100, "documents_failed": 0, "documents_unchecked": 0, "unchecked_sample": [], "started_at_ms": 1730000000000, "finished_at_ms": 1730000042000, "last_error": null}]}
+{"sources": [{"source_id": "project-docs", "state": "idle", "cancelled": false, "progress": 1.0000, "documents_processed": 100, "documents_total": 100, "documents_failed": 0, "documents_unchecked": 0, "unchecked_sample": [], "documents_kept_unlisted": 0, "started_at_ms": 1730000000000, "finished_at_ms": 1730000042000, "last_error": null}]}
 ```
 
 `state` is one of `crawling`, `embedding`, `indexing` while a run is in flight, `idle` at
@@ -1528,7 +1558,11 @@ unchanged counts as work done, so a
 re-crawl of a source that has barely moved, with one page timing out, has not failed. A run that
 indexed or confirmed some documents and failed on others finished, so it reads `idle`, with `last_error` counting what failed and what
 was indexed (`"Reindex completed with 3 errors; 400 documents indexed; see the node's log for the
-reason"`); a clean run is `idle` with `last_error: null`. `cancelled` and `failed` are different answers and the
+reason"`); a clean run is `idle` with `last_error: null`. A run whose listing had gaps is not
+clean even when nothing failed: `last_error` says so and names them (`"Reindex completed; 400
+documents indexed; the listing was incomplete, so 12 documents it did not list were kept rather
+than removed: 1 place(s) could not be read: https://docs.example.com/guide/ (links not read: HTTP
+503)"`). `cancelled` and `failed` are different answers and the
 `cancelled` boolean says which without parsing `state`: a stopped run is the outcome you asked
 for, and reporting it as a crash sends an operator looking for a fault that is not there.
 `finished_at_ms` is when the run ended — `0` while one is still going — so how long it took, and
@@ -1552,6 +1586,12 @@ run says what it had failed on by then, and each of those documents keeps the ve
 before. `documents_unchecked` is the part of it whose source could not be asked whether they had
 changed, and `unchecked_sample` names the first ten by document id — the id a query result carries,
 not an error message. The count is always whole.
+
+`documents_kept_unlisted` is how many indexed documents the re-crawl did not list and kept rather
+than removed, because its listing had gaps — pages it could not read for links, named in
+`last_error` with a status or a kind of failure, never an error message. They are not in
+`documents_failed`: nothing was asked of them, and each keeps the version indexed before. It is 0
+whenever the listing was complete.
 
 **Error — `404 Not Found`**
 

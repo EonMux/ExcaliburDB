@@ -139,7 +139,9 @@ public class ReindexStatusEndpoint implements HttpHandler {
      * documents_unchecked} is the part of it whose source could not say whether they had
      * changed, and {@code unchecked_sample} names the first of those by document id - an id a
      * query result names too, and no error message, for the reason {@code last_error} carries
-     * none.</p>
+     * none. {@code documents_kept_unlisted} is not part of it: the registered documents a listing
+     * with gaps did not include, kept rather than removed, with the gaps named in
+     * {@code last_error}.</p>
      */
     private String toJson(ReindexEndpoint.ReindexStatus status) {
         // Locale.ROOT, because the default locale picks the decimal separator: under de_DE a
@@ -156,6 +158,7 @@ public class ReindexStatusEndpoint implements HttpHandler {
                 + "\"documents_failed\": %d, "
                 + "\"documents_unchecked\": %d, "
                 + "\"unchecked_sample\": %s, "
+                + "\"documents_kept_unlisted\": %d, "
                 + "\"started_at_ms\": %d, "
                 + "\"finished_at_ms\": %d, "
                 + "\"last_error\": %s"
@@ -169,6 +172,7 @@ public class ReindexStatusEndpoint implements HttpHandler {
             status.documentsFailed(),
             status.documentsUnchecked(),
             jsonArray(status.uncheckedSample()),
+            status.documentsKeptUnlisted(),
             status.startTimeMs(),
             status.finishedAtMs(),
             status.lastError() != null

@@ -102,6 +102,14 @@ import java.util.stream.Stream;
  * larger of {@code crawlDelay} and the origin's own, which is held to
  * {@link RobotsRules#MAX_CRAWL_DELAY}.</p>
  *
+ * <h2>Pages whose links cannot be read</h2>
+ * <p>One page that fails does not fail the crawl, but neither is it read as a page with no
+ * links. A page that did not answer for itself - a {@code 5xx}, {@code 408}, {@code 429},
+ * {@code 401}, {@code 403} or {@code 407}, a timeout, a body over {@code maxResponseSize} - is
+ * a gap in the listing, reported by {@link #getListingGaps()}, and change detection keeps
+ * whatever the listing missed rather than removing it. A page that is gone or is not HTML links
+ * to nothing, and what only it led to leaves the listing, as it should.</p>
+ *
  * <h2>Change Detection</h2>
  * <p>Per document, with a conditional GET. Every fetch records the {@code ETag} and
  * {@code Last-Modified} the server sent, the document registry keeps them beside the content
@@ -166,6 +174,9 @@ public class HttpSource implements Source {
 
     /** {@code 401 Unauthorized}: the credentials were refused, for every page alike. */
     private static final int UNAUTHORIZED = 401;
+
+    /** {@code 403 Forbidden}: the page is there and is withheld from this crawler. */
+    private static final int FORBIDDEN = 403;
 
     /** {@code 407 Proxy Authentication Required}: the proxy's answer, not the page's. */
     private static final int PROXY_AUTHENTICATION_REQUIRED = 407;
@@ -239,6 +250,9 @@ public class HttpSource implements Source {
      * source does not respect robots.txt.
      */
     private volatile RobotsPolicy robots;
+
+    /** The pages the current run could not read for links; replaced when a crawl begins. */
+    private volatile ListingGaps.Recorder listingGaps = new ListingGaps.Recorder();
 
     private volatile boolean closed = false;
 
@@ -329,11 +343,19 @@ public class HttpSource implements Source {
 
         LOG.info("Starting crawl for source {}: {}", sourceId, baseUri);
         robots = newRobotsRun();
+        ListingGaps.Recorder gaps = new ListingGaps.Recorder();
+        listingGaps = gaps;
 
-        List<String> result = new ArrayList<>(crawlBreadthFirst());
+        List<String> result = new ArrayList<>(crawlBreadthFirst(gaps));
         Collections.sort(result);
 
-        LOG.info("Crawl completed for source {}: {} documents found", sourceId, result.size());
+        ListingGaps unread = gaps.snapshot();
+        if (unread.isComplete()) {
+            LOG.info("Crawl completed for source {}: {} documents found", sourceId, result.size());
+        } else {
+            LOG.warn("Crawl completed for source {}: {} documents found, and the listing is "
+                + "incomplete: {}", sourceId, result.size(), unread.describe());
+        }
 
         return result.stream();
     }
@@ -347,11 +369,12 @@ public class HttpSource implements Source {
      * it unwinds. The frontier queue here is dropped as it drains, and the budget stops the walk
      * before {@code visited} can grow without bound.</p>
      *
+     * @param gaps Told of each page whose links could not be read
      * @return The in-policy document URLs: the base URL and those discovered below it
      * @throws SourceException if the crawl is interrupted, or an origin's robots.txt cannot be
      *                         read
      */
-    private Set<String> crawlBreadthFirst() throws SourceException {
+    private Set<String> crawlBreadthFirst(ListingGaps.Recorder gaps) throws SourceException {
         Set<String> visited = new HashSet<>();
         Set<String> found = new HashSet<>();
         Deque<CrawlTarget> frontier = new ArrayDeque<>();
@@ -389,7 +412,7 @@ public class HttpSource implements Source {
 
             Set<String> links;
             try {
-                links = extractLinks(target.url());
+                links = extractLinks(target.url(), gaps);
             } catch (FetchDisallowedException e) {
                 // It redirects onto a URL robots.txt forbids, so fetching it later would too.
                 LOG.debug("Leaving {} out of the crawl: {}", target.url(), e.getMessage());
@@ -564,62 +587,127 @@ public class HttpSource implements Source {
     /**
      * Fetches a page and returns the in-policy links it contains.
      *
-     * <p>A page that cannot be fetched yields no links rather than failing the crawl; only an
-     * interruption stops the walk.</p>
+     * <p>A page that cannot be read for links does not fail the crawl, but it is not taken for a
+     * page with none either: everything below it would drop out of the listing, and change
+     * detection would read that as a site that deleted it. So what the page answered decides.
+     * A page that answered has told the crawl what it links to: HTML that was read, a body that
+     * is not HTML, a page that is gone ({@code 404}, {@code 410}), any other {@code 4xx}, a
+     * redirect this source will not follow - each links to nothing this source lists, and what
+     * only it led to is rightly missing. A page that did not answer for itself - a server error,
+     * a {@code 408} or {@code 429}, credentials refused ({@code 401}, {@code 407}) or the page
+     * withheld ({@code 403}), no answer at all, a body cut off by the timeout or larger than
+     * {@code maxResponseSize} - yields no links and is recorded as a gap, so the listing reports
+     * itself incomplete; see {@link #getListingGaps()}. A {@code 403} is a gap here although a
+     * fetch reads it as a refusal: the page is kept as it was indexed, and so must be what it
+     * linked to, since the refusal says nothing of where those pages went.</p>
      *
-     * @param url An in-policy, normalized URL
+     * <p>Only an interruption, a robots.txt that cannot be read and a redirect onto a URL
+     * robots.txt disallows stop the walk or leave the page out.</p>
+     *
+     * @param url  An in-policy, normalized URL
+     * @param gaps Told when the page could not be read for links
      * @return The set of in-policy absolute URLs linked from the page
      * @throws FetchDisallowedException if the page redirects onto a URL robots.txt disallows
      * @throws SourceException if the crawl was interrupted, or a robots.txt on the way could not
      *                         be read
      */
-    private Set<String> extractLinks(String url) throws SourceException {
-        Set<String> links = new HashSet<>();
-
+    private Set<String> extractLinks(String url, ListingGaps.Recorder gaps)
+            throws SourceException {
+        HttpResponse<InputStream> response;
         try {
-            HttpResponse<InputStream> response =
-                get(url, "text/html,application/xhtml+xml", DocumentValidators.NONE).response();
-
-            String contentType = getHeader(response, "Content-Type", "");
-            boolean html = contentType.contains("text/html")
-                || contentType.contains("application/xhtml+xml");
-            if (response.statusCode() >= 400 || !html) {
-                closeQuietly(response.body());
-                return links;
-            }
-
-            byte[] bytes = readBoundedBody(response, url);
-            // The page's own encoding: a UTF-16 page decoded as UTF-8 is NUL-interleaved text in
-            // which no href matches, so the whole subtree below it silently leaves the crawl.
-            String body = new String(bytes, detectCharset(response, bytes));
-            if (body.isEmpty()) {
-                return links;
-            }
-
-            Matcher matcher = HREF_PATTERN.matcher(body);
-            while (matcher.find()) {
-                String href = matcher.group(1).trim();
-                String resolved = resolveUrl(url, href);
-
-                if (resolved != null && isUrlAllowed(resolved)) {
-                    links.add(resolved);
-                }
-            }
-
+            response = get(url, "text/html,application/xhtml+xml", DocumentValidators.NONE)
+                .response();
         } catch (FetchDisallowedException | RobotsUnreachableException e) {
             // Not "this page yielded no links": one is a page the crawl must not list, the other
             // a crawl that can no longer list the whole site.
             throw e;
+        } catch (DocumentRefusedException e) {
+            // A redirect off the source's policy, without a Location, or past the hop limit: the
+            // server answered that the page is somewhere this source does not list.
+            LOG.debug("Not following links from {}: {}", url, e.getMessage());
+            return Set.of();
         } catch (SourceException e) {
-            LOG.debug("Failed to extract links from {}: {}", url, e.getMessage());
+            // Any other failure to get an answer says nothing about the page, and must neither
+            // end the walk nor empty what lies below it.
+            return unreadLinks(url, gaps, "no answer: " + e.getClass().getSimpleName());
         } catch (IOException e) {
-            LOG.debug("IO error extracting links from {}: {}", url, e.getMessage());
+            return unreadLinks(url, gaps, "no answer: " + e.getClass().getSimpleName());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new SourceException("Crawl interrupted", sourceId, true, e);
         }
 
+        int status = response.statusCode();
+        if (status < 200 || status >= 300) {
+            closeQuietly(response.body());
+            if (answersForItsLinks(status)) {
+                return Set.of();
+            }
+            return unreadLinks(url, gaps, "HTTP " + status);
+        }
+
+        String contentType = getHeader(response, "Content-Type", "");
+        if (!contentType.contains("text/html") && !contentType.contains("application/xhtml+xml")) {
+            closeQuietly(response.body());
+            return Set.of();
+        }
+
+        byte[] bytes;
+        try {
+            bytes = readBoundedBody(response, url);
+        } catch (DocumentRefusedException e) {
+            return unreadLinks(url, gaps, "larger than " + maxResponseSize + " bytes");
+        } catch (SourceException e) {
+            return unreadLinks(url, gaps, "timed out reading the page");
+        } catch (IOException e) {
+            return unreadLinks(url, gaps, "page not read: " + e.getClass().getSimpleName());
+        }
+        // The page's own encoding: a UTF-16 page decoded as UTF-8 is NUL-interleaved text in
+        // which no href matches, so the whole subtree below it silently leaves the crawl.
+        String body = new String(bytes, detectCharset(response, bytes));
+
+        Set<String> links = new HashSet<>();
+        Matcher matcher = HREF_PATTERN.matcher(body);
+        while (matcher.find()) {
+            String href = matcher.group(1).trim();
+            String resolved = resolveUrl(url, href);
+
+            if (resolved != null && isUrlAllowed(resolved)) {
+                links.add(resolved);
+            }
+        }
         return links;
+    }
+
+    /**
+     * Whether a status other than {@code 2xx} is the server's answer about a page's links.
+     *
+     * <p>True for a page that is gone and for any other client error the fetch path reads as an
+     * answer about the page. False for everything {@link #isTransient} reads as unanswered, for
+     * a {@code 403} (see {@link #extractLinks}), and for the {@code 1xx} and {@code 3xx}
+     * statuses that reach here - a {@code 304} to a request that asked nothing, a redirect code
+     * this source does not follow - none of which carries the page.</p>
+     *
+     * @param status A status outside {@code 2xx} that is not a followed redirect
+     * @return true when the page is rightly taken to link to nothing
+     */
+    private static boolean answersForItsLinks(int status) {
+        return status >= 400 && !isTransient(status) && status != FORBIDDEN;
+    }
+
+    /**
+     * Records a page whose links could not be read, and yields none for it.
+     *
+     * @param url    The page
+     * @param gaps   The run's gaps
+     * @param reason Why, in the fixed terms a status readback may carry
+     * @return No links
+     */
+    private Set<String> unreadLinks(String url, ListingGaps.Recorder gaps, String reason) {
+        LOG.warn("Could not read the links of {} ({}); the listing of source {} is incomplete, "
+            + "and nothing it misses is removed", url, reason, sourceId);
+        gaps.record(url, "links not read: " + reason);
+        return Set.of();
     }
 
     /**
@@ -1147,6 +1235,15 @@ public class HttpSource implements Source {
     public long getDisallowedCount() {
         RobotsPolicy run = robots;
         return run == null ? 0 : run.disallowedCount();
+    }
+
+    /**
+     * The pages the latest crawl could not read for links; see {@link #extractLinks} for which
+     * answers those are.
+     */
+    @Override
+    public ListingGaps getListingGaps() {
+        return listingGaps.snapshot();
     }
 
     private void ensureOpen() throws SourceException {

@@ -667,6 +667,7 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         private volatile long documentsFailed;
         private volatile long documentsUnchecked;
         private volatile List<String> uncheckedSample;
+        private volatile long documentsKeptUnlisted;
         private volatile String lastError;
 
         public ReindexStatus(String sourceId) {
@@ -680,6 +681,7 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
             this.documentsFailed = 0;
             this.documentsUnchecked = 0;
             this.uncheckedSample = List.of();
+            this.documentsKeptUnlisted = 0;
             this.lastError = null;
         }
 
@@ -714,6 +716,18 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         public List<String> uncheckedSample() { return uncheckedSample; }
 
         /**
+         * Registered documents the run's listing of its source did not include, kept rather
+         * than removed because the listing had gaps - places it could not read, which
+         * {@code lastError} names.
+         *
+         * <p>Not among {@link #documentsFailed()}: nothing was asked of them. Their indexed
+         * versions stay until a run whose listing is complete settles them.</p>
+         *
+         * @return The count
+         */
+        public long documentsKeptUnlisted() { return documentsKeptUnlisted; }
+
+        /**
          * When this run stopped, however it stopped, or 0 while it is still going.
          *
          * <p>Served beside the start time because between them they are how long the run took,
@@ -745,6 +759,7 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
             this.documentsFailed = 0;
             this.documentsUnchecked = 0;
             this.uncheckedSample = List.of();
+            this.documentsKeptUnlisted = 0;
             this.lastError = null;
         }
 
@@ -767,6 +782,15 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         public void recordUnchecked(long unchecked, List<String> sample) {
             this.uncheckedSample = List.copyOf(sample);
             this.documentsUnchecked = Math.max(0, unchecked);
+        }
+
+        /**
+         * Records the registered documents the run's listing missed and kept.
+         *
+         * @param keptUnlisted How many there were; negative is read as zero
+         */
+        public void recordKeptUnlisted(long keptUnlisted) {
+            this.documentsKeptUnlisted = Math.max(0, keptUnlisted);
         }
 
         /**
@@ -878,6 +902,15 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         void recordUnchecked(String sourceId, long unchecked, List<String> sample);
 
         /**
+         * Records the registered documents a run's listing did not include and kept, because the
+         * listing had gaps.
+         *
+         * @param sourceId     The source whose run it is
+         * @param keptUnlisted How many there were
+         */
+        void recordKeptUnlisted(String sourceId, long keptUnlisted);
+
+        /**
          * Records that a run stopped because it was asked to.
          *
          * <p>Separate from {@link #failReindex(String, String)} because a caller acts
@@ -977,6 +1010,14 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
             ReindexStatus status = statuses.get(sourceId);
             if (status != null) {
                 status.recordUnchecked(unchecked, sample);
+            }
+        }
+
+        @Override
+        public void recordKeptUnlisted(String sourceId, long keptUnlisted) {
+            ReindexStatus status = statuses.get(sourceId);
+            if (status != null) {
+                status.recordKeptUnlisted(keptUnlisted);
             }
         }
 

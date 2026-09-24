@@ -4,6 +4,7 @@ import com.eonmux.excalibur.core.util.StopSignal;
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.pipeline.ReindexCancelledException;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
+import com.eonmux.excalibur.ingest.source.ListingGaps;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
 import com.eonmux.excalibur.ingest.source.SourceResolver;
@@ -38,6 +39,14 @@ import java.util.Objects;
  * rolling and the standard branch apply that same rule, deliberately: which of them ran is a
  * property of how the node is deployed, not something a caller asked for, and the two must not
  * disagree about whether the same corpus reindexed successfully.</p>
+ *
+ * <p>A run whose listing of its source had gaps - a page whose links could not be read - kept
+ * the registered documents it did not list instead of removing them. That is not a failure of
+ * any document, and {@code documents_kept_unlisted} counts them apart from
+ * {@code documents_failed}; but the run did not see the whole source, so it is never reported
+ * clean either. {@code last_error} says the listing was incomplete and names the places it could
+ * not read, which are pages of the source and fixed descriptions of what they answered, never an
+ * exception's message.</p>
  *
  * <h2>Cancelled is not failed</h2>
  * <p>{@code DELETE /v1/reindex} requests the run's {@link StopSignal} and tells the caller to
@@ -426,6 +435,11 @@ public final class ReindexRun {
             statusRegistry.recordUnchecked(sourceId, documentsUnchecked, sample);
         }
 
+        @Override
+        public void listingIncomplete(ListingGaps gaps, long documentsKeptUnlisted) {
+            statusRegistry.recordKeptUnlisted(sourceId, documentsKeptUnlisted);
+        }
+
         /** Whether the run got past its listing and began on its documents. */
         boolean begun() {
             return begun;
@@ -520,6 +534,15 @@ public final class ReindexRun {
                 countedPartialFailure(result.getBasicResult()));
             return true;
         }
+        if (!result.getBasicResult().getListingGaps().isComplete()) {
+            LOGGER.warn("[reindex-{}] Rolling reindex of source {} completed over an incomplete "
+                    + "listing: {} docs indexed, new segment {}", threadName, sourceId,
+                result.getDocumentsIndexed(), result.getNewSegmentId());
+            reportCompleted(sourceId);
+            statusRegistry.completeReindexWithErrors(sourceId,
+                incompleteListing(result.getBasicResult()));
+            return true;
+        }
         LOGGER.info("[reindex-{}] Rolling reindex completed successfully for source {}: "
                 + "{} docs indexed, {} old segments tombstoned, new segment {}",
             threadName, sourceId, result.getDocumentsIndexed(),
@@ -586,6 +609,14 @@ public final class ReindexRun {
                 countedPartialFailure(result));
             return true;
         }
+        if (!result.getListingGaps().isComplete()) {
+            LOGGER.warn("[reindex-{}] Reindex of {} completed over an incomplete listing: {} "
+                    + "docs indexed, {} kept unlisted", threadName, sourceId,
+                result.getDocumentsIndexed(), result.getDocumentsKeptUnlisted());
+            reportCompleted(sourceId);
+            statusRegistry.completeReindexWithErrors(sourceId, incompleteListing(result));
+            return true;
+        }
         LOGGER.info("[reindex-{}] Reindex completed successfully for {}: {} docs "
                 + "indexed, {} skipped, {} chunks created",
             threadName, sourceId, result.getDocumentsIndexed(),
@@ -620,6 +651,7 @@ public final class ReindexRun {
         statusRegistry.recordFailures(sourceId, result.getDocumentsFailed());
         statusRegistry.recordUnchecked(sourceId, result.getDocumentsUnchecked(),
             result.getUncheckedSample());
+        statusRegistry.recordKeptUnlisted(sourceId, result.getDocumentsKeptUnlisted());
     }
 
     /**
@@ -647,7 +679,7 @@ public final class ReindexRun {
      */
     private static String countedFailure(DocumentReindexer.ReindexResult result) {
         return "Reindex failed completely with " + result.getErrorCount() + " errors"
-            + keysTaken(result) + SEE_THE_LOG;
+            + keysTaken(result) + listingClause(result) + SEE_THE_LOG;
     }
 
     /**
@@ -662,7 +694,38 @@ public final class ReindexRun {
     private static String countedPartialFailure(DocumentReindexer.ReindexResult result) {
         return "Reindex completed with " + result.getErrorCount() + " errors"
             + keysTaken(result) + "; " + result.getDocumentsIndexed() + " documents indexed"
-            + SEE_THE_LOG;
+            + listingClause(result) + SEE_THE_LOG;
+    }
+
+    /**
+     * The readback text for a run that failed on nothing and could not list the whole source.
+     *
+     * @param result What the run came to
+     * @return What the caller is told
+     */
+    private static String incompleteListing(DocumentReindexer.ReindexResult result) {
+        return "Reindex completed; " + result.getDocumentsIndexed() + " documents indexed"
+            + listingClause(result);
+    }
+
+    /**
+     * The clause saying the run's listing had gaps and what that kept, or nothing when it had
+     * none.
+     *
+     * <p>Carries the places by name, unlike the errors: they are pages or files of the source,
+     * as {@code unchecked_sample} names documents, with a reason the source wrote in fixed
+     * terms. Without them an operator could not tell which page to look at.</p>
+     *
+     * @param result What the run came to
+     * @return The clause, with its separator
+     */
+    private static String listingClause(DocumentReindexer.ReindexResult result) {
+        ListingGaps gaps = result.getListingGaps();
+        if (gaps.isComplete()) {
+            return "";
+        }
+        return "; the listing was incomplete, so " + result.getDocumentsKeptUnlisted()
+            + " documents it did not list were kept rather than removed: " + gaps.describe();
     }
 
     /**

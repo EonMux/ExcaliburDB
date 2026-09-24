@@ -7,6 +7,7 @@ import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
 import com.eonmux.excalibur.ingest.source.DocumentNotFoundException;
 import com.eonmux.excalibur.ingest.source.FetchDisallowedException;
+import com.eonmux.excalibur.ingest.source.ListingGaps;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
@@ -662,8 +663,14 @@ public class IngestionOrchestrator {
         // What the crawl was forbidden is known now, and is the whole answer for a crawl that
         // listed nothing because its site disallowed everything.
         status.setDisallowed(source.getDisallowedCount());
+        // Read once the listing has been consumed. A first crawl deletes nothing, so a gap costs
+        // only what lies behind it, but the run must still say that it may not hold everything.
+        ListingGaps gaps = source.getListingGaps();
 
         if (totalPending == 0) {
+            if (!gaps.isComplete()) {
+                status.setError(incompleteListing(sourceId, gaps));
+            }
             status.update("idle", 1.0, 0, 0);
             LOGGER.info("No documents to ingest");
             return IngestionOutcome.NOTHING;
@@ -673,7 +680,7 @@ public class IngestionOrchestrator {
         status.update("embedding", 0.0, 0, totalPending);
 
         try {
-            return ingestDocuments(source, sourceId, status, documentIds, stop);
+            return ingestDocuments(source, sourceId, status, documentIds, gaps, stop);
         } catch (RuntimeException e) {
             finishFailedRun(stop);
             throw e;
@@ -685,7 +692,7 @@ public class IngestionOrchestrator {
      */
     private IngestionOutcome ingestDocuments(Source source, String sourceId,
                                              IngestionStatus status, List<String> documentIds,
-                                             StopSignal stop) {
+                                             ListingGaps gaps, StopSignal stop) {
         long totalPending = documentIds.size();
         long lastLexicalRefresh = System.nanoTime();
         long totalIngested = 0;
@@ -782,7 +789,7 @@ public class IngestionOrchestrator {
         status.setFailed(failedDocs);
         status.setDisallowed(source.getDisallowedCount());
         reportSkippedDocuments(sourceId, skippedDocs, totalPending);
-        reportDroppedDocuments(sourceId, status, failedDocs, keysTaken, totalPending);
+        reportDroppedDocuments(sourceId, status, failedDocs, keysTaken, totalPending, gaps);
         status.update("idle", 1.0, totalIngested, 0);
         int ingestedDocs = processedDocs - failedDocs - skippedDocs - disallowedDocs;
         LOGGER.info("Ingestion complete: {} chunks from {} of {} documents",
@@ -804,24 +811,51 @@ public class IngestionOrchestrator {
      * one of the two sources is registered under an id that does not collide, and only the log
      * would otherwise say so.</p>
      *
+     * <p>A listing with gaps is said here too, after the failures: the run may have ingested
+     * every document it listed and still not hold the whole source, and a status that reported
+     * such a run as clean would give an operator no reason to look for the pages missing from
+     * it.</p>
+     *
      * @param sourceId     The source that was ingested
      * @param status       The status to report on
      * @param failedDocs   Documents that were listed but not ingested
      * @param keysTaken    Of those, documents whose key another source's document holds
      * @param totalPending Documents the crawl listed
+     * @param gaps         Where the crawl's listing could not see
      */
     private void reportDroppedDocuments(String sourceId, IngestionStatus status,
-                                        int failedDocs, int keysTaken, long totalPending) {
-        if (failedDocs <= 0) {
-            return;
+                                        int failedDocs, int keysTaken, long totalPending,
+                                        ListingGaps gaps) {
+        String error = null;
+        if (failedDocs > 0) {
+            LOGGER.warn("Ingestion of {} did not ingest {} of {} documents", sourceId, failedDocs,
+                totalPending);
+            error = failedDocs + " of " + totalPending
+                + " documents were not ingested; each failure is logged separately";
+            if (keysTaken > 0) {
+                error = error + "; " + DocumentRegistry.keysTakenNote(keysTaken);
+            }
         }
-        LOGGER.warn("Ingestion of {} did not ingest {} of {} documents", sourceId, failedDocs, totalPending);
-        String error = failedDocs + " of " + totalPending
-            + " documents were not ingested; each failure is logged separately";
-        if (keysTaken > 0) {
-            error = error + "; " + DocumentRegistry.keysTakenNote(keysTaken);
+        if (!gaps.isComplete()) {
+            String incomplete = incompleteListing(sourceId, gaps);
+            error = error == null ? incomplete : error + "; " + incomplete;
         }
-        status.setError(error);
+        if (error != null) {
+            status.setError(error);
+        }
+    }
+
+    /**
+     * Says, for the status and the log, that a crawl could not list the whole source.
+     *
+     * @param sourceId The source that was crawled
+     * @param gaps     Where its listing could not see; not complete
+     * @return The text for the run's error
+     */
+    private static String incompleteListing(String sourceId, ListingGaps gaps) {
+        LOGGER.warn("The listing of {} is incomplete, so documents may be missing from the "
+            + "index: {}", sourceId, gaps.describe());
+        return "The listing is incomplete, so documents may be missing: " + gaps.describe();
     }
 
     /**

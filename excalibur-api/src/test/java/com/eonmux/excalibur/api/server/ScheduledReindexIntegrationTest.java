@@ -135,8 +135,10 @@ class ScheduledReindexIntegrationTest {
             Source mockSource = mock(Source.class);
             SourceResolver mockResolver = mock(SourceResolver.class);
 
-            DocumentReindexer.ReindexResult mockResult = mock(DocumentReindexer.ReindexResult.class);
-            when(mockResult.hasErrors()).thenReturn(false);
+            // Built, not mocked: a mock answers null for every part of the result it was not
+            // told about, which no run ever returns.
+            DocumentReindexer.ReindexResult mockResult =
+                new DocumentReindexer.ReindexResult.Builder("1").build();
             when(mockSource.getSourceId()).thenReturn("1");
             when(mockResolver.resolve("1")).thenReturn(mockSource);
             when(mockReindexer.reindexAll(eq(mockSource), any(), any())).thenReturn(mockResult);
@@ -208,8 +210,10 @@ class ScheduledReindexIntegrationTest {
             Source mockSource = mock(Source.class);
             SourceResolver mockResolver = mock(SourceResolver.class);
 
-            DocumentReindexer.ReindexResult mockResult = mock(DocumentReindexer.ReindexResult.class);
-            when(mockResult.hasErrors()).thenReturn(true);
+            DocumentReindexer.ReindexResult mockResult =
+                new DocumentReindexer.ReindexResult.Builder("3")
+                    .addDocumentFailure("fetch", "a.txt", "timed out")
+                    .build();
             when(mockSource.getSourceId()).thenReturn("3");
             when(mockResolver.resolve("3")).thenReturn(mockSource);
             when(mockReindexer.reindexAll(eq(mockSource), any(), any())).thenReturn(mockResult);
