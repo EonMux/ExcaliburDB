@@ -2137,6 +2137,11 @@ An explicit `null` is the same as leaving the field out: the default applies.
 A `root_path` that names a file rather than a directory is a 400 naming the field rather than
 echoing the path.
 
+A field that is not in the table — a misspelling such as `include_extensions` — is a 400 naming
+every such field and listing the ones the source type takes, and so is a top-level member other
+than `source_type` and `config`. Ignored, it would be answered `registered` and the source crawled
+without the setting the caller believes it made.
+
 Whatever these say, one document is indexed only up to 100 MiB and 10,000 chunks — at the default
 chunking (512 tokens, 64 overlapping) the chunk bound is met first, at about 18 MB. A document past
 either is counted in `documents_failed`, on the first crawl and every re-crawl alike, including one
@@ -3231,6 +3236,12 @@ clears it. An empty
 included; an empty `included_extensions` reads every file, which is also what leaving it out does;
 and an empty `excluded_path_patterns` on `crawl_website` clears the crawl's default exclusions.
 Leaving a list out keeps the node's default.
+
+An argument `ingest_documents` or `crawl_website` does not declare — a misspelled
+`include_extensions`, or one of the other tool's settings — is a tool error naming it and listing
+the arguments the tool takes, and nothing is sent. Dropped, it would register the source without
+the setting the model believes it made, as the node's `400` for an unknown `config` field exists
+to prevent over HTTP.
 
 ### Without MCP
 

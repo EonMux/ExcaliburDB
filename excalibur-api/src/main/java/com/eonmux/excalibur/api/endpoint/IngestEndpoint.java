@@ -27,6 +27,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.stream.Stream;
 
 
 /**
@@ -545,6 +546,10 @@ public class IngestEndpoint implements HttpHandler {
      * @throws IllegalArgumentException if the body does not describe a source this node builds
      */
     private static SourceDescriptor parseRequest(String json, NamespaceId namespace) {
+        rejectUnknownFields(
+            JsonText.memberNames(json, "The request body must be a single well-formed JSON object"),
+            REQUEST_FIELDS, List.of(), "", "a registration");
+
         String sourceType = JsonText.string(json, "source_type");
         if (sourceType == null || sourceType.isEmpty()) {
             throw new IllegalArgumentException("Field 'source_type' is required");
@@ -555,6 +560,8 @@ public class IngestEndpoint implements HttpHandler {
         if (configJson == null) {
             throw new IllegalArgumentException("Field 'config' is required");
         }
+        List<String> configFields = JsonText.memberNames(configJson,
+            "Field 'config' must be a single well-formed JSON object");
 
         String sourceId = JsonText.string(configJson, "source_id");
         if (sourceId == null || sourceId.isBlank()) {
@@ -578,6 +585,8 @@ public class IngestEndpoint implements HttpHandler {
                 rejectFields(configJson, HTTP_ONLY_FIELDS, "an HTTP crawl only: a directory "
                     + "walk fetches nothing over a wire, so it has no request to time, no "
                     + "response body to bound and no agent to identify itself as");
+                rejectUnknownFields(configFields, FILESYSTEM_FIELDS, HTTP_ONLY_FIELDS,
+                    "config.", "a filesystem source");
                 putFilesystemTunables(configJson, config);
                 break;
 
@@ -590,6 +599,8 @@ public class IngestEndpoint implements HttpHandler {
                 rejectFields(configJson, FILESYSTEM_ONLY_FIELDS, "a filesystem walk only: an "
                     + "HTTP crawl matches URLs, which have neither a file extension nor a "
                     + "directory, no symbolic links, and no local file to size");
+                rejectUnknownFields(configFields, HTTP_FIELDS, FILESYSTEM_ONLY_FIELDS,
+                    "config.", "an http source");
                 putHttpTunables(configJson, config);
                 break;
 
@@ -618,6 +629,55 @@ public class IngestEndpoint implements HttpHandler {
         SourceFactory.TIMEOUT_SECONDS, SourceFactory.INCLUDED_PATH_PATTERNS,
         SourceFactory.EXCLUDED_PATH_PATTERNS, SourceFactory.USER_AGENT,
         SourceFactory.CRAWL_DELAY_MS, SourceFactory.RESPECT_ROBOTS_TXT);
+
+    /** The members a registration body is made of. */
+    private static final List<String> REQUEST_FIELDS = List.of("source_type", "config");
+
+    /** Every field a filesystem registration's config takes. */
+    private static final List<String> FILESYSTEM_FIELDS = Stream.concat(
+        Stream.of("source_id", SourceFactory.ROOT_PATH, SourceFactory.MAX_DEPTH),
+        FILESYSTEM_ONLY_FIELDS.stream()).toList();
+
+    /** Every field an HTTP registration's config takes. */
+    private static final List<String> HTTP_FIELDS = Stream.concat(
+        Stream.of("source_id", SourceFactory.BASE_URL, SourceFactory.MAX_DEPTH),
+        HTTP_ONLY_FIELDS.stream()).toList();
+
+    /**
+     * Refuses fields no source reads, naming every one of them.
+     *
+     * <p>Refused rather than ignored, for the reason {@link #rejectFields} gives: a misspelled
+     * {@code include_extensions} reads as absent to every accessor, so the request would be
+     * answered {@code 200 registered} and the whole root crawled with the filter the caller
+     * believes it set nowhere in effect.</p>
+     *
+     * @param present   The member names the object carries
+     * @param takes     The names this object takes, listed back to the caller
+     * @param explained Names that are not taken here but are answered elsewhere: the other
+     *                  source type's settings, which {@link #rejectFields} refuses with the reason
+     *                  when they carry a value and lets pass as the absence an explicit
+     *                  {@code null} means everywhere else
+     * @param prefix    What the names are qualified by in the message: {@code "config."} or
+     *                  nothing
+     * @param what      What the object belongs to, for the message
+     * @throws IllegalArgumentException if any member is neither taken nor explained
+     */
+    private static void rejectUnknownFields(List<String> present, List<String> takes,
+                                            List<String> explained, String prefix, String what) {
+        StringJoiner unknown = new StringJoiner("', '", "'", "'");
+        int count = 0;
+        for (String name : present) {
+            if (!takes.contains(name) && !explained.contains(name)) {
+                unknown.add(prefix + name);
+                count++;
+            }
+        }
+        if (count > 0) {
+            throw new IllegalArgumentException((count == 1 ? "Unknown field " : "Unknown fields ")
+                + unknown + ": " + what + " takes " + String.join(", ", takes)
+                + ". Correct the name, or remove the field.");
+        }
+    }
 
     /**
      * Reads the settings that shape a filesystem walk.

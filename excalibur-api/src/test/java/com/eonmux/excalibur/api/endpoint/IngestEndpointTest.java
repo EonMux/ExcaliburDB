@@ -434,6 +434,89 @@ class IngestEndpointTest {
     }
 
     @Nested
+    @DisplayName("Fields this node does not know")
+    class UnknownFields {
+
+        @Test
+        @DisplayName("a misspelled config field is refused, not ignored")
+        void misspelledConfigFieldIsRefused(@TempDir Path root) throws IOException {
+            // Ignored, the filter a caller believes it set is dropped: 200 registered, and then
+            // every file under the root is crawled.
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"include_extensions\": [\".md\"]}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("config.include_extensions")
+                .contains("included_extensions");
+            assertThat(registry.isRegistered("docs")).isFalse();
+        }
+
+        @Test
+        @DisplayName("every unknown config field is named, not only the first")
+        void everyUnknownFieldIsNamed(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://example.com/docs\", "
+                + "\"max_pages\": 10, \"delay\": null}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("config.max_pages").contains("config.delay");
+        }
+
+        @Test
+        @DisplayName("the other source type's fields keep their own explanation")
+        void otherTypesFieldsAreExplained(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"user_agent\": \"AcmeBot/1.0\"}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("user_agent").contains("an HTTP crawl only");
+        }
+
+        @Test
+        @DisplayName("an unknown top-level field is refused")
+        void unknownTopLevelFieldIsRefused(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"namespace\": \"team-a\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\"}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("'namespace'");
+            assertThat(registry.isRegistered("docs")).isFalse();
+        }
+
+        @Test
+        @DisplayName("a replacement is held to the same rule")
+        void replacementRefusesUnknownFields(@TempDir Path root) throws IOException {
+            assertThat(register(root, "docs").status()).isEqualTo(200);
+
+            Response response = send("PUT", registry,
+                ApiSecurityConfig.builder().allowIngestRoot(root).build(), null,
+                "{\"source_type\": \"filesystem\", \"config\": {\"source_id\": \"docs\", "
+                    + "\"root_path\": \"" + root + "\", \"exclude_directories\": [\"x\"]}}",
+                null);
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("config.exclude_directories");
+        }
+
+        @Test
+        @DisplayName("a body that is not one well-formed object is refused whole")
+        void malformedBodyIsRefused(@TempDir Path root) throws IOException {
+            // Every member after the missing comma would otherwise read as absent - including
+            // the filter it carries.
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\" "
+                + "\"included_extensions\": [\".md\"]}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(registry.isRegistered("docs")).isFalse();
+        }
+    }
+
+    @Nested
     @DisplayName("A source that cannot be built")
     class UnbuildableSource {
 

@@ -411,4 +411,37 @@ class JsonTextTest {
             assertThat(JsonText.has("{\"name\": \"nullable\"}", "name")).isTrue();
         }
     }
+
+    @Nested
+    @DisplayName("Member names")
+    class MemberNames {
+
+        @Test
+        @DisplayName("are the top-level names, in order, decoded, and not the nested ones")
+        void topLevelNamesInOrder() {
+            assertThat(JsonText.memberNames(
+                "{\"b\": 1, \"a\\u0062\": {\"inner\": true}, \"c\": [\"x\"]}", "bad"))
+                .containsExactly("b", "ab", "c");
+        }
+
+        @Test
+        @DisplayName("of an empty object are none")
+        void emptyObject() {
+            assertThat(JsonText.memberNames(" { } ", "bad")).isEmpty();
+        }
+
+        @Test
+        @DisplayName("are refused with the caller's message when the object cannot be walked")
+        void malformedIsRefused() {
+            // A missing comma is the case this exists for: every reader stops there, so the
+            // members after it read as absent.
+            assertThatThrownBy(() -> JsonText.memberNames("{\"a\": 1 \"b\": 2}", "not one object"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("not one object");
+            assertThatThrownBy(() -> JsonText.memberNames("[1]", "not one object"))
+                .hasMessage("not one object");
+            assertThatThrownBy(() -> JsonText.memberNames(null, "not one object"))
+                .hasMessage("not one object");
+        }
+    }
 }

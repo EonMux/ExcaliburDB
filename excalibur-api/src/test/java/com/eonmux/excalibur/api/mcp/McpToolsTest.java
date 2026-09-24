@@ -571,6 +571,29 @@ class McpToolsTest {
     }
 
     @Test
+    @DisplayName("a registration argument the tool does not take is a tool error, and nothing is sent")
+    void anUnknownRegistrationArgumentIsAToolError() throws IOException {
+        // Dropped, the setting the model believes it made never reaches the node: the directory
+        // is registered and walked whole, and the call reports success.
+        try (StubNode node = StubNode.start()) {
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            McpTools.ToolResult walk = tools.call(McpTools.INGEST_DOCUMENTS, Map.of(
+                "source_id", "docs", "root_path", "/srv/docs",
+                "include_extensions", List.of(".md")));
+            McpTools.ToolResult crawl = tools.call(McpTools.CRAWL_WEBSITE, Map.of(
+                "source_id", "site", "base_url", "https://example.com",
+                "included_extensions", List.of(".md"), "max_pages", 10));
+
+            assertThat(walk.isError()).isTrue();
+            assertThat(walk.text()).contains("include_extensions").contains("included_extensions");
+            assertThat(crawl.isError()).isTrue();
+            assertThat(crawl.text()).contains("included_extensions").contains("max_pages");
+            assertThat(node.requests()).isEmpty();
+        }
+    }
+
+    @Test
     @DisplayName("ingest_documents leaves a list the model did not send absent")
     void ingestLeavesAbsentListsAbsent() throws IOException {
         try (StubNode node = StubNode.start()) {

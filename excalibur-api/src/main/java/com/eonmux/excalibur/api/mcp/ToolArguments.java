@@ -3,6 +3,8 @@ package com.eonmux.excalibur.api.mcp;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * Reads the arguments a model sent, and refuses the ones it cannot have meant.
@@ -231,5 +233,34 @@ final class ToolArguments {
             }
         }
         return List.copyOf(list);
+    }
+
+    /**
+     * Refuses arguments the tool does not take, naming every one of them.
+     *
+     * <p>For a tool whose settings shape what the node goes on to do unattended. A misspelled
+     * setting is never read by the tool, so it would be dropped exactly as an argument of the
+     * wrong type would be, and the call would report success for work the model did not ask
+     * for.</p>
+     *
+     * @param args     The call's arguments
+     * @param accepted The argument names the tool's input schema declares
+     * @throws IllegalArgumentException if any argument is not among them
+     */
+    static void requireKnown(Map<String, Object> args, Set<String> accepted) {
+        List<String> unknown = new ArrayList<>();
+        for (String name : args.keySet()) {
+            if (!accepted.contains(name)) {
+                unknown.add("'" + name + "'");
+            }
+        }
+        if (!unknown.isEmpty()) {
+            unknown.sort(null);
+            throw new IllegalArgumentException((unknown.size() == 1 ? "Argument " : "Arguments ")
+                + String.join(", ", unknown)
+                + (unknown.size() == 1 ? " is" : " are") + " not taken by this tool, which takes "
+                + String.join(", ", new TreeSet<>(accepted))
+                + ". Correct the name, or leave it out.");
+        }
     }
 }

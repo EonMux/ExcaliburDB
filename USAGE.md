@@ -875,6 +875,20 @@ there is nothing for either filter to match. Accepting them would answer `200 re
 crawl the whole site, with nothing in the response or in `/v1/ingest/status` to say the filter had
 been discarded.
 
+**`400 Bad Request` — a field no source takes**
+
+```json
+{"error": "Bad Request: Unknown field 'config.include_extensions': a filesystem source takes source_id, root_path, max_depth, included_extensions, excluded_directories, follow_symlinks, include_hidden, max_file_bytes, charset. Correct the name, or remove the field.", "code": "invalid_request"}
+```
+
+The same outcome for the same reason: a misspelled setting reads as absent, so the request would
+be answered `200 registered` and the whole root walked. Every unknown field in `config` is named
+in one answer, and a top-level member other than `source_type` and `config` is refused the same
+way. `PUT /v1/ingest` applies the same rule, and so do the MCP `ingest_documents` and
+`crawl_website` tools, which refuse an argument their schema does not declare before anything is
+sent. A body that is not one well-formed JSON object is refused whole rather than read up to the
+first member that cannot be parsed.
+
 **`400 Bad Request` — a `root_path` that names a file**
 
 ```json

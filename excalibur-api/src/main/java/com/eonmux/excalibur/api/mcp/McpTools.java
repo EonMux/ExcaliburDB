@@ -6,6 +6,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 import com.eonmux.excalibur.graph.browse.EdgeDirection;
@@ -1153,6 +1154,7 @@ public final class McpTools {
 
     private ToolResult ingestDocuments(Map<String, Object> args)
             throws IOException, InterruptedException {
+        ToolArguments.requireKnown(args, argumentsOf(INGEST_DOCUMENTS));
         Map<String, Object> sourceConfig = Json.object();
         sourceConfig.put("source_id", ToolArguments.requiredString(args, "source_id"));
         sourceConfig.put("root_path", ToolArguments.requiredString(args, "root_path"));
@@ -1196,6 +1198,27 @@ public final class McpTools {
         return answer(client.post("/v1/documents", Json.write(body), null));
     }
 
+    /**
+     * The argument names a tool's input schema declares.
+     *
+     * <p>Read from the catalogue rather than listed a second time, so what a tool refuses is
+     * exactly what its schema does not offer, and a setting added to the schema is accepted
+     * without a second edit.</p>
+     *
+     * @param tool The tool name
+     * @return Its argument names
+     * @throws IllegalStateException if the catalogue has no such tool
+     */
+    static Set<String> argumentsOf(String tool) {
+        for (Object described : catalogue()) {
+            if (tool.equals(Json.stringAt(described, "name"))) {
+                return Set.copyOf(Json.objectAt(Json.objectAt(described, "inputSchema"),
+                    "properties").keySet());
+            }
+        }
+        throw new IllegalStateException("The catalogue describes no tool named " + tool);
+    }
+
     private ToolResult ingestionStatus(Map<String, Object> args)
             throws IOException, InterruptedException {
         String sourceId = ToolArguments.optionalString(args, "source_id");
@@ -1214,6 +1237,7 @@ public final class McpTools {
      */
     private ToolResult crawlWebsite(Map<String, Object> args)
             throws IOException, InterruptedException {
+        ToolArguments.requireKnown(args, argumentsOf(CRAWL_WEBSITE));
         Map<String, Object> sourceConfig = Json.object();
         sourceConfig.put("source_id", ToolArguments.requiredString(args, "source_id"));
         sourceConfig.put("base_url", ToolArguments.requiredString(args, "base_url"));

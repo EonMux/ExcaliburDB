@@ -612,7 +612,27 @@ public final class JsonText {
      *                                  by commas and closed by a brace, with nothing after it
      */
     public static void requireObject(String json) {
-        String malformed = "The request body must be a single well-formed JSON object";
+        memberNames(json, "The request body must be a single well-formed JSON object");
+    }
+
+    /**
+     * The names of an object's members, in the order they are written, after checking the
+     * object can be walked the way {@link #requireObject} checks it.
+     *
+     * <p>For a route that refuses members it does not know. A misspelled optional field reads
+     * as absent to every accessor here, so a request carrying one would be answered as though
+     * the caller had not asked for what it plainly did; comparing the names against the ones the
+     * route reads is what turns the misspelling into an error the caller can see.</p>
+     *
+     * @param json      The object
+     * @param malformed What to say when it is not one well-formed object
+     * @return The member names, decoded; empty for {@code {}}
+     * @throws IllegalArgumentException with {@code malformed} if it is not a single object whose
+     *                                  members are separated by commas and closed by a brace,
+     *                                  with nothing after it
+     */
+    public static List<String> memberNames(String json, String malformed) {
+        List<String> names = new ArrayList<>();
         int i = json == null ? 0 : skipWhitespace(json, 0);
         if (json == null || i >= json.length() || json.charAt(i) != '{') {
             throw new IllegalArgumentException(malformed);
@@ -620,13 +640,16 @@ public final class JsonText {
         i = skipWhitespace(json, i + 1);
         if (i < json.length() && json.charAt(i) == '}') {
             requireNothingAfter(json, i + 1, malformed);
-            return;
+            return names;
         }
         while (true) {
             if (i >= json.length() || json.charAt(i) != '"') {
                 throw new IllegalArgumentException(malformed);
             }
             int nameEnd = closingQuote(json, i + 1);
+            if (nameEnd >= 0) {
+                names.add(unescape(json.substring(i + 1, nameEnd)));
+            }
             i = nameEnd < 0 ? -1 : skipWhitespace(json, nameEnd + 1);
             if (i < 0 || i >= json.length() || json.charAt(i) != ':') {
                 throw new IllegalArgumentException(malformed);
@@ -639,7 +662,7 @@ public final class JsonText {
             i = skipWhitespace(json, i);
             if (i < json.length() && json.charAt(i) == '}') {
                 requireNothingAfter(json, i + 1, malformed);
-                return;
+                return names;
             }
             if (i >= json.length() || json.charAt(i) != ',') {
                 throw new IllegalArgumentException(malformed);
