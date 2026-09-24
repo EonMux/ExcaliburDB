@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.bootstrap;
 import com.eonmux.excalibur.core.memory.MappedFootprint;
 import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.config.GraphConfig;
+import com.eonmux.excalibur.graph.browse.GraphCatalog;
 import com.eonmux.excalibur.graph.dictionary.LabelDictionary;
 import com.eonmux.excalibur.graph.file.GraphCorruptionException;
 import com.eonmux.excalibur.graph.store.MappedEdgeStore;
@@ -93,13 +94,14 @@ public final class GraphRagFactory {
      * @param closeables  Everything opened, in the order it should be closed
      * @param directory   Where it was read from
      */
-    public record GraphRag(GraphRagPipeline pipeline, EntityLinker linker,
+    public record GraphRag(GraphRagPipeline pipeline, EntityLinker linker, GraphCatalog catalog,
                            List<AutoCloseable> closeables, Path directory)
             implements AutoCloseable {
 
         public GraphRag {
             Objects.requireNonNull(pipeline, "pipeline cannot be null");
             Objects.requireNonNull(linker, "linker cannot be null");
+            Objects.requireNonNull(catalog, "catalog cannot be null");
             closeables = List.copyOf(closeables);
         }
 
@@ -309,7 +311,8 @@ public final class GraphRagFactory {
 
             LOGGER.info("Graph-RAG pipeline opened from {}: {} entity names, {} relation names",
                 directory, entityNames.size(), relationNames.size());
-            return new GraphRag(pipeline, linker, new ArrayList<>(opened), directory);
+            GraphCatalog catalog = new GraphCatalog(edges, entityNames, relationNames);
+            return new GraphRag(pipeline, linker, catalog, new ArrayList<>(opened), directory);
         } catch (IOException | RuntimeException e) {
             // Everything opened so far, released in reverse order. Leaving mappings behind on a
             // failed start is how a node that refuses to serve also refuses to shut down cleanly.

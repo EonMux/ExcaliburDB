@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.bootstrap;
 
+import com.eonmux.excalibur.graph.browse.GraphCatalog;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
 
 import org.slf4j.Logger;
@@ -247,6 +248,15 @@ public final class GraphRagHolder implements AutoCloseable {
          */
         public GraphRagPipeline pipeline() {
             return served.stack.pipeline();
+        }
+
+        /**
+         * The entity-by-entity view of the same stack.
+         *
+         * @return The catalog over the graph this reading holds
+         */
+        public GraphCatalog catalog() {
+            return served.stack.catalog();
         }
 
         @Override

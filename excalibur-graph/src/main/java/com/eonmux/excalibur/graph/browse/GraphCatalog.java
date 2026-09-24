@@ -169,7 +169,8 @@ public final class GraphCatalog {
      * @param limit     Most edges to return, {@code 1..}{@value #MAX_LIMIT}
      * @param cursor    The previous page's cursor, or null for the first page
      * @return The page, or empty when this graph has no entity by that id
-     * @throws IllegalArgumentException if the limit is out of range or the cursor malformed
+     * @throws IllegalArgumentException if the limit is out of range, the cursor malformed or the
+     *                                  relation blank or too long to be a label
      */
     public Optional<CatalogPage<CatalogEdge>> edges(long id, String relation,
                                                     EdgeDirection direction,
@@ -183,7 +184,12 @@ public final class GraphCatalog {
         }
         int relationId = -1;
         if (relation != null) {
-            Integer known = relationIds.get(FactLabels.relation(relation));
+            String cleaned = FactLabels.relation(relation);
+            if (cleaned == null) {
+                throw new IllegalArgumentException("'relation' must be a label of 1 to "
+                    + FactLabels.MAX_LABEL_CHARS + " characters when given");
+            }
+            Integer known = relationIds.get(cleaned);
             if (known == null) {
                 return Optional.of(new CatalogPage<>(List.of(), null));
             }

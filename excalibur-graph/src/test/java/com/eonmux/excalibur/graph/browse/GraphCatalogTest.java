@@ -378,7 +378,8 @@ class GraphCatalogTest {
         }
 
         @Test
-        @DisplayName("an entity cursor or a damaged one is refused")
+        @DisplayName("an entity cursor, a damaged one, a bad limit and a blank relation are "
+            + "refused")
         void foreignCursors(@TempDir Path dir) throws IOException {
             try (Opened graph = built(dir, HUB)) {
                 long hub = hub(graph);
@@ -393,6 +394,10 @@ class GraphCatalogTest {
                 assertThatThrownBy(() -> graph.catalog()
                     .edges(hub, null, EdgeDirection.BOTH, null, 0, null))
                     .isInstanceOf(IllegalArgumentException.class);
+                assertThatThrownBy(() -> graph.catalog()
+                    .edges(hub, "  ", EdgeDirection.BOTH, null, 5, null))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("'relation'");
             }
         }
     }

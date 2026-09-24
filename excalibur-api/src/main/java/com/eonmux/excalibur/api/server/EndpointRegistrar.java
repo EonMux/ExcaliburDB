@@ -18,7 +18,9 @@ import com.eonmux.excalibur.api.endpoint.GraphBuildCancelEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphBuildEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphBuildRunner;
 import com.eonmux.excalibur.api.endpoint.GraphBuildStatusEndpoint;
+import com.eonmux.excalibur.api.endpoint.GraphEntitiesEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphErasureEndpoint;
+import com.eonmux.excalibur.api.endpoint.GraphFactsEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespaceDeleteEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespacesEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphQueryEndpoint;
@@ -1049,6 +1051,23 @@ final class EndpointRegistrar {
             target.createContext("/v1/graph/erasure", wrapHandler(exactPath("/v1/graph/erasure",
                 onlyMethod("POST", guard.protect(RequestGuard.Access.MUTATE,
                     new GraphErasureEndpoint(in.graphTenants()))), notFound)));
+            // The served graph read by entity: a read like the query it sits beside, over the
+            // same lease, and answered 503 exactly where the query is.
+            target.createContext(GraphEntitiesEndpoint.PATH, wrapHandler(
+                pathOrChild(GraphEntitiesEndpoint.PATH, onlyMethod("GET",
+                    guard.protect(RequestGuard.Access.READ,
+                        new GraphEntitiesEndpoint(in.graphTenants()))), notFound)));
+            // Both mutations: asserting stages facts the next build serves, and retracting
+            // records an erasure obligation.
+            GraphFactsEndpoint facts = new GraphFactsEndpoint(in.graphTenants());
+            target.createContext(GraphFactsEndpoint.PATH, wrapHandler(
+                pathOrChild(GraphFactsEndpoint.PATH, createMethodRouter(
+                    "POST", guard.protect(RequestGuard.Access.MUTATE, facts),
+                    "DELETE", guard.protect(RequestGuard.Access.MUTATE, facts),
+                    guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
+                        "Method Not Allowed - Use POST /v1/graph/facts to assert facts or "
+                            + "DELETE /v1/graph/facts/{fact_id} to retract one"))),
+                notFound)));
             // The namespace inventory and the drop. One context with pathOrChild, because the
             // collection is a GET and its members carry the namespace in the path. Registered
             // only where graphTenants is: a node serving somebody else's pipeline has no
