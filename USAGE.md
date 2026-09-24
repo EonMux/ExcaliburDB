@@ -1882,6 +1882,9 @@ Key fields:
   ran", which would make that path never able to report an exact total. An answer a relevancy
   threshold shortened is `exact` only when retrieval had also run out of candidates; otherwise its
   total is `at_least`, because the model judged only the candidates it was shown.
+  A document being rewritten is left out of every answer until its new version is published, and
+  a BM25 or hybrid search that left one out fills the page from the matches below it, so neither
+  a short page nor an `exact` total is caused by withholding.
 - **`explain`** (per result, only with `"explain": true`) — `signals` gives each contributing
   signal's own `rank` (absolute, from the start of the whole ranking, not of the page) and `score`
   **on that signal's own scale**: a similarity for `vector`, and for `bm25` whatever the lexical
@@ -2291,7 +2294,9 @@ curl -X POST http://localhost:8080/v1/documents/fetch \
 Every identifier asked for comes back, in the order asked, whether or not the node holds it: a
 caller that named three and received two cannot tell which was dropped. `text` is `null` for one
 the node does not hold — usually a chunk erased but not yet compacted out of the vector index —
-and `documents_not_found` counts them. A miss is not a `404`: the request is for a set, and part of
+or whose document is being rewritten at that moment, which would otherwise be part of one version
+and part of the next; `documents_not_found` counts them. Read it again once the rewrite is
+published. A miss is not a `404`: the request is for a set, and part of
 a set being absent does not make the request wrong.
 
 The identifier goes in a query parameter or a JSON array rather than in the path because a chunk
@@ -2392,7 +2397,8 @@ curl -G http://localhost:8080/v1/documents/list \
 `limit` counts chunks. Without `include_text` a page carries ids only, defaults to 100 and is
 capped at 1000. With it, each chunk also carries its text — clipped at
 `excalibur.api.max-result-text-chars` with `text_truncated` saying so, and `null` for a chunk the
-node no longer holds — and a page is capped at `excalibur.api.max-top-k`, the bound on one
+node no longer holds or whose document is being rewritten at that moment — and a page is capped at
+`excalibur.api.max-top-k`, the bound on one
 `POST /v1/documents/fetch`, because it is the same read.
 
 Page with `next_cursor` as above. The cursor carries the document's content hash: a document

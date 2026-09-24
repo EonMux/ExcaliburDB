@@ -1,6 +1,9 @@
 package com.eonmux.excalibur.ingest.registry;
 
+import java.lang.invoke.VarHandle;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
@@ -32,6 +35,14 @@ import java.util.function.Supplier;
  * ingestion thread per source, a collision is rare enough not to be worth the bookkeeping the
  * alternative needs.</p>
  *
+ * <h2>Reading without waiting</h2>
+ * <p>A reader that must not see a document half rewritten, and must not wait behind the rewrite
+ * either, reads through {@link #readUnlessRewriting}. It takes no lock: each stripe records which
+ * document holds it and counts every time a document takes it, and a read is kept only if no
+ * rewrite of its document was under way when it began and none began before it finished.
+ * Readers therefore never block writers, never block each other, and are not turned away by the
+ * rewrite of another document sharing their stripe.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent use. The locks are reentrant, so a caller already holding a document's
  * lock may take it again; no call here acquires more than one at a time, so no pair of callers
@@ -46,15 +57,36 @@ public final class DocumentLocks {
      */
     private static final int STRIPES = 1024;
 
+    /**
+     * How many times a read overtaken by a rewrite is tried again before it is answered as busy.
+     *
+     * <p>A rewrite beginning during a read is rare and brief to notice; one that begins during
+     * every one of several reads in a row is a stripe under sustained rewriting, and a reader
+     * that kept trying would be waiting for it by another name.</p>
+     */
+    private static final int READ_ATTEMPTS = 3;
+
     private static final DocumentLocks SHARED = new DocumentLocks();
 
     private final ReentrantLock[] stripes;
+
+    /**
+     * The document holding each stripe, or null when none does or when its holder took a second
+     * document on the same stripe inside the first - then the stripe cannot say which one is
+     * being rewritten, and a reader of either is turned away until it is released.
+     */
+    private final AtomicReferenceArray<String> holders;
+
+    /** How many times each stripe has been taken for a document it was not already held for. */
+    private final AtomicLongArray takes;
 
     private DocumentLocks() {
         this.stripes = new ReentrantLock[STRIPES];
         for (int i = 0; i < STRIPES; i++) {
             this.stripes[i] = new ReentrantLock();
         }
+        this.holders = new AtomicReferenceArray<>(STRIPES);
+        this.takes = new AtomicLongArray(STRIPES);
     }
 
     /**
@@ -79,11 +111,22 @@ public final class DocumentLocks {
         Objects.requireNonNull(documentKey, "documentKey must not be null");
         Objects.requireNonNull(work, "work must not be null");
 
-        ReentrantLock lock = lockFor(documentKey);
+        int stripe = stripeOf(documentKey);
+        ReentrantLock lock = stripes[stripe];
         lock.lock();
+        boolean outermost = lock.getHoldCount() == 1;
+        if (outermost || !documentKey.equals(holders.get(stripe))) {
+            // Counted before the holder is named, and both before the work writes anything, so
+            // a read that could see the work's first write sees the count move too.
+            takes.incrementAndGet(stripe);
+            holders.set(stripe, outermost ? documentKey : null);
+        }
         try {
             return work.get();
         } finally {
+            if (outermost) {
+                holders.set(stripe, null);
+            }
             lock.unlock();
         }
     }
@@ -104,6 +147,57 @@ public final class DocumentLocks {
     }
 
     /**
+     * Reads a document unless it is being rewritten, without waiting for the rewrite.
+     *
+     * <p>For readers that must not see a document while it is being rewritten, and must not wait
+     * behind the rewrite either. The read runs without the lock and its answer is kept only if no
+     * other thread was rewriting the document when it began and no rewrite of it began before it
+     * finished; otherwise it is tried again a few times and then answered as {@code busy}, as the
+     * caller would answer for a document it cannot show. On the thread already rewriting the
+     * document it runs as it is, since that thread is the rewrite.</p>
+     *
+     * <p>A rewrite of another document sharing the stripe does not turn a read away while it
+     * continues; only its release, or another document taking the stripe, during the read makes
+     * the read try again. The read may run more than once, so it must have no effect but its
+     * answer.</p>
+     *
+     * @param documentKey The document, as {@code sourceId:documentId}
+     * @param read        The read to keep only if no rewrite overlapped it
+     * @param busy        What to answer when rewrites kept overlapping it
+     * @param <T>         What the read produces
+     * @return What the read produced, or {@code busy}
+     * @throws NullPointerException if documentKey or read is null
+     */
+    public <T> T readUnlessRewriting(String documentKey, Supplier<T> read, T busy) {
+        Objects.requireNonNull(documentKey, "documentKey must not be null");
+        Objects.requireNonNull(read, "read must not be null");
+
+        int stripe = stripeOf(documentKey);
+        ReentrantLock lock = stripes[stripe];
+        if (lock.isHeldByCurrentThread()) {
+            return read.get();
+        }
+        for (int attempt = 0; attempt < READ_ATTEMPTS; attempt++) {
+            long before = takes.get(stripe);
+            if (lock.isLocked()) {
+                String holder = holders.get(stripe);
+                if (holder == null || holder.equals(documentKey)) {
+                    return busy;
+                }
+            }
+            T answer = read.get();
+            // The read's loads may not be put off past the second look at the count, or a write
+            // made after the count moved could be read and the move missed.
+            VarHandle.acquireFence();
+            if (takes.get(stripe) == before && !(lock.isLocked()
+                    && documentKey.equals(holders.get(stripe)))) {
+                return answer;
+            }
+        }
+        return busy;
+    }
+
+    /**
      * Whether the calling thread is already inside this document's lock.
      *
      * <p>For collaborators that are correct either way but want to say which they are in; it is
@@ -116,7 +210,7 @@ public final class DocumentLocks {
      */
     public boolean heldByCurrentThread(String documentKey) {
         Objects.requireNonNull(documentKey, "documentKey must not be null");
-        return lockFor(documentKey).isHeldByCurrentThread();
+        return stripes[stripeOf(documentKey)].isHeldByCurrentThread();
     }
 
     /**
@@ -125,9 +219,12 @@ public final class DocumentLocks {
      * <p>The hash is spread before it is masked because document keys share long prefixes - every
      * document of one source begins with the same source id - and {@code String.hashCode} leaves
      * that structure in the low bits, which are the ones the mask keeps.</p>
+     *
+     * @param documentKey The document, as {@code sourceId:documentId}
+     * @return The index of its stripe
      */
-    private ReentrantLock lockFor(String documentKey) {
+    static int stripeOf(String documentKey) {
         int spread = documentKey.hashCode() * 0x9E3779B1;
-        return stripes[(spread >>> 16) & (STRIPES - 1)];
+        return (spread >>> 16) & (STRIPES - 1);
     }
 }

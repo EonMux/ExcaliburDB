@@ -529,7 +529,7 @@ final class ServerWiring {
         SourceResolver resolver = sourceResolver != null ? sourceResolver : createSourceResolver();
         return new EndpointRegistrar.Inputs(
             security, config, indexOrchestrator, storageEngine, volumeManager,
-            queryPipeline, queryRegistry, embeddingClient, lexicalQueryService, queryExpander,
+            queryPipeline, queryRegistry, embeddingClient, visibleLexical(), queryExpander,
             chunkIndex,
             ingestSourceRegistry, sourceCatalog, ingestionStatusRegistry, ingestionOrchestrator,
             reindexStatusRegistry, documentReindexer, resolver, reindexCoordinator,
@@ -555,7 +555,23 @@ final class ServerWiring {
                 + "document registry and its erasure service attached before it starts");
         }
         return new InProcessServices(config, storageEngine, queryPipeline, embeddingClient,
-            lexicalQueryService, ingestionOrchestrator, documentRegistry, documentErasure,
+            visibleLexical(), ingestionOrchestrator, documentRegistry, documentErasure,
             sourceCatalog);
+    }
+
+    /**
+     * The lexical service, withholding the documents the query pipeline withholds.
+     *
+     * <p>The checker is the wrapped pipeline's, so it is read here rather than when the service
+     * was attached: ingestion hands the pipeline its checker, and the document-atomicity setting
+     * decides whether it keeps one. A lexical answer and the vector half of a fused one therefore
+     * withhold the same documents.</p>
+     *
+     * @return The service the routes search through, or null when none was attached
+     */
+    private LexicalQueryService visibleLexical() {
+        LexicalQueryService service = lexicalQueryService;
+        return service == null ? null
+            : service.withVisibility(queryPipeline.getVisibilityChecker());
     }
 }

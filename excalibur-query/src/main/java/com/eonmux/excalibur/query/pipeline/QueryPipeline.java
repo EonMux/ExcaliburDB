@@ -711,6 +711,13 @@ public class QueryPipeline {
      * {@link com.eonmux.excalibur.query.cache.CorpusVersion} for the argument in full, and
      * {@code CorpusFingerprint} for what is read and why.</p>
      *
+     * <p>With a visibility checker, its {@link DocumentVisibilityChecker#visibilityGeneration()}
+     * is part of it too. Which documents a query may return changes when one is marked in flight
+     * and when it is published, and neither writes a byte the segments could show: the mark
+     * comes before the first chunk and the publication after the last. Without it an answer
+     * computed while a document was withheld would go on withholding it after its
+     * publication.</p>
+     *
      * <p>Cheap: a set of visible segment ids and a fixed number of field reads per segment,
      * with no locks and no file access. Never throws - a corpus that cannot be read is
      * reported as {@link com.eonmux.excalibur.query.cache.CorpusVersion#UNREADABLE}, which the cache
@@ -719,7 +726,9 @@ public class QueryPipeline {
      * @return The current corpus fingerprint, never null
      */
     public com.eonmux.excalibur.query.cache.CorpusVersion corpusVersion() {
-        return corpusFingerprint.current();
+        com.eonmux.excalibur.query.cache.CorpusVersion corpus = corpusFingerprint.current();
+        DocumentVisibilityChecker checker = visibilityChecker;
+        return checker == null ? corpus : corpus.alongside(checker.visibilityGeneration());
     }
 
     // ==================== Inner Classes ====================

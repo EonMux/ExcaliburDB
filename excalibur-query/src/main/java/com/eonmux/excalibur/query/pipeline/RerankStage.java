@@ -60,31 +60,6 @@ final class RerankStage {
      */
     private static final int RERANK_CANDIDATE_MULTIPLIER = 2;
 
-    /**
-     * Epoch handed to the document atomicity filter, meaning "no epoch bound".
-     *
-     * <p>The pipeline's own epoch ({@code PipelineContext.epoch}) comes from the shard's
-     * {@link VisibilityTracker}, which counts segment lifecycle transitions and periodic
-     * ticks. Document commit epochs come from the ingest-side visibility tracker, a
-     * separate counter advanced once per published document. The two numbers have no
-     * defined ordering relationship, so comparing a document's commit epoch against the
-     * shard epoch decides visibility on whichever counter happens to be running faster -
-     * dropping committed documents when ingest is ahead, and asserting nothing when the
-     * shard tick is.</p>
-     *
-     * <p>Rather than perform a comparison across two unrelated domains, the filter is
-     * applied without an epoch bound, which reduces it to exactly the guarantee it exists
-     * to provide: a result is dropped only when its document is registered as not yet
-     * complete. Epoch-based snapshot isolation is still enforced, in its own domain, by
-     * the shard {@code EpochIsolationValidator} in Stage 2.</p>
-     *
-     * <p>Restoring an epoch bound here requires the query epoch to be drawn from the same
-     * counter that stamps document commits - i.e. an accessor for the current commit epoch
-     * on {@code DocumentVisibilityChecker}, captured in Stage 0 alongside the segment
-     * epoch.</p>
-     */
-    private static final long DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED = Long.MAX_VALUE;
-
     private final DistanceFunction distanceFunction;
     private final double coverageThreshold;
     private final DocumentVisibilityChecker visibilityChecker;
@@ -279,23 +254,18 @@ final class RerankStage {
     /**
      * The epoch to bound the atomicity filter by.
      *
-     * <p>The query's own captured epoch when the checker publishes on the clock that epoch came
-     * from, and {@link #DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED} otherwise. A rule rather than an
-     * inline condition because getting it wrong is silent in both directions: bounding by a
-     * foreign counter excludes documents arbitrarily, and never bounding gives up snapshot
-     * isolation without saying so.
+     * <p>{@link DocumentAtomicityFilter#boundFor}, the one rule every filtering path applies: the
+     * query's own captured epoch when the checker publishes on the clock that epoch came from,
+     * and {@link DocumentAtomicityFilter#UNBOUNDED} otherwise. A negative epoch is not a snapshot
+     * anyone captured; the filter rejects it outright, so falling back keeps a malformed context
+     * from failing the whole query.</p>
      *
      * @param checker    The visibility checker the filter will consult
      * @param queryEpoch The epoch captured in stage 0
      * @return The bound to filter with
      */
     static long atomicityBoundFor(DocumentVisibilityChecker checker, long queryEpoch) {
-        if (checker == null || !checker.sharesNodeEpochClock()) {
-            return DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED;
-        }
-        // A negative epoch is not a snapshot anyone captured; the filter rejects it outright,
-        // so falling back keeps a malformed context from failing the whole query.
-        return queryEpoch >= 0 ? queryEpoch : DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED;
+        return DocumentAtomicityFilter.boundFor(checker, queryEpoch);
     }
 
     /**
@@ -303,10 +273,12 @@ final class RerankStage {
      *
      * <p>The filter excludes results belonging to documents that are not yet fully
      * visible. It can only do that for documents the visibility checker knows about; when
-     * the checker holds no registrations at all - which is the case whenever ingestion
-     * runs its per-chunk path rather than atomic document batching - it has nothing to
-     * compare against, and running it would express "unknown" as "not visible" for every
-     * result in the response.</p>
+     * the checker holds nothing at all, committed or in flight, it has nothing to compare
+     * against, and a checker that cannot tell an unknown document from an incomplete one would
+     * express "unknown" as "not visible" for every result in the response. Documents in flight
+     * count as something to compare against: a node restarted over documents a previous process
+     * left half-written has published nothing yet, and those are exactly the documents to
+     * withhold - see {@link DocumentAtomicityFilter#appliesTo}.</p>
      *
      * <h3>Which epoch bounds it</h3>
      * <p>The query's own captured epoch, when the checker publishes on the same clock the
@@ -314,7 +286,7 @@ final class RerankStage {
      * reports. That is a real snapshot bound: a document committed after this query started is
      * excluded from it, so a long-running query does not pick up writes partway through.</p>
      *
-     * <p>Otherwise {@link #DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED}, and the filter degrades to a
+     * <p>Otherwise {@link DocumentAtomicityFilter#UNBOUNDED}, and the filter degrades to a
      * completeness check. Bounding by a foreign counter is worse than not bounding: the two
      * numbers are unrelated, so the comparison excludes or admits documents arbitrarily, and it
      * does so while looking exactly like a snapshot.</p>
@@ -322,22 +294,18 @@ final class RerankStage {
      * @param results The reranked results
      * @param queryEpoch The epoch this query captured in stage 0
      * @return The results that survive the filter, or the input unchanged when the filter
-     *         is not configured or holds no document registrations
+     *         is not configured or holds no document, committed or in flight
      */
     private List<QueryResultItem> applyAtomicityFilter(List<QueryResultItem> results,
                                                        long queryEpoch) {
-        if (visibilityChecker == null) {
+        if (!DocumentAtomicityFilter.appliesTo(visibilityChecker)) {
+            LOGGER.trace("Stage 3: Skipping document atomicity filter - no document tracked");
             return results;
         }
-
         int registeredDocuments = visibilityChecker.getDocumentCount();
-        if (registeredDocuments == 0) {
-            LOGGER.trace("Stage 3: Skipping document atomicity filter - no documents registered");
-            return results;
-        }
 
         long bound = atomicityBoundFor(visibilityChecker, queryEpoch);
-        boolean bounded = bound != DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED;
+        boolean bounded = bound != DocumentAtomicityFilter.UNBOUNDED;
 
         DocumentAtomicityFilter atomicityFilter = new DocumentAtomicityFilter(visibilityChecker);
         List<QueryResultItem> filtered = atomicityFilter.filterPartialDocuments(results, bound);

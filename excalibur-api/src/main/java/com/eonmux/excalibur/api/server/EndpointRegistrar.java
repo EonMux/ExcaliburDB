@@ -56,6 +56,7 @@ import com.eonmux.excalibur.api.endpoint.VersionEndpoint;
 import com.eonmux.excalibur.api.reindex.ReindexCoordinator;
 import com.eonmux.excalibur.api.retrieval.ChunkTextResolver;
 import com.eonmux.excalibur.api.retrieval.LexicalQueryService;
+import com.eonmux.excalibur.api.retrieval.VisibleChunkText;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.security.IngestTargetValidator;
 import com.eonmux.excalibur.api.security.RequestGuard;
@@ -295,7 +296,12 @@ final class EndpointRegistrar {
         QueryResultCache queryResultCache = newQueryResultCache();
         collector.withQueryResultCache(queryResultCache);
 
-        Function<String, String> chunkText = StoredChunkText.of(in.storageEngine());
+        // What a caller reads is withheld while its document is being rewritten; what the
+        // lexical compactor re-reads to rebuild the index is not, since it must see every chunk
+        // storage holds whatever state its document is in.
+        Function<String, String> storedText = StoredChunkText.of(in.storageEngine());
+        Function<String, String> chunkText = VisibleChunkText.over(storedText,
+            in.queryPipeline().getVisibilityChecker());
         QueryEndpoint queryHandler = newQueryEndpoint(chunkText, queryResultCache);
 
         // Shared by the two routes that can write under one source id, so that neither takes an
@@ -317,7 +323,7 @@ final class EndpointRegistrar {
         registerReindex(target, notFound, reindexHandler);
         registerErasure(target, notFound, suppliedSources);
         CompactionRunner compactionRunner = new CompactionRunner(
-            in.indexOrchestrator()::compactNow, lexicalCompactor(chunkText));
+            in.indexOrchestrator()::compactNow, lexicalCompactor(storedText));
         registerCompaction(target, notFound, compactionRunner);
         registerGraph(target, notFound, graphBuildRunner, graphAutoBuilder);
         target.createContext("/", wrapHandler(notFound));

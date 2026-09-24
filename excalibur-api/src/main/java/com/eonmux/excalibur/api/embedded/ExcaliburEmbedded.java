@@ -2,6 +2,7 @@ package com.eonmux.excalibur.api.embedded;
 
 import com.eonmux.excalibur.api.bootstrap.ApiConfigKeys;
 import com.eonmux.excalibur.api.bootstrap.NodeAssembly;
+import com.eonmux.excalibur.api.retrieval.VisibleChunkText;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.server.InProcessServices;
 import com.eonmux.excalibur.api.server.ShutdownBudget;
@@ -117,7 +118,8 @@ public final class ExcaliburEmbedded implements AutoCloseable {
         this.erasure = services.documentErasure();
         this.registry = services.documentRegistry();
         this.sourceCatalog = services.sourceCatalog();
-        this.chunkText = StoredChunkText.of(services.storageEngine());
+        this.chunkText = VisibleChunkText.over(StoredChunkText.of(services.storageEngine()),
+            services.queryPipeline().getVisibilityChecker());
         this.executor = Executors.newVirtualThreadPerTaskExecutor();
         this.retrieval = new EmbeddedRetrieval(services, limits, chunkText, executor);
         this.defaultTimeoutMs = Math.min(services.config().visibility().getQueryTimeoutMs(),

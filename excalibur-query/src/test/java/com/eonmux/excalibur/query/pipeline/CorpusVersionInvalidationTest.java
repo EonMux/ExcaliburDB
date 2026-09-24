@@ -1,5 +1,8 @@
 package com.eonmux.excalibur.query.pipeline;
 
+import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
+import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
+import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
 import com.eonmux.excalibur.query.IndexCoverage;
 import com.eonmux.excalibur.query.QueryResponse;
 import com.eonmux.excalibur.query.cache.CorpusVersion;
@@ -23,6 +26,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -280,6 +284,43 @@ class CorpusVersionInvalidationTest {
                     .as("a vector that has become searchable must move the fingerprint")
                     .isNotEqualTo(before);
                 assertThat(cache.get(key(), after, QueryResponse.class)).isNull();
+            } finally {
+                close(fixture);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("a document going in flight or being published changes the fingerprint")
+    void documentVisibilityInvalidatesTheCache(@TempDir Path tempDir) throws Exception {
+        // Neither writes a byte: a mark comes before the first chunk and a publication after
+        // the last. An answer computed while a document was withheld would otherwise go on
+        // withholding it after its publication, for as long as nothing else moved.
+        Path dataDir = Files.createDirectories(tempDir.resolve("data"));
+        try (Arena arena = Arena.ofShared()) {
+            Fixture fixture = fixture(dataDir, arena);
+            try {
+                DocumentVisibilityTracker documents =
+                    new DocumentVisibilityTracker(new DocumentRegistry(), fixture.visibility());
+                QueryPipeline pipeline = fixture.pipeline()
+                    .withVisibilityChecker(new DocumentVisibilityTrackerAdapter(documents));
+                QueryResultCache cache = new QueryResultCache(16);
+                CorpusVersion before = pipeline.corpusVersion();
+                cache.put(key(), before, answer());
+
+                documents.beginIngestion("src:doc", 1);
+                CorpusVersion inFlight = pipeline.corpusVersion();
+                assertThat(inFlight).as("a document withheld from now on moves the fingerprint")
+                    .isNotEqualTo(before);
+                assertThat(cache.get(key(), inFlight, QueryResponse.class)).isNull();
+
+                documents.registerDocument("src:doc", Set.of("src:doc:chunk:0"),
+                    documents.advanceEpoch());
+                CorpusVersion published = pipeline.corpusVersion();
+                assertThat(published).as("a document served from now on moves the fingerprint")
+                    .isNotEqualTo(inFlight).isNotEqualTo(before);
+                assertThat(pipeline.corpusVersion())
+                    .as("and nothing further moves it").isEqualTo(published);
             } finally {
                 close(fixture);
             }
