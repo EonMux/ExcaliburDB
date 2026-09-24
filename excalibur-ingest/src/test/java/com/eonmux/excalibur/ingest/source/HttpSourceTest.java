@@ -363,8 +363,8 @@ class HttpSourceTest {
         }
 
         @Test
-        @DisplayName("crawl respects max depth")
-        void crawl_respectsMaxDepth() throws SourceException {
+        @DisplayName("a depth of zero lists the one page named by the base URL")
+        void crawl_depthZeroListsOnlyTheBasePage() throws SourceException {
             source.close();
             source = HttpSource.builder()
             .allowPrivateAddresses(true)  // crawls a local mock server
@@ -377,7 +377,26 @@ class HttpSourceTest {
 
             var docs = source.crawl().toList();
 
-            assertThat(docs).isEmpty();
+            assertThat(docs).containsExactly(baseUrl + "/");
+        }
+
+        @Test
+        @DisplayName("lists the base page beside the pages it links to")
+        void crawl_listsTheBasePage() throws SourceException {
+            source.close();
+            source = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
+                .sourceId("test-depth-one")
+                .baseUrl(baseUrl)
+                .maxDepth(1)
+                .timeoutSeconds(5)
+                .excludedPathPatterns()
+                .build();
+
+            var docs = source.crawl().toList();
+
+            assertThat(docs).containsExactlyInAnyOrder(
+                baseUrl + "/", baseUrl + "/page1.html", baseUrl + "/page2.html");
         }
     }
 
@@ -420,7 +439,8 @@ class HttpSourceTest {
 
             var docs = source.crawl().toList();
 
-            assertThat(docs).hasSize(HubHandler.LEAF_COUNT);
+            // Every leaf, and the hub the walk started from
+            assertThat(docs).hasSize(HubHandler.LEAF_COUNT + 1).contains(baseUrl + "/hub/");
         }
     }
 

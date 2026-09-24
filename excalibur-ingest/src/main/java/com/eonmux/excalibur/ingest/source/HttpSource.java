@@ -347,7 +347,7 @@ public class HttpSource implements Source {
      * it unwinds. The frontier queue here is dropped as it drains, and the budget stops the walk
      * before {@code visited} can grow without bound.</p>
      *
-     * @return The in-policy document URLs discovered below the base URL
+     * @return The in-policy document URLs: the base URL and those discovered below it
      * @throws SourceException if the crawl is interrupted, or an origin's robots.txt cannot be
      *                         read
      */
@@ -372,7 +372,8 @@ public class HttpSource implements Source {
                 continue;
             }
 
-            if (target.depth() > 0 && !found.add(target.url())) {
+            // The base URL is a document like any other: a depth of zero is the one page it names
+            if (!found.add(target.url())) {
                 continue;
             }
 
