@@ -459,8 +459,9 @@ node mapping, for instance, is read at versions 1 to 3 — its entries name each
 versions 1 and 2 and its chunk at version 3 — and a version 4 mapping is reported unreadable, not
 checked as if it were version 3. A write-ahead log is judged the same way: one whose header names a
 version this build does not read is `UNREADABLE`, and is never trimmed or moved aside — not even
-when its segment is gone; one whose header is damaged is `CORRUPT` and put to an operator, since
-records behind it were acknowledged; and one with no header at all, which a build before the
+when its segment is gone; one whose header is damaged, or whose start was zeroed, with a sound
+record behind it is `CORRUPT` and put to an operator, since records behind it were acknowledged;
+and one with no header at all, which a build before the
 header wrote, has its records weighed against their checksums as always and is reported
 `LEGACY_UNPROTECTED`, because nothing in the file says which format they are in.
 
@@ -3474,10 +3475,14 @@ the record is being read anyway: a compaction, a split, and `excalibur-fsck`. A 
 byte can still cost a single lookup before one of those finds it.
 
 Segment files written before this existed are read at their own format version and left there.
-A checksum written now would vouch for bytes nothing has ever vouched for, so nothing is upgraded
-in place: their entries are still verified where the format allows it, their slot tables are
-reported as unverifiable rather than as sound, and a file gains protection the first time a
-compaction or a split rewrites it. `excalibur-fsck` finds a damaged slot in an older file anyway,
+A checksum written now would vouch for bytes nothing has ever vouched for, so a file with any entry
+in it is never upgraded in place: its entries are still verified where the format allows it, its
+slot table is reported as unverifiable rather than as sound, and it gains protection the first time
+a compaction or a split rewrites it. The one file that is upgraded is one whose slot table has no
+occupied slot at all. Nothing in it can be reached — a record is only ever reached through a slot —
+so the node gives it the current header and slot checksums when it opens it: that writes over no
+record anything can read, and the checksums vouch only that every slot is empty, which is what the
+slot table says. `excalibur-fsck` finds a damaged slot in an older file anyway,
 by comparing each slot against the record it names — the record keeps its own copy of the key
 hash, under the record's own checksum.
 
@@ -3485,11 +3490,17 @@ A segment's write-ahead log, `segment_<N>.wal`, begins with a 16-byte header —
 format version and a CRC-32 over both — so a node can tell a log a newer build wrote from a
 damaged one. A log whose header is sound and names a version this build does not read is refused
 and left exactly as it was: not replayed, not truncated, not given a header of this build's, and
-the node does not start on it. A damaged header is refused as damage, the same way a log damaged
-in the middle is. A log an older build wrote has no header; it is replayed and appended to exactly
-as before, and keeps its format until a compaction or a split gives its segment a fresh log, since
-writing a header into it would move every record and every offset recorded against them. One with
-no record in it is given a header as soon as it is opened.
+the node does not start on it. A damaged header with a sound record anywhere behind it is refused as
+damage, the same way a log damaged in the middle is. With no sound record anywhere in the file, it
+is a header torn as the log was created — the header is forced to disk before any record is
+written behind it — so nothing was lost, and the log is given a fresh header. A log an older build
+wrote has no header; it is replayed and appended to exactly as before, and keeps its format until a
+compaction or a split gives its segment a fresh log, since writing a header into it would move every
+record and every offset recorded against them. One with no record in it is given a header as soon
+as it is opened. "No record" is established, not inferred from the first bytes: a log whose start
+was zeroed, taking the header and the first record with it, reads at offset 0 exactly like an empty
+one, and is refused as damage when a sound record survives behind it, since the header would
+otherwise be written and the next appends would land over acknowledged records.
 
 The same standard covers the index files beside the segments: the HNSW graph, its
 node-to-chunk map, the PQ codebook and the LSH tables each carry a CRC32C over their payload
