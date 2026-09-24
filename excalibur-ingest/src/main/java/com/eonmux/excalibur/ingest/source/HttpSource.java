@@ -1172,15 +1172,23 @@ public class HttpSource implements Source {
      *
      * <p>Deliberately a second, independent check. The API layer validates addresses when a source
      * is registered, but that is one moment in time: DNS can change afterwards, and a crawl runs
-     * later and repeatedly. Re-resolving here is what makes a rebind ineffective, and it is the
-     * check that survives whoever else constructs an {@code HttpSource}.
+     * later and repeatedly. Re-resolving before every request is what stops a name repointed
+     * since registration, and it is the check that survives whoever else constructs an
+     * {@code HttpSource}. What counts as public is {@link PublicAddresses}'s rule, the same one
+     * the API applies.
      *
      * <p>A host that cannot be resolved is refused. Failing open here would turn every transient
      * DNS failure into a bypass.
      *
-     * <p>Note the JVM caches successful lookups (see {@code networkaddress.cache.ttl}), so this
-     * costs a resolution per distinct host rather than per URL — and a very long cache TTL narrows
-     * the protection, which is worth knowing when tuning it.
+     * <p>It does not pin the connection. The client resolves the name again when it connects, and
+     * {@link HttpClient} offers no way to connect to an address already checked while still
+     * sending the name as the {@code Host} header and verifying the server's certificate against
+     * it. Both lookups go through the JVM's address cache ({@code networkaddress.cache.ttl}, 30
+     * seconds by default, whatever TTL the record carries), so they return the same addresses
+     * unless the entry expires in the moment between them - a race that whoever controls an
+     * allow-listed name's DNS can keep retrying across a long crawl. That residual rebinding
+     * window is what an egress firewall on the node closes; a cache lifetime of zero widens it
+     * to every request.
      */
     private boolean isAddressAllowed(String host) {
         if (allowPrivateAddresses) {
@@ -1188,16 +1196,9 @@ public class HttpSource implements Source {
         }
         try {
             for (java.net.InetAddress address : java.net.InetAddress.getAllByName(host)) {
-                if (address.isLoopbackAddress() || address.isAnyLocalAddress()
-                        || address.isLinkLocalAddress() || address.isSiteLocalAddress()
-                        || address.isMulticastAddress()) {
-                    LOG.warn("Refusing {}: it resolves to a non-public address", host);
-                    return false;
-                }
-                // IPv6 unique-local, fc00::/7, which none of the predicates above cover.
-                byte[] bytes = address.getAddress();
-                if (bytes.length == 16 && (bytes[0] & 0xFE) == 0xFC) {
-                    LOG.warn("Refusing {}: it resolves into fc00::/7", host);
+                if (!PublicAddresses.isPublic(address)) {
+                    LOG.warn("Refusing {}: it resolves to the non-public address {}", host,
+                        address.getHostAddress());
                     return false;
                 }
             }

@@ -249,8 +249,11 @@ excalibur.graph.auto-build-max-failure-backoff-seconds=3600
 # absolute directories; a requested root_path is canonicalised first and must resolve
 # inside one of them.
 excalibur.ingest.allowed-roots=
-# URL ingest may only crawl these hosts, and only over http/https. Hosts resolving to
-# loopback, private, link-local or multicast addresses are refused regardless.
+# URL ingest may only crawl these hosts, and only over http/https. Hosts resolving to any
+# non-public address - loopback, private, link-local, carrier-grade NAT, reserved, multicast, or
+# an IPv6 form carrying one of those - are refused regardless, at registration and before every
+# request. List only hosts whose DNS you trust: see "Securing the API" in the README for the
+# rebinding window that remains between that check and the connection.
 excalibur.ingest.allowed-hosts=
 # Bound on concurrently registered ingestion sources. It bounds the source ids that documents
 # may be supplied directly under as well: an id holding supplied documents is an id no crawl can

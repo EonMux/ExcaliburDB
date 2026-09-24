@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.api.security;
 
+import com.eonmux.excalibur.ingest.source.PublicAddresses;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,10 +29,12 @@ import java.util.Set;
  *
  * <h2>URL targets</h2>
  * <p>The scheme must be http or https, the host must be allow-listed, and every
- * address the host resolves to must be a public unicast address. Refusing loopback,
- * any-local, link-local, site-local, unique-local and multicast addresses is what
- * keeps the crawler off cloud metadata endpoints (169.254.169.254) and off internal
- * services that are only reachable from the server.</p>
+ * address the host resolves to must be public by {@link PublicAddresses}'s rule: not
+ * loopback, private, link-local, shared (carrier NAT), unique-local, multicast, reserved or
+ * documentation space, and not an IPv6 form - mapped, compatible, NAT64 or 6to4 - carrying an
+ * IPv4 address that is any of those. That is what keeps the crawler off cloud metadata
+ * endpoints (169.254.169.254) and off internal services that are only reachable from the
+ * server.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is immutable and thread-safe.</p>
@@ -172,31 +176,11 @@ public final class IngestTargetValidator {
             throw new IngestTargetRejectedException(URL_REJECTED);
         }
         for (InetAddress address : addresses) {
-            if (isInternal(address)) {
+            if (!PublicAddresses.isPublic(address)) {
                 LOGGER.warn("Rejected URL ingest request: host {} resolves to internal address {}",
                     host, address.getHostAddress());
                 throw new IngestTargetRejectedException(URL_REJECTED);
             }
         }
-    }
-
-    /**
-     * Decides whether an address belongs to the server's own network.
-     *
-     * @param address The resolved address
-     * @return true when the address must not be crawled
-     */
-    static boolean isInternal(InetAddress address) {
-        if (address.isLoopbackAddress()
-            || address.isAnyLocalAddress()
-            || address.isLinkLocalAddress()
-            || address.isSiteLocalAddress()
-            || address.isMulticastAddress()) {
-            return true;
-        }
-        // IPv6 unique local addresses (fc00::/7) are private but are not covered by
-        // isSiteLocalAddress(), which only recognises the deprecated fec0::/10 range.
-        byte[] bytes = address.getAddress();
-        return bytes.length == 16 && (bytes[0] & 0xFE) == 0xFC;
     }
 }

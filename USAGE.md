@@ -918,7 +918,9 @@ caller did not name has crossed a tenancy boundary with nothing downstream to sh
 
 **`403 Forbidden` — the target is not allow-listed.** A `root_path` outside
 `excalibur.ingest.allowed-roots`, or a `base_url` whose host is not in
-`excalibur.ingest.allowed-hosts` or resolves to a loopback, private, link-local or multicast
+`excalibur.ingest.allowed-hosts` or resolves to an address that is not public — loopback,
+private, link-local, carrier-grade NAT (`100.64.0.0/10`), benchmarking, documentation, reserved,
+multicast or IPv6 unique-local, or an IPv6 form (IPv4-mapped, NAT64, 6to4) carrying such an IPv4
 address. Both lists are empty by default, and empty means disabled.
 
 **`413 Payload Too Large`** — the body is over 1 MB.

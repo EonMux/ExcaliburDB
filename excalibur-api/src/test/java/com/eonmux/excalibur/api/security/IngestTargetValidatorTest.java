@@ -189,6 +189,25 @@ class IngestTargetValidatorTest {
         }
 
         @Test
+        @DisplayName("refuses the ranges the platform's address predicates do not cover")
+        void refusesSharedBenchmarkAndTranslatedRanges() {
+            // Carrier NAT and benchmarking space pass every InetAddress predicate, and a NAT64
+            // address is IPv6 global unicast in form while its gateway delivers it to the IPv4
+            // address it carries - here, the metadata endpoint.
+            assertThatThrownBy(() -> validatorForHost("100.64.0.7").resolveUrl("http://100.64.0.7/"))
+                .isInstanceOf(IngestTargetRejectedException.class);
+            assertThatThrownBy(() -> validatorForHost("198.18.0.1").resolveUrl("http://198.18.0.1/"))
+                .isInstanceOf(IngestTargetRejectedException.class);
+            assertThatThrownBy(() -> validatorForHost("[64:ff9b::a9fe:a9fe]")
+                    .resolveUrl("http://[64:ff9b::a9fe:a9fe]/latest/meta-data/"))
+                .isInstanceOf(IngestTargetRejectedException.class);
+            assertThat(validatorForHost("[64:ff9b::808:808]").resolveUrl("http://[64:ff9b::808:808]/"))
+                .as("the same prefix carrying a public address is allowed, so it is the address "
+                    + "that was refused above and not the allow-list")
+                .isNotNull();
+        }
+
+        @Test
         @DisplayName("refuses a malformed URL")
         void refusesMalformed() {
             IngestTargetValidator validator = validatorForHost("docs.example.com");

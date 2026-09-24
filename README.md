@@ -1929,9 +1929,26 @@ checked against allow-lists that are empty until configured:
 
 An empty list means **disabled**, not unrestricted. A filesystem path is canonicalised before it is
 compared against the roots, so symlinks and `..` cannot escape them. A URL's host must be
-allow-listed and every address it resolves to is rejected if it is loopback, link-local, site-local,
-any-local or multicast, which is what keeps ingestion away from cloud metadata endpoints and
-internal services.
+allow-listed, and it is refused if any address it resolves to is not public: loopback, private
+(`10/8`, `172.16/12`, `192.168/16`), link-local (`169.254/16`, `fe80::/10`), carrier-grade NAT
+(`100.64/10`), `0/8`, benchmarking (`198.18/15`), documentation and reserved space, multicast,
+IPv6 unique-local (`fc00::/7`), and anything outside IPv6 global unicast. An IPv6 address that
+carries an IPv4 one — IPv4-mapped, IPv4-compatible, NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`) —
+is judged by the IPv4 address it carries, so `64:ff9b::a9fe:a9fe` is refused as the metadata
+endpoint it reaches through a NAT64 gateway. This is what keeps ingestion away from cloud metadata
+endpoints and internal services. The same rule is applied when a source is registered and again
+before every request its crawl makes, redirect hops and `robots.txt` included, so a name repointed
+after registration is refused when the crawl next asks for it.
+
+That per-request check resolves the name and the HTTP client then resolves it again to connect:
+`java.net.http.HttpClient` cannot be handed the address that was checked while still sending the
+host name and verifying the server's certificate against it. Both lookups share the JVM's address
+cache (`networkaddress.cache.ttl`, 30 seconds by default, whatever TTL the DNS record carries), so
+they agree unless the entry expires in the moment between them. Whoever controls the DNS of an
+allow-listed host can keep retrying for that moment over a long crawl, so treat the allow-list as
+the list of hosts you trust not to rebind, and put an egress firewall in front of the node where
+internal services must be unreachable whatever DNS says. Setting the cache lifetime to `0` widens
+the window to every request.
 
 ### Audit log
 
@@ -2108,7 +2125,8 @@ curl -X POST http://localhost:8080/v1/ingest \
 `registered` means recorded and started, not finished. `root_path` must resolve inside
 `excalibur.ingest.allowed-roots`, which is empty until configured — a 403 here is the allow-list,
 not the path. The other supported `source_type` is `http`, whose `base_url` is checked against
-`excalibur.ingest.allowed-hosts` and refused if it resolves to any private address.
+`excalibur.ingest.allowed-hosts` and refused if it resolves to any non-public address (see
+[Securing the API](#securing-the-api) for the ranges).
 
 Beyond `source_id` and the target, every field in `config` is optional and left to the source's
 own default when absent. Each is bounded, and a value outside its bound is a 400 naming the field
