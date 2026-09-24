@@ -1039,7 +1039,7 @@ above; nothing resolves them from the file or the environment.
 | --- | --- | --- |
 | `com.eonmux.excalibur.useFallback` | false | Forces the ByteBuffer implementation instead of Panama FFM. For a JVM or a sandbox where native access is unavailable; slower, and the node says so at startup |
 | `com.eonmux.excalibur.enableNativeAccessLog` | true | Whether the Panama detection result is logged. Affects logging only |
-| `com.eonmux.excalibur.graph.pageSize` | 4096 | Page size the graph's `madvise` hints are aligned to. Set it where the platform's pages are not 4 KiB |
+| `com.eonmux.excalibur.graph.pageSize` | *(the platform's page size; 4096 where it cannot be read)* | Page size the graph's `madvise` hints are aligned to, overriding the one `getpagesize` reports. A positive power of two; any other value — zero, a negative, `3000`, text — is ignored with one `WARN` at startup and the platform's page size used, since a hint is an optimisation and never worth a graph that will not open |
 
 
 ### Chunk lexical index

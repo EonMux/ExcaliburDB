@@ -47,7 +47,25 @@ public final class MemoryAdvice {
      */
     private static final MethodHandle MADVISE = lookupMadvise();
 
-    private static final long PAGE_SIZE = detectPageSize();
+    /** The JVM flag that overrides the page size hints are aligned to. */
+    static final String PAGE_SIZE_PROPERTY = "com.eonmux.excalibur.graph.pageSize";
+
+    /** The page size assumed where the platform cannot be asked for its own. */
+    private static final long DEFAULT_PAGE_SIZE = 4096L;
+
+    /**
+     * The page size hints are aligned to: the override when it is usable, else the platform's.
+     *
+     * <p>Resolved once, and never allowed to be anything but a positive power of two. The
+     * alignment below divides by it - zero there throws out of every hint, outside the guard
+     * that keeps a hint from ever being an error, and so out of opening a graph - and a value
+     * that is not a power of two rounds addresses down to boundaries no kernel pages on, so
+     * every hint would be refused. Neither is worth a node that will not start: this is an
+     * optimisation, so a bad override is reported once and the platform's size used instead,
+     * the way the other {@code com.eonmux.excalibur.*} flags fall back rather than refuse.</p>
+     */
+    private static final long PAGE_SIZE =
+        pageSize(System.getProperty(PAGE_SIZE_PROPERTY), platformPageSize());
 
     private MemoryAdvice() {
     }
@@ -71,12 +89,61 @@ public final class MemoryAdvice {
         }
     }
 
-    private static long detectPageSize() {
-        try {
-            return Long.getLong("com.eonmux.excalibur.graph.pageSize", 4096L);
-        } catch (RuntimeException e) {
-            return 4096L;
+    /**
+     * The page size to align hints to, given the override and the platform's own.
+     *
+     * @param configured The value of {@value #PAGE_SIZE_PROPERTY}, or null when it is not set
+     * @param platform   The platform's page size, used when the override is unset or unusable
+     * @return The override when it is a positive power of two, else {@code platform}
+     */
+    static long pageSize(String configured, long platform) {
+        if (configured == null || configured.isBlank()) {
+            return platform;
         }
+        long value;
+        try {
+            value = Long.parseLong(configured.strip());
+        } catch (NumberFormatException e) {
+            value = 0;
+        }
+        if (value > 0 && Long.bitCount(value) == 1) {
+            return value;
+        }
+        LOGGER.warn("-D{}={} is not a positive power of two, so it cannot be a page size; "
+            + "memory hints are aligned to the platform's {}-byte pages instead",
+            PAGE_SIZE_PROPERTY, configured, platform);
+        return platform;
+    }
+
+    /**
+     * The platform's page size, from {@code getpagesize(3)}.
+     *
+     * <p>Asked rather than assumed, because 4 KiB is not universal: Apple silicon pages at
+     * 16 KiB and some arm64 and ppc64 Linux kernels at 64 KiB, and a hint rounded down to a 4 KiB
+     * boundary there starts mid-page and is refused. Where the call is unavailable - no native
+     * access, no such symbol - or answers something that is not a page size, 4 KiB is
+     * assumed, which is right on the platforms most nodes run on.</p>
+     *
+     * @return A positive power of two
+     */
+    static long platformPageSize() {
+        try {
+            Linker linker = Linker.nativeLinker();
+            MethodHandle getpagesize = linker.defaultLookup().find("getpagesize")
+                .map(addr -> linker.downcallHandle(addr,
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT)))
+                .orElse(null);
+            if (getpagesize != null) {
+                long size = (int) getpagesize.invokeExact();
+                if (size > 0 && Long.bitCount(size) == 1) {
+                    return size;
+                }
+            }
+        } catch (Throwable t) {
+            LOGGER.debug("getpagesize unavailable; memory hints assume {}-byte pages",
+                DEFAULT_PAGE_SIZE, t);
+        }
+        return DEFAULT_PAGE_SIZE;
     }
 
     /** Whether hints can actually be applied on this platform. */
