@@ -3,6 +3,7 @@ package com.eonmux.excalibur.ingest.graph;
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.staging.ExtractedTriple;
+import com.eonmux.excalibur.graph.staging.FactLabels;
 import com.eonmux.excalibur.graph.temporal.TemporalFilter;
 import com.eonmux.excalibur.llm.LLMException;
 import com.eonmux.excalibur.llm.client.CircuitBreaker;
@@ -17,7 +18,6 @@ import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -77,8 +77,8 @@ public final class LlmRelationExtractor implements RelationExtractor {
      */
     public static final int DEFAULT_MAX_INPUT_CHARS = 8000;
 
-    /** Longest label this extractor will accept back from the model. */
-    public static final int MAX_LABEL_CHARS = 200;
+    /** Longest label this extractor will accept back from the model; see {@link FactLabels}. */
+    public static final int MAX_LABEL_CHARS = FactLabels.MAX_LABEL_CHARS;
 
     /** Most facts one document may contribute, however many the model returns. */
     public static final int DEFAULT_MAX_TRIPLES = 64;
@@ -233,9 +233,9 @@ public final class LlmRelationExtractor implements RelationExtractor {
                 }
             }
 
-            String subject = normaliseEntity(subjectLabel);
-            String relation = normaliseRelation(relationLabel);
-            String target = normaliseEntity(objectLabel);
+            String subject = FactLabels.entity(subjectLabel);
+            String relation = FactLabels.relation(relationLabel);
+            String target = FactLabels.entity(objectLabel);
             if (subject == null || relation == null || target == null) {
                 LOGGER.debug("dropping a malformed triple from {}: {}", documentKey, object);
                 continue;
@@ -353,43 +353,6 @@ public final class LlmRelationExtractor implements RelationExtractor {
             LOGGER.debug("unreadable confidence in {}: {}", documentKey, confidence.group(1));
             return DEFAULT_CONFIDENCE;
         }
-    }
-
-    /**
-     * An entity label the graph can use, or null if the model returned something that is not one.
-     *
-     * @param label What the model said
-     * @return The cleaned label, or null
-     */
-    private static String normaliseEntity(String label) {
-        if (label == null) {
-            return null;
-        }
-        String cleaned = label.strip();
-        if (cleaned.isEmpty() || cleaned.length() > MAX_LABEL_CHARS) {
-            return null;
-        }
-        return cleaned;
-    }
-
-    /**
-     * A relation label, lower-cased so that "Worked With" and "worked_with" are one relation.
-     *
-     * <p>Relations are a controlled vocabulary in everything but name: a graph in which the same
-     * relationship appears under three spellings cannot be traversed by relation at all.
-     *
-     * @param label What the model said
-     * @return The cleaned label, or null
-     */
-    private static String normaliseRelation(String label) {
-        if (label == null) {
-            return null;
-        }
-        String cleaned = label.strip().toLowerCase(Locale.ROOT).replace(' ', '_');
-        if (cleaned.isEmpty() || cleaned.length() > MAX_LABEL_CHARS) {
-            return null;
-        }
-        return cleaned;
     }
 
     /**
