@@ -432,7 +432,7 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `DELETE` | `/v1/query/{query_id}` | bearer | Cancel an in-progress query, from `/v1/query` or `/v1/graph/query` |
 | `POST` | `/v1/ingest` | bearer | Register an ingestion source |
 | `PUT` | `/v1/ingest` | bearer | Replace a registered source's configuration, keeping its history and documents |
-| `GET` | `/v1/ingest` | bearer | Read back what every source was registered as |
+| `GET` | `/v1/ingest` | bearer | Read back what every source was registered as, or one with `?source_id=` |
 | `DELETE` | `/v1/ingest` | bearer | Stop crawling a source, keeping its documents |
 | `DELETE` | `/v1/ingest/run` | bearer | Stop the ingestion run in flight, keeping the source registered |
 | `GET` | `/v1/ingest/status` | bearer | Per-source ingestion status |
@@ -905,10 +905,10 @@ address. Both lists are empty by default, and empty means disabled.
 (256 by default). Not the rate limiter's `429`, and it carries no `Retry-After`: it clears when a
 source is deregistered, not when time passes.
 
-**`405 Method Not Allowed` — a method other than GET, POST or DELETE**
+**`405 Method Not Allowed` — a method other than GET, POST, PUT or DELETE**
 
 ```json
-{"error": "Method Not Allowed - Use GET to read the registrations, POST to register a source or DELETE to stop crawling one", "code": "method_not_allowed"}
+{"error": "Method Not Allowed - Use GET to read the registrations, POST to register a source, PUT to replace its configuration or DELETE to stop crawling it", "code": "method_not_allowed"}
 ```
 
 Unauthenticated, and charged against the read budget: which handler serves a request is decided

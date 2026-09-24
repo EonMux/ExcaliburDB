@@ -1445,7 +1445,7 @@ separate so a burst of writes cannot starve ordinary reads.
 | `POST` | `/v1/documents` | bearer | mutate | Index documents supplied in the request, for a caller that holds the content rather than a target to crawl |
 | `POST` | `/v1/ingest` | bearer | mutate | Register an ingestion source and start indexing it |
 | `PUT` | `/v1/ingest` | bearer | mutate | Replace a registered source's configuration, keeping its id, status history, schedule and indexed documents. 404 for an unknown source, 409 while it is being crawled or reindexed |
-| `GET` | `/v1/ingest` | bearer | read | Read back what each source was registered as, or one named source |
+| `GET` | `/v1/ingest` | bearer | read | Read back what each source was registered as, or one with `?source_id=` |
 | `DELETE` | `/v1/ingest` | bearer | mutate | Stop crawling a source. Its indexed documents are kept |
 | `DELETE` | `/v1/ingest/run` | bearer | mutate | Stop the ingestion run in flight and leave the source registered |
 | `GET` | `/v1/ingest/status` | bearer | read | Ingestion state per source, or all sources |
