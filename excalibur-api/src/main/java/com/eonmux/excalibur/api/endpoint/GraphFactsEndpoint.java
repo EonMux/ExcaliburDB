@@ -2,6 +2,7 @@ package com.eonmux.excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import com.eonmux.excalibur.api.audit.AuditLog;
 import com.eonmux.excalibur.api.bootstrap.GraphErasureService;
 import com.eonmux.excalibur.api.bootstrap.GraphTenant;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
@@ -307,6 +308,10 @@ public final class GraphFactsEndpoint implements HttpHandler {
             sendError(exchange, 400, e.getMessage());
             return;
         }
+        // How the facts were named, never the triple itself: a retraction is an erasure, and
+        // the audit trail must not keep the labels it removes.
+        AuditLog.target(exchange, "namespace", namespace.value());
+        AuditLog.target(exchange, "retract_by", retraction.factId() >= 0 ? "fact_id" : "triple");
 
         try {
             // Never creates the namespace: one that does not exist holds no facts to retract,
@@ -349,6 +354,8 @@ public final class GraphFactsEndpoint implements HttpHandler {
         }
         LOGGER.info("facts {} retracted from namespace {} as erasure requests {}", factIds,
             namespace, requestIds);
+        AuditLog.target(exchange, "fact_ids", List.copyOf(factIds));
+        AuditLog.target(exchange, "request_ids", List.copyOf(requestIds));
 
         GraphErasureService.ErasureOutcome outcome;
         try {

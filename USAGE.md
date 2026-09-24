@@ -449,7 +449,8 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `GET` | `/v1/graph/entities/{entity_id}` | bearer | One entity: its name, its degree, and each relation's count in each direction. `404` for an id the served graph does not hold |
 | `GET` | `/v1/graph/entities/{entity_id}/edges` | bearer | An entity's edges, filtered by `relation`, `direction` and `as_of`, each with its interval, confidence and provenance |
 | `POST` | `/v1/graph/facts` | bearer | Stage facts a caller states, as `USER_ASSERTED`, returning their fact ids. `201`; served once the graph is next built |
-| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | Retract an asserted fact - by id, or every one stating a `subject`, `relation` and `object` given as query parameters. `202`; served until a compaction applies it, which `compact=true` runs now |
+| `DELETE` | `/v1/graph/facts` | bearer | Retract every asserted fact stating the `subject`, `relation` and `object` given as query parameters. `202`; served until a compaction applies it, which `compact=true` runs now |
+| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | Retract one asserted fact, by its id. `202`; served until a compaction applies it, which `compact=true` runs now |
 | `POST` | `/v1/graph/build` | bearer | Start publishing the facts ingestion has staged as the served graph. `202`; the build runs behind the response. `409` while one is already running |
 | `DELETE` | `/v1/graph/build` | bearer | Stop the build in progress. It publishes nothing; the namespace keeps the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | What the build is doing, what the last one published, whether the served graph is behind what is staged, and what the node's automatic build is doing about it |
@@ -480,7 +481,8 @@ each answer any other method with `405` rather than `401`, and a wrong method on
 costs a read, not a mutation. A collection and its members are separate paths with separate
 methods: `/v1/query` serves `POST` and `/v1/query/{query_id}` serves `DELETE`, so `DELETE /v1/query`
 with no id is a `405` naming `POST`; `/v1/erasure` and `/v1/graph/erasure` serve `POST` and their
-members `GET`; `/v1/graph/facts` serves `POST` and `/v1/graph/facts/{fact_id}` serves `DELETE`;
+members `GET`; `/v1/graph/facts` serves `POST` and `DELETE` (by subject, relation and object) and
+`/v1/graph/facts/{fact_id}` serves `DELETE`;
 `/v1/graph/namespaces` serves `GET` and `/v1/graph/namespaces/{namespace}` serves `PUT` and
 `DELETE`, so a `DELETE` of the collection or a `GET` of one namespace is a `405` as well. A path
 that is not registered at all — including anything deeper than one segment beneath a collection —
@@ -2975,7 +2977,7 @@ limited, because the guard runs inside the audit and not before it. Reads are no
 | `erasure.graph` | `POST /v1/graph/erasure` |
 | `compaction.start`, `compaction.cancel` | `POST`, `DELETE /v1/compact` |
 | `graph.build.start`, `graph.build.cancel` | `POST`, `DELETE /v1/graph/build` |
-| `graph.facts.assert`, `graph.facts.retract` | `POST /v1/graph/facts`, `DELETE /v1/graph/facts/{fact_id}` |
+| `graph.facts.assert`, `graph.facts.retract` | `POST /v1/graph/facts`; `DELETE /v1/graph/facts` and `DELETE /v1/graph/facts/{fact_id}` |
 | `graph.namespace.create`, `graph.namespace.delete` | `PUT`, `DELETE /v1/graph/namespaces/{namespace}` |
 | `query.cancel` | `DELETE /v1/query/{query_id}` |
 | `node.drain`, `node.undrain` | `POST`, `DELETE /v1/drain` |
@@ -2990,7 +2992,9 @@ vouches for. The event's timestamp is when the request finished.
 
 `audit_targets` names identifiers and counts, never content. A graph erasure asked by name records
 `"entity_by": "name"` and the `request_id` it was given, not the name; a document erasure records
-its source and `documents_named`, not which documents. An audit trail is kept longer and read more
+its source and `documents_named`, not which documents; a fact retraction records
+`"retract_by": "fact_id"` or `"triple"` and the `fact_ids` and `request_ids` it resolved to, never
+the subject, relation or object. An audit trail is kept longer and read more
 widely than the data it describes, and copying an erased name into it would undo the erasure it
 records.
 

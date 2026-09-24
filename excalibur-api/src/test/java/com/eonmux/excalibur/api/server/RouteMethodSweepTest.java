@@ -147,7 +147,7 @@ class RouteMethodSweepTest {
         allowByRequest.put("PUT /v1/erasure/receipt-1", "GET");
         allowByRequest.put("GET /v1/graph/erasure", "POST");
         allowByRequest.put("DELETE /v1/graph/erasure/5", "GET");
-        allowByRequest.put("GET /v1/graph/facts", "POST");
+        allowByRequest.put("GET /v1/graph/facts", "DELETE, POST");
         allowByRequest.put("POST /v1/graph/facts/7", "DELETE");
         allowByRequest.put("DELETE /v1/graph/entities", "GET");
         allowByRequest.put("POST /v1/graph/entities/1", "GET");

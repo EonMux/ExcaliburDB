@@ -100,6 +100,8 @@ final class EndpointBanner {
             lines.add(route("GET", "/v1/graph/entities/{id}/edges",
                 "One entity's edges, with provenance"));
             lines.add(route("POST", "/v1/graph/facts", "Stage facts a caller states"));
+            lines.add(route("DELETE", "/v1/graph/facts",
+                "Retract asserted facts by subject, relation and object"));
             lines.add(route("DELETE", "/v1/graph/facts/{fact_id}", "Retract an asserted fact"));
             lines.add(route("GET", "/v1/graph/namespaces", "Every namespace on this node"));
             lines.add(route("PUT", "/v1/graph/namespaces/{namespace}", "Create a namespace"));

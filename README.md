@@ -1465,7 +1465,8 @@ separate so a burst of writes cannot starve ordinary reads.
 | `GET` | `/v1/graph/entities/{id}` | bearer | read | One entity, its edges counted by relation and direction. `404` for an id the served graph does not hold |
 | `GET` | `/v1/graph/entities/{id}/edges` | bearer | read | An entity's edges with their intervals and provenance, narrowed by `relation`, `direction` (`out`, `in`, `both`) and `as_of` — paged by `limit` and `cursor` |
 | `POST` | `/v1/graph/facts` | bearer | mutate | Stage facts a caller states, each under a fact id of its own. `201`; they are served after the next build |
-| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | mutate | Retract an asserted fact, or every one stating `?subject=&relation=&object=`, as a source-scoped erasure. `202`; `compact=true` applies it now |
+| `DELETE` | `/v1/graph/facts` | bearer | mutate | Retract every asserted fact stating `?subject=&relation=&object=`, each as a source-scoped erasure. `202`; `compact=true` applies it now |
+| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | mutate | Retract one asserted fact, by its id, as a source-scoped erasure. `202`; `compact=true` applies it now |
 | `GET` | `/v1/graph/namespaces` | bearer | read | The namespaces on disk, a page at a time, and what each one holds and owes |
 | `PUT` | `/v1/graph/namespaces/{namespace}` | bearer | mutate | Create a namespace. `201` when created, `200` when it already existed |
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | mutate | Remove a namespace entirely. Irreversible, and `409` for `shared` |

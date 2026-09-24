@@ -1182,17 +1182,23 @@ final class EndpointRegistrar {
                     guard.protect(RequestGuard.Access.READ,
                         new GraphEntitiesEndpoint(in.graphTenants()))), notFound)));
             // Both mutations: asserting stages facts the next build serves, and retracting
-            // records an erasure obligation. The collection is asserted into and each member is
-            // one fact, so the two are separate method tables.
+            // records an erasure obligation. The collection is asserted into, and retracted from
+            // by subject, relation and object; each member is one fact, retracted by its id. So
+            // the two are separate method tables, and a retraction is audited the same way
+            // whichever of them it arrives by.
             GraphFactsEndpoint facts = new GraphFactsEndpoint(in.graphTenants());
             target.createContext(GraphFactsEndpoint.PATH, wrapHandler(
                 collectionAndMember(GraphFactsEndpoint.PATH,
                     createMethodRouter(
-                        Map.of("POST", audited("graph.facts.assert",
-                            guard.protect(RequestGuard.Access.MUTATE, facts))),
+                        Map.of(
+                            "POST", audited("graph.facts.assert",
+                                guard.protect(RequestGuard.Access.MUTATE, facts)),
+                            "DELETE", audited("graph.facts.retract",
+                                guard.protect(RequestGuard.Access.MUTATE, facts))),
                         guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
-                            "Method Not Allowed - Use POST /v1/graph/facts to assert facts or "
-                                + "DELETE /v1/graph/facts/{fact_id} to retract one"))),
+                            "Method Not Allowed - Use POST /v1/graph/facts to assert facts, or "
+                                + "DELETE with ?subject=&relation=&object= to retract every "
+                                + "one stating that triple"))),
                     createMethodRouter(
                         Map.of("DELETE", audited("graph.facts.retract",
                             guard.protect(RequestGuard.Access.MUTATE, facts))),
