@@ -13,6 +13,7 @@ import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.QueryParams;
 import com.eonmux.excalibur.api.protocol.RequestBody;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
+import com.eonmux.excalibur.api.protocol.UnknownFields;
 import com.eonmux.excalibur.graph.erasure.ErasureScope;
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
@@ -209,6 +210,8 @@ public final class GraphFactsEndpoint implements HttpHandler {
         if (!request.containsKey("facts")) {
             return List.of(factFrom(request, "the fact"));
         }
+        UnknownFields.refuse(memberNames(request), List.of("facts"), "",
+            "a request asserting a list of facts");
         if (!(request.get("facts") instanceof List<?> listed) || listed.isEmpty()
                 || listed.size() > MAX_FACTS) {
             throw new IllegalArgumentException("'facts' must be an array of 1 to " + MAX_FACTS
@@ -226,6 +229,8 @@ public final class GraphFactsEndpoint implements HttpHandler {
     }
 
     private static AssertedFact factFrom(Map<?, ?> fact, String which) {
+        UnknownFields.refuse(memberNames(fact), FACT_FIELDS,
+            "the fact".equals(which) ? "" : which + ".", "a fact");
         int validFrom = day(fact, "valid_from", which, TemporalFilter.UNDATED);
         int validTo = day(fact, "valid_to", which, TemporalFilter.OPEN);
         try {
@@ -234,6 +239,14 @@ public final class GraphFactsEndpoint implements HttpHandler {
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException(which + ": " + e.getMessage(), e);
         }
+    }
+
+    /** Every member a fact takes. */
+    private static final List<String> FACT_FIELDS =
+        List.of("subject", "relation", "object", "valid_from", "valid_to", "confidence");
+
+    private static List<String> memberNames(Map<?, ?> object) {
+        return object.keySet().stream().map(String::valueOf).toList();
     }
 
     private static String text(Map<?, ?> fact, String field, String which) {

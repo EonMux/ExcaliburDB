@@ -226,6 +226,43 @@ class DocumentUpsertEndpointTest {
         }
 
         @Test
+        @DisplayName("refuses a misspelt member of a document, naming it, rather than ignoring it")
+        void refusesAnUnknownDocumentMember() throws IOException {
+            // Read as absent, contentType would index an HTML page as plain text, markup and all
+            HttpExchange exchange = post("{\"source_id\": \"notes\", \"documents\": ["
+                + "{\"document_id\": \"a.html\", \"text\": \"<p>x</p>\", "
+                + "\"contentType\": \"text/html\"}]}");
+
+            endpoint.handle(exchange);
+
+            verify(exchange).sendResponseHeaders(eq(400), anyLong());
+            assertThat(body.toString(StandardCharsets.UTF_8))
+                .contains("documents[0].contentType").contains("content_type");
+        }
+
+        @Test
+        @DisplayName("refuses a member the request itself does not take")
+        void refusesAnUnknownRequestMember() throws IOException {
+            HttpExchange exchange = post("{\"source_id\": \"notes\", \"namespace\": \"t\", "
+                + "\"documents\": [{\"document_id\": \"a.md\", \"text\": \"x\"}]}");
+
+            endpoint.handle(exchange);
+
+            verify(exchange).sendResponseHeaders(eq(400), anyLong());
+            assertThat(body.toString(StandardCharsets.UTF_8)).contains("'namespace'");
+        }
+
+        @Test
+        @DisplayName("refuses a body that is not one well-formed object")
+        void refusesAMalformedBody() throws IOException {
+            HttpExchange exchange = post("{\"source_id\": \"notes\" \"documents\": []}");
+
+            endpoint.handle(exchange);
+
+            verify(exchange).sendResponseHeaders(eq(400), anyLong());
+        }
+
+        @Test
         @DisplayName("refuses a document with no text, rather than indexing an empty one")
         void refusesATextlessDocument() throws IOException {
             HttpExchange exchange = post("{\"source_id\": \"notes\", \"documents\": ["

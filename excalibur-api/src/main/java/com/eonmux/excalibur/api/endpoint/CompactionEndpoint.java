@@ -6,10 +6,12 @@ import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.RequestBody;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
+import com.eonmux.excalibur.api.protocol.UnknownFields;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -143,14 +145,9 @@ public final class CompactionEndpoint implements HttpHandler {
         if (body == null || body.isBlank()) {
             return false;
         }
-        for (String name : JsonText.memberNames(body,
-                "The request body must be empty or a single well-formed JSON object")) {
-            if (!FORCE.equals(name)) {
-                throw new IllegalArgumentException("Unknown field '" + name
-                    + "': a compaction request takes only force. Correct the name, or remove "
-                    + "the field.");
-            }
-        }
+        UnknownFields.refuse(JsonText.memberNames(body,
+                "The request body must be empty or a single well-formed JSON object"),
+            List.of(FORCE), "", "a compaction request");
         return JsonText.booleanValue(body, FORCE, false);
     }
 }

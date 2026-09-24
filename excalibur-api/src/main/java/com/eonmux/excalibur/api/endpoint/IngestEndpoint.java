@@ -18,6 +18,7 @@ import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.bootstrap.NamespaceRefusedException;
 import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
+import com.eonmux.excalibur.api.protocol.UnknownFields;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.tenancy.NamespaceId;
 import com.eonmux.excalibur.core.logging.StructuredLoggingHelper;
@@ -542,7 +543,7 @@ public class IngestEndpoint implements HttpHandler {
      * @throws IllegalArgumentException if the body does not describe a source this node builds
      */
     private static SourceDescriptor parseRequest(String json, NamespaceId namespace) {
-        rejectUnknownFields(
+        UnknownFields.refuse(
             JsonText.memberNames(json, "The request body must be a single well-formed JSON object"),
             REQUEST_FIELDS, List.of(), "", "a registration");
 
@@ -581,7 +582,7 @@ public class IngestEndpoint implements HttpHandler {
                 rejectFields(configJson, HTTP_ONLY_FIELDS, "an HTTP crawl only: a directory "
                     + "walk fetches nothing over a wire, so it has no request to time, no "
                     + "response body to bound and no agent to identify itself as");
-                rejectUnknownFields(configFields, FILESYSTEM_FIELDS, HTTP_ONLY_FIELDS,
+                UnknownFields.refuse(configFields, FILESYSTEM_FIELDS, HTTP_ONLY_FIELDS,
                     "config.", "a filesystem source");
                 putFilesystemTunables(configJson, config);
                 break;
@@ -595,7 +596,7 @@ public class IngestEndpoint implements HttpHandler {
                 rejectFields(configJson, FILESYSTEM_ONLY_FIELDS, "a filesystem walk only: an "
                     + "HTTP crawl matches URLs, which have neither a file extension nor a "
                     + "directory, no symbolic links, and no local file to size");
-                rejectUnknownFields(configFields, HTTP_FIELDS, FILESYSTEM_ONLY_FIELDS,
+                UnknownFields.refuse(configFields, HTTP_FIELDS, FILESYSTEM_ONLY_FIELDS,
                     "config.", "an http source");
                 putHttpTunables(configJson, config);
                 break;
@@ -638,42 +639,6 @@ public class IngestEndpoint implements HttpHandler {
     private static final List<String> HTTP_FIELDS = Stream.concat(
         Stream.of("source_id", SourceFactory.BASE_URL, SourceFactory.MAX_DEPTH),
         HTTP_ONLY_FIELDS.stream()).toList();
-
-    /**
-     * Refuses fields no source reads, naming every one of them.
-     *
-     * <p>Refused rather than ignored, for the reason {@link #rejectFields} gives: a misspelled
-     * {@code include_extensions} reads as absent to every accessor, so the request would be
-     * answered {@code 200 registered} and the whole root crawled with the filter the caller
-     * believes it set nowhere in effect.</p>
-     *
-     * @param present   The member names the object carries
-     * @param takes     The names this object takes, listed back to the caller
-     * @param explained Names that are not taken here but are answered elsewhere: the other
-     *                  source type's settings, which {@link #rejectFields} refuses with the reason
-     *                  when they carry a value and lets pass as the absence an explicit
-     *                  {@code null} means everywhere else
-     * @param prefix    What the names are qualified by in the message: {@code "config."} or
-     *                  nothing
-     * @param what      What the object belongs to, for the message
-     * @throws IllegalArgumentException if any member is neither taken nor explained
-     */
-    private static void rejectUnknownFields(List<String> present, List<String> takes,
-                                            List<String> explained, String prefix, String what) {
-        StringJoiner unknown = new StringJoiner("', '", "'", "'");
-        int count = 0;
-        for (String name : present) {
-            if (!takes.contains(name) && !explained.contains(name)) {
-                unknown.add(prefix + name);
-                count++;
-            }
-        }
-        if (count > 0) {
-            throw new IllegalArgumentException((count == 1 ? "Unknown field " : "Unknown fields ")
-                + unknown + ": " + what + " takes " + String.join(", ", takes)
-                + ". Correct the name, or remove the field.");
-        }
-    }
 
     /**
      * Reads the settings that shape a filesystem walk.

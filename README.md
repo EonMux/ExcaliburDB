@@ -3284,7 +3284,9 @@ cleaned and bounded exactly as extracted ones are: surrounding space removed, th
 lower-cased with spaces turned to underscores, each at most 200 characters, and never the
 `(erased N)` placeholder an erasure leaves in place of a name. `valid_from` and `valid_to` are ISO
 dates, absent or null for no known start or no end; `confidence` is a fraction, 1 when absent. Any
-malformed fact is a 400 naming it, and nothing in the request is staged.
+malformed fact is a 400 naming it, and nothing in the request is staged. So is a member a fact does
+not take, and one beside `facts` in a list request: a misspelt `valid_form` would otherwise state
+the fact as holding over all of time.
 
 **Staged is not served.** A fact reaches `/v1/graph/query` and `/v1/graph/entities` once the
 namespace's graph is next built, exactly as an extracted fact does — the edge store is rebuilt

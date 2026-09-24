@@ -1328,8 +1328,10 @@ versions of one document published in quick succession are reported to the graph
 they were published, and a version already superseded when its turn comes is skipped.
 
 **Error — `400 Bad Request`** — no `source_id`, no `documents`, more than 256 of them, a document
-with no `document_id`, a `document_id` over 512 characters, no `text` or text that is not text, or
-the same `document_id` twice in one request.
+with no `document_id`, a `document_id` over 512 characters, no `text` or text that is not text,
+the same `document_id` twice in one request, or a member the request or a document does not take
+(named in the error, as `documents[0].contentType`: read as absent, it would index an HTML page as
+plain text).
 
 **Error — `409 Conflict`** — either the `source_id` is a registered crawl source
 (`source_kind_conflict`), or a run over that source is already in flight (`conflict`). The first

@@ -196,7 +196,13 @@ class GraphFactsEndpointTest {
                         + "\"confidence\": 1.5}",
                     "{\"subject\": \"A\", \"relation\": \"r\", \"object\": \"B\", "
                         + "\"confidence\": \"high\"}",
-                    "{\"facts\": [" + ADA_WORKED_WITH_BABBAGE + ", {\"subject\": \"A\"}]}")) {
+                    "{\"facts\": [" + ADA_WORKED_WITH_BABBAGE + ", {\"subject\": \"A\"}]}",
+                    // A misspelt member would read as absent: an undated fact, a default confidence
+                    "{\"subject\": \"A\", \"relation\": \"r\", \"object\": \"B\", "
+                        + "\"valid_form\": \"2001-01-01\"}",
+                    "{\"facts\": [{\"subject\": \"A\", \"relation\": \"r\", \"object\": \"B\", "
+                        + "\"confidance\": 0.4}]}",
+                    "{\"facts\": [" + ADA_WORKED_WITH_BABBAGE + "], \"namespace\": \"x\"}")) {
                 GraphRouteFixture.Response refused = fixture.assertFacts(body);
                 assertThat(refused.status()).as(body).isEqualTo(400);
                 assertThat(refused.string("error")).as(body).isNotBlank();

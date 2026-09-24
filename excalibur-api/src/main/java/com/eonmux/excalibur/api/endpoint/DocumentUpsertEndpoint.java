@@ -7,6 +7,7 @@ import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.RequestBody;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
+import com.eonmux.excalibur.api.protocol.UnknownFields;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.processor.TextContent;
 import com.eonmux.excalibur.ingest.source.InlineSource;
@@ -67,6 +68,13 @@ public final class DocumentUpsertEndpoint implements HttpHandler {
 
     /** The field carrying the documents. */
     private static final String DOCUMENTS = "documents";
+
+    /** Every member a request takes. */
+    private static final List<String> REQUEST_FIELDS = List.of(SOURCE_ID, DOCUMENTS);
+
+    /** Every member a document takes. */
+    private static final List<String> DOCUMENT_FIELDS =
+        List.of("document_id", "text", "content_type", "last_modified_millis");
 
     private final IngestionOrchestrator orchestrator;
     private final SourceRegistry crawlSources;
@@ -230,6 +238,9 @@ try {
      * @throws IllegalArgumentException if it is absent or empty
      */
     private static String requireSourceId(String body) {
+        UnknownFields.refuse(
+            JsonText.memberNames(body, "The request body must be a single well-formed JSON object"),
+            REQUEST_FIELDS, "", "a document upsert");
         String sourceId = JsonText.string(body, SOURCE_ID);
         if (sourceId == null || sourceId.isEmpty()) {
             throw new IllegalArgumentException("Field '" + SOURCE_ID + "' is required");
@@ -259,7 +270,11 @@ try {
                 + maxDocuments + " documents: " + raw.length);
         }
         List<InlineSource.Document> documents = new ArrayList<>(raw.length);
-        for (String element : raw) {
+        for (int i = 0; i < raw.length; i++) {
+            String element = raw[i];
+            UnknownFields.refuse(JsonText.memberNames(element,
+                    "Field '" + DOCUMENTS + "' must hold well-formed JSON objects"),
+                DOCUMENT_FIELDS, DOCUMENTS + "[" + i + "].", "a document");
             String documentId = JsonText.string(element, "document_id");
             if (documentId == null || documentId.isEmpty()) {
                 throw new IllegalArgumentException(
