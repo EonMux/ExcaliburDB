@@ -92,7 +92,7 @@ LABEL org.opencontainers.image.title="ExcaliburDB" \
       org.opencontainers.image.source="https://github.com/EonMux/ExcaliburDB" \
       org.opencontainers.image.licenses="Apache-2.0"
 
-# curl is the HEALTHCHECK's only dependency. The Temurin JRE already carries every module the
+# curl is the HEALTHCHECK's only dependency (docker/excalibur-healthcheck). The Temurin JRE already carries every module the
 # node needs - jdk.httpserver for the API, java.net.http for the LLM client, java.management
 # for the JMX metrics, jdk.incubator.vector for the SIMD kernels - so nothing else is added.
 RUN apt-get update \
@@ -158,13 +158,19 @@ VOLUME ["/var/lib/excalibur"]
 
 EXPOSE 8080
 
-# /health/ready, not /health. /health is liveness and answers 200 while the node is still
-# opening segments or has been drained; readiness answers 200 or 503 on whether this node can
-# serve a query, and it is the one route that is unauthenticated by policy rather than by
-# accident, so the probe needs no token. Its port follows EXCALIBUR_PORT, which is what
-# ListenPort reads first. The start period covers segment recovery on a large data directory.
+# Liveness, from the address the node actually bound. The node writes its liveness URL into
+# its data directory's lock file (/var/lib/excalibur/.excalibur-lock, `health-url=`) once its
+# listener is up - https when TLS is on, the port it took however it was configured, the
+# interface it bound, loopback for a wildcard - and the script reads it from there, so no
+# setting has to be repeated here and none can disagree. /health rather than /health/ready: a
+# health check drives restarts, and a drained or still-recovering node is alive; readiness is
+# for whatever routes traffic. /health is unauthenticated by policy, so the probe needs no token.
+# The start period covers segment recovery on a large data directory. See the script for TLS
+# client certificates.
+COPY --chown=root:root --chmod=755 docker/excalibur-healthcheck \
+     /opt/excalibur/bin/excalibur-healthcheck
 HEALTHCHECK --interval=15s --timeout=5s --start-period=90s --retries=3 \
-  CMD curl -fsS -o /dev/null "http://127.0.0.1:${EXCALIBUR_PORT:-8080}/health/ready" || exit 1
+  CMD ["/opt/excalibur/bin/excalibur-healthcheck"]
 
 # exec, so the JVM is pid 1 and SIGTERM reaches its shutdown hook; the hook closes the storage
 # engine and the chunk index, which is what publishes the tail of an ingestion run. The hook

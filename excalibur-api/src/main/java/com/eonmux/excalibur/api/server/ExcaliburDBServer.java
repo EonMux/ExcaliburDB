@@ -847,6 +847,63 @@ public class ExcaliburDBServer {
     }
 
     /**
+     * Where a probe on this host reaches the liveness route.
+     *
+     * <p>From the bound socket, like {@link #baseUrl()}, so it carries the scheme, the port and
+     * the interface the listener really has. The one difference is a wildcard bind: the wildcard
+     * is what the node listens on but not an address anything can connect to, so the loopback
+     * address of the same family - on every interface the wildcard covers - stands in for it.
+     * {@code /health} and not {@code /health/ready}: a process supervisor asks whether the
+     * process is alive, and a drained or still-recovering node is alive; restarting it would
+     * only lose the recovery it is part-way through.</p>
+     *
+     * @return The liveness URL, or null if the server is not started
+     */
+    public String livenessProbeUrl() {
+        HttpServer current = server;
+        if (current == null) {
+            return null;
+        }
+        return probeUrlOf(current instanceof HttpsServer, current.getAddress());
+    }
+
+    /**
+     * Spells the liveness URL a local probe uses for a listening address.
+     *
+     * @param tls     Whether the listener serves TLS
+     * @param address The bound address
+     * @return The {@code /health} URL, on loopback when the address is a wildcard
+     */
+    static String probeUrlOf(boolean tls, InetSocketAddress address) {
+        InetAddress host = address.getAddress();
+        InetSocketAddress reachable = host.isAnyLocalAddress()
+            ? new InetSocketAddress(loopbackLike(host), address.getPort())
+            : address;
+        return urlOf(tls, reachable) + "/health";
+    }
+
+    /**
+     * Returns the loopback address of the same family as a wildcard.
+     *
+     * @param wildcard {@code 0.0.0.0} or {@code ::}
+     * @return {@code 127.0.0.1} or {@code ::1}
+     */
+    private static InetAddress loopbackLike(InetAddress wildcard) {
+        byte[] loopback = new byte[wildcard.getAddress().length];
+        if (wildcard instanceof Inet6Address) {
+            loopback[loopback.length - 1] = 1;
+        } else {
+            loopback[0] = 127;
+            loopback[loopback.length - 1] = 1;
+        }
+        try {
+            return InetAddress.getByAddress(loopback);
+        } catch (java.net.UnknownHostException e) {
+            throw new IllegalStateException("A 4- or 16-byte address was refused", e);
+        }
+    }
+
+    /**
      * Spells a listening address as a URL.
      *
      * @param tls     Whether the listener serves TLS

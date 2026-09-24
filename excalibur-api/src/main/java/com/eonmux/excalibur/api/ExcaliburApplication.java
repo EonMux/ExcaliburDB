@@ -21,6 +21,8 @@ import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.config.ConfigLoader;
 import com.eonmux.excalibur.config.ConfigValidation;
 import com.eonmux.excalibur.config.ShardConfig;
+import com.eonmux.excalibur.core.datadir.DataDirectoryLock;
+import com.eonmux.excalibur.core.datadir.InterruptedRestore;
 import com.eonmux.excalibur.core.memory.ForeignMemoryBootstrap;
 import com.eonmux.excalibur.metrics.Metrics;
 import com.eonmux.excalibur.metrics.MetricsRegistry;
@@ -89,6 +91,9 @@ public final class ExcaliburApplication {
      */
     public static final String DEFAULT_DATA_DIR = "data";
 
+    /** What the node calls itself in its data directory's lock file. */
+    static final String NODE_LOCK_HOLDER = "excalibur node";
+
     private final Config config;
 
     /**
@@ -156,6 +161,16 @@ public final class ExcaliburApplication {
 
     /** Where segments, indexes and the lexical index live. */
     private Path dataDirectory;
+
+    /**
+     * This process's exclusive claim on {@link #dataDirectory}.
+     *
+     * <p>Never released: the operating system releases it when the process exits, and releasing
+     * it any earlier - after a shutdown that left a drain running, say - would let a second node
+     * in while this one could still be writing. Held in a field so the channel it was taken
+     * through stays reachable for the whole life of the process.</p>
+     */
+    private final DataDirectoryLock dataDirectoryLock;
 
     /**
      * Main entry point.
@@ -377,9 +392,11 @@ public final class ExcaliburApplication {
         this.apiSecurity.requireSafeToServe();
         LOGGER.info("API security policy: {}", apiSecurity);
 
-        // Initialize data directory
+        // Initialize data directory, and claim it before anything in it is read: a second node
+        // on the same directory is refused here rather than after both have mapped its segments.
         Path dataDir = initializeDataDirectory();
         this.dataDirectory = dataDir;
+        this.dataDirectoryLock = claimDataDirectory(dataDir);
 
         // Build the storage stack: arena, storage engine with its HNSW initializer
         // installed before start(), volume manager and index orchestrator.
@@ -515,6 +532,60 @@ public final class ExcaliburApplication {
         return dataDir;
     }
 
+
+    /**
+     * Takes this node's exclusive claim on its data directory.
+     *
+     * <p>Two nodes on one directory each map the same segments and publish the same catalog, and
+     * the directory ends up describing neither; so do a node and an {@code excalibur-fsck
+     * --repair} or an {@code excalibur-backup restore}. All of them take this lock, and the
+     * second to arrive is refused with the directory and the holder's pid in the message.</p>
+     *
+     * <p>A directory holding the journal of a restore that did not finish is refused as well,
+     * after the lock is taken so a restore still running is told apart from one that stopped:
+     * it would hold the lock. Its files may be any mixture of the old contents and the image,
+     * and running the restore again is what completes it.</p>
+     *
+     * @param dataDir The data directory, which exists
+     * @return The claim, held for the life of the process
+     * @throws com.eonmux.excalibur.core.datadir.DataDirectoryLockedException if another process
+     *                                                                        holds the directory
+     * @throws IOException if the lock cannot be taken, or a restore was interrupted there
+     */
+    static DataDirectoryLock claimDataDirectory(Path dataDir) throws IOException {
+        DataDirectoryLock lock = DataDirectoryLock.acquire(dataDir, NODE_LOCK_HOLDER);
+        try {
+            InterruptedRestore.requireNoneIn(dataDir);
+        } catch (IOException e) {
+            try {
+                lock.close();
+            } catch (IOException release) {
+                e.addSuppressed(release);
+            }
+            throw e;
+        }
+        LOGGER.info("Data directory {} claimed ({})", dataDir, DataDirectoryLock.FILE_NAME);
+        return lock;
+    }
+
+    /**
+     * Records in the lock file where this node is listening.
+     *
+     * <p>Read by the container's health check, which has only the environment to go on and would
+     * otherwise have to reconstruct the scheme, the port and the address from configuration it
+     * cannot see - a properties file, {@code EXCALIBUR_PORT} or {@code excalibur.api.port}, a
+     * keystore - and get one of them wrong. A failure is logged rather than fatal: the node
+     * serves either way, and the health check reporting it unhealthy is what surfaces it.</p>
+     */
+    private void advertiseEndpoint() {
+        try {
+            dataDirectoryLock.advertise(server.baseUrl(), server.livenessProbeUrl());
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("Could not record the listening address in {}: {}. A health check "
+                + "that reads it will report this node unhealthy.",
+                dataDirectory.resolve(DataDirectoryLock.FILE_NAME), e.toString());
+        }
+    }
 
     /**
      * Configures the document reindexer for actual reindex operations.
@@ -703,6 +774,7 @@ public final class ExcaliburApplication {
         // refuses the http URL, a node bound to one interface is not on localhost, and port 0
         // binds an ephemeral port the configuration never names.
         String baseUrl = server.baseUrl();
+        advertiseEndpoint();
         LOGGER.info("Listening on: {}", baseUrl);
         LOGGER.info("Health endpoint: {}/health", baseUrl);
         LOGGER.info("Stats endpoint: {}/v1/stats", baseUrl);
