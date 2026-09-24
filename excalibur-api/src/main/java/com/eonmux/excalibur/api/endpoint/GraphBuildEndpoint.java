@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphExtraction;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.tenancy.NamespaceId;
@@ -106,8 +107,7 @@ public class GraphBuildEndpoint implements HttpHandler {
             namespace = GraphTenants.namespaceOf(
                 exchange.getRequestHeaders().getFirst(GraphTenants.NAMESPACE_HEADER));
         } catch (IllegalArgumentException e) {
-            ResponseBody.sendJson(exchange, 400,
-                "{\"error\": \"" + JsonText.escape(e.getMessage()) + "\"}");
+            ResponseBody.sendError(exchange, 400, ErrorCode.INVALID_NAMESPACE, e.getMessage());
             return;
         }
 
@@ -118,15 +118,15 @@ public class GraphBuildEndpoint implements HttpHandler {
             // The node is shutting down. Retryable at another node or after a restart, which is
             // what 503 says and 500 does not.
             LOGGER.warn("a graph build of namespace {} was asked for during shutdown", namespace);
-            ResponseBody.sendJson(exchange, 503,
-                "{\"error\": \"This node is shutting down and is not accepting builds\"}");
+            ResponseBody.sendError(exchange, 503, ErrorCode.SHUTTING_DOWN,
+                "This node is shutting down and is not accepting builds");
             return;
         }
 
         if (!claim.accepted()) {
-            ResponseBody.sendJson(exchange, 409,
-                "{\"error\": \"A graph build is already in progress for namespace '"
-                    + JsonText.escape(claim.blockedBy().namespace().value()) + "'\"}");
+            ResponseBody.sendError(exchange, 409, ErrorCode.BUILD_IN_PROGRESS,
+                "A graph build is already in progress for namespace '"
+                    + claim.blockedBy().namespace().value() + "'");
             return;
         }
 

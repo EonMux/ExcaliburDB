@@ -4,6 +4,7 @@ import com.eonmux.excalibur.api.protocol.RequestBody;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.api.reindex.ReindexCoordinator;
@@ -295,7 +296,8 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
                 // POST /v1/documents are recorded under their source id too, but nothing stands
                 // behind it to crawl, so the answer says what replaces a reindex for those.
                 if (!sourceRegistry.isRegistered(request.sourceId)) {
-                    sendError(exchange, 404, "Source not found: " + request.sourceId
+                    ResponseBody.sendError(exchange, 404, ErrorCode.SOURCE_NOT_FOUND,
+                        "Source not found: " + request.sourceId
                         + ". Only a source registered with POST /v1/ingest can be reindexed; "
                         + "documents supplied with POST /v1/documents are replaced by posting "
                         + "them again");
@@ -307,7 +309,8 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
                 // while nothing happens, and would block every later request.
                 if (documentReindexer == null || sourceResolver == null || reindexExecutor == null) {
                     LOGGER.warn("Reindex requested but no DocumentReindexer is configured");
-                    sendError(exchange, 503, "Reindexing is not configured on this server");
+                    ResponseBody.sendError(exchange, 503, ErrorCode.NOT_CONFIGURED,
+                        "Reindexing is not configured on this server");
                     return;
                 }
 
@@ -318,11 +321,13 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
                 final String sourceId = request.sourceId;
                 ReindexCoordinator.Lease lease = coordinator.tryAcquire(sourceId);
                 if (lease == null && !coordinator.isAccepting()) {
-                    sendError(exchange, 503, "The node is shutting down and is not reindexing");
+                    ResponseBody.sendError(exchange, 503, ErrorCode.SHUTTING_DOWN,
+                        "The node is shutting down and is not reindexing");
                     return;
                 }
                 if (lease == null) {
-                    sendError(exchange, 409, "Reindex already in progress for source: " + sourceId);
+                    ResponseBody.sendError(exchange, 409, ErrorCode.REINDEX_IN_PROGRESS,
+                        "Reindex already in progress for source: " + sourceId);
                     return;
                 }
                 // Asked again now the claim is held. Removing a source stops and waits for the
@@ -331,7 +336,8 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
                 // status the removal has cleared, for a source nothing can name any more.
                 if (!sourceRegistry.isRegistered(sourceId)) {
                     lease.release();
-                    sendError(exchange, 404, "Source not found: " + sourceId);
+                    ResponseBody.sendError(exchange, 404, ErrorCode.SOURCE_NOT_FOUND,
+                        "Source not found: " + sourceId);
                     return;
                 }
 
@@ -358,7 +364,8 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
                     reindexStatusRegistry.cancelReindex(sourceId);
                     lease.release();
                     settled = true;
-                    sendError(exchange, 503, "The node is shutting down and is not reindexing");
+                    ResponseBody.sendError(exchange, 503, ErrorCode.SHUTTING_DOWN,
+                        "The node is shutting down and is not reindexing");
                     return;
                 } finally {
                     if (!settled) {
@@ -521,7 +528,8 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         }
 
         if (!sourceRegistry.isRegistered(sourceId)) {
-            sendError(exchange, 404, "Source not found: " + sourceId);
+            ResponseBody.sendError(exchange, 404, ErrorCode.SOURCE_NOT_FOUND,
+                "Source not found: " + sourceId);
             return;
         }
 

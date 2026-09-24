@@ -222,6 +222,7 @@ class QueryCancelEndpointTest {
             String response = responseBody.toString(StandardCharsets.UTF_8);
             assertThat(response).contains("\"error\":");
             assertThat(response).contains("not found");
+            assertThat(response).contains("\"code\": \"query_not_found\"");
         }
 
         @Test

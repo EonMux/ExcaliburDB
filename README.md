@@ -1284,6 +1284,14 @@ and only the data is missing. `/v1/erasure` is the opposite case: a node built w
 service does not register it at all, so a caller under an obligation gets a 404 they can escalate
 rather than a 200 that removed nothing.
 
+Every error is `{"error": "<text>", "code": "<code>"}`, plus any members the route adds. `error`
+is prose and may be reworded; `code` is a stable snake_case name - `invalid_request`,
+`unauthorized`, `rate_limited`, `not_found`, `method_not_allowed`, `payload_too_large`,
+`conflict`, `unavailable`, and specific ones such as `source_not_found`, `graph_not_served`,
+`ambiguous_entity`, `build_in_progress`, `namespace_limit_reached` or `shutting_down` where the
+status alone does not say which cause it was. Branch on `code`, never on the text. The full table is
+in [USAGE.md](USAGE.md#error-codes).
+
 Neither erasure route is exposed as an MCP tool. They destroy data to do their job, which makes
 them the calls whose cost of being made wrongly is not bounded by retrying, and a model asked to
 tidy up a corpus would have every reason to reach for them.
@@ -2461,7 +2469,7 @@ the same thing. A name no entity has is a `404`; a name two entities share is a 
 ids in `candidates`, so the caller repeats the request with the `entity_id` of the one they meant.
 
 An `entity_id` has to name an entity: one the namespace's staged labels hold, or one the graph it
-serves names. Anything else is a `404` - `{"error": "no entity in this namespace has id 42"}` - and
+serves names. Anything else is a `404` - `{"error": "no entity in this namespace has id 42", "code": "entity_not_found"}` - and
 nothing is recorded. The obligation records the id and nothing else, and ids are handed out in
 order, so one accepted for an id nobody holds yet would erase whichever entity is given that id
 next. An id counts from the moment its label is forced to disk, and a staged id is never taken

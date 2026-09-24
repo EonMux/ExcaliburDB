@@ -2,6 +2,7 @@ package com.eonmux.excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.RequestBody;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -186,9 +187,9 @@ try {
      */
     private boolean claim(HttpExchange exchange, String sourceId) throws IOException {
         if (crawlSources != null && crawlSources.isRegistered(sourceId)) {
-            ResponseBody.sendJson(exchange, 409, "{\"error\": \"Source '" + JsonText.escape(sourceId)
-                + "' is a registered crawl source; documents supplied under its id would be "
-                + "removed by the next reindex of that crawl. Use a different source_id.\"}");
+            ResponseBody.sendError(exchange, 409, ErrorCode.SOURCE_KIND_CONFLICT, "Source '"
+                + sourceId + "' is a registered crawl source; documents supplied under its id "
+                + "would be removed by the next reindex of that crawl. Use a different source_id.");
             return false;
         }
 
@@ -198,18 +199,18 @@ try {
         if (suppliedSources != null && !suppliedSources.remember(sourceId)) {
             LOGGER.warn("Refused a document batch for {}: the supplied-source limit is reached",
                 sourceId);
-            ResponseBody.sendJson(exchange, 429,
-                "{\"error\": \"This node already holds supplied documents under as many "
+            ResponseBody.sendError(exchange, 429, ErrorCode.SOURCE_LIMIT_REACHED,
+                "This node already holds supplied documents under as many "
                     + "source_ids as it is configured for. Add to one of them, or raise "
-                    + "excalibur.ingest.max-sources.\"}");
+                    + "excalibur.ingest.max-sources.");
             return false;
         }
 
         if (crawlSources != null && crawlSources.isRegistered(sourceId)) {
-            ResponseBody.sendJson(exchange, 409, "{\"error\": \"Source '" + JsonText.escape(sourceId)
-                + "' was registered as a crawl source while this request was being handled; "
-                + "documents supplied under its id would be removed by the next reindex of that "
-                + "crawl. Use a different source_id.\"}");
+            ResponseBody.sendError(exchange, 409, ErrorCode.SOURCE_KIND_CONFLICT, "Source '"
+                + sourceId + "' was registered as a crawl source while this request was being "
+                + "handled; documents supplied under its id would be removed by the next reindex "
+                + "of that crawl. Use a different source_id.");
             return false;
         }
         return true;

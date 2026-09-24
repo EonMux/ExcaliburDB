@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.protocol.ErrorCode;
+
 /**
  * Signals that a source could not be registered.
  *
@@ -15,14 +17,25 @@ public class SourceRegistrationException extends IllegalStateException {
      */
     public enum Reason {
         /** A source with this ID is already registered. */
-        DUPLICATE(409),
+        DUPLICATE(409, ErrorCode.SOURCE_EXISTS),
         /** The registry is at its configured capacity. */
-        CAPACITY(429);
+        CAPACITY(429, ErrorCode.SOURCE_LIMIT_REACHED);
 
         private final int statusCode;
+        private final ErrorCode code;
 
-        Reason(int statusCode) {
+        Reason(int statusCode, ErrorCode code) {
             this.statusCode = statusCode;
+            this.code = code;
+        }
+
+        /**
+         * Returns the machine-readable code this reason is answered with.
+         *
+         * @return The error code
+         */
+        public ErrorCode code() {
+            return code;
         }
 
         /**

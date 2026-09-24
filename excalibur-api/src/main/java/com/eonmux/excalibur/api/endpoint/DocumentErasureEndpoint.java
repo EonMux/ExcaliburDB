@@ -5,6 +5,7 @@ import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphErasureService;
 import com.eonmux.excalibur.api.bootstrap.GraphTenant;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.RequestBody;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -271,8 +272,8 @@ public class DocumentErasureEndpoint implements HttpHandler {
             // and that is the step that failed. A 500 would be true and would not say that the
             // request can simply be repeated once the catalog is writable again.
             LOGGER.error("Erasure of source {} could not deregister it: {}", sourceId, e.getMessage(), e);
-            ResponseBody.sendJson(exchange, SourceCatalogException.STATUS_CODE,
-                "{\"error\": \"" + SourceCatalogException.CLIENT_MESSAGE + "\"}");
+            ResponseBody.sendError(exchange, SourceCatalogException.STATUS_CODE,
+                ErrorCode.CATALOG_UNAVAILABLE, SourceCatalogException.CLIENT_MESSAGE);
         } catch (IOException | RuntimeException e) {
             // IOException as well as RuntimeException: recording the graph obligation is a
             // durable write, and one that fails must be answered rather than escaping the

@@ -476,6 +476,64 @@ The `/v1/graph/*` routes are documented in the README, under
 here so the surface is complete in one table; the shapes are kept in one place rather than two so
 they cannot disagree.
 
+### Error codes
+
+Every error response — any status of `400` or above whose body is an error — is a JSON object with
+two members a client can rely on, plus whatever a route adds beside them:
+
+```json
+{"error": "Source not found: project-docs", "code": "source_not_found"}
+```
+
+`error` is prose for a person, and its wording may change between releases. `code` is for a
+program: a snake_case name that is never reworded or reused for a different cause, so branch on
+`code` (and the status), never on `error`. Members a route adds — the `candidates` of an ambiguous
+graph erasure, the `namespace` of a refused drop — are kept alongside. The probes are the exception
+by design: a `503` from `/health/ready` is a readiness report (`{"ready": false, "failed": [...]}`),
+not an error, and carries no `code`.
+
+A route that cannot tell causes apart answers with the default for its status; a route that can
+names the cause. A client that does not recognise a code should fall back to the status's default
+below, because new specific codes may be added.
+
+| Code | Status | Meaning |
+|---|---|---|
+| `invalid_request` | 400 | Malformed body, missing field, field of the wrong type or out of range. The default for `400` |
+| `invalid_namespace` | 400 | `X-Excalibur-Namespace`, or a namespace in a path, is not a legal namespace id |
+| `namespace_not_accepted` | 400 | `X-Excalibur-Namespace` named a tenant on a route that serves the shared corpus |
+| `unauthorized` | 401 | Missing or wrong bearer token |
+| `forbidden` | 403 | Understood and not permitted. The default for `403` |
+| `target_not_allowed` | 403 | An ingest `root_path` or `base_url` outside the allow-lists |
+| `not_found` | 404 | No such path, or nothing under the name the request gave. The default for `404` |
+| `source_not_found` | 404 | No source is registered under that `source_id` |
+| `query_not_found` | 404 | No query in flight has that id |
+| `namespace_not_found` | 404 | No namespace by that name exists — including one that must be created with `PUT /v1/graph/namespaces/{namespace}` first |
+| `entity_not_found` | 404 | No entity in the namespace has that name or `entity_id` |
+| `method_not_allowed` | 405 | The path exists and does not serve this method; the `Allow` header lists the ones it does |
+| `timeout` | 408, 504 | The work did not finish within the time it was given |
+| `conflict` | 409 | The request conflicts with the node's current state. The default for `409` |
+| `source_exists` | 409 | A source is already registered under that `source_id` |
+| `source_kind_conflict` | 409 | The `source_id` belongs to the other kind of source — a crawl versus documents supplied directly |
+| `reindex_in_progress` | 409 | A re-index of that source is already running; poll its status instead |
+| `compaction_in_progress` | 409 | A compaction is already running |
+| `build_in_progress` | 409 | A graph build is already running |
+| `ambiguous_entity` | 409 | A name matches more than one entity; `candidates` lists their ids |
+| `namespace_protected` | 409 | The `shared` namespace cannot be dropped |
+| `payload_too_large` | 413 | The body is over the 1 MB limit |
+| `unprocessable` | 422 | Well formed, and cannot be served as asked |
+| `rate_limited` | 429 | The caller's read or mutate budget is spent; wait `Retry-After` seconds |
+| `source_limit_reached` | 429 | The node holds `excalibur.ingest.max-sources` sources already. Clears when one is removed, not with time |
+| `namespace_limit_reached` | 429 | The node holds `excalibur.graph.max-namespaces` namespaces already. Clears when one is dropped, not with time |
+| `internal_error` | 500 | The node failed; the reason is in its log, never in the body |
+| `unavailable` | 503 | The node cannot serve this now. The default for `503` |
+| `not_configured` | 503 | The node was started without what the operation needs — an embedding client or lexical index, an ingestion pipeline, a reindexer |
+| `graph_not_served` | 503 | No graph has been built for this namespace yet; `POST /v1/graph/build` |
+| `saturated` | 503 | Every permit for the work is taken; retry with backoff |
+| `shutting_down` | 503 | The node is shutting down and refuses new work; retry against another node |
+| `catalog_unavailable` | 503 | A registration change could not be recorded in the source catalog, so it was not applied |
+| `client_error` | other 4xx | Any other client error |
+| `server_error` | other 5xx | Any other server error |
+
 ### Authentication
 
 Authentication is off until a token is configured, which is why the examples in this guide carry no
@@ -720,18 +778,18 @@ value is restored at the limit, with a warning in the log, rather than refused.
 
 ### Error responses
 
-All ingest errors use the common envelope `{"error": "<message>"}` with the appropriate HTTP status code.
+All ingest errors use the common envelope `{"error": "<message>", "code": "<code>"}` with the appropriate HTTP status code; see [Error codes](#error-codes) for every code.
 
 **`409 Conflict` — source already registered**
 
 ```json
-{"error": "Source already registered: project-docs"}
+{"error": "Source already registered: project-docs", "code": "source_exists"}
 ```
 
 **`409 Conflict` — documents were supplied under that id**
 
 ```json
-{"error": "Source 'notes' holds documents supplied directly; a crawl registered under its id would remove them on its first pass. Use a different source_id."}
+{"error": "Source 'notes' holds documents supplied directly; a crawl registered under its id would remove them on its first pass. Use a different source_id.", "code": "source_kind_conflict"}
 ```
 
 A crawl decides for itself what its source holds, and its first pass removes every document under
@@ -743,13 +801,13 @@ rather than relying on the refusal.
 **`400 Bad Request` — missing or invalid field**
 
 ```json
-{"error": "Bad Request: Field 'config.source_id' is required"}
+{"error": "Bad Request: Field 'config.source_id' is required", "code": "invalid_request"}
 ```
 
 **`400 Bad Request` — a filesystem filter sent to an HTTP crawl**
 
 ```json
-{"error": "Bad Request: Field 'config.included_extensions' applies to a filesystem walk only: an HTTP crawl matches URLs, which have neither a file extension nor a directory, no symbolic links, and no local file to size. Remove it, or register this source with the source_type it belongs to."}
+{"error": "Bad Request: Field 'config.included_extensions' applies to a filesystem walk only: an HTTP crawl matches URLs, which have neither a file extension nor a directory, no symbolic links, and no local file to size. Remove it, or register this source with the source_type it belongs to.", "code": "invalid_request"}
 ```
 
 Refused rather than dropped. The crawler has a URL and a host policy, not a directory tree, so
@@ -760,7 +818,7 @@ been discarded.
 **`400 Bad Request` — `source_id` longer than 256 characters**
 
 ```json
-{"error": "Bad Request: 'config.source_id' must be at most 256 characters: 300"}
+{"error": "Bad Request: 'config.source_id' must be at most 256 characters: 300", "code": "invalid_request"}
 ```
 
 A source id is copied into every document's registry record and printed with every log line about
@@ -786,7 +844,7 @@ source is deregistered, not when time passes.
 **`405 Method Not Allowed` — a method other than GET, POST or DELETE**
 
 ```json
-{"error": "Method Not Allowed - Use GET to read the registrations, POST to register a source or DELETE to stop crawling one"}
+{"error": "Method Not Allowed - Use GET to read the registrations, POST to register a source or DELETE to stop crawling one", "code": "method_not_allowed"}
 ```
 
 Unauthenticated, and charged against the read budget: which handler serves a request is decided
@@ -958,7 +1016,7 @@ filesystem source. A `robots.txt` the site cannot serve is a different case, rep
 **Response — `404 Not Found`** (unknown source)
 
 ```json
-{"error": "Source not found: project-docs"}
+{"error": "Source not found: project-docs", "code": "source_not_found"}
 ```
 
 `state` is one of `idle`, `crawling`, `embedding`, `indexing`, or `unconfigured`. `progress` is
@@ -1145,19 +1203,19 @@ or erased while the reindex ran is left alone — the later write stands — and
 it afresh.
 
 ```json
-{"error": "Source not found: unknown-source. Only a source registered with POST /v1/ingest can be reindexed; documents supplied with POST /v1/documents are replaced by posting them again"}
+{"error": "Source not found: unknown-source. Only a source registered with POST /v1/ingest can be reindexed; documents supplied with POST /v1/documents are replaced by posting them again", "code": "source_not_found"}
 ```
 
 **Error — `409 Conflict` (reindex already running for that source)**
 
 ```json
-{"error": "Reindex already in progress for source: project-docs"}
+{"error": "Reindex already in progress for source: project-docs", "code": "reindex_in_progress"}
 ```
 
 **Error — `405 Method Not Allowed` — a method other than POST or DELETE**
 
 ```json
-{"error": "Method Not Allowed - Use POST to start a reindex or DELETE to stop one"}
+{"error": "Method Not Allowed - Use POST to start a reindex or DELETE to stop one", "code": "method_not_allowed"}
 ```
 
 **Error — `400 Bad Request`** — the body is not JSON, or `source_id` is missing, not a string, or
@@ -1251,7 +1309,7 @@ each of them is written. `progress` is their ratio and nothing else.
 **Error — `404 Not Found`**
 
 ```json
-{"error": "No reindex has been run for source: project-docs"}
+{"error": "No reindex has been run for source: project-docs", "code": "not_found"}
 ```
 
 **Error — `400 Bad Request`** — the `source_id` parameter is not a legal source id.
@@ -1508,7 +1566,7 @@ the document.
 **Error — `400 Bad Request`**
 
 ```json
-{"error": "'document_id' or a non-empty 'document_ids' array is required"}
+{"error": "'document_id' or a non-empty 'document_ids' array is required", "code": "invalid_request"}
 ```
 
 The same `400` answers a body that is not JSON, a field of the wrong type, more than 1000 ids, or an
@@ -1931,13 +1989,13 @@ no size fixes that one.
 **`400 Bad Request` — missing `query` field**
 
 ```json
-{"error": "Bad Request: Field 'query' is required and must be non-empty"}
+{"error": "Bad Request: Field 'query' is required and must be non-empty", "code": "invalid_request"}
 ```
 
 **`400 Bad Request` — `query` longer than `excalibur.api.max-query-chars`**
 
 ```json
-{"error": "Bad Request: Field 'query' must be at most 8192 characters: 40000"}
+{"error": "Bad Request: Field 'query' must be at most 8192 characters: 40000", "code": "invalid_request"}
 ```
 
 The query text is the body of the embedding call, and on the lexical path of the expansion call as
@@ -1947,7 +2005,7 @@ which is the largest unit anything in the index was embedded as.
 **`503 Service Unavailable` — no retrieval path configured**
 
 ```json
-{"error": "Server is not configured for text queries: this node has neither an embedding client nor a lexical index, so there is no index to search. Set excalibur.llm.api-key (or EXCALIBUR_LLM_API_KEY) so the server can embed queries with the same model that ingestion uses, or see the startup log for why the chunk lexical index was not opened."}
+{"error": "Server is not configured for text queries: this node has neither an embedding client nor a lexical index, so there is no index to search. Set excalibur.llm.api-key (or EXCALIBUR_LLM_API_KEY) so the server can embed queries with the same model that ingestion uses, or see the startup log for why the chunk lexical index was not opened.", "code": "not_configured"}
 ```
 
 A missing embedding key alone does not produce this: without one the node answers from BM25
@@ -1959,7 +2017,7 @@ actionable; the reason the index would not open is in the startup log.
 **`400 Bad Request` — `explain` or `snippet` on a query of more than 64 distinct terms**
 
 ```json
-{"error": "Bad Request: the query holds 71 distinct terms and at most 64 can be explained or highlighted: shorten the query, or drop 'explain' and 'snippet'"}
+{"error": "Bad Request: the query holds 71 distinct terms and at most 64 can be explained or highlighted: shorten the query, or drop 'explain' and 'snippet'", "code": "invalid_request"}
 ```
 
 Each term is looked for in every returned passage, so the count bounds the work a single request
@@ -1968,13 +2026,13 @@ can ask for. Without `explain` and `snippet` the query is not held to it.
 **`413 Payload Too Large` — the body is over 1 MB**
 
 ```json
-{"error": "Request body too large (max 1048576 bytes)"}
+{"error": "Request body too large (max 1048576 bytes)", "code": "payload_too_large"}
 ```
 
 **`500 Internal Server Error` — the search failed**
 
 ```json
-{"error": "Query execution failed"}
+{"error": "Query execution failed", "code": "internal_error"}
 ```
 
 The vector half failed and BM25 could not answer in its place, or, on a node with no embedding
@@ -1983,7 +2041,7 @@ client, the BM25 search itself failed. The reason is in the node's log, not the 
 **`503 Service Unavailable` — the query service is saturated**
 
 ```json
-{"error": "Query service is saturated"}
+{"error": "Query service is saturated", "code": "saturated"}
 ```
 
 Only on a node with no embedding client: BM25 is its only signal, and every permit for a
@@ -1993,7 +2051,7 @@ BM25 half instead and answers from vectors.
 **`503 Service Unavailable` — the query service is not available, or was interrupted**
 
 ```json
-{"error": "Query service is not available"}
+{"error": "Query service is not available", "code": "unavailable"}
 ```
 
 The embedding came back unusable and BM25 could not answer in its place, or the node is not ready
@@ -2003,13 +2061,13 @@ down. Retry against a node that is up.
 **`401 Unauthorized` — missing or wrong bearer token**
 
 ```json
-{"error": "Authentication failed"}
+{"error": "Authentication failed", "code": "unauthorized"}
 ```
 
 **`429 Too Many Requests` — rate limit exceeded**
 
 ```json
-{"error": "Rate limit exceeded"}
+{"error": "Rate limit exceeded", "code": "rate_limited"}
 ```
 
 Carries a `Retry-After` header. Reads and mutations have separate budgets.
@@ -2017,7 +2075,7 @@ Carries a `Retry-After` header. Reads and mutations have separate budgets.
 **`405 Method Not Allowed` — a method other than POST or DELETE**
 
 ```json
-{"error": "Method Not Allowed - Use POST for queries or DELETE for cancellation"}
+{"error": "Method Not Allowed - Use POST for queries or DELETE for cancellation", "code": "method_not_allowed"}
 ```
 
 Unauthenticated, and charged against the read budget: which handler serves a request is decided
@@ -2162,7 +2220,7 @@ curl -X DELETE http://localhost:8080/v1/query/b3d9f4a0-1e2c-4a7b-9c3d-5e6f7a8b9c
 **Response — `404 Not Found`** (unknown or already-completed query)
 
 ```json
-{"error": "Query not found or already completed"}
+{"error": "Query not found or already completed", "code": "query_not_found"}
 ```
 
 **Response — `400 Bad Request`** (missing query ID in path)

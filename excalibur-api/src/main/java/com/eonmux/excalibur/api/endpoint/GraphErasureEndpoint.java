@@ -6,6 +6,7 @@ import com.eonmux.excalibur.api.bootstrap.GraphErasureService;
 import com.eonmux.excalibur.api.bootstrap.GraphRagFactory;
 import com.eonmux.excalibur.api.bootstrap.GraphTenant;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.RequestBody;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -128,6 +129,11 @@ public class GraphErasureEndpoint implements HttpHandler {
         try {
             namespace = GraphTenants.namespaceOf(
                 exchange.getRequestHeaders().getFirst(GraphTenants.NAMESPACE_HEADER));
+        } catch (IllegalArgumentException e) {
+            ResponseBody.sendError(exchange, 400, ErrorCode.INVALID_NAMESPACE, e.getMessage());
+            return;
+        }
+        try {
             requested = scopeFrom(body);
             // Every field of the request is read before any of it is acted on. Reading this one
             // after the obligation was submitted meant a body with a malformed "compact" was
@@ -352,7 +358,8 @@ public class GraphErasureEndpoint implements HttpHandler {
             ResponseBody.sendJson(exchange, 409,
                 "{\"error\": \"" + ids.size() + " entities are named \\\""
                     + JsonText.escape(name) + "\\\"; repeat the request with the 'entity_id' "
-                    + "of the one to erase\", \"candidates\": " + ids + "}");
+                    + "of the one to erase\", \"code\": \""
+                    + ErrorCode.AMBIGUOUS_ENTITY.wireName() + "\", \"candidates\": " + ids + "}");
             return null;
         }
         return new ErasureScope.Entity(ids.first());
@@ -368,10 +375,8 @@ public class GraphErasureEndpoint implements HttpHandler {
     private static void sendNotFound(HttpExchange exchange, Requested requested)
             throws IOException {
         if (requested.scope() instanceof ErasureScope.Entity entity) {
-            ResponseBody.sendJson(exchange, 404,
-                "{\"error\": \"" + JsonText.escape(
-                    new GraphErasureService.UnknownEntityException(entity.entityId())
-                        .getMessage()) + "\"}");
+            ResponseBody.sendError(exchange, 404, ErrorCode.ENTITY_NOT_FOUND,
+                new GraphErasureService.UnknownEntityException(entity.entityId()).getMessage());
             return;
         }
         sendNotNamed(exchange, requested.entityName());
@@ -385,9 +390,9 @@ public class GraphErasureEndpoint implements HttpHandler {
      * @throws IOException if the reply cannot be written
      */
     private static void sendNotNamed(HttpExchange exchange, String name) throws IOException {
-        ResponseBody.sendJson(exchange, 404,
-            "{\"error\": \"no entity in this namespace is named \\\"" + JsonText.escape(name)
-                + "\\\"; erasure resolves a name exactly rather than approximately\"}");
+        ResponseBody.sendError(exchange, 404, ErrorCode.ENTITY_NOT_FOUND,
+            "no entity in this namespace is named \"" + name
+                + "\"; erasure resolves a name exactly rather than approximately");
     }
 
     /**

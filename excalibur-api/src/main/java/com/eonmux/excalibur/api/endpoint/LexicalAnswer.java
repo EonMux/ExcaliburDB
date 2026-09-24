@@ -2,6 +2,7 @@ package com.eonmux.excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.RequestBody;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.api.retrieval.LexicalCoverage;
@@ -376,7 +377,7 @@ final class LexicalAnswer {
                 // Restore the flag: swallowing it leaves the carrier thread unable to observe
                 // the shutdown that interrupted it.
                 Thread.currentThread().interrupt();
-                return QueryReply.error(503, "Query interrupted");
+                return QueryReply.error(503, ErrorCode.SHUTTING_DOWN, "Query interrupted");
             }
             response = new LexicalResponse(queryId, scored.ranking(),
                 outcome.hits().size() < candidates,
@@ -465,7 +466,8 @@ final class LexicalAnswer {
                            int limit, CancellationToken token, long deadlineNanos) {
         Future<List<LexicalQueryService.Hit>> pending = start(lexical, parsed.query(), limit);
         if (pending == null) {
-            return Outcome.refused(QueryReply.error(503, "Query service is saturated"));
+            return Outcome.refused(QueryReply.error(503, ErrorCode.SATURATED,
+                "Query service is saturated"));
         }
         // Attached after the submit because it needs the future, and addListener runs
         // immediately if a cancellation arrived in between. It releases the request, not the
@@ -487,7 +489,8 @@ final class LexicalAnswer {
             // shutdown that interrupted it.
             Thread.currentThread().interrupt();
             abandon(pending);
-            return Outcome.refused(QueryReply.error(503, "Query interrupted"));
+            return Outcome.refused(QueryReply.error(503, ErrorCode.SHUTTING_DOWN,
+                "Query interrupted"));
         } catch (ExecutionException e) {
             // A failed search is a failure. Reporting it as 200 with an empty result list is
             // indistinguishable from "nothing matched".

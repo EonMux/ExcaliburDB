@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.QueryParams;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -158,7 +159,8 @@ public class IngestStatusEndpoint implements HttpHandler {
                     // Get status for specific source
                     IngestionStatus status = statusRegistry.getStatus(sourceId);
                     if (status == null) {
-                        sendError(exchange, 404, "Source not found: " + sourceId);
+                        ResponseBody.sendError(exchange, 404, ErrorCode.SOURCE_NOT_FOUND,
+                            "Source not found: " + sourceId);
                         return;
                     }
                     sendSingleResponse(exchange, status);

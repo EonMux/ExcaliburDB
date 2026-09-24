@@ -3,7 +3,7 @@ package com.eonmux.excalibur.api.server;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
-import com.eonmux.excalibur.api.protocol.JsonText;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.api.security.RequestGuard;
 import com.eonmux.excalibur.tenancy.NamespaceId;
@@ -11,7 +11,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -205,7 +204,7 @@ final class HttpRouting {
      * @return A handler for a method this node cannot serve
      */
     static HttpHandler unavailable(String message) {
-        return exchange -> sendError(exchange, 503, message);
+        return exchange -> ResponseBody.sendError(exchange, 503, ErrorCode.NOT_CONFIGURED, message);
     }
 
     /**
@@ -240,7 +239,8 @@ final class HttpRouting {
             // The name the caller sent is deliberately not echoed. It is attacker-controlled
             // text on a path that answers before any other validation, and naming the header
             // is what the caller needs to fix the request.
-            sendError(exchange, 400, GraphTenants.NAMESPACE_HEADER + " named a namespace, and "
+            ResponseBody.sendError(exchange, 400, ErrorCode.NAMESPACE_NOT_ACCEPTED,
+                GraphTenants.NAMESPACE_HEADER + " named a namespace, and "
                 + "this route serves the shared corpus rather than any one namespace. "
                 + "Namespaces are honoured on the /v1/graph/* routes and on POST /v1/ingest, "
                 + "which records the one a source stages into; remove the header or "
@@ -262,10 +262,6 @@ final class HttpRouting {
      */
     private static void sendError(HttpExchange exchange, int statusCode, String message)
             throws IOException {
-        String json = String.format("{\"error\": \"%s\"}", JsonText.escape(message));
-        byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
-
-        exchange.getResponseHeaders().set("Content-Type", "application/json");
-        ResponseBody.send(exchange, statusCode, bytes);
+        ResponseBody.sendError(exchange, statusCode, message);
     }
 }

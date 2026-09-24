@@ -841,6 +841,7 @@ class GraphQueryEndpointTest {
             Response response = ask("never-built");
 
             assertThat(response.status()).isEqualTo(503);
+            assertThat(response.body()).contains("\"code\": \"graph_not_served\"");
             assertThat(root.resolve("never-built")).doesNotExist();
             assertThat(tenants.openNamespaces())
                 .containsExactly(com.eonmux.excalibur.tenancy.NamespaceId.SHARED);

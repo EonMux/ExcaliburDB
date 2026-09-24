@@ -2,6 +2,7 @@ package com.eonmux.excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.RequestBody;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -77,8 +78,8 @@ public class IngestCancelEndpoint implements HttpHandler {
             // 404 rather than a quiet success, as deregistration does: a caller stopping a crawl
             // has to know whether it named a source this node is crawling, or misspelled one
             // that is still running.
-            ResponseBody.sendJson(exchange, 404,
-                "{\"error\": \"Source not registered: " + JsonText.escape(sourceId) + "\"}");
+            ResponseBody.sendError(exchange, 404, ErrorCode.SOURCE_NOT_FOUND,
+                "Source not registered: " + sourceId);
             return;
         }
 

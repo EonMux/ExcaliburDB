@@ -106,7 +106,7 @@ class RequestGuardTest {
             guard.protect(RequestGuard.Access.READ, countingHandler(new AtomicInteger())).handle(exchange);
 
             String response = body.toString(StandardCharsets.UTF_8);
-            assertThat(response).isEqualTo("{\"error\": \"Authentication failed\"}");
+            assertThat(response).isEqualTo("{\"error\": \"Authentication failed\", \"code\": \"unauthorized\"}");
         }
     }
 

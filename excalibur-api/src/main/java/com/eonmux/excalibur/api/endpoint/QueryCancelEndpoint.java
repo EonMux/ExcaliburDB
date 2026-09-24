@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.sun.net.httpserver.HttpExchange;
@@ -104,7 +105,8 @@ public class QueryCancelEndpoint implements HttpHandler {
             // Check if query exists
             if (!queryRegistry.isRegistered(queryId)) {
                 LOGGER.debug("Query not found: {}", queryId);
-                sendError(exchange, 404, "Query not found or already completed");
+                ResponseBody.sendError(exchange, 404, ErrorCode.QUERY_NOT_FOUND,
+                    "Query not found or already completed");
                 return;
             }
 

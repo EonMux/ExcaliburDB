@@ -2,6 +2,7 @@ package com.eonmux.excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.RequestBody;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -101,7 +102,8 @@ public final class CompactionEndpoint implements HttpHandler {
 
         CompactionRunner.Snapshot started = runner.start(force);
         if (started == null) {
-            ResponseBody.sendError(exchange, 409, "Compaction is already in progress");
+            ResponseBody.sendError(exchange, 409, ErrorCode.COMPACTION_IN_PROGRESS,
+                "Compaction is already in progress");
             return;
         }
 

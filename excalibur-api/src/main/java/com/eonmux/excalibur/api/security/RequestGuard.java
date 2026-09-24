@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.security;
 
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 
 import com.sun.net.httpserver.HttpExchange;
@@ -139,7 +140,7 @@ public final class RequestGuard {
         if (!decision.allowed()) {
             LOGGER.warn("Rate limit exceeded for {} on {}", clientKey, exchange.getRequestURI().getPath());
             exchange.getResponseHeaders().set("Retry-After", Long.toString(decision.retryAfterSeconds()));
-            sendJson(exchange, 429, "Rate limit exceeded");
+            ResponseBody.sendError(exchange, 429, ErrorCode.RATE_LIMITED, "Rate limit exceeded");
             return false;
         }
 
@@ -147,7 +148,7 @@ public final class RequestGuard {
             LOGGER.warn("Rejected unauthenticated request from {} to {}",
                 clientKey, exchange.getRequestURI().getPath());
             exchange.getResponseHeaders().set("WWW-Authenticate", "Bearer");
-            sendJson(exchange, 401, "Authentication failed");
+            ResponseBody.sendError(exchange, 401, ErrorCode.UNAUTHORIZED, "Authentication failed");
             return false;
         }
         return true;
@@ -215,11 +216,5 @@ public final class RequestGuard {
         byte[] origin = trustedProxies.originBehind(
             forwarded == null ? List.of() : forwarded, peer.getAddress());
         return ClientAddressKey.ofBytes(origin);
-    }
-
-    private static void sendJson(HttpExchange exchange, int statusCode, String message) throws IOException {
-        byte[] body = ("{\"error\": \"" + message + "\"}").getBytes(StandardCharsets.UTF_8);
-        exchange.getResponseHeaders().set("Content-Type", "application/json");
-        ResponseBody.send(exchange, statusCode, body);
     }
 }

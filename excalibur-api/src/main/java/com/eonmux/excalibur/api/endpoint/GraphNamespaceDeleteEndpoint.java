@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 
@@ -109,7 +110,8 @@ public class GraphNamespaceDeleteEndpoint implements HttpHandler {
             ResponseBody.sendJson(exchange, 409, "{\"error\": \"The shared namespace cannot be "
                 + "dropped: it is where every request without an "
                 + GraphTenants.NAMESPACE_HEADER + " header lands, and this node holds it open "
-                + "for the life of the process\", \"namespace\": \"shared\"}");
+                + "for the life of the process\", \"code\": \""
+                + ErrorCode.NAMESPACE_PROTECTED.wireName() + "\", \"namespace\": \"shared\"}");
             return;
         }
 
@@ -121,8 +123,7 @@ public class GraphNamespaceDeleteEndpoint implements HttpHandler {
             // is no correct repair for a name that tried to leave the graph root.
             LOGGER.warn("refused a namespace deletion for an unusable identifier: {}",
                 e.getMessage());
-            ResponseBody.sendJson(exchange, 400,
-                "{\"error\": \"" + JsonText.escape(e.getMessage()) + "\"}");
+            ResponseBody.sendError(exchange, 400, ErrorCode.INVALID_NAMESPACE, e.getMessage());
             return;
         }
 
@@ -140,8 +141,8 @@ public class GraphNamespaceDeleteEndpoint implements HttpHandler {
         try {
             Optional<GraphTenants.Dropped> dropped = tenants.drop(id);
             if (dropped.isEmpty()) {
-                ResponseBody.sendJson(exchange, 404, "{\"error\": \"No namespace named \\\""
-                    + JsonText.escape(id.value()) + "\\\" exists on this node\"}");
+                ResponseBody.sendError(exchange, 404, ErrorCode.NAMESPACE_NOT_FOUND,
+                    "No namespace named \"" + id.value() + "\" exists on this node");
                 return;
             }
             LOGGER.warn("namespace {} dropped by request: {}", id, dropped.get());
@@ -149,8 +150,8 @@ public class GraphNamespaceDeleteEndpoint implements HttpHandler {
         } catch (IllegalArgumentException e) {
             // Unreachable while the shared namespace is answered above, and kept so that the
             // registry's own refusal can never escape as a 500.
-            ResponseBody.sendJson(exchange, 409,
-                "{\"error\": \"" + JsonText.escape(e.getMessage()) + "\"}");
+            ResponseBody.sendError(exchange, 409, ErrorCode.NAMESPACE_PROTECTED, e.getMessage());
+
         } catch (IOException | RuntimeException e) {
             // A partially deleted namespace is possible here - the walk removes files as it
             // goes - so this says the node failed rather than that nothing happened, and the

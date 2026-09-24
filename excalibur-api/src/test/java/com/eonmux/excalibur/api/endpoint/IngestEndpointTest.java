@@ -808,7 +808,8 @@ class IngestEndpointTest {
             Response response = register(root, "notes", supplied);
 
             assertThat(response.status()).isEqualTo(409);
-            assertThat(response.body()).contains("notes");
+            assertThat(response.body()).contains("notes")
+                .contains("\"code\": \"source_kind_conflict\"");
             // Not registered: a crawl that was refused must not be crawling.
             assertThat(registry.isRegistered("notes")).isFalse();
         }

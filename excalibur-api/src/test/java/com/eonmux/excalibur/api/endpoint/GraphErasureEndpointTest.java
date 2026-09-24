@@ -688,6 +688,7 @@ class GraphErasureEndpointTest {
                 "{\"scope\": \"entity\", \"entity_name\": \"Ada Quazzlethorpe\"}");
 
             assertThat(response.status()).isEqualTo(409);
+            assertThat(Json.at(response.json(), "code")).isEqualTo("ambiguous_entity");
             assertThat(Json.at(response.json(), "candidates"))
                 .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.LIST)
                 .hasSize(2);

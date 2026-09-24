@@ -5,6 +5,7 @@ import java.util.Locale;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.api.protocol.RequestBody;
@@ -206,7 +207,8 @@ public class GraphQueryEndpoint implements HttpHandler {
                 exchange.getRequestHeaders().getFirst(
                     com.eonmux.excalibur.api.bootstrap.GraphTenants.NAMESPACE_HEADER));
         } catch (IllegalArgumentException e) {
-            send(exchange, 400, "{\"error\":" + quoted(e.getMessage()) + "}");
+            send(exchange, 400,
+                ResponseBody.errorJson(ErrorCode.INVALID_NAMESPACE, e.getMessage()));
             return;
         }
 
@@ -285,9 +287,9 @@ public class GraphQueryEndpoint implements HttpHandler {
      * @throws IOException if the response cannot be written
      */
     private void sendNoGraph(HttpExchange exchange) throws IOException {
-        send(exchange, 503,
-            "{\"error\":\"No graph is being served for this namespace; POST "
-                + "/v1/graph/build to build one from the facts ingestion has staged\"}");
+        send(exchange, 503, ResponseBody.errorJson(ErrorCode.GRAPH_NOT_SERVED,
+            "No graph is being served for this namespace; POST "
+                + "/v1/graph/build to build one from the facts ingestion has staged"));
     }
 
     /**
