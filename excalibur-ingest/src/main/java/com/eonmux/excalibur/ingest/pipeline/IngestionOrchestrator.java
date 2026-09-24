@@ -645,6 +645,7 @@ public class IngestionOrchestrator {
         int failedDocs = 0;
         int skippedDocs = 0;
         int disallowedDocs = 0;
+        int keysTaken = 0;
 
         for (String documentId : documentIds) {
             if (stopRequested(stop)) {
@@ -681,6 +682,10 @@ public class IngestionOrchestrator {
                 // which told someone their document was stored when nothing of it was.
                 if (outcome.dropped()) {
                     failedDocs++;
+                } else if (outcome.keyTaken()) {
+                    // A failure no retry cures, counted apart so the status can say what does.
+                    failedDocs++;
+                    keysTaken++;
                 } else if (outcome.notText()) {
                     // Counted apart from the failures. A photograph under the crawl root is not
                     // a document this run failed to ingest, and reporting it as one would make
@@ -727,7 +732,7 @@ public class IngestionOrchestrator {
         status.setSkipped(skippedDocs);
         status.setDisallowed(source.getDisallowedCount());
         reportSkippedDocuments(sourceId, skippedDocs, totalPending);
-        reportDroppedDocuments(sourceId, status, failedDocs, totalPending);
+        reportDroppedDocuments(sourceId, status, failedDocs, keysTaken, totalPending);
         status.update("idle", 1.0, totalIngested, 0);
         int ingestedDocs = processedDocs - failedDocs - skippedDocs - disallowedDocs;
         LOGGER.info("Ingestion complete: {} chunks from {} of {} documents",
@@ -744,19 +749,30 @@ public class IngestionOrchestrator {
      * nothing ingested, no error - and the log is the only place the difference exists. An
      * operator polling the status endpoint has no reason to read it.</p>
      *
+     * <p>A document refused because another source's document holds its key is named apart from
+     * the rest. Any other failure may pass on the next run; that one recurs on every run until
+     * one of the two sources is registered under an id that does not collide, and only the log
+     * would otherwise say so.</p>
+     *
      * @param sourceId     The source that was ingested
      * @param status       The status to report on
      * @param failedDocs   Documents that were listed but not ingested
+     * @param keysTaken    Of those, documents whose key another source's document holds
      * @param totalPending Documents the crawl listed
      */
     private void reportDroppedDocuments(String sourceId, IngestionStatus status,
-                                        int failedDocs, long totalPending) {
+                                        int failedDocs, int keysTaken, long totalPending) {
         if (failedDocs <= 0) {
             return;
         }
         LOGGER.warn("Ingestion of {} did not ingest {} of {} documents", sourceId, failedDocs, totalPending);
-        status.setError(failedDocs + " of " + totalPending
-            + " documents were not ingested; each failure is logged separately");
+        String error = failedDocs + " of " + totalPending
+            + " documents were not ingested; each failure is logged separately";
+        if (keysTaken > 0) {
+            error = error + "; " + keysTaken + " of them because a document of another source "
+                + "already holds the same key (source id, colon, document id)";
+        }
+        status.setError(error);
     }
 
     /**

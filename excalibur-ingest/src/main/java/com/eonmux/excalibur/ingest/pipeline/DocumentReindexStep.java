@@ -376,6 +376,10 @@ final class DocumentReindexStep {
     private Attempt writeAndPublish(String sourceId, String documentId, String documentKey,
                                     FetchedDocument fetched, byte[] content,
                                     List<TextChunk> chunks, List<float[]> vectors) {
+        String keyTaken = keyTaken(sourceId, documentId);
+        if (keyTaken != null) {
+            return Attempt.failed(new ChunkWrites(List.of(), 0, 0, List.of()), keyTaken);
+        }
         // Read before anything is written, under the lock that orders every rewrite of the
         // document: this is the version the new one replaces.
         DocumentMetadata previous = registry.get(sourceId, documentId);
@@ -463,40 +467,20 @@ final class DocumentReindexStep {
                                          FetchedDocument fetched, byte[] content,
                                          List<TextChunk> chunks, List<float[]> vectors,
                                          long startTime) {
-
-        ChunkWrites writes = writeChunks(sourceId, documentId, chunks, vectors,
-            (chunkId, chunk, embedding) ->
-                storageWriter.writeChunk(chunkId, chunk.getText(), embedding));
-
-        // As in the atomic path: the registry entry is what change detection reads, so recording
-        // the new hash for anything less than a complete document retires it from ever being
-        // reindexed again. This path had no such guard at all - a run with the embedding endpoint
-        // down replaced the entry with one naming no chunks, leaving the previous chunks in
-        // storage with nothing recording their ids.
-        if (writes.failures() > 0) {
-            long failedElapsed = System.currentTimeMillis() - startTime;
-            LOG.warn("Document {} left unchanged: {} of {} chunks failed",
-                documentId, writes.failures(), chunks.size());
-            // As in the atomic path: what was written past the surviving entry is named by
-            // nothing and has to go with the rest of the attempt.
-            rollback().undo(sourceId, documentId, writes.chunkIds());
-            return new DocumentResult(documentId, chunks.size(), 0, writes.failures(),
-                failedElapsed, leftUnchanged(writes.failures(), writes.errors(), chunks.size()));
-        }
-
-        DocumentMetadata metadata = metadataOf(sourceId, documentId, content,
-            fetched.validators(), writes.chunkIds());
-
-        // Under the document's lock, for the reason the atomic path holds it: the registry entry
-        // read and rewritten here is the one an erasure of the same document removes.
+        // Under the document's lock from the first write, for the reasons the atomic path holds
+        // it: the registry entry read and rewritten here is the one an erasure of the same
+        // document removes, and the key checked before the writes must still be this source's
+        // when they land.
         String documentKey = ChunkIdentifiers.documentKey(sourceId, documentId);
-        Committed committed = DocumentLocks.shared().inDocument(documentKey, () -> {
-            DocumentMetadata previous = registry.get(sourceId, documentId);
-            int retired = retireSuperseded(previous, writes.chunkIds());
-            registry.register(metadata);
-            return new Committed(-1L, graphReporter.published(documentKey, previous != null),
-                retired);
-        });
+        Attempt attempt = DocumentLocks.shared().inDocument(documentKey,
+            () -> writeAndRegister(sourceId, documentId, documentKey, fetched, content, chunks,
+                vectors));
+        ChunkWrites writes = attempt.writes();
+        if (attempt.committed() == null) {
+            return new DocumentResult(documentId, chunks.size(), 0, writes.failures(),
+                System.currentTimeMillis() - startTime, attempt.error());
+        }
+        Committed committed = attempt.committed();
 
         long elapsed = System.currentTimeMillis() - startTime;
         LOG.debug("Re-indexed document {}: {} chunks in {}ms",
@@ -506,6 +490,63 @@ final class DocumentReindexStep {
         return new DocumentResult(documentId, chunks.size(), writes.successes(),
             writes.failures(), elapsed, null, writes.chunkIds())
             .withChunksRetired(committed.retired());
+    }
+
+    /**
+     * Writes every chunk straight to storage and registers the document, with the document's
+     * lock held.
+     */
+    private Attempt writeAndRegister(String sourceId, String documentId, String documentKey,
+                                     FetchedDocument fetched, byte[] content,
+                                     List<TextChunk> chunks, List<float[]> vectors) {
+        String keyTaken = keyTaken(sourceId, documentId);
+        if (keyTaken != null) {
+            return Attempt.failed(new ChunkWrites(List.of(), 0, 0, List.of()), keyTaken);
+        }
+        ChunkWrites writes = writeChunks(sourceId, documentId, chunks, vectors,
+            (chunkId, chunk, embedding) ->
+                storageWriter.writeChunk(chunkId, chunk.getText(), embedding));
+
+        // As in the atomic path: the registry entry is what change detection reads, so recording
+        // the new hash for anything less than a complete document retires it from ever being
+        // reindexed again, and the previous chunks would stay in storage with nothing recording
+        // their ids.
+        if (writes.failures() > 0) {
+            LOG.warn("Document {} left unchanged: {} of {} chunks failed",
+                documentId, writes.failures(), chunks.size());
+            // As in the atomic path: what was written past the surviving entry is named by
+            // nothing and has to go with the rest of the attempt.
+            rollback().undo(sourceId, documentId, writes.chunkIds());
+            return Attempt.failed(writes,
+                leftUnchanged(writes.failures(), writes.errors(), chunks.size()));
+        }
+
+        DocumentMetadata metadata = metadataOf(sourceId, documentId, content,
+            fetched.validators(), writes.chunkIds());
+        DocumentMetadata previous = registry.get(sourceId, documentId);
+        int retired = retireSuperseded(previous, writes.chunkIds());
+        registry.register(metadata);
+        return Attempt.published(writes,
+            new Committed(-1L, graphReporter.published(documentKey, previous != null), retired));
+    }
+
+    /**
+     * Why the document cannot be written, when another source's document holds its key.
+     *
+     * <p>Asked under the document's lock and before the first write: the chunk ids this step
+     * writes begin with the key, so a key another source holds names that source's chunks, and
+     * writing them would overwrite its document in place.</p>
+     *
+     * @return The reason, or null when the key is free or already this source's
+     */
+    private String keyTaken(String sourceId, String documentId) {
+        String holder = registry.otherSourceHolding(sourceId, documentId);
+        if (holder == null) {
+            return null;
+        }
+        String reason = DocumentRegistry.keyTaken(sourceId, documentId, holder);
+        LOG.warn("Not reindexing: {}", reason);
+        return reason;
     }
 
     /**

@@ -921,6 +921,16 @@ the source, so its length is multiplied by the size of the corpus rather than by
 requests. The routes that only look a source up — deregister, reindex, erasure and status — refuse
 the same lengths, because nothing can be registered under one.
 
+A source id may contain colons. A document's key is its source id, a colon and its document id,
+and every chunk id begins with it, so a source whose id extends another's by a colon can produce a
+key the other already holds: document `wiki:home.md` of source `team` and document `home.md` of
+source `team:wiki` are both `team:wiki:home.md`. The first source to register a document under
+the key keeps it. The other's document is refused before anything of it is written, on every crawl
+and re-crawl and from `POST /v1/documents`, counted in `documents_failed`, and named in the
+source's `/v1/ingest/status` error as refused because another source holds its key — a failure
+retrying does not cure, so give one of the sources an id that does not collide. An erasure, a
+re-crawl or a document listing under the other source never reaches the holder's document.
+
 **`400 Bad Request` — an `X-Excalibur-Namespace` that is not a legal namespace id.** Refused
 before the body is read, rather than registered into `shared`: a source filed under a tenant the
 caller did not name has crossed a tenancy boundary with nothing downstream to show it.

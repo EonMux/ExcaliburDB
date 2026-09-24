@@ -2187,6 +2187,18 @@ and printed with every log line about the source, so its length is multiplied by
 corpus rather than by the number of requests. Every route that names a source — deregister,
 reindex, erasure, status — refuses the same lengths, since nothing can be registered under one.
 
+A `source_id` may contain colons, and a document is keyed by its source id and its document id
+joined by a colon — the key every chunk id begins with. Two sources can therefore produce the same
+key: document `wiki:home.md` of source `team` and document `home.md` of source `team:wiki` are
+both `team:wiki:home.md`, and the node can store only one of them. The key belongs to whichever
+source's document was registered under it first. The other source's document is refused before
+anything of it is written — on its first crawl, on every re-crawl and when supplied to
+`POST /v1/documents` — and counted in `documents_failed`, with the source's `/v1/ingest/status`
+error saying how many were refused because another source holds their key; it is not retried
+into success, so the cure is an id that does not collide. The holder's document is never
+overwritten, and an erasure, re-crawl or document listing that names the other source never
+reaches it.
+
 ### Ingest Status Example
 
 The two forms return different shapes. Named source, bare object, 404 if it was never registered:
