@@ -204,7 +204,8 @@ public final class GraphStagingStore implements AutoCloseable {
         TRIPLE_LOG + REWRITE_SUFFIX,
         ENTITY_TEXT_LOG + EntityTextLog.REWRITE_SUFFIX,
         ENTITY_LABELS + LabelInterner.REWRITE_SUFFIX,
-        RELATION_LABELS + LabelInterner.REWRITE_SUFFIX);
+        RELATION_LABELS + LabelInterner.REWRITE_SUFFIX,
+        FactIdFloor.REWRITE_NAME);
 
     private final Path directory;
     private final Path logPath;
@@ -423,10 +424,10 @@ public final class GraphStagingStore implements AutoCloseable {
      * exactly that fact, from staging and from any graph built out of it, and nothing else. That
      * is how an assertion is retracted, and why an id must never name a second fact - a
      * retraction still owed would remove the newcomer. Ids are therefore the later of one past
-     * the last id this store handed out and the current time in microseconds since the epoch: they
-     * rise across restarts without anything recording the last one, since the highest id still
-     * staged is read back when the first is wanted, and stay exact as JSON numbers until the year
-     * 2255.</p>
+     * the last id this store handed out and the current time in microseconds since the epoch, and
+     * stay exact as JSON numbers until the year 2255. The last id is recorded in
+     * {@link FactIdFloor#FILE_NAME} before any of a batch's ids is used, so they rise across
+     * restarts even after the newest facts have been erased and the clock set back.</p>
      *
      * <h3>Forced before returning</h3>
      * <p>An id handed back is a promise that the fact is kept, and a caller that goes on to
@@ -443,17 +444,17 @@ public final class GraphStagingStore implements AutoCloseable {
      */
     public List<Long> assertFacts(List<AssertedFact> facts) throws IOException {
         Objects.requireNonNull(facts, "facts must not be null");
-        List<Long> ids = new ArrayList<>(facts.size());
-        for (AssertedFact fact : List.copyOf(facts)) {
-            long id = nextAssertionId();
+        List<AssertedFact> batch = List.copyOf(facts);
+        List<Long> ids = assertionIds(batch.size());
+        for (int i = 0; i < batch.size(); i++) {
+            AssertedFact fact = batch.get(i);
             append(new ExtractedTriple(fact.subject(), fact.relation(), fact.object(),
                 fact.validFrom(), fact.validTo(),
-                new Provenance(SourceType.USER_ASSERTED, id, fact.confidence(),
+                new Provenance(SourceType.USER_ASSERTED, ids.get(i), fact.confidence(),
                     ASSERTED_EXTRACTOR_VERSION)));
-            ids.add(id);
         }
         sync();
-        return List.copyOf(ids);
+        return ids;
     }
 
     /**
@@ -483,15 +484,21 @@ public final class GraphStagingStore implements AutoCloseable {
     }
 
     /**
-     * The next fact id; see {@link #assertFacts}.
+     * The next fact ids, recorded as handed out before they are returned; see
+     * {@link #assertFacts}.
      *
-     * @return An id no fact in this store has had
-     * @throws IOException if the log has to be read to find the last id and cannot be
+     * <p>An id recorded and then not used - the append after this failed - is simply never
+     * seen; it is never handed out again either.</p>
+     *
+     * @param count How many
+     * @return Ids no fact in this store has had, rising
+     * @throws IOException if the last id cannot be read or the new one cannot be recorded
      */
-    private long nextAssertionId() throws IOException {
+    private List<Long> assertionIds(int count) throws IOException {
         synchronized (assertionLock) {
+            Path floor = directory.resolve(FactIdFloor.FILE_NAME);
             if (lastAssertionId < 0) {
-                long highest = 0;
+                long highest = FactIdFloor.read(floor);
                 for (StagedAssertion staged : assertions()) {
                     highest = Math.max(highest, staged.factId());
                 }
@@ -500,8 +507,16 @@ public final class GraphStagingStore implements AutoCloseable {
             java.time.Instant now = clock.instant();
             long micros = Math.addExact(Math.multiplyExact(now.getEpochSecond(), 1_000_000L),
                 now.getNano() / 1_000L);
-            lastAssertionId = Math.max(lastAssertionId + 1, micros);
-            return lastAssertionId;
+            long first = Math.max(lastAssertionId + 1, micros);
+            List<Long> ids = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                ids.add(first + i);
+            }
+            if (count > 0) {
+                FactIdFloor.write(floor, first + count - 1);
+                lastAssertionId = first + count - 1;
+            }
+            return List.copyOf(ids);
         }
     }
 
