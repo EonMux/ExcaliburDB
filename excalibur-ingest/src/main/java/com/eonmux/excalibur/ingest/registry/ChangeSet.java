@@ -9,7 +9,7 @@ import java.util.Objects;
  * Represents the result of change detection between a crawl and the document registry.
  *
  * <h2>Categories</h2>
- * <p>A ChangeSet categorizes documents into four groups:
+ * <p>A ChangeSet categorizes documents into five groups:
  * <ul>
  *   <li><strong>New documents:</strong> Documents that exist in the crawl but not in the registry</li>
  *   <li><strong>Changed documents:</strong> Documents that exist in both but have different content
@@ -19,6 +19,11 @@ import java.util.Objects;
  *       asked about - a timeout, a server error, a {@code 304} to a request that asked
  *       nothing. Whether they changed is unknown, so their indexed version is kept; they are
  *       listed so the run can report them as failures rather than as unchanged</li>
+ *   <li><strong>Refused documents:</strong> Documents in both whose source answered, and
+ *       answered with a version that cannot be indexed - grown past the size limit, turned into
+ *       a content type the source excludes, a {@code 403}. Unlike an unchecked document the
+ *       question was answered, so they are failures with a reason rather than unknowns; their
+ *       indexed version is kept all the same, as for any document a run fails on</li>
  * </ul>
  * <p>Every other document in both is unchanged: its source confirmed the indexed version is
  * current.</p>
@@ -45,6 +50,7 @@ public final class ChangeSet {
     private final List<ChangedDocument> changedDocuments;
     private final List<DocumentMetadata> deletedDocuments;
     private final List<String> uncheckedDocuments;
+    private final List<RefusedDocument> refusedDocuments;
     private final int totalCrawled;
     private final int totalRegistered;
 
@@ -54,6 +60,7 @@ public final class ChangeSet {
         this.changedDocuments = List.copyOf(builder.changedDocuments);
         this.deletedDocuments = List.copyOf(builder.deletedDocuments);
         this.uncheckedDocuments = List.copyOf(builder.uncheckedDocuments);
+        this.refusedDocuments = List.copyOf(builder.refusedDocuments);
         this.totalCrawled = builder.totalCrawled;
         this.totalRegistered = builder.totalRegistered;
     }
@@ -109,6 +116,16 @@ public final class ChangeSet {
     }
 
     /**
+     * Returns the registered documents whose source answered with a version that cannot be
+     * indexed.
+     *
+     * @return Unmodifiable list, in crawl order
+     */
+    public List<RefusedDocument> getRefusedDocuments() {
+        return refusedDocuments;
+    }
+
+    /**
      * Returns the count of new documents.
      *
      * @return New document count
@@ -145,14 +162,24 @@ public final class ChangeSet {
     }
 
     /**
+     * Returns the count of documents whose current version the source refused.
+     *
+     * @return Refused document count
+     */
+    public int getRefusedCount() {
+        return refusedDocuments.size();
+    }
+
+    /**
      * Returns how many registered documents the source confirmed are current.
      *
-     * <p>What the crawl listed less what is new, changed or could not be checked.</p>
+     * <p>What the crawl listed less what is new, changed, refused or could not be checked.</p>
      *
      * @return Unchanged document count
      */
     public int getUnchangedCount() {
-        return Math.max(0, totalCrawled - getNewCount() - getChangedCount() - getUncheckedCount());
+        return Math.max(0, totalCrawled - getNewCount() - getChangedCount() - getUncheckedCount()
+            - getRefusedCount());
     }
 
     /**
@@ -174,14 +201,14 @@ public final class ChangeSet {
     }
 
     /**
-     * Checks if there is anything for a run to act on or report: a new, changed, deleted or
-     * unchecked document.
+     * Checks if there is anything for a run to act on or report: a new, changed, deleted,
+     * unchecked or refused document.
      *
      * @return true if there are any
      */
     public boolean hasChanges() {
         return !newDocuments.isEmpty() || !changedDocuments.isEmpty() || !deletedDocuments.isEmpty()
-            || !uncheckedDocuments.isEmpty();
+            || !uncheckedDocuments.isEmpty() || !refusedDocuments.isEmpty();
     }
 
     /**
@@ -281,6 +308,23 @@ public final class ChangeSet {
     }
 
     /**
+     * A registered document whose source answered with a version that cannot be indexed.
+     *
+     * @param documentId The document
+     * @param reason     What the source answered
+     */
+    public record RefusedDocument(String documentId, String reason) {
+
+        /**
+         * @throws NullPointerException if either argument is null
+         */
+        public RefusedDocument {
+            Objects.requireNonNull(documentId, "documentId must not be null");
+            Objects.requireNonNull(reason, "reason must not be null");
+        }
+    }
+
+    /**
      * Builder for constructing ChangeSet instances.
      */
     public static final class Builder {
@@ -289,6 +333,7 @@ public final class ChangeSet {
         private final List<ChangedDocument> changedDocuments = new ArrayList<>();
         private final List<DocumentMetadata> deletedDocuments = new ArrayList<>();
         private final List<String> uncheckedDocuments = new ArrayList<>();
+        private final List<RefusedDocument> refusedDocuments = new ArrayList<>();
         private int totalCrawled = 0;
         private int totalRegistered = 0;
 
@@ -346,6 +391,19 @@ public final class ChangeSet {
         public Builder addUnchecked(String documentId) {
             Objects.requireNonNull(documentId, "documentId must not be null");
             uncheckedDocuments.add(documentId);
+            return this;
+        }
+
+        /**
+         * Adds a registered document whose source answered with a version that cannot be
+         * indexed.
+         *
+         * @param documentId The document ID
+         * @param reason     What the source answered, for the run's report
+         * @return This builder
+         */
+        public Builder addRefused(String documentId, String reason) {
+            refusedDocuments.add(new RefusedDocument(documentId, reason));
             return this;
         }
 

@@ -2473,11 +2473,15 @@ cannot travel in a header — names no version at all, so it is a failed fetch, 
 current. The link walk still reads every HTML page it follows links from, because a page's links
 cannot be read from a `304`.
 
-A document the re-crawl cannot ask about — the request timed out, the server answered `5xx`, or
-the `304` above — has not been shown to be either changed or current. It keeps its indexed
-version, is counted in the run's `documents_failed` and `documents_unchecked` on
+A document the re-crawl cannot ask about — the request timed out, the server answered `5xx`,
+`408` or `429`, or the `304` above — has not been shown to be either changed or current. It keeps
+its indexed version, is counted in the run's `documents_failed` and `documents_unchecked` on
 [`/v1/reindex/status`](#reindex-status-example) with the first ten named in `unchecked_sample`,
-and is asked again by the next re-crawl. Each failure's reason is in the node's log.
+and is asked again by the next re-crawl. A document the source did answer for, with a version the
+node cannot index — grown past the size limit, turned into a content type the source excludes,
+any other `4xx` — is a failure with a known reason instead: counted in `documents_failed` only,
+not as unchecked, and its indexed version kept all the same. Each failure's reason is in the
+node's log.
 
 The validators live in the registry file, not in memory, so this holds across a restart — the
 first re-crawl after one is exactly when a node would otherwise transfer the whole site again. A
@@ -2573,7 +2577,7 @@ and `progress` is their ratio.
 | Count | What it counts |
 |-------|----------------|
 | `documents_failed` | Documents the run could not index or could not check: a fetch or read that failed, a document over the per-document limits, chunks that could not all be embedded and written, and the unchecked documents below. Counted as the run goes, so a stopped or failed run reports what it had failed on by then. Each failed document keeps whatever version was indexed before |
-| `documents_unchecked` | The part of `documents_failed` the re-crawl could not ask its source about — a timeout, a `5xx`, a `304` to a request that carried no condition. See [How a re-crawl finds what changed](#how-a-re-crawl-finds-what-changed) |
+| `documents_unchecked` | The part of `documents_failed` the re-crawl could not ask its source about — a timeout, a `5xx`, `408` or `429`, a `304` to a request that carried no condition. See [How a re-crawl finds what changed](#how-a-re-crawl-finds-what-changed) |
 | `unchecked_sample` | The first ten unchecked documents, by document id — the id a query result names, never an error message. Enough to tell one host that is down from scattered timeouts; the count above is always whole |
 
 ### Compaction Example

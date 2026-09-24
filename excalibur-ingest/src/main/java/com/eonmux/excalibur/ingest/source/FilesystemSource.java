@@ -224,10 +224,9 @@ public class FilesystemSource implements Source {
             long fileSize = attrs.size();
 
             if (fileSize > maxFileSize) {
-                throw new SourceException(
+                throw new DocumentRefusedException(
                     "File too large: " + fileSize + " bytes (max: " + maxFileSize + "): " + documentId,
-                    sourceId,
-                    false
+                    sourceId
                 );
             }
 
@@ -483,19 +482,17 @@ public class FilesystemSource implements Source {
         }
 
         if (!Files.isRegularFile(filePath, linkOptions)) {
-            throw new SourceException(
+            throw new DocumentRefusedException(
                 "Document is not a regular file: " + documentId,
-                sourceId,
-                false
+                sourceId
             );
         }
 
         if (followSymlinks && !staysInsideRoot(filePath)) {
-            throw new SourceException(
+            throw new DocumentRefusedException(
                 "Document " + documentId + " is reached through a link that leaves the source "
                     + "root " + rootPath,
-                sourceId,
-                false
+                sourceId
             );
         }
 

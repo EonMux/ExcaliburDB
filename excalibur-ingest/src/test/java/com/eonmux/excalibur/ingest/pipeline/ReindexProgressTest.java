@@ -3,6 +3,7 @@ package com.eonmux.excalibur.ingest.pipeline;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
+import com.eonmux.excalibur.ingest.source.DocumentRefusedException;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
@@ -165,6 +166,32 @@ class ReindexProgressTest {
     }
 
     @Test
+    @DisplayName("a document its source refuses is a failure with its reason, not unchecked")
+    void aRefusedDocumentIsAFailureNotUnchecked() throws SourceException {
+        StubSource source = new StubSource();
+        source.add("doc-a", "A document that stays the same. ".repeat(60));
+        source.add("doc-b", "A document that grows past the limit. ".repeat(60));
+        reindexer.reindexAll(source);
+        source.refuse("doc-b");
+        Reported reported = new Reported();
+
+        DocumentReindexer.ReindexResult result = reindexer.reindexAll(source, reported);
+
+        assertThat(result.getDocumentsFailed()).isEqualTo(1);
+        assertThat(result.getDocumentsUnchecked())
+            .as("the source answered for it; it was not left unasked")
+            .isZero();
+        assertThat(result.getDocumentsUnchanged()).isEqualTo(1);
+        assertThat(result.getErrors())
+            .extracting(DocumentReindexer.ReindexResult.OperationError::getComponent)
+            .containsExactly("fetch");
+        assertThat(reported.unchecked).containsExactly("0:[]");
+        assertThat(registry.get(SOURCE, "doc-b"))
+            .as("the version indexed before stays, as for any document a run fails on")
+            .isNotNull();
+    }
+
+    @Test
     @DisplayName("the documents named as unchecked are a bounded sample of them")
     void theUncheckedSampleIsBounded() {
         DocumentReindexer.ReindexResult.Builder builder =
@@ -226,6 +253,7 @@ class ReindexProgressTest {
 
         private final Map<String, String> documents = new LinkedHashMap<>();
         private final Set<String> unreadable = ConcurrentHashMap.newKeySet();
+        private final Set<String> refused = ConcurrentHashMap.newKeySet();
 
         void add(String documentId, String content) {
             documents.put(documentId, content);
@@ -233,6 +261,10 @@ class ReindexProgressTest {
 
         void failOn(String documentId) {
             unreadable.add(documentId);
+        }
+
+        void refuse(String documentId) {
+            refused.add(documentId);
         }
 
         @Override
@@ -254,6 +286,9 @@ class ReindexProgressTest {
         public FetchedDocument fetch(String documentId) throws SourceException {
             if (unreadable.contains(documentId)) {
                 throw new SourceException("Cannot read " + documentId);
+            }
+            if (refused.contains(documentId)) {
+                throw new DocumentRefusedException("File too large: " + documentId, SOURCE);
             }
             String content = documents.get(documentId);
             if (content == null) {

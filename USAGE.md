@@ -850,8 +850,9 @@ a crawled file, a fetched page, or one supplied to `POST /v1/documents`:
 
 At the default chunk size (512 tokens, 64 overlapping) the chunk limit is the one a text document
 meets first, at roughly 18 MB. A document over either limit is counted in `documents_failed` on the
-first crawl and on every re-crawl alike, and nothing of it is searchable; a larger document has to
-be split before it is ingested.
+first crawl and on every re-crawl alike, and nothing of that version is searchable - a document
+that grew past a limit keeps the version indexed before it, as any document a re-crawl fails on
+does; a larger document has to be split before it is ingested.
 
 `max_file_bytes` and `max_response_bytes` cannot be set past the byte limit, since a larger file or
 body could only be read to be discarded. A filesystem walk never lists a file over its
@@ -1453,8 +1454,8 @@ copied or restored with its bytes intact is not rewritten, whatever its modifica
 the new time is recorded in the registry instead.
 
 A document the re-crawl cannot ask about is neither changed nor current: the request timed out,
-the server answered `5xx`, or it answered `304` to a request that carried no validators, which
-names no version at all. Its indexed version stays, it is counted in `documents_failed` and
+the server answered `5xx`, `408` or `429`, or it answered `304` to a request that carried no
+validators, which names no version at all. Its indexed version stays, it is counted in `documents_failed` and
 `documents_unchecked` on the reindex status below, with the first ten named in
 `unchecked_sample`, and the next re-crawl asks again. The reason for each is in the node's log.
 

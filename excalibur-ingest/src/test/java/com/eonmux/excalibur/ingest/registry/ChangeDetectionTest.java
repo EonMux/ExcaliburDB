@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.ingest.registry;
 
+import com.eonmux.excalibur.ingest.source.DocumentRefusedException;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
@@ -726,6 +727,48 @@ class ChangeDetectionTest {
         assertTrue(changes.hasChanges());
     }
 
+    @Test
+    void testDocumentItsSourceRefusesIsReportedRefusedNotUnchecked() throws SourceException {
+        byte[] content = "same content".getBytes(StandardCharsets.UTF_8);
+        for (String id : List.of("grown", "down", "fine")) {
+            registry.register(DocumentMetadata.builder()
+                .sourceId("test-source")
+                .documentId(id)
+                .contentHash(DocumentRegistry.computeContentHash(content))
+                .contentLength(content.length)
+                .lastModifiedMillis(1000L)
+                .addChunkId(id + "#0")
+                .build());
+        }
+        Source source = new MockSource("test-source", List.of("grown", "down", "fine"),
+            docId -> new FetchedDocument(docId, content, "text/plain", 1000L)) {
+            @Override
+            public FetchedDocument fetch(String documentId) {
+                if (documentId.equals("grown")) {
+                    throw new RefusedSourceFailure();
+                }
+                if (documentId.equals("down")) {
+                    throw new UncheckedSourceFailure();
+                }
+                return super.fetch(documentId);
+            }
+        };
+
+        ChangeSet changes = detector.detectChanges(new Rethrowing(source));
+
+        assertEquals(1, changes.getRefusedCount());
+        ChangeSet.RefusedDocument refused = changes.getRefusedDocuments().get(0);
+        assertEquals("grown", refused.documentId());
+        assertTrue(refused.reason().contains("Response too large"),
+            "the source's answer is carried as the reason: " + refused.reason());
+        assertEquals(List.of("down"), changes.getUncheckedDocuments(),
+            "only the document the source could not be asked about is unchecked");
+        assertEquals(0, changes.getDeletedCount(), "the refused document's indexed version is kept");
+        assertEquals(0, changes.getChangedCount());
+        assertEquals(1, changes.getUnchangedCount());
+        assertTrue(changes.hasChanges());
+    }
+
     // ==================== Helper Methods ====================
 
     private DocumentMetadata createMetadata(String sourceId, String documentId) {
@@ -749,7 +792,11 @@ class ChangeDetectionTest {
     private static final class UncheckedSourceFailure extends RuntimeException {
     }
 
-    /** A source whose marked fetches fail as a source does: a timeout, a 5xx. */
+    /** Marks a fetch the {@link Rethrowing} wrapper turns into a {@link DocumentRefusedException}. */
+    private static final class RefusedSourceFailure extends RuntimeException {
+    }
+
+    /** A source whose marked fetches fail as a source does: a timeout, a 5xx, a refusal. */
     private static final class Rethrowing implements Source {
         private final Source delegate;
 
@@ -779,6 +826,9 @@ class ChangeDetectionTest {
             } catch (UncheckedSourceFailure e) {
                 throw new SourceException("HTTP error 503 fetching: " + documentId,
                     getSourceId(), true);
+            } catch (RefusedSourceFailure e) {
+                throw new DocumentRefusedException("Response too large: exceeds 10 bytes: "
+                    + documentId, getSourceId());
             }
         }
 

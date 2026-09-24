@@ -158,6 +158,12 @@ public class HttpSource implements Source {
     /** The answer to a conditional request whose version the server still holds. */
     private static final int NOT_MODIFIED = 304;
 
+    /** {@code 408 Request Timeout}: the server gave up waiting, which says nothing of the page. */
+    private static final int REQUEST_TIMEOUT = 408;
+
+    /** {@code 429 Too Many Requests}: the server is shedding load, not answering for the page. */
+    private static final int TOO_MANY_REQUESTS = 429;
+
     /** IMF-fixdate, the one form of HTTP date a sender may produce. */
     private static final DateTimeFormatter HTTP_DATE = DateTimeFormatter
         .ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.ENGLISH)
@@ -688,8 +694,8 @@ public class HttpSource implements Source {
             target = redirectTarget(target, response);
         }
 
-        throw new SourceException(
-            "Too many redirects (max " + MAX_REDIRECTS + ") starting at: " + url, sourceId, false);
+        throw new DocumentRefusedException(
+            "Too many redirects (max " + MAX_REDIRECTS + ") starting at: " + url, sourceId);
     }
 
     /**
@@ -774,6 +780,16 @@ public class HttpSource implements Source {
     }
 
     /**
+     * Whether an error status says the request was not answered rather than what the document is.
+     *
+     * @param status An HTTP status of 400 or more
+     * @return true for a server error, a request timeout or load shedding
+     */
+    private static boolean isTransient(int status) {
+        return status >= 500 || status == REQUEST_TIMEOUT || status == TOO_MANY_REQUESTS;
+    }
+
+    /**
      * Resolves and authorizes the next hop of a redirect.
      *
      * @param from     The URL that returned the redirect
@@ -785,9 +801,9 @@ public class HttpSource implements Source {
             throws SourceException {
         String location = getHeader(response, "Location", null);
         if (location == null || location.isBlank()) {
-            throw new SourceException(
+            throw new DocumentRefusedException(
                 "Redirect " + response.statusCode() + " without Location header: " + from,
-                sourceId, false);
+                sourceId);
         }
 
         String next = resolveUrl(from, location);
@@ -797,9 +813,9 @@ public class HttpSource implements Source {
             // swallow the exception as "this page yielded no links".
             LOG.warn("Source {} refused a redirect from {} to {}: outside the source policy",
                 sourceId, from, location);
-            throw new SourceException(
+            throw new DocumentRefusedException(
                 "Redirect from " + from + " to " + location + " is outside the source policy",
-                sourceId, false);
+                sourceId);
         }
         return normalizeUrl(next);
     }
@@ -828,10 +844,9 @@ public class HttpSource implements Source {
         // maxResponseSize to DocumentLimits.MAX_DOCUMENT_BYTES, so the sum fits an int.
         byte[] content = readUpTo(response, url, (int) maxResponseSize + 1);
         if (content.length > maxResponseSize) {
-            throw new SourceException(
+            throw new DocumentRefusedException(
                 "Response too large: exceeds " + maxResponseSize + " bytes: " + url,
-                sourceId,
-                false);
+                sourceId);
         }
         return content;
     }
@@ -965,10 +980,9 @@ public class HttpSource implements Source {
         }
 
         if (!isUrlAllowed(documentId)) {
-            throw new SourceException(
+            throw new DocumentRefusedException(
                 "Document ID not allowed by source filters: " + documentId,
-                sourceId,
-                false
+                sourceId
             );
         }
 
@@ -994,11 +1008,12 @@ public class HttpSource implements Source {
 
             if (response.statusCode() >= 400) {
                 closeQuietly(response.body());
-                throw new SourceException(
-                    "HTTP error " + response.statusCode() + " fetching: " + documentId,
-                    sourceId,
-                    response.statusCode() >= 500
-                );
+                String failure = "HTTP error " + response.statusCode() + " fetching: " + documentId;
+                if (isTransient(response.statusCode())) {
+                    throw new SourceException(failure, sourceId, true);
+                }
+                // Any other client error answers for the document: this is what it is now.
+                throw new DocumentRefusedException(failure, sourceId);
             }
 
             byte[] content = readBoundedBody(response, documentId);
@@ -1359,10 +1374,9 @@ public class HttpSource implements Source {
         if (includedContentTypes.isEmpty() || includedContentTypes.contains(contentType)) {
             return;
         }
-        throw new SourceException(
+        throw new DocumentRefusedException(
             "Content type not accepted by this source: " + contentType + " for " + documentId,
-            sourceId,
-            false);
+            sourceId);
     }
 
     /**

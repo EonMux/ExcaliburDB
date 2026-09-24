@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.ingest.registry;
 
 import com.eonmux.excalibur.ingest.source.DocumentNotFoundException;
+import com.eonmux.excalibur.ingest.source.DocumentRefusedException;
 import com.eonmux.excalibur.ingest.source.DocumentValidators;
 import com.eonmux.excalibur.ingest.source.FetchDisallowedException;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
@@ -246,11 +247,13 @@ public class ChangeDetector {
      *
      * <p>A fetch failure is not evidence of either outcome, and the two kinds have to be told
      * apart. A {@link DocumentNotFoundException} means the crawl listed a document that is no
-     * longer there, so it is reported as unseen and the deleted-document pass tombstones it. Any
-     * other failure is transient - the host is down, the request timed out - and treating it as
-     * unseen would tombstone a document that still exists, so the previous version is kept, the
-     * failure is logged, and the document is reported unchecked rather than silently recorded as
-     * unchanged.</p>
+     * longer there, so it is reported as unseen and the deleted-document pass tombstones it. A
+     * {@link DocumentRefusedException} means the source answered with a version this node cannot
+     * index - too large, an excluded type, a {@code 403}; the previous version is kept and the
+     * document is reported refused, a failure with its reason. Any other failure is transient -
+     * the host is down, the request timed out - and treating it as unseen would tombstone a
+     * document that still exists, so the previous version is kept, the failure is logged, and the
+     * document is reported unchecked rather than silently recorded as unchanged.</p>
      *
      * <p>A {@link FetchDisallowedException} is not a failure but an answer: the publisher now
      * forbids fetching the document - a robots.txt that disallows it, or the URL it redirects
@@ -280,6 +283,13 @@ public class ChangeDetector {
             LOGGER.info("Document {} of source {} may no longer be fetched; treating as deleted: {}",
                 documentId, sourceId, e.getMessage());
             return false;
+        } catch (DocumentRefusedException e) {
+            // An answer, not a failure to get one: the source's current version is one this node
+            // cannot index.
+            LOGGER.warn("Document {} of source {} cannot be indexed as it now is: {}. "
+                + "Keeping the indexed version.", documentId, sourceId, e.getMessage());
+            builder.addRefused(documentId, e.getMessage());
+            return true;
         } catch (SourceException e) {
             LOGGER.warn("Could not determine whether document {} of source {} changed: {}. "
                 + "Keeping the indexed version.", documentId, sourceId, e.getMessage());

@@ -227,6 +227,10 @@ final class SourceReindexPass {
         ReindexResult.Builder resultBuilder = ReindexResult.builder(sourceId)
             .documentsUnchanged(changeSet.getUnchangedCount());
         changeSet.getUncheckedDocuments().forEach(resultBuilder::addUnchecked);
+        // Failed, not unchecked: the source said what the document is now, and it is not
+        // something this node indexes. The indexed version stays, as for any failed document.
+        changeSet.getRefusedDocuments().forEach(refused ->
+            resultBuilder.addDocumentFailure("fetch", refused.documentId(), refused.reason()));
         if (changeSet.getUncheckedCount() > 0) {
             LOG.warn("Reindex of {} could not check {} document(s), whose indexed versions are "
                     + "kept; the first: {}", sourceId, changeSet.getUncheckedCount(),
