@@ -22,7 +22,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * </ul>
  *
  * @author ExcaliburDB
- * @since Phase 10
  */
 class LatencyPercentileValidatorTest {
 

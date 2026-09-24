@@ -15,7 +15,6 @@ import static org.assertj.core.api.Assertions.*;
  * and that benchmarks don't exceed available RAM.</p>
  *
  * @author ExcaliburDB
- * @since Phase 10
  */
 class MemoryUsageValidatorTest {
 

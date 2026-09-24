@@ -40,7 +40,7 @@ import static org.mockito.Mockito.when;
  *   <li>Domain correctness: thresholds in [0.0, 1.0], coverage in [0.0, 1.0]</li>
  * </ul>
  *
- * <h2>Feature 106: Health Configuration Options</h2>
+ * <h2>Health Configuration Options</h2>
  * <p>This test validates that health configuration options from excalibur.properties
  * or environment variables are correctly applied to the health endpoint behavior.</p>
  */

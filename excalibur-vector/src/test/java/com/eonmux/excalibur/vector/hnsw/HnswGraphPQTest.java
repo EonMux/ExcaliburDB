@@ -63,8 +63,8 @@ class HnswGraphPQTest {
         void acceptsUntrainedQuantizerForFallback() throws IOException {
             try (HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 1000)) {
                 // Untrained quantizers are allowed for graceful fallback during cold start
-                // Per PROJECT GOAL: "if codebook is not yet trained (cold segment),
-                // distance computation uses full-precision vectors"
+                // If the codebook is not yet trained (cold segment), distance computation
+                // uses full-precision vectors
                 ProductQuantizer untrained = new ProductQuantizer(64, 8, 256);
                 // Should NOT throw - untrained quantizers are allowed
                 graph.setProductQuantizer(untrained);

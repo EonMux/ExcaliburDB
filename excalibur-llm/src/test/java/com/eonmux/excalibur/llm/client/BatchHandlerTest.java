@@ -569,11 +569,11 @@ class BatchHandlerTest {
         assertEquals("Third specific text", scores.get(2).getCandidateText());
     }
 
-    // ============= Score Combination Tests (CRITICAL - Task 24) =============
-    // Task 24: "Scores from multiple calls must be combined correctly (same format as single call)"
+    // ============= Score Combination Tests =============
+    // Scores from multiple calls must be combined correctly, in the same format as a single call.
 
     @Test
-    @DisplayName("CRITICAL Task 24: Multiple batch scores combined in same format as single call")
+    @DisplayName("Multiple batch scores combined in same format as single call")
     void scoreWithBatching_multipleBatches_sameFormatAsSingleCall() {
         // Use a low token limit to force multiple batches
         LLMClientConfig smallBatchConfig = LLMClientConfig.builder()
@@ -648,7 +648,7 @@ class BatchHandlerTest {
     }
 
     @Test
-    @DisplayName("CRITICAL Task 24: Duplicate indices from LLM are handled gracefully")
+    @DisplayName("Duplicate indices from LLM are handled gracefully")
     void scoreWithBatching_duplicateIndicesFromLLM_deduplicated() {
         // Use a low token limit to force multiple batches
         LLMClientConfig smallBatchConfig = LLMClientConfig.builder()
@@ -690,7 +690,7 @@ class BatchHandlerTest {
     }
 
     @Test
-    @DisplayName("CRITICAL Task 24: Out-of-range batch indices are skipped (not clamped)")
+    @DisplayName("Out-of-range batch indices are skipped (not clamped)")
     void scoreWithBatching_outOfRangeBatchIndices_skipped() {
         // Use a low token limit to force multiple batches
         LLMClientConfig smallBatchConfig = LLMClientConfig.builder()
@@ -734,7 +734,7 @@ class BatchHandlerTest {
     }
 
     @Test
-    @DisplayName("CRITICAL Task 24: Empty batch results handled correctly")
+    @DisplayName("Empty batch results handled correctly")
     void scoreWithBatching_emptyBatchResults_noErrors() {
         // Use a low token limit to force multiple batches
         LLMClientConfig smallBatchConfig = LLMClientConfig.builder()
@@ -767,7 +767,7 @@ class BatchHandlerTest {
     }
 
     @Test
-    @DisplayName("CRITICAL Task 24: Merged scores maintain RelevancyScore contract")
+    @DisplayName("Merged scores maintain RelevancyScore contract")
     void scoreWithBatching_mergedScores_maintainContract() {
         // Use a low token limit to force multiple batches
         LLMClientConfig smallBatchConfig = LLMClientConfig.builder()

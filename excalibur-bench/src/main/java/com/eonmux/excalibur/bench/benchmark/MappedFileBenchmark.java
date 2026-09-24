@@ -13,8 +13,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * JMH benchmark for MappedFile read/write throughput.
  *
- * <p>Measures throughput of memory-mapped I/O operations using Panama FFM
- * to validate the Phase 1 requirement for high-performance memory-mapped access.</p>
+ * <p>Measures throughput of memory-mapped I/O operations using Panama FFM.</p>
  *
  * <h2>Performance Targets</h2>
  * <ul>

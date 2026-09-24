@@ -8,7 +8,7 @@ import org.openjdk.jmh.runner.options.TimeValue;
 /**
  * JMH Benchmark Runner for MappedFile read/write throughput.
  *
- * <p>Runs benchmarks for Phase 1 memory-mapped I/O operations.</p>
+ * <p>Runs benchmarks for memory-mapped I/O operations.</p>
  *
  * <h2>Usage</h2>
  * <pre>
@@ -56,7 +56,7 @@ public class MappedFileBenchmarkRunner {
     public static void main(String[] args) throws Exception {
         System.out.println("========================================");
         System.out.println("ExcaliburDB MappedFile Benchmark Runner");
-        System.out.println("Phase 1 - Core Primitives Validation");
+        System.out.println("Core Primitives Validation");
         System.out.println("========================================");
         System.out.println();
         System.out.println("Running benchmark with configuration:");
@@ -103,7 +103,7 @@ public class MappedFileBenchmarkRunner {
         System.out.println("  - For byte operations: ops/sec * buffer_size = bytes/sec");
         System.out.println("  - Example: 1M ops/sec * 4KB = 4 GB/sec throughput");
         System.out.println();
-        System.out.println("Phase 1 Requirements:");
+        System.out.println("Requirements:");
         System.out.println("  [OK] MappedFile read/write throughput measurable");
         System.out.println();
     }

@@ -217,9 +217,9 @@ public class WriteLog implements AutoCloseable {
      * Gets the last integrated offset.
      * <p>
      * This offset tracks the write log offset up to which all entries
-     * have been linked into the HNSW graph (Phase 4). Entries beyond
+     * have been linked into the HNSW graph. Entries beyond
      * this offset exist in the write log but are not yet in the graph.
-     * Critical for live-indexing tail scan (Phase 6).
+     * Critical for the live-indexing tail scan.
      * </p>
      *
      * <p><strong>Domain Guarantee:</strong> The returned value is always
@@ -242,7 +242,7 @@ public class WriteLog implements AutoCloseable {
      *
      * <p>This method is called during HNSW graph integration to track progress.
      * The monotonicity constraint ensures the offset never goes backwards,
-     * which is critical for correct tail scan behavior in Phase 6.</p>
+     * which is critical for correct tail scan behavior.</p>
      *
      * @param offset The new last integrated offset (must be >= 0 and >= current value)
      * @throws IllegalArgumentException if offset is negative
@@ -1196,7 +1196,7 @@ public class WriteLog implements AutoCloseable {
      * Returns the last integrated offset.
      * <p>
      * This offset tracks the write log offset up to which all entries
-     * have been linked into the HNSW graph (Phase 4). Entries beyond
+     * have been linked into the HNSW graph. Entries beyond
      * this offset exist in the write log but are not yet in the graph.
      * </p>
      *

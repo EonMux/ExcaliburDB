@@ -1,4 +1,4 @@
-// excalibur-integration (Phase 10) - Integration Tests
+// excalibur-integration - Integration Tests
 plugins {
     `java`
 }

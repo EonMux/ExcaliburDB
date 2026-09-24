@@ -474,8 +474,8 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
          * Test: Epoch isolation - segment-level visibility consistency.
          *
          * <p><strong>IMPORTANT:</strong> ExcaliburDB provides SEGMENT-level epoch isolation,
-         * not document-level isolation. Per the PROJECT GOAL: "Each query captures the
-         * epoch at start time and sees a consistent segment snapshot."</p>
+         * not document-level isolation: each query captures the
+         * epoch at start time and sees a consistent segment snapshot.</p>
          *
          * <p>This means that when a query captures epoch E, it sees all segments that
          * were visible at epoch E. All documents within those segments are visible,

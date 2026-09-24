@@ -50,8 +50,8 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 /**
  * Integration tests for cold start behavior.
  *
- * <h2>Test Coverage (Phase 10 Requirement)</h2>
- * <p>These tests verify the PROJECT GOAL requirement:</p>
+ * <h2>Test Coverage</h2>
+ * <p>These tests verify the cold-start guarantee:</p>
  * <blockquote>
  *   Cold start: start with empty index, begin ingestion and querying simultaneously,
  *   verify graceful degradation.
@@ -128,9 +128,9 @@ class ColdStartIntegrationTest {
          * Test: Empty index returns degraded=true with coverage=0.0.
          *
          * <p><strong>Domain Correctness:</strong> For empty index, coverage must be exactly 0.0
-         * and degraded must be true (below 0.5 threshold as per PROJECT GOAL).</p>
+         * and degraded must be true (below the 0.5 degraded threshold).</p>
          *
-         * <p>This validates the PROJECT GOAL requirement:</p>
+         * <p>This validates the guarantee:</p>
          * <blockquote>
          *   On first boot with empty index, queries are accepted immediately.
          *   Responses have estimated_corpus_coverage = 0.0, degraded = true.
@@ -204,7 +204,7 @@ class ColdStartIntegrationTest {
          * <p><strong>Domain Correctness:</strong> All queries must complete without exception
          * and within reasonable time bounds (no blocking on empty index).</p>
          *
-         * <p>This validates the PROJECT GOAL requirement:</p>
+         * <p>This validates the guarantee:</p>
          * <blockquote>
          *   Queries are accepted immediately. No waiting for index to be "ready".
          * </blockquote>
@@ -280,7 +280,7 @@ class ColdStartIntegrationTest {
          *   <li>System must transition from degraded to non-degraded as coverage improves</li>
          * </ul>
          *
-         * <p>This validates the PROJECT GOAL requirement:</p>
+         * <p>This validates the guarantee:</p>
          * <blockquote>
          *   Results appear progressively as crawling proceeds.
          * </blockquote>
@@ -394,7 +394,7 @@ class ColdStartIntegrationTest {
          *   <li>Results progressively improve as more data is ingested</li>
          * </ul>
          *
-         * <p>This validates the PROJECT GOAL requirement:</p>
+         * <p>This validates the guarantee:</p>
          * <blockquote>
          *   Issue queries concurrently with ongoing ingestion on separate threads.
          *   Verify: (a) no exceptions, (b) results progressively improve.

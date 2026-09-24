@@ -1388,7 +1388,7 @@ public class LLMHttpClient {
             candidatesText.append(i).append(". ").append(escaped);
         }
 
-        // Format the prompt using the Phase 7 specification template
+        // Format the relevancy-scoring prompt
         String prompt = String.format(
                 "You are a relevancy judge. Given a user query and a list of candidate passages, " +
                 "score each passage from 0.0 to 1.0 based on how relevant it is to answering the query. " +

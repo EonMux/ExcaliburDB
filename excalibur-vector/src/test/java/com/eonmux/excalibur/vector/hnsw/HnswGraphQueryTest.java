@@ -214,8 +214,7 @@ class HnswGraphQueryTest {
      * Comprehensive recall@10 verification test.
      *
      * <p>Measures actual recall against brute-force ground truth to verify
-     * the default configuration achieves ≥99% recall@10 as specified in the
-     * PROJECT GOAL.</p>
+     * the default configuration achieves ≥99% recall@10.</p>
      *
      * <p><strong>Test methodology:</strong></p>
      * <ol>

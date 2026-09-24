@@ -25,7 +25,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * approximate throughput to verify the ≥1B lookups/sec target is achievable.</p>
  *
  * <h2>What is enforced</h2>
- * <p>Every measurement is printed against the PROJECT GOAL of 1,000,000,000 ops/sec and against
+ * <p>Every measurement is printed against the aspirational 1,000,000,000 ops/sec and against
  * {@link ThroughputValidator#TARGET_POINT_LOOKUP}, the realistic target the benchmark registry
  * is written against, so the distance from both stays visible. What is asserted is
  * {@link ThroughputValidator#POINT_LOOKUP_REGRESSION_FLOOR} - a target measured in wall-clock

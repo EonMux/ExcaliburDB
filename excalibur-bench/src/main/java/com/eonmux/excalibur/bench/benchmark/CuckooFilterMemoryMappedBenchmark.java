@@ -18,8 +18,7 @@ import java.util.concurrent.TimeUnit;
  *
  * <h2>Purpose</h2>
  * <p>Measures the throughput of serialization and deserialization operations
- * for Cuckoo Filters via memory-mapped I/O, validating the Phase 3 requirement
- * for high-performance memory-mappable probabilistic structures.</p>
+ * for Cuckoo Filters via memory-mapped I/O.</p>
  *
  * <h2>Benchmark Scenarios</h2>
  * <ul>

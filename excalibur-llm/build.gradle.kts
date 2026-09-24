@@ -1,4 +1,4 @@
-// excalibur-llm (Phase 7) - LLM Client
+// excalibur-llm - LLM Client
 plugins {
     `java-library`
 }
@@ -12,7 +12,7 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
 
-    // Phase 1 dependency
+    // Core primitives
     implementation(project(":excalibur-core"))
 
     // Configuration module for Config.Llm integration

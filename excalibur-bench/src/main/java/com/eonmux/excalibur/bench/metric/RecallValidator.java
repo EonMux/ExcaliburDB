@@ -16,19 +16,18 @@ package com.eonmux.excalibur.bench.metric;
  *   <li>Recall represents the fraction of true positives retrieved</li>
  *   <li>Recall = |retrieved ∩ relevant| / |relevant|</li>
  *   <li>Must be between 0.0 (no relevant items found) and 1.0 (all relevant items found)</li>
- *   <li>Target recall@10: ≥0.99 (99%) per PROJECT GOAL Phase 4</li>
+ *   <li>Target recall@10: ≥0.99 (99%)</li>
  * </ul>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is immutable and all methods are thread-safe.</p>
  *
  * @author ExcaliburDB
- * @since Phase 10
  */
 public final class RecallValidator {
 
     /**
-     * Target recall@10 value as specified in PROJECT GOAL Phase 4.
+     * Target recall@10 value for HNSW search.
      * Default: 0.99 (99%)
      */
     public static final double TARGET_RECALL_10 = 0.99;
@@ -165,7 +164,7 @@ public final class RecallValidator {
     /**
      * Validates recall@k for HNSW search.
      *
-     * <p>This is the primary validation method for Phase 4 benchmark targets.</p>
+     * <p>This is the primary validation method for HNSW recall targets.</p>
      *
      * @param recall the recall@k value
      * @param k the number of nearest neighbors (typically 10)

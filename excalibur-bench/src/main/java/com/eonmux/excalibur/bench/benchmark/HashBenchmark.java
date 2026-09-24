@@ -13,7 +13,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * JMH benchmark for measuring XxHash64 hash function throughput and latency.
  *
- * <p>This benchmark validates the Phase 1 requirement: "Benchmark hash function speed via JMH."</p>
+ * <p>Measures hash function speed via JMH.</p>
  *
  * <h2>Performance Targets</h2>
  * <ul>

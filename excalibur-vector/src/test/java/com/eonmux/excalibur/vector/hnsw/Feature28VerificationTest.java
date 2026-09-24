@@ -10,11 +10,11 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Verification test for Feature 28: HNSW Configurable efConstruction and efSearch
+ * Verification test for configurable HNSW efConstruction and efSearch.
  *
  * <p>This test verifies that:</p>
  * <ul>
- *   <li>Default values match specification (efConstruction=128, efSearch=64)</li>
+ *   <li>ShardConfig defaults are efConstruction=128, efSearch=64</li>
  *   <li>Values are configurable via ShardConfig</li>
  *   <li>Values flow through HnswConfigFactory to HnswConfig</li>
  *   <li>Values are used in HNSW graph operations</li>

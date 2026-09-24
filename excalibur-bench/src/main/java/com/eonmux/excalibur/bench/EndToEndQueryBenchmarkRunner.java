@@ -72,7 +72,6 @@ import com.eonmux.excalibur.bench.benchmark.EndToEndQueryBenchmark;
  * </pre>
  *
  * @author ExcaliburDB
- * @since Phase 10
  */
 public class EndToEndQueryBenchmarkRunner {
 

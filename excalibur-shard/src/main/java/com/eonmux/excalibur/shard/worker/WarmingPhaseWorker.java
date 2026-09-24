@@ -25,7 +25,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Virtual thread worker that handles the WARMING phase for segments.
  *
- * <p>This worker implements the PQ training workflow described in Phase 5:</p>
+ * <p>This worker implements the PQ training workflow:</p>
  * <ol>
  *   <li>Segment transitions to WARMING state after INDEXING completes</li>
  *   <li>Worker trains ProductQuantizer codebooks on segment vectors</li>

@@ -15,7 +15,6 @@ import static org.assertj.core.api.Assertions.*;
  * which is a critical domain correctness requirement for benchmarks.</p>
  *
  * @author ExcaliburDB
- * @since Phase 10
  */
 class ThroughputValidatorTest {
 

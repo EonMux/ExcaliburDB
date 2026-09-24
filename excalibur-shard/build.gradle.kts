@@ -1,4 +1,4 @@
-// excalibur-shard (Phase 5) - Index Orchestration
+// excalibur-shard - Index Orchestration
 plugins {
     `java-library`
 }
@@ -12,10 +12,10 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
 
-    // Phase 1 - Core primitives (for XxHash64)
+    // Core primitives (XxHash64)
     implementation(project(":excalibur-core"))
 
-    // Phase 2, 3, 4 dependencies
+    // Storage engine, probabilistic structures, and vector index
     implementation(project(":excalibur-store"))
     implementation(project(":excalibur-filter"))
     implementation(project(":excalibur-vector"))

@@ -25,7 +25,7 @@ class CuckooFilterFPRateBenchmarkTest {
 
     private static final Random RANDOM = new Random(42);
 
-    /** PROJECT GOAL specification: false positive rate at most 0.1%. */
+    /** Cuckoo filter target: false positive rate at most 0.1%. */
     private static final double MAX_ACCEPTABLE_FP_RATE = 0.001;
 
     /** Requested capacity; the filter rounds this up to a power-of-two bucket count. */

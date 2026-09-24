@@ -48,7 +48,6 @@ import static org.assertj.core.api.Assertions.assertThat;
  * </ul>
  *
  * @author ExcaliburDB
- * @since Phase 10
  */
 class EndToEndQueryBenchmarkValidationTest {
 

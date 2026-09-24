@@ -191,7 +191,7 @@ public class QuickBenchmarkValidation {
             + (opsPerSec >= ThroughputValidator.TARGET_POINT_LOOKUP ? " (met)" : " (not met)"));
         System.out.println("  Enforced floor: "
             + formatOpsPerSec(ThroughputValidator.POINT_LOOKUP_REGRESSION_FLOOR));
-        System.out.println("  PROJECT GOAL (aspirational): " + formatOpsPerSec(1_000_000_000.0));
+        System.out.println("  Aspirational: " + formatOpsPerSec(1_000_000_000.0));
 
         // Assert the regression floor rather than the target: the target is a wall-clock figure
         // and the host moves a reading further than a code change does. Printing

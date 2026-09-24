@@ -218,7 +218,6 @@ public final class LLMClientConfig {
 
     /**
      * Default cooldown period for circuit breaker (60 seconds = 60000ms).
-     * Domain correctness: this matches the Phase 7 specification default.
      */
     private static final Duration DEFAULT_COOLDOWN = Duration.ofMillis(60000);
 
@@ -251,7 +250,6 @@ public final class LLMClientConfig {
 
     /**
      * Default max batch tokens (4000).
-     * Domain correctness: this matches the Phase 7 specification default for batch handler.
      * This value balances context window usage with API call efficiency.
      */
     private static final int DEFAULT_MAX_BATCH_TOKENS = 4000;

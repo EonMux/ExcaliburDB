@@ -28,7 +28,6 @@ import java.util.Locale;
  * <p>This class is immutable and all methods are thread-safe.</p>
  *
  * @author ExcaliburDB
- * @since Phase 10
  */
 public final class LatencyPercentileValidator {
 

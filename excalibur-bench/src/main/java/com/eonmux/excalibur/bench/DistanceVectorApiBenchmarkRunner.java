@@ -37,7 +37,6 @@ import org.openjdk.jmh.runner.options.TimeValue;
  * </ul>
  *
  * @author ExcaliburDB
- * @since Phase 10
  */
 public class DistanceVectorApiBenchmarkRunner {
 

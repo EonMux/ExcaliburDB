@@ -14,8 +14,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * JMH benchmark for Segment point lookup throughput.
  *
- * <p>Measures throughput of hash table lookups to validate the Phase 2
- * requirement for high-performance point lookups using Robin Hood hashing.</p>
+ * <p>Measures point-lookup throughput of the Robin Hood hash table.</p>
  *
  * <h2>Performance Target</h2>
  * <p>{@code sequentialLookup} and {@code randomLookup} are held to 10 million lookups per

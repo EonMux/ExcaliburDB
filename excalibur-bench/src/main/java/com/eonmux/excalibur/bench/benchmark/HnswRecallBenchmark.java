@@ -20,8 +20,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * JMH benchmark for measuring HNSW recall@10.
  *
- * <p>This benchmark validates the Phase 4 requirement of ≥99% recall@10
- * for the HNSW vector index implementation.</p>
+ * <p>This benchmark holds the HNSW vector index to its ≥99% recall@10 target.</p>
  *
  * <h2>Recall Calculation</h2>
  * <p>Recall@k = |HNSW results ∩ True top-k| / k</p>
@@ -282,7 +281,7 @@ public class HnswRecallBenchmark {
 
     /**
      * Benchmark: Measure recall@10 for HNSW search.
-     * This is the primary metric for Phase 4 validation.
+     * This is the primary recall metric.
      *
      * <h3>Domain Correctness</h3>
      * <ul>

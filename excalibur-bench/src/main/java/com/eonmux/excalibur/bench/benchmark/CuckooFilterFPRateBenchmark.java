@@ -102,8 +102,7 @@ public class CuckooFilterFPRateBenchmark {
     private static final Random RANDOM = new Random(42);
 
     /**
-     * Maximum acceptable false positive rate per specification.
-     * Spec requirement: "Target FP rate ≤0.1%"
+     * Maximum acceptable false positive rate for the Cuckoo filter (0.1%).
      */
     public static final double MAX_ACCEPTABLE_FP_RATE = 0.001; // 0.1%
 

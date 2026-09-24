@@ -12,10 +12,9 @@ import static org.assertj.core.api.Assertions.*;
  * Tests for FPRateValidator domain correctness validation.
  *
  * <p>Verifies that false positive rate values are in range [0.0, 1.0]
- * and meet the PROJECT GOAL specification of ≤0.1% (0.001).</p>
+ * and meet the Cuckoo filter target of ≤0.1% (0.001).</p>
  *
  * @author ExcaliburDB
- * @since Phase 10
  */
 class FPRateValidatorTest {
 

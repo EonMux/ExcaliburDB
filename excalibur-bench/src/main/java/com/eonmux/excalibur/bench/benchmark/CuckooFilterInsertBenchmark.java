@@ -10,8 +10,7 @@ import java.util.concurrent.TimeUnit;
  * JMH benchmark for Cuckoo Filter insert throughput at various load factors.
  *
  * <h2>Purpose</h2>
- * <p>Measures insert operations per second at different load factors to validate
- * the Phase 3 requirement for high-performance Cuckoo Filter operations.</p>
+ * <p>Measures insert operations per second at different load factors.</p>
  *
  * <h2>Benchmark Scenarios</h2>
  * <ul>

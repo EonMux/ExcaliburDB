@@ -22,7 +22,7 @@ import static org.assertj.core.api.Assertions.*;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Feature 23 Verification Tests for LSH Hash Table with Memory Mapping
+ * Verification tests for the memory-mapped LSH hash table.
  */
 class Feature23VerificationTest {
 
