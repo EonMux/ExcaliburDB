@@ -48,6 +48,20 @@ import java.util.stream.Collectors;
  *       present in the registry</li>
  * </ul>
  *
+ * <h2>One key, one source</h2>
+ * <p>A document's key is its source id and its document id joined by a colon, and a source id may
+ * itself contain a colon, so two different documents can share a key: document
+ * {@code wiki:home.md} of source {@code team} and document {@code home.md} of source
+ * {@code team:wiki} are both {@code team:wiki:home.md}. The key is also the prefix of every chunk
+ * id, so storage, the lexical index and the vector index cannot hold both - whichever was written
+ * second would overwrite the first's chunks under the first's registry entry. The key therefore
+ * belongs to the source that registered it first. {@link #register} refuses a record whose key
+ * another source holds, and every lookup by source and document id - {@link #get},
+ * {@link #contains}, {@link #remove} - answers only for a record that source registered, so a
+ * re-crawl, a reindex or an erasure of one source can never read or remove the other's document.
+ * A writer asks {@link #otherSourceHolding} before it writes a chunk, which is what keeps the
+ * refusal from arriving after the other source's chunks were already overwritten.</p>
+ *
  * <h2>Record format</h2>
  * <p>A first line, {@code \#document-registry|<version>}, names the format. One line per
  * document follows, and a last line, {@code \#end|<count>|<crc>}, closes the file: how many
@@ -310,16 +324,65 @@ public final class DocumentRegistry {
      * Registers a document's metadata in the registry.
      *
      * <p>If a document with the same sourceId and documentId already exists,
-     * its metadata is replaced with the new values.</p>
+     * its metadata is replaced with the new values. A document of another source registered
+     * under the same key is never replaced - see the class documentation.</p>
      *
      * @param metadata The document metadata to register
-     * @throws NullPointerException if metadata is null
+     * @throws NullPointerException  if metadata is null
+     * @throws IllegalStateException if another source's document holds the same key
      */
     public void register(DocumentMetadata metadata) {
         Objects.requireNonNull(metadata, "metadata must not be null");
-        String key = makeKey(metadata.getSourceId(), metadata.getDocumentId());
-        documents.put(key, metadata);
+        String sourceId = metadata.getSourceId();
+        String key = makeKey(sourceId, metadata.getDocumentId());
+        documents.compute(key, (k, held) -> {
+            if (held != null && !sourceId.equals(held.getSourceId())) {
+                throw new IllegalStateException(keyTaken(sourceId, metadata.getDocumentId(),
+                    held.getSourceId()));
+            }
+            return metadata;
+        });
         version.incrementAndGet();
+    }
+
+    /**
+     * Names the other source whose document holds the key a document would be registered under.
+     *
+     * <p>For a writer to ask before it writes anything, under the document's lock: a document's
+     * chunk ids begin with its key, so writing one whose key another source holds overwrites
+     * that source's chunks in place, and a refusal at {@link #register} would come after the
+     * damage. Null is the answer for a key that is free and for one this source already holds,
+     * which is an earlier version of the same document.</p>
+     *
+     * @param sourceId   The source about to write the document
+     * @param documentId The document's id within that source
+     * @return The id of the source whose document holds the key, or null when none other does
+     * @throws NullPointerException if sourceId or documentId is null
+     */
+    public String otherSourceHolding(String sourceId, String documentId) {
+        Objects.requireNonNull(sourceId, "sourceId must not be null");
+        Objects.requireNonNull(documentId, "documentId must not be null");
+        DocumentMetadata held = documents.get(makeKey(sourceId, documentId));
+        return held == null || sourceId.equals(held.getSourceId()) ? null : held.getSourceId();
+    }
+
+    /**
+     * Says why a document cannot be registered under a key another source holds.
+     *
+     * <p>One wording for the refusal wherever it is reported - a source's status, a re-crawl's
+     * errors, the log - so an operator reading any of them learns the same two facts: which
+     * source holds the key, and that the cure is an id that does not collide.</p>
+     *
+     * @param sourceId   The source that was refused
+     * @param documentId The document it tried to register
+     * @param holder     The source whose document holds the key
+     * @return The reason
+     */
+    public static String keyTaken(String sourceId, String documentId, String holder) {
+        return "document '" + documentId + "' of source '" + sourceId + "' has the key '"
+            + makeKey(sourceId, documentId) + "', which a document of source '" + holder
+            + "' already holds; a source id followed by a colon must not begin another "
+            + "source's document ids";
     }
 
     /**
@@ -357,50 +420,72 @@ public final class DocumentRegistry {
     /**
      * Retrieves metadata for a specific document.
      *
+     * <p>Only a record that source registered: another source's document under the same key is
+     * not this one - see the class documentation.</p>
+     *
      * @param sourceId The source identifier
      * @param documentId The document identifier
-     * @return The document metadata, or null if not found
+     * @return The document metadata, or null if that source registered no such document
      * @throws NullPointerException if sourceId or documentId is null
      */
     public DocumentMetadata get(String sourceId, String documentId) {
         Objects.requireNonNull(sourceId, "sourceId must not be null");
         Objects.requireNonNull(documentId, "documentId must not be null");
-        String key = makeKey(sourceId, documentId);
-        return documents.get(key);
+        return ownedBy(sourceId, documents.get(makeKey(sourceId, documentId)));
     }
 
     /**
-     * Checks if a document is registered.
+     * The record, if the source asking is the one that registered it.
+     *
+     * @param sourceId The source asking
+     * @param held     What the registry holds under the key, or null
+     * @return The record, or null when there is none or another source registered it
+     */
+    private static DocumentMetadata ownedBy(String sourceId, DocumentMetadata held) {
+        return held != null && sourceId.equals(held.getSourceId()) ? held : null;
+    }
+
+    /**
+     * Checks if a document is registered, by that source.
      *
      * @param sourceId The source identifier
      * @param documentId The document identifier
-     * @return true if the document is registered
+     * @return true if the source registered the document
      * @throws NullPointerException if sourceId or documentId is null
      */
     public boolean contains(String sourceId, String documentId) {
-        Objects.requireNonNull(sourceId, "sourceId must not be null");
-        Objects.requireNonNull(documentId, "documentId must not be null");
-        String key = makeKey(sourceId, documentId);
-        return documents.containsKey(key);
+        return get(sourceId, documentId) != null;
     }
 
     /**
      * Removes a document's metadata from the registry.
      *
+     * <p>Only a record that source registered; another source's document under the same key is
+     * left where it is.</p>
+     *
      * @param sourceId The source identifier
      * @param documentId The document identifier
-     * @return The removed metadata, or null if not found
+     * @return The removed metadata, or null if that source registered no such document
      * @throws NullPointerException if sourceId or documentId is null
      */
     public DocumentMetadata remove(String sourceId, String documentId) {
         Objects.requireNonNull(sourceId, "sourceId must not be null");
         Objects.requireNonNull(documentId, "documentId must not be null");
         String key = makeKey(sourceId, documentId);
-        DocumentMetadata removed = documents.remove(key);
-        if (removed != null) {
+        DocumentMetadata[] removed = new DocumentMetadata[1];
+        // Removed only if this source registered it, in one step: a check and a removal made
+        // apart could take another source's document registered in between.
+        documents.computeIfPresent(key, (k, held) -> {
+            if (!sourceId.equals(held.getSourceId())) {
+                return held;
+            }
+            removed[0] = held;
+            return null;
+        });
+        if (removed[0] != null) {
             version.incrementAndGet();
         }
-        return removed;
+        return removed[0];
     }
 
     /**

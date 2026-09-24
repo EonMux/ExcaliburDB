@@ -11,7 +11,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -57,6 +60,34 @@ class ColonSourceIdTest {
         assertEquals("team:wiki", registry.getByKey("team:wiki:home.md").getSourceId());
         assertEquals("team", registry.getByKey("team:guide.md").getSourceId());
         assertNull(registry.getByKey("team:missing.md"));
+    }
+
+    @Test
+    void aKeyAnotherSourceHoldsIsNotRegisteredOverIt() {
+        // Document wiki:home.md of source team has the key team:wiki:home.md, which a document
+        // of team:wiki already holds.
+        DocumentMetadata held = registry.getByKey("team:wiki:home.md");
+
+        assertEquals("team:wiki", registry.otherSourceHolding("team", "wiki:home.md"));
+        assertThrows(IllegalStateException.class,
+            () -> registry.register(metadata("team", "wiki:home.md", "other")));
+        assertSame(held, registry.getByKey("team:wiki:home.md"));
+    }
+
+    @Test
+    void aSourceHoldingTheKeyItselfConflictsWithNothing() {
+        assertNull(registry.otherSourceHolding("team:wiki", "home.md"));
+        assertNull(registry.otherSourceHolding("team", "new.md"));
+    }
+
+    @Test
+    void aLookupBySourceAndIdAnswersOnlyForTheSourceThatRegisteredIt() {
+        assertNull(registry.get("team", "wiki:home.md"));
+        assertFalse(registry.contains("team", "wiki:home.md"));
+        assertNull(registry.remove("team", "wiki:home.md"));
+
+        assertEquals("team:wiki", registry.getByKey("team:wiki:home.md").getSourceId());
+        assertTrue(registry.contains("team:wiki", "home.md"));
     }
 
     private static DocumentMetadata metadata(String sourceId, String documentId, String text) {

@@ -55,6 +55,12 @@ import java.util.UUID;
  * serving it has the same problem, which nothing here can fix: that half of the obligation belongs
  * to whoever owns the source.</p>
  *
+ * <p>Every run writing under the id - a crawl, a re-crawl, a batch of supplied documents - is
+ * stopped and waited for before anything is erased, within the bound the source registry keeps.
+ * A run still writing when that runs out is answered with 409 {@code source_busy} and nothing
+ * erased, since the registry read that follows would miss the document the run is finishing.
+ * The deregistration stands, and the request is repeated.</p>
+ *
  * <p>Bounded per request, with {@code documents_remaining} saying how much is left, because the
  * work is a storage delete and an index probe per chunk. A large source is a loop of requests, and
  * the count is what tells a caller when the loop is done.</p>
@@ -295,12 +301,20 @@ public class DocumentErasureEndpoint implements HttpHandler {
             DocumentErasureService.Outcome outcome;
             if (SCOPE_SOURCE.equals(scope)) {
                 // Before erasing, not after: a crawl that ran in between would reingest the
-                // documents this request is in the middle of removing. Removing the source also
-                // stops a re-crawl of it that is in flight and waits for that to end, and stops an
-                // ingestion run - though that only at its next document boundary and without
-                // waiting, so one more document may land, and documents_remaining is what shows
-                // it.
-                deregistered = sourceRegistry != null && sourceRegistry.remove(sourceId);
+                // documents this request is in the middle of removing. And every run writing
+                // under the id - a crawl, a re-crawl, a batch of supplied documents - has to have
+                // ended before the registry is read, not only been asked to: a run finishing its
+                // document registers it after that read, and the document outlives the erasure.
+                boolean settled = true;
+                if (sourceRegistry != null) {
+                    SourceRegistry.Removal removal = sourceRegistry.removeSource(sourceId);
+                    deregistered = removal.registered();
+                    settled = removal.stopped() && sourceRegistry.stopRuns(sourceId);
+                }
+                if (!settled) {
+                    refuseWhileWriting(exchange, sourceId, deregistered);
+                    return;
+                }
                 outcome = erasureService.eraseSource(sourceId, MAX_DOCUMENTS, compactNow);
                 // After the erasure, not before it: until the documents are gone, a crawl
                 // registered under this id would still delete them. Released afterwards so the
@@ -337,6 +351,28 @@ public class DocumentErasureEndpoint implements HttpHandler {
                 documentIds.size(), sourceId, e);
             ResponseBody.sendJson(exchange, 500, "{\"error\": \"Internal Server Error\"}");
         }
+    }
+
+    /**
+     * Answers a source-scoped erasure that found a run of the source still writing.
+     *
+     * <p>A 409 and nothing erased, rather than an erasure of what the registry names so far: the
+     * run registers the document it is finishing after that read, so the reply would report the
+     * source erased and a receipt would record it, over a document the node still serves. The
+     * run stops at its next document boundary, so repeating the request is the remedy; the
+     * deregistration stands and is not undone, so the repeat does not race a new crawl.</p>
+     */
+    private static void refuseWhileWriting(HttpExchange exchange, String sourceId,
+                                           boolean deregistered) throws IOException {
+        LOGGER.warn("Erasure of source {} refused: a run of it had not stopped within the wait",
+            sourceId);
+        AuditLog.target(exchange, "deregistered", deregistered);
+        ResponseBody.sendError(exchange, 409, ErrorCode.SOURCE_BUSY,
+            "A run of source '" + sourceId + "' was still writing a document when the wait for "
+                + "it ran out, so nothing was erased. "
+                + (deregistered ? "The source has been deregistered and will not be crawled "
+                    + "again. " : "")
+                + "The run stops at its next document; repeat the request.");
     }
 
     /**

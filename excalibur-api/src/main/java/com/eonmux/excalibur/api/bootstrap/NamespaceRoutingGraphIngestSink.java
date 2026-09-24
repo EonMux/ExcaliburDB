@@ -30,11 +30,13 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <h2>Why the routing lives here</h2>
  * <p>{@link GraphTenants} is an API-layer concern and {@code excalibur-ingest} does not depend on
- * it, so the sink ingestion is handed is the piece that knows about tenants. What arrives is the
- * source-qualified document key - {@code sourceId:documentId}, as
- * {@link com.eonmux.excalibur.core.text.ChunkIdentifiers#documentKey} forms it - which is enough to find
- * the source, and the source is what carries the namespace. Nothing new is threaded through the
- * ingest pipeline for it.</p>
+ * it, so the sink ingestion is handed is the piece that knows about tenants. Ingestion names the
+ * source each document came from, and the source is what carries the namespace. The source is
+ * taken as ingestion names it and never recovered from the document key: a source id may contain
+ * a colon, so with {@code team} and {@code team:wiki} both registered the key
+ * {@code team:wiki:home.md} is as much document {@code wiki:home.md} of {@code team} as document
+ * {@code home.md} of {@code team:wiki}, and a guess from the key would stage one tenant's facts
+ * into the other's graph.</p>
  *
  * <h2>Why the tenant is borrowed per document and not held</h2>
  * <p>A raw {@code GraphStagingStore} held across an eviction is a write to a closed file: the
@@ -85,9 +87,6 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
 
     private static final Logger LOGGER =
         LoggerFactory.getLogger(NamespaceRoutingGraphIngestSink.class);
-
-    /** Separates the source id from the document id in a document key. */
-    private static final char KEY_SEPARATOR = ':';
 
     /**
      * Which namespace a registered source's documents belong to.
@@ -159,13 +158,15 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
      * failure: a graph that has quietly stopped growing for an hour shows up in a count and in
      * nothing else.</p>
      *
+     * @param sourceId           The source that ingested the document
      * @param documentKey        The source-qualified document key
      * @param text               The document's text
      * @param lastModifiedMillis The document's own date, or 0 when its source does not say
      */
     @Override
-    public void onDocumentPublished(String documentKey, String text, long lastModifiedMillis) {
-        route(documentKey, text, lastModifiedMillis, Change.PUBLISHED);
+    public void onDocumentPublished(String sourceId, String documentKey, String text,
+                                    long lastModifiedMillis) {
+        route(sourceId, documentKey, text, lastModifiedMillis, Change.PUBLISHED);
     }
 
     /**
@@ -174,13 +175,15 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
      *
      * <p>Never throws, for the reason {@link #onDocumentPublished} does not.</p>
      *
+     * @param sourceId           The source that ingested the document
      * @param documentKey        The source-qualified document key
      * @param text               The new version's text
      * @param lastModifiedMillis The new version's date, or 0 when its source does not say
      */
     @Override
-    public void onDocumentReplaced(String documentKey, String text, long lastModifiedMillis) {
-        route(documentKey, text, lastModifiedMillis, Change.REPLACED);
+    public void onDocumentReplaced(String sourceId, String documentKey, String text,
+                                   long lastModifiedMillis) {
+        route(sourceId, documentKey, text, lastModifiedMillis, Change.REPLACED);
     }
 
     /**
@@ -190,23 +193,26 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
      * the documents seen, which are the published ones offered to the graph; what it withdrew
      * is counted with every other withdrawal.</p>
      *
+     * @param sourceId    The source that ingested the document
      * @param documentKey The source-qualified document key
      */
     @Override
-    public void onDocumentRemoved(String documentKey) {
-        route(documentKey, null, 0L, Change.REMOVED);
+    public void onDocumentRemoved(String sourceId, String documentKey) {
+        route(sourceId, documentKey, null, 0L, Change.REMOVED);
     }
 
     /**
      * Finds a document's namespace and withdraws from it or stages into it, as the change asks.
      *
+     * @param sourceId           The source that ingested the document
      * @param documentKey        The source-qualified document key
      * @param text               The document's text, or null when it was removed
      * @param lastModifiedMillis The document's own date, or 0 when unknown
      * @param change             What happened to the document
      */
-    private void route(String documentKey, String text, long lastModifiedMillis, Change change) {
-        if (documentKey == null || documentKey.isBlank()) {
+    private void route(String sourceId, String documentKey, String text,
+                       long lastModifiedMillis, Change change) {
+        if (sourceId == null || documentKey == null || documentKey.isBlank()) {
             return;
         }
         boolean hasText = change != Change.REMOVED && text != null && !text.isBlank();
@@ -217,19 +223,20 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
             documentsSeen.incrementAndGet();
         }
 
-        Optional<NamespaceId> namespace = resolve(documentKey);
+        Optional<NamespaceId> namespace = sources.namespaceOf(sourceId);
         if (namespace.isEmpty()) {
             unresolvedDocuments.incrementAndGet();
-            LOGGER.warn("No registered source owns {}, so there is no namespace to {} its facts "
-                + "in; nothing is done in the shared namespace instead, which every tenant reads",
-                documentKey, change == Change.REMOVED ? "withdraw" : "stage");
+            LOGGER.warn("Source {} of {} is not registered, so there is no namespace to {} its "
+                + "facts in; nothing is done in the shared namespace instead, which every tenant "
+                + "reads", sourceId, documentKey, change == Change.REMOVED ? "withdraw" : "stage");
             return;
         }
         List<ExtractedTriple> extracted = hasText ? extract(documentKey, text) : List.of();
         if (extracted.isEmpty() && !change.withdraws()) {
             return;
         }
-        stageInto(namespace.get(), documentKey, text, lastModifiedMillis, extracted, change);
+        stageInto(namespace.get(), sourceId, documentKey, text, lastModifiedMillis, extracted,
+            change);
     }
 
     /**
@@ -255,15 +262,16 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
      * what was staged from it before first when it was replaced or removed.
      *
      * @param namespace          Where the facts belong
+     * @param sourceId           The source that ingested the document
      * @param documentKey        The document
      * @param text               Its text, or null when it was removed
      * @param lastModifiedMillis The document's own date, or 0 when unknown
      * @param extracted          Its facts, already extracted
      * @param change             What happened to the document
      */
-    private void stageInto(NamespaceId namespace, String documentKey, String text,
-                           long lastModifiedMillis, List<ExtractedTriple> extracted,
-                           Change change) {
+    private void stageInto(NamespaceId namespace, String sourceId, String documentKey,
+                           String text, long lastModifiedMillis,
+                           List<ExtractedTriple> extracted, Change change) {
         NamespaceRegistry.Lease<GraphTenant> borrowed;
         try {
             borrowed = tenants.borrow(namespace);
@@ -298,9 +306,11 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
             StagingGraphIngestSink sink = new StagingGraphIngestSink(
                 lease.resource().withdrawals(), (key, body) -> extracted);
             switch (change) {
-                case PUBLISHED -> sink.onDocumentPublished(documentKey, text, lastModifiedMillis);
-                case REPLACED -> sink.onDocumentReplaced(documentKey, text, lastModifiedMillis);
-                case REMOVED -> sink.onDocumentRemoved(documentKey);
+                case PUBLISHED -> sink.onDocumentPublished(sourceId, documentKey, text,
+                    lastModifiedMillis);
+                case REPLACED -> sink.onDocumentReplaced(sourceId, documentKey, text,
+                    lastModifiedMillis);
+                case REMOVED -> sink.onDocumentRemoved(sourceId, documentKey);
             }
             factsStaged.addAndGet(sink.factsStaged());
             recordsWithdrawn.addAndGet(sink.recordsWithdrawn());
@@ -334,35 +344,6 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
     }
 
     /**
-     * Finds the namespace of the source that published a document.
-     *
-     * <p>A document key is {@code sourceId:documentId} and a document id may itself contain
-     * colons - an HTTP source's ids are absolute URLs - so the split cannot be made on the last
-     * colon. It is not made on the first one either: a source id is not required to be free of
-     * colons, so each candidate prefix is offered to the registry in turn.</p>
-     *
-     * <p>The longest one that names a registered source is the answer. With {@code team} and
-     * {@code team:wiki} both registered, {@code team:wiki:home.md} begins with the key of each;
-     * the key alone cannot say which registered it, and the more specific source is the one a
-     * document so named was almost certainly crawled by. Taking the first match would stage every
-     * {@code team:wiki} document into the namespace {@code team} was registered in.</p>
-     *
-     * @param documentKey The source-qualified document key
-     * @return The namespace, or empty if no registered source owns the document
-     */
-    private Optional<NamespaceId> resolve(String documentKey) {
-        Optional<NamespaceId> found = Optional.empty();
-        for (int colon = documentKey.indexOf(KEY_SEPARATOR); colon > 0;
-                colon = documentKey.indexOf(KEY_SEPARATOR, colon + 1)) {
-            Optional<NamespaceId> candidate = sources.namespaceOf(documentKey.substring(0, colon));
-            if (candidate.isPresent()) {
-                found = candidate;
-            }
-        }
-        return found;
-    }
-
-    /**
      * How many published documents this sink has seen.
      *
      * @return The count
@@ -381,12 +362,13 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
     }
 
     /**
-     * How many documents named no source this node has registered.
+     * How many documents came from a source this node no longer has registered.
      *
-     * <p>Nothing was staged for them, and nothing withdrawn. A non-zero count on a node whose sources are all still
-     * registered means the key convention and the registry have drifted apart, which is
-     * otherwise invisible: the documents are indexed and searchable, and only the graph is
-     * missing what they said.</p>
+     * <p>Nothing was staged for them, and nothing withdrawn. The ordinary cause is a source
+     * deregistered while its last documents were being reported; a count that keeps climbing on
+     * a node whose sources are all still registered means ingestion and the source registry have
+     * drifted apart, which is otherwise invisible: the documents are indexed and searchable, and
+     * only the graph is missing what they said.</p>
      *
      * @return The count
      */

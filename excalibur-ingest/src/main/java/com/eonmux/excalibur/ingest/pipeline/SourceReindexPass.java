@@ -405,7 +405,7 @@ final class SourceReindexPass {
         if (publisher != null) {
             publisher.forget(sourceId, listed.getDocumentId());
         }
-        return new Removed(stored, vectors, graphReporter.removed(documentKey));
+        return new Removed(stored, vectors, graphReporter.removed(sourceId, documentKey));
     }
 
     /**

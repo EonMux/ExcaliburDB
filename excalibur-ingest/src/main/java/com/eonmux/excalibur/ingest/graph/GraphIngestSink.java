@@ -15,6 +15,14 @@ import java.util.List;
  * because a fact staged for a document whose publication then failed would be a fact about
  * something the corpus does not contain.</p>
  *
+ * <h2>The source a document came from</h2>
+ * <p>Every call names the source that ingested the document as well as its key. The key is the
+ * source id and the document id joined by a colon, and a source id may itself contain colons, so
+ * the key alone cannot say which source it came from: {@code team:wiki:home.md} is document
+ * {@code wiki:home.md} of source {@code team} as readily as document {@code home.md} of source
+ * {@code team:wiki}. A sink that decides anything by source - which tenant's graph a document's
+ * facts belong in - is handed the source rather than left to guess it from the key.</p>
+ *
  * <h2>Replacing and removing a version</h2>
  * <p>A document published over a version this node already held is reported through
  * {@link #onDocumentReplaced} rather than {@link #onDocumentPublished}. Everything staged from a
@@ -50,13 +58,15 @@ public interface GraphIngestSink {
      * page changed supersedes what the page used to say, and a batch ingested on one day is
      * ordered by when its documents were written rather than by the order it was crawled in.</p>
      *
+     * @param sourceId           The source that ingested the document
      * @param documentKey        The source-qualified document key
      * @param text               The document's text
      * @param lastModifiedMillis When the document was last modified, in epoch milliseconds, or
      *                           0 when its source does not say; its facts are then recorded as
      *                           stated on the day they are staged
      */
-    void onDocumentPublished(String documentKey, String text, long lastModifiedMillis);
+    void onDocumentPublished(String sourceId, String documentKey, String text,
+                             long lastModifiedMillis);
 
     /**
      * Records a published document that replaced a version this node already held.
@@ -69,11 +79,13 @@ public interface GraphIngestSink {
      * this for one document at a time and in the order its versions were published, so the
      * withdrawal cannot remove a later version's facts.</p>
      *
+     * @param sourceId           The source that ingested the document
      * @param documentKey        The source-qualified document key
      * @param text               The new version's text
      * @param lastModifiedMillis When the new version was last modified, or 0 when unknown
      */
-    void onDocumentReplaced(String documentKey, String text, long lastModifiedMillis);
+    void onDocumentReplaced(String sourceId, String documentKey, String text,
+                            long lastModifiedMillis);
 
     /**
      * Withdraws whatever was staged from a document this node no longer holds.
@@ -87,18 +99,20 @@ public interface GraphIngestSink {
      * already removed by the time this runs. The caller orders it with the document's
      * publications, so a removal cannot withdraw a later version's facts.</p>
      *
+     * @param sourceId    The source that ingested the document
      * @param documentKey The source-qualified document key
      */
-    void onDocumentRemoved(String documentKey);
+    void onDocumentRemoved(String sourceId, String documentKey);
 
     /**
      * Records a published document whose date is unknown.
      *
+     * @param sourceId    The source that ingested the document
      * @param documentKey The source-qualified document key
      * @param text        The document's text
      */
-    default void onDocumentPublished(String documentKey, String text) {
-        onDocumentPublished(documentKey, text, 0L);
+    default void onDocumentPublished(String sourceId, String documentKey, String text) {
+        onDocumentPublished(sourceId, documentKey, text, 0L);
     }
 
     /**
@@ -127,19 +141,19 @@ public interface GraphIngestSink {
         INSTANCE;
 
         @Override
-        public void onDocumentPublished(String documentKey, String text,
+        public void onDocumentPublished(String sourceId, String documentKey, String text,
                                         long lastModifiedMillis) {
             // No graph is built, so nothing is staged.
         }
 
         @Override
-        public void onDocumentReplaced(String documentKey, String text,
+        public void onDocumentReplaced(String sourceId, String documentKey, String text,
                                        long lastModifiedMillis) {
             // Nothing was staged from the earlier version, so there is nothing to withdraw.
         }
 
         @Override
-        public void onDocumentRemoved(String documentKey) {
+        public void onDocumentRemoved(String sourceId, String documentKey) {
             // Nothing was staged from the document, so there is nothing to withdraw.
         }
     }

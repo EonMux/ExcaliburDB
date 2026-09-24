@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.endpoint;
 
 import com.eonmux.excalibur.api.reindex.ReindexCoordinator;
+import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.shard.worker.SegmentReindexScheduler;
 
@@ -13,6 +14,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.longThat;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -209,12 +214,17 @@ class SourceRemovalTest {
         ReindexEndpoint.InMemoryReindexStatusRegistry reindexes =
             new ReindexEndpoint.InMemoryReindexStatusRegistry();
         registry.setReindexStatusRegistry(reindexes);
-        registry.setReindexCoordinator(coordinator, 20);
+        registry.setReindexCoordinator(coordinator);
+        registry.setRunStopWaitMs(20);
         AtomicBoolean closed = new AtomicBoolean();
         registry.register(closeRecording("42", closed));
         InFlightReindex run = new InFlightReindex(coordinator, reindexes, closed, "42", 300);
 
-        assertThat(registry.remove("42")).isTrue();
+        SourceRegistry.Removal removal = registry.removeSource("42");
+        assertThat(removal.registered()).isTrue();
+        assertThat(removal.stopped())
+            .as("the reindex was still going when the bound ran out, and the removal says so")
+            .isFalse();
         assertThat(registry.isRegistered("42")).isFalse();
         run.thread.join();
 
@@ -255,5 +265,101 @@ class SourceRemovalTest {
         }
         assertThat(reindexes.getStatus("42")).isNull();
         assertThat(lease.isCancelled()).isTrue();
+    }
+
+    @Test
+    @DisplayName("an ingestion run is waited for before what it records is cleared")
+    void waitsForTheIngestionRun() throws Exception {
+        // An erasure reads the registry the moment the removal returns. A run that finished its
+        // document after that would register it past the erasure, which then reports the source
+        // gone while the node still serves the document.
+        IngestionOrchestrator orchestrator = mock(IngestionOrchestrator.class);
+        registry.setIngestionOrchestrator(orchestrator);
+        Source source = source("42");
+        registry.register(source);
+        when(orchestrator.stopIngestion("42")).thenReturn(true);
+        AtomicBoolean waitedWhileRecorded = new AtomicBoolean();
+        doAnswer(invocation -> {
+            waitedWhileRecorded.set(statuses.getStatus("42") != null);
+            verify(source, never()).close();
+            return true;
+        }).when(orchestrator).stopIngestionAndAwait(eq("42"), anyLong());
+
+        SourceRegistry.Removal removal = registry.removeSource("42");
+
+        assertThat(removal).isEqualTo(new SourceRegistry.Removal(true, true));
+        assertThat(waitedWhileRecorded)
+            .as("the run was waited for while its status was still there to record into")
+            .isTrue();
+        assertThat(statuses.getStatus("42")).isNull();
+        verify(source).close();
+    }
+
+    @Test
+    @DisplayName("an ingestion run that outlives the bound is reported, and the removal stands")
+    void anIngestionRunThatWillNotStop() throws Exception {
+        IngestionOrchestrator orchestrator = mock(IngestionOrchestrator.class);
+        registry.setIngestionOrchestrator(orchestrator);
+        registry.setRunStopWaitMs(20);
+        registry.register(source("42"));
+        when(orchestrator.stopIngestion("42")).thenReturn(true);
+        when(orchestrator.stopIngestionAndAwait(eq("42"), anyLong())).thenReturn(false);
+
+        SourceRegistry.Removal removal = registry.removeSource("42");
+
+        assertThat(removal.registered()).isTrue();
+        assertThat(removal.stopped()).isFalse();
+        assertThat(registry.remove("42"))
+            .as("the source is gone all the same")
+            .isFalse();
+        verify(orchestrator).stopIngestionAndAwait(eq("42"), longThat(wait -> wait <= 20));
+    }
+
+    @Test
+    @DisplayName("the runs under an id no registration holds are stopped and waited for too")
+    void stopsTheRunsOfAnUnregisteredId() throws Exception {
+        // Documents supplied directly run under an id this registry never held.
+        IngestionOrchestrator orchestrator = mock(IngestionOrchestrator.class);
+        registry.setIngestionOrchestrator(orchestrator);
+        when(orchestrator.stopIngestion("supplied")).thenReturn(true);
+        when(orchestrator.stopIngestionAndAwait(eq("supplied"), anyLong())).thenReturn(true);
+
+        assertThat(registry.stopRuns("supplied")).isTrue();
+        verify(orchestrator).stopIngestionAndAwait(eq("supplied"), anyLong());
+    }
+
+    @Test
+    @DisplayName("an id with nothing in flight is not waited on")
+    void stopsNothingWhenNothingRuns() throws Exception {
+        IngestionOrchestrator orchestrator = mock(IngestionOrchestrator.class);
+        registry.setIngestionOrchestrator(orchestrator);
+        registry.setReindexCoordinator(new ReindexCoordinator());
+
+        assertThat(registry.stopRuns("idle")).isTrue();
+        verify(orchestrator, never()).stopIngestionAndAwait(eq("idle"), anyLong());
+    }
+
+    @Test
+    @DisplayName("an interrupted wait reports the runs as not stopped, and keeps the interrupt")
+    void anInterruptedWaitIsNotAStop() throws Exception {
+        IngestionOrchestrator orchestrator = mock(IngestionOrchestrator.class);
+        registry.setIngestionOrchestrator(orchestrator);
+        when(orchestrator.stopIngestion("42")).thenReturn(true);
+        when(orchestrator.stopIngestionAndAwait(eq("42"), anyLong()))
+            .thenThrow(new InterruptedException());
+
+        try {
+            assertThat(registry.stopRuns("42")).isFalse();
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
+    @DisplayName("a negative wait is refused")
+    void aNegativeWaitIsRefused() {
+        assertThatThrownBy(() -> registry.setRunStopWaitMs(-1))
+            .isInstanceOf(IllegalArgumentException.class);
     }
 }

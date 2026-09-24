@@ -237,6 +237,16 @@ final class DocumentIngestor {
                                     FetchedDocument doc, List<TextChunk> chunks,
                                     Map<Integer, float[]> embeddings) {
         List<String> writtenKeys = new ArrayList<>(chunks.size());
+        // Before anything is written: the chunk ids about to be written begin with the document
+        // key, and a key another source's document holds names that document's chunks. Written,
+        // they would overwrite it in place, and no rollback could bring it back.
+        String holder = documentRegistry == null ? null
+            : documentRegistry.otherSourceHolding(sourceId, documentId);
+        if (holder != null) {
+            LOGGER.warn("Not ingesting: {}",
+                DocumentRegistry.keyTaken(sourceId, documentId, holder));
+            return new Written(DocumentOutcome.KEY_TAKEN, null);
+        }
         // Read under the lock and before anything is written: this is the version the new one
         // replaces, and it decides which of its chunks become surplus on success and which of
         // this attempt's writes are orphans on failure.
@@ -262,7 +272,7 @@ final class DocumentIngestor {
         // A previous version means facts may have been staged from it, which the report of this
         // one has to withdraw before staging its own.
         return new Written(DocumentOutcome.published(chunks.size()),
-            graphReporter.published(documentKey, previous != null));
+            graphReporter.published(sourceId, documentKey, previous != null));
     }
 
     /**
@@ -308,12 +318,14 @@ final class DocumentIngestor {
     /**
      * What one document's ingestion produced.
      *
-     * <p>The three zero cases are not the same and the run has to tell them apart: a document
-     * with nothing in it was listed and had nothing to give; a dropped one was listed, had
-     * something to give and did not give it; a document that is not text was listed and was
-     * never a document at all. Only the second is a failure. The third is worth a count of its
-     * own rather than silence, because an operator who pointed the node at a directory of
-     * photographs and saw nothing indexed has no other way to learn why.</p>
+     * <p>The zero cases are not the same and the run has to tell them apart: a document with
+     * nothing in it was listed and had nothing to give; a dropped one was listed, had something
+     * to give and did not give it; a document that is not text was listed and was never a
+     * document at all; and one whose key another source's document holds was refused so as not
+     * to overwrite that document. The second and the last are failures, and the last is told
+     * apart from the second because its cure is not a retry but a different id. The third is
+     * worth a count of its own rather than silence, because an operator who pointed the node at
+     * a directory of photographs and saw nothing indexed has no other way to learn why.</p>
      *
      * @param chunks      Chunks published, zero when none were
      * @param disposition What became of the document
@@ -329,7 +341,9 @@ final class DocumentIngestor {
             /** It held something, and that something could not be ingested. */
             DROPPED,
             /** Its bytes are not text, so there was nothing in it to index. */
-            NOT_TEXT
+            NOT_TEXT,
+            /** Its key is held by another source's document, which writing it would overwrite. */
+            KEY_TAKEN
         }
 
         /** A document that held nothing to ingest. */
@@ -340,6 +354,9 @@ final class DocumentIngestor {
 
         /** A document whose bytes are not text in the encoding its source declared. */
         static final DocumentOutcome NOT_TEXT = new DocumentOutcome(0, Disposition.NOT_TEXT);
+
+        /** A document refused because another source's document holds its key. */
+        static final DocumentOutcome KEY_TAKEN = new DocumentOutcome(0, Disposition.KEY_TAKEN);
 
         /**
          * A document whose chunks were published.
@@ -367,6 +384,15 @@ final class DocumentIngestor {
          */
         boolean notText() {
             return disposition == Disposition.NOT_TEXT;
+        }
+
+        /**
+         * Whether the document was refused because another source's document holds its key.
+         *
+         * @return true when nothing was written and the document counts as failed
+         */
+        boolean keyTaken() {
+            return disposition == Disposition.KEY_TAKEN;
         }
     }
 

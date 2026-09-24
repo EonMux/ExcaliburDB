@@ -32,10 +32,15 @@ import java.util.Objects;
  *
  * <h3>What it stops</h3>
  * <p>Everything registering the source started: an ingestion run in flight, a re-crawl in
- * flight - which is waited for, within a bound - its {@code /v1/ingest/status} and
- * {@code /v1/reindex/status} entries, and its place in the re-crawl schedule. The documents it already
- * indexed stay, and stay queryable. A run is stopped at its next document boundary, so a document
- * already being written is finished rather than abandoned half-way.</p>
+ * flight, its {@code /v1/ingest/status} and {@code /v1/reindex/status} entries, and its place in
+ * the re-crawl schedule. The documents it already indexed stay, and stay queryable. A run is
+ * stopped at its next document boundary, so a document already being written is finished rather
+ * than abandoned half-way.</p>
+ *
+ * <p>Both runs are waited for, within one bound. {@code runs_stopped} says whether they ended
+ * within it: false means a run was still finishing a document when the bound ran out, and may
+ * yet write it. The deregistration stands either way - the source will not be crawled again - so
+ * the reply is still a 200; the field is what keeps it from claiming more than happened.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Stateless; the registry it calls is thread-safe.</p>
@@ -92,9 +97,9 @@ public class SourceDeregisterEndpoint implements HttpHandler {
         }
 
         AuditLog.target(exchange, "source_id", sourceId);
-        boolean removed;
+        SourceRegistry.Removal removal;
         try {
-            removed = sourceRegistry.remove(sourceId);
+            removal = sourceRegistry.removeSource(sourceId);
         } catch (SourceCatalogException e) {
             // The source is still registered and still being crawled. Reporting success here
             // would leave the caller believing a crawl had stopped that restarts itself at the
@@ -104,7 +109,7 @@ public class SourceDeregisterEndpoint implements HttpHandler {
                 ErrorCode.CATALOG_UNAVAILABLE, SourceCatalogException.CLIENT_MESSAGE);
             return;
         }
-        if (!removed) {
+        if (!removal.registered()) {
             // 404, not a quiet success: a caller stopping a crawl needs to know whether they named
             // a source this node was actually crawling, or misspelled one that still is.
             ResponseBody.sendError(exchange, 404, ErrorCode.SOURCE_NOT_FOUND,
@@ -113,13 +118,20 @@ public class SourceDeregisterEndpoint implements HttpHandler {
         }
 
         LOGGER.info("Deregistered source {} on request; its indexed documents were kept", sourceId);
+        String detail = removal.stopped()
+            ? "Crawling stopped. Documents already indexed are unchanged and still queryable; "
+                + "POST /v1/erasure removes them."
+            : "Deregistered, but a run of the source was still finishing a document when the "
+                + "wait for it ran out and may yet write it; it stops at its next document. "
+                + "Documents already indexed are unchanged and still queryable; "
+                + "POST /v1/erasure removes them.";
         ResponseBody.sendJson(exchange, 200,
             "{"
                 + "\"source_id\": \"" + JsonText.escape(sourceId) + "\", "
                 + "\"deregistered\": true, "
+                + "\"runs_stopped\": " + removal.stopped() + ", "
                 + "\"documents_kept\": true, "
-                + "\"detail\": \"Crawling stopped. Documents already indexed are unchanged and "
-                + "still queryable; POST /v1/erasure removes them.\""
+                + "\"detail\": \"" + detail + "\""
                 + "}");
     }
 }

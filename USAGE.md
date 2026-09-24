@@ -589,7 +589,7 @@ below, because new specific codes may be added.
 | `conflict` | 409 | The request conflicts with the node's current state. The default for `409` |
 | `source_exists` | 409 | A source is already registered under that `source_id` |
 | `source_kind_conflict` | 409 | The `source_id` belongs to the other kind of source — a crawl versus documents supplied directly |
-| `source_busy` | 409 | `PUT /v1/ingest` while a crawl or re-index of the source is running; replace it once that ends |
+| `source_busy` | 409 | `PUT /v1/ingest` while a crawl or re-index of the source is running; replace it once that ends. A source-scoped `POST /v1/erasure` whose wait for a run of the source ran out; nothing was erased, repeat it |
 | `source_namespace_mismatch` | 409 | `PUT /v1/ingest` names a namespace other than the one the source was registered in |
 | `reindex_in_progress` | 409 | A re-index of that source is already running; poll its status instead |
 | `compaction_in_progress` | 409 | A compaction is already running |
@@ -935,6 +935,16 @@ A source id is copied into every document's registry record and printed with eve
 the source, so its length is multiplied by the size of the corpus rather than by the number of
 requests. The routes that only look a source up — deregister, reindex, erasure and status — refuse
 the same lengths, because nothing can be registered under one.
+
+A source id may contain colons. A document's key is its source id, a colon and its document id,
+and every chunk id begins with it, so a source whose id extends another's by a colon can produce a
+key the other already holds: document `wiki:home.md` of source `team` and document `home.md` of
+source `team:wiki` are both `team:wiki:home.md`. The first source to register a document under
+the key keeps it. The other's document is refused before anything of it is written, on every crawl
+and re-crawl and from `POST /v1/documents`, counted in `documents_failed`, and named in the
+source's `/v1/ingest/status` error as refused because another source holds its key — a failure
+retrying does not cure, so give one of the sources an id that does not collide. An erasure, a
+re-crawl or a document listing under the other source never reaches the holder's document.
 
 **`400 Bad Request` — an `X-Excalibur-Namespace` that is not a legal namespace id.** Refused
 before the body is read, rather than registered into `shared`: a source filed under a tenant the
@@ -1557,8 +1567,8 @@ not a legal source id. **`413 Payload Too Large`** — the body is over the requ
 
 ### Stop crawling a source
 
-Takes a source out of the crawl: any ingestion run in flight is stopped, a re-crawl in flight is
-stopped and waited for (up to thirty seconds — it finishes the document it is on), its
+Takes a source out of the crawl: any ingestion run and any re-crawl in flight are stopped and
+waited for (up to thirty seconds for the two together — a run finishes the document it is on), its
 `/v1/ingest/status` and `/v1/reindex/status` entries are cleared, and it is removed from the
 re-crawl schedule. **The documents it already indexed
 are kept** and stay queryable — this is the routine case of a source that moved, went stale or
@@ -1578,10 +1588,15 @@ curl -X DELETE http://localhost:8080/v1/ingest \
 {
   "source_id": "project-docs",
   "deregistered": true,
+  "runs_stopped": true,
   "documents_kept": true,
   "detail": "Crawling stopped. Documents already indexed are unchanged and still queryable; POST /v1/erasure removes them."
 }
 ```
+
+`runs_stopped` is `false` when a run was still finishing a document when the wait ran out. The
+source is deregistered all the same and is not crawled again, but that run may still write the
+document it is on; `detail` says so.
 
 **Error — `404 Not Found`** — no source is registered under that id. Reported rather than answered
 with a quiet success, so a misspelled id does not read as a stopped crawl.
@@ -1621,13 +1636,13 @@ curl -X POST http://localhost:8080/v1/erasure \
 `scope` is a separate word rather than an omission: a request naming no document is a `400`, so
 "everything" cannot be reached by a client that forgot a field. It cannot be combined with
 `document_id` or `document_ids` either. A source-scoped erasure first **deregisters the source**
-— stopping any ingestion run in flight, stopping any re-crawl in flight and waiting for it to end,
-clearing its status entries and cancelling its re-crawl schedule — so nothing restores what was
-just erased, and reports `source_deregistered`. Each request erases up to 1000 documents and
-reports `documents_remaining`; repeat until it reaches zero. An ingestion run stopped mid-flight
-finishes the document it was on without being waited for, so one more may land between two calls,
-which is what the remaining count is for. A re-crawl is waited for before anything is erased, up
-to thirty seconds; one that outlives that is logged and may likewise land one more document.
+— stopping any ingestion run and any re-crawl in flight and waiting for them to end, clearing its
+status entries and cancelling its re-crawl schedule — so nothing restores what was just erased,
+and reports `source_deregistered`. A run of documents supplied under the id with
+`POST /v1/documents` is stopped and waited for too. Each request erases up to 1000 documents and
+reports `documents_remaining`; repeat until it reaches zero. The runs are waited for before
+anything is erased, up to thirty seconds for all of them together, because a run finishes the
+document it is on and would otherwise register it after the erasure had looked.
 
 **Response — `200 OK`, or `202 Accepted` while the graph half is still queued**
 
@@ -1723,6 +1738,13 @@ and some of it is not. The remedy is to repeat the request, which is safe — th
 kept for exactly the documents that fell short, so the repeat can still name their chunks. A
 caller looping a source erasure until `documents_remaining` reaches zero **must also watch
 `documents_incomplete`**, or it will loop forever over documents the node keeps failing to erase.
+
+**Error — `409 Conflict`** (`source_busy`) — a source-scoped erasure found a run of the source
+still writing a document when the thirty-second wait for it ran out. Nothing was erased and no
+receipt was recorded, because what the registry named at that moment would have missed the
+document the run is finishing. If the source was registered it has been deregistered, and the
+message says so; that stands. Repeat the request: the run stops at its next document, and the
+repeat waits for it again.
 
 The vector indexes are covered as well: each erased document's HNSW nodes are retired in every
 segment's graph before the response is sent, so no vector query ranks them afterwards; only the disk

@@ -76,7 +76,7 @@ class NamespaceRoutingGraphIngestSinkTest {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", acme)), oneFact());
 
-            sink.onDocumentPublished("docs:ada", "Ada knows Babbage.");
+            sink.onDocumentPublished("docs", "docs:ada", "Ada knows Babbage.");
 
             assertThat(staged(tenants, acme))
                 .as("nothing could put a fact into a named namespace before this: the header "
@@ -90,24 +90,38 @@ class NamespaceRoutingGraphIngestSinkTest {
     }
 
     @Test
-    @DisplayName("a source whose id extends another's stages into its own namespace")
-    void theMostSpecificSourceOwnsADocument(@TempDir Path root) throws IOException {
-        // A source id may contain a colon, so team:wiki:home.md begins with the key of source
-        // team as much as with that of team:wiki. The longer id is the one registered for it.
+    @DisplayName("a document stages into the namespace of the source that ingested it, "
+        + "whichever registered source its key begins with")
+    void theIngestingSourceOwnsADocument(@TempDir Path root) throws IOException {
+        // A source id may contain a colon, so the key team:wiki:home.md is document
+        // wiki:home.md of source team as readily as a document of team:wiki. Only the source
+        // ingestion names can say which.
         NamespaceId team = NamespaceId.of("team");
         NamespaceId wiki = NamespaceId.of("wiki");
         try (GraphTenants tenants = tenants(root, 4)) {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
-                tenants, registered(Map.of("team", team, "team:wiki", wiki)), oneFact());
+                tenants, registered(Map.of("team", team, "team:wiki", wiki)),
+                (documentKey, text) -> List.of(ExtractedTriple.alwaysValid("Ada", "knows",
+                    "Babbage", Provenance.of(SourceType.DOCUMENT,
+                        LlmRelationExtractor.sourceIdOf(documentKey), 0.9, 1))));
 
-            sink.onDocumentPublished("team:wiki:home.md", "Ada knows Babbage.");
-            sink.onDocumentPublished("team:guide.md", "Ada knows Babbage.");
+            sink.onDocumentPublished("team", "team:wiki:home.md", "Ada knows Babbage.");
+            sink.onDocumentPublished("team:wiki", "team:wiki:faq.md", "Ada knows Babbage.");
 
-            assertThat(staged(tenants, wiki))
-                .as("the document of team:wiki belongs in the namespace team:wiki was "
-                    + "registered in, not in that of the shorter id its key also begins with")
+            assertThat(staged(tenants, team))
+                .as("wiki:home.md of source team belongs in the namespace team was registered "
+                    + "in, however much of its key the longer source id matches")
                 .isEqualTo(1);
-            assertThat(staged(tenants, team)).isEqualTo(1);
+            assertThat(staged(tenants, wiki)).isEqualTo(1);
+
+            sink.onDocumentRemoved("team", "team:wiki:home.md");
+
+            assertThat(staged(tenants, team))
+                .as("its removal withdraws from the same namespace")
+                .isZero();
+            assertThat(staged(tenants, wiki))
+                .as("and leaves the other source's namespace alone")
+                .isEqualTo(1);
         }
     }
 
@@ -125,8 +139,8 @@ class NamespaceRoutingGraphIngestSinkTest {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", gone)), oneFact());
 
-            sink.onDocumentPublished("docs:ada", "Ada knows Babbage.");
-            sink.onDocumentRemoved("docs:ada");
+            sink.onDocumentPublished("docs", "docs:ada", "Ada knows Babbage.");
+            sink.onDocumentRemoved("docs", "docs:ada");
 
             assertThat(sink.factsStaged()).isZero();
             assertThat(sink.tenantFailures()).isEqualTo(2);
@@ -151,7 +165,7 @@ class NamespaceRoutingGraphIngestSinkTest {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", acme)), oneFact());
 
-            sink.onDocumentPublished("docs:ada", "Ada knows Babbage.", lastModified);
+            sink.onDocumentPublished("docs", "docs:ada", "Ada knows Babbage.", lastModified);
 
             try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(acme)) {
                 java.util.List<Integer> stated = new java.util.ArrayList<>();
@@ -169,7 +183,7 @@ class NamespaceRoutingGraphIngestSinkTest {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", NamespaceId.SHARED)), oneFact());
 
-            sink.onDocumentPublished("docs:ada", "Ada knows Babbage.");
+            sink.onDocumentPublished("docs", "docs:ada", "Ada knows Babbage.");
 
             assertThat(tenants.shared().staging().stagedCount())
                 .as("a node that never sees the header must behave exactly as it did before "
@@ -187,9 +201,9 @@ class NamespaceRoutingGraphIngestSinkTest {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("acme-docs", acme, "beta-docs", beta)), oneFact());
 
-            sink.onDocumentPublished("acme-docs:ada", "Ada knows Babbage.");
-            sink.onDocumentPublished("beta-docs:ada", "Ada knows Babbage.");
-            sink.onDocumentPublished("beta-docs:grace", "Ada knows Babbage.");
+            sink.onDocumentPublished("acme-docs", "acme-docs:ada", "Ada knows Babbage.");
+            sink.onDocumentPublished("beta-docs", "beta-docs:ada", "Ada knows Babbage.");
+            sink.onDocumentPublished("beta-docs", "beta-docs:grace", "Ada knows Babbage.");
 
             assertThat(staged(tenants, acme)).isEqualTo(1);
             assertThat(staged(tenants, beta)).isEqualTo(2);
@@ -203,7 +217,7 @@ class NamespaceRoutingGraphIngestSinkTest {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of()), oneFact());
 
-            sink.onDocumentPublished("deregistered:ada", "Ada knows Babbage.");
+            sink.onDocumentPublished("deregistered", "deregistered:ada", "Ada knows Babbage.");
 
             assertThat(tenants.shared().staging().stagedCount())
                 .as("a source deregistered mid-crawl has no namespace to name, and the shared "
@@ -225,7 +239,7 @@ class NamespaceRoutingGraphIngestSinkTest {
 
             // An HTTP source's document ids are absolute URLs, so the key cannot be split on
             // its last colon and a source id is not guaranteed to be free of them either.
-            sink.onDocumentPublished("site:https://example.com/a", "Ada knows Babbage.");
+            sink.onDocumentPublished("site", "site:https://example.com/a", "Ada knows Babbage.");
 
             assertThat(staged(tenants, acme)).isEqualTo(1);
         }
@@ -243,7 +257,8 @@ class NamespaceRoutingGraphIngestSinkTest {
                 tenants, registered(sources), oneFact());
 
             for (int i = 0; i < 6; i++) {
-                sink.onDocumentPublished("source-" + i + ":ada", "Ada knows Babbage.");
+                sink.onDocumentPublished("source-" + i, "source-" + i + ":ada",
+                    "Ada knows Babbage.");
             }
 
             assertThat(tenants.openCount())
@@ -270,7 +285,7 @@ class NamespaceRoutingGraphIngestSinkTest {
                     throw new IllegalStateException("the model is refusing calls");
                 });
 
-            assertThatCode(() -> sink.onDocumentPublished("docs:ada", "Ada knows Babbage."))
+            assertThatCode(() -> sink.onDocumentPublished("docs", "docs:ada", "Ada knows Babbage."))
                 .as("the document is published and counted by the time this runs, so throwing "
                     + "would report a loss that did not happen")
                 .doesNotThrowAnyException();
@@ -290,7 +305,7 @@ class NamespaceRoutingGraphIngestSinkTest {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", acme)), RelationExtractor.none());
 
-            sink.onDocumentPublished("docs:ada", "Ada knows Babbage.");
+            sink.onDocumentPublished("docs", "docs:ada", "Ada knows Babbage.");
 
             assertThat(tenants.openNamespaces()).doesNotContain(acme);
             assertThat(sink.documentsSeen()).isEqualTo(1);
@@ -305,10 +320,10 @@ class NamespaceRoutingGraphIngestSinkTest {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", NamespaceId.SHARED)), oneFact());
 
-            sink.onDocumentPublished(null, "Ada knows Babbage.");
-            sink.onDocumentPublished("docs:ada", null);
-            sink.onDocumentPublished("docs:ada", "   ");
-            sink.onDocumentPublished("   ", "Ada knows Babbage.");
+            sink.onDocumentPublished("docs", null, "Ada knows Babbage.");
+            sink.onDocumentPublished("docs", "docs:ada", null);
+            sink.onDocumentPublished("docs", "docs:ada", "   ");
+            sink.onDocumentPublished("docs", "   ", "Ada knows Babbage.");
 
             assertThat(sink.documentsSeen()).isZero();
             assertThat(tenants.shared().staging().stagedCount()).isZero();
@@ -356,10 +371,10 @@ class NamespaceRoutingGraphIngestSinkTest {
         try (GraphTenants tenants = tenants(root, 4)) {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", acme)), employer());
-            sink.onDocumentPublished("docs:ada", "Acme", 1L);
-            sink.onDocumentPublished("docs:other", "Initech", 1L);
+            sink.onDocumentPublished("docs", "docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs", "docs:other", "Initech", 1L);
 
-            sink.onDocumentReplaced("docs:ada", "Globex", 2L);
+            sink.onDocumentReplaced("docs", "docs:ada", "Globex", 2L);
 
             assertThat(employers(tenants, acme))
                 .as("the next build must not publish where the document used to say Ada worked")
@@ -377,11 +392,11 @@ class NamespaceRoutingGraphIngestSinkTest {
         try (GraphTenants tenants = tenants(root, 4)) {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", acme)), employer());
-            sink.onDocumentPublished("docs:ada", "Acme", 1L);
-            sink.onDocumentPublished("docs:bob", "Initech", 1L);
+            sink.onDocumentPublished("docs", "docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs", "docs:bob", "Initech", 1L);
 
-            sink.onDocumentReplaced("docs:ada", "nothing", 2L);
-            sink.onDocumentReplaced("docs:bob", "fail", 2L);
+            sink.onDocumentReplaced("docs", "docs:ada", "nothing", 2L);
+            sink.onDocumentReplaced("docs", "docs:bob", "fail", 2L);
 
             assertThat(employers(tenants, acme))
                 .as("what the earlier versions said is not true of the published documents")
@@ -398,11 +413,11 @@ class NamespaceRoutingGraphIngestSinkTest {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", NamespaceId.SHARED)), employer());
 
-            sink.onDocumentReplaced(null, "Acme", 1L);
-            sink.onDocumentReplaced(" ", "Acme", 1L);
+            sink.onDocumentReplaced("docs", null, "Acme", 1L);
+            sink.onDocumentReplaced("docs", " ", "Acme", 1L);
             assertThat(sink.documentsSeen()).isZero();
 
-            sink.onDocumentReplaced("gone:ada", "Acme", 1L);
+            sink.onDocumentReplaced("gone", "gone:ada", "Acme", 1L);
             assertThat(sink.unresolvedDocuments()).isEqualTo(1);
             assertThat(tenants.shared().staging().stagedCount()).isZero();
         }
@@ -415,10 +430,10 @@ class NamespaceRoutingGraphIngestSinkTest {
         try (GraphTenants tenants = tenants(root, 4)) {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", acme)), employer());
-            sink.onDocumentPublished("docs:ada", "Acme", 1L);
-            sink.onDocumentPublished("docs:other", "Initech", 1L);
+            sink.onDocumentPublished("docs", "docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs", "docs:other", "Initech", 1L);
 
-            sink.onDocumentRemoved("docs:ada");
+            sink.onDocumentRemoved("docs", "docs:ada");
 
             assertThat(employers(tenants, acme))
                 .as("the next build must not publish what a document the source dropped said")
@@ -437,13 +452,13 @@ class NamespaceRoutingGraphIngestSinkTest {
         try (GraphTenants tenants = tenants(root, 4)) {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", NamespaceId.SHARED)), employer());
-            sink.onDocumentPublished("docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs", "docs:ada", "Acme", 1L);
 
-            sink.onDocumentRemoved(null);
-            sink.onDocumentRemoved(" ");
+            sink.onDocumentRemoved("docs", null);
+            sink.onDocumentRemoved("docs", " ");
             assertThat(sink.unresolvedDocuments()).isZero();
 
-            sink.onDocumentRemoved("gone:ada");
+            sink.onDocumentRemoved("gone", "gone:ada");
             assertThat(sink.unresolvedDocuments()).isEqualTo(1);
             assertThat(tenants.shared().staging().stagedCount())
                 .as("a removal no namespace owns must not withdraw from the shared one")
@@ -476,11 +491,11 @@ class NamespaceRoutingGraphIngestSinkTest {
         try (GraphTenants tenants = tenants(root, 4)) {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", acme)), employer());
-            sink.onDocumentPublished("docs:ada", "Acme", 1L);
-            sink.onDocumentPublished("docs:other", "Initech", 1L);
+            sink.onDocumentPublished("docs", "docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs", "docs:other", "Initech", 1L);
             Path blocker = refuseErasures(root, acme);
 
-            sink.onDocumentRemoved("docs:ada");
+            sink.onDocumentRemoved("docs", "docs:ada");
             assertThat(sink.withdrawalFailures()).isEqualTo(1);
             assertThat(employers(tenants, acme)).containsExactly("Acme", "Initech");
 
@@ -500,10 +515,10 @@ class NamespaceRoutingGraphIngestSinkTest {
         try (GraphTenants tenants = tenants(root, 4)) {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", acme)), employer());
-            sink.onDocumentPublished("docs:ada", "Acme", 1L);
-            sink.onDocumentPublished("docs:other", "Initech", 1L);
+            sink.onDocumentPublished("docs", "docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs", "docs:other", "Initech", 1L);
             Path blocker = refuseErasures(root, acme);
-            sink.onDocumentRemoved("docs:ada");
+            sink.onDocumentRemoved("docs", "docs:ada");
             removeBlocker(blocker);
 
             tenants.build(acme, () -> false);
@@ -522,10 +537,10 @@ class NamespaceRoutingGraphIngestSinkTest {
         try (GraphTenants tenants = tenants(root, 4)) {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", acme)), employer());
-            sink.onDocumentPublished("docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs", "docs:ada", "Acme", 1L);
             blocker = refuseErasures(root, acme);
 
-            sink.onDocumentReplaced("docs:ada", "Globex", 2L);
+            sink.onDocumentReplaced("docs", "docs:ada", "Globex", 2L);
 
             assertThat(employers(tenants, acme))
                 .as("the new version would be taken by the owed withdrawal, so it is not staged")
@@ -547,8 +562,8 @@ class NamespaceRoutingGraphIngestSinkTest {
         try (GraphTenants tenants = tenants(root, 4)) {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", acme)), employer());
-            sink.onDocumentPublished("docs:ada", "Acme", 1L);
-            sink.onDocumentPublished("docs:other", "Initech", 1L);
+            sink.onDocumentPublished("docs", "docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs", "docs:other", "Initech", 1L);
             tenants.invalidate(acme);
             // A record of owed withdrawals the tenant cannot open fails the whole open.
             Path record = root.resolve("acme").resolve("graph-staging")
@@ -556,7 +571,7 @@ class NamespaceRoutingGraphIngestSinkTest {
             java.nio.file.Files.delete(record);
             java.nio.file.Files.createDirectories(record.resolve("held"));
 
-            sink.onDocumentRemoved("docs:ada");
+            sink.onDocumentRemoved("docs", "docs:ada");
 
             assertThat(sink.tenantFailures()).isEqualTo(1);
             assertThat(tenants.unrecordedWithdrawals()).isEqualTo(1);
@@ -580,7 +595,7 @@ class NamespaceRoutingGraphIngestSinkTest {
         try (GraphTenants tenants = tenants(root, 4)) {
             NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
                 tenants, registered(Map.of("docs", acme)), employer());
-            sink.onDocumentPublished("docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs", "docs:ada", "Acme", 1L);
 
             tenants.oweWithdrawal(acme, "docs:ada");
 

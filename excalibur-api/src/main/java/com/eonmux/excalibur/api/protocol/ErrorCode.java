@@ -81,7 +81,11 @@ public enum ErrorCode {
     SOURCE_KIND_CONFLICT("source_kind_conflict"),
     /** 429: the node already holds as many sources as it is configured for. */
     SOURCE_LIMIT_REACHED("source_limit_reached"),
-    /** 409: a crawl or reindex of the source is running, so its registration cannot change. */
+    /**
+     * 409: a crawl or reindex of the source is running, so its registration cannot change - or,
+     * for a source-scoped erasure, a run was still writing when the wait for it ran out, so
+     * nothing was erased.
+     */
     SOURCE_BUSY("source_busy"),
     /** 409: a replacement names a different namespace from the source's own. */
     SOURCE_NAMESPACE_MISMATCH("source_namespace_mismatch"),
