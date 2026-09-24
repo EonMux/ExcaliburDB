@@ -1201,7 +1201,9 @@ where that erasure stands, after the response and after a restart. The answer is
 a document the request named is still held (repeat the request), `pending` while a graph erasure
 it queued has not been discharged, `applied` while the lexical index still keeps the removed
 content's bytes awaiting a compaction, and `discharged` once nothing the request removed remains
-anywhere the node keeps it, with `discharged_at_ms`. `remaining` counts what is still owed and
+anywhere the node keeps it, with `discharged_at_ms` — null when that time is recorded nowhere: a
+lexical reclamation was owed, a namespace it queued work in was dropped, or a graph completion has
+aged out of its log. `remaining` counts what is still owed and
 `graph` lists each namespace's queued requests. What backs it is `<data dir>/erasure-receipts`: the
 source, the scope, the per-document counts and the graph request ids of the 1024 most recent
 erasures — never a document id, a name or any content. An older request is `404`; a receipt that

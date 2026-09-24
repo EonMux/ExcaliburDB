@@ -1858,7 +1858,15 @@ curl http://localhost:8080/v1/erasure/0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11
 | `incomplete` | A document the request named is still held — the request answered `500`. Repeat it |
 | `pending` | A graph obligation it queued has not been discharged yet |
 | `applied` | Out of storage, the index and the graph, but the lexical index still keeps the removed chunks' bytes on disk until a compaction reclaims them |
-| `discharged` | Nothing the request removed remains anywhere the node keeps it. `discharged_at_ms` says when |
+| `discharged` | Nothing the request removed remains anywhere the node keeps it. `discharged_at_ms` says when, where the node can know (below) |
+
+`discharged_at_ms` is null until the state is `discharged`, and is then the latest time a graph
+obligation the request queued was discharged — or `requested_at_ms` when it queued none. It stays
+null, for good, when that time is not recorded anywhere: when the request left a lexical
+reclamation owed (the index drops an obligation once it is reclaimed and does not keep when), when
+a namespace it queued obligations in has been dropped since, or when a graph obligation's completion
+has fallen out of the 1024 its namespace's log keeps in full. Read it as "discharged, time unknown",
+not as "not yet".
 
 `remaining` counts what is still owed; `graph` lists each namespace the request queued graph
 obligations in. A namespace dropped since (`DELETE /v1/graph/namespaces/{namespace}`) took
