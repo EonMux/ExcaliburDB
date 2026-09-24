@@ -122,11 +122,11 @@ public final class QueryPipelineFactory {
      * is a re-ranking of results the pipeline already has, so the node answers without it.</p>
      *
      * @param config The node's configuration
-     * @return A scorer, or null when this node has no chat model or could not build one
+     * @return A scorer, or null when this node has no chat model in use or could not build one
      */
     private static QueryPipeline.LlmScorer llmScorer(Config config) {
         if (!RetrievalCapabilities.from(config.llm()).chatModel()) {
-            LOGGER.info("LLM API key not configured - LLM scoring disabled");
+            LOGGER.info("LLM scoring disabled: the {}", config.llm().chatEndpoint().describe());
             return null;
         }
         try {

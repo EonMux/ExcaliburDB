@@ -83,6 +83,30 @@ class GraphTenantsTest {
         }
 
         @Test
+        @DisplayName("extraction asked for with chat switched off says so, with a warning")
+        void chatOffIsChatDisabled(@TempDir Path root) throws IOException {
+            try (GraphTenants tenants = tenants(root, 2, Map.of(
+                    "excalibur.graph.extraction-enabled", "true",
+                    "excalibur.llm.api-key", "test-key",
+                    "excalibur.llm.chat-enabled", "false"))) {
+                assertThat(tenants.extraction()).isEqualTo(GraphExtraction.CHAT_DISABLED);
+                assertThat(tenants.extraction().wireName()).isEqualTo("chat_disabled");
+                assertThat(tenants.extraction().warning()).get().asString()
+                    .contains("excalibur.llm.chat-enabled is false");
+            }
+        }
+
+        @Test
+        @DisplayName("extraction on a keyless chat server could run: no key is needed")
+        void keylessChatServerCouldRun(@TempDir Path root) throws IOException {
+            try (GraphTenants tenants = tenants(root, 2, Map.of(
+                    "excalibur.graph.extraction-enabled", "true",
+                    "excalibur.llm.chat-base-url", "http://127.0.0.1:9"))) {
+                assertThat(tenants.extraction()).isEqualTo(GraphExtraction.UNAVAILABLE);
+            }
+        }
+
+        @Test
         @DisplayName("extraction that could run is unavailable until ingestion says it is wired")
         void couldRunIsUnavailableUntilWired(@TempDir Path root) throws IOException {
             try (GraphTenants tenants = tenants(root, 2, Map.of(

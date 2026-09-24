@@ -611,6 +611,54 @@ class ConfigValidationTest {
             assertThatCode(() -> ConfigValidation.validate(config))
                 .doesNotThrowAnyException();
         }
+
+        @Test
+        @DisplayName("rejects a shared key inherited by a role on a remote plain-http host")
+        void rejectsInheritedKeyOverCleartextRoleEndpoint() {
+            baseProps.put("excalibur.llm.api-key", "test-key");
+            baseProps.put("excalibur.llm.embedding-base-url", "http://gpu-box:8080");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("embedding endpoint")
+                .hasMessageContaining("gpu-box")
+                .hasMessageNotContaining("test-key");
+        }
+
+        @Test
+        @DisplayName("accepts a keyed hosted chat role beside a keyless remote embedding role")
+        void acceptsKeyScopedToTheRoleThatNeedsIt() {
+            baseProps.put("excalibur.llm.chat-api-key", "test-key");
+            baseProps.put("excalibur.llm.embedding-base-url", "http://gpu-box:8080");
+            Config config = new Config(baseProps);
+
+            assertThatCode(() -> ConfigValidation.validate(config))
+                .doesNotThrowAnyException();
+        }
+
+        @Test
+        @DisplayName("does not refuse a disabled role for the key it would have sent")
+        void ignoresDisabledRoleTransport() {
+            baseProps.put("excalibur.llm.api-key", "test-key");
+            baseProps.put("excalibur.llm.chat-base-url", "http://llm-gateway.internal");
+            baseProps.put("excalibur.llm.chat-enabled", "false");
+            Config config = new Config(baseProps);
+
+            assertThatCode(() -> ConfigValidation.validate(config))
+                .doesNotThrowAnyException();
+        }
+
+        @Test
+        @DisplayName("rejects a malformed role base URL by its own name")
+        void rejectsMalformedRoleBaseUrl() {
+            baseProps.put("excalibur.llm.chat-base-url", "not-a-url");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.chat-base-url must be a valid URL");
+        }
     }
 
     @Nested

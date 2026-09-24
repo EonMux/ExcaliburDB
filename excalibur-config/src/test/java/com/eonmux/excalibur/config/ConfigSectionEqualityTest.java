@@ -196,6 +196,11 @@ class ConfigSectionEqualityTest {
         return new SectionUnderTest(LlmConfig.class, LlmConfig::new, Map.of(), List.of(
             v("baseUrl", "excalibur.llm.base-url", "https://models.example.test/v1"),
             v("apiKey", "excalibur.llm.api-key", "sk-not-a-real-key"),
+            v("chatBaseUrl", "excalibur.llm.chat-base-url", "https://chat.example.test/v1"),
+            v("chatApiKey", "excalibur.llm.chat-api-key", "sk-not-a-real-chat-key"),
+            v("chatEnabled", "excalibur.llm.chat-enabled", "false"),
+            v("embeddingBaseUrl", "excalibur.llm.embedding-base-url", "http://localhost:11434"),
+            v("embeddingApiKey", "excalibur.llm.embedding-api-key", "sk-not-a-real-embed-key"),
             v("chatModel", "excalibur.llm.chat-model", "gpt-4o"),
             v("embeddingModel", "excalibur.llm.embedding-model", "text-embedding-3-large"),
             v("embeddingsDimensions", "excalibur.llm.embeddings-dimensions", "3072"),

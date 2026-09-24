@@ -80,7 +80,7 @@ subprojects {
         "excalibur-query" to "Query pipeline: planning, execution and result aggregation",
         "excalibur-llm" to "OpenAI-compatible client for embeddings and relevancy scoring",
         "excalibur-ingest" to "Ingestion pipeline: chunking, indexing and erasure",
-        "excalibur-api" to "HTTP API surface and server bootstrap"
+        "excalibur-api" to "HTTP API surface, server bootstrap and the in-process embedded node"
     )
 
     publishedModules[project.name]?.let { moduleDescription ->

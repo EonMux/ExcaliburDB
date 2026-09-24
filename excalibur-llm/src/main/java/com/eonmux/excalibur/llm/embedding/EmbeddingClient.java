@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.llm.embedding;
 
+import com.eonmux.excalibur.llm.client.AuthFailure;
 import com.eonmux.excalibur.llm.client.CorrelationId;
 import com.eonmux.excalibur.llm.client.SafeUrl;
 import com.eonmux.excalibur.llm.client.LLMClientConfig;
@@ -83,6 +84,7 @@ public final class EmbeddingClient {
     private final LLMClientConfig config;
     private final CircuitBreaker circuitBreaker;
     private final EmbeddingResponseParser parser;
+    private final AuthFailure authFailure = new AuthFailure();
 
     /**
      * Creates a new EmbeddingClient with the given configuration.
@@ -454,6 +456,16 @@ public final class EmbeddingClient {
         return sb.toString();
     }
 
+    /**
+     * Whether requests carry a bearer token.
+     *
+     * @return true if a non-empty key is configured
+     */
+    private boolean hasApiKey() {
+        String apiKey = config.getApiKey();
+        return apiKey != null && !apiKey.isEmpty();
+    }
+
     private HttpResponse<String> executeRequest(String url, String requestBody, String correlationId) {
         int maxRetries = config.getMaxRetries();
         LLMException lastException = null;
@@ -467,9 +479,8 @@ public final class EmbeddingClient {
                         .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8));
 
                 // Add authorization header if API key is configured
-                String apiKey = config.getApiKey();
-                if (apiKey != null && !apiKey.isEmpty()) {
-                    requestBuilder.header(AUTHORIZATION_HEADER, "Bearer " + apiKey);
+                if (hasApiKey()) {
+                    requestBuilder.header(AUTHORIZATION_HEADER, "Bearer " + config.getApiKey());
                 }
 
                 // Validated at the point of use, for the same reason as in the chat client:
@@ -502,6 +513,11 @@ public final class EmbeddingClient {
                                 mapStatusToErrorType(statusCode), statusCode);
                         LOG.warn("Retryable HTTP error {} on attempt {}/{} (correlationId={})",
                                 statusCode, attempt + 1, maxRetries + 1, correlationId);
+                    } else if (AuthFailure.isAuthStatus(statusCode)) {
+                        String message = AuthFailure.describe("Embedding API", statusCode,
+                                SafeUrl.redact(config.getBaseUrl()), hasApiKey());
+                        authFailure.report(LOG, message);
+                        throw new LLMException(message, ErrorType.AUTH_ERROR, statusCode);
                     } else {
                         throw new LLMException(
                                 "Embedding API returned error status " + statusCode,

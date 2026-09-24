@@ -527,4 +527,26 @@ final class ServerWiring {
             reindexStatusRegistry, documentReindexer, resolver, reindexCoordinator,
             documentErasure, graphTenants, graphIngestSink, graphPipeline, documentRegistry);
     }
+
+    /**
+     * The collaborators a caller in the same process searches, supplies and erases through.
+     *
+     * <p>Read at the same point {@link #endpointInputs()} is, and for the same reason: after
+     * every attachment, so the pipeline is the one ingestion wrapped and not the one it was
+     * handed.</p>
+     *
+     * @return The node's services, as the routes would have used them
+     * @throws IllegalStateException if the node was assembled without ingestion, a document
+     *                               registry or an erasure service, which an in-process caller
+     *                               has no other way to reach
+     */
+    InProcessServices inProcessServices() {
+        if (ingestionOrchestrator == null || documentRegistry == null || documentErasure == null) {
+            throw new IllegalStateException("An in-process node needs its ingestion pipeline, its "
+                + "document registry and its erasure service attached before it starts");
+        }
+        return new InProcessServices(config, storageEngine, queryPipeline, embeddingClient,
+            lexicalQueryService, ingestionOrchestrator, documentRegistry, documentErasure,
+            sourceCatalog);
+    }
 }

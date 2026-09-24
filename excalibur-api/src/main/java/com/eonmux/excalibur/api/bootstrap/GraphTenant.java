@@ -539,7 +539,7 @@ public final class GraphTenant implements AutoCloseable {
      * @return The dimension
      */
     private static int embeddingDimension(Config config) {
-        return com.eonmux.excalibur.llm.client.LLMClientConfig.fromConfig(config.llm())
+        return com.eonmux.excalibur.llm.client.LLMClientConfig.forEmbeddings(config.llm())
             .getEmbeddingDimension();
     }
 

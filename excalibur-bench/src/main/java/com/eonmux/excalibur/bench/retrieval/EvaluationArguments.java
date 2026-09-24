@@ -34,7 +34,7 @@ import java.util.Objects;
  * @param engines             The lexical engines to measure, in order
  * @param embeddingModel      The embedding model, or null for none
  * @param embeddingDimensions Width of the embedding model's vectors
- * @param apiKey              The key sent to the endpoint; never blank
+ * @param apiKey              The key sent to the endpoint; empty for one that needs none
  */
 record EvaluationArguments(Path corpus, Path indexRoot, Path qrels, int k, String baseUrl,
                            String chatModel, List<LexicalEngine> engines, String embeddingModel,
@@ -47,15 +47,6 @@ record EvaluationArguments(Path corpus, Path indexRoot, Path qrels, int k, Strin
         + "[k] [baseUrl] [chatModel] [native|lucene|both] [embeddingModel] [dimensions]\n"
         + "       optional arguments are positional; '-' skips one. The endpoint's key is read "
         + "from " + API_KEY_VARIABLE + ".";
-
-    /**
-     * Sent when no key is set.
-     *
-     * <p>A local OpenAI-compatible server accepts any key, and a node reads a blank one as having
-     * no model at all - which would turn every model-backed strategy into a skipped one on the
-     * endpoints most people evaluate against.
-     */
-    private static final String PLACEHOLDER_KEY = "none";
 
     private static final int DEFAULT_K = 10;
     private static final int MAX_ARGUMENTS = 9;
@@ -113,7 +104,7 @@ record EvaluationArguments(Path corpus, Path indexRoot, Path qrels, int k, Strin
             embeddingModel,
             dimensions == null ? LlmConfig.DEFAULT_EMBEDDINGS_DIMENSIONS
                 : positive(dimensions, "embedding dimensions"),
-            key == null || key.isBlank() ? PLACEHOLDER_KEY : key.trim());
+            key == null ? "" : key.trim());
     }
 
     /**

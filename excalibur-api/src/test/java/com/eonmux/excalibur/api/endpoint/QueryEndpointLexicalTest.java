@@ -64,8 +64,9 @@ class QueryEndpointLexicalTest extends QueryEndpointTestBase {
 
             assertThat(body.toString(StandardCharsets.UTF_8))
                 .as("an operator reading the response should not have to go to the logs")
-                .contains("excalibur.llm.api-key")
-                .contains("EXCALIBUR_LLM_API_KEY");
+                .contains("excalibur.llm.embedding-base-url")
+                .contains("excalibur.llm.base-url")
+                .contains("excalibur.llm.api-key");
         }
 
         @Test

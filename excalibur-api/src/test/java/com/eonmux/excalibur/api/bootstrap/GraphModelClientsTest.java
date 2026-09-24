@@ -57,6 +57,43 @@ class GraphModelClientsTest {
     }
 
     @Test
+    @DisplayName("a keyless local server gets both clients: it needs no key")
+    void keylessLocalServerHasClients() {
+        GraphModelClients models = GraphModelClients.forConfig(new Config(new HashMap<>(Map.of(
+            "excalibur.llm.base-url", "http://127.0.0.1:9"))));
+
+        assertThat(models.rerankClient()).isNotNull();
+        assertThat(models.queryEmbeddingClient()).isNotNull();
+        assertThat(models.entityEmbedder()).isNotNull();
+    }
+
+    @Test
+    @DisplayName("each role is decided alone: an embedding server with chat switched off")
+    void rolesAreDecidedApart() {
+        GraphModelClients models = GraphModelClients.forConfig(new Config(new HashMap<>(Map.of(
+            "excalibur.llm.embedding-base-url", "http://127.0.0.1:9"))));
+
+        assertThat(models.rerankClient())
+            .as("chat is still on the hosted default with no key")
+            .isNull();
+        assertThat(models.queryEmbeddingClient()).isNotNull();
+        assertThat(models.entityEmbedder()).isNotNull();
+        assertThat(models.toString()).contains("rerank=no model").contains("queryEmbedding=");
+    }
+
+    @Test
+    @DisplayName("the rerank client is addressed at the chat endpoint, not the embedding one")
+    void rerankUsesTheChatEndpoint() {
+        GraphModelClients models = GraphModelClients.forConfig(new Config(new HashMap<>(Map.of(
+            "excalibur.llm.chat-base-url", "http://127.0.0.1:9",
+            "excalibur.llm.embeddings-enabled", "false"))));
+
+        assertThat(models.rerankClient()).isNotNull();
+        assertThat(models.queryEmbeddingClient()).isNull();
+        assertThat(models.entityEmbedder()).isNull();
+    }
+
+    @Test
     @DisplayName("a client exists from the first graph that asks for it, and is the only one")
     void createdOnceOnFirstUse() {
         GraphModelClients models = GraphModelClients.forConfig(keyed());

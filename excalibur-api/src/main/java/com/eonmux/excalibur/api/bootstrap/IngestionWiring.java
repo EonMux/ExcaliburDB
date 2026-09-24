@@ -15,6 +15,7 @@ import com.eonmux.excalibur.llm.client.LLMClientConfig;
 import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.config.Config;
+import com.eonmux.excalibur.config.LlmEndpoint;
 import com.eonmux.excalibur.llm.client.LLMHttpClient;
 import com.eonmux.excalibur.retrieval.expand.LlmQueryExpander;
 import com.eonmux.excalibur.retrieval.expand.CachingQueryExpander;
@@ -130,10 +131,13 @@ public record IngestionWiring(Config config,
             // requiring it meant a corpus-wide embedding pass before a single document could be
             // searched.
             RetrievalCapabilities capabilities = RetrievalCapabilities.from(config);
+            logModelEndpoints(config);
 
-            LLMClientConfig llmClientConfig = LLMClientConfig.fromConfig(config.llm());
-            EmbeddingClient embeddingClient = createEmbeddingClient(capabilities, llmClientConfig);
-            int vectorDimensions = resolveVectorDimensions(llmClientConfig);
+            LLMClientConfig embeddingClientConfig = LLMClientConfig.forEmbeddings(config.llm());
+            LLMClientConfig chatClientConfig = LLMClientConfig.forChat(config.llm());
+            EmbeddingClient embeddingClient =
+                createEmbeddingClient(capabilities, embeddingClientConfig);
+            int vectorDimensions = resolveVectorDimensions(embeddingClientConfig);
             chunkIndex = openChunkIndex();
             LshIngestionService lshIngestionService =
                 createLshIngestionService(capabilities, vectorDimensions);
@@ -145,7 +149,7 @@ public record IngestionWiring(Config config,
             attachOrchestratorHooks(server);
 
             if (chunkIndex != null) {
-                sweep = attachLexicalRetrieval(server, chunkIndex, capabilities, llmClientConfig);
+                sweep = attachLexicalRetrieval(server, chunkIndex, capabilities, chatClientConfig);
             }
 
             logRetrievalMode(config, capabilities, chunkIndex != null);
@@ -157,15 +161,14 @@ public record IngestionWiring(Config config,
             // no orchestrator, or an exception anywhere above - leaves the state that says so.
             boolean extractionEnabled = config.graph().isExtractionEnabled();
             if (extractionEnabled && !capabilities.chatModel()) {
-                LOGGER.warn("excalibur.graph.extraction-enabled is true but excalibur.llm.api-key "
-                    + "(EXCALIBUR_LLM_API_KEY) is not set - relation extraction is INACTIVE. "
-                    + "Documents are ingested and searchable, but no facts are staged, so "
-                    + "POST /v1/graph/build has nothing to publish. Set the key and restart to "
-                    + "extract facts.");
+                LOGGER.warn("excalibur.graph.extraction-enabled is true but the {} - relation "
+                    + "extraction is INACTIVE. Documents are ingested and searchable, but no "
+                    + "facts are staged, so POST /v1/graph/build has nothing to publish.",
+                    config.llm().chatEndpoint().describe());
             } else if (capabilities.chatModel()) {
-                boolean wired = configureGraphIngest(server, llmClientConfig);
+                boolean wired = configureGraphIngest(server, chatClientConfig);
                 graphTenants.reportExtraction(
-                    GraphExtraction.of(extractionEnabled, true, wired));
+                    GraphExtraction.of(extractionEnabled, LlmEndpoint.Status.ACTIVE, wired));
             }
 
         } catch (Exception e) {
@@ -196,37 +199,46 @@ public record IngestionWiring(Config config,
     }
 
     /**
-     * Builds the embedding client, or explains in the log why this node will not have one.
+     * Says once, at startup, which model endpoints this node will call and why the others not.
      *
-     * <p>The three outcomes are genuinely different and an operator has to be able to tell them
-     * apart from the log alone: embeddings on, embeddings declined by configuration, and no key
-     * at all. Only the last is a warning, because it is the one nobody chose.</p>
+     * <p>One line per role. A role left off because the hosted default has no key is a warning,
+     * because it is the one outcome nobody chose; switched off by its flag, or in use, is
+     * information. Either way the line names the settings that change it.</p>
      *
-     * @param capabilities    What the configured models allow
-     * @param llmClientConfig The resolved LLM endpoint and dimensions
+     * @param config The node's configuration
+     */
+    static void logModelEndpoints(Config config) {
+        for (LlmEndpoint endpoint : List.of(config.llm().embeddingEndpoint(),
+                config.llm().chatEndpoint())) {
+            if (endpoint.status() == LlmEndpoint.Status.MISSING_API_KEY) {
+                LOGGER.warn("Model {}", endpoint.describe());
+            } else {
+                LOGGER.info("Model {}", endpoint.describe());
+            }
+        }
+    }
+
+    /**
+     * Builds the embedding client, or none on a node that does not embed its corpus.
+     *
+     * <p>Without one, documents are still chunked, stored and term-indexed and
+     * {@code POST /v1/query} answers from BM25; {@link #logModelEndpoints} has already said why
+     * and how to change it.</p>
+     *
+     * @param capabilities          What the configured models allow
+     * @param embeddingClientConfig The resolved embedding endpoint and dimensions
      * @return A client, or null when this node ingests lexically
      */
     private EmbeddingClient createEmbeddingClient(RetrievalCapabilities capabilities,
-                                                  LLMClientConfig llmClientConfig) {
-        if (capabilities.embedCorpus()) {
-            EmbeddingClient embeddingClient = new EmbeddingClient(llmClientConfig);
-            LOGGER.info("EmbeddingClient created: baseUrl={}, model={}, dimensions={}",
-                config.llm().getBaseUrl(), config.llm().getEmbeddingModel(),
-                llmClientConfig.getEmbeddingDimension());
-            return embeddingClient;
+                                                  LLMClientConfig embeddingClientConfig) {
+        if (!capabilities.embedCorpus()) {
+            return null;
         }
-        if (capabilities.chatModel()) {
-            LOGGER.info("Corpus embedding declined by excalibur.llm.embeddings-enabled - "
-                + "ingesting lexically. Documents are chunked, stored and term-indexed, and "
-                + "POST /v1/query answers from BM25 with the chat model expanding the query.");
-        } else {
-            LOGGER.warn("LLM API key not configured - ingesting lexically. Documents are "
-                + "chunked, stored and term-indexed, and POST /v1/query answers from BM25 "
-                + "over that index. No vectors are produced, so the vector signal is "
-                + "missing and every answer reports its coverage as degraded. Set "
-                + "excalibur.llm.api-key, or EXCALIBUR_LLM_API_KEY, to add it.");
-        }
-        return null;
+        EmbeddingClient embeddingClient = new EmbeddingClient(embeddingClientConfig);
+        LOGGER.info("EmbeddingClient created: baseUrl={}, model={}, dimensions={}",
+            config.llm().embeddingEndpoint().baseUrl(), config.llm().getEmbeddingModel(),
+            embeddingClientConfig.getEmbeddingDimension());
+        return embeddingClient;
     }
 
     /**
@@ -236,12 +248,12 @@ public record IngestionWiring(Config config,
      * keep being written at that width. When it is not set the embedding model's own dimension is
      * the only answer that cannot disagree with the vectors the client will return.</p>
      *
-     * @param llmClientConfig The resolved LLM endpoint, which knows its model's width
+     * @param embeddingClientConfig The resolved embedding endpoint, which knows its model's width
      * @return The vector width the LSH pre-filter is sized for
      */
-    private int resolveVectorDimensions(LLMClientConfig llmClientConfig) {
+    private int resolveVectorDimensions(LLMClientConfig embeddingClientConfig) {
         int configured = config.query().getVectorDimensions();
-        return configured > 0 ? configured : llmClientConfig.getEmbeddingDimension();
+        return configured > 0 ? configured : embeddingClientConfig.getEmbeddingDimension();
     }
 
     /**
@@ -323,14 +335,14 @@ public record IngestionWiring(Config config,
      *
      * @param server          The server to attach the read side to
      * @param chunkIndex      The index that opened
-     * @param capabilities    What the configured models allow
-     * @param llmClientConfig The resolved LLM endpoint, for the expander's client
+     * @param capabilities     What the configured models allow
+     * @param chatClientConfig The resolved chat endpoint, for the expander's client
      * @return The sweep enforcing the index's erasure deadline
      */
     private LexicalErasureSweep attachLexicalRetrieval(ExcaliburDBServer server,
                                                        ChunkIndex chunkIndex,
                                                        RetrievalCapabilities capabilities,
-                                                       LLMClientConfig llmClientConfig) {
+                                                       LLMClientConfig chatClientConfig) {
         IngestionOrchestrator orchestrator = server.getIngestionOrchestrator();
         if (orchestrator != null) {
             orchestrator.setLexicalIndex(chunkIndex);
@@ -341,7 +353,7 @@ public record IngestionWiring(Config config,
         // response expands to report, and a second generation is a second bill and possibly
         // different terms from the ones that actually ran.
         QueryExpander expander = CachingQueryExpander.over(
-            createQueryExpander(capabilities, llmClientConfig));
+            createQueryExpander(capabilities, chatClientConfig));
         server.withLexicalQueryService(new LexicalQueryService(
             chunkIndex, expander, List.of(),
             config.query().getRrfK(), config.query().getPerSignalOverFetch()));
@@ -362,26 +374,26 @@ public record IngestionWiring(Config config,
      * which is a weaker search and still a working one - which is why the absence is logged only
      * on a node that has nothing else to fall back on.</p>
      *
-     * @param capabilities    What the configured models allow
-     * @param llmClientConfig The resolved LLM endpoint, for the expander's client
+     * @param capabilities     What the configured models allow
+     * @param chatClientConfig The resolved chat endpoint, for the expander's client
      * @return The expander the lexical query service will run every query through
      */
     private QueryExpander createQueryExpander(RetrievalCapabilities capabilities,
-                                              LLMClientConfig llmClientConfig) {
+                                              LLMClientConfig chatClientConfig) {
         if (capabilities.expandQueries()) {
             // On the expansion budget rather than the ingestion client's. Expansion runs inside
             // a request a caller is holding open and the search cannot start until it returns,
             // so the 60s the client is configured with - longer than any query budget a caller
             // can ask for - made one slow call to the chat model an empty timed-out answer.
             LlmQueryExpander expander = new LlmQueryExpander(
-                new LLMHttpClient(llmClientConfig),
+                new LLMHttpClient(chatClientConfig),
                 config.query().getExpansionTimeoutMs());
             LOGGER.info("Query expansion enabled with chat model {}",
                 config.llm().getChatModel());
             return expander;
         }
         if (!capabilities.embedCorpus()) {
-            LOGGER.info("No chat model configured; retrieval is plain BM25 without "
+            LOGGER.info("No chat model in use; retrieval is plain BM25 without "
                 + "query expansion");
         }
         return QueryExpander.identity();
@@ -432,12 +444,12 @@ public record IngestionWiring(Config config,
      * graph for the length of one borrow; a source registered without a namespace stages into
      * the shared one, which is the whole of what a single-tenant node ever does.</p>
      *
-     * @param server          The server holding the ingestion orchestrator
-     * @param llmClientConfig The LLM configuration, for the extractor's client
+     * @param server           The server holding the ingestion orchestrator
+     * @param chatClientConfig The resolved chat endpoint, for the extractor's client
      * @return true if documents now reach the graph, false if there was no orchestrator to wire
      */
     private boolean configureGraphIngest(ExcaliburDBServer server,
-                                         LLMClientConfig llmClientConfig) {
+                                         LLMClientConfig chatClientConfig) {
         IngestionOrchestrator orchestrator = server.getIngestionOrchestrator();
         if (orchestrator == null) {
             LOGGER.warn("No ingestion orchestrator; documents will not reach the graph");
@@ -448,7 +460,7 @@ public record IngestionWiring(Config config,
         RelationExtractor extractor = RelationExtractor.none();
         if (extractionEnabled) {
             extractor = new LlmRelationExtractor(
-                new LLMHttpClient(llmClientConfig),
+                new LLMHttpClient(chatClientConfig),
                 config.graph().getExtractorVersion());
         }
 

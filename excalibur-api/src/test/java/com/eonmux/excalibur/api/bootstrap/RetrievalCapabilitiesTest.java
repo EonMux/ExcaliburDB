@@ -89,6 +89,44 @@ class RetrievalCapabilitiesTest {
     }
 
     @Nested
+    @DisplayName("With a keyless local server")
+    class KeylessLocal {
+
+        @Test
+        @DisplayName("every signal a key would have given is offered: Ollama needs no key")
+        void keylessEndpointIsUsed() {
+            RetrievalCapabilities caps =
+                from(Map.of("excalibur.llm.base-url", "http://localhost:11434"));
+
+            assertThat(caps.chatModel()).isTrue();
+            assertThat(caps.embedCorpus()).isTrue();
+            assertThat(caps.expandQueries()).isFalse();
+        }
+
+        @Test
+        @DisplayName("an embedding server alone embeds, and nothing calls a chat model")
+        void embeddingOnly() {
+            RetrievalCapabilities caps =
+                from(Map.of("excalibur.llm.embedding-base-url", "http://127.0.0.1:8080"));
+
+            assertThat(caps.embedCorpus()).isTrue();
+            assertThat(caps.chatModel()).isFalse();
+            assertThat(caps.expandQueries()).isFalse();
+        }
+
+        @Test
+        @DisplayName("turning chat off keeps the embedding pass")
+        void chatDeclined() {
+            RetrievalCapabilities caps = from(Map.of(
+                "excalibur.llm.base-url", "http://localhost:11434",
+                "excalibur.llm.chat-enabled", "false"));
+
+            assertThat(caps.embedCorpus()).isTrue();
+            assertThat(caps.chatModel()).isFalse();
+        }
+    }
+
+    @Nested
     @DisplayName("With a key, embeddings on, and hybrid expansion asked for")
     class ExpandedHybrid {
 

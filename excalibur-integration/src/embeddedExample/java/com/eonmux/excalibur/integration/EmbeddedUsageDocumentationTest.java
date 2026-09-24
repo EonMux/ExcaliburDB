@@ -18,11 +18,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * Holds USAGE.md's embedded example to the code {@link EmbeddedUsageExampleTest} compiles and runs.
  *
- * <p>USAGE.md says the snippet is the body of {@code ingestAndQuery}, and that claim is what an
- * embedder relies on when copying it: that it compiles, and that it does what the test proves.
- * Nothing held the two together, so an edit to either one left the other describing code that no
- * longer existed. This compares them token for token. Layout is ignored because the documentation
- * is indented one level less than the method.</p>
+ * <p>USAGE.md says the snippet is {@code ingestAndQuery} and {@code reopenAndErase}, and that
+ * claim is what an embedder relies on when copying it: that it compiles, and that it does what the
+ * test proves. Nothing held the two together, so an edit to either one left the other describing
+ * code that no longer existed. This compares them token for token. Layout is ignored because the
+ * documentation is indented one level less than the methods.</p>
  */
 @DisplayName("Embedded usage example matches USAGE.md")
 class EmbeddedUsageDocumentationTest {
@@ -30,8 +30,8 @@ class EmbeddedUsageDocumentationTest {
     /** The heading the example sits under; the first Java block after it is the example. */
     private static final String HEADING = "### Ingesting and querying in-process";
 
-    private static final String METHOD = "static List<QueryResultItem> ingestAndQuery(";
-    private static final String HELPER = "static InlineSource.Document text(";
+    private static final String METHOD = "static List<SearchHit> ingestAndQuery(";
+    private static final String REOPEN = "static SearchAnswer reopenAndErase(";
 
     private static final Pattern IMPORT = Pattern.compile("(?m)^import ([\\w.]+);");
 
@@ -46,17 +46,17 @@ class EmbeddedUsageDocumentationTest {
     }
 
     @Test
-    @DisplayName("the documented helper is the one the test runs")
-    void helperMatches() throws IOException {
-        assertThat(normalise(member(documentedExample(), HELPER)))
-            .isEqualTo(normalise(member(exampleSource(), HELPER)));
+    @DisplayName("the documented reopening is the one the test runs")
+    void reopenMatches() throws IOException {
+        assertThat(normalise(member(documentedExample(), REOPEN)))
+            .isEqualTo(normalise(member(exampleSource(), REOPEN)));
     }
 
     @Test
     @DisplayName("the documented imports are exactly the ones the example uses")
     void importsMatch() throws IOException {
         String compiled = exampleSource();
-        String example = member(compiled, METHOD) + member(compiled, HELPER);
+        String example = member(compiled, METHOD) + member(compiled, REOPEN);
         Set<String> used = new LinkedHashSet<>();
         for (String imported : imports(compiled)) {
             String simpleName = imported.substring(imported.lastIndexOf('.') + 1);

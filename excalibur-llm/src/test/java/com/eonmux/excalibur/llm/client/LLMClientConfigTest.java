@@ -394,8 +394,8 @@ class LLMClientConfigTest {
     class ConfigLlmIntegrationTests {
 
         @Test
-        @DisplayName("fromConfig() creates LLMClientConfig from LlmConfig")
-        void fromConfigCreatesLlmClientConfigFromConfigLlm() {
+        @DisplayName("forChat() creates LLMClientConfig from LlmConfig")
+        void forChatCreatesLlmClientConfigFromConfigLlm() {
             // Create a LlmConfig with custom values
             Map<String, String> props = new HashMap<>();
             props.put("excalibur.llm.base-url", "https://api.custom.com/v1");
@@ -414,7 +414,7 @@ class LLMClientConfigTest {
             Config config = new Config(props);
             LlmConfig llmConfig = config.llm();
 
-            LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
+            LLMClientConfig clientConfig = LLMClientConfig.forChat(llmConfig);
 
             // Verify all values are correctly mapped. The base URL is normalised on the way
             // through: the property said ".../v1" and the clients append "/v1/embeddings"
@@ -433,8 +433,8 @@ class LLMClientConfigTest {
         }
 
         @Test
-        @DisplayName("fromConfig() uses defaults for missing properties")
-        void fromConfigUsesDefaultsForMissingProperties() {
+        @DisplayName("forChat() uses defaults for missing properties")
+        void forChatUsesDefaultsForMissingProperties() {
             // Create LlmConfig with minimal properties
             Map<String, String> props = new HashMap<>();
             props.put("excalibur.llm.base-url", "http://localhost:11434");
@@ -442,7 +442,7 @@ class LLMClientConfigTest {
             Config config = new Config(props);
             LlmConfig llmConfig = config.llm();
 
-            LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
+            LLMClientConfig clientConfig = LLMClientConfig.forChat(llmConfig);
 
             // Verify defaults are applied
             assertEquals("http://localhost:11434", clientConfig.getBaseUrl());
@@ -459,17 +459,61 @@ class LLMClientConfigTest {
         }
 
         @Test
-        @DisplayName("fromConfig() throws NullPointerException for null input")
-        void fromConfigThrowsNullPointerExceptionForNullInput() {
+        @DisplayName("each role is addressed at its own endpoint and key")
+        void rolesAreAddressedSeparately() {
+            Map<String, String> props = new HashMap<>();
+            props.put("excalibur.llm.base-url", "https://api.hosted.test/v1");
+            props.put("excalibur.llm.api-key", "shared-key");
+            props.put("excalibur.llm.embedding-base-url", "http://localhost:11434/v1");
+            props.put("excalibur.llm.embedding-api-key", "embed-key");
+            props.put("excalibur.llm.chat-model", "chat-x");
+            props.put("excalibur.llm.embedding-model", "embed-y");
+            LlmConfig llmConfig = new Config(props).llm();
+
+            LLMClientConfig chat = LLMClientConfig.forChat(llmConfig);
+            LLMClientConfig embeddings = LLMClientConfig.forEmbeddings(llmConfig);
+
+            assertEquals("https://api.hosted.test", chat.getBaseUrl());
+            assertEquals("shared-key", chat.getApiKey());
+            assertEquals("http://localhost:11434", embeddings.getBaseUrl());
+            assertEquals("embed-key", embeddings.getApiKey());
+            // The models are not per-role settings of the endpoint: both configurations carry
+            // both, and each client uses the one its calls need.
+            assertEquals("chat-x", embeddings.getChatModel());
+            assertEquals("embed-y", chat.getEmbeddingModel());
+        }
+
+        @Test
+        @DisplayName("builderFor() lets one value be overridden on top of configuration")
+        void builderForAllowsAnOverride() {
+            Map<String, String> props = new HashMap<>();
+            props.put("excalibur.llm.chat-base-url", "http://127.0.0.1:8000");
+            LlmConfig llmConfig = new Config(props).llm();
+
+            LLMClientConfig config = LLMClientConfig.builderFor(llmConfig, llmConfig.chatEndpoint())
+                .timeout(Duration.ofMillis(1234))
+                .build();
+
+            assertEquals("http://127.0.0.1:8000", config.getBaseUrl());
+            assertEquals(Duration.ofMillis(1234), config.getTimeout());
+            assertThrows(NullPointerException.class,
+                () -> LLMClientConfig.builderFor(llmConfig, null));
+            assertThrows(NullPointerException.class,
+                () -> LLMClientConfig.forEmbeddings(null));
+        }
+
+        @Test
+        @DisplayName("forChat() throws NullPointerException for null input")
+        void forChatThrowsNullPointerExceptionForNullInput() {
             assertThrows(
                 NullPointerException.class,
-                () -> LLMClientConfig.fromConfig(null)
+                () -> LLMClientConfig.forChat(null)
             );
         }
 
         @Test
-        @DisplayName("fromConfig() validates all values through builder")
-        void fromConfigValidatesAllValuesThroughBuilder() {
+        @DisplayName("forChat() validates all values through builder")
+        void forChatValidatesAllValuesThroughBuilder() {
             // Create LlmConfig with invalid values - failure-threshold of 0 is below minimum
             Map<String, String> props = new HashMap<>();
             props.put("excalibur.llm.base-url", "https://api.test.com");
@@ -481,7 +525,7 @@ class LLMClientConfigTest {
             // Should throw due to validation in the builder (0 is below minimum of 1)
             assertThrows(
                 IllegalArgumentException.class,
-                () -> LLMClientConfig.fromConfig(llmConfig)
+                () -> LLMClientConfig.forChat(llmConfig)
             );
         }
     }
@@ -532,7 +576,7 @@ class LLMClientConfigTest {
             LlmConfig llmConfig = new Config(props).llm();
 
             assertEquals(0.75, llmConfig.getRelevancyThreshold(), 0.001);
-            assertThat(LLMClientConfig.fromConfig(llmConfig))
+            assertThat(LLMClientConfig.forChat(llmConfig))
                 .extracting(Object::toString, org.assertj.core.api.InstanceOfAssertFactories.STRING)
                 .doesNotContain("relevancyThreshold");
         }
@@ -551,8 +595,8 @@ class LLMClientConfigTest {
             // Verify LlmConfig has the correct value
             assertEquals(25, llmConfig.getMaxPromptsPerQuery());
 
-            // Verify LLMClientConfig.fromConfig() maps it correctly
-            LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
+            // Verify LLMClientConfig.forChat() maps it correctly
+            LLMClientConfig clientConfig = LLMClientConfig.forChat(llmConfig);
             assertEquals(25, clientConfig.getMaxPromptsPerQuery());
         }
 
@@ -570,8 +614,8 @@ class LLMClientConfigTest {
             // Verify LlmConfig has the correct value
             assertEquals(1000, llmConfig.getRetryBaseDelayMs());
 
-            // Verify LLMClientConfig.fromConfig() maps it correctly
-            LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
+            // Verify LLMClientConfig.forChat() maps it correctly
+            LLMClientConfig clientConfig = LLMClientConfig.forChat(llmConfig);
             assertEquals(Duration.ofMillis(1000), clientConfig.getRetryBaseDelay());
         }
     }
