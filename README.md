@@ -2289,8 +2289,11 @@ is wrong with it where a crawl can only pass a file over and count it.
 the source's root now rather than the state it was in the first time the node walked it. Every
 run counts the same thing - documents that are not text, and nothing else - so an unchanged root
 reads the same after a re-crawl as after the crawl that first registered it. A run that passes
-over nothing, including one whose root lists no documents at all, sets it back to zero; the rest of `/v1/ingest/status` is left
-to the run that wrote it, because a reindex reports how far it got through
+over nothing, including one whose root lists no documents at all, sets it back to zero. A
+re-crawl that is cancelled, or fails, once it has begun on its documents reports what it had
+passed over up to then, and `entries_disallowed` the same way; one that ends while still listing
+the source has looked at nothing and leaves both as they were. The rest of `/v1/ingest/status` is
+left to the run that wrote it, because a reindex reports how far it got through
 `/v1/reindex/status`.
 
 A document that passes is chunked as it reads, with one exception: a document whose content type

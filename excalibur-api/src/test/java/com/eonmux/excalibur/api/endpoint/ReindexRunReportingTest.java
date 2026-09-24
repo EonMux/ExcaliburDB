@@ -299,6 +299,67 @@ class ReindexRunReportingTest {
     }
 
     @Nested
+    @DisplayName("a run that stopped partway")
+    class StoppedPartway {
+
+        @Test
+        @DisplayName("reports what it passed over before it was stopped")
+        void aCancelledRunReportsItsSkips() throws Exception {
+            ingestionStatus.getOrCreate(SOURCE_ID).setSkipped(40);
+            when(source.getDisallowedCount()).thenReturn(2L);
+            when(reindexer.reindexAll(eq(source), any(), any())).thenAnswer(invocation -> {
+                DocumentReindexer.ReindexProgress progress = invocation.getArgument(1);
+                progress.documentsDone(0, 10);
+                progress.documentsDone(4, 10);
+                progress.documentsCounted(0, 3);
+                throw new ReindexCancelledException("stopped after 4 of 10");
+            });
+
+            run().execute(SOURCE_ID);
+
+            assertThat(status().cancelled()).isTrue();
+            assertThat(ingestionStatus.getStatus(SOURCE_ID).entriesSkipped())
+                .as("what the run found before it stopped, not the figure of the run before it")
+                .isEqualTo(3);
+            assertThat(ingestionStatus.getStatus(SOURCE_ID).entriesDisallowed()).isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("reports what it passed over before it broke")
+        void aFailedRunReportsItsSkips() throws Exception {
+            ingestionStatus.getOrCreate(SOURCE_ID).setSkipped(40);
+            when(reindexer.reindexAll(eq(source), any(), any())).thenAnswer(invocation -> {
+                DocumentReindexer.ReindexProgress progress = invocation.getArgument(1);
+                progress.documentsDone(0, 10);
+                progress.documentsCounted(1, 5);
+                throw new IllegalStateException("the lexical index is closed");
+            });
+
+            run().execute(SOURCE_ID);
+
+            assertThat(status().state()).isEqualTo(ReindexEndpoint.ReindexStatus.STATE_FAILED);
+            assertThat(status().documentsFailed()).isEqualTo(1);
+            assertThat(ingestionStatus.getStatus(SOURCE_ID).entriesSkipped()).isEqualTo(5);
+        }
+
+        @Test
+        @DisplayName("leaves the figures alone when it stopped before judging any document")
+        void aRunStoppedBeforeItStartedReportsNothing() throws Exception {
+            ingestionStatus.getOrCreate(SOURCE_ID).setSkipped(40);
+            ingestionStatus.getStatus(SOURCE_ID).setDisallowed(6);
+            when(reindexer.reindexAll(eq(source), any(), any()))
+                .thenThrow(new ReindexCancelledException("stopped while listing"));
+
+            run().execute(SOURCE_ID);
+
+            assertThat(ingestionStatus.getStatus(SOURCE_ID).entriesSkipped())
+                .as("a run that never got past its listing found nothing to replace them with")
+                .isEqualTo(40);
+            assertThat(ingestionStatus.getStatus(SOURCE_ID).entriesDisallowed()).isEqualTo(6);
+        }
+    }
+
+    @Nested
     @DisplayName("what the source's ingestion status is told")
     class SkippedDocuments {
 

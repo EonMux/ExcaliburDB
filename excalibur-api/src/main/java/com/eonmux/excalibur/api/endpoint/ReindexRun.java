@@ -64,7 +64,12 @@ import java.util.Objects;
  * able to say so - and {@code entries_skipped} and {@code entries_disallowed} on
  * {@code GET /v1/ingest/status} are where the node says it. Nothing else on that status is
  * touched, because a reindex has its own readback for how far it got and how it ended.</p>
-
+ *
+ * <p>A run that was stopped, or broke, once it had begun on its documents reports the two as far
+ * as it got: what it passed over is what the source is now known to hold, and the figure the run
+ * before it left describes a corpus this one has looked at since. A run that ended before it
+ * judged any document - stopped or broken while listing - has found nothing to replace them
+ * with, and leaves them as they were.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Thread-safe. Every field is final and the mutual exclusion that matters - one reindex per
@@ -176,8 +181,10 @@ public final class ReindexRun {
         String threadName = Thread.currentThread().getName();
         LOGGER.info("[reindex-{}] Starting reindex execution for source: {}", threadName, sourceId);
 
+        Source source = null;
+        RunReport report = null;
         try {
-            Source source = sourceResolver.resolve(sourceId);
+            source = sourceResolver.resolve(sourceId);
             if (source == null) {
                 String error = "Source not found: " + sourceId;
                 LOGGER.error("[reindex-{}] {}", threadName, error);
@@ -189,7 +196,7 @@ public final class ReindexRun {
             // the reindexer publishes is the size of the run.
             statusRegistry.updateProgress(sourceId, STATE_CRAWLING, 0.0, 0, 0);
 
-            RunReport report = new RunReport(sourceId);
+            report = new RunReport(sourceId);
             boolean useRollingReplacement = volumeManager != null && segmentCatalog != null
                 && reindexer.hasRollingReplacement();
             return useRollingReplacement
@@ -197,6 +204,7 @@ public final class ReindexRun {
                 : runStandard(threadName, sourceId, source, report, stop);
 
         } catch (Exception e) {
+            reportEndedEarly(sourceId, source, report);
             if (wasCancelled(stop, e)) {
                 LOGGER.info("[reindex-{}] Reindex of source {} stopped on request after {} of "
                         + "{} document(s)", threadName, sourceId,
@@ -227,6 +235,30 @@ public final class ReindexRun {
     }
 
     /**
+     * Records on the source's ingestion status what a run that ended early had found.
+     *
+     * <p>Only once it had begun on its documents; see the class documentation. Kept from
+     * throwing, since it runs on the way to recording the run's verdict and a failure here must
+     * not cost the verdict.</p>
+     *
+     * @param sourceId The source being reindexed
+     * @param source   The resolved source, or null when it was never resolved
+     * @param report   What the run reported, or null when it never began
+     */
+    private void reportEndedEarly(String sourceId, Source source, RunReport report) {
+        if (source == null || report == null || !report.begun()) {
+            return;
+        }
+        try {
+            reportSkipped(sourceId, report.notText());
+            reportDisallowed(sourceId, source);
+        } catch (RuntimeException e) {
+            LOGGER.warn("What the stopped reindex of {} passed over was not recorded: {}",
+                sourceId, e.getMessage());
+        }
+    }
+
+    /**
      * Records on the source's ingestion status how many documents this run passed over.
      *
      * <p>Reported after the run rather than during it, because it is a property of the run as a
@@ -238,7 +270,7 @@ public final class ReindexRun {
      * @param sourceId The source that was reindexed
      * @param skipped  Documents listed whose bytes are not text
      */
-    private void reportSkipped(String sourceId, int skipped) {
+    private void reportSkipped(String sourceId, long skipped) {
         if (ingestionStatusRegistry == null) {
             return;
         }
@@ -330,17 +362,23 @@ public final class ReindexRun {
     }
 
     /**
-     * The listener that turns the reindexer's counts into the status a caller polls.
+     * The listener that turns the reindexer's counts into the status a caller polls, and keeps
+     * what a run that ends early still has to report.
      *
      * <p>The phase is settled once, from what this node can do, rather than guessed per
      * document: a node with no embedding endpoint never enters an embedding phase, and
      * reporting one would be reporting work it does not perform.</p>
-
+     *
+     * <p>The count of documents passed over as not text is held here rather than written to
+     * the ingestion status as it moves, because each write of that status to a settled source
+     * rewrites its history on disk; it is written once, when the run ends.</p>
      */
     private final class RunReport implements DocumentReindexer.ReindexProgress {
 
         private final String sourceId;
         private final String state;
+        private volatile boolean begun;
+        private volatile long notText;
 
         RunReport(String sourceId) {
             this.sourceId = sourceId;
@@ -349,18 +387,30 @@ public final class ReindexRun {
 
         @Override
         public void documentsDone(long processed, long total) {
+            begun = true;
             statusRegistry.updateProgress(sourceId, state, fractionDone(processed, total),
                 processed, total);
         }
 
         @Override
         public void documentsCounted(long documentsFailed, long documentsNotText) {
+            notText = documentsNotText;
             statusRegistry.recordFailures(sourceId, documentsFailed);
         }
 
         @Override
         public void documentsUnchecked(long documentsUnchecked, List<String> sample) {
             statusRegistry.recordUnchecked(sourceId, documentsUnchecked, sample);
+        }
+
+        /** Whether the run got past its listing and began on its documents. */
+        boolean begun() {
+            return begun;
+        }
+
+        /** Documents passed over as not text, as far as the run got. */
+        long notText() {
+            return notText;
         }
     }
 

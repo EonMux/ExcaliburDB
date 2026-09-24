@@ -1150,7 +1150,9 @@ line breaks so neighbouring words do not run together. Every other type is index
 
 Every run rewrites it, including a re-crawl — the scheduled one and `POST /v1/reindex` alike — so
 it describes what the root holds now and not what it held the first time the node walked it. A
-run that lists no documents at all sets it back to zero too.
+run that lists no documents at all sets it back to zero too. A re-crawl that is cancelled or fails
+once it has begun on its documents writes what it had passed over by then; one that ends while
+still listing the source leaves the figure as it was.
 Every run also counts the same thing: an empty file, or one that decodes to nothing the chunker
 can index, is passed over without being counted, on the first crawl and on every re-crawl, so an
 unchanged root reads the same number after either. The
@@ -1164,8 +1166,8 @@ different things. A skipped file is not text. A disallowed page is one the site 
 out, and only the site's owner, or a registration with `respect_robots_txt: false`, can change
 that. It is not an error and is not in `last_error`.
 
-Like `entries_skipped`, it is rewritten by every run, re-crawls included, and it is always 0 for a
-filesystem source. A `robots.txt` the site cannot serve is a different case, reported through
+Like `entries_skipped`, it is rewritten by every run, re-crawls included — a cancelled or failed
+one as far as it got — and it is always 0 for a filesystem source. A `robots.txt` the site cannot serve is a different case, reported through
 `last_error`: see [robots.txt](#robotstxt).
 
 `documents_failed` is how many documents the crawl listed and could not index: a read or fetch
