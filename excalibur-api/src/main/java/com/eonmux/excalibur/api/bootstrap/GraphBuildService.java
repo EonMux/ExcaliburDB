@@ -10,6 +10,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
@@ -24,6 +25,16 @@ import java.util.concurrent.locks.ReentrantLock;
  * build produces a whole store from them. Making that a step someone takes, rather than something
  * that happens after every document, is deliberate: a build is proportional to the whole graph, and
  * doing one per document would spend all of a node's time rebuilding and none of it ingesting.</p>
+ *
+ * <h2>What a build tells staging</h2>
+ * <p>A build reads {@link GraphStagingStore#changeCount()} before it reads staging, and once it
+ * has published hands it back to {@link GraphStagingStore#markPublished(long)}, which is what
+ * lets the node tell a current graph from one behind its staging. A build with nothing staged
+ * publishes nothing, and leaves a graph it would otherwise have replaced where it is - unless
+ * staging has changed since that graph was published, in which case the graph holds only what
+ * has since been withdrawn, and it is retired: taken out of service and removed, so graph
+ * queries answer that nothing is built rather than with the facts of documents that are
+ * gone.</p>
  *
  * <h2>One build at a time</h2>
  * <p>Builds are serialised, and serialised against erasure compaction, by the holder's
@@ -102,14 +113,17 @@ public final class GraphBuildService {
      * What a build did.
      *
      * @param published whether a new graph was published
+     * @param retired   whether, with nothing staged, the graph it would have replaced was taken
+     *                  out of service because everything it held had been withdrawn
      * @param edges     facts in the published store
      * @param entities  entity ids it addresses
      * @param relations relations it names
      * @param indexed   entities that had text to rank them by
+     * @param embedded  entities that got a vector
      * @param staged    facts staged at the moment of the build
      */
-    public record BuildOutcome(boolean published, long edges, int entities, int relations,
-                               int indexed, long embedded, long staged) {
+    public record BuildOutcome(boolean published, boolean retired, long edges, int entities,
+                               int relations, int indexed, long embedded, long staged) {
     }
 
     /**
@@ -122,6 +136,10 @@ public final class GraphBuildService {
         ReentrantLock buildLock = holder.replacementLock();
         buildLock.lock();
         try {
+            // Before anything reads staging: a change counted after this is one the build may
+            // not have seen, and keeps the graph marked behind.
+            long asOf = staging.changeCount();
+            boolean behind = staging.unpublishedChanges().pending();
             Path target = holder.directory();
             SupersessionPolicy supersession =
                 GraphBuilder.singleValued(staging, singleValuedRelations);
@@ -138,18 +156,65 @@ public final class GraphBuildService {
                     published -> GraphRagFactory.openPublished(config, published, models));
             GraphDirectoryBuilder.BuildResult result = built.result();
             if (!result.published()) {
-                LOGGER.info("graph build for {} had nothing to publish", target);
-                return new BuildOutcome(false, 0, result.entities(), result.relations(), 0,
-                    0, staging.stagedCount());
+                boolean retired = behind && retire(target);
+                LOGGER.info("graph build for {} had nothing to publish{}", target,
+                    retired ? "; the graph it served held only withdrawn facts and was retired"
+                        : "");
+                published(asOf);
+                return new BuildOutcome(false, retired, 0, result.entities(), result.relations(),
+                    0, 0, staging.stagedCount());
             }
             holder.install(built.opened());
+            published(asOf);
 
             LOGGER.info("graph built and served from {}: {} facts over {} entities",
                 target, result.edges(), result.entities());
-            return new BuildOutcome(true, result.edges(), result.entities(), result.relations(),
-                result.indexed(), result.embedded(), staging.stagedCount());
+            return new BuildOutcome(true, false, result.edges(), result.entities(),
+                result.relations(), result.indexed(), result.embedded(), staging.stagedCount());
         } finally {
             buildLock.unlock();
+        }
+    }
+
+    /**
+     * Takes a graph out of service and off disk, once everything it was built from is withdrawn.
+     *
+     * <p>Queries are drained first, then every copy a publish could restore is removed before the
+     * served one, so recovery cannot bring back what this retires.</p>
+     *
+     * @param target Where the graph is served from
+     * @return true if there was a graph to retire
+     * @throws IOException if it cannot be removed
+     */
+    private boolean retire(Path target) throws IOException {
+        if (!Files.isDirectory(target) && !GraphBuilder.hasDisplacedGraph(target)) {
+            return false;
+        }
+        holder.withdraw();
+        GraphBuilder.discard(GraphBuilder.previousFor(target));
+        GraphBuilder.discard(GraphBuilder.retiredFor(target));
+        GraphBuilder.discard(target);
+        return true;
+    }
+
+    /**
+     * Tells staging a graph built from it as of {@code asOf} is now being served.
+     *
+     * <p>A marker that cannot be removed does not fail a build that has already published: it is
+     * logged, and costs one more build than was needed.</p>
+     *
+     * @param asOf The change count read before the build read staging
+     */
+    private void published(long asOf) {
+        try {
+            if (!staging.markPublished(asOf)) {
+                LOGGER.debug("staging changed while the graph at {} was being built; it stays "
+                    + "marked behind", holder.directory());
+            }
+        } catch (IOException e) {
+            LOGGER.warn("could not clear the record of unpublished changes for {}; the graph "
+                + "will be built once more than it needs to be: {}", holder.directory(),
+                e.toString());
         }
     }
 

@@ -566,7 +566,7 @@ class GraphBuildEndpointTest {
             entered.countDown();
             await(release);
             return new com.eonmux.excalibur.api.bootstrap.GraphBuildService.BuildOutcome(
-                false, 0, 0, 0, 0, 0, 0);
+                false, false, 0, 0, 0, 0, 0, 0);
         };
     }
 

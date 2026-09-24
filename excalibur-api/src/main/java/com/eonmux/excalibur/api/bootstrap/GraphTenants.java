@@ -683,6 +683,62 @@ public final class GraphTenants implements AutoCloseable {
     }
 
     /**
+     * Builds one namespace's graph if it is behind its staging, from the borrow to the
+     * re-costing.
+     *
+     * <p>For the automatic build. A namespace that does not exist is not created, and one that
+     * is current by the time its lock is held - an explicit build got there first - is left
+     * alone; see {@link GraphTenant#buildIfBehind}.</p>
+     *
+     * @param id              The namespace to build
+     * @param cancelRequested Read at the boundaries of the build; true asks it to stop
+     * @return What was built, or empty when there was nothing to build
+     * @throws IOException if the graph cannot be built or reopened
+     * @throws com.eonmux.excalibur.graph.build.BuildCancelledException if the build was asked to
+     *                     stop and reached a boundary before publishing
+     */
+    public Optional<GraphBuildService.BuildOutcome> buildIfBehind(NamespaceId id,
+                                                                  BooleanSupplier cancelRequested)
+            throws IOException {
+        Objects.requireNonNull(id, "id must not be null");
+        Objects.requireNonNull(cancelRequested, "cancelRequested must not be null");
+        Optional<NamespaceRegistry.Lease<GraphTenant>> lease = borrowIfPresent(id);
+        if (lease.isEmpty()) {
+            return Optional.empty();
+        }
+        try (NamespaceRegistry.Lease<GraphTenant> held = lease.get()) {
+            Optional<GraphBuildService.BuildOutcome> outcome =
+                held.resource().buildIfBehind(cancelRequested);
+            if (outcome.isPresent()) {
+                recost(id);
+            }
+            return outcome;
+        }
+    }
+
+    /**
+     * Whether a namespace's served graph is behind its staging.
+     *
+     * <p>A resident namespace answers from memory; one that is not is read from its staging
+     * directory without being opened, so asking about every namespace on a node costs a few
+     * stats each and evicts nothing.</p>
+     *
+     * @param id The namespace
+     * @return The freshness; a namespace that does not exist is current
+     * @throws IOException if its staging exists and cannot be read
+     */
+    public GraphFreshness freshness(NamespaceId id) throws IOException {
+        Objects.requireNonNull(id, "id must not be null");
+        Optional<NamespaceRegistry.Lease<GraphTenant>> resident = borrowResident(id);
+        if (resident.isPresent()) {
+            try (NamespaceRegistry.Lease<GraphTenant> held = resident.get()) {
+                return held.resource().freshness();
+            }
+        }
+        return GraphTenant.freshnessOnDisk(graphDirectoryOf(id));
+    }
+
+    /**
      * Borrows a namespace's graph for one operation, but only if the namespace already exists.
      *
      * <p>For the operations that read. Opening a tenant writes its staging directory, takes one of
@@ -836,16 +892,19 @@ public final class GraphTenants implements AutoCloseable {
      *                            could not be measured
      * @param outstandingErasures How many erasure obligations it still owes, or empty when the
      *                            erasure log could not be read - which is never the same as zero
+     * @param freshness           Whether its served graph is behind its staging, or empty when
+     *                            that could not be read
      * @param error               What could not be read, or null when everything could
      */
     public record NamespaceSummary(NamespaceId id, boolean open, boolean built,
                                    OptionalLong stagedFacts, OptionalInt outstandingErasures,
-                                   String error) {
+                                   Optional<GraphFreshness> freshness, String error) {
 
         public NamespaceSummary {
             Objects.requireNonNull(id, "id must not be null");
             Objects.requireNonNull(stagedFacts, "stagedFacts must not be null");
             Objects.requireNonNull(outstandingErasures, "outstandingErasures must not be null");
+            Objects.requireNonNull(freshness, "freshness must not be null");
         }
     }
 
@@ -895,7 +954,8 @@ public final class GraphTenants implements AutoCloseable {
             return new NamespaceSummary(id, true,
                 GraphTenant.hasBuiltGraph(graphDirectoryOf(id)),
                 OptionalLong.of(tenant.staging().stagedCount()),
-                OptionalInt.of(tenant.erasureService().outstandingCount()), null);
+                OptionalInt.of(tenant.erasureService().outstandingCount()),
+                Optional.of(tenant.freshness()), null);
         }
     }
 
@@ -926,8 +986,18 @@ public final class GraphTenants implements AutoCloseable {
             problems.add("the erasure log could not be read: " + e.getMessage());
         }
 
+        Optional<GraphFreshness> freshness = Optional.empty();
+        try {
+            freshness = Optional.of(GraphTenant.freshnessOnDisk(graph));
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("could not tell whether namespace {}'s graph is behind its staging: {}",
+                id, e.toString());
+            problems.add("whether the graph is behind its staging could not be read: "
+                + e.getMessage());
+        }
+
         return new NamespaceSummary(id, false, GraphTenant.hasBuiltGraph(graph), staged,
-            outstanding, problems.isEmpty() ? null : String.join("; ", problems));
+            outstanding, freshness, problems.isEmpty() ? null : String.join("; ", problems));
     }
 
     /**

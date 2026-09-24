@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.bootstrap;
 
+import com.eonmux.excalibur.ingest.graph.LlmRelationExtractor;
 import com.eonmux.excalibur.ingest.graph.RelationExtractor;
 import com.eonmux.excalibur.ingest.graph.StagingGraphIngestSink;
 import com.eonmux.excalibur.config.Config;
@@ -56,6 +57,21 @@ class GraphBuildServiceTest {
                 from(1)),
             ExtractedTriple.alwaysValid("Charles Babbage", "designed", "Analytical Engine",
                 from(1)));
+    }
+
+    /**
+     * Fixed facts attributed to the document they were extracted from, as the chat-model
+     * extractor attributes them, so withdrawing the document takes them.
+     */
+    private static RelationExtractor factsOfTheDocument() {
+        return (documentKey, text) -> {
+            long source = LlmRelationExtractor.sourceIdOf(documentKey);
+            return List.of(
+                ExtractedTriple.alwaysValid("Ada Lovelace", "collaborated_with",
+                    "Charles Babbage", from(source)),
+                ExtractedTriple.alwaysValid("Charles Babbage", "designed", "Analytical Engine",
+                    from(source)));
+        };
     }
 
     /** The node's model clients, as the tenants that own a build service would hold them. */
@@ -176,6 +192,95 @@ class GraphBuildServiceTest {
             assertThat(second.edges()).isEqualTo(3);
             // A new stack, not the old one still mapping a directory the rebuild replaced.
             assertThat(served(holder).orElseThrow()).isNotSameAs(first);
+        }
+    }
+
+    @Test
+    @DisplayName("a build that saw every staged change leaves nothing unpublished")
+    void aBuildClearsTheUnpublishedRecord(@TempDir Path tempDir) throws IOException {
+        Path graphDirectory = tempDir.resolve("graph");
+        Config config = configFor(graphDirectory);
+
+        try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"));
+             GraphRagHolder holder = new GraphRagHolder(graphDirectory, null)) {
+            new StagingGraphIngestSink(staging, fixedFacts())
+                .onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
+            assertThat(staging.unpublishedChanges().pending()).isTrue();
+
+            GraphBuildService.BuildOutcome outcome =
+                new GraphBuildService(staging, holder, config, models(config), List.of()).build();
+
+            assertThat(outcome.published()).isTrue();
+            assertThat(outcome.retired()).isFalse();
+            assertThat(staging.unpublishedChanges().pending()).isFalse();
+        }
+    }
+
+    @Test
+    @DisplayName("a build of nothing staged clears the record without touching the graph")
+    void anEmptyBuildClearsTheRecord(@TempDir Path tempDir) throws IOException {
+        Path graphDirectory = tempDir.resolve("graph");
+        Config config = configFor(graphDirectory);
+
+        try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"));
+             GraphRagHolder holder = new GraphRagHolder(graphDirectory, null)) {
+            staging.markUnpublished();
+
+            GraphBuildService.BuildOutcome outcome =
+                new GraphBuildService(staging, holder, config, models(config), List.of()).build();
+
+            assertThat(outcome.published()).isFalse();
+            assertThat(outcome.retired()).as("there was no graph to retire").isFalse();
+            assertThat(staging.unpublishedChanges().pending()).isFalse();
+        }
+    }
+
+    @Test
+    @DisplayName("once every fact is withdrawn, a build stops serving the graph they built")
+    void everythingWithdrawnRetiresTheGraph(@TempDir Path tempDir) throws IOException {
+        Path graphDirectory = tempDir.resolve("graph");
+        Config config = configFor(graphDirectory);
+
+        try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"));
+             GraphRagHolder holder = new GraphRagHolder(graphDirectory, null)) {
+            StagingGraphIngestSink sink =
+                new StagingGraphIngestSink(staging, factsOfTheDocument());
+            GraphBuildService service =
+                new GraphBuildService(staging, holder, config, models(config), List.of());
+            sink.onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
+            assertThat(service.build().published()).isTrue();
+
+            sink.onDocumentRemoved("docs:ada");
+            assertThat(staging.stagedCount()).isZero();
+            assertThat(staging.unpublishedChanges().pending()).isTrue();
+
+            GraphBuildService.BuildOutcome outcome = service.build();
+
+            assertThat(outcome.published()).isFalse();
+            assertThat(outcome.retired()).isTrue();
+            assertThat(holder.isPresent()).as("the removed document's facts are not served")
+                .isFalse();
+            assertThat(graphDirectory).doesNotExist();
+            assertThat(staging.unpublishedChanges().pending()).isFalse();
+        }
+    }
+
+    @Test
+    @DisplayName("a graph nothing staged ever changed is kept by a build of nothing")
+    void anUnchangedGraphIsKept(@TempDir Path tempDir) throws IOException {
+        Path graphDirectory = tempDir.resolve("graph");
+        MinimalGraph.write(graphDirectory, false);
+        Config config = configFor(graphDirectory);
+
+        try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"));
+             GraphRagHolder holder = new GraphRagHolder(graphDirectory,
+                 GraphRagFactory.openAt(config, graphDirectory))) {
+            GraphBuildService.BuildOutcome outcome =
+                new GraphBuildService(staging, holder, config, models(config), List.of()).build();
+
+            assertThat(outcome.retired()).isFalse();
+            assertThat(holder.isPresent()).isTrue();
+            assertThat(graphDirectory).isDirectory();
         }
     }
 
