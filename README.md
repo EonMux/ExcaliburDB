@@ -1528,9 +1528,12 @@ replaced document used to say. Staging records each change no published graph ha
   `excalibur.graph.auto-build-max-concurrent` across the node. The build takes the namespace's
   replacement lock, as explicit builds and erasure compactions do, and checks again under it
   whether the graph is still behind, so a namespace an explicit build caught up is left alone;
-- not while extraction is asked for but has no API key or could not be wired: a replaced
-  document's old facts are withdrawn whether or not its new ones could be extracted, and a build
-  would publish a graph that lost them with nothing in their place. The status says it is paused;
+- not while extraction is asked for but has no API key, has chat switched off
+  (`excalibur.llm.chat-enabled=false`) or could not be wired: a replaced document's old facts are
+  withdrawn whether or not its new ones could be extracted, and a build would publish a graph that
+  lost them with nothing in their place. The pause covers every namespace and every staged change,
+  so facts asserted with `POST /v1/graph/facts` and retractions are not published automatically
+  either — `POST /v1/graph/build` publishes them. The status says it is paused;
 - not while the graph is withheld for an interrupted erasure, which the erasure sweep applies first.
 
 A failed automatic build is retried after `excalibur.graph.auto-build-failure-backoff-seconds`,
@@ -1683,7 +1686,12 @@ Three stages, cheapest first, each narrowing what the next has to look at:
 Each stage needs something the deployment may not have, and each degrades to the stage beneath it
 rather than failing the question: no stored vectors means no exact rerank, and an embedding endpoint
 that is briefly unavailable means a query with no embedding, which skips the exact rerank for that
-request. No API key means neither rerank, and BM25 answers alone.
+request. The two reranks hang off different endpoints. The exact rerank needs the embedding endpoint
+— it embedded the stored vectors at build time and embeds the question at query time — so a node
+with `excalibur.llm.chat-enabled=false`, or no chat key while it embeds through a server that needs
+none, still has it. The chat rerank needs the chat endpoint in use, and without it the exact
+rerank's order stands. Only a node with neither endpoint in use — the hosted defaults with no key,
+and no keyless server named — ranks by BM25 alone.
 
 ### Namespaces
 
@@ -2641,8 +2649,8 @@ is behind what the namespace has staged — `behind_staging`, with `staged_chang
 `last_staged_change_ms` when it is — and `automatic` what the node is doing about it: `state` is
 `current`, `pending` (waiting for the debounce or the maximum delay), `running`, `backing_off`
 (after a failure, or after several builds in a row were superseded, until `next_attempt_at_ms`),
-`paused` (with `paused_reason`, while extraction is `missing_api_key` or `unavailable`), `withheld`
-or `disabled`; `last_result` is `completed`, `unchanged` (an explicit build got there first),
+`paused` (with `paused_reason`, while extraction is `missing_api_key`, `chat_disabled` or
+`unavailable` — the three states that carry a `warning`), `withheld` or `disabled`; `last_result` is `completed`, `unchanged` (an explicit build got there first),
 `failed` (with `last_error`), `cancelled`, or `superseded` — an erasure was recorded while it ran,
 so its publish was refused and the next pass builds again without it; nothing failed.
 `consecutive_failures` and `consecutive_supersessions` count each in a row. `withheld_facts` on the
@@ -4242,8 +4250,9 @@ from their sources — so the namespace stops serving it, and `/v1/graph/query` 
 The served graph is what the last build published. Read `freshness` and `automatic` on
 `GET /v1/graph/build/status` with the namespace's header: `behind_staging: true` with `pending`
 means the node rebuilds once staging has been quiet for
-`excalibur.graph.auto-build-debounce-seconds`; `paused` means extraction is not active and nothing
-is built automatically until it is; `backing_off` means the last automatic build failed, and
+`excalibur.graph.auto-build-debounce-seconds`; `paused` means extraction was asked for and is not
+active (`missing_api_key`, `chat_disabled` or `unavailable`) and nothing — asserted facts and
+retractions included — is built automatically until it is; `backing_off` means the last automatic build failed, and
 `last_error` says why — or, with `last_result` `superseded`, that erasures keep arriving while it
 builds, and the attempts are being spaced out; `disabled` means
 `excalibur.graph.auto-build-enabled=false`.
