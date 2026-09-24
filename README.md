@@ -2182,9 +2182,11 @@ search rather than resuming a cursor, because a ranked index has none, which is 
 `offset + top_k` is bounded by `excalibur.api.max-top-k`.
 
 `"explain": true` says why each result is there: `explain.signals` gives each contributing
-signal's own absolute rank and its score *on its own scale*, and `explain.matched_terms` names the
-query terms the passage actually contains. The response also carries `query_expansion` once, with
-a `status` of `applied`, `not_applied`, `fell_back` when the model could not widen the query and it
+signal — `{"signal", "rank", "score"}` — with its own absolute rank and its score *on its own
+scale*, and `explain.matched_terms` names the
+query terms the passage actually contains. The response also carries `query_expansion` once: the `terms` the query was widened with, each
+`{"term", "weight"}`, `terms_truncated` when more than the 32 reported were produced, and a
+`status` of `applied`, `not_applied`, `fell_back` when the model could not widen the query and it
 was searched as typed, or `unreported` when this node cannot say, which is a different fact from
 the query not having been widened. It is read from the expansion the answer was searched with, a
 replayed answer included, so explaining never calls the model a second time.
@@ -2229,7 +2231,8 @@ curl -X POST http://localhost:8080/v1/ingest \
 
 `registered` means recorded and started, not finished. `root_path` must resolve inside
 `excalibur.ingest.allowed-roots`, which is empty until configured — a 403 here is the allow-list,
-not the path. The other supported `source_type` is `http`, whose `base_url` is checked against
+not the path. A relative path is resolved against the node's working directory and held to the same
+rule. The other supported `source_type` is `http`, whose `base_url` is checked against
 `excalibur.ingest.allowed-hosts` and refused if it resolves to any non-public address (see
 [Securing the API](#securing-the-api) for the ranges). A crawl stays on that host and under that URL's
 path: only URLs whose path begins with the path of `base_url` are fetched, redirect hops included,
@@ -2241,7 +2244,7 @@ rather than a silent clamp:
 
 | Field | Applies to | Bound | What it does |
 |-------|-----------|-------|--------------|
-| `included_extensions` | filesystem | — | Only these file extensions are read |
+| `included_extensions` | filesystem | — | Only these file extensions are read. An empty list reads every file, as leaving it out does |
 | `excluded_directories` | filesystem | — | Directory names the walk does not descend into, matched at any depth below the root. The walk never opens them, so a large `node_modules` costs nothing and a link cycle inside one cannot abort the crawl. A file that shares a name with one is still a file |
 | `follow_symlinks` | filesystem | — | Whether the walk descends through symbolic links. A link out of the allowed root is still refused: the real path is what is checked |
 | `include_hidden` | filesystem | — | Whether dot-files are read, and whether the walk enters dot-directories — `.config/notes.md` is hidden with its directory. The root itself may be hidden |
@@ -2286,7 +2289,8 @@ both `team:wiki:home.md`, and the node can store only one of them. The key belon
 source's document was registered under it first. The other source's document is refused before
 anything of it is written — on its first crawl, on every re-crawl and when supplied to
 `POST /v1/documents` — and counted in `documents_failed`, with the source's `/v1/ingest/status`
-error saying how many were refused because another source holds their key; it is not retried
+error, and on a re-crawl its `/v1/reindex/status` `last_error`, saying how many were refused
+because another source holds their key; it is not retried
 into success, so the cure is an id that does not collide. The holder's document is never
 overwritten, and an erasure, re-crawl or document listing that names the other source never
 reaches it.
@@ -2723,6 +2727,10 @@ curl http://localhost:8080/v1/stats
     "unreadableChunksDropped": 0, "unsearchableChunks": 0, "unreadableSegments": 0,
     "outdatedSegments": 0
   },
+  "queryCache": {
+    "hits": 8412, "misses": 2190, "evictions": 0, "invalidations": 1877,
+    "size": 1024, "capacity": 1024, "hitRatio": 0.7934
+  },
   "graph": {
     "namespaces": {"open": 3, "maxOpen": 16, "evictions": 41},
     "budget": {"graphMappings": 81, "processMappings": 12408, "mappingHighWater": 45871,
@@ -2740,8 +2748,8 @@ curl http://localhost:8080/v1/stats
 }
 ```
 
-The `lexical` block is present only on a node that keeps a chunk index, and `graph` only on a node
-that serves a graph. `breakers` holds one entry per circuit breaker the node has — `embedding`,
+The `lexical` block is present only on a node that keeps a chunk index, `queryCache` only with
+`excalibur.query.cache.enabled=true`, and `graph` only on a node that serves a graph. `breakers` holds one entry per circuit breaker the node has — `embedding`,
 `llmRelevancy` for stage 4's relevancy scoring, `queryExpansion` for the chat call that widens a
 lexical query, `graphExtraction` for the chat call that finds a document's facts, `graphRerank` for the
 chat call `POST /v1/graph/query` reranks its candidates with, `graphQueryEmbedding` for the
@@ -2831,7 +2839,8 @@ too. An automatic build overtaken the same way ends `superseded` rather than `fa
 
 The top-level fields describe the last build asked for. `freshness` says whether the served graph
 is behind what the namespace has staged — `behind_staging`, with `staged_changes_since_ms` and
-`last_staged_change_ms` when it is — and `automatic` what the node is doing about it: `state` is
+`last_staged_change_ms` when it is, and `withheld` while the graph is withheld until an interrupted
+erasure is applied; when that cannot be read it is `{"error": "<why>"}` instead — and `automatic` what the node is doing about it: `state` is
 `current`, `pending` (waiting for the debounce or the maximum delay), `running`, `backing_off`
 (after a failure, or after several builds in a row were superseded, until `next_attempt_at_ms`),
 `paused` (with `paused_reason`, while extraction is `missing_api_key`, `chat_disabled` or
@@ -2846,8 +2855,8 @@ one would turn every question into a refusal. Its status says so and why, from `
 
 ```json
 {"state": "completed", "namespace": "shared", "extraction": "missing_api_key",
- "warning": "excalibur.graph.extraction-enabled is true, but no LLM API key is configured, ...",
- "message": "Nothing was staged, so nothing was published and this namespace is still serving the graph it had. excalibur.graph.extraction-enabled is true, but no LLM API key is configured, ...",
+ "warning": "excalibur.graph.extraction-enabled is true, but the chat endpoint requires an API key and none is configured, ...",
+ "message": "Nothing was staged, so nothing was published and this namespace is still serving the graph it had. excalibur.graph.extraction-enabled is true, but the chat endpoint requires an API key and none is configured, ...",
  "published": false, "edges": 0, "staged_facts": 0, ...}
 ```
 
@@ -2905,6 +2914,10 @@ A client has to tell the statuses apart:
 | `needs_input` | The question did not say which entity it meant. Carries `reason` — one of `unbound_pronoun`, `ambiguous_pronoun`, `no_entity_mention` or `ambiguous_entity` (a name several entities share, which the evidence could not tell apart) — plus `question` and `candidates`; send the chosen one back in `context_entities` with the same query. Entities that share a name are offered as the name followed by ` #` and the entity id (`Ada #12`), so the one sent back names exactly one of them. Returned as 200 — the request was well-formed and the system did what it should |
 | `declined` | The evidence does not support an answer. `reason` is one of `no_match`, `below_confidence_threshold`, `low_provenance_confidence`, `unresolved_reference` or `timed_out` (the deadline passed before the graph was walked, so there was nothing to judge). Deliberately not an empty `answered`, which a client would render as "nothing found" |
 | `cancelled` | `DELETE /v1/query/{query_id}` withdrew the question while it ran. No context, whatever it had reached; `cancelled` is `true` |
+
+`plan` is the shape the question was classified as: `lookup`, `traverse` or `aggregate` — a
+question asked as of a time is reported by the plan that does the work, since the time says when
+to evaluate and not what, so `temporal` never appears — or `null` when no plan was made.
 
 `tokens`, `facts_included`, `facts_dropped`, `truncated` and `format` come with the serialised
 context, so they are absent on an `answered` response that carries none — read `context` and treat
@@ -3044,7 +3057,8 @@ not a discharge — the data is still staged — so the request stays `pending` 
 deadline that has to be able to say the data is gone. The scopes are
 `{"scope":"entity","entity_id":N}`, `{"scope":"entity","entity_name":"Ada Lovelace"}`,
 `{"scope":"source","source_type":"DOCUMENT","source_id":N}` and
-`{"scope":"extractor","version":N}`.
+`{"scope":"extractor","version":N}`. An entity scope naming both `entity_id` and `entity_name` is
+refused with a 400, since the two could name different entities and an erasure is not reversible.
 
 `request_id` is how the obligation is followed afterwards, with the same `X-Excalibur-Namespace`
 it was recorded under:
@@ -3274,13 +3288,18 @@ curl -X DELETE 'http://localhost:8080/v1/graph/facts?subject=Ada%20Lovelace&rela
 ```
 
 By subject, relation and object it retracts every asserted fact stating that triple, matched on
-exact labels; a fact extraction found is never touched by this route — erase its document for
-that. Nothing staged to retract is a 404 and records nothing, as is a namespace that does not
-exist, which is not created. Otherwise the answer is 202 with the `fact_ids` retracted, their
-`request_ids`, and the compaction outcome. As with any erasure, accepting is not removing: until a
+the labels as staging normalises them: the subject and object trimmed of surrounding whitespace
+and otherwise exact, the relation trimmed, lowercased and with each space made an underscore, so
+`worked with` retracts what was asserted as `worked_with`. A fact extraction found is never
+touched by this route — erase its document for that. A fact id in the path together with any of
+`subject`, `relation` or `object` is a 400: retract by one or the other. Nothing staged to retract
+is a 404 and records nothing, as is a namespace that does not exist, which is not created.
+Otherwise the answer is 202 with `namespace`, the `fact_ids` retracted, their `request_ids`,
+`accepted: true`, and the compaction outcome — `compacted`, `edges_removed`, the namespace's
+`outstanding` obligations and a `detail` saying what happened. As with any erasure, accepting is not removing: until a
 compaction runs the fact is still staged and still served by the graph already published, though
 no build publishes it again — every build leaves out what an outstanding erasure covers.
-`compact=true` runs one now. An entity-scoped erasure covers asserted facts as it covers extracted ones.
+`compact=true`, or a bare `compact`, runs one now. An entity-scoped erasure covers asserted facts as it covers extracted ones.
 
 The provenance source types are `UNKNOWN`, `DOCUMENT` and `USER_ASSERTED`, and those are what
 `"scope": "source"` accepts. Three more were defined and never produced — a knowledge-base import, a

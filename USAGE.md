@@ -468,12 +468,12 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `GET` | `/v1/graph/entities/{entity_id}/edges` | bearer | An entity's edges, filtered by `relation`, `direction` and `as_of`, each with its interval, confidence and provenance |
 | `GET` | `/v1/graph/relations` | bearer | The served graph's relation vocabulary, in label order, each with its edge count, a page at a time (`limit`, default 100, at most 500; `cursor`). `503` while no graph is served |
 | `POST` | `/v1/graph/facts` | bearer | Stage facts a caller states, as `USER_ASSERTED`, returning their fact ids. `201`; served once the graph is next built |
-| `DELETE` | `/v1/graph/facts` | bearer | Retract every asserted fact stating the `subject`, `relation` and `object` given as query parameters. `202`; served until a compaction applies it, which `compact=true` runs now |
-| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | Retract one asserted fact, by its id. `202`; served until a compaction applies it, which `compact=true` runs now |
+| `DELETE` | `/v1/graph/facts` | bearer | Retract every asserted fact stating the `subject`, `relation` and `object` given as query parameters. `202`; served until a compaction applies it, which `compact=true` (or a bare `compact`) runs now |
+| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | Retract one asserted fact, by its id. `202`; served until a compaction applies it, which `compact=true` (or a bare `compact`) runs now. `400` when a `subject`, `relation` or `object` is given as well: retract by id or by triple, not both |
 | `POST` | `/v1/graph/build` | bearer | Start publishing the facts ingestion has staged as the served graph. `202`; the build runs behind the response. `409` while one is already running |
 | `DELETE` | `/v1/graph/build` | bearer | Stop the build in progress. It publishes nothing; the namespace keeps the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | What the build is doing, what the last one published, whether the served graph is behind what is staged, and what the node's automatic build is doing about it |
-| `POST` | `/v1/graph/erasure` | bearer | Record an obligation to erase, and compact when it is due. `404` for an entity, by name or `entity_id`, that nothing in the namespace holds, and nothing is recorded |
+| `POST` | `/v1/graph/erasure` | bearer | Record an obligation to erase, and compact when it is due. `404` for an entity, by name or `entity_id`, that nothing in the namespace holds, and nothing is recorded. `400` for both `entity_id` and `entity_name`, which could name different entities |
 | `GET` | `/v1/graph/erasure` | bearer | The namespace's outstanding and recently discharged erasure obligations, a page at a time (`state`, `limit`, default 100, at most 1000; `cursor`) |
 | `GET` | `/v1/graph/erasure/{request_id}` | bearer | Where one graph erasure obligation stands, in the namespace the header names |
 | `GET` | `/v1/graph/namespaces` | bearer | The namespaces on disk, a page at a time (`limit`, default 100, at most 1000; `cursor`): whether each is open, whether it has built a graph, what it has staged, whether its graph is behind that, and what it still owes |
@@ -701,13 +701,16 @@ curl -X POST http://localhost:8080/v1/ingest \
   }'
 ```
 
-**Required:** `source_id`, `root_path` (absolute path)
+**Required:** `source_id`, `root_path` — a directory inside one of the allowed ingest roots once
+links are followed. A relative path is resolved against the node's working directory, and is
+accepted if it lands inside an allowed root like any other; an absolute path is what reads the same
+wherever the node was started.
 
 **Optional**, all of them filesystem-only:
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `included_extensions` | array of string | _(all)_ | Only files with one of these extensions are indexed |
+| `included_extensions` | array of string | _(all)_ | Only files with one of these extensions are indexed. An empty list reads every file, as leaving it out does |
 | `excluded_directories` | array of string | `.git`, `.svn`, `.hg`, `node_modules`, `target`, `build`, `.idea`, `.vscode` | Directory names the walk does not enter, anywhere under the root, compared without regard to case. Nothing inside one is read, so its size costs nothing and a link cycle in it cannot abort the crawl. It names directories only: a file called `build` is still indexed. Supplying this **replaces** the default list |
 | `max_depth` | integer | 100 | Directory levels below the root to descend, 1 to 1000 |
 | `follow_symlinks` | bool | `false` | Whether the walk descends through symbolic links. A link whose real target lies outside the root is skipped whatever this is set to, so a link cannot be used to read a directory the allow-list does not permit |
@@ -1283,7 +1286,7 @@ registration to record a namespace in. `POST /v1/erasure` withdraws them from th
 |-------|------|----------|---------|
 | `source_id` | string | yes | What the documents are recorded as belonging to, so `/v1/erasure` can name them later. It is not a crawl registration: there is nothing behind it for `/v1/reindex` to re-read, which answers `404` for it. At most 256 characters |
 | `documents` | array | yes | 1 to 256 documents |
-| `documents[].document_id` | string | yes | Names the document within its source. Posting the same id again replaces what the node holds under it; see below |
+| `documents[].document_id` | string | yes | Names the document within its source. Posting the same id again replaces what the node holds under it; see below. At most 512 characters |
 | `documents[].text` | string | yes | The document's text. Empty is refused rather than indexed, because it would produce no chunks and be reported as ingested while being unfindable. Text that is not text — one carrying U+0000, which a crawl treats as the mark of a binary file — is refused for the same reason |
 | `documents[].content_type` | string | no | Defaults to `text/plain`. `text/html` or `application/xhtml+xml` indexes the text the markup shows rather than the markup — tags, scripts and styles stripped, character references decoded — the same as for a crawled page |
 | `documents[].last_modified_millis` | int | no | Epoch millis; `0` when unknown |
@@ -1320,8 +1323,8 @@ versions of one document published in quick succession are reported to the graph
 they were published, and a version already superseded when its turn comes is skipped.
 
 **Error — `400 Bad Request`** — no `source_id`, no `documents`, more than 256 of them, a document
-with no `document_id`, no `text` or text that is not text, or the same `document_id` twice in one
-request.
+with no `document_id`, a `document_id` over 512 characters, no `text` or text that is not text, or
+the same `document_id` twice in one request.
 
 **Error — `409 Conflict`** — either the `source_id` is a registered crawl source, or a run over
 that source is already in flight. The first is refused because documents recorded under a crawl's
@@ -1697,6 +1700,7 @@ document it is on and would otherwise register it after the erasure had looked.
 
 ```json
 {
+  "request_id": "0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11",
   "source_id": "project-docs",
   "scope": "document",
   "documents_erased": 1,
@@ -1769,6 +1773,7 @@ done with it, so re-issuing a request that was interrupted finishes what it left
 ```json
 {
   "error": "Some documents could not be fully erased; repeat the request",
+  "request_id": "5c2d9e40-7b1a-4f3e-8d62-91a0c4e7b3f5",
   "source_id": "project-docs",
   "documents_erased": 3,
   "documents_incomplete": 1,
@@ -2043,7 +2048,8 @@ Key fields:
   ranking deeper, no deeper than `excalibur.api.max-top-k` and inside the request's deadline — so
   neither a short page nor an `exact` total is caused by withholding. A vector answer is `exact`
   only when every segment ran out of matches before the depth it was asked for.
-- **`explain`** (per result, only with `"explain": true`) — `signals` gives each contributing
+- **`explain`** (per result, only with `"explain": true`) — `signals` is a list of
+  `{"signal", "rank", "score"}`, one per contributing signal (`vector` or `bm25`), giving that
   signal's own `rank` (absolute, from the start of the whole ranking, not of the page) and `score`
   **on that signal's own scale**: a similarity for `vector`, and for `bm25` whatever the lexical
   service returns, which is its own internal fused score when more than one ranker contributed.
@@ -2053,7 +2059,9 @@ Key fields:
   and case-insensitive, in the order you typed them — computed the same way on every retrieval
   path, so a vector-only answer explains its matches too.
 - **`query_expansion`** (response level, only with `"explain": true`) — what the query was widened
-  with, once for the answer rather than per result. `status` is `applied`, `not_applied`,
+  with, once for the answer rather than per result: `{"status", "terms", "terms_truncated"}`, where
+  `terms` lists each term added to the typed query as `{"term", "weight"}` and `terms_truncated` is
+  `true` when the expander produced more than the 32 reported. `status` is `applied`, `not_applied`,
   `fell_back` or `unreported`. `fell_back` means the node meant to widen the query and could not —
   the model failed, ran out of time or answered with nothing usable — so it was searched as typed,
   with an empty `terms`. `unreported` means *this node cannot say* — no expander is wired, or no
@@ -2540,8 +2548,8 @@ thousands of chunks, so a page counted only in documents bounds nothing; `return
 the walk is over. A single document over the whole budget is still returned on its own, so the
 walk always advances.
 
-**Error — `400 Bad Request`** — a `limit` above the cap or not a whole number, or a `cursor` this
-node did not issue. A limit above the cap is refused rather than trimmed: a caller paging by the
+**Error — `400 Bad Request`** — a `limit` below 1, above the cap or not a whole number, a
+`source_id` that is not a valid source id, or a `cursor` this node did not issue. A limit above the cap is refused rather than trimmed: a caller paging by the
 limit it asked for would otherwise skip the documents it never received.
 
 **Error — `404 Not Found`** — the node keeps no document registry, so it has no record to read
@@ -2583,7 +2591,8 @@ versions, so the old cursor is refused with **`409 Conflict`** and the read star
 
 **Error — `400 Bad Request`** — `document_id` without `source_id` (a document id is unique only
 within its source), `include_text` that is neither `true` nor `false` or given without
-`document_id`, a limit over the cap, or a cursor issued for the listing rather than for a document.
+`document_id`, `include_text=true` on a node that cannot read chunk text, a limit below 1 or over
+the cap, or a cursor issued for the listing rather than for a document.
 **`404 Not Found`** — the source holds no such document.
 
 ### Cancel a query
@@ -2776,12 +2785,14 @@ curl -X POST -H "Authorization: Bearer $EXCALIBUR_API_AUTH_TOKEN" \
 # Put it back
 curl -X DELETE -H "Authorization: Bearer $EXCALIBUR_API_AUTH_TOKEN" \
   http://localhost:8080/v1/drain
+# {"draining": false}
 ```
 
 A drained node keeps serving every request it is sent. Only `/health/ready` changes, because the
 traffic still arriving during a drain is the traffic that has not noticed yet, and refusing it
 would cause the outage the drain exists to avoid. Both verbs are idempotent, and the flag is not
-persisted: a restart clears it.
+persisted: a restart clears it. A `reason` over 256 characters is refused with `400` and
+`"code": "invalid_request"`, and the node stays as it was.
 
 ### Version
 
