@@ -358,8 +358,8 @@ class IngestEndpointTest {
             assertThat(response.status()).isEqualTo(400);
             assertThat(response.body())
                 .as("refused at the boundary, not inside a crawler constructor: that failure is "
-                    + "answered with a deliberately opaque 'Invalid source configuration', which "
-                    + "leaves the caller with nothing to correct")
+                    + "answered only with 'the source could not be built', which leaves the "
+                    + "caller with nothing to correct")
                 .contains("source_id")
                 .contains(String.valueOf(Source.MAX_ID_LENGTH));
             assertThat(registry.getAllSourceIds()).isEmpty();
@@ -430,6 +430,25 @@ class IngestEndpointTest {
                 + "\"base_url\": \"https://example.com/docs\"}}");
 
             assertThat(response.status()).isNotEqualTo(400);
+        }
+    }
+
+    @Nested
+    @DisplayName("A source that cannot be built")
+    class UnbuildableSource {
+
+        @Test
+        @DisplayName("a root_path naming a file is refused naming the field, not the path")
+        void rootThatIsAFileNamesTheField(@TempDir Path root) throws IOException {
+            Path file = java.nio.file.Files.writeString(root.resolve("notes.md"), "notes");
+
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + file + "\"}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("config.root_path").contains("directory")
+                .doesNotContain(root.toString());
+            assertThat(registry.isRegistered("docs")).isFalse();
         }
     }
 

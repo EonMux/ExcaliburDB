@@ -8,9 +8,9 @@ import com.eonmux.excalibur.ingest.source.Source;
  * <p>{@link Source#MAX_ID_LENGTH} is the bound, and both crawler implementations enforce it in
  * their constructors - which is where an embedded caller meets it, and the wrong place for an HTTP
  * one to. A registration whose id is too long would otherwise reach a crawler constructor, and this
- * endpoint answers a failed construction with {@code Invalid source configuration}: deliberately
- * opaque, because construction failures can name paths on this node. The caller learns nothing
- * about which field it got wrong. Checking here turns that into a message naming the field and the
+ * endpoint answers a failed construction by saying only that the source could not be built:
+ * deliberately opaque, because construction failures can name paths on this node. The caller
+ * learns nothing about which field it got wrong. Checking here turns that into a message naming the field and the
  * bound, and does it before any allow-list decision, so the answer does not depend on the
  * target.</p>
  *

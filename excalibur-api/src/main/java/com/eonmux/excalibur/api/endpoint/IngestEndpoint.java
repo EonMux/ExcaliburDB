@@ -384,11 +384,17 @@ public class IngestEndpoint implements HttpHandler {
                     ResponseBody.sendError(exchange, 403, ErrorCode.TARGET_NOT_ALLOWED,
                         e.getMessage());
                     return;
-                } catch (IllegalArgumentException | IllegalStateException e) {
-                    // Source construction failures can echo server-side detail; log it
-                    // and answer with a fixed message.
+                } catch (SourceConfigurationException e) {
+                    // Written for the caller: it names the field and what is wrong with it.
                     LOGGER.warn("Rejected ingest source configuration: {}", e.getMessage());
-                    sendError(exchange, 400, "Invalid source configuration");
+                    sendError(exchange, 400, "Bad Request: " + e.getMessage());
+                    return;
+                } catch (IllegalArgumentException | IllegalStateException e) {
+                    // Raised by the crawler itself, with a message written for the log that can
+                    // name the node's paths; the caller is told which step failed, not how.
+                    LOGGER.warn("Rejected ingest source configuration: {}", e.getMessage());
+                    sendError(exchange, 400, "Bad Request: the source could not be built from "
+                        + "this configuration; the node's log records why");
                     return;
                 }
 

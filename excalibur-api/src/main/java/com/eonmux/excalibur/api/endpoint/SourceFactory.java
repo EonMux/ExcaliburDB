@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory;
 
 import java.net.URI;
 import java.nio.charset.Charset;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashSet;
 import java.util.Locale;
@@ -159,14 +160,16 @@ public final class SourceFactory {
      * @return A crawler the caller owns and must close
      * @throws NullPointerException     if the descriptor is null
      * @throws com.eonmux.excalibur.api.security.IngestTargetRejectedException if the target is not allow-listed
-     * @throws IllegalArgumentException if the type is unknown or the configuration is incomplete
+     * @throws SourceConfigurationException if the type is unknown or a setting is invalid,
+     *                                      naming the field
+     * @throws IllegalArgumentException if the crawler cannot be built from what was resolved
      */
     public Source create(SourceDescriptor descriptor) {
         Objects.requireNonNull(descriptor, "descriptor must not be null");
         return switch (descriptor.sourceType().toLowerCase(Locale.ROOT)) {
             case TYPE_FILESYSTEM -> createFilesystemSource(descriptor);
             case TYPE_HTTP -> createHttpSource(descriptor);
-            default -> throw new IllegalArgumentException(
+            default -> throw new SourceConfigurationException(
                 "Unknown source type: " + descriptor.sourceType());
         };
     }
@@ -180,6 +183,13 @@ public final class SourceFactory {
      */
     private FilesystemSource createFilesystemSource(SourceDescriptor descriptor) {
         Path rootPath = targetValidator.resolveFilesystemRoot(descriptor.get(ROOT_PATH));
+        // After the allow-list, so a caller learns what kind of file a path is only for one it
+        // may read. Named by field and not by path: the resolved path is the node's view of
+        // the filesystem, not the one the caller sent.
+        if (!Files.isDirectory(rootPath)) {
+            throw new SourceConfigurationException(
+                "Field 'config." + ROOT_PATH + "' must name a directory, not a file");
+        }
 
         FilesystemSource.Builder builder = FilesystemSource.builder()
             .sourceId(descriptor.sourceId())
@@ -305,12 +315,12 @@ public final class SourceFactory {
      *
      * @param name The encoding's name or one of its aliases, as {@link Charset#forName} takes it
      * @return The charset
-     * @throws IllegalArgumentException naming the field, if the name is blank, malformed, or not
-     *                                  supported by this runtime
+     * @throws SourceConfigurationException naming the field, if the name is blank, malformed, or not
+     *                                      supported by this runtime
      */
     public static Charset charset(String name) {
         if (name == null || name.isBlank()) {
-            throw new IllegalArgumentException(
+            throw new SourceConfigurationException(
                 "Field 'config." + CHARSET + "' must name an encoding");
         }
         try {
@@ -318,7 +328,7 @@ public final class SourceFactory {
         } catch (IllegalArgumentException e) {
             // Both IllegalCharsetNameException and UnsupportedCharsetException land here; the
             // caller is told which field and which value, not which of the two it was.
-            throw new IllegalArgumentException("Field 'config." + CHARSET + "' names an "
+            throw new SourceConfigurationException("Field 'config." + CHARSET + "' names an "
                 + "encoding this node does not support: " + name, e);
         }
     }
@@ -363,11 +373,11 @@ public final class SourceFactory {
         try {
             value = Long.parseLong(raw.trim());
         } catch (NumberFormatException e) {
-            throw new IllegalArgumentException(
+            throw new SourceConfigurationException(
                 "Field 'config." + key + "' must be a whole number, got: " + raw, e);
         }
         if (value < min || value > max) {
-            throw new IllegalArgumentException("Field 'config." + key + "' must be between "
+            throw new SourceConfigurationException("Field 'config." + key + "' must be between "
                 + min + " and " + max + ", got: " + value);
         }
         return value;
@@ -381,7 +391,7 @@ public final class SourceFactory {
         if ("true".equalsIgnoreCase(raw) || "false".equalsIgnoreCase(raw)) {
             return Boolean.parseBoolean(raw);
         }
-        throw new IllegalArgumentException(
+        throw new SourceConfigurationException(
             "Field 'config." + key + "' must be true or false, got: " + raw);
     }
 
@@ -417,13 +427,13 @@ public final class SourceFactory {
      */
     private static String requireHeaderSafe(String userAgent) {
         if (userAgent.length() > USER_AGENT_LIMIT) {
-            throw new IllegalArgumentException("Field 'config." + USER_AGENT + "' must be at "
+            throw new SourceConfigurationException("Field 'config." + USER_AGENT + "' must be at "
                 + "most " + USER_AGENT_LIMIT + " characters, got: " + userAgent.length());
         }
         for (int i = 0; i < userAgent.length(); i++) {
             char c = userAgent.charAt(i);
             if (c < 0x20 || c == 0x7F) {
-                throw new IllegalArgumentException("Field 'config." + USER_AGENT + "' must not "
+                throw new SourceConfigurationException("Field 'config." + USER_AGENT + "' must not "
                     + "contain control characters: one of them would end the header and let "
                     + "the rest of the value become headers this node did not agree to send");
             }

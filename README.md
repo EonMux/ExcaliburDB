@@ -2134,6 +2134,9 @@ rather than a silent clamp:
 
 An explicit `null` is the same as leaving the field out: the default applies.
 
+A `root_path` that names a file rather than a directory is a 400 naming the field rather than
+echoing the path.
+
 Whatever these say, one document is indexed only up to 100 MiB and 10,000 chunks — at the default
 chunking (512 tokens, 64 overlapping) the chunk bound is met first, at about 18 MB. A document past
 either is counted in `documents_failed`, on the first crawl and every re-crawl alike, including one

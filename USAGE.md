@@ -875,6 +875,18 @@ there is nothing for either filter to match. Accepting them would answer `200 re
 crawl the whole site, with nothing in the response or in `/v1/ingest/status` to say the filter had
 been discarded.
 
+**`400 Bad Request` — a `root_path` that names a file**
+
+```json
+{"error": "Bad Request: Field 'config.root_path' must name a directory, not a file", "code": "invalid_request"}
+```
+
+Checked after the allow-list, so what kind of file a path is only answers for one the caller may
+read, and the message names the field rather than echoing the resolved path. A value the node
+cannot turn into a crawler for a reason of its own is answered `the source could not be built
+from this configuration`, with the detail in the node's log, because that detail can describe
+the node's filesystem.
+
 **`400 Bad Request` — `source_id` longer than 256 characters**
 
 ```json
