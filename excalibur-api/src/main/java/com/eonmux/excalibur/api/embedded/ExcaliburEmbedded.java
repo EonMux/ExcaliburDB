@@ -325,7 +325,40 @@ public final class ExcaliburEmbedded implements AutoCloseable {
         Objects.requireNonNull(documentIds, "documentIds cannot be null");
         DocumentErasureService.Outcome outcome = erasure.erase(sourceId, documentIds, false);
         return new ErasureOutcome(outcome.erasedDocumentIds(), outcome.documentsNotFound(),
-            outcome.documentsIncomplete(), outcome.chunksNotRemoved());
+            outcome.documentsIncomplete(), 0, outcome.chunksNotRemoved(), false);
+    }
+
+    /**
+     * Erases everything the node holds of a source, and the source's registration with it.
+     *
+     * <p>{@code POST /v1/erasure} with {@code "scope": "source"}, in-process: for a caller that
+     * wants everything a source contributed and holds no list of its documents. A crawl
+     * registered under the id in this data directory is deregistered first, as the route does,
+     * because a node serving the directory would otherwise crawl the documents straight back.</p>
+     *
+     * <p>Unlike the route it is not a batch of a thousand: the route bounds a request so that one
+     * caller cannot hold the node's mutate budget, and a call made in-process holds nothing but
+     * its own thread. The documents are the node's list as the call begins, each erased once;
+     * any supplied under the source while it runs are counted in
+     * {@link ErasureOutcome#documentsRemaining()} rather than chased.</p>
+     *
+     * @param sourceId The source to erase
+     * @return What was removed, what could not be, and whether a registration was dropped
+     * @throws IllegalStateException if the node is closed
+     * @throws IOException           if the source's registration could not be dropped; nothing
+     *                               has been erased then, and the call can be repeated
+     */
+    public ErasureOutcome eraseSource(String sourceId) throws IOException {
+        requireOpen();
+        Objects.requireNonNull(sourceId, "sourceId cannot be null");
+        boolean deregistered = sourceCatalog != null && sourceCatalog.forget(sourceId);
+        DocumentErasureService.Outcome outcome =
+            erasure.erase(sourceId, registry.getDocumentIds(sourceId), false);
+        // The incomplete documents keep their registry entries so they can be erased again;
+        // they were reached, so only what is left beyond them was supplied after the list.
+        int remaining = Math.max(0, registry.size(sourceId) - outcome.documentsIncomplete());
+        return new ErasureOutcome(outcome.erasedDocumentIds(), 0, outcome.documentsIncomplete(),
+            remaining, outcome.chunksNotRemoved(), deregistered);
     }
 
     /**

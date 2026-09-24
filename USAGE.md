@@ -4010,6 +4010,14 @@ What each call does:
 - **`erase(sourceId, documentIds)`** is `POST /v1/erasure` for named documents: nothing named is
   searchable once it returns, and the `ErasureOutcome` separates what was erased from what was
   not found. The space is reclaimed by the compaction policy, as on a node.
+- **`eraseSource(sourceId)`** is the same route's `"scope": "source"`: everything the node holds
+  under the source, for a caller with no list of its documents. A crawl a served node registered
+  under that id in this directory is deregistered first, so serving the directory again does not
+  crawl the documents back, and `sourceDeregistered()` says whether there was one; a failure to
+  drop it is an `IOException` with nothing erased. Unlike the route it is not a batch of 1000 -
+  the bound is there to keep one HTTP caller from holding the mutate budget - so one call
+  reaches every document held when it begins, and `documentsRemaining()` counts any supplied
+  under the source while it ran.
 - **`close()`** runs the server's shutdown sequence, bounded by
   `excalibur.api.shutdown-timeout-seconds`: ingestion and queries drained, background work
   stopped, the chunk index and the document registry persisted, the storage engine closed. It is
@@ -4021,7 +4029,13 @@ source id at the same time is refused by the second, as the HTTP route refuses i
 
 What an embedded node leaves out, because it lives around the HTTP surface rather than in the
 node: crawl registration and re-indexing on request, relevancy scoring by the chat model, the
-query result cache, pagination and explanations. The knowledge graph is not built in-process:
+query result cache, pagination and explanations. A search's own settings are fewer than the
+route's too. Every hit carries its chunk's whole text - there is no `include_text` to turn it
+off, no `snippet` window and no clipping to `excalibur.api.max-result-text-chars`. The similarity
+floor is the node's `excalibur.query.threshold`, set with `property(...)`, for every search, not
+one a call sets. And a `SearchAnswer` reports its route and `timedOut()`, not the `coverage`,
+`result_total` or `degraded` the route reports; an answer whose `route()` differs from the node's
+is how a signal that failed shows. The knowledge graph is not built in-process:
 `open()` refuses `excalibur.graph.extraction-enabled=true`, and a directory's graph is built and
 queried by serving it. Erasing a document in-process therefore withdraws nothing from a graph a
 served node built over the same directory; erase through the HTTP API where a graph is in use.

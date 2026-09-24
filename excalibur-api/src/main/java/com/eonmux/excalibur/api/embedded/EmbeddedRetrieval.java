@@ -43,8 +43,12 @@ import java.util.function.Function;
  *
  * <h2>What it leaves out</h2>
  * <p>The HTTP surface around the search: the result cache, pagination, explanations,
- * cancellation by query id and relevancy scoring by the chat model. An embedder that wants any of
- * those runs the server.</p>
+ * cancellation by query id and relevancy scoring by the chat model. So do the request's
+ * presentation and reporting fields: a hit always carries its chunk's whole text, with no
+ * snippet window; the similarity floor is the node's {@code excalibur.query.threshold} for every
+ * search rather than one a request sets; and the answer reports its route and whether it timed
+ * out, not the coverage, {@code result_total} or {@code degraded} the route reports. An embedder
+ * that wants any of those runs the server.</p>
  */
 final class EmbeddedRetrieval {
 
