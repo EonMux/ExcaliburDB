@@ -43,7 +43,9 @@ class McpToolsTest {
             .containsExactlyInAnyOrder(McpTools.SEARCH_DOCUMENTS, McpTools.SEARCH_GRAPH,
                 McpTools.BUILD_GRAPH, McpTools.INGEST_DOCUMENTS, McpTools.ADD_DOCUMENTS,
                 McpTools.INGESTION_STATUS, McpTools.CRAWL_WEBSITE, McpTools.DEREGISTER_SOURCE,
-                McpTools.REINDEX_SOURCE, McpTools.REINDEX_STATUS, McpTools.GRAPH_BUILD_STATUS);
+                McpTools.REINDEX_SOURCE, McpTools.REINDEX_STATUS, McpTools.GRAPH_BUILD_STATUS,
+                McpTools.FIND_GRAPH_ENTITIES, McpTools.GRAPH_ENTITY_EDGES,
+                McpTools.ASSERT_GRAPH_FACTS);
         for (Object described : catalogue) {
             assertThat(Json.stringAt(described, "name")).isNotBlank();
             assertThat(Json.stringAt(described, "description"))

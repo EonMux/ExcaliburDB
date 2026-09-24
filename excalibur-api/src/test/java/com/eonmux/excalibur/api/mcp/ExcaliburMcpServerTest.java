@@ -114,7 +114,9 @@ class ExcaliburMcpServerTest {
                     McpTools.BUILD_GRAPH, McpTools.INGEST_DOCUMENTS, McpTools.ADD_DOCUMENTS,
                     McpTools.INGESTION_STATUS, McpTools.CRAWL_WEBSITE,
                     McpTools.DEREGISTER_SOURCE, McpTools.REINDEX_SOURCE,
-                    McpTools.REINDEX_STATUS, McpTools.GRAPH_BUILD_STATUS);
+                    McpTools.REINDEX_STATUS, McpTools.GRAPH_BUILD_STATUS,
+                    McpTools.FIND_GRAPH_ENTITIES, McpTools.GRAPH_ENTITY_EDGES,
+                    McpTools.ASSERT_GRAPH_FACTS);
         }
     }
 

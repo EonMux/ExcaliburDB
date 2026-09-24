@@ -226,6 +226,37 @@ public final class ExcaliburClient {
             .GET(), namespace);
     }
 
+    /**
+     * Reads from the node with any number of query parameters.
+     *
+     * @param path      The route to read
+     * @param query     Parameter names to values, sent in iteration order; a null value is
+     *                  left out, so an argument the caller did not give leaves the node's default
+     * @param namespace The namespace to read in, or null to send none
+     * @return The node's answer
+     * @throws IOException          if the node cannot be reached
+     * @throws InterruptedException if the calling thread is interrupted
+     */
+    public Response get(String path, Map<String, String> query, String namespace)
+            throws IOException, InterruptedException {
+        StringBuilder target = new StringBuilder(path);
+        char separator = '?';
+        for (Map.Entry<String, String> parameter : query.entrySet()) {
+            if (parameter.getValue() == null) {
+                continue;
+            }
+            target.append(separator)
+                .append(URLEncoder.encode(parameter.getKey(), StandardCharsets.UTF_8))
+                .append('=')
+                .append(URLEncoder.encode(parameter.getValue(), StandardCharsets.UTF_8));
+            separator = '&';
+        }
+        return send(HttpRequest.newBuilder()
+            .uri(baseUri.resolve(target.toString()))
+            .timeout(timeout)
+            .GET(), namespace);
+    }
+
     private Response send(HttpRequest.Builder request, String namespace)
             throws IOException, InterruptedException {
         if (authToken != null) {
