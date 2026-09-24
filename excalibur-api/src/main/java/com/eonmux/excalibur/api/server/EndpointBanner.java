@@ -100,6 +100,8 @@ final class EndpointBanner {
                 "One entity, its edges counted"));
             lines.add(route("GET", "/v1/graph/entities/{id}/edges",
                 "One entity's edges, with provenance"));
+            lines.add(route("GET", "/v1/graph/relations",
+                "The relations the served graph uses, counted"));
             lines.add(route("POST", "/v1/graph/facts", "Stage facts a caller states"));
             lines.add(route("DELETE", "/v1/graph/facts",
                 "Retract asserted facts by subject, relation and object"));

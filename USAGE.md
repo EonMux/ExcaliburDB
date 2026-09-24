@@ -448,6 +448,7 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `GET` | `/v1/graph/entities` | bearer | List the served graph's entities, by exact `name` or name `prefix`, a page at a time. `503` while no graph is served |
 | `GET` | `/v1/graph/entities/{entity_id}` | bearer | One entity: its name, its degree, and each relation's count in each direction. `404` for an id the served graph does not hold |
 | `GET` | `/v1/graph/entities/{entity_id}/edges` | bearer | An entity's edges, filtered by `relation`, `direction` and `as_of`, each with its interval, confidence and provenance |
+| `GET` | `/v1/graph/relations` | bearer | The served graph's relation vocabulary, in label order, each with its edge count, a page at a time (`limit`, default 100, at most 500; `cursor`). `503` while no graph is served |
 | `POST` | `/v1/graph/facts` | bearer | Stage facts a caller states, as `USER_ASSERTED`, returning their fact ids. `201`; served once the graph is next built |
 | `DELETE` | `/v1/graph/facts` | bearer | Retract every asserted fact stating the `subject`, `relation` and `object` given as query parameters. `202`; served until a compaction applies it, which `compact=true` runs now |
 | `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | Retract one asserted fact, by its id. `202`; served until a compaction applies it, which `compact=true` runs now |
@@ -477,7 +478,7 @@ single-method routes as much as for the ones that answer two or three methods: `
 `DELETE /v1/ingest/run`, `GET /v1/ingest/status`, `GET /v1/documents/list`,
 `GET /v1/reindex/status`, `POST /v1/erasure`, `GET /v1/erasure/{request_id}`,
 `GET /v1/compact/status`, `POST /v1/graph/query`, `GET /v1/graph/entities` and every path beneath
-it, `GET /v1/graph/build/status`, `POST` and `GET /v1/graph/erasure` and
+it, `GET /v1/graph/relations`, `GET /v1/graph/build/status`, `POST` and `GET /v1/graph/erasure` and
 `GET /v1/graph/erasure/{request_id}` each answer any other method with `405` rather than `401`, and a wrong method on a mutating route
 costs a read, not a mutation. A collection and its members are separate paths with separate
 methods: `/v1/query` serves `POST` and `/v1/query/{query_id}` serves `DELETE`, so `DELETE /v1/query`

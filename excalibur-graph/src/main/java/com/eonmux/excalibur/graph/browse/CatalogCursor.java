@@ -13,6 +13,8 @@ import java.util.Base64;
  * than at whatever now sits at the old offset - nothing skipped, nothing repeated, except among
  * edges that agree on relation and neighbour, which are ordered by when they were staged.</p>
  *
+ * <p>A relation listing resumes the way an entity listing does, after a label and an id.</p>
+ *
  * <p>Opaque to a caller: base64url, so it survives a query string unescaped, over a short
  * text form that is this class's to change.</p>
  */
@@ -20,6 +22,7 @@ final class CatalogCursor {
 
     private static final String ENTITY = "n";
     private static final String EDGE = "e";
+    private static final String RELATION = "r";
 
     private CatalogCursor() {
     }
@@ -47,6 +50,28 @@ final class CatalogCursor {
 
     static String entity(NameKey key) {
         return encode(ENTITY + ":" + key.id() + ":" + key.folded());
+    }
+
+    static String relation(NameKey key) {
+        return encode(RELATION + ":" + key.id() + ":" + key.folded());
+    }
+
+    /**
+     * Reads a relation listing's cursor.
+     *
+     * @param cursor The cursor, or null for the first page
+     * @return The key - the last relation's label and id - or null for the first page
+     * @throws IllegalArgumentException if it is not a cursor a relation listing issued
+     */
+    static NameKey relation(String cursor) {
+        if (cursor == null) {
+            return null;
+        }
+        String[] parts = decode(cursor).split(":", 3);
+        if (parts.length != 3 || !RELATION.equals(parts[0])) {
+            throw malformed();
+        }
+        return new NameKey(parts[2], number(parts[1]));
     }
 
     static String edge(EdgeKey key) {

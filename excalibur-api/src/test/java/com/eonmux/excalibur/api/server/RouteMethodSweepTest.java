@@ -136,7 +136,8 @@ class RouteMethodSweepTest {
             "/health", "/health/ready", "/metrics", "/v1/stats", "/v1/query",
             "/v1/documents", "/v1/documents/list", "/v1/erasure", "/v1/ingest",
             "/v1/graph/query", "/v1/graph/namespaces", "/v1/graph/build/status",
-            "/v1/graph/erasure", "/v1/graph/entities", "/v1/graph/facts");
+            "/v1/graph/erasure", "/v1/graph/entities", "/v1/graph/relations",
+            "/v1/graph/facts");
     }
 
     @Test
@@ -151,6 +152,7 @@ class RouteMethodSweepTest {
         allowByRequest.put("POST /v1/graph/facts/7", "DELETE");
         allowByRequest.put("DELETE /v1/graph/entities", "GET");
         allowByRequest.put("POST /v1/graph/entities/1", "GET");
+        allowByRequest.put("DELETE /v1/graph/relations", "GET");
         allowByRequest.put("DELETE /v1/graph/entities/1/edges", "GET");
         allowByRequest.put("PATCH /v1/ingest", "DELETE, GET, POST, PUT");
 

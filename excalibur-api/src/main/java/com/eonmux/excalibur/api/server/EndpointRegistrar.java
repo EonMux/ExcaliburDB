@@ -32,6 +32,7 @@ import com.eonmux.excalibur.api.endpoint.GraphNamespaceDeleteEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespacesEndpoint;
 import com.eonmux.excalibur.api.endpoint.NamespaceAdmission;
 import com.eonmux.excalibur.api.endpoint.GraphQueryEndpoint;
+import com.eonmux.excalibur.api.endpoint.GraphRelationsEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphStatsReader;
 import com.eonmux.excalibur.api.endpoint.HealthEndpoint;
 import com.eonmux.excalibur.api.endpoint.InMemorySourceRegistry;
@@ -1190,6 +1191,12 @@ final class EndpointRegistrar {
                 pathAndBelow(GraphEntitiesEndpoint.PATH, onlyMethod("GET",
                     guard.protect(RequestGuard.Access.READ,
                         new GraphEntitiesEndpoint(in.graphTenants()))), notFound)));
+            // The served graph's relation vocabulary: a read over the same lease as the entity
+            // routes, answered 503 where they are.
+            target.createContext(GraphRelationsEndpoint.PATH, wrapHandler(
+                exactPath(GraphRelationsEndpoint.PATH, onlyMethod("GET",
+                    guard.protect(RequestGuard.Access.READ,
+                        new GraphRelationsEndpoint(in.graphTenants()))), notFound)));
             // Both mutations: asserting stages facts the next build serves, and retracting
             // records an erasure obligation. The collection is asserted into, and retracted from
             // by subject, relation and object; each member is one fact, retracted by its id. So

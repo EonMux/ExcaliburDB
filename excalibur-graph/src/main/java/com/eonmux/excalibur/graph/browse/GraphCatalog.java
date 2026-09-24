@@ -35,13 +35,21 @@ import java.util.TreeMap;
  * <p>An entity an erasure removed is not listed. Its id keeps a placeholder label, so that no id
  * moves, but the placeholder names nobody.</p>
  *
+ * <h2>The relation vocabulary</h2>
+ * <p>Every relation the served graph's edges use, with how many use it: the labels
+ * {@code excalibur.graph.single-valued-relations}, a relation filter and a relation a question
+ * names are matched against. Counted in one pass over the forward relation column the first
+ * time a listing needs it - four bytes read per edge - and kept, like the name index, for the
+ * life of the graph.</p>
+ *
  * <h2>Paging</h2>
  * <p>Every listing takes a limit and returns a cursor for the next page; see
  * {@link CatalogCursor} for why the cursor is a key rather than an offset, and so survives a
  * rebuild between pages.</p>
  *
  * <h2>Thread Safety</h2>
- * <p>Safe for concurrent use over stores that are; the name index is built once, under a lock.</p>
+ * <p>Safe for concurrent use over stores that are; the name index and the relation vocabulary
+ * are each built once, under a lock.</p>
  *
  * @author ExcaliburDB
  */
@@ -58,6 +66,9 @@ public final class GraphCatalog {
 
     /** Entity ids sorted by folded name, then id; null until the first listing needs it. */
     private volatile int[] byName;
+
+    /** Relations in label order, each with its edge count; null until the first listing. */
+    private volatile CatalogRelation[] byRelation;
 
     /**
      * Creates a catalog over one served graph.
@@ -150,6 +161,47 @@ public final class GraphCatalog {
             return false;
         }
         return !LabelInterner.erasedLabel((int) id).equals(entities.apply(id));
+    }
+
+    // ---------------------------------------------------------------- relations
+
+    /**
+     * The graph's relation vocabulary: every relation at least one edge uses, in label order,
+     * with how many edges use it.
+     *
+     * <p>A relation the dictionary still holds and no edge uses - one whose every fact an erasure
+     * removed - is not listed: the vocabulary is what a question or a filter could match.</p>
+     *
+     * @param limit  Most relations to return, {@code 1..}{@value #MAX_LIMIT}
+     * @param cursor The previous page's cursor, or null for the first page
+     * @return The page
+     * @throws IllegalArgumentException if the limit is out of range or the cursor malformed
+     */
+    public CatalogPage<CatalogRelation> relations(int limit, String cursor) {
+        requireLimit(limit);
+        CatalogCursor.NameKey after = CatalogCursor.relation(cursor);
+        CatalogRelation[] vocabulary = relationIndex();
+        int from = 0;
+        if (after != null) {
+            int lo = 0;
+            int hi = vocabulary.length;
+            while (lo < hi) {
+                int mid = (lo + hi) >>> 1;
+                int c = vocabulary[mid].name().compareTo(after.folded());
+                if (c < 0 || (c == 0 && vocabulary[mid].id() <= after.id())) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            from = lo;
+        }
+        int to = Math.min(vocabulary.length, from + limit);
+        List<CatalogRelation> page = List.of(Arrays.copyOfRange(vocabulary, from, to));
+        CatalogRelation last = page.isEmpty() ? null : page.getLast();
+        return new CatalogPage<>(page, to < vocabulary.length && last != null
+            ? CatalogCursor.relation(new CatalogCursor.NameKey(last.name(), last.id()))
+            : null);
     }
 
     // ---------------------------------------------------------------- edges
@@ -396,6 +448,45 @@ public final class GraphCatalog {
 
     /** An entity id and its folded name, while the name index is sorted. */
     private record Named(String folded, int id) {
+    }
+
+    /**
+     * The relations edges use, sorted by label and then id, built on first use.
+     *
+     * @return The vocabulary
+     */
+    private CatalogRelation[] relationIndex() {
+        CatalogRelation[] index = byRelation;
+        if (index != null) {
+            return index;
+        }
+        synchronized (indexLock) {
+            if (byRelation == null) {
+                byRelation = buildRelationIndex();
+            }
+            return byRelation;
+        }
+    }
+
+    /**
+     * Counts every edge by relation, in one sequential pass over the forward relation column.
+     *
+     * @return The relations with at least one edge, in label order
+     */
+    private CatalogRelation[] buildRelationIndex() {
+        Map<Integer, long[]> counts = new HashMap<>();
+        long edgeCount = edges.edgeCount();
+        for (long position = 0; position < edgeCount; position++) {
+            counts.computeIfAbsent(edges.relationAt(false, position), r -> new long[1])[0]++;
+        }
+        List<CatalogRelation> used = new ArrayList<>(counts.size());
+        counts.forEach((relation, count) -> used.add(
+            new CatalogRelation(relation, relations.apply(relation), count[0])));
+        used.sort((a, b) -> {
+            int c = a.name().compareTo(b.name());
+            return c != 0 ? c : Integer.compare(a.id(), b.id());
+        });
+        return used.toArray(new CatalogRelation[0]);
     }
 
     /**

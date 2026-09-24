@@ -192,6 +192,9 @@ public final class McpTools {
     /** List the facts the served graph holds about one entity. */
     public static final String GRAPH_ENTITY_EDGES = "graph_entity_edges";
 
+    /** List the relations the served graph's facts use, with how many use each. */
+    public static final String LIST_GRAPH_RELATIONS = "list_graph_relations";
+
     /** State facts for the graph to hold after its next build. */
     public static final String ASSERT_GRAPH_FACTS = "assert_graph_facts";
 
@@ -580,7 +583,8 @@ public final class McpTools {
                 ToolSchema.optional("relation", "string",
                     "Only facts with this relation, spelt as extraction spells one: lower case, "
                     + "words joined by underscores ('worked with' is read as 'worked_with'). "
-                    + "Omit for every relation.", null),
+                    + LIST_GRAPH_RELATIONS + " lists the ones the graph holds. Omit for every "
+                    + "relation.", null),
                 ToolSchema.optionalChoice("direction",
                     "'out' for the facts the entity is the subject of, 'in' for those it is the "
                     + "object of, 'both' for either. Omit for both.", edgeDirectionNames()),
@@ -590,6 +594,28 @@ public final class McpTools {
                     + "for every fact whenever it held, including ones since superseded.", null),
                 ToolSchema.optionalInteger("limit",
                     "Most facts per page, up to 500. Omit for the server's default of 50.", 1),
+                ToolSchema.optional("cursor", "string",
+                    "The 'next_cursor' of the previous page, passed back unchanged. Omit for "
+                    + "the first page.", null),
+                ToolSchema.optional("namespace", "string",
+                    "Namespace to read. Omit for the configured default, or the shared one.",
+                    null))));
+
+        tools.add(ToolSchema.tool(LIST_GRAPH_RELATIONS,
+            "List the relations the facts of the served graph use - its vocabulary - in "
+            + "alphabetical order, each with its 'relation' label, its 'relation_id' and how "
+            + "many facts ('edges') use it. Labels are spelt exactly as the graph stores them, "
+            + "which is how " + GRAPH_ENTITY_EDGES + "'s 'relation' filter matches them and how "
+            + ASSERT_GRAPH_FACTS + " should name a relation the graph already has, so a new "
+            + "fact joins it rather than starting a near-duplicate. Use it to learn what "
+            + "extraction called a relationship before filtering by it. Results come a page at "
+            + "a time: follow 'next_cursor' as " + FIND_GRAPH_ENTITIES + " does. Reads only the "
+            + "graph being served, so it needs " + BUILD_GRAPH + " to have run; a 503 means none "
+            + "is being served in that namespace.",
+            ToolSchema.object(
+                ToolSchema.optionalInteger("limit",
+                    "Most relations per page, up to 500. Omit for the server's default of 100.",
+                    1),
                 ToolSchema.optional("cursor", "string",
                     "The 'next_cursor' of the previous page, passed back unchanged. Omit for "
                     + "the first page.", null),
@@ -888,6 +914,7 @@ public final class McpTools {
                 case FIND_GRAPH_ENTITIES -> findGraphEntities(args);
                 case GRAPH_ENTITY -> graphEntity(args);
                 case GRAPH_ENTITY_EDGES -> graphEntityEdges(args);
+                case LIST_GRAPH_RELATIONS -> listGraphRelations(args);
                 case ASSERT_GRAPH_FACTS -> assertGraphFacts(args);
                 default -> ToolResult.error("No such tool: " + name);
             };
@@ -1290,6 +1317,13 @@ public final class McpTools {
         putPage(args, query);
         return answer(client.get("/v1/graph/entities/" + entityId + "/edges", query,
             scope(args)));
+    }
+
+    private ToolResult listGraphRelations(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        Map<String, String> query = new LinkedHashMap<>();
+        putPage(args, query);
+        return answer(client.get("/v1/graph/relations", query, scope(args)));
     }
 
     /**

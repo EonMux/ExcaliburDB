@@ -123,6 +123,8 @@ class EndpointBannerTest {
                 && line.contains("/v1/graph/entities/{id} "));
             assertThat(lines).anyMatch(line -> line.contains("GET")
                 && line.contains("/v1/graph/entities/{id}/edges"));
+            assertThat(lines).anyMatch(line -> line.contains("GET")
+                && line.contains("/v1/graph/relations"));
             assertThat(lines).anyMatch(line -> line.contains("POST")
                 && line.contains("/v1/graph/facts "));
             assertThat(lines).anyMatch(line -> line.contains("DELETE")

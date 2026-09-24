@@ -75,6 +75,30 @@ class McpGraphRecordToolsTest {
     }
 
     @Test
+    @DisplayName("list_graph_relations reads the vocabulary, paged and scoped by namespace")
+    void relationsReadsTheVocabulary() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            node.answerWith(200, "{\"relations\":[],\"next_cursor\":null}");
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            McpTools.ToolResult first = tools.call(McpTools.LIST_GRAPH_RELATIONS, null);
+            McpTools.ToolResult next = tools.call(McpTools.LIST_GRAPH_RELATIONS,
+                Map.of("limit", 20, "cursor", "cjoxOmtub3dz", "namespace", "tenant-a"));
+
+            assertThat(first.isError()).isFalse();
+            assertThat(next.isError()).isFalse();
+            assertThat(node.requests()).extracting(StubNode.Received::path)
+                .containsOnly("/v1/graph/relations");
+            assertThat(node.requests()).extracting(StubNode.Received::query)
+                .containsExactly(null, "limit=20&cursor=cjoxOmtub3dz");
+            assertThat(node.requests().get(1).headers())
+                .containsEntry(ExcaliburClient.NAMESPACE_HEADER, "tenant-a");
+            assertThat(properties(McpTools.LIST_GRAPH_RELATIONS))
+                .containsOnlyKeys("limit", "cursor", "namespace");
+        }
+    }
+
+    @Test
     @DisplayName("graph_entity reads one entity, scoped by namespace, refusing a bad id first")
     void entityReadsOne() throws IOException {
         try (StubNode node = StubNode.start()) {

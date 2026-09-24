@@ -1467,6 +1467,7 @@ separate so a burst of writes cannot starve ordinary reads.
 | `GET` | `/v1/graph/entities` | bearer | read | Entities in the served graph by exact `name` or `prefix`, or all of them, in name order — paged by `limit` and `cursor` |
 | `GET` | `/v1/graph/entities/{id}` | bearer | read | One entity, its edges counted by relation and direction. `404` for an id the served graph does not hold |
 | `GET` | `/v1/graph/entities/{id}/edges` | bearer | read | An entity's edges with their intervals and provenance, narrowed by `relation`, `direction` (`out`, `in`, `both`) and `as_of` — paged by `limit` and `cursor` |
+| `GET` | `/v1/graph/relations` | bearer | read | The served graph's relation vocabulary, in label order, each relation with how many edges use it — paged by `limit` and `cursor`. `503` while no graph is served |
 | `POST` | `/v1/graph/facts` | bearer | mutate | Stage facts a caller states, each under a fact id of its own. `201`; they are served after the next build |
 | `DELETE` | `/v1/graph/facts` | bearer | mutate | Retract every asserted fact stating `?subject=&relation=&object=`, each as a source-scoped erasure. `202`; `compact=true` applies it now |
 | `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | mutate | Retract one asserted fact, by its id, as a source-scoped erasure. `202`; `compact=true` applies it now |
@@ -3002,6 +3003,28 @@ issue is a 400. An id the served graph does not hold is a 404. A namespace with 
 served — never built, damaged, or withheld until an interrupted erasure is applied — is a 503 with
 the query's own message, and a namespace that does not exist gets the same 503 and is not created.
 
+`GET /v1/graph/relations` lists the graph's vocabulary — every relation at least one served edge
+uses, in label order, with how many edges use it:
+
+```bash
+curl 'http://localhost:8080/v1/graph/relations?limit=100'
+```
+
+```json
+{"namespace": "shared",
+ "relations": [{"relation": "born_in", "relation_id": 2, "edges": 318},
+               {"relation": "worked_with", "relation_id": 3, "edges": 41}],
+ "next_cursor": null}
+```
+
+The labels are the ones stored, which is what `excalibur.graph.single-valued-relations`, the
+`relation` filter above and a relation a question names are matched against — so a setting or a
+filter is written against what extraction actually called a relationship rather than guessed at.
+A relation whose every fact an erasure removed is not listed. The counts are taken in one pass
+over the graph the first time the vocabulary is asked for and kept until the graph is replaced.
+It pages, answers 503 and treats a namespace that does not exist exactly as the entity listing
+does; `limit` defaults to 100 here, since a vocabulary is usually read whole.
+
 ### Stating facts
 
 Extraction is not the only way in. `POST /v1/graph/facts` stages facts a caller states:
@@ -3145,6 +3168,7 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `find_graph_entities` | `name`, `prefix`, `limit`, `cursor`, `namespace` | Finds entities in the served graph by exact name or prefix, ignoring case, with their ids and degrees — `GET /v1/graph/entities` |
 | `graph_entity` | **`entity_id`**, `namespace` | One entity with its facts counted by relation and direction, to choose which relation to page through — `GET /v1/graph/entities/{id}` |
 | `graph_entity_edges` | **`entity_id`**, `relation`, `direction`, `as_of`, `limit`, `cursor`, `namespace` | Lists one entity's facts with their intervals and provenance — `GET /v1/graph/entities/{id}/edges` |
+| `list_graph_relations` | `limit`, `cursor`, `namespace` | The relations the served graph's facts use, with how many use each — the labels `graph_entity_edges` filters by — `GET /v1/graph/relations` |
 | `assert_graph_facts` | **`facts`** (each **`subject`**, **`relation`**, **`object`**, `valid_from`, `valid_to`, `confidence`), `namespace` | Stages facts the model states, served after the next `build_graph` — `POST /v1/graph/facts` |
 
 Arguments in bold are required; every other one is optional and, when left out, is not sent, so
@@ -3154,8 +3178,8 @@ Together they are the whole loop, so a model can prepare a corpus as well as que
 matters: `build_graph` has to run after ingestion finishes - it answers as soon as the build
 starts, so `graph_build_status` is how a model waits for one - and `search_graph` reports that no
 graph is being served until it has. The same holds for `assert_graph_facts`: what it states is
-served after the next `build_graph`, and `find_graph_entities`, `graph_entity` and
-`graph_entity_edges` read only the graph being served.
+served after the next `build_graph`, and `find_graph_entities`, `graph_entity`,
+`graph_entity_edges` and `list_graph_relations` read only the graph being served.
 
 The two ways in are not alternatives either. `ingest_documents` points the node at a directory,
 which has to be inside an allow-listed root - the right policy for a node that goes and reads
