@@ -284,6 +284,41 @@ class ConfigLoaderTest {
         }
 
         @Test
+        @DisplayName("an empty variable does not wipe the value the file sets")
+        void anEmptyVariableOverridesNothing() throws IOException {
+            // What a compose file produces when it interpolates a variable unset on the host.
+            // Copied through, the blank reads as absent and the shipped default wins over the file.
+            Files.writeString(configFile, """
+                excalibur.query.top-k-default=7
+                excalibur.llm.api-key=from-the-file
+                """);
+
+            Map<String, String> envOverrides = new HashMap<>();
+            envOverrides.put("EXCALIBUR_QUERY_TOP_K_DEFAULT", "");
+            envOverrides.put("EXCALIBUR_LLM_API_KEY", "   ");
+
+            Config config = ConfigLoader.load(configFile.toString(), envOverrides);
+
+            assertThat(config.query().getDefaultTopK()).isEqualTo(7);
+            assertThat(config.llm().getApiKey()).isEqualTo("from-the-file");
+            assertThat(config.getEffectiveProperties())
+                .containsEntry("excalibur.query.top-k-default", "7");
+        }
+
+        @Test
+        @DisplayName("an empty variable for a key the file does not set leaves the default")
+        void anEmptyVariableLeavesTheDefault() throws IOException {
+            Files.writeString(configFile, "excalibur.visibility.epoch-tick-ms=100\n");
+
+            Config config = ConfigLoader.load(configFile.toString(),
+                Map.of("EXCALIBUR_QUERY_TOP_K_DEFAULT", ""));
+
+            assertThat(config.query().getDefaultTopK()).isEqualTo(QueryConfig.DEFAULT_TOP_K);
+            assertThat(config.getEffectiveProperties())
+                .doesNotContainKey("excalibur.query.top-k-default");
+        }
+
+        @Test
         @DisplayName("reaches a key whose name is more than one section deep")
         void reachesADeeperSection() throws IOException {
             // The documented rule is that any setting can be supplied from the environment.

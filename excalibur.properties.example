@@ -3,7 +3,9 @@
 #
 # Copy to excalibur.properties (gitignored) and edit. Every key below can also be supplied
 # from the environment as EXCALIBUR_<KEY>, upper-cased with - and . replaced by _ , which
-# overrides the file. Supply secrets that way rather than writing them into a file.
+# overrides the file. Supply secrets that way rather than writing them into a file. A variable
+# that is set but empty overrides nothing: it is ignored with a warning, and this file's value
+# stands.
 
 # Visibility Configuration
 excalibur.visibility.epoch-tick-ms=100

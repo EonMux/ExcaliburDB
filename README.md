@@ -741,6 +741,11 @@ export EXCALIBUR_LLM_BASE_URL=https://api.openai.com/v1
 export EXCALIBUR_PORT=9090
 ```
 
+A variable that is set but empty, or only whitespace, overrides nothing: it is ignored with a
+warning naming it, and the file's value (or the default) stands. That is what a compose file
+delivers when it interpolates a variable unset on the host - `EXCALIBUR_API_AUTH_TOKEN: ${TOKEN}`
+with no `TOKEN` - and copied through it would switch off the authentication the file turns on.
+
 Three variables are read directly rather than as property overrides, because deployments already
 spell them this way:
 

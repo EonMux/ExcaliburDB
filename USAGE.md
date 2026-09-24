@@ -323,6 +323,12 @@ default `./data`; there is no property for it) and `EXCALIBUR_LOG_LEVEL` (the ro
 default `INFO`). Every other `EXCALIBUR_` variable is the override of the key it names — including
 `EXCALIBUR_API_AUTH_TOKEN`, which is `excalibur.api.auth-token` like any other.
 
+A variable that is set but empty, or only whitespace, overrides nothing. It is ignored with a
+warning naming it, and the file's value — or the default, if the file does not set the key —
+stands. A compose file that interpolates a variable unset on the host
+(`EXCALIBUR_API_AUTH_TOKEN: ${TOKEN}` with no `TOKEN`) delivers exactly that, and copying the
+blank over the file's token would start the node with authentication off.
+
 A value that is present but unparseable (a bad number, a non-finite double, an unrecognised
 boolean) fails startup naming the key, rather than silently falling back to the default. Blank and
 absent values still take the default. Booleans under `excalibur.query.*`, `excalibur.ingest.*`,
