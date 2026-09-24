@@ -155,6 +155,53 @@ class ReingestionTest {
             .as("the previous version is still published and still owns its graph nodes")
             .isEmpty();
         assertThat(retiredVectors.chunks()).isEmpty();
+        assertThat(tracker.isDocumentTracked(documentKey)).isTrue();
+        assertThat(tracker.isDocumentFullyVisible(documentKey, Long.MAX_VALUE))
+            .as("the failed attempt overwrote the published chunks in place, so storage holds "
+                + "part of each version and the document stays hidden rather than served mixed")
+            .isFalse();
+
+        tracker.refusing = false;
+        orchestrator.ingestNow(source);
+
+        assertThat(tracker.isDocumentFullyVisible(documentKey, Long.MAX_VALUE))
+            .as("published whole, the document is served again")
+            .isTrue();
+        assertThat(tracker.getPendingDocumentCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("with fewer chunks has retired the previous version's tail by the time it is "
+        + "published")
+    void theTailIsGoneBeforeTheNewVersionIsVisible() {
+        List<List<String>> storedAtPublication = new ArrayList<>();
+        DocumentVisibilityTracker tracker = new DocumentVisibilityTracker(documents) {
+            @Override
+            public void registerFromMetadata(DocumentMetadata metadata, long commitEpoch) {
+                List<String> stored = new ArrayList<>();
+                String documentKey = ChunkIdentifiers.documentKey("docs", "a.txt");
+                for (int i = 0; i < 200; i++) {
+                    String chunkId = ChunkIdentifiers.chunkIdForDocumentKey(documentKey, i);
+                    if (stored(chunkId)) {
+                        stored.add(chunkId);
+                    }
+                }
+                storedAtPublication.add(stored);
+                super.registerFromMetadata(metadata, commitEpoch);
+            }
+        };
+        IngestionOrchestrator orchestrator = orchestrator(tracker);
+        MutableSource source = new MutableSource("docs");
+
+        source.put("a.txt", String.join(" ", words("old", 60)));
+        orchestrator.ingestNow(source);
+        source.put("a.txt", "a short replacement");
+        orchestrator.ingestNow(source);
+
+        assertThat(storedAtPublication).hasSize(2);
+        assertThat(storedAtPublication.get(1))
+            .as("the moment the new version becomes visible, storage holds it and nothing else")
+            .containsExactlyElementsOf(documents.get("docs", "a.txt").getChunkIds());
     }
 
     private IngestionOrchestrator orchestrator(DocumentVisibilityTracker tracker) {

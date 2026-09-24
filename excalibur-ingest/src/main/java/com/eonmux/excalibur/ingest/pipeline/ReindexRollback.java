@@ -22,13 +22,12 @@ import java.util.Set;
  *
  * <h2>Why leaving them is not the safe option</h2>
  * <p>A reindex writes a document's chunks one at a time and publishes at the end, and a failure
- * partway leaves the document on its previous version - the right answer, but not a complete one
- * on its own. Chunk ids are deterministic, so the writes that landed overwrote the previous
- * version's chunks in place and then wrote further ids past them. Those further ids are named by
- * nothing: the registry entry that survives is the previous one, and it is the only map from a
- * document to its chunks. The document's key is visibility-tracked, so the atomicity filter lets
- * such a chunk through and a read returns content from a version that was never published; and a
- * later erasure works from the registry, so it never learns the chunk exists.</p>
+ * partway leaves the registry on the document's previous version. Chunk ids are deterministic, so
+ * the writes that landed overwrote the previous version's chunks in place and then wrote further
+ * ids past them. Those further ids are named by nothing: the registry entry that survives is the
+ * previous one, and it is the only map from a document to its chunks. A later erasure works from
+ * the registry, so it would never learn such a chunk exists, and whenever the document is next
+ * visible a read would return content from a version that was never published.</p>
  *
  * <h2>Why only the surplus</h2>
  * <p>The ids the surviving entry still names hold content the corpus is expected to have. They
@@ -36,6 +35,13 @@ import java.util.Set;
  * place and is exactly why the document stays classified as changed for the next run to replace
  * properly. Deleting them would take the document's content away while its entry went on
  * promising it, which is worse than the state being undone.</p>
+ *
+ * <h2>What becomes of the document meanwhile</h2>
+ * <p>Undoing the surplus does not make the document a version again: where the attempt
+ * overwrote any of the previous version's chunks, storage holds part of each, and serving that
+ * is the mix the visibility tracker exists to prevent. {@link #overwrotePublishedChunks} is the
+ * test a caller applies before releasing the document's in-flight mark: such a document stays
+ * hidden until a later attempt publishes it whole.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Stateless beyond the collaborators it is given, each of which is itself thread-safe.</p>
@@ -96,6 +102,33 @@ final class ReindexRollback {
         return DocumentLocks.shared().inDocument(
             ChunkIdentifiers.documentKey(sourceId, documentId),
             () -> removeOrphans(sourceId, documentId, writtenChunkIds));
+    }
+
+    /**
+     * Whether an attempt overwrote any chunk of the version published before it.
+     *
+     * <p>When it did, what storage holds of the document is neither version, and the document must
+     * stay hidden until it is next published whole rather than have its in-flight mark
+     * released.</p>
+     *
+     * @param previous        The registry entry the attempt replaced, or null when there was none
+     * @param writtenChunkIds The chunk ids the attempt wrote
+     * @return true if any written id is one the previous version was published under
+     * @throws NullPointerException if writtenChunkIds is null
+     */
+    static boolean overwrotePublishedChunks(DocumentMetadata previous,
+                                            Collection<String> writtenChunkIds) {
+        Objects.requireNonNull(writtenChunkIds, "writtenChunkIds must not be null");
+        if (previous == null || writtenChunkIds.isEmpty()) {
+            return false;
+        }
+        Set<String> published = new HashSet<>(previous.getChunkIds());
+        for (String chunkId : writtenChunkIds) {
+            if (published.contains(chunkId)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Removes the written ids no entry accounts for, with the document's lock held. */

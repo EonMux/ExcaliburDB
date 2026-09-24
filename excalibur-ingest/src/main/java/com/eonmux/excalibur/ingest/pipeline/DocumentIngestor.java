@@ -246,16 +246,18 @@ final class DocumentIngestor {
             // atomicity filter excludes on: a chunk written but not yet published is reachable
             // by a tail scan, and without the marker the filter has no way to tell that from a
             // document it simply has not heard of, so it either shows half a document or drops
-            // whole ones. Publishing clears it; so does rollback.
+            // whole ones. It hides a version published earlier too, whose chunks are about to be
+            // overwritten in place. Publishing clears it; so does a rollback that leaves nothing
+            // of the attempt behind.
             beginIngestion(documentKey, chunks);
             writeChunks(documentKey, chunks, embeddings, writtenKeys);
+            retireSupersededVersion(documentKey, previous, writtenKeys);
             publishDocument(sourceId, documentId, documentKey, doc, chunks);
         } catch (Exception e) {
             rollbackChunks(sourceId, documentId, documentKey, previous, writtenKeys, e);
             return new Written(DocumentOutcome.DROPPED, null);
         }
         lexicalSideIndex.addDocument(documentKey, lexicalChunks(documentKey, chunks));
-        retireSupersededVersion(documentKey, previous, writtenKeys);
         // A previous version means facts may have been staged from it, which the report of this
         // one has to withdraw before staging its own.
         return new Written(DocumentOutcome.published(chunks.size()),
@@ -267,11 +269,12 @@ final class DocumentIngestor {
      *
      * <p>A client posting a document id again, and the first crawl of a source registered again
      * after its registration was removed, both publish here over a version this node already
-     * holds. The registry entry now names only the new chunk ids, and it is the only map from a
-     * document to its chunks, so the previous version's surplus tail would otherwise stay stored
-     * and lexically searchable with nothing able to name it - not a re-crawl, not an erasure.
-     * Retired as a reindex retires a changed document, after publication, and here under the
-     * document's lock, so a query sees one version or the other and never neither.</p>
+     * holds. The registry entry is about to name only the new chunk ids, and it is the only map
+     * from a document to its chunks, so the previous version's surplus tail would otherwise stay
+     * stored and lexically searchable with nothing able to name it - not a re-crawl, not an
+     * erasure. Retired as a reindex retires a changed document: once every chunk of the new
+     * version is written and before it is published, under the document's lock and while the
+     * document is in flight, so no query sees the new version beside the old tail.</p>
      */
     private void retireSupersededVersion(String documentKey, DocumentMetadata previous,
                                          List<String> publishedChunkIds) {
@@ -501,7 +504,8 @@ final class DocumentIngestor {
     }
 
     /**
-     * Removes chunks written for a document that failed to publish.
+     * Removes chunks written for a document that failed to publish, and decides whether the
+     * document may be seen again.
      *
      * <p>A document with no previous version loses everything this attempt wrote, graph nodes
      * included. One that replaces a published version keeps it: the ids the surviving registry
@@ -510,6 +514,12 @@ final class DocumentIngestor {
      * left to follow storage through the write log: each node is attributed to its chunk, so the
      * tombstones retire exactly the nodes of the undone writes, where retiring by document here
      * would take the published version's nodes with them.</p>
+     *
+     * <p>The in-flight mark is released only once nothing is left for it to hide: after the
+     * writes are removed, never before, or the chunks still waiting to be removed are served in
+     * between. An attempt that overwrote chunks of the published version cannot be undone that
+     * far - storage holds part of each version - so that document keeps its mark and stays
+     * hidden until it is next published whole.</p>
      */
     private void rollbackChunks(String sourceId, String documentId, String documentKey,
                                 DocumentMetadata previous, List<String> writtenKeys,
@@ -517,22 +527,26 @@ final class DocumentIngestor {
         LOGGER.error("Rolling back document {} after publication failure: {}",
             documentKey, cause.getMessage(), cause);
 
-        // Clear the in-flight marker. A document left pending is invisible to every query
-        // for the life of the process, and never released.
-        if (visibilityTracker != null) {
-            visibilityTracker.abortIngestion(documentKey);
-        }
-
         if (previous != null) {
             new ReindexRollback(documentRegistry, upsertHandler, lexicalSideIndex::retire)
                 .undo(sourceId, documentId, writtenKeys);
+        } else {
+            for (String chunkId : writtenKeys) {
+                tombstone(chunkId.getBytes(StandardCharsets.UTF_8));
+            }
+            lexicalSideIndex.retire(writtenKeys);
+            retireVectors(documentKey);
+        }
+
+        if (visibilityTracker == null) {
             return;
         }
-        for (String chunkId : writtenKeys) {
-            tombstone(chunkId.getBytes(StandardCharsets.UTF_8));
+        if (ReindexRollback.overwrotePublishedChunks(previous, writtenKeys)) {
+            LOGGER.warn("Document {} stays hidden until it is next ingested whole: the failed "
+                + "attempt overwrote chunks of its published version in place", documentKey);
+            return;
         }
-        lexicalSideIndex.retire(writtenKeys);
-        retireVectors(documentKey);
+        visibilityTracker.abortIngestion(documentKey);
     }
 
     /**
