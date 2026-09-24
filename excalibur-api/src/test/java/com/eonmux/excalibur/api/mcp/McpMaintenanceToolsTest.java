@@ -102,8 +102,61 @@ class McpMaintenanceToolsTest {
     }
 
     @Test
+    @DisplayName("node_status answers with the build and the node's counters together")
+    void nodeStatusReadsVersionAndStats() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            node.answerAt("/v1/version", 200, "{\"version\":\"1.2.3\",\"uptimeMs\":5}");
+            node.answerAt("/v1/stats", 200, "{\"coverage\":1.0,\"breakers\":{\"embedding\":\"OPEN\"}}");
+
+            McpTools.ToolResult result =
+                new McpTools(node.client(Map.of())).call(McpTools.NODE_STATUS, Map.of());
+
+            List<StubNode.Received> requests = node.requests();
+            assertThat(requests).extracting(StubNode.Received::method).containsOnly("GET");
+            assertThat(requests).extracting(StubNode.Received::path)
+                .containsExactly("/v1/version", "/v1/stats");
+            assertThat(requests).extracting(StubNode.Received::headers)
+                .as("both routes serve the whole node and refuse a namespace")
+                .allSatisfy(headers -> assertThat(headers).doesNotContainKey("X-Excalibur-Namespace"));
+            assertThat(result.isError()).isFalse();
+            Object status = Json.parse(result.text());
+            assertThat(Json.stringAt(Json.at(status, "version"), "version")).isEqualTo("1.2.3");
+            assertThat(Json.stringAt(Json.objectAt(Json.at(status, "stats"), "breakers"),
+                "embedding")).isEqualTo("OPEN");
+        }
+    }
+
+    @Test
+    @DisplayName("node_status answers a refused read as that refusal, never as half a status")
+    void nodeStatusReportsARefusal() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            node.answerAt("/v1/version", 200, "{\"version\":\"1.2.3\"}");
+            node.answerAt("/v1/stats", 401, "{\"error\":\"Missing bearer token\"}");
+
+            McpTools.ToolResult result =
+                new McpTools(node.client(Map.of())).call(McpTools.NODE_STATUS, Map.of());
+
+            assertThat(result.isError()).isTrue();
+            assertThat(result.text()).contains("401").contains("Missing bearer token")
+                .doesNotContain("1.2.3");
+        }
+        try (StubNode node = StubNode.start()) {
+            node.answerWith(503, "{\"error\":\"draining\"}");
+
+            McpTools.ToolResult result =
+                new McpTools(node.client(Map.of())).call(McpTools.NODE_STATUS, Map.of());
+
+            assertThat(result.isError()).isTrue();
+            assertThat(node.requests()).extracting(StubNode.Received::path)
+                .as("the counters are not read once the build could not be")
+                .containsExactly("/v1/version");
+        }
+    }
+
+    @Test
     @DisplayName("none of them requires an argument, and each points at the tools it pairs with")
     void describedForAModel() {
+        assertThat(required(McpTools.NODE_STATUS)).isEmpty();
         assertThat(required(McpTools.COMPACT)).isEmpty();
         assertThat(required(McpTools.COMPACTION_STATUS)).isEmpty();
         assertThat(required(McpTools.LIST_SOURCES)).isEmpty();

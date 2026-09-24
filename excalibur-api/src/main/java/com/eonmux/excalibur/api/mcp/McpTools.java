@@ -174,6 +174,9 @@ public final class McpTools {
     /** Read back where an erasure stands. */
     public static final String ERASURE_STATUS = "erasure_status";
 
+    /** Read which build of the node is answering and its own counters. */
+    public static final String NODE_STATUS = "node_status";
+
     /** The argument a destructive tool requires, repeating what it destroys. */
     static final String CONFIRM = "confirm";
 
@@ -929,6 +932,7 @@ public final class McpTools {
                 case CANCEL_COMPACTION -> answer(client.delete("/v1/compact", null));
                 case COMPACT -> answer(MaintenanceTools.compact(client, args));
                 case COMPACTION_STATUS -> answer(MaintenanceTools.compactionStatus(client));
+                case NODE_STATUS -> answer(MaintenanceTools.nodeStatus(client));
                 case LIST_SOURCES -> answer(MaintenanceTools.listSources(client, args));
                 case CANCEL_GRAPH_BUILD -> answer(client.delete("/v1/graph/build", scope(args)));
                 case ERASE_DOCUMENTS -> eraseDocuments(args);

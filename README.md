@@ -3163,6 +3163,7 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `cancel_reindex` | **`source_id`** | Stops a running `reindex_source`, keeping what it had already re-indexed |
 | `compact` | `force` | Reclaims the space erased and replaced documents still hold, behind the reply — `POST /v1/compact`. `force` rewrites every segment, the thing to send after a large erasure |
 | `compaction_status` | | How the most recent compaction went — `GET /v1/compact/status` |
+| `node_status` | | Which build is answering and how long it has been up, with the node's own counters: coverage, segments still indexing, open breakers, graph builds and erasures owed — `GET /v1/version` and `GET /v1/stats` in one answer |
 | `cancel_compaction` | | Stops the compaction in progress, keeping what it had reclaimed |
 | `build_graph` | `namespace` | Publishes the staged facts as the served graph |
 | `graph_build_status` | `namespace` | How far a build has got, and what the last one published |
@@ -3210,7 +3211,13 @@ erasing it; changing a registration in place (`PUT /v1/ingest`) stays operator-o
 that needs different settings deregisters the source and registers it again under the same id,
 whose first crawl reconciles what is indexed with what the new settings find.
 `compact` frees the space erased and replaced documents still hold - nothing searchable changes -
-and `compaction_status` reads back how it went.
+and `compaction_status` reads back how it went. `node_status` is how a model explains an answer
+that came back degraded or incomplete - segments still indexing, an open embedding breaker - and it
+answers a refusal of either read as that refusal rather than as half a status. The rest of the
+node's own surface stays operator-only: `POST /v1/drain` takes a node out of rotation, which is a
+deployment's decision and not a model's, and `/metrics` is a Prometheus exposition for a scraper,
+counters and histograms that mean something as a series over time rather than read once in a
+conversation.
 
 Two tools do destroy data, `erase_documents` and `delete_namespace`, and both are gated the same
 way. Each requires a `confirm` argument that repeats exactly what it destroys — the `source_id`,
