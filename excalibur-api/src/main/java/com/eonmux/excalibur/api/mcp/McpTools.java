@@ -175,6 +175,9 @@ public final class McpTools {
     /** Read back where an erasure stands. */
     public static final String ERASURE_STATUS = "erasure_status";
 
+    /** Read which build of the node is answering and its own counters. */
+    public static final String NODE_STATUS = "node_status";
+
     /** The argument a destructive tool requires, repeating what it destroys. */
     static final String CONFIRM = "confirm";
 
@@ -192,6 +195,9 @@ public final class McpTools {
 
     /** List the facts the served graph holds about one entity. */
     public static final String GRAPH_ENTITY_EDGES = "graph_entity_edges";
+
+    /** List the relations the served graph's facts use, with how many use each. */
+    public static final String LIST_GRAPH_RELATIONS = "list_graph_relations";
 
     /** State facts for the graph to hold after its next build. */
     public static final String ASSERT_GRAPH_FACTS = "assert_graph_facts";
@@ -258,6 +264,22 @@ public final class McpTools {
                 ToolSchema.optional("snippet_chars", "integer",
                     "Width of each snippet in characters, from 16 up to the server's per-result "
                     + "limit. Only with snippet true. Omit for the server's default.", null),
+                ToolSchema.optional("explain", "boolean",
+                    "Say why each passage was returned: its 'explain' gives every signal that "
+                    + "found it with that signal's own rank and score, and the query terms the "
+                    + "passage contains; the reply's 'query_expansion' says whether the query "
+                    + "was widened. Useful for judging a surprising result, or why an expected "
+                    + "one is missing.", null),
+                ToolSchema.optional("threshold", "number",
+                    "Lowest meaning-similarity, from 0 to 1, a passage may have and still be "
+                    + "returned. It applies to the meaning signal only, before any fusion, so "
+                    + "it does not filter keyword-only matches and is not on the scale of a "
+                    + "'hybrid' score. Omit for the server's configured floor.", null),
+                ToolSchema.optional("llm_threshold", "number",
+                    "Lowest relevance, from 0 to 1, a passage may be judged to have by the "
+                    + "node's relevancy model and still be returned. It applies only when the "
+                    + "reply says 'llm_scored' true; a node with no relevancy model names it in "
+                    + "'ignored_fields'. Omit for the server's configured bar.", null),
                 ToolSchema.optional("source_ids", "array",
                     "Search only the documents of these sources, by the 'source_id' they "
                     + "were ingested under, as " + INGESTION_STATUS + " and " + LIST_DOCUMENTS
@@ -294,6 +316,12 @@ public final class McpTools {
                     + "it), 'both' for either. Omit for both, which is right unless the "
                     + "direction of the relation is the point of the question.",
                     directionNames()),
+                ToolSchema.optional("timeout_ms", "integer",
+                    "Longest the question may take, in milliseconds. A question that runs out "
+                    + "is judged on what was gathered by then and answered with 'timed_out' "
+                    + "true, so an 'answered' or 'declined' reply with it set may be missing what "
+                    + "more time would have found. The node caps it (60000 by default) and "
+                    + "refuses more. Omit for the server's default.", null),
                 ToolSchema.optional("namespace", "string",
                     "Namespace to query. Omit for the configured default, or the shared one.",
                     null))));
@@ -584,7 +612,8 @@ public final class McpTools {
                 ToolSchema.optional("relation", "string",
                     "Only facts with this relation, spelt as extraction spells one: lower case, "
                     + "words joined by underscores ('worked with' is read as 'worked_with'). "
-                    + "Omit for every relation.", null),
+                    + LIST_GRAPH_RELATIONS + " lists the ones the graph holds. Omit for every "
+                    + "relation.", null),
                 ToolSchema.optionalChoice("direction",
                     "'out' for the facts the entity is the subject of, 'in' for those it is the "
                     + "object of, 'both' for either. Omit for both.", edgeDirectionNames()),
@@ -594,6 +623,28 @@ public final class McpTools {
                     + "for every fact whenever it held, including ones since superseded.", null),
                 ToolSchema.optionalInteger("limit",
                     "Most facts per page, up to 500. Omit for the server's default of 50.", 1),
+                ToolSchema.optional("cursor", "string",
+                    "The 'next_cursor' of the previous page, passed back unchanged. Omit for "
+                    + "the first page.", null),
+                ToolSchema.optional("namespace", "string",
+                    "Namespace to read. Omit for the configured default, or the shared one.",
+                    null))));
+
+        tools.add(ToolSchema.tool(LIST_GRAPH_RELATIONS,
+            "List the relations the facts of the served graph use - its vocabulary - in "
+            + "alphabetical order, each with its 'relation' label, its 'relation_id' and how "
+            + "many facts ('edges') use it. Labels are spelt exactly as the graph stores them, "
+            + "which is how " + GRAPH_ENTITY_EDGES + "'s 'relation' filter matches them and how "
+            + ASSERT_GRAPH_FACTS + " should name a relation the graph already has, so a new "
+            + "fact joins it rather than starting a near-duplicate. Use it to learn what "
+            + "extraction called a relationship before filtering by it. Results come a page at "
+            + "a time: follow 'next_cursor' as " + FIND_GRAPH_ENTITIES + " does. Reads only the "
+            + "graph being served, so it needs " + BUILD_GRAPH + " to have run; a 503 means none "
+            + "is being served in that namespace.",
+            ToolSchema.object(
+                ToolSchema.optionalInteger("limit",
+                    "Most relations per page, up to 500. Omit for the server's default of 100.",
+                    1),
                 ToolSchema.optional("cursor", "string",
                     "The 'next_cursor' of the previous page, passed back unchanged. Omit for "
                     + "the first page.", null),
@@ -885,6 +936,7 @@ public final class McpTools {
                 case CANCEL_COMPACTION -> answer(client.delete("/v1/compact", null));
                 case COMPACT -> answer(MaintenanceTools.compact(client, args));
                 case COMPACTION_STATUS -> answer(MaintenanceTools.compactionStatus(client));
+                case NODE_STATUS -> answer(MaintenanceTools.nodeStatus(client));
                 case LIST_SOURCES -> answer(MaintenanceTools.listSources(client, args));
                 case CANCEL_GRAPH_BUILD -> answer(client.delete("/v1/graph/build", scope(args)));
                 case ERASE_DOCUMENTS -> eraseDocuments(args);
@@ -892,6 +944,7 @@ public final class McpTools {
                 case FIND_GRAPH_ENTITIES -> findGraphEntities(args);
                 case GRAPH_ENTITY -> graphEntity(args);
                 case GRAPH_ENTITY_EDGES -> graphEntityEdges(args);
+                case LIST_GRAPH_RELATIONS -> listGraphRelations(args);
                 case ASSERT_GRAPH_FACTS -> assertGraphFacts(args);
                 default -> ToolResult.error("No such tool: " + name);
             };
@@ -923,6 +976,9 @@ public final class McpTools {
         putWholeNumber(args, body, "timeout_ms");
         putFlag(args, body, "snippet");
         putWholeNumber(args, body, "snippet_chars");
+        putFlag(args, body, "explain");
+        putNumber(args, body, "threshold");
+        putNumber(args, body, "llm_threshold");
         putStrings(args, body, "source_ids");
         return answer(client.post("/v1/query", Json.write(body), null));
     }
@@ -1133,6 +1189,7 @@ public final class McpTools {
         if (direction != null) {
             body.put("direction", TraversalDirection.parse(direction).wireName());
         }
+        putWholeNumber(args, body, "timeout_ms");
         return answer(client.post("/v1/graph/query", Json.write(body), scope(args)));
     }
 
@@ -1319,6 +1376,13 @@ public final class McpTools {
             scope(args)));
     }
 
+    private ToolResult listGraphRelations(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        Map<String, String> query = new LinkedHashMap<>();
+        putPage(args, query);
+        return answer(client.get("/v1/graph/relations", query, scope(args)));
+    }
+
     /**
      * Reads the entity id a graph tool puts in its path, as a whole number the node could have
      * issued, so nothing else can reach the path.
@@ -1385,6 +1449,22 @@ public final class McpTools {
     private static void putWholeNumber(Map<String, Object> args, Map<String, Object> config,
                                        String field) {
         Integer value = ToolArguments.wholeNumber(args, field);
+        if (value != null) {
+            config.put(field, value);
+        }
+    }
+
+    /**
+     * Copies a numeric setting that may be fractional into a request body, absent staying
+     * absent.
+     *
+     * @param args   The call's arguments
+     * @param config The body being built
+     * @param field  The setting
+     */
+    private static void putNumber(Map<String, Object> args, Map<String, Object> config,
+                                  String field) {
+        Double value = ToolArguments.number(args, field);
         if (value != null) {
             config.put(field, value);
         }

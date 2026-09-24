@@ -197,6 +197,74 @@ class ExcaliburEmbeddedTest {
                     .extracting(SearchHit::chunkId).doesNotContain(TIERING_CHUNK);
             }
         }
+
+        @Test
+        @DisplayName("erases a whole source without naming its documents, and no other source")
+        void erasesAWholeSource() throws Exception {
+            try (ExcaliburEmbedded db = lexicalNode().open()) {
+                db.supply("handbook", handbook());
+                supplyOverlappingSources(db);
+
+                ErasureOutcome erased = db.eraseSource("handbook");
+
+                assertThat(erased.erasedDocumentIds())
+                    .containsExactlyInAnyOrder("tiering.txt", "hnsw.txt", "backup.txt");
+                assertThat(erased.documentsNotFound()).isZero();
+                assertThat(erased.documentsIncomplete()).isZero();
+                assertThat(erased.documentsRemaining()).isZero();
+                assertThat(erased.chunksNotRemoved()).isZero();
+                assertThat(erased.sourceDeregistered())
+                    .as("a supplied source has no registration to drop")
+                    .isFalse();
+                assertThat(db.documents("handbook")).isEmpty();
+                assertThat(db.fetch(TIERING_CHUNK)).isEmpty();
+                assertThat(db.query("cold segments cheaper disks", 5).hits())
+                    .extracting(SearchHit::chunkId)
+                    .containsExactlyInAnyOrder("team:tiering.txt:chunk:0",
+                        "team:wiki:tiering.txt:chunk:0", "other:tiering.txt:chunk:0");
+
+                ErasureOutcome team = db.eraseSource("team");
+                assertThat(team.erasedDocumentIds()).containsExactly("tiering.txt");
+                assertThat(db.documents()).extracting(StoredDocument::sourceId)
+                    .as("team:wiki extends team's id and is a different source")
+                    .containsExactlyInAnyOrder("team:wiki", "other");
+
+                assertThat(db.eraseSource("nobody").erasedDocumentIds()).isEmpty();
+                db.supply("handbook", List.of(EmbeddedDocument.of("a.md", "Supplied again.")));
+                assertThat(db.documents("handbook")).extracting(StoredDocument::documentId)
+                    .containsExactly("a.md");
+            }
+
+            try (ExcaliburEmbedded db = lexicalNode().open()) {
+                assertThat(db.documents()).extracting(StoredDocument::sourceId)
+                    .as("the erasure survives a restart")
+                    .containsExactlyInAnyOrder("handbook", "team:wiki", "other");
+            }
+        }
+
+        @Test
+        @DisplayName("erasing a whole source drops a crawl this directory registered under it")
+        void erasingASourceDeregistersItsCrawl() throws Exception {
+            SourceCatalog.open(dataDir).record(
+                new SourceDescriptor("filesystem", "site", Map.of("path", "/srv/site")));
+
+            try (ExcaliburEmbedded db = lexicalNode().open()) {
+                ErasureOutcome erased = db.eraseSource("site");
+
+                assertThat(erased.sourceDeregistered()).isTrue();
+                assertThat(erased.erasedDocumentIds()).isEmpty();
+                assertThat(db.eraseSource("site").sourceDeregistered())
+                    .as("there is nothing left to deregister")
+                    .isFalse();
+                assertThat(db.supply("site", List.of(EmbeddedDocument.of("a", "text")))
+                    .documentsIngested())
+                    .as("the id is no longer a crawl's, so documents may be supplied under it")
+                    .isEqualTo(1);
+            }
+
+            assertThat(SourceCatalog.open(dataDir).all())
+                .extracting(SourceDescriptor::sourceId).doesNotContain("site");
+        }
     }
 
     @Nested
@@ -406,6 +474,8 @@ class ExcaliburEmbeddedTest {
             assertThatThrownBy(db::documents).isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> db.documents("s")).isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> db.erase("s", List.of("a")))
+                .isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> db.eraseSource("s"))
                 .isInstanceOf(IllegalStateException.class);
         }
 

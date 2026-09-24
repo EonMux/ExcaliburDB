@@ -1499,6 +1499,34 @@ public final class GraphTenants implements AutoCloseable {
     }
 
     /**
+     * A page of a namespace's erasure requests, without creating or opening anything.
+     *
+     * <p>Read as {@link #erasureStatus} reads: from the resident tenant where there is one,
+     * otherwise from the namespace's log. A namespace that does not exist on disk lists nothing,
+     * exactly as one that exists and never owed anything does.</p>
+     *
+     * @param id    The namespace
+     * @param state Only requests in this state, or null for both
+     * @param after List only request ids above this one; 0 for the first page
+     * @param limit Most requests the page carries
+     * @return The page
+     * @throws IOException if the namespace's log exists and cannot be read
+     * @see ErasureLog#requests(ErasureLog.State, long, int)
+     */
+    public ErasureLog.RequestPage erasureRequests(NamespaceId id, ErasureLog.State state,
+                                                  long after, int limit) throws IOException {
+        Objects.requireNonNull(id, "id must not be null");
+        Optional<NamespaceRegistry.Lease<GraphTenant>> resident = registry.borrowResident(id);
+        if (resident.isPresent()) {
+            try (NamespaceRegistry.Lease<GraphTenant> held = resident.get()) {
+                return held.resource().erasureService().requests(state, after, limit);
+            }
+        }
+        return ErasureLog.requestsOf(GraphTenant.erasureLogOf(graphDirectoryOf(id)), state,
+            after, limit);
+    }
+
+    /**
      * Where several erasure requests of a namespace stand, read once, without creating or
      * opening anything.
      *

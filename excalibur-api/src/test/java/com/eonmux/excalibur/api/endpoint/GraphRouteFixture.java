@@ -43,6 +43,7 @@ final class GraphRouteFixture implements AutoCloseable {
     private GraphTenants tenants;
     private GraphEntitiesEndpoint entities;
     private GraphFactsEndpoint facts;
+    private GraphRelationsEndpoint relations;
 
     GraphRouteFixture(Path root) throws IOException {
         this(root, Map.of());
@@ -67,6 +68,7 @@ final class GraphRouteFixture implements AutoCloseable {
         tenants = new GraphTenants(root, config, MappingBudget.detect(), 4);
         entities = new GraphEntitiesEndpoint(tenants);
         facts = new GraphFactsEndpoint(tenants);
+        relations = new GraphRelationsEndpoint(tenants);
     }
 
     /** Something done to the files while no namespace is open. */
@@ -102,6 +104,10 @@ final class GraphRouteFixture implements AutoCloseable {
 
     Response get(String uri, String namespace) throws IOException {
         return call(entities, "GET", uri, "", namespace);
+    }
+
+    Response relations(String method, String uri, String namespace) throws IOException {
+        return call(relations, method, uri, "", namespace);
     }
 
     Response entities(String method, String uri) throws IOException {

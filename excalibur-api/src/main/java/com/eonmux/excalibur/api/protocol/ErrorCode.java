@@ -22,14 +22,10 @@ public enum ErrorCode {
     INVALID_REQUEST("invalid_request"),
     /** 401: no bearer token, or the wrong one. */
     UNAUTHORIZED("unauthorized"),
-    /** 403: the request was understood and is not permitted. */
-    FORBIDDEN("forbidden"),
     /** 404: nothing at this path, or nothing by the name the request gave. */
     NOT_FOUND("not_found"),
     /** 405: the path exists and does not serve this method. */
     METHOD_NOT_ALLOWED("method_not_allowed"),
-    /** 408 and 504: the work did not finish within the time it was given. */
-    TIMEOUT("timeout"),
     /** 409: the request conflicts with the node's current state. */
     CONFLICT("conflict"),
     /** 413: the request body is over the size limit. */
@@ -123,10 +119,8 @@ public enum ErrorCode {
         return switch (statusCode) {
             case 400 -> INVALID_REQUEST;
             case 401 -> UNAUTHORIZED;
-            case 403 -> FORBIDDEN;
             case 404 -> NOT_FOUND;
             case 405 -> METHOD_NOT_ALLOWED;
-            case 408, 504 -> TIMEOUT;
             case 409 -> CONFLICT;
             case 413 -> PAYLOAD_TOO_LARGE;
             case 422 -> UNPROCESSABLE;

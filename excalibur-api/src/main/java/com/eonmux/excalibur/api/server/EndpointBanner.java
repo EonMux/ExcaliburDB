@@ -92,6 +92,7 @@ final class EndpointBanner {
             lines.add(route("DELETE", "/v1/graph/build", "Stop the graph build in progress"));
             lines.add(route("GET", "/v1/graph/build/status", "What the last graph build did"));
             lines.add(route("POST", "/v1/graph/erasure", "Record an obligation to erase"));
+            lines.add(route("GET", "/v1/graph/erasure", "The namespace's erasure obligations"));
             lines.add(route("GET", "/v1/graph/erasure/{request_id}",
                 "Where one erasure obligation stands"));
             lines.add(route("GET", "/v1/graph/entities", "Entities in the served graph"));
@@ -99,7 +100,11 @@ final class EndpointBanner {
                 "One entity, its edges counted"));
             lines.add(route("GET", "/v1/graph/entities/{id}/edges",
                 "One entity's edges, with provenance"));
+            lines.add(route("GET", "/v1/graph/relations",
+                "The relations the served graph uses, counted"));
             lines.add(route("POST", "/v1/graph/facts", "Stage facts a caller states"));
+            lines.add(route("DELETE", "/v1/graph/facts",
+                "Retract asserted facts by subject, relation and object"));
             lines.add(route("DELETE", "/v1/graph/facts/{fact_id}", "Retract an asserted fact"));
             lines.add(route("GET", "/v1/graph/namespaces", "Every namespace on this node"));
             lines.add(route("PUT", "/v1/graph/namespaces/{namespace}", "Create a namespace"));

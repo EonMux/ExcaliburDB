@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.graph.browse.CatalogEdge;
 import com.eonmux.excalibur.graph.browse.CatalogEntity;
+import com.eonmux.excalibur.graph.browse.CatalogRelation;
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.temporal.TemporalFilter;
@@ -12,9 +13,9 @@ import java.time.LocalDate;
 /**
  * How the structured graph routes write entities, edges and their dates.
  *
- * <p>One place, because {@code /v1/graph/entities} and {@code /v1/graph/facts} describe the same
- * things - a label, an interval, a provenance - and a caller reading one and writing the other
- * should meet a single spelling of each.</p>
+ * <p>One place, because {@code /v1/graph/entities}, {@code /v1/graph/relations} and
+ * {@code /v1/graph/facts} describe the same things - a label, an interval, a provenance - and a
+ * caller reading one and writing the other should meet a single spelling of each.</p>
  *
  * <h2>Spellings</h2>
  * <ul>
@@ -60,6 +61,19 @@ final class GraphCatalogJson {
             json.append(']');
         }
         return json.append('}').toString();
+    }
+
+    /**
+     * One relation of the graph's vocabulary, spelled as an entity's per-relation counts spell
+     * it.
+     *
+     * @param relation The relation
+     * @return A JSON object
+     */
+    static String relation(CatalogRelation relation) {
+        return "{\"relation\":" + quoted(relation.name())
+            + ",\"relation_id\":" + relation.id()
+            + ",\"edges\":" + relation.edges() + "}";
     }
 
     /**

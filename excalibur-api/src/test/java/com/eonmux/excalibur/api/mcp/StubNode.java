@@ -13,6 +13,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A stand-in for a running node, so the MCP tests exercise the real HTTP client.
@@ -33,6 +34,11 @@ final class StubNode implements AutoCloseable {
     private final List<Received> received = new ArrayList<>();
     private volatile int status = 200;
     private volatile String responseBody = "{}";
+    private final Map<String, Answer> byPath = new ConcurrentHashMap<>();
+
+    /** What one path is answered with, in place of the answer every other path gets. */
+    private record Answer(int status, String body) {
+    }
 
     private StubNode(HttpServer server) {
         this.server = server;
@@ -65,9 +71,11 @@ final class StubNode implements AutoCloseable {
                 body, headers));
         }
 
-        byte[] payload = responseBody.getBytes(StandardCharsets.UTF_8);
+        Answer answer = byPath.getOrDefault(exchange.getRequestURI().getPath(),
+            new Answer(status, responseBody));
+        byte[] payload = answer.body().getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(status, payload.length);
+        exchange.sendResponseHeaders(answer.status(), payload.length);
         exchange.getResponseBody().write(payload);
         exchange.close();
     }
@@ -76,6 +84,11 @@ final class StubNode implements AutoCloseable {
     void answerWith(int status, String body) {
         this.status = status;
         this.responseBody = body;
+    }
+
+    /** Sets what every subsequent request to one path is answered with, whatever the others get. */
+    void answerAt(String path, int status, String body) {
+        byPath.put(path, new Answer(status, body));
     }
 
     /** The base URL a client should be pointed at. */

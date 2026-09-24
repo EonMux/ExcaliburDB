@@ -5,12 +5,12 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The tools that look after the node rather than its corpus: reclaiming space, and reading back
- * what each source was registered as.
+ * The tools that look after the node rather than its corpus: reclaiming space, reading back
+ * what each source was registered as, and saying which build is answering and how it is.
  *
  * <p>Kept apart from {@link McpTools} because none of them searches, supplies or erases anything,
- * and each is a single call to one route. {@link McpTools} names them and dispatches to them, so
- * the catalogue a model reads is still one list.</p>
+ * and each reads or starts one piece of node housekeeping. {@link McpTools} names them and
+ * dispatches to them, so the catalogue a model reads is still one list.</p>
  */
 final class MaintenanceTools {
 
@@ -60,6 +60,17 @@ final class MaintenanceTools {
             + "compacted, skipped and failed; a completed run with failed segments reclaimed "
             + "the rest. 'lexical' reports the keyword index's half separately.",
             ToolSchema.object()));
+
+        tools.add(ToolSchema.tool(McpTools.NODE_STATUS,
+            "Which build of the node is answering and how it is. 'version' names the build and "
+            + "says how long it has been up - a short 'uptimeMs' means it restarted. 'stats' is "
+            + "the node's own account of itself: 'coverage' below 1 means part of the corpus is "
+            + "not yet searchable, 'segments' says how much is still indexing, 'breakers' "
+            + "reads 'OPEN' for a model role that has been failing and is being skipped - an "
+            + "open 'embedding' breaker is why searches answer by keyword only - and 'graph', "
+            + "when the node builds one, counts builds and erasures still owed. Use it to "
+            + "explain a degraded or incomplete answer, or before a long ingestion or build.",
+            ToolSchema.object()));
     }
 
     /**
@@ -103,5 +114,32 @@ final class MaintenanceTools {
     static ExcaliburClient.Response compactionStatus(ExcaliburClient client)
             throws IOException, InterruptedException {
         return client.get("/v1/compact/status", Map.of(), null);
+    }
+
+    /**
+     * Reads which build is answering and the node's counters, as one answer.
+     *
+     * <p>Two reads rather than one route because the node serves them apart: {@code /v1/version}
+     * is the build and its uptime, {@code /v1/stats} everything the node counts. A failure of
+     * either is answered as that failure, so a model is never handed half a status as though it
+     * were the whole of one.</p>
+     *
+     * @param client The node
+     * @return {@code {"version": ..., "stats": ...}}, or the first read the node refused
+     */
+    static ExcaliburClient.Response nodeStatus(ExcaliburClient client)
+            throws IOException, InterruptedException {
+        ExcaliburClient.Response version = client.get("/v1/version", Map.of(), null);
+        if (!version.isSuccess()) {
+            return version;
+        }
+        ExcaliburClient.Response stats = client.get("/v1/stats", Map.of(), null);
+        if (!stats.isSuccess()) {
+            return stats;
+        }
+        Map<String, Object> status = Json.object();
+        status.put("version", Json.parse(version.body()));
+        status.put("stats", Json.parse(stats.body()));
+        return new ExcaliburClient.Response(stats.status(), Json.write(status));
     }
 }

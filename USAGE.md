@@ -432,7 +432,7 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `DELETE` | `/v1/query/{query_id}` | bearer | Cancel an in-progress query, from `/v1/query` or `/v1/graph/query` |
 | `POST` | `/v1/ingest` | bearer | Register an ingestion source |
 | `PUT` | `/v1/ingest` | bearer | Replace a registered source's configuration, keeping its history and documents |
-| `GET` | `/v1/ingest` | bearer | Read back what every source was registered as |
+| `GET` | `/v1/ingest` | bearer | Read back what every source was registered as, or one with `?source_id=` |
 | `DELETE` | `/v1/ingest` | bearer | Stop crawling a source, keeping its documents |
 | `DELETE` | `/v1/ingest/run` | bearer | Stop the ingestion run in flight, keeping the source registered |
 | `GET` | `/v1/ingest/status` | bearer | Per-source ingestion status |
@@ -448,12 +448,15 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `GET` | `/v1/graph/entities` | bearer | List the served graph's entities, by exact `name` or name `prefix`, a page at a time. `503` while no graph is served |
 | `GET` | `/v1/graph/entities/{entity_id}` | bearer | One entity: its name, its degree, and each relation's count in each direction. `404` for an id the served graph does not hold |
 | `GET` | `/v1/graph/entities/{entity_id}/edges` | bearer | An entity's edges, filtered by `relation`, `direction` and `as_of`, each with its interval, confidence and provenance |
+| `GET` | `/v1/graph/relations` | bearer | The served graph's relation vocabulary, in label order, each with its edge count, a page at a time (`limit`, default 100, at most 500; `cursor`). `503` while no graph is served |
 | `POST` | `/v1/graph/facts` | bearer | Stage facts a caller states, as `USER_ASSERTED`, returning their fact ids. `201`; served once the graph is next built |
-| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | Retract an asserted fact - by id, or every one stating a `subject`, `relation` and `object` given as query parameters. `202`; served until a compaction applies it, which `compact=true` runs now |
+| `DELETE` | `/v1/graph/facts` | bearer | Retract every asserted fact stating the `subject`, `relation` and `object` given as query parameters. `202`; served until a compaction applies it, which `compact=true` runs now |
+| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | Retract one asserted fact, by its id. `202`; served until a compaction applies it, which `compact=true` runs now |
 | `POST` | `/v1/graph/build` | bearer | Start publishing the facts ingestion has staged as the served graph. `202`; the build runs behind the response. `409` while one is already running |
 | `DELETE` | `/v1/graph/build` | bearer | Stop the build in progress. It publishes nothing; the namespace keeps the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | What the build is doing, what the last one published, whether the served graph is behind what is staged, and what the node's automatic build is doing about it |
 | `POST` | `/v1/graph/erasure` | bearer | Record an obligation to erase, and compact when it is due. `404` for an entity, by name or `entity_id`, that nothing in the namespace holds, and nothing is recorded |
+| `GET` | `/v1/graph/erasure` | bearer | The namespace's outstanding and recently discharged erasure obligations, a page at a time (`state`, `limit`, default 100, at most 1000; `cursor`) |
 | `GET` | `/v1/graph/erasure/{request_id}` | bearer | Where one graph erasure obligation stands, in the namespace the header names |
 | `GET` | `/v1/graph/namespaces` | bearer | The namespaces on disk, a page at a time (`limit`, default 100, at most 1000; `cursor`): whether each is open, whether it has built a graph, what it has staged, whether its graph is behind that, and what it still owes |
 | `PUT` | `/v1/graph/namespaces/{namespace}` | bearer | Create a namespace. `201` when created, `200` when it already existed; `429 namespace_limit_reached` past `excalibur.graph.max-namespaces` |
@@ -475,12 +478,13 @@ single-method routes as much as for the ones that answer two or three methods: `
 `DELETE /v1/ingest/run`, `GET /v1/ingest/status`, `GET /v1/documents/list`,
 `GET /v1/reindex/status`, `POST /v1/erasure`, `GET /v1/erasure/{request_id}`,
 `GET /v1/compact/status`, `POST /v1/graph/query`, `GET /v1/graph/entities` and every path beneath
-it, `GET /v1/graph/build/status`, `POST /v1/graph/erasure` and `GET /v1/graph/erasure/{request_id}`
-each answer any other method with `405` rather than `401`, and a wrong method on a mutating route
+it, `GET /v1/graph/relations`, `GET /v1/graph/build/status`, `POST` and `GET /v1/graph/erasure` and
+`GET /v1/graph/erasure/{request_id}` each answer any other method with `405` rather than `401`, and a wrong method on a mutating route
 costs a read, not a mutation. A collection and its members are separate paths with separate
 methods: `/v1/query` serves `POST` and `/v1/query/{query_id}` serves `DELETE`, so `DELETE /v1/query`
-with no id is a `405` naming `POST`; `/v1/erasure` and `/v1/graph/erasure` serve `POST` and their
-members `GET`; `/v1/graph/facts` serves `POST` and `/v1/graph/facts/{fact_id}` serves `DELETE`;
+with no id is a `405` naming `POST`; `/v1/erasure` serves `POST` and its members `GET`;
+`/v1/graph/erasure` serves `POST` and `GET` (the listing) and its members `GET`; `/v1/graph/facts` serves `POST` and `DELETE` (by subject, relation and object) and
+`/v1/graph/facts/{fact_id}` serves `DELETE`;
 `/v1/graph/namespaces` serves `GET` and `/v1/graph/namespaces/{namespace}` serves `PUT` and
 `DELETE`, so a `DELETE` of the collection or a `GET` of one namespace is a `405` as well. A path
 that is not registered at all — including anything deeper than one segment beneath a collection —
@@ -558,7 +562,6 @@ below, because new specific codes may be added.
 | `invalid_namespace` | 400 | `X-Excalibur-Namespace`, or a namespace in a path, is not a legal namespace id |
 | `namespace_not_accepted` | 400 | `X-Excalibur-Namespace` named a tenant on a route that serves the shared corpus |
 | `unauthorized` | 401 | Missing or wrong bearer token |
-| `forbidden` | 403 | Understood and not permitted. The default for `403` |
 | `target_not_allowed` | 403 | An ingest `root_path` or `base_url` outside the allow-lists |
 | `not_found` | 404 | No such path, or nothing under the name the request gave. The default for `404` |
 | `source_not_found` | 404 | No source is registered under that `source_id` |
@@ -568,7 +571,6 @@ below, because new specific codes may be added.
 | `fact_not_found` | 404 | No asserted fact in the namespace has that `fact_id`, or states that subject, relation and object |
 | `erasure_not_found` | 404 | No erasure receipt or graph erasure request has that id - never issued, or older than the receipts kept |
 | `method_not_allowed` | 405 | The path exists and does not serve this method; the `Allow` header lists the ones it does |
-| `timeout` | 408, 504 | The work did not finish within the time it was given |
 | `conflict` | 409 | The request conflicts with the node's current state. The default for `409` |
 | `source_exists` | 409 | A source is already registered under that `source_id` |
 | `source_kind_conflict` | 409 | The `source_id` belongs to the other kind of source — a crawl versus documents supplied directly |
@@ -936,10 +938,10 @@ address. Both lists are empty by default, and empty means disabled.
 (256 by default). Not the rate limiter's `429`, and it carries no `Retry-After`: it clears when a
 source is deregistered, not when time passes.
 
-**`405 Method Not Allowed` — a method other than GET, POST or DELETE**
+**`405 Method Not Allowed` — a method other than GET, POST, PUT or DELETE**
 
 ```json
-{"error": "Method Not Allowed - Use GET to read the registrations, POST to register a source or DELETE to stop crawling one", "code": "method_not_allowed"}
+{"error": "Method Not Allowed - Use GET to read the registrations, POST to register a source, PUT to replace its configuration or DELETE to stop crawling it", "code": "method_not_allowed"}
 ```
 
 Unauthenticated, and charged against the read budget: which handler serves a request is decided
@@ -1797,6 +1799,32 @@ are per namespace — and answers `pending` or `discharged`, with `requested_at_
 requests of each namespace keep that detail; an older one still answers `discharged`, with its
 scope and timestamps null and `detail_retained: false`. An id the namespace never issued, or a
 namespace that does not exist, is `404`.
+
+A caller that does not hold the ids lists them instead, with the same header:
+
+```bash
+curl 'http://localhost:8080/v1/graph/erasure?state=pending&limit=100' \
+  -H 'X-Excalibur-Namespace: acme'
+```
+
+```json
+{"namespace": "acme",
+ "requests": [{"request_id": 7, "state": "pending", "scope": "entity", "entity_id": 42,
+               "requested_at_ms": 1756649000000, "discharged_at_ms": null,
+               "detail_retained": true}],
+ "count": 1, "total": 1, "next_cursor": null}
+```
+
+Each request is spelled exactly as the member route spells it, in id order — the order they were
+accepted. `state` narrows the listing to `pending` or `discharged`; absent, it holds both. `limit`
+is 100 by default and at most 1000, and a larger one is refused rather than trimmed; `cursor`
+continues after the previous page's `next_cursor`, which is `null` on the last page, and `total`
+counts the whole listing. It holds every outstanding obligation and the 1024 most recently
+discharged — those whose scope and timestamps the log still keeps; an older one is not listed,
+though its id still answers `discharged`. Nothing listed carries a name, only the ids a scope is
+recorded by. A namespace that does not exist lists nothing, as one that never owed anything does,
+and asking opens or creates nothing. **Error — `400`** — a `state`, `limit` or `cursor` that is
+not one of those, or an unusable namespace header.
 
 ---
 
@@ -3015,7 +3043,7 @@ limited, because the guard runs inside the audit and not before it. Reads are no
 | `erasure.graph` | `POST /v1/graph/erasure` |
 | `compaction.start`, `compaction.cancel` | `POST`, `DELETE /v1/compact` |
 | `graph.build.start`, `graph.build.cancel` | `POST`, `DELETE /v1/graph/build` |
-| `graph.facts.assert`, `graph.facts.retract` | `POST /v1/graph/facts`, `DELETE /v1/graph/facts/{fact_id}` |
+| `graph.facts.assert`, `graph.facts.retract` | `POST /v1/graph/facts`; `DELETE /v1/graph/facts` and `DELETE /v1/graph/facts/{fact_id}` |
 | `graph.namespace.create`, `graph.namespace.delete` | `PUT`, `DELETE /v1/graph/namespaces/{namespace}` |
 | `query.cancel` | `DELETE /v1/query/{query_id}` |
 | `node.drain`, `node.undrain` | `POST`, `DELETE /v1/drain` |
@@ -3030,7 +3058,9 @@ vouches for. The event's timestamp is when the request finished.
 
 `audit_targets` names identifiers and counts, never content. A graph erasure asked by name records
 `"entity_by": "name"` and the `request_id` it was given, not the name; a document erasure records
-its source and `documents_named`, not which documents. An audit trail is kept longer and read more
+its source and `documents_named`, not which documents; a fact retraction records
+`"retract_by": "fact_id"` or `"triple"` and the `fact_ids` and `request_ids` it resolved to, never
+the subject, relation or object. An audit trail is kept longer and read more
 widely than the data it describes, and copying an erased name into it would undo the erasure it
 records.
 
@@ -4020,6 +4050,14 @@ What each call does:
 - **`erase(sourceId, documentIds)`** is `POST /v1/erasure` for named documents: nothing named is
   searchable once it returns, and the `ErasureOutcome` separates what was erased from what was
   not found. The space is reclaimed by the compaction policy, as on a node.
+- **`eraseSource(sourceId)`** is the same route's `"scope": "source"`: everything the node holds
+  under the source, for a caller with no list of its documents. A crawl a served node registered
+  under that id in this directory is deregistered first, so serving the directory again does not
+  crawl the documents back, and `sourceDeregistered()` says whether there was one; a failure to
+  drop it is an `IOException` with nothing erased. Unlike the route it is not a batch of 1000 -
+  the bound is there to keep one HTTP caller from holding the mutate budget - so one call
+  reaches every document held when it begins, and `documentsRemaining()` counts any supplied
+  under the source while it ran.
 - **`close()`** runs the server's shutdown sequence, bounded by
   `excalibur.api.shutdown-timeout-seconds`: ingestion and queries drained, background work
   stopped, the chunk index and the document registry persisted, the storage engine closed. It is
@@ -4031,7 +4069,13 @@ source id at the same time is refused by the second, as the HTTP route refuses i
 
 What an embedded node leaves out, because it lives around the HTTP surface rather than in the
 node: crawl registration and re-indexing on request, relevancy scoring by the chat model, the
-query result cache, pagination and explanations. The knowledge graph is not built in-process:
+query result cache, pagination and explanations. A search's own settings are fewer than the
+route's too. Every hit carries its chunk's whole text - there is no `include_text` to turn it
+off, no `snippet` window and no clipping to `excalibur.api.max-result-text-chars`. The similarity
+floor is the node's `excalibur.query.threshold`, set with `property(...)`, for every search, not
+one a call sets. And a `SearchAnswer` reports its route and `timedOut()`, not the `coverage`,
+`result_total` or `degraded` the route reports; an answer whose `route()` differs from the node's
+is how a signal that failed shows. The knowledge graph is not built in-process:
 `open()` refuses `excalibur.graph.extraction-enabled=true`, and a directory's graph is built and
 queried by serving it. Erasing a document in-process therefore withdraws nothing from a graph a
 served node built over the same directory; erase through the HTTP API where a graph is in use.

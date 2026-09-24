@@ -552,6 +552,20 @@ public final class GraphErasureService {
     }
 
     /**
+     * A page of this namespace's obligations: every outstanding one and the most recently
+     * discharged.
+     *
+     * @param state Only obligations in this state, or null for both
+     * @param after List only request ids above this one; 0 for the first page
+     * @param limit Most obligations the page carries
+     * @return The page
+     * @see ErasureLog#requests(ErasureLog.State, long, int)
+     */
+    public ErasureLog.RequestPage requests(ErasureLog.State state, long after, int limit) {
+        return coordinator.requests(state, after, limit);
+    }
+
+    /**
      * Runs a compaction, closing and reopening the served stack around it.
      *
      * <p>A graph withheld for an interrupted erasure is compacted whatever {@code force} says and

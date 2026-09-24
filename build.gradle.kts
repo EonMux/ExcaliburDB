@@ -31,9 +31,8 @@ subprojects {
     apply(plugin = "java-library")
     apply(plugin = "jacoco")
 
-    // Declared once here rather than per module. Ten modules had drifted to "com.excaliburdb",
-    // so the same build published two different coordinate namespaces depending on which module
-    // you asked for, and USAGE.md's dependency block resolved for some of them and not others.
+    // Declared once here rather than per module, so every module publishes under one coordinate
+    // namespace and USAGE.md's dependency block resolves for whichever module it names.
     group = rootProject.group
     version = rootProject.version
 
@@ -53,11 +52,11 @@ subprojects {
     // Publishing, declared once for every module an embedder can depend on.
     //
     // Presence in this map is what makes a module publishable, and the description is the one
-    // the POM carries. Five modules used to apply `maven-publish` and declare no publication, so
-    // they owned a publishToMavenLocal task that installed nothing while looking installable in a
-    // task listing; excalibur-store, excalibur-query and excalibur-vector -- the three an
-    // embedded query cannot do without -- did not apply the plugin at all, so the set that did
-    // install could not be assembled into a working dependency.
+    // the POM carries. A module either applies `maven-publish` here with a publication or not at
+    // all: one with the plugin and no publication owns a publishToMavenLocal task that installs
+    // nothing while looking installable in a task listing. And the map has to hold every module
+    // an embedded node needs at run time -- excalibur-store, excalibur-query and excalibur-vector
+    // among them -- or what installs cannot be assembled into a working dependency.
     //
     // Absent by intent: excalibur-bench is a JMH harness whose entry points are benchmark runs,
     // excalibur-integration and excalibur-test-bootstrap exist only for the test classpath, and
@@ -123,9 +122,8 @@ subprojects {
 
                         developers {
                             developer {
-                                // No email: the field is optional, and the address here was a
-                                // reserved example domain, so it was never reachable by anyone
-                                // who read it off a published artifact.
+                                // No email: the field is optional, and there is no
+                                // monitored address to publish in it.
                                 id.set("aeslampanah")
                                 name.set("Amir Eslampanah")
                             }
@@ -170,9 +168,8 @@ subprojects {
             testRuntimeOnly(project(":excalibur-test-bootstrap"))
         }
 
-        // Declared once. Six modules pinned Mockito individually and two of them had drifted to a
-        // different version, so the same mock could behave differently depending on which module's
-        // tests you were reading.
+        // Declared once, so every module's tests run against the same Mockito and a mock behaves
+        // the same whichever module's tests you are reading.
         testImplementation("org.mockito:mockito-core:5.15.2")
         testImplementation("org.mockito:mockito-junit-jupiter:5.15.2")
     }
@@ -241,10 +238,10 @@ subprojects {
     //
     // `test` excludes the `slow` and `benchmark` tags because those tests take minutes, which
     // leaves them running nowhere at all unless something asks for them by name. This is that
-    // something. It was registered in excalibur-bench alone, and a Test task only ever runs its
-    // own project's classes, so the tags outside that module -- the Cuckoo filter's false
-    // positive rate at a million items, HNSW recall against brute force -- were assertions about
-    // this system's stated guarantees that no task in the build could execute.
+    // something, registered in every module because a Test task only ever runs its own project's
+    // classes: the tagged tests outside excalibur-bench -- the Cuckoo filter's false positive
+    // rate at a million items, HNSW recall against brute force -- are assertions about this
+    // system's stated guarantees that would otherwise have no task to execute them.
     tasks.register<Test>("benchmarkTest") {
         group = "verification"
         description = "Runs the tag-excluded gate tests in this module (slow: takes minutes)"
@@ -253,7 +250,7 @@ subprojects {
         classpath = testSourceSet.runtimeClasspath
         useJUnitPlatform {
             // Exclusion beats inclusion, so the block above has to be cleared here or this task
-            // would select nothing -- which is how these gates came to never run.
+            // would select nothing -- and a gate task that selects nothing passes.
             excludeTags = LinkedHashSet()
             includeTags("slow", "benchmark")
         }
@@ -271,9 +268,9 @@ subprojects {
         // loop run on twenty-four threads turns into twenty-four cores writing the same few cache
         // lines. Measured on the point-lookup benchmark's own workload: 6.98 M ops/sec
         // single-threaded and 37.40 M on twenty-four threads without the agent, against 5.61 M
-        // and 1.31 M with it. The scaling gate therefore read 0.23x - it was measuring the
-        // instrumentation contending with itself, and would have gone on reporting a concurrency
-        // defect in the storage engine that the engine does not have.
+        // and 1.31 M with it. Under the agent the scaling gate reads 0.23x: it measures the
+        // instrumentation contending with itself, and reports a concurrency defect in the storage
+        // engine that the engine does not have.
         extensions.configure<JacocoTaskExtension> {
             isEnabled = false
         }
@@ -307,7 +304,7 @@ subprojects {
         // Same exclusions as the aggregate: JMH's generated harness classes are machine-written
         // and never unit-tested by design, so counting them measures code generation. The
         // hand-written @Benchmark bodies beside them are excluded for the same reason -- see
-        // the aggregate task below for why, and for what was pulled out of them first.
+        // the aggregate task below for why, and for where their ordinary code lives instead.
         classDirectories.setFrom(
             fileTree(layout.buildDirectory.dir("classes/java/main")) {
                 exclude(
@@ -377,9 +374,9 @@ tasks.register<JacocoReport>("jacocoAggregateReport") {
     group = "verification"
     description = "Generates aggregate code coverage report for all subprojects"
 
-    // Every module, derived from the build rather than listed. The previous hard-coded list of
-    // four went stale the moment a module was added, and a coverage report that silently omits
-    // most of the codebase is worse than none: it reports a number people trust.
+    // Every module, derived from the build rather than listed. A list goes stale the moment a
+    // module is added, and a coverage report that silently omits part of the codebase is worse
+    // than none: it reports a number people trust.
     val covered = subprojects
 
     dependsOn(covered.map { it.tasks.named("test") })
@@ -387,9 +384,9 @@ tasks.register<JacocoReport>("jacocoAggregateReport") {
     // output, and the test dependency alone does not survive `-x test`.
     dependsOn(covered.map { it.tasks.named("classes") })
 
-    // Resolved lazily. The previous version called File.exists() while configuring, before any
-    // test had run, so on a clean build every path was skipped and the report came out empty --
-    // and empty renders as a valid report, not as an error.
+    // Resolved lazily. A File.exists() check made while configuring runs before any test has,
+    // so on a clean build it would skip every path and the report would come out empty -- and
+    // empty renders as a valid report, not as an error.
     executionData.from(covered.map { project ->
         project.layout.buildDirectory.file("jacoco/test.exec")
     })
@@ -404,11 +401,12 @@ tasks.register<JacocoReport>("jacocoAggregateReport") {
     // excalibur/bench/benchmark holds the hand-written half of the same harness: @Benchmark
     // bodies, @Setup fixtures and @State classes. They are established by being run -- a trial
     // builds hundred-thousand-vector indexes and multi-gigabyte mapped files over minutes --
-    // and a unit test of one would either not run it or not be a unit test. What they used to
-    // contain that is ordinary code (the scalar distance kernels, brute-force ground truth and
-    // recall, false-positive accumulation, latency percentiles) now lives in
-    // com.eonmux.excalibur.bench.kernel, which is counted here and tested directly. Only the measurement
-    // loop is excluded, and only where it cannot be separated from the thing being measured.
+    // and a unit test of one would either not run it or not be a unit test. The ordinary code
+    // the harness needs (the scalar distance kernels, brute-force ground truth and recall,
+    // false-positive accumulation, latency percentiles) lives in
+    // com.eonmux.excalibur.bench.kernel, which is counted here and tested directly. Only the
+    // measurement loop is excluded, and only where it cannot be separated from the thing being
+    // measured.
     classDirectories.from(covered.map { project ->
         project.fileTree(project.layout.buildDirectory.dir("classes/java/main")) {
             exclude(
@@ -441,8 +439,8 @@ tasks.register<JavaExec>("generateCoverageSummary") {
     mainClass.set("com.eonmux.excalibur.coverage.CoverageReportGenerator")
 
     // The module list comes from the build, for the same reason the aggregate report's does: a
-    // list compiled into the generator named four modules of twenty-one, so `./gradlew coverage`
-    // ran every module's tests and then printed a summary describing a fifth of the repository.
+    // list compiled into the generator goes stale as modules are added, and `./gradlew coverage`
+    // would then run every module's tests and print a summary describing only some of them.
     args(
         listOf(
             rootProject.projectDir.absolutePath,
@@ -468,10 +466,9 @@ tasks.register("benchmarkTest") {
 // Per-module reports plus the aggregate. The floors are enforced by `check` as well, so this
 // task is for reading the numbers rather than for gating on them.
 //
-// Every module, derived from the build. This listed four of eighteen, so it printed "Coverage
-// Report Generation Complete" over a run that had measured less than a quarter of the codebase
-// -- the same defect the aggregate report above was already fixed for, left in the task people
-// actually invoke.
+// Every module, derived from the build rather than listed, so the task people actually invoke
+// cannot print "Coverage Report Generation Complete" over a run that measured part of the
+// codebase -- the reason the aggregate report above derives its modules too.
 tasks.register("coverage") {
     group = "verification"
     description = "Runs tests, generates coverage reports, and enforces each module's coverage floor"

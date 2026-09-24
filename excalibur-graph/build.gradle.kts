@@ -21,4 +21,7 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.junit.jupiter:junit-jupiter-params:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
+    // A misconfiguration the build can only report, not refuse, is reported as a warning, and
+    // the tests that pin it read the events logback captured.
+    testImplementation("ch.qos.logback:logback-classic:1.5.12")
 }

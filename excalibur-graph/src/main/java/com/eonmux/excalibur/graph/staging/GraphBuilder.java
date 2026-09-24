@@ -13,9 +13,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * Builds a whole edge store, and the dictionaries that name it, from staged facts.
@@ -268,26 +272,45 @@ public final class GraphBuilder {
      * the configuration readable and the policy correct across rebuilds, which renumber nothing
      * but do introduce ids the configuration has never seen.
      *
+     * <p>Both sides are cleaned by {@link FactLabels#relation}, the function every extracted and
+     * asserted relation is stored through, so a configured {@code works at} or {@code Works_At}
+     * names the stored {@code works_at}. A configured label that names no staged relation is
+     * logged as a warning: it supersedes nothing, and a misspelt one would otherwise go
+     * unnoticed while the graph kept every value it was meant to close.
+     *
      * @param staging     The store holding the relation assignments
      * @param labels      Labels of the relations that hold one value at a time
      * @return The policy
      */
     public static SupersessionPolicy singleValued(GraphStagingStore staging,
-                                                  java.util.Collection<String> labels) {
+                                                  Collection<String> labels) {
         Objects.requireNonNull(staging, "staging must not be null");
         if (labels == null || labels.isEmpty()) {
             return SupersessionPolicy.NONE;
         }
-        java.util.Set<String> wanted = labels.stream()
-            .filter(label -> label != null && !label.isBlank())
-            .map(label -> label.trim().toLowerCase(java.util.Locale.ROOT))
-            .collect(java.util.stream.Collectors.toSet());
+        Set<String> wanted = new TreeSet<>();
+        for (String label : labels) {
+            String cleaned = FactLabels.relation(label);
+            if (cleaned != null) {
+                wanted.add(cleaned);
+            }
+        }
 
         List<String> relations = staging.relationLabels();
-        java.util.Set<Integer> ids = new java.util.HashSet<>();
+        Set<Integer> ids = new HashSet<>();
+        Set<String> matched = new HashSet<>();
         for (int id = 0; id < relations.size(); id++) {
-            if (wanted.contains(relations.get(id).toLowerCase(java.util.Locale.ROOT))) {
+            String stored = FactLabels.relation(relations.get(id));
+            if (stored != null && wanted.contains(stored)) {
                 ids.add(id);
+                matched.add(stored);
+            }
+        }
+        for (String label : wanted) {
+            if (!matched.contains(label)) {
+                LOGGER.warn("single-valued relation '{}' names no relation staged for this "
+                    + "graph, so it supersedes nothing; GET /v1/graph/relations lists the "
+                    + "relations a served graph uses", label);
             }
         }
         return ids::contains;

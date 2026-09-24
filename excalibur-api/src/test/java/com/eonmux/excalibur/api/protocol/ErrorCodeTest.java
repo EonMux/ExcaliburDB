@@ -28,19 +28,19 @@ class ErrorCodeTest {
     @CsvSource({
         "400, invalid_request",
         "401, unauthorized",
-        "403, forbidden",
         "404, not_found",
         "405, method_not_allowed",
-        "408, timeout",
         "409, conflict",
         "413, payload_too_large",
         "422, unprocessable",
         "429, rate_limited",
         "500, internal_error",
         "503, unavailable",
-        "504, timeout",
+        "403, client_error",
+        "408, client_error",
         "418, client_error",
-        "502, server_error"
+        "502, server_error",
+        "504, server_error"
     })
     @DisplayName("every status has a default code")
     void defaultsFollowTheStatus(int status, String code) {

@@ -24,6 +24,7 @@ import com.eonmux.excalibur.api.endpoint.GraphBuildRunner;
 import com.eonmux.excalibur.api.endpoint.GraphBuildStatusEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphEntitiesEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphErasureEndpoint;
+import com.eonmux.excalibur.api.endpoint.GraphErasureListEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphErasureStatusEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphFactsEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespaceCreateEndpoint;
@@ -31,6 +32,7 @@ import com.eonmux.excalibur.api.endpoint.GraphNamespaceDeleteEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespacesEndpoint;
 import com.eonmux.excalibur.api.endpoint.NamespaceAdmission;
 import com.eonmux.excalibur.api.endpoint.GraphQueryEndpoint;
+import com.eonmux.excalibur.api.endpoint.GraphRelationsEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphStatsReader;
 import com.eonmux.excalibur.api.endpoint.HealthEndpoint;
 import com.eonmux.excalibur.api.endpoint.InMemorySourceRegistry;
@@ -726,19 +728,6 @@ final class EndpointRegistrar {
     }
 
     /**
-     * Routes a path that serves one method.
-     *
-     * <p>Every other method is answered 405 by a handler of its own, behind the public guard,
-     * as the multi-method routes do. Left to the route's handler, the 405 would be served beneath
-     * the route's guard instead: an anonymous caller would be answered 401 for a method the path
-     * does not serve at all, and a wrong method on a mutating route would be charged to the much
-     * smaller mutate budget.</p>
-     *
-     * @param method  The one method the path serves
-     * @param guarded The path's handler, already guarded
-     * @return A handler dispatching {@code method} to the route and refusing the rest
-     */
-    /**
      * Records every request reaching a mutating route in the audit trail.
      *
      * <p>Outside the guard, so a request it refuses - unauthenticated, or over the mutate budget -
@@ -753,6 +742,19 @@ final class EndpointRegistrar {
         return AuditLog.audited(action, guarded);
     }
 
+    /**
+     * Routes a path that serves one method.
+     *
+     * <p>Every other method is answered 405 by a handler of its own, behind the public guard,
+     * as the multi-method routes do. Left to the route's handler, the 405 would be served beneath
+     * the route's guard instead: an anonymous caller would be answered 401 for a method the path
+     * does not serve at all, and a wrong method on a mutating route would be charged to the much
+     * smaller mutate budget.</p>
+     *
+     * @param method  The one method the path serves
+     * @param guarded The path's handler, already guarded
+     * @return A handler dispatching {@code method} to the route and refusing the rest
+     */
     private HttpHandler onlyMethod(String method, HttpHandler guarded) {
 
         return createMethodRouter(Map.of(method, guarded),
@@ -1163,13 +1165,21 @@ final class EndpointRegistrar {
                     new GraphBuildStatusEndpoint(graphBuildRunner, graphAutoBuilder))),
                 notFound)));
             // One context for the collection and its members: POST on the collection records an
-            // obligation, GET on a member reads back where one stands. The readback is a read, so
-            // polling a deadline is not rationed against the mutate budget.
+            // obligation and GET on it lists them, GET on a member reads back where one stands.
+            // Both reads are reads, so polling a deadline is not rationed against the mutate
+            // budget.
             target.createContext("/v1/graph/erasure", wrapHandler(
                 collectionAndMember("/v1/graph/erasure",
-                    onlyMethod("POST", audited("erasure.graph",
-                        guard.protect(RequestGuard.Access.MUTATE,
-                            new GraphErasureEndpoint(in.graphTenants())))),
+                    createMethodRouter(
+                        Map.of(
+                            "POST", audited("erasure.graph",
+                                guard.protect(RequestGuard.Access.MUTATE,
+                                    new GraphErasureEndpoint(in.graphTenants()))),
+                            "GET", guard.protect(RequestGuard.Access.READ,
+                                new GraphErasureListEndpoint(in.graphTenants()))),
+                        guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
+                            "Method Not Allowed - Use POST /v1/graph/erasure to record an "
+                                + "obligation or GET to list them"))),
                     onlyMethod("GET", guard.protect(RequestGuard.Access.READ,
                         new GraphErasureStatusEndpoint(in.graphTenants()))),
                     notFound)));
@@ -1181,18 +1191,30 @@ final class EndpointRegistrar {
                 pathAndBelow(GraphEntitiesEndpoint.PATH, onlyMethod("GET",
                     guard.protect(RequestGuard.Access.READ,
                         new GraphEntitiesEndpoint(in.graphTenants()))), notFound)));
+            // The served graph's relation vocabulary: a read over the same lease as the entity
+            // routes, answered 503 where they are.
+            target.createContext(GraphRelationsEndpoint.PATH, wrapHandler(
+                exactPath(GraphRelationsEndpoint.PATH, onlyMethod("GET",
+                    guard.protect(RequestGuard.Access.READ,
+                        new GraphRelationsEndpoint(in.graphTenants()))), notFound)));
             // Both mutations: asserting stages facts the next build serves, and retracting
-            // records an erasure obligation. The collection is asserted into and each member is
-            // one fact, so the two are separate method tables.
+            // records an erasure obligation. The collection is asserted into, and retracted from
+            // by subject, relation and object; each member is one fact, retracted by its id. So
+            // the two are separate method tables, and a retraction is audited the same way
+            // whichever of them it arrives by.
             GraphFactsEndpoint facts = new GraphFactsEndpoint(in.graphTenants());
             target.createContext(GraphFactsEndpoint.PATH, wrapHandler(
                 collectionAndMember(GraphFactsEndpoint.PATH,
                     createMethodRouter(
-                        Map.of("POST", audited("graph.facts.assert",
-                            guard.protect(RequestGuard.Access.MUTATE, facts))),
+                        Map.of(
+                            "POST", audited("graph.facts.assert",
+                                guard.protect(RequestGuard.Access.MUTATE, facts)),
+                            "DELETE", audited("graph.facts.retract",
+                                guard.protect(RequestGuard.Access.MUTATE, facts))),
                         guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
-                            "Method Not Allowed - Use POST /v1/graph/facts to assert facts or "
-                                + "DELETE /v1/graph/facts/{fact_id} to retract one"))),
+                            "Method Not Allowed - Use POST /v1/graph/facts to assert facts, or "
+                                + "DELETE with ?subject=&relation=&object= to retract every "
+                                + "one stating that triple"))),
                     createMethodRouter(
                         Map.of("DELETE", audited("graph.facts.retract",
                             guard.protect(RequestGuard.Access.MUTATE, facts))),

@@ -402,6 +402,82 @@ class GraphCatalogTest {
         }
     }
 
+    @Nested
+    @DisplayName("relations")
+    class Relations {
+
+        @Test
+        @DisplayName("every relation an edge uses is listed once, in label order, with its count")
+        void listsTheVocabulary(@TempDir Path dir) throws IOException {
+            try (Opened graph = built(dir, PEOPLE)) {
+                List<CatalogRelation> vocabulary =
+                    drain(cursor -> graph.catalog().relations(1, cursor));
+
+                assertThat(vocabulary).extracting(CatalogRelation::name)
+                    .containsExactly("admired", "built", "knows");
+                assertThat(vocabulary).extracting(CatalogRelation::edges)
+                    .containsExactly(1L, 1L, 3L);
+                assertThat(vocabulary).allSatisfy(relation -> assertThat(
+                    graph.relations().apply(relation.id())).isEqualTo(relation.name()));
+            }
+        }
+
+        @Test
+        @DisplayName("a page that holds the whole vocabulary has no next cursor")
+        void oneWholePage(@TempDir Path dir) throws IOException {
+            try (Opened graph = built(dir, PEOPLE)) {
+                CatalogPage<CatalogRelation> page = graph.catalog().relations(3, null);
+
+                assertThat(page.items()).hasSize(3);
+                assertThat(page.nextCursor()).isNull();
+            }
+        }
+
+        @Test
+        @DisplayName("labels are listed exactly as stored, since that is what a filter matches")
+        void labelsAreStoredLabels(@TempDir Path dir) throws IOException {
+            try (Opened graph = built(dir, List.of(fact("Ada", "works_at", "Analytical Society"),
+                    fact("Ada", "Works At", "Royal Society")))) {
+                assertThat(graph.catalog().relations(5, null).items())
+                    .extracting(CatalogRelation::name).containsExactly("Works At", "works_at");
+            }
+        }
+
+        @Test
+        @DisplayName("a relation whose every edge was erased is not listed")
+        void erasedRelationsAreNotListed(@TempDir Path dir) throws IOException {
+            try (GraphStagingStore staging = GraphStagingStore.open(dir.resolve("staging"))) {
+                for (ExtractedTriple triple : PEOPLE) {
+                    staging.append(triple);
+                }
+                int engine = staging.findEntity("Difference Engine");
+                staging.erase(ScopedStagedErasure.of(new ErasureScope.Entity(engine)));
+                GraphBuilder.build(staging, dir.resolve("graph"));
+            }
+            try (Opened graph = Opened.at(dir.resolve("graph"))) {
+                assertThat(graph.catalog().relations(5, null).items())
+                    .extracting(CatalogRelation::name).containsExactly("admired", "knows");
+            }
+        }
+
+        @Test
+        @DisplayName("a bad limit and a foreign cursor are refused")
+        void refusals(@TempDir Path dir) throws IOException {
+            try (Opened graph = built(dir, PEOPLE)) {
+                GraphCatalog catalog = graph.catalog();
+                assertThatThrownBy(() -> catalog.relations(0, null))
+                    .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("limit");
+                String entityCursor = catalog.allEntities(1, null).nextCursor();
+                for (String cursor : List.of("%%%", entityCursor, encoded("r:x:knows"),
+                        encoded("r:1"))) {
+                    assertThatThrownBy(() -> catalog.relations(5, cursor))
+                        .isInstanceOf(IllegalArgumentException.class)
+                        .hasMessageContaining("cursor");
+                }
+            }
+        }
+    }
+
     @Test
     @DisplayName("directions read as a request spells them")
     void directions() {

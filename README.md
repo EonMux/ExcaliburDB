@@ -864,7 +864,7 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.graph.extraction-enabled` | false | Extract facts from ingested documents with the chat model |
 | `excalibur.graph.extractor-version` | 1 | Recorded on every extracted fact, so one extractor's output can be erased by version. -32768 to 32767 |
 | `excalibur.graph.entity-vectors-enabled` | true | Embed each entity's text at build time, so retrieval can rerank against real vectors |
-| `excalibur.graph.single-valued-relations` | *(empty)* | Comma-separated relations that hold one value at a time, per subject. At build time a new value closes the previous one on the day it began — its stated start, else the day it was stated (document date, else staging day), with staging order breaking ties. A restatement of the current value closes nothing, and one document's same-day values stay ambiguous |
+| `excalibur.graph.single-valued-relations` | *(empty)* | Comma-separated relations that hold one value at a time, per subject. At build time a new value closes the previous one on the day it began — its stated start, else the day it was stated (document date, else staging day), with staging order breaking ties. A restatement of the current value closes nothing, and one document's same-day values stay ambiguous. Names are cleaned as stored relations are — `works at` and `Works_At` both name `works_at` — and `GET /v1/graph/relations` lists the ones a graph uses; a name that matches no staged relation is logged as a warning at build time, since it supersedes nothing |
 | `excalibur.graph.max-open-namespaces` | 16 | Graphs held open at once before the least recently used is evicted. At least 1 |
 | `excalibur.graph.max-namespaces` | 10000 | Tenant namespaces held on disk before creating another is refused with `429 namespace_limit_reached`. The shared namespace is not counted, and dropping one makes room. At least 1 |
 | `excalibur.graph.require-explicit-namespaces` | false | Refuse a request that names a namespace nobody created, with `404 namespace_not_found`, rather than creating it. A namespace is then created only by `PUT /v1/graph/namespaces/{namespace}`, so a typo in a header cannot become a tenant |
@@ -1163,6 +1163,8 @@ out of the store and the staged facts, then `discharged` with `discharged_at_ms`
 namespace's own erasure log, so it survives a restart. The completion of the most recent 1024
 requests per namespace is kept in full; an older one still answers `discharged`, with no scope,
 no timestamps and `detail_retained: false`. A request id the namespace never issued is `404`.
+`GET /v1/graph/erasure` lists them for a caller that no longer holds the ids: every outstanding
+obligation and the 1024 most recently discharged, each spelled as the member route spells it.
 
 What no erasure can reach is the source itself. A document removed here and still served by the
 directory or website it was crawled from comes back on the next re-crawl. That half of an obligation
@@ -1443,7 +1445,7 @@ separate so a burst of writes cannot starve ordinary reads.
 | `POST` | `/v1/documents` | bearer | mutate | Index documents supplied in the request, for a caller that holds the content rather than a target to crawl |
 | `POST` | `/v1/ingest` | bearer | mutate | Register an ingestion source and start indexing it |
 | `PUT` | `/v1/ingest` | bearer | mutate | Replace a registered source's configuration, keeping its id, status history, schedule and indexed documents. 404 for an unknown source, 409 while it is being crawled or reindexed |
-| `GET` | `/v1/ingest` | bearer | read | Read back what each source was registered as, or one named source |
+| `GET` | `/v1/ingest` | bearer | read | Read back what each source was registered as, or one with `?source_id=` |
 | `DELETE` | `/v1/ingest` | bearer | mutate | Stop crawling a source. Its indexed documents are kept |
 | `DELETE` | `/v1/ingest/run` | bearer | mutate | Stop the ingestion run in flight and leave the source registered |
 | `GET` | `/v1/ingest/status` | bearer | read | Ingestion state per source, or all sources |
@@ -1460,12 +1462,15 @@ separate so a burst of writes cannot starve ordinary reads.
 | `DELETE` | `/v1/graph/build` | bearer | mutate | Stop the build in progress. It publishes nothing, and the namespace keeps serving the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | read | What the build is doing, and what the last one published |
 | `POST` | `/v1/graph/erasure` | bearer | mutate | Record an obligation to erase, and compact when it is due |
+| `GET` | `/v1/graph/erasure` | bearer | read | The obligations of the namespace `X-Excalibur-Namespace` names — every outstanding one and the 1024 most recently discharged, narrowed by `state`, paged by `limit` and `cursor` |
 | `GET` | `/v1/graph/erasure/{request_id}` | bearer | read | Where one graph erasure obligation stands: `pending` or `discharged`, with timestamps, in the namespace `X-Excalibur-Namespace` names |
 | `GET` | `/v1/graph/entities` | bearer | read | Entities in the served graph by exact `name` or `prefix`, or all of them, in name order — paged by `limit` and `cursor` |
 | `GET` | `/v1/graph/entities/{id}` | bearer | read | One entity, its edges counted by relation and direction. `404` for an id the served graph does not hold |
 | `GET` | `/v1/graph/entities/{id}/edges` | bearer | read | An entity's edges with their intervals and provenance, narrowed by `relation`, `direction` (`out`, `in`, `both`) and `as_of` — paged by `limit` and `cursor` |
+| `GET` | `/v1/graph/relations` | bearer | read | The served graph's relation vocabulary, in label order, each relation with how many edges use it — paged by `limit` and `cursor`. `503` while no graph is served |
 | `POST` | `/v1/graph/facts` | bearer | mutate | Stage facts a caller states, each under a fact id of its own. `201`; they are served after the next build |
-| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | mutate | Retract an asserted fact, or every one stating `?subject=&relation=&object=`, as a source-scoped erasure. `202`; `compact=true` applies it now |
+| `DELETE` | `/v1/graph/facts` | bearer | mutate | Retract every asserted fact stating `?subject=&relation=&object=`, each as a source-scoped erasure. `202`; `compact=true` applies it now |
+| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | mutate | Retract one asserted fact, by its id, as a source-scoped erasure. `202`; `compact=true` applies it now |
 | `GET` | `/v1/graph/namespaces` | bearer | read | The namespaces on disk, a page at a time, and what each one holds and owes |
 | `PUT` | `/v1/graph/namespaces/{namespace}` | bearer | mutate | Create a namespace. `201` when created, `200` when it already existed |
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | mutate | Remove a namespace entirely. Irreversible, and `409` for `shared` |
@@ -1523,9 +1528,12 @@ replaced document used to say. Staging records each change no published graph ha
   `excalibur.graph.auto-build-max-concurrent` across the node. The build takes the namespace's
   replacement lock, as explicit builds and erasure compactions do, and checks again under it
   whether the graph is still behind, so a namespace an explicit build caught up is left alone;
-- not while extraction is asked for but has no API key or could not be wired: a replaced
-  document's old facts are withdrawn whether or not its new ones could be extracted, and a build
-  would publish a graph that lost them with nothing in their place. The status says it is paused;
+- not while extraction is asked for but has no API key, has chat switched off
+  (`excalibur.llm.chat-enabled=false`) or could not be wired: a replaced document's old facts are
+  withdrawn whether or not its new ones could be extracted, and a build would publish a graph that
+  lost them with nothing in their place. The pause covers every namespace and every staged change,
+  so facts asserted with `POST /v1/graph/facts` and retractions are not published automatically
+  either — `POST /v1/graph/build` publishes them. The status says it is paused;
 - not while the graph is withheld for an interrupted erasure, which the erasure sweep applies first.
 
 A failed automatic build is retried after `excalibur.graph.auto-build-failure-backoff-seconds`,
@@ -1678,7 +1686,12 @@ Three stages, cheapest first, each narrowing what the next has to look at:
 Each stage needs something the deployment may not have, and each degrades to the stage beneath it
 rather than failing the question: no stored vectors means no exact rerank, and an embedding endpoint
 that is briefly unavailable means a query with no embedding, which skips the exact rerank for that
-request. No API key means neither rerank, and BM25 answers alone.
+request. The two reranks hang off different endpoints. The exact rerank needs the embedding endpoint
+— it embedded the stored vectors at build time and embeds the question at query time — so a node
+with `excalibur.llm.chat-enabled=false`, or no chat key while it embeds through a server that needs
+none, still has it. The chat rerank needs the chat endpoint in use, and without it the exact
+rerank's order stands. Only a node with neither endpoint in use — the hosted defaults with no key,
+and no keyless server named — ranks by BM25 alone.
 
 ### Namespaces
 
@@ -2675,8 +2688,8 @@ is behind what the namespace has staged — `behind_staging`, with `staged_chang
 `last_staged_change_ms` when it is — and `automatic` what the node is doing about it: `state` is
 `current`, `pending` (waiting for the debounce or the maximum delay), `running`, `backing_off`
 (after a failure, or after several builds in a row were superseded, until `next_attempt_at_ms`),
-`paused` (with `paused_reason`, while extraction is `missing_api_key` or `unavailable`), `withheld`
-or `disabled`; `last_result` is `completed`, `unchanged` (an explicit build got there first),
+`paused` (with `paused_reason`, while extraction is `missing_api_key`, `chat_disabled` or
+`unavailable` — the three states that carry a `warning`), `withheld` or `disabled`; `last_result` is `completed`, `unchanged` (an explicit build got there first),
 `failed` (with `last_error`), `cancelled`, or `superseded` — an erasure was recorded while it ran,
 so its publish was refused and the next pass builds again without it; nothing failed.
 `consecutive_failures` and `consecutive_supersessions` count each in a row. `withheld_facts` on the
@@ -2904,6 +2917,21 @@ curl http://localhost:8080/v1/graph/erasure/7
 the scope selects are gone from the served graph and from the staged facts. An entity erased by
 name reports its `entity_id`, never the name.
 
+Without the id, list what the namespace owes — `state` narrows it to `pending` or `discharged`,
+and `limit` and `cursor` page it as every other listing does:
+
+```bash
+curl 'http://localhost:8080/v1/graph/erasure?state=pending'
+```
+
+```json
+{"namespace": "shared",
+ "requests": [{"request_id": 7, "state": "pending", "scope": "entity", "entity_id": 42,
+               "requested_at_ms": 1756649000000, "discharged_at_ms": null,
+               "detail_retained": true}],
+ "count": 1, "total": 1, "next_cursor": null}
+```
+
 In the source scope, `N` names one ingested document, not a registered source: it is the XxHash64
 (seed 0) of the UTF-8 bytes of the document's key, `<source_id>:<document_id>` — `my-docs:guide.md`
 for the document whose chunks come back from `/v1/query` as `my-docs:guide.md:chunk:N`. It is
@@ -3022,6 +3050,28 @@ issue is a 400. An id the served graph does not hold is a 404. A namespace with 
 served — never built, damaged, or withheld until an interrupted erasure is applied — is a 503 with
 the query's own message, and a namespace that does not exist gets the same 503 and is not created.
 
+`GET /v1/graph/relations` lists the graph's vocabulary — every relation at least one served edge
+uses, in label order, with how many edges use it:
+
+```bash
+curl 'http://localhost:8080/v1/graph/relations?limit=100'
+```
+
+```json
+{"namespace": "shared",
+ "relations": [{"relation": "born_in", "relation_id": 2, "edges": 318},
+               {"relation": "worked_with", "relation_id": 3, "edges": 41}],
+ "next_cursor": null}
+```
+
+The labels are the ones stored, which is what `excalibur.graph.single-valued-relations`, the
+`relation` filter above and a relation a question names are matched against — so a setting or a
+filter is written against what extraction actually called a relationship rather than guessed at.
+A relation whose every fact an erasure removed is not listed. The counts are taken in one pass
+over the graph the first time the vocabulary is asked for and kept until the graph is replaced.
+It pages, answers 503 and treats a namespace that does not exist exactly as the entity listing
+does; `limit` defaults to 100 here, since a vocabulary is usually read whole.
+
 ### Stating facts
 
 Extraction is not the only way in. `POST /v1/graph/facts` stages facts a caller states:
@@ -3108,7 +3158,7 @@ environment rather than by the properties file:
 |----------|---------|---------|
 | `EXCALIBUR_URL` | Base URL of the node | `http://127.0.0.1:8080` |
 | `EXCALIBUR_API_AUTH_TOKEN` | Bearer token, when the node requires one | none |
-| `EXCALIBUR_NAMESPACE` | Default namespace for the tools that take one: the graph tools (`build_graph`, `graph_build_status`, `search_graph`, `cancel_graph_build`), and `ingest_documents` and `crawl_website`, which fix a source's namespace at registration. A call's own `namespace` argument overrides it. `create_namespace` and `delete_namespace` never use it — they act on the namespace the call names, so a drop cannot fall on one the model never mentioned — and `list_namespaces` lists them all. Every other tool serves the whole corpus and sends no namespace, since those routes refuse one | the shared one |
+| `EXCALIBUR_NAMESPACE` | Default namespace for the tools that take one: the graph tools (`build_graph`, `graph_build_status`, `search_graph`, `cancel_graph_build`, `find_graph_entities`, `graph_entity`, `graph_entity_edges`, `list_graph_relations`, `assert_graph_facts`), and `ingest_documents` and `crawl_website`, which fix a source's namespace at registration. A call's own `namespace` argument overrides it. `create_namespace` and `delete_namespace` never use it — they act on the namespace the call names, so a drop cannot fall on one the model never mentioned — and `list_namespaces` lists them all. Every other tool serves the whole corpus and sends no namespace, since those routes refuse one | the shared one |
 | `EXCALIBUR_MCP_TIMEOUT_SECONDS` | Per-request timeout | 60 |
 
 The flags are the ones the node itself runs with — the server lives in the same jar, and the
@@ -3142,7 +3192,7 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `reindex_status` | `source_id` | How far a reindex has got, and whether it finished, failed or was cancelled |
 | `deregister_source` | **`source_id`** | Stops a source being crawled again; the documents already indexed stay |
 | `list_sources` | `source_id` | What each source was registered as — its type, namespace and settings — and whether the node still crawls it — `GET /v1/ingest` |
-| `search_documents` | **`query`**, `top_k`, `offset`, `timeout_ms`, `snippet`, `snippet_chars`, `source_ids` | Searches the indexed documents and returns the matching passages, best first. `offset` pages past the first `top_k`, `timeout_ms` bounds how long the search may run, `snippet` returns a window around the match (`snippet_chars` wide) instead of the whole chunk, and `source_ids` confines the search to those sources |
+| `search_documents` | **`query`**, `top_k`, `offset`, `timeout_ms`, `snippet`, `snippet_chars`, `explain`, `threshold`, `llm_threshold`, `source_ids` | Searches the indexed documents and returns the matching passages, best first. `offset` pages past the first `top_k`, `timeout_ms` bounds how long the search may run, `snippet` returns a window around the match (`snippet_chars` wide) instead of the whole chunk, `explain` says why each passage was returned, `threshold` and `llm_threshold` raise the similarity and relevancy-model floors a passage must clear, and `source_ids` confines the search to those sources |
 | `list_documents` | `source_id`, `limit`, `cursor` | The documents the node holds, a page at a time, with each one's chunk ids |
 | `fetch_documents` | **`document_ids`** | The text of chunks by their ids, in the order asked; `null` for one the node no longer holds |
 | `read_document` | **`source_id`**, **`document_id`**, `include_text`, `limit`, `cursor` | One document whole, its chunks in order with their text unless `include_text` is `false` — `GET /v1/documents/list?document_id=` |
@@ -3152,6 +3202,7 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `cancel_reindex` | **`source_id`** | Stops a running `reindex_source`, keeping what it had already re-indexed |
 | `compact` | `force` | Reclaims the space erased and replaced documents still hold, behind the reply — `POST /v1/compact`. `force` rewrites every segment, the thing to send after a large erasure |
 | `compaction_status` | | How the most recent compaction went — `GET /v1/compact/status` |
+| `node_status` | | Which build is answering and how long it has been up, with the node's own counters: coverage, segments still indexing, open breakers, graph builds and erasures owed — `GET /v1/version` and `GET /v1/stats` in one answer |
 | `cancel_compaction` | | Stops the compaction in progress, keeping what it had reclaimed |
 | `build_graph` | `namespace` | Publishes the staged facts as the served graph |
 | `graph_build_status` | `namespace` | How far a build has got, and what the last one published |
@@ -3161,10 +3212,11 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `erase_documents` | **`source_id`**, `document_ids`, `scope`, `compact`, **`confirm`** | Permanently erases the named documents, or with `scope` `source` everything the source holds, from the corpus and the graph. `confirm` must repeat `source_id` |
 | `delete_namespace` | **`namespace`**, **`confirm`** | Permanently removes a namespace's graph, staged facts and erasure log. `confirm` must repeat `namespace` |
 | `erasure_status` | **`request_id`** | Where an `erase_documents` call stands — `pending`, `applied`, `discharged` or `incomplete` — by the `request_id` its reply carried; `GET /v1/erasure/{request_id}` |
-| `search_graph` | **`query`**, `context_entities`, `as_of`, `direction`, `namespace` | Asks the graph a question, optionally `as_of` a date, an instant or `all` of history, in one `direction`, and in a conversation: `context_entities` names what was mentioned, each with an optional grammatical shape and turn so a pronoun binds the right one |
+| `search_graph` | **`query`**, `context_entities`, `as_of`, `direction`, `timeout_ms`, `namespace` | Asks the graph a question, optionally `as_of` a date, an instant or `all` of history, in one `direction`, and in a conversation: `context_entities` names what was mentioned, each with an optional grammatical shape and turn so a pronoun binds the right one. `timeout_ms` bounds how long the question may run; one that runs out is judged on what was gathered and says `timed_out` |
 | `find_graph_entities` | `name`, `prefix`, `limit`, `cursor`, `namespace` | Finds entities in the served graph by exact name or prefix, ignoring case, with their ids and degrees — `GET /v1/graph/entities` |
 | `graph_entity` | **`entity_id`**, `namespace` | One entity with its facts counted by relation and direction, to choose which relation to page through — `GET /v1/graph/entities/{id}` |
 | `graph_entity_edges` | **`entity_id`**, `relation`, `direction`, `as_of`, `limit`, `cursor`, `namespace` | Lists one entity's facts with their intervals and provenance — `GET /v1/graph/entities/{id}/edges` |
+| `list_graph_relations` | `limit`, `cursor`, `namespace` | The relations the served graph's facts use, with how many use each — the labels `graph_entity_edges` filters by — `GET /v1/graph/relations` |
 | `assert_graph_facts` | **`facts`** (each **`subject`**, **`relation`**, **`object`**, `valid_from`, `valid_to`, `confidence`), `namespace` | Stages facts the model states, served after the next `build_graph` — `POST /v1/graph/facts` |
 
 Arguments in bold are required; every other one is optional and, when left out, is not sent, so
@@ -3174,8 +3226,8 @@ Together they are the whole loop, so a model can prepare a corpus as well as que
 matters: `build_graph` has to run after ingestion finishes - it answers as soon as the build
 starts, so `graph_build_status` is how a model waits for one - and `search_graph` reports that no
 graph is being served until it has. The same holds for `assert_graph_facts`: what it states is
-served after the next `build_graph`, and `find_graph_entities`, `graph_entity` and
-`graph_entity_edges` read only the graph being served.
+served after the next `build_graph`, and `find_graph_entities`, `graph_entity`,
+`graph_entity_edges` and `list_graph_relations` read only the graph being served.
 
 The two ways in are not alternatives either. `ingest_documents` points the node at a directory,
 which has to be inside an allow-listed root - the right policy for a node that goes and reads
@@ -3198,7 +3250,13 @@ erasing it; changing a registration in place (`PUT /v1/ingest`) stays operator-o
 that needs different settings deregisters the source and registers it again under the same id,
 whose first crawl reconciles what is indexed with what the new settings find.
 `compact` frees the space erased and replaced documents still hold - nothing searchable changes -
-and `compaction_status` reads back how it went.
+and `compaction_status` reads back how it went. `node_status` is how a model explains an answer
+that came back degraded or incomplete - segments still indexing, an open embedding breaker - and it
+answers a refusal of either read as that refusal rather than as half a status. The rest of the
+node's own surface stays operator-only: `POST /v1/drain` takes a node out of rotation, which is a
+deployment's decision and not a model's, and `/metrics` is a Prometheus exposition for a scraper,
+counters and histograms that mean something as a series over time rather than read once in a
+conversation.
 
 Two tools do destroy data, `erase_documents` and `delete_namespace`, and both are gated the same
 way. Each requires a `confirm` argument that repeats exactly what it destroys — the `source_id`,
@@ -3209,13 +3267,17 @@ asked for it. `delete_namespace` never falls back on `EXCALIBUR_NAMESPACE`, and 
 tool puts in a path is checked against the node's naming rule first, so `..` or a `/` cannot turn
 it into a different route; the ids `cancel_query` and `erasure_status` put in a path are held to
 the shape the node issues them in, for the same reason. Graph erasure (`POST /v1/graph/erasure`)
-and its read-back stay operator-only: its obligations come from graph erasures and fact
+and its read-backs, the listing and the per-request status, stay operator-only: its obligations come from graph erasures and fact
 retractions, neither of which is a tool, and the graph half of a document erasure is already in
 what `erasure_status` reports.
 
 The two searches are not alternatives. `search_documents` returns the passages that match and
 needs nothing but an ingestion run - the adapter asks the node for the text, because a model has
-no way to resolve a chunk identifier against the store the corpus was ingested from;
+no way to resolve a chunk identifier against the store the corpus was ingested from. It takes
+every `/v1/query` field that changes what a question returns or how it is shown, and leaves out
+the ones that tune how the node goes about it - `oversampling_factor`, `include_partial_segments`
+and `enable_llm_scoring` trade latency against recall and belong to whoever runs the node, so a
+tool call gets the node's configured defaults for them;
 `search_graph` returns entities and the facts connecting them
 and needs a graph, which in turn needs a chat model and `excalibur.graph.extraction-enabled`, off
 by default. A model given only the graph search has nothing to reach the corpus with on an
@@ -3244,7 +3306,9 @@ blank name is left out rather than sent as an object the node would refuse.
 Arguments are checked before anything is sent. One of the wrong type - a number where a string is
 declared, a string where an array is - is returned as a tool error naming the argument rather than
 coerced or dropped, so a model learns what it got wrong. An integer argument accepts `5`, `5.0` or
-`"5"`, and refuses a fraction. A true/false argument accepts `true` or `"true"`, in any case, and
+`"5"`, and refuses a fraction. A number that may be fractional, such as `threshold`, accepts
+`0.5` or `"0.5"` and refuses anything that is not a finite number; its range is the node's to
+enforce, so a value outside it comes back as the node's `400`. A true/false argument accepts `true` or `"true"`, in any case, and
 refuses anything else - `1` and `"yes"` included - rather than guess which was meant. An array is
 forwarded element for element, exactly as the same body sent over HTTP would be: an empty one is
 never dropped, and a blank or space-padded element is neither dropped nor trimmed - what it means
@@ -3758,6 +3822,7 @@ its target, and a standard run without `--capture` exits `1` on one too.
 | `runHnswRecallBenchmark` | `HnswRecallBenchmark` | HNSW recall@10 (target ≥ 99%) |
 | `runMappedFileBenchmark` | `MappedFileBenchmark` | Memory-mapped I/O throughput |
 | `runPointLookupBenchmark` | `PointLookupBenchmark` | Point lookup throughput (target ≥ 10M ops/sec) |
+| `runBenchmark --args='segment'` | `SegmentBenchmark` | Lookups through a whole segment - lock, hash and checksums - sequential, random, batched, with the epoch that keeps a zero-copy slice valid, ten under one read lock, and for absent keys (target ≥ 10M ops/sec for sequential and random) |
 | `runTailScanBenchmark` | `TailScanBenchmark` | Brute-force scan throughput at varying tail sizes |
 
 To compare two builds rather than measure one, `runBenchmarkComparison` runs
@@ -3789,7 +3854,8 @@ run that measured nothing), `3` a combination errored and so was never measured 
 Results are matched to their baseline by benchmark, mode and `@Param` values, so each parameter
 combination is compared with its own baseline rather than with a sibling's.
 
-`CuckooFilterInsertBenchmark` has no task of its own; reach it with
+`SegmentBenchmark` and `CuckooFilterInsertBenchmark` have no task of their own; reach them with
+`./gradlew :excalibur-bench:runBenchmark --args='segment'` and
 `./gradlew :excalibur-bench:runBenchmark --args='cuckoo-insert'` — the runner matches one
 argument against `segment`, `cuckoo` and `cuckoo`+`insert`, so the two words have to arrive as one
 token.
@@ -4244,8 +4310,9 @@ from their sources — so the namespace stops serving it, and `/v1/graph/query` 
 The served graph is what the last build published. Read `freshness` and `automatic` on
 `GET /v1/graph/build/status` with the namespace's header: `behind_staging: true` with `pending`
 means the node rebuilds once staging has been quiet for
-`excalibur.graph.auto-build-debounce-seconds`; `paused` means extraction is not active and nothing
-is built automatically until it is; `backing_off` means the last automatic build failed, and
+`excalibur.graph.auto-build-debounce-seconds`; `paused` means extraction was asked for and is not
+active (`missing_api_key`, `chat_disabled` or `unavailable`) and nothing — asserted facts and
+retractions included — is built automatically until it is; `backing_off` means the last automatic build failed, and
 `last_error` says why — or, with `last_result` `superseded`, that erasures keep arriving while it
 builds, and the attempts are being spaced out; `disabled` means
 `excalibur.graph.auto-build-enabled=false`.
