@@ -72,8 +72,8 @@ import java.util.Optional;
  * subject, relation and object it retracts every asserted fact stating that triple; facts
  * extraction found are never touched by this route. Nothing staged matching is a 404, and
  * nothing is recorded. Add {@code compact=true} to run the compaction now rather than when the
- * erasure policy calls it due - until it runs, the fact is still served, and a build still
- * publishes it.</p>
+ * erasure policy calls it due - until it runs, the graph already published still serves the
+ * fact. No build publishes it again: a build leaves out whatever an outstanding erasure covers.</p>
  *
  * <p>Fact ids are never reused, whether the fact is retracted or its entity erased, so an id in a
  * client's hands never comes to mean another fact.</p>
@@ -374,7 +374,8 @@ public final class GraphFactsEndpoint implements HttpHandler {
             + ",\"outstanding\":" + erasure.outstandingCount()
             + ",\"detail\":" + GraphCatalogJson.quoted(outcome.ran()
                 ? outcome.reason()
-                : "retraction recorded; the fact is served until a compaction applies it ("
+                : "retraction recorded; the fact is served until a compaction applies it, "
+                    + "though no build publishes it again ("
                     + outcome.reason() + ")")
             + "}");
     }

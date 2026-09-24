@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.graph.erasure;
 
 import com.eonmux.excalibur.graph.provenance.Provenance;
+import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.staging.StagedErasure;
 
 import java.util.Collection;
@@ -24,8 +25,15 @@ public final class ScopedStagedErasure implements StagedErasure {
 
     private final List<ErasureScope> scopes;
 
-    private ScopedStagedErasure(List<ErasureScope> scopes) {
+    /**
+     * Whether a snippet of unrecorded origin counts as covered when a scope selects by
+     * provenance. See {@link #withheldFromBuild}.
+     */
+    private final boolean unprovenCovered;
+
+    private ScopedStagedErasure(List<ErasureScope> scopes, boolean unprovenCovered) {
         this.scopes = scopes;
+        this.unprovenCovered = unprovenCovered;
     }
 
     /**
@@ -37,7 +45,37 @@ public final class ScopedStagedErasure implements StagedErasure {
      */
     public static ScopedStagedErasure of(Collection<? extends ErasureScope> scopes) {
         Objects.requireNonNull(scopes, "scopes must not be null");
-        return new ScopedStagedErasure(List.copyOf(scopes));
+        return new ScopedStagedErasure(List.copyOf(scopes), false);
+    }
+
+    /**
+     * What a build must leave out while the given scopes are owed.
+     *
+     * <h3>Why this is not {@link #of(Collection)}</h3>
+     * <p>The two differ over one kind of record: a snippet recorded before origins were kept.
+     * An erasure cannot remove one on a scope that selects by provenance - nothing says the
+     * snippet came from the source named, and removing it would destroy prose nobody asked to
+     * erase - so it keeps it and leaves the request outstanding. A build faces the opposite
+     * question, whether it may publish the snippet, and nothing says the snippet did not come
+     * from that source either. Publishing it could put withdrawn prose back in service, while
+     * leaving it out of one graph destroys nothing: staging keeps it. So a build withholds every
+     * snippet of unrecorded origin for as long as any provenance scope is owed. What it loses is
+     * ranking text for the entities those snippets describe, and only until the obligation is
+     * met or the snippets are re-ingested with their origin.</p>
+     *
+     * <p>Everything else is covered exactly as {@link #of(Collection)} covers it, so a build
+     * leaves out what the erasure compaction will remove and nothing more.</p>
+     *
+     * @param scopes The scopes owed; a record is withheld when any of them covers it
+     * @return The matcher
+     * @throws NullPointerException if {@code scopes} or any scope in it is null
+     */
+    public static ScopedStagedErasure withheldFromBuild(Collection<? extends ErasureScope> scopes) {
+        Objects.requireNonNull(scopes, "scopes must not be null");
+        List<ErasureScope> copied = List.copyOf(scopes);
+        boolean selectsByProvenance = copied.stream()
+            .anyMatch(scope -> !(scope instanceof ErasureScope.Entity));
+        return new ScopedStagedErasure(copied, selectsByProvenance);
     }
 
     /**
@@ -48,7 +86,7 @@ public final class ScopedStagedErasure implements StagedErasure {
      * @throws NullPointerException if {@code scope} is null
      */
     public static ScopedStagedErasure of(ErasureScope scope) {
-        return new ScopedStagedErasure(List.of(Objects.requireNonNull(scope, "scope")));
+        return new ScopedStagedErasure(List.of(Objects.requireNonNull(scope, "scope")), false);
     }
 
     @Override
@@ -64,6 +102,9 @@ public final class ScopedStagedErasure implements StagedErasure {
 
     @Override
     public boolean erasesSnippet(int entityId, Provenance provenance) {
+        if (unprovenCovered && provenance.sourceType() == SourceType.UNKNOWN) {
+            return true;
+        }
         for (ErasureScope scope : scopes) {
             if (covers(scope, entityId, entityId, provenance)) {
                 return true;

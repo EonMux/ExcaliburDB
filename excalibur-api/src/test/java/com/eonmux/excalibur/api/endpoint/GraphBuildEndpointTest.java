@@ -37,6 +37,7 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -206,6 +207,53 @@ class GraphBuildEndpointTest {
                 "staged_facts"}) {
                 assertThat(Json.at(json, field)).as("field %s", field).isNotNull();
             }
+        }
+
+        @Test
+        @DisplayName("a build reports the staged facts it left out for an outstanding erasure")
+        void theWithheldFactsAreReported() throws IOException {
+            try (NamespaceRegistry.Lease<com.eonmux.excalibur.api.bootstrap.GraphTenant> lease =
+                     tenants.borrow(NamespaceId.SHARED)) {
+                List<Long> facts = lease.resource().staging().assertFacts(List.of(
+                    com.eonmux.excalibur.graph.staging.AssertedFact.always("Ada", "knows",
+                        "Babbage"),
+                    com.eonmux.excalibur.graph.staging.AssertedFact.always("Babbage", "designed",
+                        "Engine")));
+                lease.resource().erasureService().submit(
+                    new com.eonmux.excalibur.graph.erasure.ErasureScope.Source(
+                        SourceType.USER_ASSERTED, facts.get(0)));
+            }
+
+            call(build, "POST", null);
+            Object json = awaitState(null, GraphBuildRunner.STATE_COMPLETED);
+
+            assertThat(Json.at(json, "published")).isEqualTo(Boolean.TRUE);
+            assertThat(Json.at(json, "edges")).isEqualTo(1L);
+            assertThat(Json.at(json, "staged_facts")).isEqualTo(2L);
+            assertThat(Json.at(json, "withheld_facts"))
+                .as("the retracted fact is still staged, and was not published")
+                .isEqualTo(1L);
+        }
+
+        @Test
+        @DisplayName("a build with every staged fact owed to an erasure says so")
+        void everyFactWithheldIsExplained() throws IOException {
+            try (NamespaceRegistry.Lease<com.eonmux.excalibur.api.bootstrap.GraphTenant> lease =
+                     tenants.borrow(NamespaceId.SHARED)) {
+                List<Long> facts = lease.resource().staging().assertFacts(List.of(
+                    com.eonmux.excalibur.graph.staging.AssertedFact.always("Ada", "knows",
+                        "Babbage")));
+                lease.resource().erasureService().submit(
+                    new com.eonmux.excalibur.graph.erasure.ErasureScope.Source(
+                        SourceType.USER_ASSERTED, facts.get(0)));
+            }
+
+            call(build, "POST", null);
+            Object json = awaitState(null, GraphBuildRunner.STATE_COMPLETED);
+
+            assertThat(Json.at(json, "published")).isEqualTo(Boolean.FALSE);
+            assertThat(Json.at(json, "withheld_facts")).isEqualTo(1L);
+            assertThat(Json.stringAt(json, "message")).contains("owed to an outstanding erasure");
         }
 
         @Test
@@ -734,7 +782,7 @@ class GraphBuildEndpointTest {
             entered.countDown();
             await(release);
             return new com.eonmux.excalibur.api.bootstrap.GraphBuildService.BuildOutcome(
-                false, false, 0, 0, 0, 0, 0, 0);
+                false, false, 0, 0, 0, 0, 0, 0, 0);
         };
     }
 

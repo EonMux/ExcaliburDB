@@ -48,7 +48,7 @@ class GraphAutoBuilderTest {
     private static final NamespaceId BETA = NamespaceId.of("beta");
     private static final NamespaceId GAMMA = NamespaceId.of("gamma");
     private static final GraphBuildService.BuildOutcome PUBLISHED =
-        new GraphBuildService.BuildOutcome(true, false, 3, 2, 1, 2, 0, 3);
+        new GraphBuildService.BuildOutcome(true, false, 3, 2, 1, 2, 0, 3, 0);
 
     private final MutableClock clock = new MutableClock(T0);
     private final FakeNamespaces namespaces = new FakeNamespaces();

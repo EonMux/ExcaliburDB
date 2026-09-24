@@ -21,6 +21,32 @@ import com.eonmux.excalibur.graph.provenance.Provenance;
 public interface StagedErasure {
 
     /**
+     * Covers nothing: what a build withholds when no erasure is owed.
+     */
+    StagedErasure NOTHING = new StagedErasure() {
+        @Override
+        public boolean erasesFact(int subject, int relation, int object, int validFrom,
+                                  int validTo, Provenance provenance) {
+            return false;
+        }
+
+        @Override
+        public boolean erasesSnippet(int entityId, Provenance provenance) {
+            return false;
+        }
+
+        @Override
+        public boolean erasesLabel(int entityId) {
+            return false;
+        }
+
+        @Override
+        public String toString() {
+            return "StagedErasure.NOTHING";
+        }
+    };
+
+    /**
      * Whether one staged fact must be removed.
      *
      * @param subject    Subject entity id

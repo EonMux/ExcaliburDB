@@ -47,6 +47,7 @@ import java.util.Optional;
  *   "entities_with_text": 3180,
  *   "entities_with_vectors": 3180,
  *   "staged_facts": 12840,
+ *   "withheld_facts": 0,
  *   "retired": false,
  *   "freshness": {
  *     "behind_staging": true,
@@ -83,6 +84,14 @@ import java.util.Optional;
  * replaced by nothing or removed - reports {@code "retired": true}: the namespace stops serving
  * the graph those facts built, since serving it would go on answering with documents that are
  * gone.</p>
+ *
+ * <p>{@code withheld_facts} counts staged facts the build left out because an outstanding
+ * erasure obligation covers them - a retracted fact, an erased entity's, a withdrawn document's -
+ * which staging still holds until a compaction applies the obligation. A build never publishes
+ * those, and a build that would have published nothing else retires the graph that held them.
+ * An obligation recorded while a build runs fails that build, with an {@code error} saying so,
+ * rather than letting it publish what it read before the obligation existed; the graph it would
+ * have replaced goes on being served and stays behind, so the next build publishes without it.</p>
  *
  * <h2>Whether the graph is current</h2>
  * <p>{@code freshness} says whether the served graph is behind what the namespace has staged:
@@ -228,8 +237,11 @@ public final class GraphBuildStatusEndpoint implements HttpHandler {
         }
         GraphBuildService.BuildOutcome outcome = snapshot.outcome();
         if (outcome != null && outcome.retired()) {
-            json.append(", \"message\": \"Every staged fact has been withdrawn, so this "
-                + "namespace no longer serves the graph they built\"");
+            json.append(", \"message\": \"Every staged fact has been withdrawn or is owed to "
+                + "an erasure, so this namespace no longer serves the graph they built\"");
+        } else if (outcome != null && !outcome.published() && outcome.withheld() > 0) {
+            json.append(", \"message\": \"Every staged fact is owed to an outstanding erasure, "
+                + "so nothing was published\"");
         } else if (outcome != null && !outcome.published() && outcome.staged() == 0) {
             // The outcome a caller most needs explained: a completed build that changed nothing.
             json.append(", \"message\": \"").append(JsonText.escape(nothingStaged(extraction)))
@@ -280,6 +292,7 @@ public final class GraphBuildStatusEndpoint implements HttpHandler {
             .append(", \"entities_with_text\": ").append(outcome.indexed())
             .append(", \"entities_with_vectors\": ").append(outcome.embedded())
             .append(", \"staged_facts\": ").append(outcome.staged())
+            .append(", \"withheld_facts\": ").append(outcome.withheld())
             .append(", \"retired\": ").append(outcome.retired());
     }
 }

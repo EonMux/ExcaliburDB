@@ -525,8 +525,9 @@ here so the surface is complete in one table; the shapes are kept in one place r
 they cannot disagree. [Reading the graph by entity](README.md#reading-the-graph-by-entity) covers
 the entity listings, their cursors and filters, and
 [Stating facts](README.md#stating-facts) covers asserting and retracting facts: what a fact id is,
-why a stated fact is not served until the next build, and why a retracted one is served until a
-compaction applies the retraction.
+why a stated fact is not served until the next build, and why a retracted one is served by the
+graph already published until a compaction applies the retraction, though no build publishes it
+again.
 
 ### Error codes
 

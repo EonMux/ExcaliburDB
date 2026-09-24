@@ -1520,7 +1520,26 @@ A failed automatic build is retried after `excalibur.graph.auto-build-failure-ba
 doubling with each further failure up to `excalibur.graph.auto-build-max-failure-backoff-seconds`.
 An erasure compaction is not a change to publish: it rewrites staging and the served graph alike.
 A build that finds every staged fact withdrawn — its documents all removed — stops serving the
-graph they built rather than going on answering from it. A node upgraded from one that kept no
+graph they built rather than going on answering from it.
+
+No build, automatic or asked for, publishes what an outstanding erasure obligation covers. An
+obligation — a retracted fact, an erased entity, a withdrawn document — is owed from the moment it
+is recorded, but staging holds what it covers until the compaction that applies it, which the
+erasure policy may not call due for an hour. So every build reads the namespace's erasure log
+under the replacement lock before it reads staging and leaves out of every artifact it publishes
+whatever an outstanding obligation covers: the facts from the edge store, the names from the
+dictionary and the label index (each is published as its `(erased N)` placeholder), and the
+prose from the entity documents and the vectors computed from them. While any obligation selects
+by source or extractor version, prose staged before origins were recorded is left out too, since
+nothing can show it did not come from what was withdrawn. An obligation recorded while a build is
+running is not one it left out, so the build's publish — the renames that put it in place — is
+refused if one arrived: the build fails with an error saying so, publishes nothing, the graph it
+would have replaced goes on being served, and the namespace stays behind so the next build
+publishes without it. The renames and the check are one step against a new obligation, so a
+request accepted after them is simply owed against the new graph. Leaving a fact out of a build
+does not discharge anything: staging still holds it, and the obligation stays `pending` until a
+compaction erases it there and records it met. `withheld_facts` on the build status counts what
+was left out, and a build that would publish nothing else retires the graph that held it. A node upgraded from one that kept no
 marker notices staged facts written after its graph was built, from the files' times, when the
 namespace opens.
 
@@ -1697,7 +1716,8 @@ graph when it next opens the namespace. A compaction rewrites the served files, 
 graph first and waits for running queries to finish before touching them; a query that is still
 running thirty seconds later is failed rather than left to hold up the erasure. Builds and
 compactions of one namespace are serialised against each other, so a build cannot republish facts
-a compaction is removing.
+a compaction is removing — nor facts an obligation no compaction has yet applied covers, which
+every build leaves out (see [Keeping the graph current](#keeping-the-graph-current)).
 
 A compaction publishes its rewritten graph by the same two renames a build does, so the same
 recovery covers a crash in either. Its obligations are marked discharged only once that publish is
@@ -2554,6 +2574,7 @@ curl http://localhost:8080/v1/graph/build/status
   "entities_with_text": 5210,
   "entities_with_vectors": 5210,
   "staged_facts": 19004,
+  "withheld_facts": 0,
   "retired": false,
   "freshness": {"behind_staging": false, "withheld": false},
   "automatic": {"enabled": true, "state": "current", "debounce_seconds": 60,
@@ -2566,6 +2587,12 @@ curl http://localhost:8080/v1/graph/build/status
 `state` is `idle`, `running`, `completed`, `cancelled` or `failed`. One build runs at a time across
 the node — it saturates the same disk and the same embedding endpoint either way — so a second
 `POST` while one is in flight is refused with `409` naming the namespace that holds it.
+
+`withheld_facts` is how many staged facts the build left out because an outstanding erasure
+obligation covers them; they stay staged, and the obligation `pending`, until a compaction applies
+it. A build that would have published nothing else answers `"published": false` with a `message`
+saying so. A build overtaken by an obligation recorded while it ran ends `failed`, with an `error`
+naming the request, and publishes nothing; the next build leaves that obligation out too.
 
 The top-level fields describe the last build asked for. `freshness` says whether the served graph
 is behind what the namespace has staged — `behind_staging`, with `staged_changes_since_ms` and
@@ -2771,7 +2798,11 @@ curl -X POST http://localhost:8080/v1/graph/erasure \
 
 202, not 200: accepting is not removing. The obligation is recorded durably before this answers, so
 it survives a restart, and a compaction rewrites the edges out when the ratio or the latency bound
-says it is due. `"compact": true` in the request forces it immediately, for a caller under a
+says it is due. Until then the graph already published still serves what the obligation covers,
+but no build publishes it again: every build, automatic or asked for, leaves out whatever an
+outstanding obligation covers, and one overtaken by a new obligation publishes nothing. That is
+not a discharge — the data is still staged — so the request stays `pending` until the compaction.
+`"compact": true` in the request forces it immediately, for a caller under a
 deadline that has to be able to say the data is gone. The scopes are
 `{"scope":"entity","entity_id":N}`, `{"scope":"entity","entity_name":"Ada Lovelace"}`,
 `{"scope":"source","source_type":"DOCUMENT","source_id":N}` and
@@ -2970,8 +3001,9 @@ exact labels; a fact extraction found is never touched by this route — erase i
 that. Nothing staged to retract is a 404 and records nothing, as is a namespace that does not
 exist, which is not created. Otherwise the answer is 202 with the `fact_ids` retracted, their
 `request_ids`, and the compaction outcome. As with any erasure, accepting is not removing: until a
-compaction runs the fact is still served, and a build still publishes it. `compact=true` runs one
-now. An entity-scoped erasure covers asserted facts as it covers extracted ones.
+compaction runs the fact is still staged and still served by the graph already published, though
+no build publishes it again — every build leaves out what an outstanding erasure covers.
+`compact=true` runs one now. An entity-scoped erasure covers asserted facts as it covers extracted ones.
 
 The provenance source types are `UNKNOWN`, `DOCUMENT` and `USER_ASSERTED`, and those are what
 `"scope": "source"` accepts. Three more were defined and never produced — a knowledge-base import, a

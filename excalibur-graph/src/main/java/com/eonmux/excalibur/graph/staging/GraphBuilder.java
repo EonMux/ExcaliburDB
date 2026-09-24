@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
@@ -79,9 +80,12 @@ public final class GraphBuilder {
      * @param edges      how many facts were written into the store
      * @param entities   how many entity ids the store addresses
      * @param relations  how many distinct relations were named
+     * @param withheld   how many staged facts were left out because an outstanding erasure
+     *                   obligation covers them; see {@link PublishFence}
      * @param directory  where the store was published
      */
-    public record BuildResult(long edges, int entities, int relations, Path directory) {
+    public record BuildResult(long edges, int entities, int relations, long withheld,
+                              Path directory) {
     }
 
     /**
@@ -145,16 +149,47 @@ public final class GraphBuilder {
      */
     public static BuildResult buildInto(GraphStagingStore staging, Path target,
                                         SupersessionPolicy supersession) throws IOException {
+        return buildInto(staging, target, supersession, StagedErasure.NOTHING);
+    }
+
+    /**
+     * Writes the edge store and its dictionaries into the scratch directory, leaving out what
+     * {@code withheld} covers, without publishing.
+     *
+     * <h3>What is left out</h3>
+     * <p>A fact {@code withheld} covers is not replayed into the store, and a label it covers is
+     * written to the entity dictionary as its {@link LabelInterner#erasedLabel placeholder} - the
+     * one the erasure compaction will later put in staging itself - so the graph reads exactly as
+     * one built after that compaction would. Ids do not move, so the store still addresses every
+     * id staging has assigned. Supersession runs over what is kept: a withheld statement does not
+     * close the interval of the one before it, as it would not once erased. Staging is only
+     * read.</p>
+     *
+     * <p>A build that withholds every staged fact has nothing to publish, and its scratch
+     * directory is removed rather than left for the next build to find.</p>
+     *
+     * @param staging      The facts to build from
+     * @param target       Where the graph will be served from
+     * @param supersession Which relations hold one value at a time
+     * @param withheld     What to leave out
+     * @return What was built; {@code edges() == 0} means nothing is left to publish
+     * @throws IOException if the store cannot be written
+     * @throws NullPointerException if any argument is null
+     */
+    public static BuildResult buildInto(GraphStagingStore staging, Path target,
+                                        SupersessionPolicy supersession, StagedErasure withheld)
+            throws IOException {
         Objects.requireNonNull(staging, "staging must not be null");
         Objects.requireNonNull(target, "target must not be null");
         Objects.requireNonNull(supersession, "supersession must not be null");
+        Objects.requireNonNull(withheld, "withheld must not be null");
 
         staging.flush();
         long stagedCount = staging.stagedCount();
         int entityCount = staging.entityCount();
         if (stagedCount == 0 || entityCount == 0) {
             LOGGER.info("nothing staged for {}; leaving the existing graph in place", target);
-            return new BuildResult(0, entityCount, staging.relationCount(), target);
+            return new BuildResult(0, entityCount, staging.relationCount(), 0, target);
         }
 
         Path scratch = scratchFor(target);
@@ -170,17 +205,59 @@ public final class GraphBuilder {
         // In the order the facts were staged, which is supersession's last tie-break: of two
         // statements from different sources that nothing else orders, the one staged later is
         // the one that superseded the other.
-        long written = staging.forEachStaged(
-            (subject, relation, object, validFrom, validTo, statedOn, provenance) ->
-                writer.add(subject, relation, object, validFrom, validTo, statedOn, provenance));
+        long[] left = new long[1];
+        long replayed = staging.forEachStaged(
+            (subject, relation, object, validFrom, validTo, statedOn, provenance) -> {
+                if (withheld.erasesFact(subject, relation, object, validFrom, validTo,
+                        provenance)) {
+                    left[0]++;
+                    return;
+                }
+                writer.add(subject, relation, object, validFrom, validTo, statedOn, provenance);
+            });
+        long written = replayed - left[0];
+        if (written == 0) {
+            deleteRecursively(scratch);
+            LOGGER.info("every one of the {} fact(s) staged for {} is covered by an outstanding "
+                + "erasure; nothing is left to publish", replayed, target);
+            return new BuildResult(0, entityCount, staging.relationCount(), left[0], target);
+        }
 
         writer.build(scratch, entityCount);
-        writeDictionary(scratch, ENTITY_DICTIONARY, staging.entityLabels());
+        writeDictionary(scratch, ENTITY_DICTIONARY, entityLabels(staging, withheld));
         writeDictionary(scratch, RELATION_DICTIONARY, staging.relationLabels());
 
-        LOGGER.info("assembled graph for {}: {} facts, {} entities, {} relations",
-            target, written, entityCount, staging.relationCount());
-        return new BuildResult(written, entityCount, staging.relationCount(), target);
+        LOGGER.info("assembled graph for {}: {} facts, {} entities, {} relations, {} staged "
+            + "fact(s) left out for outstanding erasures", target, written, entityCount,
+            staging.relationCount(), left[0]);
+        return new BuildResult(written, entityCount, staging.relationCount(), left[0], target);
+    }
+
+    /**
+     * The entity labels a build names its ids by: staging's, with every label {@code withheld}
+     * covers replaced by its {@link LabelInterner#erasedLabel placeholder}.
+     *
+     * <p>Public because every artifact a build derives from labels - the dictionary here, and the
+     * label index and entity documents a caller writes into the same scratch directory - has to
+     * name the same entities the same way.</p>
+     *
+     * @param staging  The store holding the assignments
+     * @param withheld What to leave out
+     * @return One label per entity id, in id order
+     * @throws NullPointerException if an argument is null
+     */
+    public static List<String> entityLabels(GraphStagingStore staging, StagedErasure withheld) {
+        Objects.requireNonNull(staging, "staging must not be null");
+        Objects.requireNonNull(withheld, "withheld must not be null");
+        List<String> labels = staging.entityLabels();
+        if (withheld == StagedErasure.NOTHING) {
+            return labels;
+        }
+        List<String> named = new ArrayList<>(labels.size());
+        for (int id = 0; id < labels.size(); id++) {
+            named.add(withheld.erasesLabel(id) ? LabelInterner.erasedLabel(id) : labels.get(id));
+        }
+        return List.copyOf(named);
     }
 
     /**
@@ -331,10 +408,37 @@ public final class GraphBuilder {
      */
     public static <T> T publish(Path scratch, Path target, Durability durability,
                                 Opener<T> opener) throws IOException {
+        return publish(scratch, target, durability, opener, PublishFence.NONE);
+    }
+
+    /**
+     * As {@link #publish(Path, Path, Durability, Opener)}, with the renames run through
+     * {@code fence}.
+     *
+     * <p>Only the renames and the sync that makes them durable run inside it: forcing the build
+     * comes first and opening it after, because each can take as long as the graph is large, and
+     * an erasure recorded meanwhile would wait for all of it. A refused swap moves nothing, so
+     * the graph served before is still served and the scratch directory is left where it is, for
+     * the caller to discard - it holds what the refusing obligation may cover.</p>
+     *
+     * @param <T>        What opening the graph produces
+     * @param scratch    Where the build was assembled
+     * @param target     Where it is to be served from
+     * @param durability How the assembled build and the published name are forced
+     * @param opener     Opens the published graph
+     * @param fence      Admits or refuses the renames
+     * @return What {@code opener} returned
+     * @throws PublishRefusedException if the fence refused the renames
+     * @throws IOException if the build cannot be forced, a move fails, or the opener fails
+     * @throws NullPointerException if any argument is null
+     */
+    public static <T> T publish(Path scratch, Path target, Durability durability,
+                                Opener<T> opener, PublishFence fence) throws IOException {
         Objects.requireNonNull(scratch, "scratch must not be null");
         Objects.requireNonNull(target, "target must not be null");
         Objects.requireNonNull(durability, "durability must not be null");
         Objects.requireNonNull(opener, "opener must not be null");
+        Objects.requireNonNull(fence, "fence must not be null");
 
         Path previous = previousFor(target);
         recoverInterruptedPublish(target);
@@ -344,26 +448,29 @@ public final class GraphBuilder {
         durability.fsyncTree(scratch);
 
         boolean hadPrevious = Files.exists(target);
-        if (hadPrevious) {
-            Files.move(target, previous, StandardCopyOption.ATOMIC_MOVE);
-        }
-        try {
-            Files.move(scratch, target, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException e) {
-            if (hadPrevious) {
-                // Put back what was being served rather than leaving the target absent.
-                Files.move(previous, target, StandardCopyOption.ATOMIC_MOVE);
-            }
-            throw e;
-        }
-
-        // Both renames happened in the parent, and a forced file whose name is not yet durable
-        // can come back with no directory entry pointing at it. Forced before the previous graph
-        // is deleted, so the new one is reachable by name before the fallback stops existing.
         Path parent = target.getParent();
-        if (parent != null) {
-            durability.fsyncDirectory(parent);
-        }
+        fence.swap(() -> {
+            if (hadPrevious) {
+                Files.move(target, previous, StandardCopyOption.ATOMIC_MOVE);
+            }
+            try {
+                Files.move(scratch, target, StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException e) {
+                if (hadPrevious) {
+                    // Put back what was being served rather than leaving the target absent.
+                    Files.move(previous, target, StandardCopyOption.ATOMIC_MOVE);
+                }
+                throw e;
+            }
+
+            // Both renames happened in the parent, and a forced file whose name is not yet
+            // durable can come back with no directory entry pointing at it. Forced before the
+            // previous graph is deleted, so the new one is reachable by name before the fallback
+            // stops existing.
+            if (parent != null) {
+                durability.fsyncDirectory(parent);
+            }
+        });
 
         T opened;
         try {
