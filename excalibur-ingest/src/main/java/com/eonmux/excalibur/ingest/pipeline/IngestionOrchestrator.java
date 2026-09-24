@@ -23,6 +23,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
@@ -208,8 +210,14 @@ public class IngestionOrchestrator {
      *
      * @param thread The thread carrying it out
      * @param stop   How it is asked to stop
+     * @param ended  Released once the run has left the storage engine alone and given up its
+     *               claim on the source
      */
-    private record Run(Thread thread, StopSignal stop) {
+    private record Run(Thread thread, StopSignal stop, CountDownLatch ended) {
+
+        Run(Thread thread, StopSignal stop) {
+            this(thread, stop, new CountDownLatch(1));
+        }
     }
 
     /**
@@ -433,6 +441,7 @@ public class IngestionOrchestrator {
         if (shutdown.get()) {
             synchronousIngestions.remove(sourceId, run);
             activeIngestions.remove(sourceId);
+            run.ended().countDown();
             throw new IllegalStateException("The node is shutting down and is not ingesting");
         }
 
@@ -462,6 +471,7 @@ public class IngestionOrchestrator {
         } finally {
             synchronousIngestions.remove(sourceId, run);
             activeIngestions.remove(sourceId);
+            run.ended().countDown();
             // Cleared before the thread goes back to whatever it was doing. Nothing this class
             // delivers is still set by now, but an interrupt from elsewhere that arrived after the
             // run's last check was addressed to this run, and this is a request thread from a
@@ -534,23 +544,26 @@ public class IngestionOrchestrator {
         LOGGER.info("Starting background ingestion for source: {}", sourceId);
 
         StopSignal stop = new StopSignal();
+        CountDownLatch ended = new CountDownLatch(1);
         Thread worker = Thread.ofVirtual().name("ingestion-" + sourceId).unstarted(() -> {
             try {
                 runIngestion(source, stop);
             } finally {
                 ingestionThreads.remove(sourceId);
                 activeIngestions.remove(sourceId);
+                ended.countDown();
             }
         });
         // Published before the flag is read, for the reason ingestNow gives: shutdown() stops
         // and joins what is in this map, so a worker that enters it afterwards is one nothing
         // waits for. Registered unstarted, so backing out here costs no thread.
-        Run run = new Run(worker, stop);
+        Run run = new Run(worker, stop, ended);
         ingestionThreads.put(sourceId, run);
         if (shutdown.get()) {
             LOGGER.warn("Cannot start ingestion: orchestrator is shutting down");
             ingestionThreads.remove(sourceId, run);
             activeIngestions.remove(sourceId);
+            ended.countDown();
             return;
         }
         worker.start();
@@ -983,20 +996,55 @@ public class IngestionOrchestrator {
      */
     public boolean stopIngestion(String sourceId) {
         Objects.requireNonNull(sourceId, "sourceId cannot be null");
-        // Either kind of run. A source can be in flight on a background thread or on the request
-        // thread that supplied its documents, and an operator asking for one to stop does not
-        // know or care which - looking only at the background threads meant a synchronous run
-        // could not be stopped at all.
-        Run run = ingestionThreads.get(sourceId);
-        if (run == null) {
-            run = synchronousIngestions.get(sourceId);
-        }
+        Run run = runOf(sourceId);
         if (run == null) {
             return false;
         }
         LOGGER.info("Stopping ingestion of source {}", sourceId);
         run.stop().request();
         return true;
+    }
+
+    /**
+     * Stops the ingestion of one source and waits for the run to end.
+     *
+     * <p>What an erasure needs, where {@link #stopIngestion} is only what a deregistration needs.
+     * An erasure reads the registry for the source's documents and deletes what it finds; a run
+     * still in flight registers the document it is writing after that read, and the document
+     * outlives the erasure that was meant to take it. Waiting for the run to end closes that
+     * window: once this returns true, every document the run registered is in the registry, and
+     * no run of this source is writing.</p>
+     *
+     * <p>A run stops at its next document boundary, so the wait is about one document's fetch,
+     * embedding and writes. False means the run was still going when the wait ran out - still
+     * writing, and still holding the source's claim.</p>
+     *
+     * @param sourceId      The source whose ingestion should stop
+     * @param timeoutMillis How long to wait for the run to end
+     * @return true if no run of the source was in flight, or the one that was has ended
+     * @throws InterruptedException if the calling thread is interrupted while waiting
+     */
+    public boolean stopIngestionAndAwait(String sourceId, long timeoutMillis)
+            throws InterruptedException {
+        Objects.requireNonNull(sourceId, "sourceId cannot be null");
+        Run run = runOf(sourceId);
+        if (run == null) {
+            return true;
+        }
+        LOGGER.info("Stopping ingestion of source {} and waiting for it to end", sourceId);
+        run.stop().request();
+        return run.ended().await(Math.max(0, timeoutMillis), TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * The run of a source in flight, of either kind.
+     *
+     * <p>A source can be in flight on a background thread or on the request thread that supplied
+     * its documents, and a caller asking for it to stop does not know or care which.</p>
+     */
+    private Run runOf(String sourceId) {
+        Run run = ingestionThreads.get(sourceId);
+        return run != null ? run : synchronousIngestions.get(sourceId);
     }
 
     /**

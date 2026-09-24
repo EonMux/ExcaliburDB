@@ -171,10 +171,10 @@ public interface SourceRegistry extends AutoCloseable {
      * <p>Registration starts more than a map entry: an ingestion run, a status entry and a place
      * in the re-crawl schedule. An implementation that removed only the entry would leave the node
      * crawling a source no request can name and reporting one that no longer exists, so a removal
-     * must stop all three and close the source it owns. The schedule's own work counts too: a
-     * re-crawl already running is stopped and, within a bound, waited for before this returns,
-     * because a caller erasing the source removes its documents next and a re-crawl still writing
-     * would put them back.</p>
+     * must stop all three and close the source it owns. The runs are stopped and, within a bound,
+     * waited for before this returns - the ingestion run and a re-crawl alike - because a caller
+     * erasing the source removes its documents next and a run still writing would put them back.
+     * {@link #removeSource(String)} says whether they ended within it.</p>
      *
      * <p>What it must <em>not</em> touch is the documents the source contributed. Stopping a crawl
      * and erasing what it produced are different operations, and only one of them is reversible.</p>
@@ -183,6 +183,50 @@ public interface SourceRegistry extends AutoCloseable {
      * @return true if a source was registered under that id
      */
     boolean remove(String sourceId);
+
+    /**
+     * Removes a source as {@link #remove(String)} does, and says whether its runs have ended.
+     *
+     * <p>The removal stands either way. What the second half answers is whether anything of the
+     * source is still writing: a run that did not reach its next document boundary within the
+     * bound is still finishing a document, and a caller about to erase the source's documents
+     * must not read the registry until it has.</p>
+     *
+     * <p>The default reports the runs as ended, for a registry with no runs behind it.</p>
+     *
+     * @param sourceId The source ID to remove
+     * @return Whether a source was registered under that id, and whether its runs have ended
+     */
+    default Removal removeSource(String sourceId) {
+        return new Removal(remove(sourceId), true);
+    }
+
+    /**
+     * Stops every run writing under a source id, and waits for them within the same bound a
+     * removal uses.
+     *
+     * <p>Whether or not the id is registered: documents supplied directly are ingested under an
+     * id no registration holds, and an erasure of that id needs the run ended just as much as a
+     * crawl's. Nothing else about the id is touched.</p>
+     *
+     * <p>The default reports nothing in flight, for a registry with no runs behind it.</p>
+     *
+     * @param sourceId The source id whose runs should end
+     * @return true if no run under the id is in flight any longer
+     */
+    default boolean stopRuns(String sourceId) {
+        return true;
+    }
+
+    /**
+     * What a removal did.
+     *
+     * @param registered Whether a source was registered under the id
+     * @param stopped    Whether every run of the source has ended; false when one was still
+     *                   finishing a document when the bound ran out
+     */
+    record Removal(boolean registered, boolean stopped) {
+    }
 
     /**
      * Stops an ingestion run without touching the registration behind it.

@@ -495,7 +495,7 @@ class DocumentErasureEndpointTest {
             // being erased. When that step fails the documents have to stay: erasing them and
             // leaving the source scheduled reports an obligation as met and then undoes it.
             SourceRegistry refusing = mock(SourceRegistry.class);
-            when(refusing.remove("docs"))
+            when(refusing.removeSource("docs"))
                 .thenThrow(new SourceCatalogException("catalog is unwritable", new IOException()));
             endpoint = new DocumentErasureEndpoint(
                 new DocumentErasureService(registry, storageAdapter(), null, null), refusing);
@@ -508,6 +508,73 @@ class DocumentErasureEndpointTest {
             assertThat(response.body())
                 .as("the reply names no path on this node")
                 .doesNotContain("catalog is unwritable");
+        }
+
+        @Test
+        @DisplayName("a run still writing when the wait runs out erases nothing, and says so")
+        void aRunThatWillNotStopErasesNothing() throws IOException {
+            // Erasing what the registry names so far would miss the document the run registers
+            // once it finishes, and the reply and the receipt would report the source erased.
+            SourceRegistry busy = mock(SourceRegistry.class);
+            when(busy.removeSource("docs")).thenReturn(new SourceRegistry.Removal(true, false));
+            endpoint = new DocumentErasureEndpoint(
+                new DocumentErasureService(registry, storageAdapter(), null, null), busy);
+            ingest("docs", "a.md", 1);
+
+            Response response = post("{\"source_id\": \"docs\", \"scope\": \"source\"}");
+
+            assertThat(response.status()).isEqualTo(409);
+            assertThat(Json.at(response.json(), "code")).isEqualTo("source_busy");
+            assertThat(response.body())
+                .as("the caller is told the deregistration took effect, and to repeat")
+                .contains("deregistered")
+                .contains("repeat the request");
+            assertThat(response.body()).doesNotContain("request_id");
+            assertThat(storage).as("nothing was erased").isNotEmpty();
+        }
+
+        @Test
+        @DisplayName("the repeat of a refused erasure waits out the run and erases the source")
+        void theRepeatOfARefusedErasureCompletes() throws IOException {
+            // The deregistration stood, so the repeat finds no registration. What it still has
+            // to wait for is the run the first request left finishing its document.
+            SourceRegistry busy = mock(SourceRegistry.class);
+            when(busy.removeSource("docs"))
+                .thenReturn(new SourceRegistry.Removal(true, false))
+                .thenReturn(new SourceRegistry.Removal(false, true));
+            when(busy.stopRuns("docs")).thenReturn(true);
+            endpoint = new DocumentErasureEndpoint(
+                new DocumentErasureService(registry, storageAdapter(), null, null), busy);
+            ingest("docs", "a.md", 1);
+
+            assertThat(post("{\"source_id\": \"docs\", \"scope\": \"source\"}").status())
+                .isEqualTo(409);
+            Response repeat = post("{\"source_id\": \"docs\", \"scope\": \"source\"}");
+
+            assertThat(repeat.status()).isEqualTo(200);
+            assertThat(Json.at(repeat.json(), "documents_erased")).isEqualTo(1L);
+            assertThat(storage).isEmpty();
+            verify(busy).stopRuns("docs");
+        }
+
+        @Test
+        @DisplayName("a run under an id no registration holds is waited for before the erasure")
+        void aSuppliedRunIsWaitedFor() throws IOException {
+            // Documents supplied directly run under an id the source registry never held.
+            SourceRegistry none = mock(SourceRegistry.class);
+            when(none.removeSource("docs")).thenReturn(new SourceRegistry.Removal(false, true));
+            when(none.stopRuns("docs")).thenReturn(false);
+            endpoint = new DocumentErasureEndpoint(
+                new DocumentErasureService(registry, storageAdapter(), null, null), none);
+            ingest("docs", "a.md", 1);
+
+            Response response = post("{\"source_id\": \"docs\", \"scope\": \"source\"}");
+
+            assertThat(response.status()).isEqualTo(409);
+            assertThat(response.body())
+                .as("nothing was deregistered, so the reply does not claim it")
+                .doesNotContain("has been deregistered");
+            assertThat(storage).isNotEmpty();
         }
 
         @Test

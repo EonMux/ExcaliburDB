@@ -1698,6 +1698,87 @@ class IngestionPipelineTest {
         }
 
         @Test
+        @DisplayName("a stop that waits returns once the run has ended, its document written")
+        void aStopThatWaitsOutlastsTheRun() throws Exception {
+            // An erasure reads the registry once the run is stopped. A run still finishing its
+            // document registers it after that read, and the document outlives the erasure.
+            IngestionOrchestrator orchestrator = orchestrator();
+            CountDownLatch inFetch = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            AtomicReference<String> inFlight = new AtomicReference<>();
+            FakeSource source = new FakeSource("awaited", Map.of(
+                "a.txt", "the document in flight when the stop arrives",
+                "b.txt", "the document after it")) {
+                @Override
+                public FetchedDocument fetch(String documentId)
+                        throws SourceException, DocumentNotFoundException {
+                    if (inFlight.compareAndSet(null, documentId)) {
+                        inFetch.countDown();
+                        awaitIgnoringInterrupts(release);
+                    }
+                    return super.fetch(documentId);
+                }
+            };
+
+            orchestrator.startIngestion(source);
+            assertThat(inFetch.await(30, TimeUnit.SECONDS)).isTrue();
+            CompletableFuture<Boolean> stopped = new CompletableFuture<>();
+            Thread stopping = new Thread(() -> {
+                try {
+                    stopped.complete(orchestrator.stopIngestionAndAwait("awaited", 30_000));
+                } catch (InterruptedException e) {
+                    stopped.completeExceptionally(e);
+                }
+            }, "stopping-ingestion");
+            stopping.start();
+            awaitTimedWaiting(stopping);
+            assertThat(stopped).as("the run is still writing its document").isNotDone();
+            release.countDown();
+
+            assertThat(stopped.get(30, TimeUnit.SECONDS)).isTrue();
+            assertThat(orchestrator.isIngestionActive("awaited"))
+                .as("the claim on the source is given up before the wait returns")
+                .isFalse();
+            assertThat(storedChunkExists("awaited", inFlight.get(), 0))
+                .as("the document under way was finished before the wait returned")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("a stop that waits waits for a run on the caller's thread too")
+        void aStopThatWaitsCoversASynchronousRun() throws Exception {
+            CountDownLatch inFetch = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            FakeSource source = new FakeSource("supplied", Map.of("a.txt", "supplied text")) {
+                @Override
+                public FetchedDocument fetch(String documentId)
+                        throws SourceException, DocumentNotFoundException {
+                    inFetch.countDown();
+                    awaitIgnoringInterrupts(release);
+                    return super.fetch(documentId);
+                }
+            };
+            IngestionOrchestrator orchestrator = orchestrator();
+            Thread supplying = new Thread(() -> orchestrator.ingestNow(source), "supplying");
+            supplying.setDaemon(true);
+            supplying.start();
+            assertThat(inFetch.await(30, TimeUnit.SECONDS)).isTrue();
+
+            assertThat(orchestrator.stopIngestionAndAwait("supplied", 20))
+                .as("the run is held in its fetch, past a short wait")
+                .isFalse();
+            release.countDown();
+            assertThat(orchestrator.stopIngestionAndAwait("supplied", 30_000)).isTrue();
+            assertThat(orchestrator.isIngestionActive("supplied")).isFalse();
+        }
+
+        @Test
+        @DisplayName("a stop that waits has nothing to wait for on an idle source")
+        void aStopThatWaitsOnAnIdleSource() throws Exception {
+            assertThat(orchestrator().stopIngestionAndAwait("never-started", 0)).isTrue();
+        }
+
+        @Test
         @DisplayName("a source id is required")
         void sourceIdIsRequired() {
             assertThatThrownBy(() -> orchestrator().stopIngestion(null))

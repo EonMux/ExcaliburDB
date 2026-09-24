@@ -104,6 +104,7 @@ class SourceDeregisterEndpointTest {
         Response response = delete("{\"source_id\": \"project-docs\"}");
 
         assertThat(Json.at(response.json(), "documents_kept")).isEqualTo(Boolean.TRUE);
+        assertThat(Json.at(response.json(), "runs_stopped")).isEqualTo(Boolean.TRUE);
         assertThat(Json.stringAt(response.json(), "detail")).contains("/v1/erasure");
     }
 
@@ -142,12 +143,29 @@ class SourceDeregisterEndpointTest {
     }
 
     @Test
+    @DisplayName("a run that outlives the wait is reported, and the deregistration stands")
+    void aRunThatWillNotStopIsReported() throws IOException {
+        // A 200 that said crawling stopped would be untrue while the run is still writing; a
+        // failure would be untrue too, because the source is deregistered and stays so.
+        SourceRegistry busy = mock(SourceRegistry.class);
+        when(busy.removeSource("project-docs"))
+            .thenReturn(new SourceRegistry.Removal(true, false));
+        endpoint = new SourceDeregisterEndpoint(busy);
+
+        Response response = delete("{\"source_id\": \"project-docs\"}");
+
+        assertThat(response.status()).isEqualTo(200);
+        assertThat(response.body()).contains("\"runs_stopped\": false");
+        assertThat(response.body()).contains("still finishing a document");
+    }
+
+    @Test
     @DisplayName("a deregistration that could not be recorded is not reported as done")
     void anUnrecordableDeregistrationIsRefused() throws IOException {
         // The source is still registered and still on the crawl schedule. A 200 here would tell
         // the caller a crawl had stopped that starts itself again at the next boot.
         SourceRegistry refusing = mock(SourceRegistry.class);
-        when(refusing.remove("project-docs"))
+        when(refusing.removeSource("project-docs"))
             .thenThrow(new SourceCatalogException("catalog is unwritable", new IOException()));
         endpoint = new SourceDeregisterEndpoint(refusing);
 

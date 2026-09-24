@@ -1173,12 +1173,19 @@ belongs to whoever owns the source.
 `DELETE /v1/ingest` stops a crawl without destroying anything, which is the ordinary case — a source
 moved, a feed went stale, a job finished. It is a separate route from erasure on purpose: an
 operator stopping a runaway crawl should not have to reach for the button that also deletes. Both go
-through the same removal, which stops an ingestion run in flight, stops a re-crawl in flight and
-waits for it to end, clears the source's `/v1/ingest/status` and `/v1/reindex/status` entries and
-cancels its place in the re-crawl schedule. The re-crawl is waited for — up to thirty seconds,
-which is one document's fetch, embedding and writes — because it finishes the document it is on
-when asked to stop, and a document that landed after an erasure had looked would put back what
-the erasure removed.
+through the same removal, which stops an ingestion run and a re-crawl in flight and waits for both
+to end, clears the source's `/v1/ingest/status` and `/v1/reindex/status` entries and cancels its
+place in the re-crawl schedule. The runs are waited for — up to thirty seconds for the two together,
+which is one document's fetch, embedding and writes — because a run finishes the document it is on
+when asked to stop, and a document that landed after an erasure had looked would put back what the
+erasure removed. A source-scoped erasure waits the same way for a run of documents supplied under
+the id through `POST /v1/documents`, which no registration holds.
+
+When the wait runs out with a run still writing, neither route pretends otherwise. The
+deregistration stands either way. `DELETE /v1/ingest` still answers `200`, with `runs_stopped:
+false`. A source-scoped erasure erases nothing and answers `409 source_busy`: erasing what the
+registry named so far would miss the document the run is finishing and report the source erased
+over it. No receipt is recorded, and the request is simply repeated once the run has stopped.
 
 It reaches the vector indexes too. Every HNSW node of an erased document is retired in each
 segment's graph as part of the request, before the response is sent, so from then on no vector query
@@ -4159,9 +4166,10 @@ reply is a `202` rather than a `200` until it is done.
 
 **How do I remove everything one source contributed?**
 `POST /v1/erasure` with `{"source_id": "...", "scope": "source"}` — no document ids, which the node
-looks up itself. It also deregisters the source first — stopping a re-crawl already running and
-waiting for it to end — so neither the scheduler nor a run in flight can put back what you just
-erased. Each request erases up to a thousand documents and reports `documents_remaining`; repeat
+looks up itself. It also deregisters the source first — stopping an ingestion run or re-crawl
+already running and waiting for it to end — so neither the scheduler nor a run in flight can put
+back what you just erased; a run still writing after thirty seconds is answered with
+`409 source_busy` and nothing erased, and the request is repeated. Each request erases up to a thousand documents and reports `documents_remaining`; repeat
 until that is zero — and watch `documents_incomplete` alongside it, because a document the node
 could not fully erase is answered with a `500` and stays in the registry, so a loop keyed only on
 `documents_remaining` will never finish. The documents may still exist in the source, and nothing
