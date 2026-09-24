@@ -13,14 +13,16 @@ import java.util.TreeSet;
 /**
  * Notices that a data directory moved while it was being copied.
  *
- * <h2>Why this exists at all</h2>
- * <p>Nothing in this engine takes an exclusive lock on its data directory. There is no lock
- * file, no pid file and no OS-level exclusion; two processes on the same directory are
- * prevented by convention only. So a snapshot cannot ask whether a node is running, and any
- * claim it made that one was not would be a claim it had no way to check.</p>
+ * <h2>Why this exists beside the lock</h2>
+ * <p>A node holds its data directory's lock for as long as it runs, and a snapshot takes the
+ * same lock before it copies anything, so a node of this build that is running is refused at
+ * the door and one cannot start during the copy. That covers the writers that take the lock.
+ * It does not cover one that does not: a build older than the lock, a node started with the
+ * lock file deleted underneath it, a filesystem whose locks are not honoured across hosts, or a
+ * snapshot taken with {@code --allow-live}. This is the check that still sees those.</p>
  *
- * <h2>What it can do instead</h2>
- * <p>It can notice that one is. The directory is fingerprinted before the copy and again
+ * <h2>What it does</h2>
+ * <p>It notices a writer. The directory is fingerprinted before the copy and again
  * after it, and a file that grew, shrank, appeared, vanished or was rewritten in place
  * between the two is proof that something was writing. That is a one-sided test - a node
  * that happened to write nothing during the copy looks exactly like a node that was not
@@ -55,7 +57,12 @@ public final class QuiescenceProbe {
         Objects.requireNonNull(dataDir, "dataDir");
         List<Path> files;
         try (var walk = Files.walk(dataDir)) {
-            files = walk.filter(Files::isRegularFile).toList();
+            // Not the lock file, whose record changes whenever a holder takes it, and not a
+            // restore's scratch: neither is copied, so neither moving tears the image.
+            files = walk.filter(Files::isRegularFile)
+                .filter(file -> !com.eonmux.excalibur.core.datadir.ReservedNames.isReserved(
+                    dataDir.relativize(file).toString().replace('\\', '/')))
+                .toList();
         }
         var observed = new TreeMap<String, FileStat>();
         for (Path file : files) {

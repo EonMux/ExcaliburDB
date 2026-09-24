@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.backup.snapshot;
 
+import com.eonmux.excalibur.core.datadir.ReservedNames;
 import com.eonmux.excalibur.store.ObsoleteSidecars;
 
 import java.io.IOException;
@@ -21,6 +22,13 @@ import java.util.Objects;
  * holding {@code graph-staging/} and, once a build has run, {@code graph/}. A directory an
  * earlier build wrote may also hold {@code segment_N.tfs}, a term sketch this build has no use
  * for; it is {@link Inclusion#OBSOLETE} and never copied.</p>
+ *
+ * <h2>What is not listed at all</h2>
+ * <p>The entries that coordinate processes rather than hold data - the lock file every node
+ * takes, and a restore's journal and scratch ({@link ReservedNames}) - are left out of the
+ * inventory entirely, rather than listed as omitted. They describe a process, not the store: an
+ * image carrying the lock file would hand a stale holder's record to whatever restored it, and
+ * listing it as omitted on every snapshot would be noise about a file that is always there.</p>
  *
  * <h2>Why the classification is a table and not a filter</h2>
  * <p>An unrecognised file is kept, not dropped. A build newer than this tool will write
@@ -67,10 +75,10 @@ public final class DataDirectoryInventory {
     }
 
     /**
-     * Walks a data directory and classifies every regular file under it.
+     * Walks a data directory and classifies every regular file under it that holds data.
      *
      * @param dataDir The directory
-     * @return Every file, in sorted path order
+     * @return Every file but the reserved entries, in sorted path order
      * @throws IOException          if the directory cannot be walked
      * @throws NullPointerException if dataDir is null
      */
@@ -82,6 +90,7 @@ public final class DataDirectoryInventory {
         try (var walk = Files.walk(dataDir)) {
             return walk.filter(Files::isRegularFile)
                 .map(file -> relativize(dataDir, file))
+                .filter(path -> !ReservedNames.isReserved(path))
                 .sorted(Comparator.naturalOrder())
                 .map(path -> new ClassifiedFile(path, classify(path), reason(path)))
                 .toList();

@@ -6,6 +6,6 @@
  * torn image that will be discovered to be useless at the worst possible moment. What is
  * here instead is an image taken from a stopped node, described by a manifest that names
  * every file with its length and its checksums, checkable without being restored, and
- * restored by staging beside the target and renaming on.</p>
+ * restored in place under the data directory's lock, one journaled step at a time.</p>
  */
 package com.eonmux.excalibur.backup;

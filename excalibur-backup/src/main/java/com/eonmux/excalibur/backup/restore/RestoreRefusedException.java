@@ -6,8 +6,9 @@ import java.util.Objects;
 /**
  * A restore this tool declined to perform.
  *
- * <p>The target is untouched when this is thrown. That is the point of it: the checks that
- * raise it all run before a single byte is written, and the write itself is one rename.</p>
+ * <p>The target's data is untouched when this is thrown. That is the point of it: the checks
+ * that raise it all run before anything of the image is written. At most, a target that did not
+ * exist is created and removed again, and a lock file is left in one that did.</p>
  *
  * @author ExcaliburDB
  */
@@ -34,7 +35,17 @@ public final class RestoreRefusedException extends IOException {
          * <p>Most of the time this is the wrong target. When it is the right one, saying
          * so explicitly is a second of work against the alternative.</p>
          */
-        TARGET_NOT_EMPTY
+        TARGET_NOT_EMPTY,
+
+        /**
+         * Another process holds the target's lock: a node is running on it, or an
+         * {@code excalibur-fsck --repair} or another restore is.
+         *
+         * <p>Replacing a directory under a live node would leave the node serving files that
+         * are no longer there and writing into ones that belong to the image. Stop the holder
+         * and restore again.</p>
+         */
+        TARGET_IN_USE
     }
 
     /** Why this one was refused. */

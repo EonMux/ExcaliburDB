@@ -10,6 +10,9 @@ import com.eonmux.excalibur.backup.snapshot.SnapshotOptions;
 import com.eonmux.excalibur.backup.snapshot.SnapshotWriter;
 import com.eonmux.excalibur.backup.testing.DataDirectoryFixture;
 import com.eonmux.excalibur.backup.verify.VerifyDepth;
+import com.eonmux.excalibur.core.datadir.DataDirectoryLock;
+import com.eonmux.excalibur.core.datadir.DataDirectoryLockedException;
+import com.eonmux.excalibur.core.datadir.InterruptedRestore;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -18,13 +21,17 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 /**
  * What a restore must refuse.
@@ -34,6 +41,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * discovered halfway through with the original already gone; it must not overwrite a
  * directory that holds anything, because the operator who typed the wrong target has no
  * second chance; and when it does refuse, the target must be exactly as it was.
+ *
+ * <p>And it must work where data directories actually live. The target is replaced in place,
+ * never renamed, so a mount point is restored like any other directory; and because that
+ * replacement is a sequence of renames rather than one, every way the sequence can stop - an
+ * entry that will not move, an unwinding that fails too, the process dying between two renames
+ * - is driven here and shown to end in the image or in what was there before, never in a
+ * mixture a node would start on.</p>
  */
 @DisplayName("Restoring a data directory from a snapshot")
 class SnapshotRestorerTest {
@@ -238,23 +252,26 @@ class SnapshotRestorerTest {
             .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM));
 
         assertThat(target.resolve("stale-file"))
-            .as("a swap leaves the snapshot's tree, not a merge of the two").doesNotExist();
+            .as("a restore leaves the snapshot's tree, not a merge of the two").doesNotExist();
         assertThat(target.resolve("catalog.dat")).exists();
     }
 
     @Test
-    @DisplayName("restoring stages beside the target and swaps, leaving no scratch behind")
-    void restoreLeavesNoScratchDirectory() throws IOException {
+    @DisplayName("restoring leaves no journal or scratch in the target, and nothing beside it")
+    void restoreLeavesNoScratch() throws IOException {
         Path snapshotDir = snapshot();
-        Path target = tempDir.resolve("restored");
+        Path parent = Files.createDirectories(tempDir.resolve("volume"));
+        Path target = parent.resolve("restored");
 
-        new SnapshotRestorer()
+        RestoreResult result = new SnapshotRestorer()
             .restore(new RestoreOptions(snapshotDir, target, false, VerifyDepth.CHECKSUM));
 
-        try (var siblings = Files.list(tempDir)) {
-            assertThat(siblings.map(p -> p.getFileName().toString()))
-                .noneMatch(name -> name.contains(SnapshotLayout.STAGING_INFIX));
-        }
+        assertThat(result.recovery()).isEmpty();
+        assertThat(namesIn(target))
+            .noneMatch(name -> InterruptedRestore.isRestoreEntry(name)
+                && !name.equals(DataDirectoryLock.FILE_NAME));
+        assertThat(namesIn(parent)).containsExactly("restored");
+        assertThat(DataDirectoryFixture.digestTree(target)).isEqualTo(imageOf(snapshotDir));
     }
 
     @Test
@@ -295,98 +312,480 @@ class SnapshotRestorerTest {
     }
 
     @Test
-    @DisplayName("a swap that fails puts the displaced target back as it was")
-    void failedSwapRestoresTheDisplacedTarget() throws IOException {
+    @DisplayName("a target whose parent cannot be written - a mount point - is restored in place")
+    void aMountPointIsRestoredInPlace() throws IOException {
         Path snapshotDir = snapshot();
-        Path parent = Files.createDirectories(tempDir.resolve("volume"));
-        Path target = Files.createDirectories(parent.resolve("live"));
-        DataDirectoryFixture.writeRandom(target.resolve("catalog.dat"), 4096, 903L);
-        DataDirectoryFixture.writeRandom(target.resolve("nested/segment_0.dat"), 2048, 904L);
+        Path parent = Files.createDirectories(tempDir.resolve("root-owned"));
+        Path target = Files.createDirectories(parent.resolve("var-lib-excalibur"));
+        DataDirectoryFixture.writeRandom(target.resolve("stale-file"), 4096, 906L);
+        DataDirectoryFixture.writeRandom(target.resolve("nested/stale"), 1024, 907L);
+        Set<PosixFilePermission> writable = Files.getPosixFilePermissions(parent);
+        Files.setPosixFilePermissions(parent, PosixFilePermissions.fromString("r-xr-xr-x"));
+        try {
+            assumeFalse(Files.isWritable(parent), "running as a user who can write anywhere");
+
+            new SnapshotRestorer()
+                .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM));
+        } finally {
+            Files.setPosixFilePermissions(parent, writable);
+        }
+
+        assertThat(DataDirectoryFixture.digestTree(target))
+            .as("the target's name never moved, and it now holds exactly the image")
+            .isEqualTo(imageOf(snapshotDir));
+        assertThat(target.resolve("nested")).doesNotExist();
+    }
+
+    @Test
+    @DisplayName("a target holding only the lock file a stopped node left counts as empty")
+    void aTargetHoldingOnlyALockFileIsEmpty() throws IOException {
+        Path snapshotDir = snapshot();
+        Path target = Files.createDirectories(tempDir.resolve("stopped-node"));
+        DataDirectoryLock.acquire(target, "excalibur node").close();
+
+        new SnapshotRestorer()
+            .restore(new RestoreOptions(snapshotDir, target, false, VerifyDepth.CHECKSUM));
+
+        assertThat(DataDirectoryFixture.digestTree(target)).isEqualTo(imageOf(snapshotDir));
+    }
+
+    @Test
+    @DisplayName("a target another holder has locked is refused, and left as it was")
+    void aHeldTargetIsRefused() throws IOException {
+        Path snapshotDir = snapshot();
+        Path target = Files.createDirectories(tempDir.resolve("live"));
+        DataDirectoryFixture.writeRandom(target.resolve("catalog.dat"), 4096, 908L);
         Map<String, String> before = DataDirectoryFixture.digestTree(target);
 
-        SnapshotRestorer restorer = new SnapshotRestorer(failingOnto(target, false));
+        try (DataDirectoryLock held = DataDirectoryLock.acquire(target, "excalibur node")) {
+            assertThatThrownBy(() -> new SnapshotRestorer()
+                .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM)))
+                .isInstanceOf(RestoreRefusedException.class)
+                .hasMessageContaining(target.toString())
+                .hasMessageContaining("Nothing was restored")
+                .extracting(e -> ((RestoreRefusedException) e).reason())
+                .isEqualTo(RestoreRefusedException.Reason.TARGET_IN_USE);
+        }
+        assertThat(DataDirectoryFixture.digestTree(target)).isEqualTo(before);
+    }
+
+    @Test
+    @DisplayName("the target is locked while the restore writes it")
+    void theTargetIsLockedWhileRestoring() throws IOException {
+        Path snapshotDir = snapshot();
+        Path target = tempDir.resolve("restored");
+        List<Boolean> lockedDuringInstall = new ArrayList<>();
+        SnapshotRestorer restorer = new SnapshotRestorer((source, destination) -> {
+            lockedDuringInstall.add(isHeld(target));
+            Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE);
+        });
+
+        restorer.restore(new RestoreOptions(snapshotDir, target, false, VerifyDepth.CHECKSUM));
+
+        assertThat(lockedDuringInstall).isNotEmpty().containsOnly(true);
+        assertThat(isHeld(target)).as("and released once it is done").isFalse();
+    }
+
+    @Test
+    @DisplayName("an entry that will not move in is unwound, putting the target back")
+    void aFailedInstallIsUnwound() throws IOException {
+        Path snapshotDir = snapshot();
+        Path target = occupiedTarget();
+        Map<String, String> before = DataDirectoryFixture.digestTree(target);
+        SnapshotRestorer restorer = new SnapshotRestorer(failing(Step.INSTALL, "routing.dir"));
 
         assertThatThrownBy(() -> restorer
             .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM)))
             .isInstanceOf(IOException.class)
-            .hasMessageContaining("the swap onto the target failed");
+            .hasMessageContaining("routing.dir will not move")
+            .satisfies(failure -> assertThat(failure.getSuppressed()).isEmpty());
 
         assertThat(DataDirectoryFixture.digestTree(target))
-            .as("the operator must be left with the directory they had, not with none")
+            .as("the entries already installed went back, and the displaced ones returned")
             .isEqualTo(before);
-        try (var siblings = Files.list(parent)) {
-            assertThat(siblings.map(p -> p.getFileName().toString()))
-                .as("neither the staged tree nor the displaced one may be left beside it")
-                .containsExactly("live");
-        }
+        assertThat(restoreEntriesIn(target)).isEmpty();
     }
 
     @Test
-    @DisplayName("a rollback that fails too is reported on the failure, not lost")
-    void failedRollbackIsAttachedToTheFailure() throws IOException {
+    @DisplayName("an entry that will not move aside is unwound, putting the target back")
+    void aFailedDisplaceIsUnwound() throws IOException {
+        Path snapshotDir = snapshot();
+        Path target = occupiedTarget();
+        Map<String, String> before = DataDirectoryFixture.digestTree(target);
+        SnapshotRestorer restorer = new SnapshotRestorer(failing(Step.DISPLACE, "nested"));
+
+        assertThatThrownBy(() -> restorer
+            .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM)))
+            .isInstanceOf(IOException.class)
+            .hasMessageContaining("nested will not move");
+
+        assertThat(DataDirectoryFixture.digestTree(target)).isEqualTo(before);
+        assertThat(restoreEntriesIn(target)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("a failed restore into a target it created removes the target again")
+    void aFailedRestoreRemovesTheTargetItCreated() throws IOException {
         Path snapshotDir = snapshot();
         Path parent = Files.createDirectories(tempDir.resolve("volume"));
-        Path target = Files.createDirectories(parent.resolve("live"));
-        DataDirectoryFixture.writeRandom(target.resolve("catalog.dat"), 4096, 905L);
+        Path target = parent.resolve("fresh");
+        SnapshotRestorer restorer = new SnapshotRestorer(failing(Step.INSTALL, "routing.dir"));
 
-        SnapshotRestorer restorer = new SnapshotRestorer(failingOnto(target, true));
+        assertThatThrownBy(() -> restorer
+            .restore(new RestoreOptions(snapshotDir, target, false, VerifyDepth.CHECKSUM)))
+            .isInstanceOf(IOException.class);
+
+        assertThat(namesIn(parent)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("an unwinding that fails too leaves the journal, and the next restore finishes it")
+    void aFailedUnwindingIsFinishedByTheNextRestore() throws IOException {
+        Path snapshotDir = snapshot();
+        Path target = occupiedTarget();
+        Map<String, String> before = DataDirectoryFixture.digestTree(target);
+        SnapshotRestorer restorer = new SnapshotRestorer(
+            failing(Step.INSTALL, "routing.dir").or(failing(Step.UNINSTALL, "catalog.dat")));
 
         assertThatThrownBy(() -> restorer
             .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM)))
             .isInstanceOf(IOException.class)
             .satisfies(failure -> assertThat(failure.getSuppressed())
                 .anySatisfy(suppressed -> assertThat(suppressed)
-                    .hasMessageContaining("the rollback failed")));
-        try (var siblings = Files.list(parent)) {
-            assertThat(siblings.map(p -> p.getFileName().toString()))
-                .as("the displaced directory is still there, under the name the error gives")
-                .anyMatch(name -> name.contains(SnapshotLayout.STAGING_INFIX + "replaced-"));
-        }
+                    .hasMessageContaining("could not be unwound")
+                    .hasMessageContaining("excalibur-backup restore")));
+        assertThatThrownBy(() -> InterruptedRestore.requireNoneIn(target))
+            .as("a node refuses the directory while it is a mixture")
+            .isInstanceOf(IOException.class);
+
+        assertThatThrownBy(() -> new SnapshotRestorer()
+            .restore(new RestoreOptions(snapshotDir, target, false, VerifyDepth.CHECKSUM)))
+            .as("the rerun finishes the unwinding, and then, without --force, refuses to "
+                + "replace what it put back")
+            .isInstanceOf(RestoreRefusedException.class)
+            .extracting(e -> ((RestoreRefusedException) e).reason())
+            .isEqualTo(RestoreRefusedException.Reason.TARGET_NOT_EMPTY);
+        assertThat(DataDirectoryFixture.digestTree(target)).isEqualTo(before);
+        assertThat(restoreEntriesIn(target)).isEmpty();
+        InterruptedRestore.requireNoneIn(target);
     }
 
     @Test
-    @DisplayName("a swap that fails with no previous target leaves nothing behind")
-    void failedSwapWithNoPreviousTargetLeavesNothing() throws IOException {
+    @DisplayName("a crash while installing is carried forward to the image by the next restore")
+    void aCrashWhileInstallingIsCarriedForward() throws IOException {
         Path snapshotDir = snapshot();
-        Path parent = Files.createDirectories(tempDir.resolve("volume"));
-        Path target = parent.resolve("fresh");
+        Path target = occupiedTarget();
+        SnapshotRestorer crashing = new SnapshotRestorer(crashing(Step.INSTALL, 3));
 
-        SnapshotRestorer restorer = new SnapshotRestorer(failingOnto(target, false));
-
-        assertThatThrownBy(() -> restorer
-            .restore(new RestoreOptions(snapshotDir, target, false, VerifyDepth.CHECKSUM)))
+        assertThatThrownBy(() -> crashing
+            .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM)))
+            .isInstanceOf(Crash.class);
+        assertThat(RestoreJournal.read(target)).hasValueSatisfying(journal ->
+            assertThat(journal.phase()).isEqualTo(RestoreJournal.Phase.INSTALLING));
+        assertThatThrownBy(() -> InterruptedRestore.requireNoneIn(target))
             .isInstanceOf(IOException.class);
-        try (var siblings = Files.list(parent)) {
-            assertThat(siblings).isEmpty();
+
+        RestoreResult rerun = new SnapshotRestorer()
+            .restore(new RestoreOptions(snapshotDir, target, false, VerifyDepth.CHECKSUM));
+
+        assertThat(rerun.recovery()).hasValueSatisfying(recovery ->
+            assertThat(recovery).contains("completed"));
+        assertThat(DataDirectoryFixture.digestTree(target)).isEqualTo(imageOf(snapshotDir));
+        assertThat(restoreEntriesIn(target)).isEmpty();
+        InterruptedRestore.requireNoneIn(target);
+    }
+
+    @Test
+    @DisplayName("a crash while moving the old entries aside is carried forward too")
+    void aCrashWhileDisplacingIsCarriedForward() throws IOException {
+        Path snapshotDir = snapshot();
+        Path target = occupiedTarget();
+        SnapshotRestorer crashing = new SnapshotRestorer(crashing(Step.DISPLACE, 1));
+
+        assertThatThrownBy(() -> crashing
+            .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM)))
+            .isInstanceOf(Crash.class);
+
+        new SnapshotRestorer()
+            .restore(new RestoreOptions(snapshotDir, target, false, VerifyDepth.CHECKSUM));
+
+        assertThat(DataDirectoryFixture.digestTree(target)).isEqualTo(imageOf(snapshotDir));
+        assertThat(restoreEntriesIn(target)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("a crash while unwinding is unwound by the next restore")
+    void aCrashWhileUnwindingIsUnwound() throws IOException {
+        Path snapshotDir = snapshot();
+        Path target = occupiedTarget();
+        Map<String, String> before = DataDirectoryFixture.digestTree(target);
+        SnapshotRestorer crashing = new SnapshotRestorer(
+            failing(Step.INSTALL, "routing.dir").or(crashing(Step.UNDISPLACE, 1)));
+
+        assertThatThrownBy(() -> crashing
+            .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM)))
+            .isInstanceOf(Crash.class);
+        assertThat(RestoreJournal.read(target)).hasValueSatisfying(journal ->
+            assertThat(journal.phase()).isEqualTo(RestoreJournal.Phase.UNDISPLACING));
+
+        new SnapshotRestorer()
+            .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM));
+
+        assertThat(DataDirectoryFixture.digestTree(target))
+            .as("unwound first, then restored again since --force was given")
+            .isEqualTo(imageOf(snapshotDir))
+            .isNotEqualTo(before);
+    }
+
+    @Test
+    @DisplayName("a restore of another image finishes the interrupted one, then its own")
+    void anInterruptedRestoreOfAnotherImageIsFinishedFirst() throws IOException {
+        Path snapshotDir = snapshot();
+        Path otherData = Files.createDirectories(tempDir.resolve("other-data"));
+        DataDirectoryFixture.writeRandom(otherData.resolve("catalog.dat"), 2048, 909L);
+        Path otherSnapshot = tempDir.resolve("other-snap");
+        new SnapshotWriter().take(new SnapshotOptions(otherData, otherSnapshot, true, false));
+        Path target = occupiedTarget();
+        assertThatThrownBy(() -> new SnapshotRestorer(crashing(Step.INSTALL, 2))
+            .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM)))
+            .isInstanceOf(Crash.class);
+
+        RestoreResult rerun = new SnapshotRestorer()
+            .restore(new RestoreOptions(otherSnapshot, target, true, VerifyDepth.CHECKSUM));
+
+        String interrupted = ManifestCodec.read(snapshotDir.resolve(ManifestCodec.FILE_NAME))
+            .snapshotId();
+        assertThat(rerun.recovery()).hasValueSatisfying(recovery -> assertThat(recovery)
+            .contains(interrupted).contains("completed"));
+        assertThat(DataDirectoryFixture.digestTree(target)).isEqualTo(imageOf(otherSnapshot));
+    }
+
+    @Test
+    @DisplayName("a journal left while the image was still being staged is discarded")
+    void aStagingJournalIsDiscarded() throws IOException {
+        Path snapshotDir = snapshot();
+        Path target = Files.createDirectories(tempDir.resolve("restored"));
+        RestoreJournal journal = RestoreJournal.begin("an-earlier-image");
+        journal.write(target);
+        DataDirectoryFixture.writeRandom(journal.stagingIn(target).resolve("catalog.dat"), 100,
+            910L);
+
+        RestoreResult result = new SnapshotRestorer()
+            .restore(new RestoreOptions(snapshotDir, target, false, VerifyDepth.CHECKSUM));
+
+        assertThat(result.recovery()).hasValueSatisfying(recovery ->
+            assertThat(recovery).contains("an-earlier-image").contains("undone"));
+        assertThat(DataDirectoryFixture.digestTree(target)).isEqualTo(imageOf(snapshotDir));
+        assertThat(restoreEntriesIn(target)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("a journal that cannot be read is refused, and nothing is moved")
+    void anUnreadableJournalIsRefused() throws IOException {
+        Path snapshotDir = snapshot();
+        Path target = occupiedTarget();
+        Files.writeString(target.resolve(InterruptedRestore.JOURNAL_FILE_NAME), "garbage\n");
+        Map<String, String> before = DataDirectoryFixture.digestTree(target);
+
+        assertThatThrownBy(() -> new SnapshotRestorer()
+            .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM)))
+            .isInstanceOf(IOException.class)
+            .hasMessageContaining("cannot be read")
+            .hasMessageContaining(InterruptedRestore.DISPLACED_PREFIX);
+
+        assertThat(DataDirectoryFixture.digestTree(target)).isEqualTo(before);
+    }
+
+    @Test
+    @DisplayName("a target that is a file is refused")
+    void aFileTargetIsRefused() throws IOException {
+        Path snapshotDir = snapshot();
+        Path target = Files.writeString(tempDir.resolve("a-file"), "x");
+
+        assertThatThrownBy(() -> new SnapshotRestorer()
+            .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM)))
+            .isInstanceOf(IOException.class)
+            .hasMessageContaining("is a file");
+        assertThat(target).hasContent("x");
+    }
+
+    @Test
+    @DisplayName("a journal survives a round trip, and a scratch name leaving the target is refused")
+    void theJournalRoundTripsAndConfinesItsNames() {
+        RestoreJournal journal = RestoreJournal.begin("snap-1")
+            .at(RestoreJournal.Phase.UNINSTALLING);
+
+        assertThat(RestoreJournal.parse(journal.render().lines().toList())).isEqualTo(journal);
+        assertThatThrownBy(() -> new RestoreJournal(RestoreJournal.Phase.STAGING, "snap-1",
+            InterruptedRestore.STAGING_PREFIX + "../../etc", journal.displaced()))
+            .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new RestoreJournal(RestoreJournal.Phase.STAGING, "snap-1",
+            "elsewhere", journal.displaced()))
+            .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> RestoreJournal.parse(List.of(RestoreJournal.HEADER,
+            "phase=STAGING")))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("snapshot");
+        assertThatThrownBy(() -> RestoreJournal.parse(List.of(RestoreJournal.HEADER, "junk")))
+            .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new RestoreJournal(RestoreJournal.Phase.STAGING, " ",
+            journal.staging(), journal.displaced()))
+            .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    /**
+     * Creates a target that holds a data directory of its own, a nested one included.
+     *
+     * @return The target
+     * @throws IOException if it cannot be written
+     */
+    private Path occupiedTarget() throws IOException {
+        Path target = Files.createDirectories(tempDir.resolve("live"));
+        DataDirectoryFixture.writeRandom(target.resolve("catalog.dat"), 4096, 903L);
+        DataDirectoryFixture.writeRandom(target.resolve("nested/segment_0.dat"), 2048, 904L);
+        DataDirectoryFixture.writeRandom(target.resolve("zz-last"), 64, 905L);
+        return target;
+    }
+
+    /**
+     * Returns what a restore of an image must produce: its payload, byte for byte.
+     *
+     * @param snapshotDir The image
+     * @return The payload's digests
+     * @throws IOException if it cannot be read
+     */
+    private static Map<String, String> imageOf(Path snapshotDir) throws IOException {
+        return DataDirectoryFixture.digestTree(
+            snapshotDir.resolve(SnapshotLayout.PAYLOAD_DIRECTORY));
+    }
+
+    private static List<String> namesIn(Path directory) throws IOException {
+        try (var entries = Files.list(directory)) {
+            return entries.map(entry -> entry.getFileName().toString()).sorted().toList();
+        }
+    }
+
+    private static List<String> restoreEntriesIn(Path target) throws IOException {
+        return namesIn(target).stream().filter(InterruptedRestore::isRestoreEntry).toList();
+    }
+
+    /**
+     * Whether some holder has the directory's lock, tested from a second process's view.
+     *
+     * @param directory The directory
+     * @return True if the lock is held
+     * @throws IOException if it cannot be probed
+     */
+    private static boolean isHeld(Path directory) throws IOException {
+        try {
+            DataDirectoryLock.acquire(directory, "probe").close();
+            return false;
+        } catch (DataDirectoryLockedException e) {
+            return true;
+        }
+    }
+
+    /** Which of the publish's renames a mover is looking at. */
+    private enum Step {
+
+        /** A previous entry of the target, moving into the displaced directory. */
+        DISPLACE,
+
+        /** A staged entry, moving into the target. */
+        INSTALL,
+
+        /** An installed entry, moving back into the staging directory. */
+        UNINSTALL,
+
+        /** A displaced entry, moving back into the target. */
+        UNDISPLACE;
+
+        static Step of(Path source, Path destination) {
+            String from = source.getParent().getFileName().toString();
+            String to = destination.getParent().getFileName().toString();
+            if (to.startsWith(InterruptedRestore.DISPLACED_PREFIX)) {
+                return DISPLACE;
+            }
+            if (from.startsWith(InterruptedRestore.STAGING_PREFIX)) {
+                return INSTALL;
+            }
+            if (to.startsWith(InterruptedRestore.STAGING_PREFIX)) {
+                return UNINSTALL;
+            }
+            return UNDISPLACE;
+        }
+    }
+
+    /** Stands in for the process dying: nothing after it runs, as nothing would. */
+    private static final class Crash extends Error {
+
+        private static final long serialVersionUID = 1L;
+
+        Crash() {
+            super("the process died here");
         }
     }
 
     /**
-     * Returns a mover that refuses to rename anything onto the target.
+     * A mover that stands in for the renames a real filesystem refuses, every other one being
+     * real.
+     */
+    @FunctionalInterface
+    private interface FaultyMover extends SnapshotRestorer.EntryMover {
+
+        /**
+         * Decides whether this rename fails, and how.
+         *
+         * @param step        Which rename it is
+         * @param source      What is renamed
+         * @param destination Its new name
+         * @return True if the fault was raised
+         * @throws IOException if the rename fails
+         */
+        boolean fault(Step step, Path source, Path destination) throws IOException;
+
+        @Override
+        default void move(Path source, Path destination) throws IOException {
+            fault(Step.of(source, destination), source, destination);
+            Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE);
+        }
+
+        default FaultyMover or(FaultyMover other) {
+            return (step, source, destination) -> fault(step, source, destination)
+                || other.fault(step, source, destination);
+        }
+    }
+
+    /**
+     * Refuses the one rename of the given entry at the given step.
      *
-     * <p>Standing in for the one failure the swap guards against: the old directory has been
-     * renamed aside and the new one will not take its name. Every other rename is real, so
-     * what the restorer does next - putting the old directory back, and clearing up the
-     * staged tree - happens on the filesystem and is asserted there.</p>
-     *
-     * @param target         The name nothing may be renamed onto
-     * @param rollbackFails  Whether the rename that puts the old directory back fails too
+     * @param step  Where the refusal happens
+     * @param entry The entry's name
      * @return The mover
      */
-    private static SnapshotRestorer.DirectoryMover failingOnto(Path target,
-                                                               boolean rollbackFails) {
-        return (source, destination) -> {
-            boolean onto = destination.toAbsolutePath().normalize()
-                .equals(target.toAbsolutePath().normalize());
-            boolean rollback = source.getFileName().toString()
-                .contains(SnapshotLayout.STAGING_INFIX + "replaced-");
-            if (onto && !rollback) {
-                throw new IOException("the swap onto the target failed");
+    private static FaultyMover failing(Step step, String entry) {
+        return (at, source, destination) -> {
+            if (at == step && source.getFileName().toString().equals(entry)) {
+                throw new IOException(entry + " will not move");
             }
-            if (onto && rollbackFails) {
-                throw new IOException("the rollback failed");
+            return false;
+        };
+    }
+
+    /**
+     * Dies before the n-th rename, counting from one, of the given step.
+     *
+     * @param step  Where the process dies
+     * @param nth   Before which of its renames
+     * @return The mover
+     */
+    private static FaultyMover crashing(Step step, int nth) {
+        int[] seen = {0};
+        return (at, source, destination) -> {
+            if (at == step && ++seen[0] == nth) {
+                throw new Crash();
             }
-            Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE);
+            return false;
         };
     }
 }
