@@ -58,7 +58,8 @@ final class EndpointBanner {
         lines.add(route("GET", "/v1/documents", "Read one chunk's text"));
         lines.add(route("POST", "/v1/documents/fetch", "Read the text of a page of chunks"));
         if (routes.documentListing()) {
-            lines.add(route("GET", "/v1/documents/list", "Which documents this node holds"));
+            lines.add(route("GET", "/v1/documents/list",
+                "Which documents this node holds, or one document's chunks"));
         }
         if (routes.ingestion()) {
             lines.add(route("POST", "/v1/documents", "Index documents sent in the request"));

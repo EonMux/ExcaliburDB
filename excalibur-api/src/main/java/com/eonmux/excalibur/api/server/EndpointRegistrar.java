@@ -946,7 +946,11 @@ final class EndpointRegistrar {
             target.createContext("/v1/documents/list",
                 wrapHandler(exactPath("/v1/documents/list",
                     onlyMethod("GET", corpusRoute(RequestGuard.Access.READ,
-                        new DocumentListEndpoint(in.documentRegistry()))), notFound)));
+                        // A document read with its text is the same read the batch fetch is,
+                        // so it is clipped and bounded the same way.
+                        new DocumentListEndpoint(in.documentRegistry(),
+                            ChunkTextResolver.over(chunkText, in.security().maxResultTextChars()),
+                            in.security().maxTopK()))), notFound)));
         }
     }
 
