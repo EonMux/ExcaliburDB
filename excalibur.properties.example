@@ -166,6 +166,8 @@ excalibur.graph.max-walk-facts=10000
 excalibur.graph.min-score=0.05
 excalibur.graph.min-separation=0.01
 excalibur.graph.min-mean-confidence=0.3
+# Candidates handed back when the answer is ambiguous. At least 2: ambiguity is a comparison
+# between competing readings, and one candidate is not something to compare.
 excalibur.graph.max-ambiguous-candidates=5
 # Divisor on the log-odds of the confidence an answer reports. 1.0 leaves it untouched, which is
 # the honest default: the number a node reports is built from a ranking score by arithmetic, and
@@ -417,7 +419,8 @@ excalibur.shard.hnsw-integration-queue-depth-limit=100000
 # Neighbours an HNSW node keeps. More means better recall, a larger graph file and a slower build.
 # Layer 0 is where the walk stops descending and becomes exhaustive, so it is given more; 0 means
 # twice the value above it. Both are written into a graph's header when it is created and a graph
-# already on disk keeps what it was built with, so these govern graphs built from here on.
+# already on disk keeps what it was built with, so these govern graphs built from here on. The
+# first is 2 to 256; the second is 0 (twice the first), or at least the first and at most 512.
 excalibur.shard.default-max-connections=16
 excalibur.shard.default-max-connections-layer0=0
 

@@ -788,7 +788,7 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.shard.hnsw-integration-queue-depth-limit` | 100000 | Max vectors in HNSW integration queue. 10000 to 1000000 |
 | `excalibur.shard.compaction-delay-ms` | 10000 | Delay before compaction starts (ms). At least 0 |
 | `excalibur.shard.default-max-connections` | 16 | Neighbours an HNSW node keeps above layer 0, the graph's `M`. More means better recall, a larger file and a slower build. Written into a graph's header at creation, so it governs graphs built from here on; 2 to 256 |
-| `excalibur.shard.default-max-connections-layer0` | _(twice `M`)_ | Neighbours kept at layer 0, where the walk stops descending and becomes exhaustive. `0` means twice the value above; it may not be narrower than it |
+| `excalibur.shard.default-max-connections-layer0` | _(twice `M`)_ | Neighbours kept at layer 0, where the walk stops descending and becomes exhaustive. `0` means twice the value above; otherwise at least the value above and at most 512 |
 | `excalibur.shard.compaction-interval-ms` | 5000 | How often the segment compactor looks for work. At least 100 |
 | `excalibur.shard.segment-sync-interval-ms` | 1000 | How often the index registry is reconciled with the storage engine's directory. The sweep is what notices a segment the engine created without announcing it, so this is the longest a new segment can stay unsearchable. Refused rather than clamped below the sweep's own floor. At least 250 |
 | `excalibur.shard.compaction-tombstone-ratio` | 0.2 | Tombstoned fraction of a segment at which a rewrite repays itself. Above 0, at most 1 |
@@ -892,7 +892,7 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.graph.min-score` | 0.05 | Smallest relevance the entity the question named must reach to be answered, on the unit scale: its share of the question's BM25 weight, counting only words the graph holds, or its vector similarity. 0.0 to 1.0 |
 | `excalibur.graph.min-separation` | 0.01 | Smallest gap, as a fraction of the best, between the two best entities sharing the name the question used before the result is ambiguous. 0.0 to 1.0 |
 | `excalibur.graph.min-mean-confidence` | 0.3 | Smallest mean provenance confidence across the surviving evidence. 0.0 to 1.0 |
-| `excalibur.graph.max-ambiguous-candidates` | 5 | Candidates returned when the answer is ambiguous |
+| `excalibur.graph.max-ambiguous-candidates` | 5 | Candidates returned when the answer is ambiguous. At least 2 |
 | `excalibur.graph.confidence-temperature` | 1.0 | Divisor on the log-odds of the confidence an answer reports, in `(0.0, 20.0]`. The default leaves it untouched, which is honest: the reported number is arithmetic over a ranking score until labelled outcomes say otherwise. `AbstentionCalibrator.fitTemperature` fits it and reports the calibration error before and after — above 1.0 softens overconfident claims, below 1.0 sharpens underconfident ones. Scaling is monotone and fixes 0.5, so it changes how strongly an answer is claimed and never which answer is given or whether one is given at all |
 | `excalibur.graph.ram-buffer-mb` | 16 | Lucene RAM buffer per index. Named for the graph, but it sizes the ingestion pipeline's chunk index too when that runs on the `lucene` engine — a node with no graph still pays it, once per open index. Above 0 |
 
