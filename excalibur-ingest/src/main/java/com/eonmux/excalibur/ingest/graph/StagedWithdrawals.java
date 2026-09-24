@@ -370,7 +370,7 @@ public final class StagedWithdrawals implements AutoCloseable {
             return true;
         }
         try {
-            log.complete(ids);
+            log.complete(ids, clock.instant());
             log.flush();
             owedInMemory.remove(scope);
             return true;

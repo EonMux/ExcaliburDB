@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 import com.eonmux.excalibur.graph.erasure.CompactionPolicy.CompactionStats;
 import com.eonmux.excalibur.graph.erasure.EdgeStoreCompactor.CompactionResult;
@@ -250,7 +251,7 @@ public final class GraphErasureCoordinator {
                                          GraphStagingStore.EraseResult staged,
                                          CompactionResult compaction) throws IOException {
         List<ErasureRequest> satisfied = satisfiedBy(requests, staged, compaction);
-        log.complete(idsOf(satisfied));
+        log.complete(idsOf(satisfied), clock.instant());
         int withheld = requests.size() - satisfied.size();
         if (withheld == 0) {
             return satisfied.size();
@@ -402,7 +403,7 @@ public final class GraphErasureCoordinator {
         if (unassigned.isEmpty()) {
             return List.of();
         }
-        log.complete(idsOf(unassigned));
+        log.complete(idsOf(unassigned), clock.instant());
         log.flush();
         for (ErasureRequest request : unassigned) {
             LOGGER.warn("erasure request {} names entity {}, which nothing in this namespace was "
@@ -818,6 +819,16 @@ public final class GraphErasureCoordinator {
      */
     public ErasureLog.Pending pending() {
         return log.pending();
+    }
+
+    /**
+     * Where one request stands.
+     *
+     * @param requestId The id {@link #submit} returned
+     * @return Its status, or empty when no request was ever given that id
+     */
+    public Optional<ErasureLog.RequestStatus> status(long requestId) {
+        return log.status(requestId);
     }
 
     @Override
