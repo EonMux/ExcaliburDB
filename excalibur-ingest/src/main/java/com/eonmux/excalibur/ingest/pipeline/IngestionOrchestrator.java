@@ -721,11 +721,14 @@ public class IngestionOrchestrator {
         refreshLexicalIndex(stop);
         persistRegistry();
 
-        status.update("idle", 1.0, totalIngested, 0);
+        // The counts and the error first, and the idle that ends the run last: a caller polling
+        // the status stops at the first idle reading at full progress, and what is recorded
+        // after it is never read.
         status.setSkipped(skippedDocs);
         status.setDisallowed(source.getDisallowedCount());
         reportSkippedDocuments(sourceId, skippedDocs, totalPending);
         reportDroppedDocuments(sourceId, status, failedDocs, totalPending);
+        status.update("idle", 1.0, totalIngested, 0);
         int ingestedDocs = processedDocs - failedDocs - skippedDocs - disallowedDocs;
         LOGGER.info("Ingestion complete: {} chunks from {} of {} documents",
             totalIngested, ingestedDocs, totalPending);
