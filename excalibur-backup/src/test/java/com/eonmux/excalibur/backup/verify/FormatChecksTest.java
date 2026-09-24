@@ -9,6 +9,8 @@ import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.retrieval.lexical.native_.LexicalSidecars;
 import com.eonmux.excalibur.retrieval.lexical.native_.SegmentManifest;
 import com.eonmux.excalibur.store.RoutingDirectory;
+import com.eonmux.excalibur.store.format.WriteLogFormat;
+import com.eonmux.excalibur.store.format.WriteLogHeader;
 import com.eonmux.excalibur.vector.hnsw.NodeDocumentMapping;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -286,6 +288,46 @@ class FormatChecksTest {
         assertThat(DataDirectoryFixture.digest(file))
             .as("these checkers read where the file lies, so they must not write")
             .isEqualTo(before);
+    }
+
+    @Test
+    @DisplayName("a write-ahead log is proven by its header and its records' checksums")
+    void aWriteAheadLogIsProven() throws IOException {
+        ContentCheck check = check("segment_0.wal");
+
+        assertThat(check.healthy()).as(check.detail()).isTrue();
+        assertThat(check.proven()).as(check.detail()).isTrue();
+        assertThat(check.detail()).contains("INTACT");
+    }
+
+    @Test
+    @DisplayName("a write-ahead log a newer build wrote fails the image, and is not walked")
+    void aWriteAheadLogFromANewerBuildFails() throws IOException {
+        Path log = dataDir.resolve("segment_0.wal");
+        try (var file = new java.io.RandomAccessFile(log.toFile(), "rw")) {
+            file.write(WriteLogHeader.encode(WriteLogFormat.CURRENT.version() + 1));
+        }
+
+        ContentCheck check = check("segment_0.wal");
+
+        assertThat(check.healthy())
+            .as("the node refuses the log and will not start, so an image holding it does not "
+                + "restore a node that serves: %s", check.detail())
+            .isFalse();
+        assertThat(check.proven()).isFalse();
+        assertThat(check.detail()).contains("UNREADABLE").contains("newer build");
+    }
+
+    @Test
+    @DisplayName("a write-ahead log an older build wrote, with no header, is healthy and unproven")
+    void aHeaderlessWriteAheadLogIsNotProven() throws IOException {
+        Files.write(dataDir.resolve("segment_0.wal"), new byte[4096]);
+
+        ContentCheck check = check("segment_0.wal");
+
+        assertThat(check.healthy()).as(check.detail()).isTrue();
+        assertThat(check.proven()).isFalse();
+        assertThat(check.detail()).contains("LEGACY_UNPROTECTED");
     }
 
     @Test

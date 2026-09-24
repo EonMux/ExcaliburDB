@@ -446,14 +446,20 @@ public final class RepairPlanner {
         switch (finding.kind()) {
             case "catalog-names-missing-segment" ->
                 dropRecord(scan, finding, actions);
-            case "index-without-segment" ->
-                quarantineByRelative(scan, finding.subject(), actions,
-                    RepairKind.QUARANTINE_ORPHANED_INDEX,
-                    "It belongs to a segment that is not in this directory, so nothing will "
-                        + "open it and nothing will rebuild it in place. Every byte is "
-                        + "preserved under the quarantine directory - which matters most for "
-                        + "a write-ahead log, whose unintegrated records are the only copy "
-                        + "of themselves left");
+            case "index-without-segment" -> {
+                // Not a file that could not be read: its own verdict puts it to an operator,
+                // and an orphan in a newer build's format is most likely a directory a newer
+                // build has been running on, where moving files aside is not this build's call.
+                if (!isUnreadable(scan, finding.subject())) {
+                    quarantineByRelative(scan, finding.subject(), actions,
+                        RepairKind.QUARANTINE_ORPHANED_INDEX,
+                        "It belongs to a segment that is not in this directory, so nothing will "
+                            + "open it and nothing will rebuild it in place. Every byte is "
+                            + "preserved under the quarantine directory - which matters most for "
+                            + "a write-ahead log, whose unintegrated records are the only copy "
+                            + "of themselves left");
+                }
+            }
             case "staging-leftover" -> {
                 // A graph staging rewrite is left for the node, which deletes it on open: it
                 // may hold what an erasure removed, and quarantine would keep every byte.
@@ -477,6 +483,22 @@ public final class RepairPlanner {
                 // A warning with no action: reported by the survey, nothing to decide.
             }
         }
+    }
+
+    /**
+     * Reports whether the survey could not read a file far enough to judge it.
+     *
+     * @param scan     The survey
+     * @param relative The file's path relative to the data directory
+     * @return true if the file's verdict is {@link CheckStatus#UNREADABLE}
+     */
+    private static boolean isUnreadable(DataDirectoryScan scan, String relative) {
+        for (FileCheck file : scan.files()) {
+            if (file.relative().equals(relative)) {
+                return file.status() == CheckStatus.UNREADABLE;
+            }
+        }
+        return false;
     }
 
     /**

@@ -4,6 +4,9 @@ import com.eonmux.excalibur.core.checksum.CRC32Checksum;
 import com.eonmux.excalibur.core.memory.Segment;
 import com.eonmux.excalibur.core.memory.MemorySegmentFactory;
 import com.eonmux.excalibur.store.format.LogEntry;
+import com.eonmux.excalibur.store.format.UnsupportedWriteLogFormatException;
+import com.eonmux.excalibur.store.format.WriteLogFormat;
+import com.eonmux.excalibur.store.format.WriteLogHeader;
 import com.eonmux.excalibur.store.hash.XxHash64;
 
 import java.io.IOException;
@@ -27,12 +30,29 @@ import java.util.logging.Logger;
  * crash recovery for segment mutations. Every mutation (put, delete) is first
  * appended to the log and fsynced before the in-memory hash map is updated.</p>
  *
+ * <h2>File Format</h2>
+ * <p>A log this build creates is {@link WriteLogFormat#CURRENT}: a {@link WriteLogHeader} -
+ * magic {@code "EXWL"}, a format version and a CRC over both - followed by the records. A log
+ * written before the header existed ({@link WriteLogFormat#V1}) has records from offset 0 and
+ * is still read and appended to; see {@link WriteLogFormat} for when it is replaced by a
+ * headed one. Opening a log whose sound header names a version this build does not read fails
+ * with {@link UnsupportedWriteLogFormatException} and leaves the file exactly as it was.</p>
+ *
+ * <p>Every offset this class hands out or takes back - {@link #writeOffset()},
+ * {@link #readEntryAt(long)}, {@link #entrySizeAt(long)} and the integrated offset - is a
+ * position in the record stream, which does not include the header. Those offsets are
+ * recorded against the log elsewhere (the catalog and the graph keep the integrated offset),
+ * and they mean the same thing in a headed log as in a headerless one. The offsets in a
+ * {@link CorruptLogException}, and {@link #firstCorruptOffset()}, are offsets in the file,
+ * because an operator reads the file.</p>
+ *
  * <h2>Log Entry Format</h2>
- * <p>Each entry follows the format defined in {@link LogEntry}:</p>
+ * <p>Each entry follows the format defined in {@link LogEntry}. Its multi-byte fields are
+ * written through the {@link Segment} accessors, which are big-endian:</p>
  * <pre>
  * Offset 0:   opcode (1 byte: PUT=0x01, DELETE=0x02)
- * Offset 1:   lsn (8 bytes, monotonically increasing, little-endian)
- * Offset 9:   timestamp (8 bytes, epoch millis, little-endian)
+ * Offset 1:   lsn (8 bytes, monotonically increasing)
+ * Offset 9:   timestamp (8 bytes, epoch millis)
  * Offset 17:  key_hash (8 bytes)
  * Offset 25:  key_len (4 bytes)
  * Offset 29:  value_len (4 bytes, 0 for DELETE)
@@ -46,7 +66,7 @@ import java.util.logging.Logger;
  *   <li>{@code lsn}: Starts at 0, increases monotonically by 1 for each entry</li>
  *   <li>{@code timestamp}: Positive 64-bit epoch milliseconds</li>
  *   <li>{@code opcode}: Exactly 0x01 (PUT) or 0x02 (DELETE)</li>
- *   <li>{@code crc32}: CRC-32 checksum stored in little-endian format</li>
+ *   <li>{@code crc32}: CRC-32 checksum of the record's preceding bytes</li>
  *   <li>Log file is append-only (no in-place modifications)</li>
  * </ul>
  *
@@ -114,7 +134,22 @@ public class WriteLog implements AutoCloseable {
     private volatile Arena mappingArena;
     private final ReentrantLock appendLock;
     private final AtomicLong nextLsn;
+
+    /**
+     * Where the next record is written, as an offset in the file.
+     *
+     * <p>A file offset rather than a record-stream one, because every read and write of the
+     * mapping is made at one; {@link #writeOffset()} subtracts the header on the way out.</p>
+     */
     private final AtomicLong writeOffset;
+
+    /**
+     * The format of the file currently mapped, which says where its first record is.
+     *
+     * <p>Not final: a rotation starts a new file, which is always the current format whatever
+     * the one it replaced was.</p>
+     */
+    private volatile WriteLogFormat format;
 
     private volatile FileChannel fileChannel;
     private volatile MemorySegment mappedSegment; // Native Panama segment (may be null in fallback mode)
@@ -287,9 +322,13 @@ public class WriteLog implements AutoCloseable {
      *
      * <p>If the log file exists, it will be opened and the next LSN will be
      * determined by scanning existing entries. If the file does not exist,
-     * it will be created.</p>
+     * it will be created, with a header naming {@link WriteLogFormat#CURRENT}.</p>
      *
      * @param logFilePath The path to the log file
+     * @throws UnsupportedWriteLogFormatException if a newer build wrote the log; the file is
+     *                                            left untouched
+     * @throws CorruptLogException if the log is damaged in a way that loses acknowledged
+     *                             records; the file is left untouched
      * @throws IOException if the file cannot be created or opened
      * @throws NullPointerException if logFilePath is null
      */
@@ -319,7 +358,13 @@ public class WriteLog implements AutoCloseable {
     private void initializeLogFile() throws IOException {
         boolean hasExistingEntries = Files.exists(logFilePath) && Files.size(logFilePath) > 0;
 
-        if (!hasExistingEntries) {
+        LogScan existing = null;
+        if (hasExistingEntries) {
+            // Before anything maps the file for writing: that mapping extends it to the log's
+            // full capacity, and a log that has to be refused - a newer build's, or one damaged
+            // in the middle - must be left exactly as it was found.
+            existing = LogScan.of(logFilePath);
+        } else {
             // Create parent directories if needed
             Path parent = logFilePath.getParent();
             if (parent != null && !Files.exists(parent)) {
@@ -333,20 +378,81 @@ public class WriteLog implements AutoCloseable {
         // accumulates. The file is sparse: blocks are allocated as entries are written.
         openFileChannel(MAX_FILE_SIZE);
 
-        if (hasExistingEntries) {
-            try {
-                // Scan to find the highest LSN and write offset
-                scanExistingEntries();
-            } catch (IOException | RuntimeException e) {
-                // The constructor is about to fail, so nothing will ever call close() on this
-                // log: the mapping and the descriptor are released here or not at all.
-                releaseOnFailedOpen(e);
-                throw e;
+        try {
+            if (existing == null) {
+                startWithHeader();
+            } else {
+                adopt(existing);
             }
+        } catch (IOException | RuntimeException e) {
+            // The constructor is about to fail, so nothing will ever call close() on this
+            // log: the mapping and the descriptor are released here or not at all.
+            releaseOnFailedOpen(e);
+            throw e;
         }
 
-        LOGGER.log(Level.INFO, "WriteLog initialized at {0}, nextLSN={1}, writeOffset={2}",
-            new Object[] { logFilePath, nextLsn.get(), writeOffset.get() });
+        LOGGER.log(Level.INFO, "WriteLog initialized at {0}, format=v{1}, nextLSN={2}, "
+            + "writeOffset={3}",
+            new Object[] { logFilePath, format.version(), nextLsn.get(), writeOffset() });
+    }
+
+    /**
+     * Makes the mapped file an empty log in the current format.
+     *
+     * <p>The header is forced before this returns, and so before any record can be written
+     * behind it. That ordering is what lets a scan treat a damaged header with nothing behind it
+     * as a header torn while it was being written - nothing has been lost - and one with
+     * records behind it as damage.</p>
+     *
+     * @throws IOException if the header cannot be made durable
+     */
+    private void startWithHeader() throws IOException {
+        mappedSegmentWrapper.setBytes(0, WriteLogHeader.encode(WriteLogFormat.CURRENT.version()));
+        force(0, WriteLogHeader.SIZE);
+        format = WriteLogFormat.CURRENT;
+        nextLsn.set(0);
+        writeOffset.set(format.recordsStart());
+    }
+
+    /**
+     * Takes up where an existing log left off.
+     *
+     * <p>A log that holds nothing and has no header to believe - a headerless log no record was
+     * ever written to, or a log whose header was torn as it was created - is given a header
+     * now, because this is the one point at which that is free: no record has to move, so no
+     * offset recorded against the log changes, and an older build reading the result finds a
+     * log that ends at offset 0 and writes over the header, losing nothing. A headerless log
+     * with records keeps its format until its segment is given a fresh log by a compaction or
+     * a split; writing a header into it would mean moving every record, and every offset the
+     * catalog and the graph hold for it.</p>
+     *
+     * @param scan What the read-only scan of the file found
+     * @throws IOException if a header has to be written and cannot be made durable
+     */
+    private void adopt(LogScan scan) throws IOException {
+        if (scan.tornTail() != null) {
+            // Loud but not fatal: the records the tail lost were never acknowledged, so the
+            // log genuinely ends here - but an operator still needs to know the process did
+            // not shut down cleanly, and where.
+            LOGGER.log(Level.WARNING,
+                "Write-ahead log {0} ends in a corrupt or partly written record at offset "
+                + "{1}: {2}. Nothing was written after it, so this is a tail torn by a crash "
+                + "and the log ends before it; those bytes were never acknowledged.",
+                new Object[] { logFilePath, scan.endOffset(), scan.tornTail() });
+        }
+
+        if (scan.endOffset() == 0) {
+            LOGGER.log(Level.INFO,
+                "Write-ahead log {0} holds no record and no header this build can believe; "
+                + "writing a version {1} header", new Object[] { logFilePath,
+                WriteLogFormat.CURRENT.version() });
+            startWithHeader();
+            return;
+        }
+
+        format = scan.format();
+        nextLsn.set(scan.nextLsn());
+        writeOffset.set(scan.endOffset());
     }
 
     /**
@@ -427,29 +533,6 @@ public class WriteLog implements AutoCloseable {
                     "Could not release the mapping for write log " + logFilePath, e);
             }
         }
-    }
-
-    /**
-     * Reads an existing log to find where it ends and which LSN comes next.
-     *
-     * @throws CorruptLogException if the log is damaged anywhere but its tail
-     */
-    private void scanExistingEntries() throws CorruptLogException {
-        LogScan scan = LogScan.of(mappedSegmentWrapper, logFilePath);
-
-        if (scan.tornTail() != null) {
-            // Loud but not fatal: the records the tail lost were never acknowledged, so the
-            // log genuinely ends here - but an operator still needs to know the process did
-            // not shut down cleanly, and where.
-            LOGGER.log(Level.WARNING,
-                "Write-ahead log {0} ends in a corrupt or partly written record at offset "
-                + "{1}: {2}. Nothing was written after it, so this is a tail torn by a crash "
-                + "and the log ends before it; those bytes were never acknowledged.",
-                new Object[] { logFilePath, scan.endOffset(), scan.tornTail() });
-        }
-
-        nextLsn.set(scan.nextLsn());
-        writeOffset.set(scan.endOffset());
     }
 
     // ==================== Append Operations ====================
@@ -658,7 +741,9 @@ public class WriteLog implements AutoCloseable {
         Objects.requireNonNull(handler, "Handler cannot be null");
         ensureOpen();
 
-        long offset = 0;
+        // File offsets throughout, from the first record to the head: a record that will not
+        // read is reported where it lies in the file.
+        long offset = format.recordsStart();
         long endOffset = writeOffset.get(); // Only scan up to actual written data
         int entriesRecovered = 0;
         int entriesSkipped = 0;
@@ -748,7 +833,7 @@ public class WriteLog implements AutoCloseable {
      * <ol>
      *   <li>Closes the current file channel</li>
      *   <li>Renames the old log file by appending ".old"</li>
-     *   <li>Creates a new empty log file</li>
+     *   <li>Creates a new empty log file, with a header naming the current format</li>
      *   <li>Resets LSN counter to 0</li>
      * </ol>
      *
@@ -781,9 +866,9 @@ public class WriteLog implements AutoCloseable {
             // in isFull() measures it against.
             openFileChannel(MAX_FILE_SIZE);
 
-            // Reset counters
-            nextLsn.set(0);
-            writeOffset.set(0);
+            // A new file, so the current format whatever the old one was; this also resets
+            // the LSN and the head.
+            startWithHeader();
 
             LOGGER.log(Level.INFO, "Log rotation complete. Old log at: {0}", rotatedPath);
         } finally {
@@ -862,6 +947,20 @@ public class WriteLog implements AutoCloseable {
      * @throws IOException if fsync fails
      */
     void fsync(long offset, int length) throws IOException {
+        force(offset, length);
+    }
+
+    /**
+     * Forces a written range to the device; what {@link #fsync} does when no test stands in.
+     *
+     * <p>Private so the constructor can make the header durable without calling a method a
+     * subclass may have overridden before its own fields are set.</p>
+     *
+     * @param offset Offset of the range to persist
+     * @param length Length of the range to persist
+     * @throws IOException if fsync fails
+     */
+    private void force(long offset, int length) throws IOException {
         MemorySegment mapping = this.mappedSegment;
         if (mapping != null) {
             mapping.asSlice(offset, length).force();
@@ -881,12 +980,25 @@ public class WriteLog implements AutoCloseable {
     }
 
     /**
-     * Returns the current write offset in the log file.
+     * Returns the head of the log: how many bytes of records it holds.
+     *
+     * <p>A position in the record stream, not in the file - the header is not counted - so it
+     * is the offset the next record will be read back at, and an empty log's head is 0 in
+     * every format.</p>
      *
      * @return The write offset in bytes
      */
     public long writeOffset() {
-        return writeOffset.get();
+        return writeOffset.get() - format.recordsStart();
+    }
+
+    /**
+     * Returns the format of the log file currently mapped.
+     *
+     * @return The format, never null
+     */
+    public WriteLogFormat format() {
+        return format;
     }
 
     /**
@@ -898,47 +1010,14 @@ public class WriteLog implements AutoCloseable {
      * <p><strong>Performance:</strong> This is a direct read from the memory-mapped
      * file with CRC32 validation. For bulk reads, consider using {@link #recover(Consumer)}.</p>
      *
-     * @param offset The byte offset within the log file
+     * @param offset The record's position in the record stream, as {@link #writeOffset()}
+     *               counts it
      * @return The log entry, or null if offset is out of range or entry is corrupted
      * @throws IllegalStateException if the log is closed
      */
     public LogEntry readEntryAt(long offset) {
         ensureOpen();
-
-        long endOffset = writeOffset.get();
-
-        // Check if offset is within valid range
-        if (offset < 0 || offset >= endOffset) {
-            return null;
-        }
-
-        // Check if we have enough bytes for a header
-        if (offset + LogEntry.HEADER_SIZE > endOffset) {
-            return null;
-        }
-
-        try {
-            // Read entry size first
-            int entrySize = LogEntry.sizeAt(mappedSegmentWrapper, offset);
-
-            // Check if we have enough bytes for the full entry
-            if (offset + entrySize > endOffset) {
-                return null;
-            }
-
-            // Validate CRC32
-            if (!LogEntry.validateCrc32(mappedSegmentWrapper, offset)) {
-                LOGGER.fine("CRC32 validation failed at offset " + offset);
-                return null;
-            }
-
-            // Read and return the entry
-            return LogEntry.readFromUnchecked(mappedSegmentWrapper, offset);
-
-        } catch (Exception e) {
-            LOGGER.fine("Failed to read entry at offset " + offset + ": " + e.getMessage());
-            return null;
-        }
+        return readEntryAt(mappedSegmentWrapper, offset);
     }
 
     /**
@@ -946,25 +1025,14 @@ public class WriteLog implements AutoCloseable {
      *
      * <p>This is useful for iterating through entries without reading the full content.</p>
      *
-     * @param offset The byte offset within the log file
+     * @param offset The record's position in the record stream, as {@link #writeOffset()}
+     *               counts it
      * @return The entry size in bytes, or -1 if offset is invalid
      * @throws IllegalStateException if the log is closed
      */
     public int entrySizeAt(long offset) {
         ensureOpen();
-
-        long endOffset = writeOffset.get();
-
-        if (offset < 0 || offset + LogEntry.HEADER_SIZE > endOffset) {
-            return -1;
-        }
-
-        try {
-            return LogEntry.sizeAt(mappedSegmentWrapper, offset);
-        } catch (Exception e) {
-            LOGGER.fine("Failed to read the entry size at offset " + offset + ": " + e.getMessage());
-            return -1;
-        }
+        return entrySizeAt(mappedSegmentWrapper, offset);
     }
 
     /**
@@ -990,7 +1058,7 @@ public class WriteLog implements AutoCloseable {
      *
      * <p>This method provides access to the underlying memory through the
      * {@link Segment} interface, which abstracts over Panama FFM and ByteBuffer
-     * implementations.</p>
+     * implementations. It maps the whole file, header included.</p>
      *
      * @return The Segment wrapper, or null if not initialized
      */
@@ -1002,7 +1070,8 @@ public class WriteLog implements AutoCloseable {
      * Returns the native MemorySegment (Panama FFM).
      *
      * <p>This method provides direct access to the native MemorySegment for
-     * advanced operations. Returns null if Panama FFM is not available.</p>
+     * advanced operations. Returns null if Panama FFM is not available. It maps the whole
+     * file, header included.</p>
      *
      * @return The native MemorySegment, or null if not using Panama FFM
      */
@@ -1017,8 +1086,9 @@ public class WriteLog implements AutoCloseable {
      * the Segment abstraction layer for better compatibility across different
      * memory access implementations.</p>
      *
-     * @param segment The segment to read from
-     * @param offset The byte offset within the log file
+     * @param segment A mapping of this log's whole file, as {@link #getSegment()} returns
+     * @param offset  The record's position in the record stream, as {@link #writeOffset()}
+     *                counts it
      * @return The log entry, or null if offset is out of range or entry is corrupted
      * @throws IllegalStateException if the log is closed
      * @throws NullPointerException if segment is null
@@ -1027,35 +1097,25 @@ public class WriteLog implements AutoCloseable {
         Objects.requireNonNull(segment, "Segment cannot be null");
         ensureOpen();
 
-        long endOffset = writeOffset.get();
-
-        // Check if offset is within valid range
-        if (offset < 0 || offset >= endOffset) {
+        int entrySize = entrySizeAt(segment, offset);
+        if (entrySize < 0) {
             return null;
         }
-
-        // Check if we have enough bytes for a header
-        if (offset + LogEntry.HEADER_SIZE > endOffset) {
-            return null;
-        }
-
+        long at = offset + format.recordsStart();
         try {
-            // Read entry size first
-            int entrySize = LogEntry.sizeAt(segment, offset);
-
             // Check if we have enough bytes for the full entry
-            if (offset + entrySize > endOffset) {
+            if (at + entrySize > writeOffset.get()) {
                 return null;
             }
 
             // Validate CRC32
-            if (!LogEntry.validateCrc32(segment, offset)) {
+            if (!LogEntry.validateCrc32(segment, at)) {
                 LOGGER.fine("CRC32 validation failed at offset " + offset);
                 return null;
             }
 
             // Read and return the entry
-            return LogEntry.readFromUnchecked(segment, offset);
+            return LogEntry.readFromUnchecked(segment, at);
 
         } catch (Exception e) {
             LOGGER.fine("Failed to read entry at offset " + offset + ": " + e.getMessage());
@@ -1066,8 +1126,9 @@ public class WriteLog implements AutoCloseable {
     /**
      * Returns the size of the entry at the specified offset using the Segment abstraction.
      *
-     * @param segment The segment to read from
-     * @param offset The byte offset within the log file
+     * @param segment A mapping of this log's whole file, as {@link #getSegment()} returns
+     * @param offset  The record's position in the record stream, as {@link #writeOffset()}
+     *                counts it
      * @return The entry size in bytes, or -1 if offset is invalid
      * @throws IllegalStateException if the log is closed
      * @throws NullPointerException if segment is null
@@ -1076,14 +1137,18 @@ public class WriteLog implements AutoCloseable {
         Objects.requireNonNull(segment, "Segment cannot be null");
         ensureOpen();
 
+        // Taken together, so that a rotation between the two reads cannot pair one file's
+        // head with the other's header size.
+        WriteLogFormat mapped = format;
         long endOffset = writeOffset.get();
+        long at = offset + mapped.recordsStart();
 
-        if (offset < 0 || offset + LogEntry.HEADER_SIZE > endOffset) {
+        if (offset < 0 || at + LogEntry.HEADER_SIZE > endOffset) {
             return -1;
         }
 
         try {
-            return LogEntry.sizeAt(segment, offset);
+            return LogEntry.sizeAt(segment, at);
         } catch (Exception e) {
             LOGGER.fine("Failed to read the entry size at offset " + offset + ": " + e.getMessage());
             return -1;
@@ -1228,7 +1293,7 @@ public class WriteLog implements AutoCloseable {
             "entries=%d, bytes=%d, corrupt=%d, lastIntOff=%d, domainCorrect=%s]",
             logFilePath,
             nextLsn.get(),
-            writeOffset.get(),
+            writeOffset(),
             fileSize(),
             totalEntriesAppended.get(),
             totalBytesWritten.get(),
