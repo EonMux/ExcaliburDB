@@ -82,6 +82,41 @@ public interface DocumentVisibilityChecker {
     }
 
     /**
+     * Whether this checker holds anything it could withhold: a committed document or one in
+     * flight.
+     *
+     * <p>What decides whether filtering by it can change an answer at all. Counting committed
+     * documents alone is not enough: a node restarted over documents a previous process left in
+     * flight has published nothing yet, and a filter skipped on that count serves every one of
+     * them.</p>
+     *
+     * <p>Committed documents only by default, for an implementation that keeps no in-flight
+     * state; one that does overrides this to count it.</p>
+     *
+     * @return true when some document is committed or in flight
+     */
+    default boolean hasTrackedDocuments() {
+        return getDocumentCount() > 0;
+    }
+
+    /**
+     * A counter that moves whenever what this checker would answer about some document changes.
+     *
+     * <p>Marking a document in flight, publishing it, releasing it and forgetting it change which
+     * results a query may return without writing a byte a corpus fingerprint could see: the mark
+     * comes before the first chunk and the publication after the last. A cached answer is only
+     * still an answer while this has not moved.</p>
+     *
+     * <p>Zero by default, for an implementation that cannot count its changes; a cache over it
+     * then relies on the corpus itself moving.</p>
+     *
+     * @return The current generation
+     */
+    default long visibilityGeneration() {
+        return 0L;
+    }
+
+    /**
      * Checks if a document is fully visible at the specified query epoch.
      *
      * <p>A document is fully visible if:</p>

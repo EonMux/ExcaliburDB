@@ -53,6 +53,16 @@ public final class DocumentVisibilityTrackerAdapter implements DocumentVisibilit
     }
 
     @Override
+    public boolean hasTrackedDocuments() {
+        return tracker.hasTrackedDocuments();
+    }
+
+    @Override
+    public long visibilityGeneration() {
+        return tracker.getVisibilityGeneration();
+    }
+
+    @Override
     public boolean isDocumentVisible(String documentId, long queryEpoch) {
         return tracker.isDocumentFullyVisible(documentId, queryEpoch);
     }

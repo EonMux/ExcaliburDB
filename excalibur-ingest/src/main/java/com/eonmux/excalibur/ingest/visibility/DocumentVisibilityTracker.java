@@ -141,6 +141,12 @@ public class DocumentVisibilityTracker {
     private final Object evictionLock = new Object();
 
     /**
+     * Moves after every change to what this tracker answers about some document; see
+     * {@link #getVisibilityGeneration()}.
+     */
+    private final AtomicLong generation = new AtomicLong();
+
+    /**
      * Where in-flight documents are recorded, or null when the registry is in memory only.
      *
      * <p>Null is not a degraded mode to be papered over: a registry with no file names no data
@@ -350,6 +356,7 @@ public class DocumentVisibilityTracker {
         if (journal != null) {
             journal.end(documentKey);
         }
+        generation.incrementAndGet();
         forgetOldestBeyondRetention();
 
         LOGGER.debug("Document {} registered at epoch {} with {} chunks",
@@ -394,6 +401,7 @@ public class DocumentVisibilityTracker {
             journal.begin(documentId);
         }
         pendingChunks.put(documentId, new HashSet<>());
+        generation.incrementAndGet();
         LOGGER.trace("Began tracking ingestion for document {}", documentId);
     }
 
@@ -427,6 +435,7 @@ public class DocumentVisibilityTracker {
             // for a restart to hide and the mark would only hide the next attempt.
             journal.end(documentId);
         }
+        generation.incrementAndGet();
         if (removed != null) {
             LOGGER.debug("Aborted ingestion for document {} with {} pending chunks",
                 documentId, removed.size());
@@ -608,6 +617,35 @@ public class DocumentVisibilityTracker {
     }
 
     /**
+     * Whether any document is committed or in flight here.
+     *
+     * <p>In-flight documents count: a node restarted over documents a previous process left in
+     * flight holds those marks and no committed document, and they are exactly what a query
+     * must be kept from.</p>
+     *
+     * @return true when this tracker holds anything a query could be kept from
+     */
+    public boolean hasTrackedDocuments() {
+        return !documentVisibility.isEmpty() || !pendingChunks.isEmpty();
+    }
+
+    /**
+     * A counter that moves after every change to what this tracker answers about a document.
+     *
+     * <p>Marking a document in flight, publishing it, releasing it and forgetting it each move
+     * it, after the change is made, so a reader that sees the new value also sees the change.
+     * Retention does not: a document it forgets was committed and whole, and is answered the same
+     * way unknown. None of these writes a byte to storage - a mark is made before the first chunk
+     * and a publication after the last - so this is what tells a cached answer it may no longer
+     * be the answer.</p>
+     *
+     * @return The current generation
+     */
+    public long getVisibilityGeneration() {
+        return generation.get();
+    }
+
+    /**
      * Removes a document from visibility tracking.
      *
      * <p>This should be called when a document is tombstoned.</p>
@@ -622,6 +660,7 @@ public class DocumentVisibilityTracker {
         if (journal != null) {
             journal.end(documentId);
         }
+        generation.incrementAndGet();
         if (removed != null) {
             LOGGER.debug("Document {} removed from visibility tracking", documentId);
             return true;
@@ -638,6 +677,7 @@ public class DocumentVisibilityTracker {
         if (journal != null) {
             journal.clear();
         }
+        generation.incrementAndGet();
         LOGGER.debug("DocumentVisibilityTracker cleared");
     }
 
