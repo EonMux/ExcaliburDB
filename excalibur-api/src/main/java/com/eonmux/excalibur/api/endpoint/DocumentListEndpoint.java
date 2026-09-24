@@ -615,8 +615,10 @@ public class DocumentListEndpoint implements HttpHandler {
      * <p>The version is not the content hash alone: the same bytes are indexed again as other
      * text when their decoding changes - a source's {@code charset} replaced, a page labelled with
      * another encoding, a document posted again under another content type - and the chunks at
-     * each position change with it. So the version is taken over the hash, the decoding and when
-     * the document was indexed, which only a publish of its chunks changes.</p>
+     * each position change with it. So the version is taken over the hash and when the document
+     * was indexed, which only a publish of its chunks changes. Not over the recorded decoding: a
+     * re-crawl fills that in for an entry written without one, and the chunks stay as they
+     * were.</p>
      *
      * @param position The position of the first chunk the next page carries
      * @param version  {@link #versionOf} the document the page was read from
@@ -675,9 +677,7 @@ public class DocumentListEndpoint implements HttpHandler {
          * @return A value that differs between any two versions whose chunks can differ
          */
         static long versionOf(DocumentMetadata metadata) {
-            String decoding = Objects.requireNonNullElse(metadata.getDecoding(), "");
-            return XxHash64.hash(metadata.getContentHash() + "|" + metadata.getIndexTimeMillis()
-                + "|" + decoding);
+            return XxHash64.hash(metadata.getContentHash() + "|" + metadata.getIndexTimeMillis());
         }
 
         /**

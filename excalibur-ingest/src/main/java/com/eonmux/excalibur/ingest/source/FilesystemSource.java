@@ -9,6 +9,7 @@ import java.nio.charset.Charset;
 import java.nio.file.FileSystemLoopException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.HashSet;
@@ -488,12 +489,18 @@ public class FilesystemSource implements Source {
             );
         }
 
-        if (followSymlinks && !staysInsideRoot(filePath)) {
-            throw new DocumentRefusedException(
-                "Document " + documentId + " is reached through a link that leaves the source "
-                    + "root " + rootPath,
-                sourceId
-            );
+        if (followSymlinks) {
+            switch (containment(filePath)) {
+                case INSIDE -> { }
+                case OUTSIDE -> throw new DocumentRefusedException(
+                    "Document " + documentId + " is reached through a link that leaves the source "
+                        + "root " + rootPath,
+                    sourceId);
+                case GONE -> throw new DocumentNotFoundException(documentId, sourceId);
+                case UNRESOLVED -> throw new SourceException(
+                    "Could not resolve where document " + documentId + " really is", sourceId,
+                    true);
+            }
         }
 
         return filePath;
@@ -514,21 +521,38 @@ public class FilesystemSource implements Source {
      * worse than leaving one file out of the crawl.</p>
      */
     private boolean staysInsideRoot(Path path) {
+        return containment(path) == Containment.INSIDE;
+    }
+
+    /**
+     * Where a path reached by following links really lies, as far as can be told.
+     *
+     * <p>Only {@link Containment#INSIDE} is admitted. The others are told apart so that a fetch
+     * reports each as what it is: a link leaving the root is the source's answer about the file,
+     * a file gone before it could be resolved is a deletion, and anything else is a question that
+     * went unanswered.</p>
+     */
+    private Containment containment(Path path) {
         try {
             Path realPath = path.toRealPath();
             if (realPath.startsWith(realRootPath)) {
-                return true;
+                return Containment.INSIDE;
             }
             LOG.warn("Skipping {}: it resolves to {}, so the link leaves the source root {}.",
                 path, realPath, realRootPath);
-            return false;
+            return Containment.OUTSIDE;
 
+        } catch (NoSuchFileException e) {
+            return Containment.GONE;
         } catch (IOException e) {
             LOG.warn("Skipping {}: its real location could not be resolved ({}), so it cannot be "
                 + "shown to lie inside the source root {}.", path, e.getMessage(), realRootPath);
-            return false;
+            return Containment.UNRESOLVED;
         }
     }
+
+    /** Where a path reached by following links lies; see {@link #containment}. */
+    private enum Containment { INSIDE, OUTSIDE, GONE, UNRESOLVED }
 
     private boolean shouldProcessFile(Path path, LinkOption[] linkOptions) {
         try {

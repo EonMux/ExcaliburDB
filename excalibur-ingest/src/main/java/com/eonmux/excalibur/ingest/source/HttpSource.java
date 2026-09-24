@@ -158,6 +158,18 @@ public class HttpSource implements Source {
     /** The answer to a conditional request whose version the server still holds. */
     private static final int NOT_MODIFIED = 304;
 
+    /** {@code 404 Not Found}: the page is not there. */
+    private static final int NOT_FOUND = 404;
+
+    /** {@code 410 Gone}: the page was there and has been removed for good. */
+    private static final int GONE = 410;
+
+    /** {@code 401 Unauthorized}: the credentials were refused, for every page alike. */
+    private static final int UNAUTHORIZED = 401;
+
+    /** {@code 407 Proxy Authentication Required}: the proxy's answer, not the page's. */
+    private static final int PROXY_AUTHENTICATION_REQUIRED = 407;
+
     /** {@code 408 Request Timeout}: the server gave up waiting, which says nothing of the page. */
     private static final int REQUEST_TIMEOUT = 408;
 
@@ -783,10 +795,12 @@ public class HttpSource implements Source {
      * Whether an error status says the request was not answered rather than what the document is.
      *
      * @param status An HTTP status of 400 or more
-     * @return true for a server error, a request timeout or load shedding
+     * @return true for a server error, a request timeout, load shedding, or credentials the
+     *         server or a proxy refused - none of which is an answer about this page
      */
     private static boolean isTransient(int status) {
-        return status >= 500 || status == REQUEST_TIMEOUT || status == TOO_MANY_REQUESTS;
+        return status >= 500 || status == REQUEST_TIMEOUT || status == TOO_MANY_REQUESTS
+            || status == UNAUTHORIZED || status == PROXY_AUTHENTICATION_REQUIRED;
     }
 
     /**
@@ -1001,7 +1015,7 @@ public class HttpSource implements Source {
                 return null;
             }
 
-            if (response.statusCode() == 404) {
+            if (response.statusCode() == NOT_FOUND || response.statusCode() == GONE) {
                 closeQuietly(response.body());
                 throw new DocumentNotFoundException(documentId, sourceId);
             }

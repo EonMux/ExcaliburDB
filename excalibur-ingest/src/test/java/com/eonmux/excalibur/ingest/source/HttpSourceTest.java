@@ -5,6 +5,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -37,6 +39,7 @@ class HttpSourceTest {
         server.createContext("/page1.html", new Page1Handler());
         server.createContext("/page2.html", new Page2Handler());
         server.createContext("/missing.html", new NotFoundHandler());
+        server.createContext("/status/", new StatusHandler());
         server.createContext("/large.html", new LargeContentHandler());
         server.createContext("/api/data.json", new ApiHandler());
         server.createContext("/redirect-in-policy.html", new RedirectHandler("/page1.html"));
@@ -232,6 +235,29 @@ class HttpSourceTest {
             assertThatThrownBy(() -> source.fetch(baseUrl + "/missing.html"))
                 .isInstanceOf(DocumentNotFoundException.class)
                 .hasMessageContaining("missing.html");
+        }
+
+        @ParameterizedTest(name = "{0} is reported as {1}")
+        @CsvSource({
+            "410, gone",
+            "403, refused",
+            "400, refused",
+            "401, unanswered",
+            "407, unanswered",
+            "408, unanswered",
+            "429, unanswered",
+            "503, unanswered"
+        })
+        @DisplayName("an error status is reported as what it says about the page")
+        void fetch_classifiesErrorStatuses(int status, String meaning) {
+            Throwable thrown = catchThrowable(() -> source.fetch(baseUrl + "/status/" + status));
+
+            switch (meaning) {
+                case "gone" -> assertThat(thrown).isInstanceOf(DocumentNotFoundException.class);
+                case "refused" -> assertThat(thrown).isInstanceOf(DocumentRefusedException.class);
+                default -> assertThat(thrown).isExactlyInstanceOf(SourceException.class)
+                    .satisfies(e -> assertThat(((SourceException) e).isRetryable()).isTrue());
+            }
         }
 
         @Test
@@ -822,6 +848,17 @@ class HttpSourceTest {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             exchange.sendResponseHeaders(404, -1);
+            exchange.getResponseBody().close();
+        }
+    }
+
+    /** Answers {@code /status/<code>} with that status and no body. */
+    private static class StatusHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            String path = exchange.getRequestURI().getPath();
+            int status = Integer.parseInt(path.substring(path.lastIndexOf('/') + 1));
+            exchange.sendResponseHeaders(status, -1);
             exchange.getResponseBody().close();
         }
     }
