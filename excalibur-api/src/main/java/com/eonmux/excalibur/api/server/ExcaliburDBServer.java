@@ -617,6 +617,39 @@ public class ExcaliburDBServer {
     }
 
     /**
+     * Starts the node without binding a listener, for a caller in the same process.
+     *
+     * <p>Everything {@link #start()} starts except the socket: the index orchestrator, whose
+     * epoch tick is what makes a published document visible, starts here too. The node then
+     * counts as running, so {@link #stop(ShutdownBudget)} drains the query pipeline, ingestion
+     * and the orchestrator exactly as it does for a served node - there is simply no listener or
+     * request pool for it to stop first. The security policy is not consulted: it governs a
+     * listener, and there is none.</p>
+     *
+     * @return What the routes would have been built from
+     * @throws IllegalStateException if the node is already running, or was assembled without
+     *                               what an in-process caller needs
+     */
+    public synchronized InProcessServices startInProcess() {
+        if (running.get()) {
+            throw new IllegalStateException("Server is already running");
+        }
+        InProcessServices services = wiring.inProcessServices();
+
+        IndexOrchestrator indexOrchestrator = wiring.indexOrchestrator();
+        try {
+            indexOrchestrator.start();
+        } catch (RuntimeException e) {
+            stopOrchestratorAfterFailedStart(indexOrchestrator, e);
+            throw e;
+        }
+        running.set(true);
+        LOGGER.info("ExcaliburDB {} on {} started in-process, with no listener",
+            BuildInfo.version(), BuildInfo.jvm());
+        return services;
+    }
+
+    /**
      * Takes down an orchestrator a failed {@link #start()} brought up, and records whether it
      * went.
      *

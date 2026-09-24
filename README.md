@@ -2746,7 +2746,7 @@ whether it is in use and, if not, which setting would change that.
 | `excalibur-ingest` | Document ingestion, chunking, source adapters |
 | `excalibur-shard` | Index orchestration, volume management, visibility tracking |
 | `excalibur-llm` | LLM client with circuit breaker and retry logic |
-| `excalibur-api` | HTTP server, API endpoints and the MCP server |
+| `excalibur-api` | HTTP server, API endpoints, the MCP server and the in-process embedded node (`ExcaliburEmbedded`, see [USAGE.md](USAGE.md#programmatic-usage-jvm-embedded)) |
 | `excalibur-fsck` | Offline integrity check and repair for a data directory |
 | `excalibur-backup` | Verified snapshot, verify and restore for a data directory |
 | `excalibur-metrics` | JMX metrics and observability |
@@ -3080,7 +3080,7 @@ The system uses epoch-based visibility tracking to ensure:
 
 ```
 excaliburdb/
-├── excalibur-api/          # HTTP server and endpoints
+├── excalibur-api/          # HTTP server, endpoints and the embedded node
 ├── excalibur-backup/       # Offline snapshot, verify and restore command
 ├── excalibur-core/         # Primitives: memory, hash, checksums
 ├── excalibur-config/       # Configuration loading
@@ -3315,11 +3315,11 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 ```
 
 The embedded example in [USAGE.md](USAGE.md#programmatic-usage-jvm-embedded) runs in a source set
-of its own, `embeddedExample`. Its only dependencies are the seven coordinates USAGE.md lists, so
-it proves that list is enough. `check` runs it:
+of its own, `embeddedExample`. Its only dependency is the one coordinate USAGE.md lists,
+`excalibur-api`, so it proves that coordinate is enough. `check` runs it:
 
-- `EmbeddedUsageExampleTest` - The example compiles against those seven alone, ingests through a stand-in embeddings endpoint, and answers
-- `EmbeddedUsageDocumentationTest` - The code block in USAGE.md matches that test's method and helper token for token, and its imports are exactly the ones the example uses
+- `EmbeddedUsageExampleTest` - The example compiles against `excalibur-api` alone, supplies documents through `ExcaliburEmbedded` with a stand-in embeddings endpoint and answers; after the node is closed and the directory reopened the documents are still there, and a replacement and an erasure both take effect and outlive the next restart
+- `EmbeddedUsageDocumentationTest` - The code block in USAGE.md matches that test's two example methods token for token, and its imports are exactly the ones the example uses
 
 ```bash
 ./gradlew :excalibur-integration:embeddedExampleTest

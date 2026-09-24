@@ -3388,7 +3388,11 @@ watches only `file:` and `http:` URLs, and a `jar:` URL is not one.
 
 ## Programmatic Usage (JVM Embedded)
 
-You can embed ExcaliburDB directly in a JVM application.
+You can run an ExcaliburDB node inside a JVM application and call it directly instead of over
+HTTP. `ExcaliburEmbedded`, in `excalibur-api`, opens a data directory through the same assembly
+the server's bootstrap uses, so an embedded node and a served one over the same directory are the
+same node: the same configuration keys and defaults, the same persisted document registry, the
+same erasure, and the query route `POST /v1/query` would take.
 
 **Nothing is on Maven Central.** `./gradlew publishToMavenLocal` installs all sixteen library
 modules into `~/.m2`, so a coordinate dependency resolves there. The other five are not libraries:
@@ -3411,242 +3415,166 @@ includeBuild("/path/to/ExcaliburDB")
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("com.eonmux:excalibur-core:1.0.0-SNAPSHOT")    // ForeignMemoryBootstrap
-    implementation("com.eonmux:excalibur-store:1.0.0-SNAPSHOT")   // StorageEngine, HnswInitializer
-    implementation("com.eonmux:excalibur-vector:1.0.0-SNAPSHOT")  // distance functions, HNSW config
-    implementation("com.eonmux:excalibur-shard:1.0.0-SNAPSHOT")   // IndexOrchestrator
-    implementation("com.eonmux:excalibur-llm:1.0.0-SNAPSHOT")     // EmbeddingClient
-    implementation("com.eonmux:excalibur-ingest:1.0.0-SNAPSHOT")  // IngestionOrchestrator
-    implementation("com.eonmux:excalibur-query:1.0.0-SNAPSHOT")   // QueryPipeline
+    implementation("com.eonmux:excalibur-api:1.0.0-SNAPSHOT")   // ExcaliburEmbedded
 }
 ```
 
-Each is named directly because the example below uses a class from each. Some of them would
-arrive anyway, since a few modules expose theirs as `api` (`excalibur-vector` hands on
-`excalibur-core`, for one). Most declare their dependencies as `implementation`, which a consumer
-sees at run time and not at compile time, so relying on what happens to be exposed would break
-when a module's internals change. These seven are also enough: `excalibur-integration`'s
-`embeddedExampleTest` compiles and runs the example against exactly this list, through the same
-variants these POMs give a consumer, and nothing else.
+One coordinate is enough. Every type the facade's methods take or return is either a JDK type or
+one of its own in `com.eonmux.excalibur.api.embedded`, so nothing else has to be on the compile
+classpath, and the modules underneath arrive at run time as `excalibur-api`'s own dependencies.
+`excalibur-integration`'s `embeddedExampleTest` compiles and runs the example below against
+exactly this coordinate, through the same variants its POM gives a consumer, and nothing else.
+`excalibur-api` also brings Logback at run time, the binding the server logs through; an
+application with a binding of its own excludes it.
 
-Gradle substitutes each coordinate with the project in the included build. The consuming project
+Gradle substitutes the coordinate with the project in the included build. The consuming project
 must also compile and run on Java 21 with `--enable-preview`, for the reason in
 [Requirements](#requirements).
 
 ### Ingesting and querying in-process
 
-The example opens a data directory, ingests three documents and queries them, assembled in the
-order the server's own bootstrap uses. It is not a sketch: it is the body of
-`EmbeddedUsageExampleTest.ingestAndQuery` in `excalibur-integration`, which compiles it against the
-current API and runs it on every build, against an in-process stand-in for the embeddings
-endpoint. A test beside it compares the block below with that method, token for token, so neither
-can change without the other.
+The example opens a data directory, supplies three documents and queries them; then, as a second
+run of the application would, opens the same directory again, finds the documents still there,
+replaces one, erases another and queries what is left. It is not a sketch: the two methods are
+`EmbeddedUsageExampleTest.ingestAndQuery` and `reopenAndErase` in `excalibur-integration`, which
+compiles them against the current API and runs them on every build, against an in-process
+stand-in for the embeddings endpoint. A test beside it compares the block below with those
+methods, token for token, so neither can change without the other.
 
 ```java
-import com.eonmux.excalibur.core.memory.ForeignMemoryBootstrap;
-import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
-import com.eonmux.excalibur.ingest.processor.TextChunker;
-import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
-import com.eonmux.excalibur.ingest.source.InlineSource;
-import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
-import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
-import com.eonmux.excalibur.llm.client.LLMClientConfig;
-import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
-import com.eonmux.excalibur.query.QueryRequest;
-import com.eonmux.excalibur.query.QueryResponse;
-import com.eonmux.excalibur.query.QueryResultItem;
-import com.eonmux.excalibur.query.executor.CancellationToken;
-import com.eonmux.excalibur.query.pipeline.QueryPipeline;
-import com.eonmux.excalibur.shard.IndexOrchestrator;
-import com.eonmux.excalibur.store.HnswInitializer;
-import com.eonmux.excalibur.store.Segment;
-import com.eonmux.excalibur.store.StorageEngine;
-import com.eonmux.excalibur.vector.distance.CosineSimilarity;
-import com.eonmux.excalibur.vector.distance.DistanceFunction;
-import com.eonmux.excalibur.vector.hnsw.HnswConfigFactory;
+import com.eonmux.excalibur.api.embedded.EmbeddedDocument;
+import com.eonmux.excalibur.api.embedded.ErasureOutcome;
+import com.eonmux.excalibur.api.embedded.ExcaliburEmbedded;
+import com.eonmux.excalibur.api.embedded.SearchAnswer;
+import com.eonmux.excalibur.api.embedded.SearchHit;
+import com.eonmux.excalibur.api.embedded.StoredDocument;
 
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.util.List;
 
-static List<QueryResultItem> ingestAndQuery(Path dataDir, String embeddingEndpoint)
+static List<SearchHit> ingestAndQuery(Path dataDir, String embeddingEndpoint)
         throws Exception {
-    // First statement, before anything can start a thread.
-    ForeignMemoryBootstrap.ensureInitialized();
+    // The same keys excalibur.properties takes, set in code. A local Ollama, vLLM or TGI
+    // server needs no key; a hosted endpoint also takes excalibur.llm.api-key, and a model
+    // other than the default takes excalibur.llm.embedding-model and its dimensions.
+    try (ExcaliburEmbedded db = ExcaliburEmbedded.builder(dataDir)
+            .property("excalibur.llm.embedding-base-url", embeddingEndpoint)
+            .property("excalibur.llm.chat-enabled", "false")
+            .open()) {
+        // Chunked, embedded and indexed before supply returns; results name the chunk
+        // that matched, "<sourceId>:<documentId>:chunk:<n>".
+        db.supply("handbook", List.of(
+            EmbeddedDocument.of("tiering.txt",
+                "Cold segments are moved to cheaper disks by the tiering policy."),
+            EmbeddedDocument.of("hnsw.txt",
+                "The HNSW graph links every vector to its nearest neighbours."),
+            EmbeddedDocument.of("backup.txt",
+                "Backups copy the write log and the catalog to object storage.")));
 
-    // The embedding width and the distance metric are properties of the corpus: ingestion and
-    // queries must use the same model, width and metric for the lifetime of dataDir.
-    int dimension = 1536;
-    DistanceFunction metric = CosineSimilarity.getInstance();
-    EmbeddingClient embeddingClient = new EmbeddingClient(LLMClientConfig.builder()
-        .baseUrl(embeddingEndpoint)                  // e.g. "https://api.openai.com"
-        .apiKey(System.getenv().getOrDefault("OPENAI_API_KEY", ""))
-        .embeddingModel("text-embedding-3-small")
-        .embeddingDimension(dimension)
-        .build());
-
-    try (StorageEngine storage = new StorageEngine(dataDir)) {
-        // Installed before start(), so every segment start() opens or creates has a graph.
-        storage.setHnswInitializer(new HnswInitializer(HnswConfigFactory.defaults(), metric,
-            dimension, HnswInitializer.DEFAULT_MAX_NODES, storage.arena()));
-        storage.start();
-
-        try (IndexOrchestrator indexing = new IndexOrchestrator(storage.getCatalog(), storage)) {
-            // One visibility clock for storage, ingestion and queries.
-            storage.setVisibilityTracker(indexing.getVisibilityTracker());
-            indexing.syncSegmentsFromStorage();
-            indexing.start();
-            storage.startLifecycleManager();
-
-            DocumentVisibilityTracker documents = new DocumentVisibilityTracker(
-                new DocumentRegistry(), indexing.getVisibilityTracker());
-            IngestionOrchestrator ingestion = new IngestionOrchestrator(
-                new TextChunker(), embeddingClient, storage, indexing,
-                sourceId -> new IngestionOrchestrator.IngestionStatus() {
-                    @Override
-                    public void update(String state, double progress, long ingested,
-                                       long pending) {
-                    }
-
-                    @Override
-                    public void setSkipped(long skipped) {
-                    }
-
-                    @Override
-                    public void setDisallowed(long disallowed) {
-                    }
-
-                    @Override
-                    public void setError(String error) {
-                        System.err.println(sourceId + ": " + error);
-                    }
-                },
-                documents);
-
-            QueryPipeline pipeline = new QueryPipeline(
-                storage,
-                indexing.getVisibilityTracker(),
-                new DocumentVisibilityTrackerAdapter(documents),
-                segmentId -> {
-                    Segment segment = storage.getSegment(segmentId);
-                    return segment != null ? segment.getHnswGraph() : null;
-                },
-                metric);
-
-            try {
-                // Ingest: chunk, embed, write, publish. Returns once the documents are
-                // published; results name the chunk that matched,
-                // "<sourceId>:<documentId>:chunk:<n>".
-                ingestion.ingestNow(InlineSource.of("handbook", List.of(
-                    text("tiering.txt",
-                        "Cold segments are moved to cheaper disks by the tiering policy."),
-                    text("hnsw.txt",
-                        "The HNSW graph links every vector to its nearest neighbours."),
-                    text("backup.txt",
-                        "Backups copy the write log and the catalog to object storage."))));
-
-                // Query: embed the question with the SAME client, then search.
-                String queryText = "which policy moves cold segments to cheaper disks";
-                QueryRequest request = QueryRequest.builder()
-                    .queryText(queryText)
-                    .queryVector(embeddingClient.embed(queryText))
-                    .topK(3)
-                    .timeoutMs(5000)
-                    .includePartialSegments(true)
-                    .enableLlmScoring(false)
-                    .build();
-                QueryResponse response = pipeline.executeSync(request, new CancellationToken());
-
-                response.results().forEach(item ->
-                    System.out.println(item.documentIdStr() + " -> " + item.score()));
-                return response.results();
-            } finally {
-                // Stop taking work before the storage underneath it closes.
-                pipeline.shutdown(Duration.ofSeconds(30));
-                ingestion.shutdown(Duration.ofSeconds(30));
-            }
-        }
+        // Embedded by the node with the model the corpus was embedded with, and fused
+        // with BM25 over the same chunks.
+        SearchAnswer answer = db.query("which policy moves cold segments to cheaper disks", 3);
+        answer.hits().forEach(hit ->
+            System.out.println(hit.chunkId() + " -> " + hit.score() + ": " + hit.text()));
+        return answer.hits();
     }
 }
 
-static InlineSource.Document text(String documentId, String content) {
-    return new InlineSource.Document(documentId, content.getBytes(StandardCharsets.UTF_8),
-        "text/plain", 0L);
+static SearchAnswer reopenAndErase(Path dataDir, String embeddingEndpoint) throws Exception {
+    try (ExcaliburEmbedded db = ExcaliburEmbedded.builder(dataDir)
+            .property("excalibur.llm.embedding-base-url", embeddingEndpoint)
+            .property("excalibur.llm.chat-enabled", "false")
+            .open()) {
+        // What the last node supplied is still here: documents and their chunks.
+        for (StoredDocument document : db.documents("handbook")) {
+            System.out.println(document.documentId() + " " + document.chunkIds());
+        }
+
+        // Supplying a document id again replaces it; a query sees one version or the other.
+        db.supply("handbook", List.of(EmbeddedDocument.of("tiering.txt",
+            "Warm segments stay on fast disks until the tiering policy demotes them.")));
+
+        // Gone from storage, from the lexical index and from the vectors.
+        ErasureOutcome erased = db.erase("handbook", List.of("backup.txt"));
+        System.out.println("erased " + erased.erasedDocumentIds());
+
+        return db.query("when are warm segments demoted from fast disks", 3);
+    }
 }
 ```
 
-What each piece is for:
+What each call does:
 
-- **`StorageEngine`** owns the data directory. The `HnswInitializer` must be installed before
-  `start()`, or the segments it opens carry no vector index and vector search finds nothing in
-  them. `storage.arena()` is the engine's own arena, so the graphs live and die with it.
-- **`IndexOrchestrator`** owns the visibility clock and the worker that integrates each written
-  vector into its segment's HNSW graph. Handing its clock to the engine, to the document tracker
-  and to the pipeline is what makes a published document visible to all three at once.
-- **`IngestionOrchestrator.ingestNow`** chunks, embeds, writes and publishes the documents of one
-  source, and returns once they are published — the in-process equivalent of `POST /v1/documents`.
-  The status callback is where a crawl's progress and errors would be reported; a crawl of a
-  filesystem or a website goes through the same orchestrator with a different `Source`.
-- **`QueryPipeline`** is built over the same engine and clock, and the document tracker's adapter,
-  which hides a document until all of its chunks are published. This 5-argument constructor is
-  the plain pipeline; the wider constructors add what the server adds on top — LLM relevancy
-  scoring and its coverage threshold, the epoch isolation validator and product-quantisation settings — and `withLlmScorer` adds the
-  scorer to a pipeline already built.
+- **`builder(dataDir)…open()`** opens the directory, creating it if it is missing, and starts the
+  node's background workers. Configuration is layered as the server layers it: the built-in
+  defaults, then a file given to `configFile(path)`, then `property`/`properties`, then the
+  `EXCALIBUR_*` variables handed to `environment(map)`. The process environment is **not** read
+  unless you pass it (`environment(System.getenv())`), so a library inside your application is not
+  reconfigured by whatever the shell exported. Every value goes through the server's validation,
+  and an invalid one fails `open()` with the message the server would log; an unknown key is
+  logged as a warning, as on a node.
+- **`supply(sourceId, documents)`** is `POST /v1/documents` in-process: each document is chunked,
+  embedded and indexed, and the call returns once the documents are searchable. A document id
+  supplied again replaces the previous version, the new one published before the old one's
+  surplus is removed, so a query sees one or the other and never neither. The `SupplyOutcome`
+  counts what was ingested and what failed. `EmbeddedDocument` is checked the way the HTTP route
+  checks a posted document: an id, and content that is text (`text/plain` unless a content type
+  is given). A source id a crawl was registered under in this directory is refused, because its
+  documents belong to that crawl.
+- **`query(text, topK)`** takes the route `POST /v1/query` takes on the same node, and
+  `SearchAnswer.route()` says which: `HYBRID` (the vector and BM25 signals fused by reciprocal
+  rank) on a node with an embedding endpoint and a chunk index and
+  `excalibur.query.hybrid-retrieval` on; `VECTOR` with it off; `LEXICAL` on a node that does not
+  embed (the embedding endpoint disabled, or left at the hosted default with no key), or when the
+  endpoint fails or runs out of time mid-query. A node with
+  neither signal refuses every query with `IllegalStateException`; `route()` on the node answers
+  that before any query is made. The limits are the server's: `excalibur.api.max-query-chars`,
+  `max-top-k` and `max-query-timeout-ms`, and `query(text, topK, timeout)` sets a budget below the
+  default. Each `SearchHit` carries the chunk id, its score, the signals that found it and the
+  chunk's text; `timedOut()` on the answer says the budget ran out and the hits are what was
+  found before it did.
+- **`fetch(chunkId)`** reads a chunk's text back. **`documents()`** and **`documents(sourceId)`**
+  list what the node holds, with each document's chunk ids, length and indexing time, as
+  `GET /v1/documents/list` does.
+- **`erase(sourceId, documentIds)`** is `POST /v1/erasure` for named documents: nothing named is
+  searchable once it returns, and the `ErasureOutcome` separates what was erased from what was
+  not found. The space is reclaimed by the compaction policy, as on a node.
+- **`close()`** runs the server's shutdown sequence, bounded by
+  `excalibur.api.shutdown-timeout-seconds`: ingestion and queries drained, background work
+  stopped, the chunk index and the document registry persisted, the storage engine closed. It is
+  idempotent, and every other method refuses once it has begun. Everything supplied before it is
+  there the next time the directory is opened, embedded or served.
 
-The pipeline operates on vectors, so the caller embeds the question — with the **same**
-`EmbeddingClient`, model and width the corpus was ingested with; the HTTP API does this step
-itself. Results come back closest first. Read `documentIdStr()`, not `documentId()`: the string is
-the identifier ingestion assigned to the chunk that matched — `<sourceId>:<documentId>:chunk:<n>`,
-so `handbook:tiering.txt:chunk:0` here — and the one the HTTP API returns; the chunk's text is
-stored under it. `documentId()` is the numeric handle, which for a string-keyed result is the HNSW
-node id and matches nothing a caller can look up. A result whose graph node has no chunk identity
-carries an empty `documentIdStr()`; set `requireNamedResults(true)` on the
-`QueryRequest`, as the HTTP API does, to have such results dropped before the page is cut.
+All of these may be called from any number of threads at once. Supplying two batches under one
+source id at the same time is refused by the second, as the HTTP route refuses it.
 
-Shut down in the reverse of the order things were started: the pipeline and the ingestion
-orchestrator first, so nothing is still taking work, then the index orchestrator and the storage
-engine, which the `try`-with-resources blocks close.
-
-Every wait is the caller's to choose. `pipeline.shutdown(wait)` and `ingestion.shutdown(wait)`
-wait no longer than they are handed and answer whether everything ended; neither interrupts work
-still running, because an interrupt inside a read or a write closes the file channels every other
-reader shares. The two `close()` calls wait, the way `ExecutorService.close` does, until the
-background workers have stopped. An embedder with a deadline of its own bounds those too:
-`indexing.shutdown(wait)` and `storage.stopBackgroundWork(wait)` answer whether the segment
-workers, and the storage engine's own splits and lifecycle checks, have ended, and
-`indexing.close(wait)` releases the orchestrator waiting no longer than that. Close the engine
-only on a `true`: a worker still running when the engine closes is writing into a mapping whose
-memory is about to be released, which ends the process rather than failing it.
+What an embedded node leaves out, because it lives around the HTTP surface rather than in the
+node: crawl registration and re-indexing on request, relevancy scoring by the chat model, the
+query result cache, pagination and explanations. The knowledge graph is not built in-process:
+`open()` refuses `excalibur.graph.extraction-enabled=true`, and a directory's graph is built and
+queried by serving it. Erasing a document in-process therefore withdraws nothing from a graph a
+served node built over the same directory; erase through the HTTP API where a graph is in use.
 
 ### Remember when embedding
 
-- **Call `ForeignMemoryBootstrap.ensureInitialized()` as the first statement of your startup,
-  before anything spawns a thread.** Two threads reaching `java.lang.foreign` for the first time
-  at the same instant deadlock the JVM inside the JDK's own class-initialization monitors, and a
-  thread waiting on one of those cannot be interrupted, so nothing times out and the process
-  hangs rather than fails. The call is idempotent and costs about 34ms once. The server does this
-  in `ExcaliburApplication.main`; an embedder has no such entry point, so it has to do it itself.
-  Two threads is all it takes - storage, query, retrieval, graph and shard components hand work
-  to virtual threads, so one sequential caller that starts a worker is already a race.
+- **One process per data directory.** A directory can be served and embedded in turn, never at
+  once, and two `ExcaliburEmbedded` instances over the same directory are two nodes writing the
+  same files.
+- **Call `ExcaliburEmbedded.prepare()` first if your application starts threads that might reach
+  `java.lang.foreign` before the node is opened.** Two threads reaching it for the first time at
+  the same instant deadlock the JVM inside the JDK's own class-initialization monitors, and a
+  thread waiting on one of those cannot be interrupted, so nothing times out and the process hangs
+  rather than fails. `open()` makes the same call before the node starts any thread, so an
+  application whose first use of the library is opening a node needs nothing else. The call is
+  idempotent and costs about 34ms once.
 - Always pass `--enable-preview --enable-native-access=ALL-UNNAMED
   --add-modules=jdk.incubator.vector` JVM flags. Without the last one the SIMD distance
   kernels fall back to scalar arithmetic silently.
+- The embedding model, its width and the distance metric are properties of the corpus: open a
+  directory with the model its documents were embedded with, every time. A different model's
+  vectors are not comparable with the stored ones, so a model change means re-supplying the
+  documents, or re-indexing the directory through a served node.
 - HNSW graphs cap at `Integer.MAX_VALUE` nodes per segment.
-- The routing directory's width is a power of two, and it doubles only when a segment as deep as
-  the directory splits (extendible hashing); every other split re-points slots the segment
-  already owns. `getSegmentCount()` returns that width, and `getSegments().size()` the number of
-  distinct segments behind it. The directory lives on the heap at about 60 bytes a slot and stays
-  within a small multiple of the segment count: 300 MB of 1536-dimensional chunks fills 510
-  segments behind a 512-slot directory. `withMaxRoutingWidth(int)` (default 2^20 slots; `excalibur.shard.max-routing-width` on a node) bounds
-  the case keys that do not hash evenly would otherwise make unbounded: a split that would double
-  past it is refused with `RoutingDirectoryFullException` and counted in
-  `getStatistics().getRefusedSplits()`.
-- An entry larger than an empty segment's 1 MiB data region is refused with
-  `IllegalArgumentException`, since no split can make room for it. A write or delete that reaches
-  a segment in the middle of a split waits for the split to publish or be abandoned, then routes
-  again.
-- `StorageEngine` is thread-safe; multiple concurrent queries and ingests are supported.
 
 ---
 
