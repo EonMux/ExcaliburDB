@@ -49,7 +49,9 @@ import java.util.Objects;
  *
  * <p>Every identifier asked for comes back, in the order it was asked for, whether or not the
  * node holds it: a caller that named three and received two cannot tell which was dropped.
- * {@code text} is null for one this node does not hold, and {@code documents_not_found} counts
+ * {@code text} is null for one this node does not hold - or, when the node reads through
+ * {@link com.eonmux.excalibur.api.retrieval.VisibleChunkText}, one whose document is being
+ * rewritten at that moment - and {@code documents_not_found} counts
  * them so the common case needs no scan of the list. Text past
  * {@code excalibur.api.max-result-text-chars} is clipped, and {@code text_truncated} says so -
  * a clipped passage that does not say so gets quoted as the whole one.</p>

@@ -108,7 +108,10 @@ import java.util.PriorityQueue;
  * may run to {@link #MAX_LIMIT}; with it each chunk also carries its text, clipped at
  * {@code excalibur.api.max-result-text-chars} and flagged when clipped, and a page may carry no
  * more chunks than one {@code POST /v1/documents/fetch} may name, because it is the same read.
- * {@code text} is null for a chunk whose text this node no longer holds.</p>
+ * {@code text} is null for a chunk whose text this node no longer holds, or - when the node reads
+ * through {@link com.eonmux.excalibur.api.retrieval.VisibleChunkText} - one whose document is being
+ * rewritten at that moment. The listing's other fields come from the document registry, which only
+ * ever holds a whole published version, so they are served while the rewrite runs.</p>
  * <p>The cursor carries the document's content hash as well as the position. A document
  * re-ingested between two pages has a different chunking, and continuing it by position would
  * stitch the start of one version to the end of another; that continuation is refused with
