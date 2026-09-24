@@ -137,6 +137,13 @@ excalibur.graph.context-token-budget=2000
 # what it is given, so this is what lets an entity that term overlap ranked poorly be rescued by
 # its vector. Each extra candidate is one more full-precision vector read.
 excalibur.graph.rerank-over-fetch=4
+# How wide one graph walk may grow. max-frontier is the most new entities one hop admits: past it,
+# the ones reached along the strongest edges are kept (extraction confidence, then the later
+# valid-time start, then the lower entity id), so a hub with thousands of neighbours costs what
+# a thousand do. max-walk-facts is the most facts one walk collects, those touching the entities
+# the question named kept first. An answer a cap cut short says so in its "walk" object.
+excalibur.graph.max-frontier=1000
+excalibur.graph.max-walk-facts=10000
 # Abstention thresholds. Below these the endpoint declines rather than answering from evidence
 # it does not trust -- an empty "answered" reads to a client as "nothing found", which is a
 # different statement from "found something and did not believe it".
