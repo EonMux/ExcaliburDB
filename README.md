@@ -20,7 +20,7 @@ ExcaliburDB is built on Java 21's Panama Foreign Function & Memory API for zero-
 - **Staged reranking on the graph route** - BM25 over an embedded Lucene index, then reranked against the entities' uncompressed vectors, then reranked again in one batched call to the chat model; each stage falls back to the ordering beneath it when its endpoint is unavailable. The route has one signal, so its scores are handed through rather than fused - reciprocal-rank fusion over a single list would score every top result alike and leave the abstention thresholds nothing to read. Every stage reports on one unit relevance scale: BM25 as a share of what the question's words could score in this graph, the vector rerank as a similarity (an entity with no vector ranks beneath every one with), and the model as the relevance it judged. It is `/v1/query` that actually fuses two signals
 - **Abstention rather than a weak answer** - a sealed result type that can answer, decline, or hand back an ambiguity, rather than returning a weak answer as though it were a strong one. The thresholds a running node applies are configuration (`excalibur.graph.min-*`). `AbstentionCalibrator.calibrate` fits all three together instead, from labelled outcomes you supply - together rather than one at a time, because the gates overlap and combining three separate fits gives a node stricter than any of them measured. It is a library API rather than a server route, because the labels have to come from a query set whose answers are known, and a node cannot manufacture one for itself. The fit also reports where the coverage it gave up went, split between queries handed back as ambiguous and queries refused outright, and prefers the former where the two buy the same precision. The confidence attached to an answer is fitted separately and by a different method: `AbstentionCalibrator.fitTemperature` scales the reported confidence so it can be read as a probability, and `expectedCalibrationError` and `reliability` say how far off it was before and after. A fitted temperature goes into `excalibur.graph.confidence-temperature`, which is the whole of what a node needs to apply it; scaling is monotone and fixes the midpoint, so it changes how strongly an answer is claimed and never which answer is given. Which queries to answer and how strongly to claim them fail independently, so neither fit stands in for the other
 - **Erasure that removes data** - `POST /v1/graph/erasure` records an obligation durably, and a compaction rewrites the tombstoned edges out of the store and out of the staged facts it was built from, driven by the oldest outstanding request and not only by how much has accumulated. Erasing only the store would leave the next `POST /v1/graph/build` free to replay the staging log and restore exactly what was erased. Nor is a request discharged while a copy a crash left beside the graph could still hold what it covers: a build's or a compaction's scratch, a graph a publish set aside, a staging rewrite that never finished
-- **Per-namespace isolation** - one graph directory per tenant, selected by a request header, with mapping-count and descriptor budgets - `vm.max_map_count` and `RLIMIT_NOFILE`, read from the running process - counted against the whole process rather than the graphs alone — segments, vector indexes and the JVM share the same limits — that evict the least recently used graph before either limit is reached; a request holds a lease, so eviction never unmaps a graph out from under a reader. Ingestion routes by the same header: a source registered with it stages its facts into that tenant, one registered without it into `shared`, and the binding is written into the source catalog so a re-crawl after a restart stages where it did before
+- **Per-namespace knowledge graphs** - the graph is partitioned by namespace (documents, vectors and search are one corpus per node, behind one credential; see [Namespaces](#namespaces)): one graph directory per namespace, selected by a request header, with mapping-count and descriptor budgets - `vm.max_map_count` and `RLIMIT_NOFILE`, read from the running process - counted against the whole process rather than the graphs alone — segments, vector indexes and the JVM share the same limits — that evict the least recently used graph before either limit is reached; a request holds a lease, so eviction never unmaps a graph out from under a reader. Ingestion routes by the same header: a source registered with it stages its facts into that tenant, one registered without it into `shared`, and the binding is written into the source catalog so a re-crawl after a restart stages where it did before
 - **A graph the node builds** - with `excalibur.graph.extraction-enabled=true` and a chat model, ingestion extracts facts from the documents it publishes and stages them; `POST /v1/graph/build` turns everything staged into the edge store, the dictionaries and the two Lucene indexes, and serves the result without a restart. Extraction is off by default because it is one chat-model call per document, the most expensive thing ingestion can do, and it has to be on *before* the documents are ingested - a build after the fact finds nothing staged
 - **An MCP server** - the ingest, search, build and graph-query calls exposed as tools, so a model can be pointed at a directory and then question what was built from it without any adapter code
 - **Retrieval without embedding the corpus** - every ingested chunk is indexed into the engine's own inverted index, and a node with no embedding endpoint answers `POST /v1/query` from BM25 instead of refusing the query
@@ -1620,6 +1620,14 @@ uses one namespace called `shared`, which is the single-tenant arrangement — m
 something a node should acquire by accident. Each namespace gets its own directory under the graph
 root: its own store, its own staged facts, its own erasure obligations.
 
+**What a namespace is not.** Namespaces partition the knowledge graph and nothing else. A node
+holds one corpus: every document, vector and lexical entry is searchable through `/v1/query` and
+readable through `/v1/documents` by any caller, whichever namespace a source's facts were staged
+into. And a node has one bearer token, which grants every route - reading, erasing and deleting any
+namespace included - so namespaces organise a graph for one trusted operator; they are not a
+security boundary between mutually untrusted tenants. Serve those from separate nodes, each with
+its own data directory and token.
+
 A served namespace is around twenty-seven memory mappings - thirteen of them the edge store's
 columns, the rest the two dictionaries, the entity vectors and the two Lucene indexes, whose share
 moves as segments merge. The served indexes are opened read-only, so on a 64-bit JVM, where Lucene
@@ -3094,7 +3102,7 @@ whether it is in use and, if not, which setting would change that.
 | `excalibur-graph` | Memory-mapped CSR adjacency, bitemporal and provenance columns, erasure |
 | `excalibur-retrieval` | Ranking signals, reciprocal rank fusion, rerank, serialisation budget, abstention |
 | `excalibur-planner` | Deterministic query classification and lexical coreference |
-| `excalibur-tenancy` | Per-namespace index isolation, mapping budget, eviction |
+| `excalibur-tenancy` | Per-namespace graph directories, mapping budget, eviction |
 | `excalibur-filter` | Cuckoo filters, LSH indexes |
 | `excalibur-query` | Query pipeline with multi-stage filtering |
 | `excalibur-ingest` | Document ingestion, chunking, source adapters |
@@ -3470,7 +3478,7 @@ excaliburdb/
 ├── excalibur-retrieval/    # Ranking, fusion, rerank, serialisation, abstention
 ├── excalibur-shard/        # Index orchestration
 ├── excalibur-store/        # Storage engine
-├── excalibur-tenancy/      # Namespace isolation and eviction
+├── excalibur-tenancy/      # Namespace graph directories and eviction
 ├── excalibur-test/         # Test utilities
 ├── excalibur-test-bootstrap/  # Foreign-memory warm-up for every test JVM
 ├── excalibur-vector/       # HNSW, distance, quantization
