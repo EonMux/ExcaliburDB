@@ -22,7 +22,7 @@ ExcaliburDB is built on Java 21's Panama Foreign Function & Memory API for zero-
 - **Erasure that removes data** - `POST /v1/graph/erasure` records an obligation durably, and a compaction rewrites the tombstoned edges out of the store and out of the staged facts it was built from, driven by the oldest outstanding request and not only by how much has accumulated. Erasing only the store would leave the next `POST /v1/graph/build` free to replay the staging log and restore exactly what was erased. Nor is a request discharged while a copy a crash left beside the graph could still hold what it covers: a build's or a compaction's scratch, a graph a publish set aside, a staging rewrite that never finished
 - **Per-namespace isolation** - one graph directory per tenant, selected by a request header, with mapping-count and descriptor budgets - `vm.max_map_count` and `RLIMIT_NOFILE`, read from the running process - counted against the whole process rather than the graphs alone — segments, vector indexes and the JVM share the same limits — that evict the least recently used graph before either limit is reached; a request holds a lease, so eviction never unmaps a graph out from under a reader. Ingestion routes by the same header: a source registered with it stages its facts into that tenant, one registered without it into `shared`, and the binding is written into the source catalog so a re-crawl after a restart stages where it did before
 - **A graph the node builds** - with `excalibur.graph.extraction-enabled=true` and a chat model, ingestion extracts facts from the documents it publishes and stages them; `POST /v1/graph/build` turns everything staged into the edge store, the dictionaries and the two Lucene indexes, and serves the result without a restart. Extraction is off by default because it is one chat-model call per document, the most expensive thing ingestion can do, and it has to be on *before* the documents are ingested - a build after the fact finds nothing staged
-- **An MCP server** - the ingest, search, build and graph-query calls exposed as tools, so a model can be pointed at a directory and then question what was built from it without any adapter code
+- **An MCP server** - the ingest, search, read-back, build, graph-query and cancellation calls exposed as tools, with document erasure behind an explicit confirmation, so a model can be pointed at a directory and then question what was built from it without any adapter code
 - **Retrieval without embedding the corpus** - every ingested chunk is indexed into the engine's own inverted index, and a node with no embedding endpoint answers `POST /v1/query` from BM25 instead of refusing the query
 - **Hybrid retrieval on the document route** - a node with an embedding model runs BM25 and vector search concurrently on `POST /v1/query` and fuses their rankings by reciprocal rank, so the inverted index it maintains anyway is read rather than merely paid for; `excalibur.query.hybrid-retrieval=false` restores vector-only ranking
 - **Query-side semantic expansion** - a chat model turns one question into the vocabulary a matching document would contain (`out of RAM` becomes `OOM killer`, `ENOMEM`, `SIGKILL`, `cgroup memory limit`) and weights each formulation itself, so the semantic work is paid for once per query instead of once per chunk of the corpus. It runs on a node that has a chat model and does not embed its corpus, which is where it replaces work the embeddings would otherwise have done; a node doing both takes it with `excalibur.query.expand-hybrid-queries=true`
@@ -1297,9 +1297,11 @@ is prose and may be reworded; `code` is a stable snake_case name - `invalid_requ
 status alone does not say which cause it was. Branch on `code`, never on the text. The full table is
 in [USAGE.md](USAGE.md#error-codes).
 
-Neither erasure route is exposed as an MCP tool. They destroy data to do their job, which makes
-them the calls whose cost of being made wrongly is not bounded by retrying, and a model asked to
-tidy up a corpus would have every reason to reach for them.
+Document erasure is exposed as an MCP tool, `erase_documents`, but only behind a confirmation that
+repeats the source it erases — see [The tools](#the-tools). Graph erasure is not: it removes facts
+by entity or by extractor version rather than by anything a model ingested, so a model has no way
+to know what a call would take with it, and the cost of making one wrongly is not bounded by
+retrying.
 
 ### The graph store
 
@@ -2553,7 +2555,7 @@ environment rather than by the properties file:
 |----------|---------|---------|
 | `EXCALIBUR_URL` | Base URL of the node | `http://127.0.0.1:8080` |
 | `EXCALIBUR_API_AUTH_TOKEN` | Bearer token, when the node requires one | none |
-| `EXCALIBUR_NAMESPACE` | Default namespace for the tools that take one: the three graph tools, and `ingest_documents` and `crawl_website`, which fix a source's namespace at registration. A call's own `namespace` argument overrides it. Every other tool serves the whole corpus and sends no namespace, since those routes refuse one | the shared one |
+| `EXCALIBUR_NAMESPACE` | Default namespace for the tools that take one: the graph tools (`build_graph`, `graph_build_status`, `search_graph`, `cancel_graph_build`), and `ingest_documents` and `crawl_website`, which fix a source's namespace at registration. A call's own `namespace` argument overrides it. `create_namespace` and `delete_namespace` never use it — they act on the namespace the call names, so a drop cannot fall on one the model never mentioned — and `list_namespaces` lists them all. Every other tool serves the whole corpus and sends no namespace, since those routes refuse one | the shared one |
 | `EXCALIBUR_MCP_TIMEOUT_SECONDS` | Per-request timeout | 60 |
 
 The flags are the ones the node itself runs with — the server lives in the same jar, and the
@@ -2586,9 +2588,21 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `reindex_source` | **`source_id`** | Re-reads a registered source and replaces what changed |
 | `reindex_status` | `source_id` | How far a reindex has got, and whether it finished, failed or was cancelled |
 | `deregister_source` | **`source_id`** | Stops a source being crawled again; the documents already indexed stay |
-| `search_documents` | **`query`**, `top_k` | Searches the indexed documents and returns the matching passages, best first |
+| `search_documents` | **`query`**, `top_k`, `offset`, `timeout_ms`, `snippet`, `snippet_chars` | Searches the indexed documents and returns the matching passages, best first. `offset` pages past the first `top_k`, `timeout_ms` bounds how long the search may run, and `snippet` returns a window around the match (`snippet_chars` wide) instead of the whole chunk |
+| `list_documents` | `source_id`, `limit`, `cursor` | The documents the node holds, a page at a time, with each one's chunk ids |
+| `fetch_documents` | **`document_ids`** | The text of chunks by their ids, in the order asked; `null` for one the node no longer holds |
+| `list_queries` | | The searches running right now, with the id `cancel_query` takes |
+| `cancel_query` | **`query_id`** | Cancels a running search, which then answers with no results |
+| `cancel_ingestion` | **`source_id`** | Stops a source's ingestion run in flight; the source and its documents stay |
+| `cancel_reindex` | **`source_id`** | Stops a running `reindex_source`, keeping what it had already re-indexed |
+| `cancel_compaction` | | Stops the compaction in progress, keeping what it had reclaimed |
 | `build_graph` | `namespace` | Publishes the staged facts as the served graph |
 | `graph_build_status` | `namespace` | How far a build has got, and what the last one published |
+| `cancel_graph_build` | `namespace` | Stops a build; it publishes nothing and the staged facts are kept |
+| `list_namespaces` | `limit`, `cursor` | The graph namespaces on the node, a page at a time |
+| `create_namespace` | **`namespace`** | Creates a namespace — the only way to on a node with `excalibur.graph.require-explicit-namespaces` on |
+| `erase_documents` | **`source_id`**, `document_ids`, `scope`, `compact`, **`confirm`** | Permanently erases the named documents, or with `scope` `source` everything the source holds, from the corpus and the graph. `confirm` must repeat `source_id` |
+| `delete_namespace` | **`namespace`**, **`confirm`** | Permanently removes a namespace's graph, staged facts and erasure log. `confirm` must repeat `namespace` |
 | `search_graph` | **`query`**, `context_entities`, `as_of`, `direction`, `namespace` | Asks the graph a question, optionally `as_of` a date, an instant or `all` of history, in one `direction`, and in a conversation: `context_entities` names what was mentioned, each with an optional grammatical shape and turn so a pronoun binds the right one |
 
 Arguments in bold are required; every other one is optional and, when left out, is not sent, so
@@ -2613,9 +2627,17 @@ Registering is not a one-way door. `reindex_source` re-reads a source that has a
 registered and replaces what changed - which is what a model reaching for a second
 `ingest_documents` under the same id was trying to do, and what that call refuses with a 409.
 `deregister_source` is the way back: it stops the source being crawled again and leaves every
-document it indexed in place. Neither erases anything, which is why they are here and the
-erasure routes are not - `POST /v1/erasure` and `POST /v1/graph/erasure` destroy data and stay
-operator-only.
+document it indexed in place. Neither erases anything, and the `cancel_` tools do not either: each
+stops work in flight and keeps whatever it had already done.
+
+Two tools do destroy data, `erase_documents` and `delete_namespace`, and both are gated the same
+way. Each requires a `confirm` argument that repeats exactly what it destroys — the `source_id`,
+or the namespace — and the adapter refuses the call without sending anything when it is absent or
+differs, so a model cannot erase by filling in a plausible-looking argument it was never given.
+Their descriptions say the call is irreversible and is to be made only when the user explicitly
+asked for it. `delete_namespace` never falls back on `EXCALIBUR_NAMESPACE`, and every namespace a
+tool puts in a path is checked against the node's naming rule first, so `..` or a `/` cannot turn
+it into a different route. Graph erasure (`POST /v1/graph/erasure`) stays operator-only.
 
 The two searches are not alternatives. `search_documents` returns the passages that match and
 needs nothing but an ingestion run - the adapter asks the node for the text, because a model has
