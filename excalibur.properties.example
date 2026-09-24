@@ -194,7 +194,9 @@ excalibur.graph.entity-vectors-enabled=true
 # Relations that hold one value at a time: a new value closes the previous interval rather than
 # sitting beside it. Empty by default, because closing an interval destroys information - a
 # relation wrongly left multi-valued returns a stale extra answer, one wrongly superseded silently
-# deletes a true fact ("authored" closing the previous book when someone writes another).
+# deletes a true fact ("authored" closing the previous book when someone writes another). Named
+# as the graph stores them - "lives in" and "Lives_In" both name lives_in - and listed by
+# GET /v1/graph/relations; a name no staged relation has is warned about at build time.
 #excalibur.graph.single-valued-relations=employer,lives_in
 
 # Graphs held open at once. A served store is thirteen memory mappings and a process has a finite

@@ -1,5 +1,9 @@
 package com.eonmux.excalibur.graph.staging;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.store.MappedEdgeStore;
@@ -10,6 +14,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -419,6 +424,47 @@ class GraphStagingStoreTest {
                 assertThat(policy.isSingleValued(employer)).isTrue();
                 assertThat(policy.isSingleValued(authored)).isFalse();
             }
+        }
+
+        @Test
+        @DisplayName("a configured relation is cleaned as a stored one is, spaces and all")
+        void configuredLabelsAreCleanedAsStoredOnes(@TempDir Path tempDir) throws IOException {
+            try (GraphStagingStore staging = GraphStagingStore.open(tempDir)) {
+                int worksAt = staging.relationIdOf(FactLabels.relation("Works At"));
+                int livesIn = staging.relationIdOf("lives_in");
+
+                SupersessionPolicy spaced =
+                    GraphBuilder.singleValued(staging, List.of(" works at "));
+                SupersessionPolicy mixed =
+                    GraphBuilder.singleValued(staging, List.of("Works_At", "LIVES IN"));
+
+                assertThat(spaced.isSingleValued(worksAt)).isTrue();
+                assertThat(spaced.isSingleValued(livesIn)).isFalse();
+                assertThat(mixed.isSingleValued(worksAt)).isTrue();
+                assertThat(mixed.isSingleValued(livesIn)).isTrue();
+            }
+        }
+
+        @Test
+        @DisplayName("a configured relation that names nothing staged is warned about")
+        void unmatchedLabelsAreWarnedAbout(@TempDir Path tempDir) throws IOException {
+            Logger logger = (Logger) LoggerFactory.getLogger(GraphBuilder.class);
+            ListAppender<ILoggingEvent> events = new ListAppender<>();
+            events.start();
+            logger.addAppender(events);
+            try (GraphStagingStore staging = GraphStagingStore.open(tempDir)) {
+                staging.relationIdOf("works_at");
+
+                GraphBuilder.singleValued(staging, List.of("works at", "employed by"));
+            } finally {
+                logger.detachAppender(events);
+            }
+
+            assertThat(events.list).singleElement().satisfies(event -> {
+                assertThat(event.getLevel()).isEqualTo(Level.WARN);
+                assertThat(event.getFormattedMessage()).contains("'employed_by'")
+                    .doesNotContain("works_at");
+            });
         }
 
         @Test
