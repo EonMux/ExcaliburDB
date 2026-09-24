@@ -470,7 +470,10 @@ begin it — is `CORRUPT`. The verdict on
 `erasure.log` also counts the outstanding entity erasures that name an id nothing in the namespace
 holds, which the node discharges when it next opens the namespace. The `erasure.interrupted`
 marker beside them is recognised as well; the node writes it empty and reads only whether it is
-there, so an empty one is `INTACT`.
+there, so an empty one is `INTACT`. So is `asserted.last-id`, the checksummed record of the highest
+fact id handed out (see [Stating facts](#stating-facts)): `INTACT` when it matches its checksum,
+otherwise `CORRUPT`, since the node asserts no fact in that namespace until it is restored or
+removed.
 
 A namespace's built graph, `<namespace>/graph/`, is checked as one structure, by the checks the node
 runs before it serves one: the descriptor, every column against the length and CRC32C the descriptor
@@ -1271,6 +1274,11 @@ separate so a burst of writes cannot starve ordinary reads.
 | `DELETE` | `/v1/graph/build` | bearer | mutate | Stop the build in progress. It publishes nothing, and the namespace keeps serving the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | read | What the build is doing, and what the last one published |
 | `POST` | `/v1/graph/erasure` | bearer | mutate | Record an obligation to erase, and compact when it is due |
+| `GET` | `/v1/graph/entities` | bearer | read | Entities in the served graph by exact `name` or `prefix`, or all of them, in name order — paged by `limit` and `cursor` |
+| `GET` | `/v1/graph/entities/{id}` | bearer | read | One entity, its edges counted by relation and direction. `404` for an id the served graph does not hold |
+| `GET` | `/v1/graph/entities/{id}/edges` | bearer | read | An entity's edges with their intervals and provenance, narrowed by `relation`, `direction` (`out`, `in`, `both`) and `as_of` — paged by `limit` and `cursor` |
+| `POST` | `/v1/graph/facts` | bearer | mutate | Stage facts a caller states, each under a fact id of its own. `201`; they are served after the next build |
+| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | mutate | Retract an asserted fact, or every one stating `?subject=&relation=&object=`, as a source-scoped erasure. `202`; `compact=true` applies it now |
 | `GET` | `/v1/graph/namespaces` | bearer | read | Every namespace on disk, and what each one holds and owes |
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | mutate | Remove a namespace entirely. Irreversible, and `409` for `shared` |
 
@@ -1286,7 +1294,8 @@ rather than a 200 that removed nothing.
 
 Neither erasure route is exposed as an MCP tool. They destroy data to do their job, which makes
 them the calls whose cost of being made wrongly is not bounded by retrying, and a model asked to
-tidy up a corpus would have every reason to reach for them.
+tidy up a corpus would have every reason to reach for them. Retracting an asserted fact,
+`DELETE /v1/graph/facts`, is recorded as a graph erasure and stays with them.
 
 ### The graph store
 
@@ -2504,6 +2513,122 @@ the staging the erasure has already cleaned, which is why the staging erasure ru
 with no embedding endpoint can rebuild the text and not the vectors, and says so in
 `requests_withheld` rather than publishing a graph whose vectors were silently dropped.
 
+### Reading the graph by entity
+
+`/v1/graph/query` answers a question. It does not say what extraction produced, what the graph
+holds about one entity, or which id an entity has — and an id is what `"scope": "entity"` erasure
+and the edge listing below take. `GET /v1/graph/entities` reads the served graph by entity instead,
+through the same lease the query takes, so it lists exactly what a question could be answered
+from:
+
+```bash
+curl 'http://localhost:8080/v1/graph/entities?name=ada%20lovelace'
+curl 'http://localhost:8080/v1/graph/entities?prefix=ada&limit=20'
+curl 'http://localhost:8080/v1/graph/entities/12'
+curl 'http://localhost:8080/v1/graph/entities/12/edges?direction=out&relation=worked_with&as_of=1840-01-01'
+```
+
+```json
+{
+  "namespace": "shared",
+  "entity_id": 12,
+  "direction": "out",
+  "edges": [
+    {"direction": "out",
+     "subject": {"id": 12, "name": "Ada Lovelace"},
+     "relation": "worked_with", "relation_id": 3,
+     "object": {"id": 40, "name": "Charles Babbage"},
+     "valid_from": null, "valid_to": null, "confidence": 1.00,
+     "provenance": {"source_type": "USER_ASSERTED", "source_id": 1788439912004211,
+                    "extractor_version": 0},
+     "fact_id": 1788439912004211}
+  ],
+  "next_cursor": null
+}
+```
+
+`name` matches the whole name and `prefix` its start, both ignoring case and surrounding space;
+with neither the listing is every entity in name order, and both at once is a 400. Two spellings
+of a name are two entities, and so are names that differ only in case, so a `name` lookup can
+return several. An entity an erasure removed is not listed. `/{id}` adds each relation's count in
+each direction. `/{id}/edges` lists outgoing edges before incoming ones, each by relation and then
+by the other endpoint; `relation` is cleaned as extraction cleans one (`Worked With` reads as
+`worked_with`), `direction` is `out`, `in` or `both` (the default), and `as_of` is spelled as the
+query spells it — a date, an instant, or `all` — but defaults to all of valid time, because a
+listing is a record of what is held rather than an answer about today. Each edge carries its
+interval (`null` for an unknown start or an open end), its confidence as a fraction, and its
+provenance, whose `source_type` and `source_id` are a source-scoped erasure request as they stand;
+an asserted fact also carries its `fact_id`.
+
+Every listing takes `limit` (default 50, at most 500) and `cursor`, and answers with `next_cursor`,
+null on the last page. A cursor names the last item returned — entity name and id, or relation and
+other endpoint — rather than a position, so one carried across a rebuild resumes after that item
+instead of skipping or repeating what the rebuild moved. It is opaque; one this listing did not
+issue is a 400. An id the served graph does not hold is a 404. A namespace with no graph being
+served — never built, damaged, or withheld until an interrupted erasure is applied — is a 503 with
+the query's own message, and a namespace that does not exist gets the same 503 and is not created.
+
+### Stating facts
+
+Extraction is not the only way in. `POST /v1/graph/facts` stages facts a caller states:
+
+```bash
+curl -X POST http://localhost:8080/v1/graph/facts \
+  -H 'Content-Type: application/json' \
+  -d '{"facts": [{"subject": "Ada Lovelace", "relation": "worked with",
+                  "object": "Charles Babbage", "valid_from": "1833-06-05", "confidence": 0.95}]}'
+```
+
+```json
+{
+  "namespace": "shared",
+  "staged": 1,
+  "facts": [{"fact_id": 1788439912004211, "subject": "Ada Lovelace", "relation": "worked_with",
+             "object": "Charles Babbage", "valid_from": "1833-06-05", "valid_to": null,
+             "confidence": 0.95}],
+  "served": false,
+  "detail": "staged; served once the graph is next built (POST /v1/graph/build)"
+}
+```
+
+A body is one fact, or up to 64 under `facts` — the most one extraction call stages. Labels are
+cleaned and bounded exactly as extracted ones are: surrounding space removed, the relation
+lower-cased with spaces turned to underscores, each at most 200 characters, and never the
+`(erased N)` placeholder an erasure leaves in place of a name. `valid_from` and `valid_to` are ISO
+dates, absent or null for no known start or no end; `confidence` is a fraction, 1 when absent. Any
+malformed fact is a 400 naming it, and nothing in the request is staged.
+
+**Staged is not served.** A fact reaches `/v1/graph/query` and `/v1/graph/entities` once the
+namespace's graph is next built, exactly as an extracted fact does — the edge store is rebuilt
+rather than appended to. The answer is 201 with `"served": false` and says so.
+
+Each fact is staged with `USER_ASSERTED` provenance whose source id is the fact id the answer
+returns. Fact ids rise, and are never handed out again — not after a retraction, not after an
+erasure of either entity, and not after a restart, even one with the clock set back. A fact id is
+the time it was asserted in microseconds, or one more than the last, whichever is larger.
+
+Retracting one is a source-scoped erasure of it, recorded through the same service
+`POST /v1/graph/erasure` uses:
+
+```bash
+curl -X DELETE 'http://localhost:8080/v1/graph/facts/1788439912004211?compact=true'
+curl -X DELETE 'http://localhost:8080/v1/graph/facts?subject=Ada%20Lovelace&relation=worked_with&object=Charles%20Babbage'
+```
+
+By subject, relation and object it retracts every asserted fact stating that triple, matched on
+exact labels; a fact extraction found is never touched by this route — erase its document for
+that. Nothing staged to retract is a 404 and records nothing, as is a namespace that does not
+exist, which is not created. Otherwise the answer is 202 with the `fact_ids` retracted, their
+`request_ids`, and the compaction outcome. As with any erasure, accepting is not removing: until a
+compaction runs the fact is still served, and a build still publishes it. `compact=true` runs one
+now. An entity-scoped erasure covers asserted facts as it covers extracted ones.
+
+The provenance source types are `UNKNOWN`, `DOCUMENT` and `USER_ASSERTED`, and those are what
+`"scope": "source"` accepts. Three more were defined and never produced — a knowledge-base import, a
+conversation and an inference, codes 1, 3 and 5 — and are retired: the codes stay reserved and are
+never reissued, an edge stored under one reads as `UNKNOWN`, and an erasure request recorded
+against one is replayed as owing nothing, since nothing was ever stored under it.
+
 ## Pointing a model at it
 
 The graph endpoint answers in the shape a model needs - entities and facts to ground on, a
@@ -2559,6 +2684,9 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `build_graph` | `namespace` | Publishes the staged facts as the served graph |
 | `graph_build_status` | `namespace` | How far a build has got, and what the last one published |
 | `search_graph` | **`query`**, `context_entities`, `as_of`, `direction`, `namespace` | Asks the graph a question, optionally `as_of` a date, an instant or `all` of history, in one `direction`, and in a conversation: `context_entities` names what was mentioned, each with an optional grammatical shape and turn so a pronoun binds the right one |
+| `find_graph_entities` | `name`, `prefix`, `limit`, `cursor`, `namespace` | Finds entities in the served graph by exact name or prefix, ignoring case, with their ids and degrees — `GET /v1/graph/entities` |
+| `graph_entity_edges` | **`entity_id`**, `relation`, `direction`, `as_of`, `limit`, `cursor`, `namespace` | Lists one entity's facts with their intervals and provenance — `GET /v1/graph/entities/{id}/edges` |
+| `assert_graph_facts` | **`facts`** (each **`subject`**, **`relation`**, **`object`**, `valid_from`, `valid_to`, `confidence`), `namespace` | Stages facts the model states, served after the next `build_graph` — `POST /v1/graph/facts` |
 
 Arguments in bold are required; every other one is optional and, when left out, is not sent, so
 the node's configured default applies rather than one the adapter chose.
@@ -2566,7 +2694,9 @@ the node's configured default applies rather than one the adapter chose.
 Together they are the whole loop, so a model can prepare a corpus as well as query one. The order
 matters: `build_graph` has to run after ingestion finishes - it answers as soon as the build
 starts, so `graph_build_status` is how a model waits for one - and `search_graph` reports that no
-graph is being served until it has.
+graph is being served until it has. The same holds for `assert_graph_facts`: what it states is
+served after the next `build_graph`, and `find_graph_entities` and `graph_entity_edges` read only
+the graph being served.
 
 The two ways in are not alternatives either. `ingest_documents` points the node at a directory,
 which has to be inside an allow-listed root - the right policy for a node that goes and reads

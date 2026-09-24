@@ -423,6 +423,11 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `DELETE` | `/v1/compact` | bearer | Ask the compaction in progress to stop |
 | `GET` | `/v1/compact/status` | bearer | What the last compaction examined, reclaimed and failed on |
 | `POST` | `/v1/graph/query` | bearer | Answer a question from the graph |
+| `GET` | `/v1/graph/entities` | bearer | List the served graph's entities, by exact `name` or name `prefix`, a page at a time. `503` while no graph is served |
+| `GET` | `/v1/graph/entities/{entity_id}` | bearer | One entity: its name, its degree, and each relation's count in each direction. `404` for an id the served graph does not hold |
+| `GET` | `/v1/graph/entities/{entity_id}/edges` | bearer | An entity's edges, filtered by `relation`, `direction` and `as_of`, each with its interval, confidence and provenance |
+| `POST` | `/v1/graph/facts` | bearer | Stage facts a caller states, as `USER_ASSERTED`, returning their fact ids. `201`; served once the graph is next built |
+| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | Retract an asserted fact - by id, or every one stating a `subject`, `relation` and `object` given as query parameters. `202`; served until a compaction applies it, which `compact=true` runs now |
 | `POST` | `/v1/graph/build` | bearer | Start publishing the facts ingestion has staged as the served graph. `202`; the build runs behind the response. `409` while one is already running |
 | `DELETE` | `/v1/graph/build` | bearer | Stop the build in progress. It publishes nothing; the namespace keeps the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | What the build is doing, and what the last one published |
@@ -432,8 +437,8 @@ See [README.md](README.md#configuration-options) for the full property table.
 
 All request/response bodies are JSON. Request size limit: **1 MB**, and a body over it is refused with `413` by every endpoint that reads one - split the payload rather than retrying it. The `GET` routes read no body, and neither do `POST` and `DELETE /v1/drain`,
 `DELETE /v1/query/{query_id}`, `DELETE /v1/compact`,
-`DELETE /v1/graph/namespaces/{namespace}`, `DELETE /v1/graph/build` or `POST /v1/graph/build`,
-so none of them ever produces a `413`.
+`DELETE /v1/graph/namespaces/{namespace}`, `DELETE /v1/graph/build`, `POST /v1/graph/build` or
+`DELETE /v1/graph/facts`, so none of them ever produces a `413`.
 
 A method a registered path does not serve is answered `405` on every path, and it is answered
 before authentication: the `405` is a routing answer, decided by the path and the method alone, so
@@ -443,7 +448,8 @@ caller cannot spend routing decisions at line rate for free. That holds for the 
 routes as much as for the ones that answer two or three methods: `GET /v1/stats`, `GET /metrics`,
 `GET /v1/version`, `GET /v1/query/status`, `DELETE /v1/ingest/run`, `GET /v1/ingest/status`,
 `GET /v1/documents/list`, `GET /v1/reindex/status`, `POST /v1/erasure`, `GET /v1/compact/status`,
-`POST /v1/graph/query`, `GET /v1/graph/build/status` and `POST /v1/graph/erasure` each answer any
+`POST /v1/graph/query`, `GET /v1/graph/entities`, `GET /v1/graph/build/status` and
+`POST /v1/graph/erasure` each answer any
 other method with `405` rather than `401`, and a wrong method on a mutating route costs a read, not
 a mutation. A path that is not registered at all is `404`.
 
@@ -474,7 +480,11 @@ quietly serving the shared index — set the header to `shared` or leave it off.
 The `/v1/graph/*` routes are documented in the README, under
 [Graph Examples](README.md#graph-examples) for the request and response shapes. They are named
 here so the surface is complete in one table; the shapes are kept in one place rather than two so
-they cannot disagree.
+they cannot disagree. [Reading the graph by entity](README.md#reading-the-graph-by-entity) covers
+the entity listings, their cursors and filters, and
+[Stating facts](README.md#stating-facts) covers asserting and retracting facts: what a fact id is,
+why a stated fact is not served until the next build, and why a retracted one is served until a
+compaction applies the retraction.
 
 ### Authentication
 
@@ -2998,6 +3008,14 @@ opens and builds from it with, so the verdict is the node's:
 The `erasure.interrupted` marker beside them says the graph is withheld until the erasures it still
 owes are applied. The node writes it empty and reads only whether it is there, so an empty one is
 `INTACT`, and one holding bytes is `UNCHECKED`.
+
+`asserted.last-id` beside them is not a log but one checksummed value: the highest fact id the
+namespace has handed out to `POST /v1/graph/facts`. It is recorded before any id in it is
+returned, so ids stay unique after the newest asserted facts have been retracted or erased and the
+clock set back. A record that matches its checksum is `INTACT` and names that id; any other is
+`CORRUPT` and left for an operator, since the node refuses to assert facts in that namespace until
+it is restored from a backup or removed. A leftover `asserted.last-id.writing` is an unfinished
+rewrite the node deletes on open.
 
 A namespace's built graph, `<namespace>/graph/`, is checked as one structure, by the same checks the
 node runs before it serves one:
