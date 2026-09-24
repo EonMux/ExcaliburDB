@@ -461,6 +461,38 @@ class DocumentListEndpointTest {
         }
 
         @Test
+        @DisplayName("the same bytes read again as other text refuse the old cursor")
+        void theSameBytesDecodedAgainAreAConflict() throws IOException {
+            hold("src", "guide.md", List.of("c0", "c1", "c2"));
+            String cursor = cursorOf(read("?source_id=src&document_id=guide.md&limit=1").body());
+            registry.register(DocumentMetadata.builder().sourceId("src").documentId("guide.md")
+                .chunkIds(List.of("c0", "c1", "c2")).contentLength(42).contentHash(7)
+                .lastModifiedMillis(1_000L).indexTimeMillis(3_000L).decoding("windows-1252")
+                .build());
+
+            Answer answer = read("?source_id=src&document_id=guide.md&cursor=" + cursor);
+
+            assertThat(answer.status())
+                .as("same hash and chunk count, but every chunk was written again")
+                .isEqualTo(409);
+        }
+
+        @Test
+        @DisplayName("new validators recorded for an unchanged document keep the cursor good")
+        void aRefreshedRecordIsNotAConflict() throws IOException {
+            hold("src", "guide.md", List.of("c0", "c1", "c2"));
+            String cursor = cursorOf(read("?source_id=src&document_id=guide.md&limit=1").body());
+            DocumentMetadata held = registry.get("src", "guide.md");
+            registry.replace(held, held.toBuilder().lastModifiedMillis(5_000L)
+                .entityTag("\"v2\"").build());
+
+            Answer answer = read("?source_id=src&document_id=guide.md&cursor=" + cursor);
+
+            assertThat(answer.status()).isEqualTo(200);
+            assertThat(answer.body()).contains("\"returned\": 2");
+        }
+
+        @Test
         @DisplayName("an unknown document is 404; a document without its source is refused")
         void refusals() throws IOException {
             hold("src", "guide.md", List.of("c0"));

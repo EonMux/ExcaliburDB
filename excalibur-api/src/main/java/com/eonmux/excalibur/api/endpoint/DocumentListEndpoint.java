@@ -6,6 +6,7 @@ import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.QueryParams;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.api.retrieval.ChunkTextResolver;
+import com.eonmux.excalibur.core.hash.XxHash64;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 
@@ -112,7 +113,7 @@ import java.util.PriorityQueue;
  * through {@link com.eonmux.excalibur.api.retrieval.VisibleChunkText} - one whose document is being
  * rewritten at that moment. The listing's other fields come from the document registry, which only
  * ever holds a whole published version, so they are served while the rewrite runs.</p>
- * <p>The cursor carries the document's content hash as well as the position. A document
+ * <p>The cursor carries the document's version as well as the position. A document
  * re-ingested between two pages has a different chunking, and continuing it by position would
  * stitch the start of one version to the end of another; that continuation is refused with
  * {@code 409}, and the read starts again.</p>
@@ -310,7 +311,7 @@ public class DocumentListEndpoint implements HttpHandler {
         return body.append("], \"returned\": ").append(Math.max(0, to - from))
             .append(", \"next_cursor\": ")
             .append(to < chunkIds.size()
-                ? "\"" + new ChunkCursor(to, metadata.getContentHash()).encode() + "\""
+                ? "\"" + new ChunkCursor(to, ChunkCursor.versionOf(metadata)).encode() + "\""
                 : "null")
             .append('}')
             .toString();
@@ -611,10 +612,16 @@ public class DocumentListEndpoint implements HttpHandler {
      * <p>Begins with the separator, which no listing cursor does, so neither kind is mistaken
      * for the other.</p>
      *
-     * @param position    The position of the first chunk the next page carries
-     * @param contentHash The content hash of the document the page was read from
+     * <p>The version is not the content hash alone: the same bytes are indexed again as other
+     * text when their decoding changes - a source's {@code charset} replaced, a page labelled with
+     * another encoding, a document posted again under another content type - and the chunks at
+     * each position change with it. So the version is taken over the hash, the decoding and when
+     * the document was indexed, which only a publish of its chunks changes.</p>
+     *
+     * @param position The position of the first chunk the next page carries
+     * @param version  {@link #versionOf} the document the page was read from
      */
-    private record ChunkCursor(int position, long contentHash) {
+    private record ChunkCursor(int position, long version) {
 
         /** What a value that is not a chunk cursor this node issued is answered with. */
         private static final String UNREADABLE =
@@ -657,8 +664,20 @@ public class DocumentListEndpoint implements HttpHandler {
         /** @return the cursor as it travels, opaque to the caller */
         String encode() {
             return Base64.getUrlEncoder().withoutPadding().encodeToString(
-                (CURSOR_SEPARATOR + Integer.toString(position) + CURSOR_SEPARATOR + contentHash)
+                (CURSOR_SEPARATOR + Integer.toString(position) + CURSOR_SEPARATOR + version)
                     .getBytes(StandardCharsets.UTF_8));
+        }
+
+        /**
+         * Names one published version of a document's chunks.
+         *
+         * @param metadata The document as the registry holds it
+         * @return A value that differs between any two versions whose chunks can differ
+         */
+        static long versionOf(DocumentMetadata metadata) {
+            String decoding = Objects.requireNonNullElse(metadata.getDecoding(), "");
+            return XxHash64.hash(metadata.getContentHash() + "|" + metadata.getIndexTimeMillis()
+                + "|" + decoding);
         }
 
         /**
@@ -669,7 +688,7 @@ public class DocumentListEndpoint implements HttpHandler {
          * @throws DocumentChanged if the document is not the version the cursor was issued for
          */
         int resume(DocumentMetadata metadata) {
-            if (metadata.getContentHash() != contentHash
+            if (versionOf(metadata) != version
                     || position > metadata.getChunkIds().size()) {
                 throw new DocumentChanged("Document '" + echo(metadata.getDocumentId())
                     + "' was re-ingested since this read began; its chunks are no longer the "

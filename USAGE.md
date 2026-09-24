@@ -2570,8 +2570,9 @@ node no longer holds or whose document is being rewritten at that moment — and
 `excalibur.api.max-top-k`, the bound on one
 `POST /v1/documents/fetch`, because it is the same read.
 
-Page with `next_cursor` as above. The cursor carries the document's content hash: a document
-re-ingested between two pages has different chunks, and continuing it by position would splice two
+Page with `next_cursor` as above. The cursor carries the document's version - its content hash,
+how its bytes were decoded and when it was indexed, so the same bytes read again as other text
+count as a new version: a document re-ingested between two pages has different chunks, and continuing it by position would splice two
 versions, so the old cursor is refused with **`409 Conflict`** and the read starts again.
 
 **Error — `400 Bad Request`** — `document_id` without `source_id` (a document id is unique only
