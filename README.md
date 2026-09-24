@@ -474,7 +474,8 @@ will not read — an I/O error, a permission refused — is `UNREADABLE`, and fa
 file the device refuses. The
 source status history, `source-status`, is excused the same way for a different reason. It is not
 derived: how each source's last crawl ended is recorded nowhere else, and the node restores it on
-restart, so losing it loses that history, though never any of the corpus. But nothing the node
+restart, so losing it loses that history — and each source is re-crawled at the first check after
+startup, having no finished crawl on record — though never any of the corpus. But nothing the node
 serves depends on it, and the node reads one it will not take — cut short, without its header, or
 at a version it does not read, or altered so its checksum no longer matches — as no history and
 reports each source from its next run, so such a file is reported `CORRUPT` and not counted as
@@ -844,7 +845,7 @@ it does read.
 | `excalibur.shard.pq-training-samples` | 100000 | Vectors the codebook training samples from a segment, or 0 for all of them. Training runs while a segment is `warming`, which is a queryable state like every other one a segment is searched in — the segment answers from its full-precision vectors throughout, and `pq-search-enabled` simply has nothing to use on it until the codebook is fitted. What this bounds is how long that lasts. Must be at least `pq-centroids` |
 | `excalibur.ingest.document-atomicity-timeout-ms` | 2000 | Document atomicity commit timeout (ms). 1000 to 30000 |
 | `excalibur.ingest.document-atomicity` | true | Whether a document's chunks become visible together. Turning it off removes the guarantee listed under [Visibility and Consistency](#visibility-and-consistency): a query can then see half a document |
-| `excalibur.ingest.reindex-interval-ms` | 3600000 | How often a registered source is re-crawled on its own (1 hour). A node with no embedding endpoint re-crawls too, re-chunking and re-indexing lexically. 60000 to 86400000 |
+| `excalibur.ingest.reindex-interval-ms` | 3600000 | How often a registered source is re-crawled on its own (1 hour), counted from its last crawl that ran to its end — across a restart too, so a node restarted more often than this still re-crawls. A source whose interval passed while the node was down, or none of whose crawls ever finished, is re-crawled at the first check after startup, about a minute in; sources due together are re-crawled one after another, never at once. After a failed re-crawl the wait doubles, and doubles again with each further failure, up to 64 intervals; a restart starts it over. A node with no embedding endpoint re-crawls too, re-chunking and re-indexing lexically. 60000 to 86400000 |
 | `excalibur.ingest.crawl-delay-ms` | 200 | The shortest gap a web crawl leaves between two requests to its host — 200ms is five a second. A crawl walks sequentially and makes two requests per page, one to read its links and one to fetch it, so nothing but the host's own latency limited how fast it was asked for pages. A registration's `crawl_delay_ms` may ask for a longer gap and never a shorter one. `0` paces nothing; the maximum is 60000, and a value outside that range is refused at startup against the property name |
 | `excalibur.ingest.chunk-target-tokens` | 512 | Tokens one chunk aims for. Larger chunks carry more context into a single result; smaller ones rank more precisely, because a chunk's score is diluted by whatever in it the question did not ask about. At least 1 |
 | `excalibur.ingest.chunk-overlap-tokens` | 64 | Tokens a chunk repeats from the one before it, so an answer that straddles a boundary is not split across two chunks holding half of it each. Must be less than the target, or chunking would never advance; the node refuses the pair at startup rather than failing on the first document |
@@ -2440,7 +2441,9 @@ A web crawl obeys each site's `robots.txt` unless it was registered with
   complete disallow, as the RFC requires. The crawl **fails**, and `last_error` names the origin
   and the reason. It does not index what it could reach, because a listing with that site's pages
   missing would read to change detection as a site that had deleted them, and they would be
-  tombstoned. The registration stays, and the next scheduled re-crawl tries again.
+  tombstoned. The registration stays, and the next scheduled re-crawl tries again, on
+  `excalibur.ingest.reindex-interval-ms` — or, if the node restarts first and no crawl of the
+  source has ever finished, at the first check after startup.
 - **Every URL is checked before it is requested.** That covers the base URL, every link the walk
   finds, and every redirect hop, on the first crawl and on every re-crawl, conditional GETs
   included.
@@ -3859,19 +3862,23 @@ the marker fails the start; see
 
 `<data dir>/source-status` records how each registered source's last run ended — its state, its
 progress and counts, when it finished, and its `last_error` — so `GET /v1/ingest/status` after a
-restart reports that run rather than zeros stamped with the moment the node came up. Only finished
-runs are written (`idle` or `unconfigured`); a crawl the restart cut short comes back `idle` with
-`last_error` saying that the run in progress when the node stopped did not finish, never still
-claiming to run. The file is written the way the catalog is — a `\#source-status|4` header, one
-line per source, a `\#end|<count>|<crc>` marker, forced to disk and published by an atomic rename
-— but unlike the catalog, one that cannot be read, or whose checksum does not match, does not fail
-the start. It is a report, not state the store depends on: the node logs it, treats the history as
-empty, and each source reports from its next run. A data directory from a build without the file
-needs nothing; it is written when the first run ends. Older versions are still read: versions 1
-to 3, written before a run's failures were counted, with each source's `documents_failed` as 0;
-version 1, written before a crawl counted the pages `robots.txt` kept it from, with its
-`entries_disallowed` as 0 too; and versions 1 and 2 with no checksum to verify. The next run to end
-rewrites the file at version 4.
+restart reports that run rather than zeros stamped with the moment the node came up. It also
+records when a crawl of the source — the first or a re-crawl — last ran to its end, which a run
+that was stopped, failed, or cut short never moves; a restored source's next re-crawl is due one
+`excalibur.ingest.reindex-interval-ms` after it, or at the first check after startup when that has
+passed or there is none. Only finished runs are written (`idle` or `unconfigured`); a crawl the
+restart cut short comes back `idle` with `last_error` saying that the run in progress when the node
+stopped did not finish, never still claiming to run. The file is written the way the catalog is —
+a `\#source-status|5` header, one line per source, a `\#end|<count>|<crc>` marker, forced to disk
+and published by an atomic rename — but unlike the catalog, one that cannot be read, or whose
+checksum does not match, does not fail the start. It is a report, not state the store depends on:
+the node logs it, treats the history as empty, and each source reports from its next run. A data
+directory from a build without the file needs nothing; it is written when the first run ends. Older versions are still read: versions 1
+to 4, written before the time a crawl last ran to its end was kept, with none on record — so each
+source is re-crawled once at the first check after the upgrade; versions 1 to 3, written before a
+run's failures were counted, with each source's `documents_failed` as 0; version 1, written before
+a crawl counted the pages `robots.txt` kept it from, with its `entries_disallowed` as 0 too; and
+versions 1 and 2 with no checksum to verify. The next run to end rewrites the file at version 5.
 
 `<data dir>/erasure-receipts` is what `GET /v1/erasure/{request_id}` answers from: one line per
 document erasure — its id, when it was made, the source and scope, the per-document counts and the

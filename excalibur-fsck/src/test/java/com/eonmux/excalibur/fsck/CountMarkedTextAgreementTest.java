@@ -245,8 +245,8 @@ class CountMarkedTextAgreementTest {
             }
             case SOURCE_STATUS -> {
                 SourceStatusFile.open(dataDir).write(List.of(
-                    new SourceStatusFile.Entry("a", "idle", 1.0, 3, 0, 1, 0, 0, 1000L, null),
-                    new SourceStatusFile.Entry("b", "idle", 1.0, 5, 0, 0, 2, 1, 2000L, "boom")));
+                    new SourceStatusFile.Entry("a", "idle", 1.0, 3, 0, 1, 0, 0, 1000L, 1000L, null),
+                    new SourceStatusFile.Entry("b", "idle", 1.0, 5, 0, 0, 2, 1, 2000L, 0L, "boom")));
                 return dataDir.resolve(SourceStatusFile.FILE);
             }
             case ERASURE_RECEIPTS -> {

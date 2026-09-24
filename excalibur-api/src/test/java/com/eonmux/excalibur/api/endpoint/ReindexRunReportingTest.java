@@ -299,6 +299,62 @@ class ReindexRunReportingTest {
     }
 
     @Nested
+    @DisplayName("when the source was last crawled to its end")
+    class CompletedCrawl {
+
+        @Test
+        @DisplayName("moves when a re-crawl runs to its end")
+        void aFinishedRunRecordsIt() throws Exception {
+            IngestStatusEndpoint.IngestionStatus ingest = ingestionStatus.getOrCreate(SOURCE_ID);
+            long before = System.currentTimeMillis();
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(result(3));
+
+            run().execute(SOURCE_ID);
+
+            assertThat(ingest.lastCompletedMs())
+                .as("a restarted node counts this source's re-crawl interval from it")
+                .isBetween(before, System.currentTimeMillis());
+        }
+
+        @Test
+        @DisplayName("moves when a re-crawl finished with some documents failed")
+        void aFinishedRunWithFailuresRecordsIt() throws Exception {
+            IngestStatusEndpoint.IngestionStatus ingest = ingestionStatus.getOrCreate(SOURCE_ID);
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(
+                new DocumentReindexer.ReindexResult.Builder(SOURCE_ID)
+                    .documentsIndexed(4)
+                    .addUnchecked("https://example.com/slow")
+                    .build());
+
+            run().execute(SOURCE_ID);
+
+            assertThat(ingest.lastCompletedMs()).isPositive();
+        }
+
+        @Test
+        @DisplayName("stays put when a re-crawl is stopped, or fails")
+        void anUnfinishedRunDoesNot() throws Exception {
+            IngestStatusEndpoint.IngestionStatus ingest = ingestionStatus.getOrCreate(SOURCE_ID);
+            when(reindexer.reindexAll(eq(source), any(), any())).thenAnswer(invocation -> {
+                DocumentReindexer.ReindexProgress progress = invocation.getArgument(1);
+                progress.documentsDone(0, 10);
+                progress.documentsCounted(0, 1);
+                throw new ReindexCancelledException("stopped after 0 of 10");
+            });
+            run().execute(SOURCE_ID);
+
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(
+                new DocumentReindexer.ReindexResult.Builder(SOURCE_ID)
+                    .addUnchecked("https://example.com/")
+                    .build());
+            statusRegistry.startReindex(SOURCE_ID);
+            run().execute(SOURCE_ID);
+
+            assertThat(ingest.lastCompletedMs()).isZero();
+        }
+    }
+
+    @Nested
     @DisplayName("a run that stopped partway")
     class StoppedPartway {
 

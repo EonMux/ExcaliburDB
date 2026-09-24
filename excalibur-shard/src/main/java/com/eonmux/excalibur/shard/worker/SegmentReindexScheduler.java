@@ -32,6 +32,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * keeps a node that comes up with many sources overdue from starting all of their crawls at once:
  * they queue behind each other on this thread.</p>
  *
+ * <h2>When a source is first due</h2>
+ * <p>A source registered and crawled now is first due one interval later. A source brought back
+ * at startup is registered with the time its last crawl ran to its end - see
+ * {@link #registerSource(String, long, Instant)} - so its interval runs on across the restart
+ * rather than starting again each time the node is bounced, and one that never finished a crawl
+ * is due at the first check.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p><strong>This class is fully thread-safe.</strong></p>
  * <ul>
@@ -267,19 +274,45 @@ public class SegmentReindexScheduler {
     // ==================== Source Registration ====================
 
     /**
-     * Registers a source for re-index scheduling.
+     * Registers a source that is being crawled now, first due one interval from now.
      *
-     * <p>The source will be re-indexed at its configured interval.</p>
+     * <p>Registration counts as the moment the source was last crawled because the caller crawls
+     * it immediately afterwards: counting from anything earlier would have the first check
+     * re-crawl a source that is still being ingested.</p>
      *
      * @param sourceId          The source ID
      * @param reindexIntervalMs The re-index interval for this source
      */
     public void registerSource(String sourceId, long reindexIntervalMs) {
+        registerSource(sourceId, reindexIntervalMs, Instant.now());
+    }
+
+    /**
+     * Registers a source whose last finished crawl happened before this call, first due one
+     * interval after it.
+     *
+     * <p>For a source brought back at startup, which is not crawled on the way up. Counting its
+     * interval from the restart would reset it on every boot - a node restarted more often than
+     * the interval would never re-crawl anything - so it is counted from when the source's last
+     * crawl ran to its end, and a source that interval has already passed for is due at the
+     * first check. So is one with no finished crawl on record, which is what a first crawl cut
+     * short by the restart leaves: part of it indexed and nothing to say which part.</p>
+     *
+     * <p>A time ahead of this node's clock is read as now, so a clock set back since cannot push
+     * a source out by more than one interval.</p>
+     *
+     * @param sourceId          The source ID
+     * @param reindexIntervalMs The re-index interval for this source
+     * @param lastCrawled       When a crawl of the source last ran to its end, or null when none
+     *                          is on record
+     * @throws IllegalArgumentException if the id is blank or the interval out of range
+     */
+    public void registerSource(String sourceId, long reindexIntervalMs, Instant lastCrawled) {
         requireSourceId(sourceId);
         validateReindexInterval(reindexIntervalMs);
-        sourceSchedules.put(sourceId, new SourceSchedule(sourceId, reindexIntervalMs));
-        LOGGER.debug("Registered source {} for re-index scheduling with interval {}ms",
-            sourceId, reindexIntervalMs);
+        sourceSchedules.put(sourceId, new SourceSchedule(sourceId, reindexIntervalMs, lastCrawled));
+        LOGGER.debug("Registered source {} for re-index scheduling with interval {}ms, last "
+            + "crawled {}", sourceId, reindexIntervalMs, lastCrawled != null ? lastCrawled : "never");
     }
 
     /**
@@ -296,7 +329,8 @@ public class SegmentReindexScheduler {
         if (reindexIntervalMs <= 0) {
             throw new IllegalArgumentException("Reindex interval must be positive, got: " + reindexIntervalMs);
         }
-        sourceSchedules.put(sourceId, new SourceSchedule(sourceId, reindexIntervalMs));
+        sourceSchedules.put(sourceId,
+            new SourceSchedule(sourceId, reindexIntervalMs, Instant.now()));
         LOGGER.debug("Registered source {} for re-index scheduling with interval {}ms (unchecked)",
             sourceId, reindexIntervalMs);
     }
@@ -411,8 +445,10 @@ public class SegmentReindexScheduler {
                 }
 
                 // Check if re-index is needed based on interval (backed off after failures)
-                Duration timeSinceLastReindex = Duration.between(schedule.lastReindexTime, now);
-                if (timeSinceLastReindex.toMillis() >= schedule.currentIntervalMs()) {
+                if (schedule.isDue(now)) {
+                    // Read before the listener runs, since a listener that completes
+                    // synchronously has already moved it by the time it returns
+                    String lastReindex = schedule.describeLastReindex(now);
                     try {
                         // Mark as in progress BEFORE calling listener to prevent re-entry
                         schedule.reindexInProgress = true;
@@ -427,8 +463,8 @@ public class SegmentReindexScheduler {
                                 totalReindexesTriggered.incrementAndGet();
                                 reindexesTriggered++;
                             }
-                            LOGGER.info("Scheduled re-index triggered for source {} (last reindex: {} ago)",
-                                schedule.sourceId, formatDuration(timeSinceLastReindex));
+                            LOGGER.info("Scheduled re-index triggered for source {} (last reindex: {})",
+                                schedule.sourceId, lastReindex);
                         } else {
                             // Listener rejected, reset in-progress flag
                             schedule.reindexInProgress = false;
@@ -450,7 +486,7 @@ public class SegmentReindexScheduler {
     /**
      * Formats a duration for logging.
      */
-    private String formatDuration(Duration duration) {
+    private static String formatDuration(Duration duration) {
         long hours = duration.toHours();
         long minutes = duration.toMinutesPart();
         if (hours > 0) {
@@ -511,7 +547,7 @@ public class SegmentReindexScheduler {
         if (schedule == null) {
             return null;
         }
-        return schedule.lastReindexTime.plusMillis(schedule.currentIntervalMs());
+        return schedule.nextReindexTime();
     }
 
     // ==================== Configuration Getters/Setters ====================
@@ -647,20 +683,52 @@ public class SegmentReindexScheduler {
      */
     private static class SourceSchedule {
         final String sourceId;
+        /** When the source took its place in the schedule. */
+        final Instant registeredAt;
         volatile long reindexIntervalMs;
+        /** When the last attempt ended, or null while no crawl of the source is on record. */
         volatile Instant lastReindexTime;
         volatile boolean reindexInProgress;
         volatile int consecutiveFailures;
 
-        SourceSchedule(String sourceId, long reindexIntervalMs) {
+        /**
+         * @param lastCrawled When a crawl of the source last ran to its end, or null when none is
+         *                    on record; a time ahead of the clock is read as now
+         */
+        SourceSchedule(String sourceId, long reindexIntervalMs, Instant lastCrawled) {
             this.sourceId = sourceId;
+            this.registeredAt = Instant.now();
             this.reindexIntervalMs = reindexIntervalMs;
-            // Registration counts as the moment the source was last indexed: the caller
-            // ingests it immediately afterwards. Starting from the epoch would make the
-            // very first check re-crawl a source that is still being ingested.
-            this.lastReindexTime = Instant.now();
+            this.lastReindexTime = lastCrawled == null || lastCrawled.isBefore(registeredAt)
+                ? lastCrawled : registeredAt;
             this.reindexInProgress = false;
             this.consecutiveFailures = 0;
+        }
+
+        /**
+         * Whether the source is due at {@code now}: it has no crawl on record, or its interval -
+         * backed off after failures - has passed since the last one.
+         */
+        boolean isDue(Instant now) {
+            Instant last = lastReindexTime;
+            return last == null
+                || Duration.between(last, now).toMillis() >= currentIntervalMs();
+        }
+
+        /**
+         * When the source is next due; for one with no crawl on record, the moment it was
+         * registered, since it has been due since then.
+         */
+        Instant nextReindexTime() {
+            Instant last = lastReindexTime;
+            return last == null ? registeredAt : last.plusMillis(currentIntervalMs());
+        }
+
+        /** How long ago the last attempt ended, for the log. */
+        String describeLastReindex(Instant now) {
+            Instant last = lastReindexTime;
+            return last == null ? "none on record"
+                : formatDuration(Duration.between(last, now)) + " ago";
         }
 
         /**

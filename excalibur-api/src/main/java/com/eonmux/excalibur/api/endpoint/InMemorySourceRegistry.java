@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.time.Instant;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Map;
@@ -311,8 +312,9 @@ public class InMemorySourceRegistry implements SourceRegistry {
      * <p>Everything registration starts except the crawl. The source takes its place in the
      * registry, in {@code /v1/ingest/status} - reporting the last run it finished before the
      * restart, where the status registry keeps a history - and in the re-crawl schedule, and the
-     * schedule is what crawls it next - one interval from now, which is what a source registered
-     * before the restart was already waiting for.</p>
+     * schedule is what crawls it next: one interval after its last crawl that ran to its end,
+     * which is what it was waiting for when the node stopped, or at the first check if that time
+     * has passed or no crawl of it ever finished. See {@link #lastCrawled}.</p>
      *
      * <p>Re-ingesting on the way up would be the wrong default: it re-fetches and re-hashes the
      * whole corpus every time the node is bounced, to discover what the next scheduled re-crawl
@@ -327,8 +329,8 @@ public class InMemorySourceRegistry implements SourceRegistry {
      */
     public void restore(Source source) {
         admit(source, NamespaceId.SHARED, null, Crawl.NO);
-        LOGGER.info("Restored source {} from the catalog; next re-crawl in {}ms",
-            source.getSourceId(), reindexIntervalMs);
+        LOGGER.info("Restored source {} from the catalog; next re-crawl {}",
+            source.getSourceId(), nextRecrawl(source.getSourceId()));
     }
 
     /**
@@ -352,8 +354,24 @@ public class InMemorySourceRegistry implements SourceRegistry {
     public void restore(Source source, SourceDescriptor descriptor) {
         requireMatching(source, descriptor);
         admit(source, descriptor.namespace(), null, Crawl.NO);
-        LOGGER.info("Restored source {} in namespace {} from the catalog; next re-crawl in {}ms",
-            source.getSourceId(), descriptor.namespace(), reindexIntervalMs);
+        LOGGER.info("Restored source {} in namespace {} from the catalog; next re-crawl {}",
+            source.getSourceId(), descriptor.namespace(), nextRecrawl(source.getSourceId()));
+    }
+
+    /**
+     * Says when a restored source is next re-crawled, for the log line that reports it.
+     *
+     * @param sourceId The restored source
+     * @return The time, "at the first check" when that has passed, or "never" on a node that
+     *         does not re-crawl
+     */
+    private String nextRecrawl(String sourceId) {
+        SegmentReindexScheduler scheduler = this.reindexScheduler;
+        Instant next = scheduler == null ? null : scheduler.getNextReindexTime(sourceId);
+        if (next == null) {
+            return "never: this node schedules no re-crawls";
+        }
+        return next.isAfter(Instant.now()) ? "at " + next : "at the first check";
     }
 
     /** Whether admitting a source starts a crawl, or only takes its place in the schedule. */
@@ -581,9 +599,15 @@ public class InMemorySourceRegistry implements SourceRegistry {
             LOGGER.debug("Created initial status entry for source: {}", sourceId);
         }
 
-        // Register with reindex scheduler for periodic reindexing
+        // A place in the re-crawl schedule: one interval after the crawl starting now, or, for a
+        // restored source, one interval after the last of its crawls that ran to its end.
         if (reindexScheduler != null) {
-            reindexScheduler.registerSource(sourceId, reindexIntervalMs);
+            if (crawl == Crawl.YES) {
+                reindexScheduler.registerSource(sourceId, reindexIntervalMs);
+            } else {
+                reindexScheduler.registerSource(sourceId, reindexIntervalMs,
+                    lastCrawled(initialStatus));
+            }
             LOGGER.debug("Registered source {} with reindex scheduler (interval={}ms)",
                 sourceId, reindexIntervalMs);
         }
@@ -607,6 +631,31 @@ public class InMemorySourceRegistry implements SourceRegistry {
                 .start(new UnconfiguredSourceProbe(source, initialStatus));
             LOGGER.debug("No ingestion pipeline configured; probing source: {}", sourceId);
         }
+    }
+
+    /**
+     * When a restored source was last crawled to its end, which its re-crawl interval counts from.
+     *
+     * <p>From the status history, which records the time with every run that ends. Not the time
+     * the last run ended: a run stopped by the shutdown, broken, or cut short by a crash says
+     * nothing about whether the source's listing was ever read whole, and a first crawl ended
+     * that way leaves part of the source indexed and nothing to say which part. So only a crawl
+     * that ran to its end counts, and a source with none on record - that first crawl, a node
+     * that kept no history, a history written before the time was recorded - is due at the
+     * scheduler's first check rather than an interval later.</p>
+     *
+     * <p>A node restarted with many sources overdue does not crawl them all at once: the
+     * scheduler re-crawls the sources due at a check one after another, on its own thread.</p>
+     *
+     * @param restored The status restored for the source, or null on a node with no status
+     *                 registry
+     * @return When a crawl of it last ran to its end, or null when none is on record
+     */
+    private static Instant lastCrawled(IngestStatusEndpoint.IngestionStatus restored) {
+        if (restored == null || restored.lastCompletedMs() <= 0) {
+            return null;
+        }
+        return Instant.ofEpochMilli(restored.lastCompletedMs());
     }
 
     /**

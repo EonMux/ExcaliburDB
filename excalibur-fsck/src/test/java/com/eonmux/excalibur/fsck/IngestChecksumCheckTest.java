@@ -214,7 +214,7 @@ class IngestChecksumCheckTest {
             }
             case SOURCE_STATUS -> {
                 SourceStatusFile.open(dataDir).write(List.of(
-                    new SourceStatusFile.Entry("a", "idle", 1.0, 3, 0, 1, 0, 0, 1000L, null)));
+                    new SourceStatusFile.Entry("a", "idle", 1.0, 3, 0, 1, 0, 0, 1000L, 1000L, null)));
                 yield dataDir.resolve(SourceStatusFile.FILE);
             }
             case ERASURE_RECEIPTS -> {

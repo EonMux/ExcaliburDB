@@ -35,10 +35,19 @@ import java.util.Objects;
  * source whose crawl the restart interrupted comes back reporting the last crawl that finished,
  * never a crawl that claims to still be running.</p>
  *
+ * <p>Beside how the last run ended, each record keeps when a crawl of the source - its first
+ * crawl or a re-crawl - last ran to its end. The two differ: a run stopped, broken or cut short
+ * by a restart ends too, and a re-crawl reports what it passed over as it stops. The re-crawl
+ * schedule is seeded from this one at startup, so a source's interval runs on across a restart
+ * instead of starting again, and a source none of whose crawls ever finished - a first crawl the
+ * restart cut short - is re-crawled at once rather than waiting out an interval with half its
+ * documents indexed.</p>
+ *
  * <h2>Record format</h2>
  * <p>The catalog's conventions, deliberately, so the tools that check a data directory read both
  * the same way. A first line, {@code \#source-status|<version>}, names the format; one line per
- * source follows, {@code id|state|progress|ingested|pending|skipped|disallowed|failed|updated_ms[|error]},
+ * source follows,
+ * {@code id|state|progress|ingested|pending|skipped|disallowed|failed|updated_ms|completed_ms[|error]},
  * escaped as the catalog escapes; and a last line, {@code \#end|<count>|<crc>}, closes the file:
  * the count, so a file that lost its tail is told apart from a shorter history, and the CRC32C of
  * every byte before the line, header included (see {@link EndLine}), so a record altered in place
@@ -48,7 +57,11 @@ import java.util.Objects;
  * <p>Version 1 had no {@code disallowed} field, since nothing was left out of a crawl on a
  * publisher's say-so before robots.txt was honoured; its records are still read, with that count
  * as zero. Versions 1 to 3 had no {@code failed} field, since a run's failures were reported
- * only in words; their records are read with that count as zero. Versions 1 and 2 closed with
+ * only in words; their records are read with that count as zero. Versions 1 to 4 had no
+ * {@code completed_ms} field, and their records are read as having no finished crawl on record,
+ * rather than guessing one from a time a stopped or broken run may have written: the source is
+ * re-crawled once at the first check after the upgrade, and has the field from then on. A
+ * {@code completed_ms} of zero means the same in every version. Versions 1 and 2 closed with
  * {@code \#end|count} and no checksum, and are read with their count checked and their records
  * unverified. Any of them is rewritten in the current version when the next run ends. How many
  * fields a record has is a property of the version its file declares, never guessed from the
@@ -83,7 +96,7 @@ public final class SourceStatusFile {
      * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
      * judge this file offline and must accept exactly what this class accepts.</p>
      */
-    public static final int FORMAT_VERSION = 4;
+    public static final int FORMAT_VERSION = 5;
 
     /**
      * The first version whose closing line carries a checksum.
@@ -106,6 +119,9 @@ public final class SourceStatusFile {
 
     /** The version that first carried the failed count. */
     private static final int FIRST_FAILED_VERSION = 4;
+
+    /** The version that first carried the time a crawl last ran to its end. */
+    private static final int FIRST_COMPLETED_VERSION = 5;
 
     /**
      * Opens the first line, which names the format the rest of the file is in.
@@ -136,8 +152,11 @@ public final class SourceStatusFile {
     /** Fields every record carries in versions 2 and 3, the disallowed count among the counts. */
     private static final int FIXED_FIELDS_V2 = 8;
 
-    /** Fields every record carries from version 4 on, the failed count after the disallowed. */
+    /** Fields every version 4 record carries, the failed count after the disallowed. */
     private static final int FIXED_FIELDS_V4 = 9;
+
+    /** Fields every record carries from version 5 on, the completed time after the updated. */
+    private static final int FIXED_FIELDS_V5 = 10;
 
     private final Path file;
     private final SourceCatalog.CatalogWriter writer;
@@ -157,24 +176,26 @@ public final class SourceStatusFile {
      *                      them
      * @param failed        Documents it listed and could not index
      * @param lastUpdatedMs When it ended, epoch milliseconds
+     * @param lastCompletedMs When a crawl of the source last ran to its end, epoch
+     *                      milliseconds, or 0 when none is on record
      * @param lastError     What went wrong, or null if nothing did
      */
     public record Entry(String sourceId, String state, double progress, long ingested,
                         long pending, long skipped, long disallowed, long failed,
-                        long lastUpdatedMs, String lastError) {
+                        long lastUpdatedMs, long lastCompletedMs, String lastError) {
 
         /**
          * Validates an entry.
          *
          * @throws NullPointerException     if the id or the state is null
-         * @throws IllegalArgumentException if a count or the time is negative, or the progress
+         * @throws IllegalArgumentException if a count or a time is negative, or the progress
          *                                  is not in [0.0, 1.0]
          */
         public Entry {
             Objects.requireNonNull(sourceId, "sourceId must not be null");
             Objects.requireNonNull(state, "state must not be null");
             if (ingested < 0 || pending < 0 || skipped < 0 || disallowed < 0 || failed < 0
-                    || lastUpdatedMs < 0) {
+                    || lastUpdatedMs < 0 || lastCompletedMs < 0) {
                 throw new IllegalArgumentException("status counts must not be negative");
             }
             if (!(progress >= 0.0 && progress <= 1.0)) {
@@ -277,7 +298,8 @@ public final class SourceStatusFile {
             .append(entry.skipped()).append(FIELD_SEPARATOR)
             .append(entry.disallowed()).append(FIELD_SEPARATOR)
             .append(entry.failed()).append(FIELD_SEPARATOR)
-            .append(entry.lastUpdatedMs());
+            .append(entry.lastUpdatedMs()).append(FIELD_SEPARATOR)
+            .append(entry.lastCompletedMs());
         if (entry.lastError() != null) {
             line.append(FIELD_SEPARATOR).append(SourceCatalog.escape(entry.lastError()));
         }
@@ -374,13 +396,16 @@ public final class SourceStatusFile {
         List<String> fields = SourceCatalog.splitEscaped(line, FIELD_SEPARATOR);
         boolean countsDisallowed = version >= FIRST_DISALLOWED_VERSION;
         boolean countsFailed = version >= FIRST_FAILED_VERSION;
-        int fixed = countsFailed ? FIXED_FIELDS_V4
+        boolean recordsCompleted = version >= FIRST_COMPLETED_VERSION;
+        int fixed = recordsCompleted ? FIXED_FIELDS_V5
+            : countsFailed ? FIXED_FIELDS_V4
             : countsDisallowed ? FIXED_FIELDS_V2 : FIXED_FIELDS_V1;
         if (fields.size() != fixed && fields.size() != fixed + 1) {
             return null;
         }
-        // The time closes the fixed fields, so it moves with each count a version added before it.
-        int time = fixed - 1;
+        // The updated time follows the counts, so it moves with each count a version added before
+        // it; the completed time, where there is one, closes the fixed fields after it.
+        int time = recordsCompleted ? fixed - 2 : fixed - 1;
         try {
             return new Entry(
                 SourceCatalog.unescape(fields.get(0)),
@@ -392,6 +417,7 @@ public final class SourceStatusFile {
                 countsDisallowed ? Long.parseLong(fields.get(6)) : 0L,
                 countsFailed ? Long.parseLong(fields.get(7)) : 0L,
                 Long.parseLong(fields.get(time)),
+                recordsCompleted ? Long.parseLong(fields.get(time + 1)) : 0L,
                 fields.size() > fixed ? SourceCatalog.unescape(fields.get(fixed)) : null);
         } catch (IllegalArgumentException e) {
             return null;

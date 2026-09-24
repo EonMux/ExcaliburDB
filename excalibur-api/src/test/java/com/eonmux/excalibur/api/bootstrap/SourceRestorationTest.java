@@ -21,6 +21,7 @@ import java.nio.file.Path;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
@@ -70,7 +71,7 @@ class SourceRestorationTest {
 
         assertThat(restored).isEqualTo(1);
         assertThat(registry.isRegistered("my-docs")).isTrue();
-        verify(scheduler).registerSource("my-docs", 3_600_000L);
+        verify(scheduler).registerSource("my-docs", 3_600_000L, null);
     }
 
     @Test
@@ -110,6 +111,7 @@ class SourceRestorationTest {
             .as("a root the operator revoked must not come back through the node's own file")
             .isFalse();
         verify(scheduler, never()).registerSource(anyString(), anyLong());
+        verify(scheduler, never()).registerSource(anyString(), anyLong(), any());
     }
 
     @Test
