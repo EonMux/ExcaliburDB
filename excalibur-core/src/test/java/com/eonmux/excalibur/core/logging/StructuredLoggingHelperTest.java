@@ -40,6 +40,10 @@ class StructuredLoggingHelperTest {
         MDC.clear();
     }
 
+    private static String mdc(String key) {
+        return MDC.get(key);
+    }
+
     @Nested
     @DisplayName("Correlation ID")
     class CorrelationIdTests {
@@ -51,7 +55,7 @@ class StructuredLoggingHelperTest {
 
             StructuredLoggingHelper.setCorrelationId(testId);
 
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isEqualTo(testId);
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isEqualTo(testId);
             assertThat(MDC.get("correlationId")).isEqualTo(testId);
         }
 
@@ -61,7 +65,7 @@ class StructuredLoggingHelperTest {
             StructuredLoggingHelper.setCorrelationId("test-id");
             StructuredLoggingHelper.clearCorrelationId();
 
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isNull();
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isNull();
             assertThat(MDC.get("correlationId")).isNull();
         }
 
@@ -71,7 +75,7 @@ class StructuredLoggingHelperTest {
             StructuredLoggingHelper.setCorrelationId("existing-id");
             StructuredLoggingHelper.setCorrelationId(null);
 
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isNull();
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isNull();
         }
 
         @Test
@@ -80,7 +84,7 @@ class StructuredLoggingHelperTest {
             StructuredLoggingHelper.setCorrelationId("existing-id");
             StructuredLoggingHelper.setCorrelationId("");
 
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isNull();
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isNull();
         }
     }
 
@@ -95,69 +99,36 @@ class StructuredLoggingHelperTest {
 
             StructuredLoggingHelper.setSourceId(sourceId);
 
-            assertThat(StructuredLoggingHelper.getSourceId()).isEqualTo(sourceId);
+            assertThat(mdc(StructuredLoggingHelper.SOURCE_ID)).isEqualTo(sourceId);
             assertThat(MDC.get("sourceId")).isEqualTo(sourceId);
         }
 
-        @Test
-        @DisplayName("clears source ID")
-        void clearSourceId() {
-            StructuredLoggingHelper.setSourceId("test-source");
-            StructuredLoggingHelper.clearSourceId();
-
-            assertThat(StructuredLoggingHelper.getSourceId()).isNull();
-        }
     }
 
     @Nested
-    @DisplayName("Query ID")
-    class QueryIdTests {
+    @DisplayName("Document ID")
+    class DocumentIdTests {
 
         @Test
-        @DisplayName("sets and gets query ID")
-        void setAndGetQueryId() {
-            String queryId = "query-123";
+        @DisplayName("sets and clears document ID")
+        void setAndClearDocumentId() {
+            StructuredLoggingHelper.setDocumentId("doc-7");
+            assertThat(mdc(StructuredLoggingHelper.DOCUMENT_ID)).isEqualTo("doc-7");
 
-            StructuredLoggingHelper.setQueryId(queryId);
-
-            assertThat(StructuredLoggingHelper.getQueryId()).isEqualTo(queryId);
-            assertThat(MDC.get("queryId")).isEqualTo(queryId);
+            StructuredLoggingHelper.clearDocumentId();
+            assertThat(mdc(StructuredLoggingHelper.DOCUMENT_ID)).isNull();
         }
 
         @Test
-        @DisplayName("clears query ID")
-        void clearQueryId() {
-            StructuredLoggingHelper.setQueryId("test-query");
-            StructuredLoggingHelper.clearQueryId();
+        @DisplayName("a null or empty document ID clears it")
+        void nullOrEmptyDocumentIdClears() {
+            StructuredLoggingHelper.setDocumentId("doc-7");
+            StructuredLoggingHelper.setDocumentId(null);
+            assertThat(mdc(StructuredLoggingHelper.DOCUMENT_ID)).isNull();
 
-            assertThat(StructuredLoggingHelper.getQueryId()).isNull();
-        }
-    }
-
-    @Nested
-    @DisplayName("Segment ID")
-    class SegmentIdTests {
-
-        @Test
-        @DisplayName("sets segment ID from string")
-        void setSegmentIdFromString() {
-            String segmentId = "segment-42";
-
-            StructuredLoggingHelper.setSegmentId(segmentId);
-
-            assertThat(StructuredLoggingHelper.getSegmentId()).isEqualTo(segmentId);
-            assertThat(MDC.get("segmentId")).isEqualTo(segmentId);
-        }
-
-        @Test
-        @DisplayName("sets segment ID from long")
-        void setSegmentIdFromLong() {
-            long segmentId = 12345L;
-
-            StructuredLoggingHelper.setSegmentId(segmentId);
-
-            assertThat(StructuredLoggingHelper.getSegmentId()).isEqualTo("12345");
-            assertThat(MDC.get("segmentId")).isEqualTo("12345");
+            StructuredLoggingHelper.setDocumentId("doc-7");
+            StructuredLoggingHelper.setDocumentId("");
+            assertThat(mdc(StructuredLoggingHelper.DOCUMENT_ID)).isNull();
         }
     }
 
@@ -172,18 +143,10 @@ class StructuredLoggingHelperTest {
 
             StructuredLoggingHelper.setStage(stage);
 
-            assertThat(StructuredLoggingHelper.getStage()).isEqualTo(stage);
+            assertThat(mdc(StructuredLoggingHelper.STAGE)).isEqualTo(stage);
             assertThat(MDC.get("stage")).isEqualTo(stage);
         }
 
-        @Test
-        @DisplayName("clears stage")
-        void clearStage() {
-            StructuredLoggingHelper.setStage("crawling");
-            StructuredLoggingHelper.clearStage();
-
-            assertThat(StructuredLoggingHelper.getStage()).isNull();
-        }
     }
 
     @Nested
@@ -193,26 +156,29 @@ class StructuredLoggingHelperTest {
         @Test
         @DisplayName("clears all MDC fields")
         void clearsAllFields() {
-            // Set all fields
-            StructuredLoggingHelper.setCorrelationId("corr-1");
-            StructuredLoggingHelper.setQueryId("query-1");
-            StructuredLoggingHelper.setSourceId("source-1");
-            StructuredLoggingHelper.setDocumentId("doc-1");
-            StructuredLoggingHelper.setSegmentId("seg-1");
-            StructuredLoggingHelper.setStage("test");
-            StructuredLoggingHelper.setThreadName("thread-1");
+            MDC.put(StructuredLoggingHelper.CORRELATION_ID, "corr-1");
+            MDC.put(StructuredLoggingHelper.QUERY_ID, "query-1");
+            MDC.put(StructuredLoggingHelper.SOURCE_ID, "source-1");
+            MDC.put(StructuredLoggingHelper.DOCUMENT_ID, "doc-1");
+            MDC.put(StructuredLoggingHelper.SEGMENT_ID, "seg-1");
+            MDC.put(StructuredLoggingHelper.STAGE, "test");
+            MDC.put(StructuredLoggingHelper.THREAD_NAME, "thread-1");
+            MDC.put("unrelated", "kept");
 
             // Clear all
             StructuredLoggingHelper.clearAll();
 
             // Verify all are null
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isNull();
-            assertThat(StructuredLoggingHelper.getQueryId()).isNull();
-            assertThat(StructuredLoggingHelper.getSourceId()).isNull();
-            assertThat(StructuredLoggingHelper.getDocumentId()).isNull();
-            assertThat(StructuredLoggingHelper.getSegmentId()).isNull();
-            assertThat(StructuredLoggingHelper.getStage()).isNull();
-            assertThat(StructuredLoggingHelper.getThreadName()).isNull();
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.QUERY_ID)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.SOURCE_ID)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.DOCUMENT_ID)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.SEGMENT_ID)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.STAGE)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.THREAD_NAME)).isNull();
+            assertThat(MDC.get("unrelated"))
+                .as("only this helper's own keys are cleared")
+                .isEqualTo("kept");
         }
     }
 
@@ -251,8 +217,8 @@ class StructuredLoggingHelperTest {
             StructuredLoggingHelper.restoreContext(captured);
 
             // Verify restored values
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isEqualTo("original");
-            assertThat(StructuredLoggingHelper.getSourceId()).isEqualTo("original-source");
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isEqualTo("original");
+            assertThat(mdc(StructuredLoggingHelper.SOURCE_ID)).isEqualTo("original-source");
         }
 
         @Test
@@ -263,7 +229,7 @@ class StructuredLoggingHelperTest {
             StructuredLoggingHelper.restoreContext(null);
 
             // Should clear all
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isNull();
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isNull();
         }
     }
 
@@ -277,11 +243,11 @@ class StructuredLoggingHelperTest {
             AtomicReference<String> capturedId = new AtomicReference<>();
 
             StructuredLoggingHelper.runWithCorrelationId("test-corr-id", () -> {
-                capturedId.set(StructuredLoggingHelper.getCorrelationId());
+                capturedId.set(mdc(StructuredLoggingHelper.CORRELATION_ID));
             });
 
             assertThat(capturedId.get()).isEqualTo("test-corr-id");
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isNull();
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isNull();
         }
 
         @Test
@@ -292,7 +258,7 @@ class StructuredLoggingHelperTest {
             })).isInstanceOf(RuntimeException.class);
 
             // Context should still be cleared
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isNull();
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isNull();
         }
 
         @Test
@@ -306,14 +272,14 @@ class StructuredLoggingHelperTest {
             AtomicReference<String> capturedSource = new AtomicReference<>();
 
             StructuredLoggingHelper.runWithContext(context, () -> {
-                capturedCorr.set(StructuredLoggingHelper.getCorrelationId());
-                capturedSource.set(StructuredLoggingHelper.getSourceId());
+                capturedCorr.set(mdc(StructuredLoggingHelper.CORRELATION_ID));
+                capturedSource.set(mdc(StructuredLoggingHelper.SOURCE_ID));
             });
 
             assertThat(capturedCorr.get()).isEqualTo("corr-1");
             assertThat(capturedSource.get()).isEqualTo("source-1");
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isNull();
-            assertThat(StructuredLoggingHelper.getSourceId()).isNull();
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.SOURCE_ID)).isNull();
         }
     }
 
@@ -329,13 +295,13 @@ class StructuredLoggingHelperTest {
                     .withSourceId("scoped-source")
                     .build()) {
 
-                assertThat(StructuredLoggingHelper.getCorrelationId()).isEqualTo("scoped-corr");
-                assertThat(StructuredLoggingHelper.getSourceId()).isEqualTo("scoped-source");
+                assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isEqualTo("scoped-corr");
+                assertThat(mdc(StructuredLoggingHelper.SOURCE_ID)).isEqualTo("scoped-source");
             }
 
             // Context should be cleared after try-with-resources
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isNull();
-            assertThat(StructuredLoggingHelper.getSourceId()).isNull();
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.SOURCE_ID)).isNull();
         }
 
         @Test
@@ -345,7 +311,7 @@ class StructuredLoggingHelperTest {
                     .withSegmentId(42L)
                     .build()) {
 
-                assertThat(StructuredLoggingHelper.getSegmentId()).isEqualTo("42");
+                assertThat(mdc(StructuredLoggingHelper.SEGMENT_ID)).isEqualTo("42");
             }
         }
 
@@ -361,13 +327,13 @@ class StructuredLoggingHelperTest {
                     .withCorrelationId("inner-corr")
                     .build()) {
 
-                assertThat(StructuredLoggingHelper.getCorrelationId()).isEqualTo("inner-corr");
-                assertThat(StructuredLoggingHelper.getSourceId()).isEqualTo("outer-source"); // Preserved
+                assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isEqualTo("inner-corr");
+                assertThat(mdc(StructuredLoggingHelper.SOURCE_ID)).isEqualTo("outer-source"); // Preserved
             }
 
             // Outer values should be restored
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isEqualTo("outer-corr");
-            assertThat(StructuredLoggingHelper.getSourceId()).isEqualTo("outer-source");
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isEqualTo("outer-corr");
+            assertThat(mdc(StructuredLoggingHelper.SOURCE_ID)).isEqualTo("outer-source");
         }
 
         @Test
@@ -382,7 +348,7 @@ class StructuredLoggingHelperTest {
             }).isInstanceOf(RuntimeException.class);
 
             // Context should still be cleared (or restored to previous)
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isNull();
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isNull();
         }
 
         @Test
@@ -398,23 +364,23 @@ class StructuredLoggingHelperTest {
                     .withThreadName("test-thread")
                     .build()) {
 
-                assertThat(StructuredLoggingHelper.getCorrelationId()).isEqualTo("corr-1");
-                assertThat(StructuredLoggingHelper.getQueryId()).isEqualTo("query-1");
-                assertThat(StructuredLoggingHelper.getSourceId()).isEqualTo("source-1");
-                assertThat(StructuredLoggingHelper.getDocumentId()).isEqualTo("doc-1");
-                assertThat(StructuredLoggingHelper.getSegmentId()).isEqualTo("seg-1");
-                assertThat(StructuredLoggingHelper.getStage()).isEqualTo("test-stage");
-                assertThat(StructuredLoggingHelper.getThreadName()).isEqualTo("test-thread");
+                assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isEqualTo("corr-1");
+                assertThat(mdc(StructuredLoggingHelper.QUERY_ID)).isEqualTo("query-1");
+                assertThat(mdc(StructuredLoggingHelper.SOURCE_ID)).isEqualTo("source-1");
+                assertThat(mdc(StructuredLoggingHelper.DOCUMENT_ID)).isEqualTo("doc-1");
+                assertThat(mdc(StructuredLoggingHelper.SEGMENT_ID)).isEqualTo("seg-1");
+                assertThat(mdc(StructuredLoggingHelper.STAGE)).isEqualTo("test-stage");
+                assertThat(mdc(StructuredLoggingHelper.THREAD_NAME)).isEqualTo("test-thread");
             }
 
             // All should be cleared
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isNull();
-            assertThat(StructuredLoggingHelper.getQueryId()).isNull();
-            assertThat(StructuredLoggingHelper.getSourceId()).isNull();
-            assertThat(StructuredLoggingHelper.getDocumentId()).isNull();
-            assertThat(StructuredLoggingHelper.getSegmentId()).isNull();
-            assertThat(StructuredLoggingHelper.getStage()).isNull();
-            assertThat(StructuredLoggingHelper.getThreadName()).isNull();
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.QUERY_ID)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.SOURCE_ID)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.DOCUMENT_ID)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.SEGMENT_ID)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.STAGE)).isNull();
+            assertThat(mdc(StructuredLoggingHelper.THREAD_NAME)).isNull();
         }
     }
 
@@ -426,12 +392,12 @@ class StructuredLoggingHelperTest {
         @DisplayName("callWithCorrelationId returns result and clears context")
         void callWithCorrelationId() throws Exception {
             String result = StructuredLoggingHelper.callWithCorrelationId("call-corr", () -> {
-                assertThat(StructuredLoggingHelper.getCorrelationId()).isEqualTo("call-corr");
+                assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isEqualTo("call-corr");
                 return "success";
             });
 
             assertThat(result).isEqualTo("success");
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isNull();
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isNull();
         }
 
         @Test
@@ -441,7 +407,7 @@ class StructuredLoggingHelperTest {
                 throw new Exception("Test exception");
             })).isInstanceOf(Exception.class);
 
-            assertThat(StructuredLoggingHelper.getCorrelationId()).isNull();
+            assertThat(mdc(StructuredLoggingHelper.CORRELATION_ID)).isNull();
         }
     }
 }

@@ -123,25 +123,6 @@ public final class AtomicPublish {
     }
 
     /**
-     * Moves a directory onto a name atomically, forcing its contents first.
-     *
-     * <p>The target must not exist; whoever calls this is responsible for having moved
-     * anything that was there out of the way, so that the swap itself is one rename and the
-     * target is never a blend of the two trees.</p>
-     *
-     * @param staged The fully written tree, in the same parent as the target
-     * @param target The name it should take
-     * @throws IOException if the force or the rename fails
-     */
-    public static void publishTree(Path staged, Path target) throws IOException {
-        Objects.requireNonNull(staged, "staged");
-        Objects.requireNonNull(target, "target");
-        syncTree(staged);
-        Files.move(staged, target, StandardCopyOption.ATOMIC_MOVE);
-        syncContainingDirectory(target);
-    }
-
-    /**
      * Deletes a tree, deepest entry first.
      *
      * @param root The tree; nothing happens if it is absent

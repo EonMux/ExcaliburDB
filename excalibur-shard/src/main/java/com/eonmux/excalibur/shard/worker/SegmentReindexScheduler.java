@@ -334,21 +334,6 @@ public class SegmentReindexScheduler {
     }
 
     /**
-     * Updates the re-index interval for a source.
-     *
-     * @param sourceId          The source ID
-     * @param reindexIntervalMs The new re-index interval
-     */
-    public void updateReindexInterval(String sourceId, long reindexIntervalMs) {
-        validateReindexInterval(reindexIntervalMs);
-        SourceSchedule schedule = sourceSchedules.get(sourceId);
-        if (schedule != null) {
-            schedule.reindexIntervalMs = reindexIntervalMs;
-            LOGGER.debug("Updated re-index interval for source {} to {}ms", sourceId, reindexIntervalMs);
-        }
-    }
-
-    /**
      * Rejects an id no removal could later name.
      *
      * @param sourceId The source ID to check
@@ -369,39 +354,6 @@ public class SegmentReindexScheduler {
      */
     public int getRegisteredSourceCount() {
         return sourceSchedules.size();
-    }
-
-    // ==================== Manual Re-index ====================
-
-    /**
-     * Triggers an immediate re-index for a source.
-     *
-     * <p>This bypasses the normal scheduling and triggers re-index immediately.</p>
-     *
-     * @param sourceId The source ID to re-index
-     * @return true if re-index was triggered successfully
-     */
-    public boolean triggerReindexNow(String sourceId) {
-        SourceSchedule schedule = sourceSchedules.get(sourceId);
-        if (schedule == null) {
-            LOGGER.warn("Cannot trigger re-index: source {} not registered", sourceId);
-            return false;
-        }
-
-        try {
-            boolean triggered = listener.onReindexNeeded(sourceId);
-            if (triggered) {
-                totalReindexesTriggered.incrementAndGet();
-                schedule.lastReindexTime = Instant.now();
-                schedule.consecutiveFailures = 0;
-                LOGGER.info("Triggered immediate re-index for source {}", sourceId);
-            }
-            return triggered;
-        } catch (Exception e) {
-            totalReindexesFailed.incrementAndGet();
-            LOGGER.error("Failed to trigger re-index for source {}: {}", sourceId, e.getMessage());
-            return false;
-        }
     }
 
     /**
@@ -645,6 +597,39 @@ public class SegmentReindexScheduler {
     }
 
     // ==================== Test-Friendly Methods ====================
+
+    /**
+     * Runs the listener for one registered source now, outside the schedule.
+     *
+     * <p><strong>For testing only.</strong> It drives the listener and the bookkeeping around it
+     * without waiting out a check interval. It does not mark the source in progress, so it must
+     * not race a running scheduler for the same source.</p>
+     *
+     * @param sourceId The source ID to re-index
+     * @return true if re-index was triggered successfully
+     */
+    boolean triggerReindexNow(String sourceId) {
+        SourceSchedule schedule = sourceSchedules.get(sourceId);
+        if (schedule == null) {
+            LOGGER.warn("Cannot trigger re-index: source {} not registered", sourceId);
+            return false;
+        }
+
+        try {
+            boolean triggered = listener.onReindexNeeded(sourceId);
+            if (triggered) {
+                totalReindexesTriggered.incrementAndGet();
+                schedule.lastReindexTime = Instant.now();
+                schedule.consecutiveFailures = 0;
+                LOGGER.info("Triggered immediate re-index for source {}", sourceId);
+            }
+            return triggered;
+        } catch (Exception e) {
+            totalReindexesFailed.incrementAndGet();
+            LOGGER.error("Failed to trigger re-index for source {}: {}", sourceId, e.getMessage());
+            return false;
+        }
+    }
 
     /**
      * Sets the check interval in milliseconds without validation.

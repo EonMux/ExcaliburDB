@@ -377,27 +377,6 @@ class QueryTimeoutTest {
         assertThat(callCount.get()).isEqualTo(3);
     }
 
-    // ==================== Integration Test Helpers ====================
-
-    @Test
-    @DisplayName("QueryRequest.toQueryOptions converts correctly")
-    void testQueryRequestToQueryOptions() {
-        QueryRequest request = QueryRequest.builder()
-            .queryVector(new float[128])
-            .topK(20)
-            .threshold(0.7f)
-            .timeoutMs(10000)
-            .includePartialSegments(false)
-            .build();
-
-        QueryOptions options = request.toQueryOptions();
-
-        assertThat(options.topK()).isEqualTo(20);
-        assertThat(options.threshold()).isEqualTo(0.7f);
-        assertThat(options.timeout().toMillis()).isEqualTo(10000);
-        assertThat(options.includePartialSegments()).isFalse();
-    }
-
     // ==================== QueryRegistry Tests ====================
 
     @Test

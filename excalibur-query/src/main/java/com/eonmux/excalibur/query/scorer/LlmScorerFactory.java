@@ -181,16 +181,4 @@ public final class LlmScorerFactory {
         LLMHttpClient llmClient = new LLMHttpClient(config);
         return new LlmRelevancyScorer(llmClient);
     }
-
-    /**
-     * Creates a no-op LLM scorer that passes through results unchanged.
-     *
-     * <p>This is useful for testing or when LLM scoring is disabled but
-     * a non-null scorer is required.</p>
-     *
-     * @return A no-op LlmScorer that returns results unchanged
-     */
-    public static LlmScorer noOp() {
-        return (queryText, results, threshold) -> results;
-    }
 }

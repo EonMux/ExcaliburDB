@@ -295,39 +295,6 @@ public class VolumeManager {
     }
 
     /**
-     * Forces reassignment of a segment to a new volume.
-     *
-     * <p>This is useful when a volume is being removed and segments
-     * need to be migrated to other volumes.</p>
-     *
-     * @param segmentId The segment ID to reassign
-     * @return The new volume path
-     */
-    public Path reassignSegment(long segmentId) {
-        lock.writeLock().lock();
-        try {
-            // Remove existing assignment
-            Path oldVolume = segmentToVolume.remove(segmentId);
-            if (oldVolume != null) {
-                List<Long> segments = volumeToSegments.get(oldVolume);
-                if (segments != null) {
-                    segments.remove(segmentId);
-                }
-            }
-
-            // Get new assignment
-            Path newVolume = hashRing.assignSegment(segmentId);
-            if (newVolume != null) {
-                recordAssignment(segmentId, newVolume);
-            }
-
-            return newVolume;
-        } finally {
-            lock.writeLock().unlock();
-        }
-    }
-
-    /**
      * Gets the volume assignment for a segment.
      *
      * @param segmentId The segment ID

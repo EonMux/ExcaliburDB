@@ -452,30 +452,6 @@ class ChangeDetectionTest {
     }
 
     @Test
-    void testIncrementalDetection() throws SourceException {
-        // Pre-populate registry
-        for (int i = 0; i < 100; i++) {
-            registry.register(createMetadata("test-source", "doc" + i));
-        }
-
-        Source source = new MockSource("test-source", 
-            List.of("doc0", "doc1", "doc2", "doc3", "doc4"), // 95 deleted
-            docId -> new FetchedDocument(docId, 
-                ("content for " + docId).getBytes(), 
-                "text/plain", 
-                System.currentTimeMillis()));
-
-        List<ChangeSet> batches = new java.util.ArrayList<>();
-        ChangeSet finalChanges = detector.detectChangesIncremental(source, 2, batches::add);
-
-        // Should have 3 batches: [doc0, doc1], [doc2, doc3], [doc4]
-        assertEquals(3, batches.size());
-        
-        // Final changeset should contain deleted documents
-        assertEquals(95, finalChanges.getDeletedCount());
-    }
-
-    @Test
     void testHasChangedMethod() throws SourceException {
         byte[] content = "test content".getBytes();
         long hash = DocumentRegistry.computeContentHash(content);

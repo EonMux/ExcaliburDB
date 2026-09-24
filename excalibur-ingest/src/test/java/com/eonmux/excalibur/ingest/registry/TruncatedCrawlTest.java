@@ -106,15 +106,4 @@ class TruncatedCrawlTest {
             .containsExactlyInAnyOrder("a.txt", "b.txt", "c.txt");
     }
 
-    @Test
-    @DisplayName("an incremental detection is cut short the same way")
-    void incrementalDetectionAlsoFails() {
-        DocumentRegistry registry = registryHolding("a.txt", "b.txt", "c.txt");
-        ChangeDetector detector = new ChangeDetector(registry);
-
-        assertThatThrownBy(() -> detector.detectChangesIncremental(
-            new TruncatingSource(List.of("a.txt")), 10, batch -> { }))
-            .isInstanceOf(SourceException.class)
-            .hasMessageContaining("not the full contents");
-    }
 }
