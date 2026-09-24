@@ -161,9 +161,14 @@ class GraphAutoBuilderTest {
         clock.advance(Duration.ofSeconds(120));
         namespaces.put(ACME, behind(T0.plusSeconds(30), T0.plusSeconds(30)));
         namespaces.put(BETA, behind(T0, T0));
+        // Held running, so its slot is still taken when the pass looks at the next namespace.
+        namespaces.gate = new CountDownLatch(1);
 
         assertThat(builder.runPass()).containsExactly(BETA);
+        namespaces.gate.countDown();
         awaitFinished(BETA);
+        assertThat(builder.runPass()).containsExactly(ACME);
+        awaitFinished(ACME);
     }
 
     @Test

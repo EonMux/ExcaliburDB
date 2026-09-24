@@ -481,10 +481,13 @@ public final class GraphAutoBuilder implements AutoCloseable {
      * @return The namespace, when it is due
      */
     private Optional<Due> dueAt(NamespaceId id, Instant now) {
-        if (inFlight.contains(id) || explicitBuildRunning.test(id)) {
+        // The memory before the slot: a build frees its slot as it records how it ended, so a
+        // memory read first that still says running is never paired with a free slot and a
+        // backoff not yet recorded.
+        Memory memory = remembered.getOrDefault(id, Memory.NONE);
+        if (memory.running() || inFlight.contains(id) || explicitBuildRunning.test(id)) {
             return Optional.empty();
         }
-        Memory memory = remembered.getOrDefault(id, Memory.NONE);
         if (memory.retryAtMs() > now.toEpochMilli()) {
             return Optional.empty();
         }
@@ -580,7 +583,8 @@ public final class GraphAutoBuilder implements AutoCloseable {
             LOGGER.error("automatic graph build of namespace {} failed ({} in a row); the "
                 + "next attempt waits {}s", id, failures, wait.toSeconds(), e);
         } finally {
-            inFlight.remove(id);
+            // The slot was freed by finish(), with the memory: freeing it again here could free
+            // one a later pass has since taken for the next build of this namespace.
             // One pool thread runs many builds; a flag left set by anything would kill the
             // next build at its first channel operation.
             Thread.interrupted();
@@ -588,7 +592,10 @@ public final class GraphAutoBuilder implements AutoCloseable {
     }
 
     /**
-     * Records how a build ended.
+     * Records how a build ended, and frees its slot in the same step.
+     *
+     * <p>Together, so nothing sees the build finished and its namespace still in flight - a pass
+     * would skip it - or free and its backoff not yet recorded - a pass would retry at once.</p>
      */
     private void finish(NamespaceId id, long startedAtMs, String result, String error,
                         GraphBuildService.BuildOutcome outcome, int failures, long retryAtMs) {
@@ -596,6 +603,7 @@ public final class GraphAutoBuilder implements AutoCloseable {
         remembered.compute(id, (key, memory) -> {
             GraphBuildService.BuildOutcome kept = outcome != null ? outcome
                 : memory == null ? null : memory.lastOutcome();
+            inFlight.remove(id);
             return new Memory(false, startedAtMs, finishedAtMs, result, error, kept, failures,
                 retryAtMs);
         });

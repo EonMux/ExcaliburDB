@@ -68,6 +68,7 @@ import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.shard.allocator.VolumeManager;
 import com.eonmux.excalibur.shard.worker.SegmentReindexScheduler;
 import com.eonmux.excalibur.config.Config;
+import com.eonmux.excalibur.config.GraphConfig;
 import com.eonmux.excalibur.llm.client.CircuitBreaker;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
 import com.eonmux.excalibur.store.SegmentCatalog;
@@ -245,7 +246,8 @@ final class EndpointRegistrar {
         // Beside the runner, which it defers to: a namespace an explicit build is running for
         // is left to that build.
         GraphAutoBuilder graphAutoBuilder = graphBuildRunner != null
-            ? GraphAutoBuilder.start(in.graphTenants(), graphBuildRunner, in.config().graph())
+            ? GraphAutoBuilder.start(in.graphTenants(), graphBuildRunner, in.config() != null
+                ? in.config().graph() : new GraphConfig(Map.of()))
             : null;
         if (graphBuildRunner != null) {
             IngestionOrchestrator ingestion = in.ingestionOrchestrator();
