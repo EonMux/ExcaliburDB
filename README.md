@@ -2191,6 +2191,7 @@ curl 'http://localhost:8080/v1/ingest/status?source_id=my-docs'
   "entries_pending": 170000,
   "entries_skipped": 1204,
   "entries_disallowed": 0,
+  "documents_failed": 0,
   "last_updated_ms": 1730000042000,
   "last_error": null
 }
@@ -2207,10 +2208,12 @@ curl http://localhost:8080/v1/ingest/status
   "sources": [
     {"source_id": "my-docs", "state": "embedding", "progress": 0.7300,
      "entries_ingested": 450000, "entries_pending": 170000, "entries_skipped": 1204,
-     "entries_disallowed": 0, "last_updated_ms": 1730000042000, "last_error": null},
+     "entries_disallowed": 0, "documents_failed": 0, "last_updated_ms": 1730000042000,
+     "last_error": null},
     {"source_id": "docs-site", "state": "idle", "progress": 1.0000,
      "entries_ingested": 12034, "entries_pending": 0, "entries_skipped": 0,
-     "entries_disallowed": 37, "last_updated_ms": 1729900000000, "last_error": null}
+     "entries_disallowed": 37, "documents_failed": 0, "last_updated_ms": 1729900000000,
+     "last_error": null}
   ]
 }
 ```
@@ -2240,6 +2243,7 @@ progress when the node stopped did not finish.
 | `entries_pending` | Documents the crawl listed and has not reached yet |
 | `entries_skipped` | Documents the crawl listed that are not text, so nothing was indexed from them. Not a failure, and deliberately not folded into `last_error`: a directory holding photographs beside its documents is the ordinary case, and calling those failures would leave every such source reading as broken. An empty file, or one that decodes to nothing worth a chunk, is not counted here by the first crawl or by any re-crawl |
 | `entries_disallowed` | Pages a web crawl left alone because the site's `robots.txt` disallows them — met as links, or reached through a redirect. Counted apart from `entries_skipped` because it answers a different question: a skipped photograph is ordinary, a disallowed page is one the site asked to be left out, which only its owner or a registration with `respect_robots_txt: false` can change. Not an error. Always 0 for a filesystem source. See [robots.txt](#robotstxt) |
+| `documents_failed` | Documents the crawl listed and could not index: a fetch or read that failed, a document over the per-document limits, or chunks that could not all be embedded and written. An error, which `last_error` states in words; those documents are not searchable. Named as `POST /v1/documents` names the same count |
 
 ### What gets indexed
 
@@ -3650,15 +3654,16 @@ progress and counts, when it finished, and its `last_error` — so `GET /v1/inge
 restart reports that run rather than zeros stamped with the moment the node came up. Only finished
 runs are written (`idle` or `unconfigured`); a crawl the restart cut short comes back `idle` with
 `last_error` saying that the run in progress when the node stopped did not finish, never still
-claiming to run. The file is written the way the catalog is — a `\#source-status|3` header, one
+claiming to run. The file is written the way the catalog is — a `\#source-status|4` header, one
 line per source, a `\#end|<count>|<crc>` marker, forced to disk and published by an atomic rename
 — but unlike the catalog, one that cannot be read, or whose checksum does not match, does not fail
 the start. It is a report, not state the store depends on: the node logs it, treats the history as
 empty, and each source reports from its next run. A data directory from a build without the file
-needs nothing; it is written when the first run ends. Versions 1 and 2 carry no checksum and are
-still read — version 1, written before a crawl counted the pages `robots.txt` kept it from, with
-each source's `entries_disallowed` as 0 — and the next run to end rewrites the file at version
-3.
+needs nothing; it is written when the first run ends. Older versions are still read: versions 1
+to 3, written before a run's failures were counted, with each source's `documents_failed` as 0;
+version 1, written before a crawl counted the pages `robots.txt` kept it from, with its
+`entries_disallowed` as 0 too; and versions 1 and 2 with no checksum to verify. The next run to end
+rewrites the file at version 4.
 
 `<data dir>/erasure-receipts` is what `GET /v1/erasure/{request_id}` answers from: one line per
 document erasure — its id, when it was made, the source and scope, the per-document counts and the

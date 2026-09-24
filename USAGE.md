@@ -1081,6 +1081,7 @@ curl http://localhost:8080/v1/ingest/status
       "entries_pending": 170000,
       "entries_skipped": 1204,
       "entries_disallowed": 0,
+      "documents_failed": 0,
       "last_updated_ms": 1730000042000,
       "last_error": null
     },
@@ -1092,6 +1093,7 @@ curl http://localhost:8080/v1/ingest/status
       "entries_pending": 0,
       "entries_skipped": 0,
       "entries_disallowed": 37,
+      "documents_failed": 0,
       "last_updated_ms": 1729900000000,
       "last_error": null
     }
@@ -1116,6 +1118,7 @@ curl "http://localhost:8080/v1/ingest/status?source_id=project-docs"
   "entries_pending": 170000,
   "entries_skipped": 1204,
   "entries_disallowed": 0,
+  "documents_failed": 0,
   "last_updated_ms": 1730000042000,
   "last_error": null
 }
@@ -1164,6 +1167,13 @@ that. It is not an error and is not in `last_error`.
 Like `entries_skipped`, it is rewritten by every run, re-crawls included, and it is always 0 for a
 filesystem source. A `robots.txt` the site cannot serve is a different case, reported through
 `last_error`: see [robots.txt](#robotstxt).
+
+`documents_failed` is how many documents the crawl listed and could not index: a read or fetch
+that failed, a document over the per-document limits, or one whose chunks could not all be
+embedded and written. Unlike the two counts above it is a failure, the same one `last_error`
+states in words, and those documents are not searchable. It is the count `POST /v1/documents`
+answers with under the same name. It belongs to the ingestion run that wrote it; a reindex counts
+its own failures on `GET /v1/reindex/status`.
 
 **Response — `404 Not Found`** (unknown source)
 
@@ -3802,13 +3812,14 @@ taken before the upgrade.
 
 **`<data dir>/source-status` — no step required.** A build older than the file never wrote it,
 so a directory it left has none, and every source reports from its next run exactly as it did
-before the upgrade; the file appears when the first run ends. The file is version 3, whose marker,
-`\#end|<count>|<crc>`, adds a CRC32C of every byte before it; a history whose checksum does not
-match is logged and treated as empty, as any history the node cannot read is. Versions 1 and 2
-carry no checksum, are read as before, and are rewritten at version 3 when the next run ends. An
-older build does not read version 3: it logs the file as unreadable and starts with no history, so
-rolling back loses the record of each source's last run, never indexed data, unless a
-pre-upgrade image is restored.
+before the upgrade; the file appears when the first run ends. The file is version 4, which adds
+each source's `documents_failed` to what version 3 held; a version 3 history is read with that
+count as 0. Its marker, `\#end|<count>|<crc>`, carries a CRC32C of every byte before it; a history
+whose checksum does not match is logged and treated as empty, as any history the node cannot read
+is. Versions 1 and 2 carry no checksum and are read as before. Every older version is rewritten at
+version 4 when the next run ends. An older build does not read version 4: it logs the file as
+unreadable and starts with no history, so rolling back loses the record of each source's last run,
+never indexed data, unless a pre-upgrade image is restored.
 
 **`<data dir>/erasure-receipts` — no step required.** A build older than the file never wrote it;
 the first `POST /v1/erasure` after the upgrade creates it, and erasures made before then have no

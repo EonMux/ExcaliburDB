@@ -220,6 +220,30 @@ class IngestStatusEndpointHandlerTest {
         }
 
         @Test
+        @DisplayName("documents a run could not index are counted, and a reset clears them")
+        void failedIsCountedAndResets() throws IOException {
+            IngestStatusEndpoint.InMemoryIngestionStatusRegistry registry = registryWith("docs");
+            IngestStatusEndpoint.IngestionStatus status = registry.getStatus("docs");
+            IngestStatusEndpoint endpoint = new IngestStatusEndpoint(registry);
+            status.update("idle", 1.0, 40, 0);
+            status.setFailed(2);
+            status.setError("2 of 42 documents could not be indexed");
+
+            Object json = call(endpoint, "GET", "/v1/ingest/status?source_id=docs").json();
+            assertThat(Json.at(json, "documents_failed")).isEqualTo(2L);
+            assertThat(Json.at(json, "entries_skipped")).isEqualTo(0L);
+
+            status.setFailed(-1);
+            assertThat(Json.at(call(endpoint, "GET", "/v1/ingest/status?source_id=docs").json(),
+                "documents_failed")).isEqualTo(0L);
+
+            status.setFailed(3);
+            status.setUnconfigured("no pipeline", 1);
+            assertThat(Json.at(call(endpoint, "GET", "/v1/ingest/status?source_id=docs").json(),
+                "documents_failed")).isEqualTo(0L);
+        }
+
+        @Test
         @DisplayName("a negative disallowed count is reported as none, and a reset clears it")
         void disallowedIsNeverNegativeAndResets() throws IOException {
             IngestStatusEndpoint.InMemoryIngestionStatusRegistry registry = registryWith("site");

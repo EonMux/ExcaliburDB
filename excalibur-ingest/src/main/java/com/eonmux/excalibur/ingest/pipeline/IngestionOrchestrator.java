@@ -140,6 +140,21 @@ public class IngestionOrchestrator {
         void setDisallowed(long entriesDisallowed);
 
         /**
+         * Records how many of this run's documents could not be indexed: the fetch failed, the
+         * document was too large or produced too many chunks, or its chunks could not all be
+         * embedded and written, so it was rolled back.
+         *
+         * <p>A count of its own beside {@link #setSkipped} and {@link #setDisallowed}, because it
+         * is the one of the three that is a failure, and reported like them: when the crawl has
+         * listed the source, and again when the run ends or is stopped. The error message says
+         * the same thing in words; this is the number a caller can compare between runs.</p>
+         *
+         * @param documentsFailed Documents listed and not indexed through a failure; zero clears
+         *                        it
+         */
+        void setFailed(long documentsFailed);
+
+        /**
          * Sets an error state.
          *
          * @param error Error message
@@ -608,9 +623,11 @@ public class IngestionOrchestrator {
         LOGGER.info("Discovered {} documents", totalPending);
 
         // Zeroed at the start of the run rather than carried: a re-crawl that skips nothing must
-        // not go on reporting what the crawl before it skipped - and that includes a crawl that
-        // lists nothing at all, which is where a root emptied since the last one ends up.
+        // not go on reporting what the crawl before it skipped, nor what it failed on - and that
+        // includes a crawl that lists nothing at all, which is where a root emptied since the
+        // last one ends up.
         status.setSkipped(0);
+        status.setFailed(0);
         // What the crawl was forbidden is known now, and is the whole answer for a crawl that
         // listed nothing because its site disallowed everything.
         status.setDisallowed(source.getDisallowedCount());
@@ -655,6 +672,7 @@ public class IngestionOrchestrator {
                     sourceId, processedDocs, totalPending);
                 finishStoppedRun(stop);
                 status.setSkipped(skippedDocs);
+                status.setFailed(failedDocs);
                 status.setDisallowed(source.getDisallowedCount());
                 status.setError("Ingestion stopped");
                 return new IngestionOutcome(
@@ -725,6 +743,7 @@ public class IngestionOrchestrator {
         // the status stops at the first idle reading at full progress, and what is recorded
         // after it is never read.
         status.setSkipped(skippedDocs);
+        status.setFailed(failedDocs);
         status.setDisallowed(source.getDisallowedCount());
         reportSkippedDocuments(sourceId, skippedDocs, totalPending);
         reportDroppedDocuments(sourceId, status, failedDocs, totalPending);

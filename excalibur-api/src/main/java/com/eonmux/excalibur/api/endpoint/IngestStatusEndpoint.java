@@ -48,6 +48,7 @@ import java.util.function.Consumer;
  *   "entries_pending": 170000,
  *   "entries_skipped": 1204,
  *   "entries_disallowed": 37,
+ *   "documents_failed": 2,
  *   "last_updated_ms": 1730000000000,
  *   "last_error": null
  * }
@@ -66,7 +67,12 @@ import java.util.function.Consumer;
  * crawl met them as links or a fetch was redirected onto one. They are kept apart because they
  * answer different questions: a skipped image is ordinary, while a disallowed page is one the
  * site asked to be left out, which only its owner - or a registration made with
- * {@code respect_robots_txt: false} - can change. Neither is an error.</p>
+ * {@code respect_robots_txt: false} - can change. Neither is an error.
+ * {@code documents_failed} is the documents the run listed and could not index, because a fetch
+ * failed, a document was over the per-document limits, or its chunks could not all be embedded
+ * and written. That is an error, and {@code last_error} says the same in words. All three count
+ * documents, whatever their prefix; this one is named as {@code POST /v1/documents} names the
+ * count it answers with.</p>
  *
  * <h2>States</h2>
  * <ul>
@@ -244,6 +250,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             "\"entries_pending\": %d, " +
             "\"entries_skipped\": %d, " +
             "\"entries_disallowed\": %d, " +
+            "\"documents_failed\": %d, " +
             "\"last_updated_ms\": %d, " +
             "\"last_error\": %s" +
             "}",
@@ -254,6 +261,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             status.entriesPending(),
             status.entriesSkipped(),
             status.entriesDisallowed(),
+            status.documentsFailed(),
             status.lastUpdatedMs(),
             status.lastError() != null ? "\"" + JsonText.escape(status.lastError()) + "\"" : "null"
         );
@@ -283,6 +291,7 @@ public class IngestStatusEndpoint implements HttpHandler {
         private volatile long entriesPending;
         private volatile long entriesSkipped;
         private volatile long entriesDisallowed;
+        private volatile long documentsFailed;
         private volatile String lastError;
         private volatile long lastUpdatedMs;
 
@@ -300,6 +309,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             this.entriesPending = 0;
             this.entriesSkipped = 0;
             this.entriesDisallowed = 0;
+            this.documentsFailed = 0;
             this.lastError = null;
             this.lastUpdatedMs = System.currentTimeMillis();
         }
@@ -311,6 +321,7 @@ public class IngestStatusEndpoint implements HttpHandler {
         public long entriesPending() { return entriesPending; }
         public long entriesSkipped() { return entriesSkipped; }
         public long entriesDisallowed() { return entriesDisallowed; }
+        public long documentsFailed() { return documentsFailed; }
         public String lastError() { return lastError; }
         public long lastUpdatedMs() { return lastUpdatedMs; }
 
@@ -349,7 +360,8 @@ public class IngestStatusEndpoint implements HttpHandler {
          */
         SourceStatusFile.Entry snapshot() {
             return new SourceStatusFile.Entry(sourceId, state, progress, entriesIngested,
-                entriesPending, entriesSkipped, entriesDisallowed, lastUpdatedMs, lastError);
+                entriesPending, entriesSkipped, entriesDisallowed, documentsFailed, lastUpdatedMs,
+                lastError);
         }
 
         /**
@@ -370,6 +382,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             status.entriesPending = entry.pending();
             status.entriesSkipped = entry.skipped();
             status.entriesDisallowed = entry.disallowed();
+            status.documentsFailed = entry.failed();
             status.lastError = entry.lastError();
             status.lastUpdatedMs = entry.lastUpdatedMs();
             if (!status.isSettled()) {
@@ -460,6 +473,22 @@ public class IngestStatusEndpoint implements HttpHandler {
         }
 
         /**
+         * Records how many of this run's documents could not be indexed.
+         *
+         * <p>Kept like {@link #setSkipped}: left alone by {@link #update} and {@link #setError},
+         * and reported by the run it describes. Unlike it, a failure: the run's error says the
+         * same in words.</p>
+         *
+         * @param documentsFailed Documents listed and not indexed through a failure; negative is
+         *                        read as zero
+         */
+        public void setFailed(long documentsFailed) {
+            this.documentsFailed = Math.max(0, documentsFailed);
+            this.lastUpdatedMs = System.currentTimeMillis();
+            reportIfSettled();
+        }
+
+        /**
          * Sets an error state.
          */
         public void setError(String error) {
@@ -487,6 +516,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             this.entriesIngested = 0;
             this.entriesSkipped = 0;
             this.entriesDisallowed = 0;
+            this.documentsFailed = 0;
             this.entriesPending = Math.max(0, entriesPending);
             this.lastError = reason;
             this.lastUpdatedMs = System.currentTimeMillis();
@@ -503,6 +533,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             this.entriesPending = 0;
             this.entriesSkipped = 0;
             this.entriesDisallowed = 0;
+            this.documentsFailed = 0;
             this.lastError = null;
             this.lastUpdatedMs = System.currentTimeMillis();
             reportIfSettled();

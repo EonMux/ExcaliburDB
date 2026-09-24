@@ -216,7 +216,7 @@ class CountMarkedChecksumTest {
     class Status {
 
         private final SourceStatusFile.Entry entry =
-            new SourceStatusFile.Entry("docs", "idle", 1.0, 3, 0, 1, 2, 1000L, "boom");
+            new SourceStatusFile.Entry("docs", "idle", 1.0, 3, 0, 1, 2, 0, 1000L, "boom");
 
         @Test
         @DisplayName("a rewrite closes with the count and the checksum of every byte before it")
@@ -228,8 +228,8 @@ class CountMarkedChecksumTest {
             String body = written.substring(0, written.lastIndexOf(SourceStatusFile.END_MARKER));
             List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
 
-            assertThat(lines.get(0)).isEqualTo("\\#source-status|3");
-            assertThat(SourceStatusFile.FORMAT_VERSION).isEqualTo(3);
+            assertThat(lines.get(0)).isEqualTo("\\#source-status|4");
+            assertThat(SourceStatusFile.FORMAT_VERSION).isEqualTo(4);
             assertThat(lines.get(lines.size() - 1))
                 .isEqualTo("\\#end|1|" + EndLine.hex(Sealed.crc(body)));
             assertThat(SourceStatusFile.open(dir).loaded()).containsExactly(Map.entry("docs", entry));
@@ -257,7 +257,7 @@ class CountMarkedChecksumTest {
         }
 
         @Test
-        @DisplayName("a version 2 history is read, and rewritten in version 3 when a run ends")
+        @DisplayName("a version 2 history is read, and rewritten in the current version when a run ends")
         void aVersionTwoHistoryIsUpgraded(@TempDir Path dir) throws IOException {
             Path file = dir.resolve(SourceStatusFile.FILE);
             Files.writeString(file,
@@ -268,7 +268,7 @@ class CountMarkedChecksumTest {
             status.write(new ArrayList<>(status.loaded().values()));
 
             List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
-            assertThat(lines.get(0)).isEqualTo("\\#source-status|3");
+            assertThat(lines.get(0)).isEqualTo("\\#source-status|4");
             assertThat(lines.get(lines.size() - 1)).startsWith("\\#end|1|");
         }
 
@@ -276,7 +276,7 @@ class CountMarkedChecksumTest {
         @DisplayName("a version above the newest is set aside")
         void aNewerVersionIsSetAside(@TempDir Path dir) throws IOException {
             Sealed.write(dir.resolve(SourceStatusFile.FILE),
-                List.of("\\#source-status|4", "docs|idle|1.0|3|0|1|2|1000"),
+                List.of("\\#source-status|5", "docs|idle|1.0|3|0|1|2|0|1000"),
                 SourceStatusFile.END_MARKER, 1);
 
             assertThat(SourceStatusFile.open(dir).loaded()).isEmpty();

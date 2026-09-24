@@ -89,6 +89,19 @@ class IngestStatusDurabilityTest {
     }
 
     @Test
+    @DisplayName("how many documents a finished crawl failed on reads the same after the restart")
+    void theFailedCountSurvives() {
+        IngestStatusEndpoint.IngestionStatus status = node().getOrCreate("docs");
+        crawl(status, 80, 2);
+        status.setFailed(3);
+
+        IngestStatusEndpoint.IngestionStatus after = node().restore("docs");
+
+        assertThat(after.documentsFailed()).isEqualTo(3);
+        assertThat(after.entriesSkipped()).isEqualTo(2);
+    }
+
+    @Test
     @DisplayName("a run the restart interrupted does not come back claiming to be running")
     void anInterruptedRunIsNotResumedOnPaper() {
         IngestStatusEndpoint.InMemoryIngestionStatusRegistry before = node();
@@ -198,7 +211,7 @@ class IngestStatusDurabilityTest {
     @DisplayName("a history in a state this build does not report is read as a finished run")
     void anUnknownStateIsNotReportedAsRunning() throws IOException {
         SourceStatusFile.open(dataDir).write(List.of(new SourceStatusFile.Entry(
-            "docs", "embedding", 0.4, 4, 6, 0, 0, LONG_AGO, null)));
+            "docs", "embedding", 0.4, 4, 6, 0, 0, 0, LONG_AGO, null)));
 
         IngestStatusEndpoint.IngestionStatus after = node().restore("docs");
 

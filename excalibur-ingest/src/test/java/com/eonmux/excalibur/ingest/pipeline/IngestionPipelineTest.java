@@ -73,6 +73,7 @@ class IngestionPipelineTest {
         private volatile long pending;
         private volatile long skipped;
         private volatile long disallowed;
+        private volatile long failed;
         private volatile String error;
 
         @Override
@@ -92,6 +93,11 @@ class IngestionPipelineTest {
         @Override
         public void setDisallowed(long disallowed) {
             this.disallowed = disallowed;
+        }
+
+        @Override
+        public void setFailed(long failed) {
+            this.failed = failed;
         }
 
         @Override
@@ -514,6 +520,9 @@ class IngestionPipelineTest {
                 .as("half the corpus is absent from the index and the status has to say so")
                 .isNotNull()
                 .contains("1 of 2");
+            assertThat(status.failed)
+                .as("the same failure, as the count a caller compares between runs")
+                .isEqualTo(1);
             assertThat(storedChunkExists("docs", "good.txt", 0)).isTrue();
             assertThat(storedChunkExists("docs", "bad.txt", 0))
                 .as("a document that could not be fetched leaves nothing behind")
@@ -533,6 +542,7 @@ class IngestionPipelineTest {
             assertThat(status.error)
                 .as("the site said no; nothing failed")
                 .isNull();
+            assertThat(status.failed).isZero();
             assertThat(status.disallowed)
                 .as("two the crawl left out, and one refused when it was fetched")
                 .isEqualTo(3);
@@ -1974,6 +1984,22 @@ class IngestionPipelineTest {
                 new FakeSource("docs", Map.of("a.txt", "Ada Lovelace")));
 
             assertThat(status.skipped).isZero();
+        }
+
+        @Test
+        @DisplayName("a re-crawl that fails on nothing clears what the crawl before it failed on")
+        void aCleanCrawlClearsTheFailures() {
+            Map<String, String> documents = new ConcurrentHashMap<>(Map.of(
+                "good.txt", "real text here",
+                "bad.txt", "!fail"));
+            FakeSource source = new FakeSource("docs", documents);
+            IngestionOrchestrator orchestrator = orchestrator();
+            assertThat(ingest(orchestrator, source).failed).as("precondition").isEqualTo(1);
+
+            documents.put("bad.txt", "readable now");
+            RecordingStatus status = ingest(orchestrator, source);
+
+            assertThat(status.failed).isZero();
         }
 
         @Test

@@ -256,6 +256,8 @@ class IngestEndpointTest {
                 @Override
                 public void setDisallowed(long entriesDisallowed) {}
                 @Override
+                public void setFailed(long documentsFailed) {}
+                @Override
                 public void setError(String error) {}
             }
         ) {

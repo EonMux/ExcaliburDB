@@ -109,6 +109,10 @@ class TailScanHandoffIntegrationTest {
                 }
 
                 @Override
+                public void setFailed(long failed) {
+                }
+
+                @Override
                 public void setError(String error) {
                 }
             });
