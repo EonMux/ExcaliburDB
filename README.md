@@ -3357,7 +3357,7 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `cancel_compaction` | | Stops the compaction in progress, keeping what it had reclaimed |
 | `build_graph` | `namespace` | Publishes the staged facts as the served graph |
 | `graph_build_status` | `namespace` | How far a build has got, and what the last one published |
-| `cancel_graph_build` | `namespace` | Stops a build; it publishes nothing and the staged facts are kept |
+| `cancel_graph_build` | `namespace` | Stops the namespace's build, whether `build_graph` or the node's automatic build started it; it publishes nothing and the staged facts are kept, and a stopped automatic build is `deferred` until `next_attempt_at_ms` — `DELETE /v1/graph/build` |
 | `list_namespaces` | `limit`, `cursor` | The graph namespaces on the node, a page at a time |
 | `create_namespace` | **`namespace`** | Creates a namespace — the only way to on a node with `excalibur.graph.require-explicit-namespaces` on |
 | `erase_documents` | **`source_id`**, `document_ids`, `scope`, `compact`, **`confirm`** | Permanently erases the named documents, or with `scope` `source` everything the source holds, from the corpus and the graph. `confirm` must repeat `source_id` |
