@@ -150,6 +150,60 @@ class McpToolsTest {
     }
 
     @Test
+    @DisplayName("a search forwards explain and both relevance floors, and only when given")
+    void searchDocumentsForwardsExplainAndFloors() throws IOException {
+        assertThat(Json.objectAt(Json.objectAt(tool(McpTools.SEARCH_DOCUMENTS), "inputSchema"),
+            "properties")).containsKeys("explain", "threshold", "llm_threshold")
+            .as("operator and performance knobs stay off the tool")
+            .doesNotContainKeys("oversampling_factor", "include_partial_segments",
+                "enable_llm_scoring");
+        try (StubNode node = StubNode.start()) {
+            node.answerWith(200, "{\"results\":[],\"coverage\":{}}");
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            tools.call(McpTools.SEARCH_DOCUMENTS, Map.of("query", "analytical engine",
+                "explain", true, "threshold", 0.5, "llm_threshold", "0.25"));
+            tools.call(McpTools.SEARCH_DOCUMENTS, Map.of("query", "analytical engine"));
+
+            Object asked = Json.parse(node.requests().get(0).body());
+            assertThat(Json.at(asked, "explain")).isEqualTo(Boolean.TRUE);
+            assertThat(Json.at(asked, "threshold")).isEqualTo(0.5);
+            assertThat(Json.at(asked, "llm_threshold"))
+                .as("a quoted number is read as the number it spells")
+                .isEqualTo(0.25);
+            Object bare = Json.parse(node.requests().get(1).body());
+            assertThat(Json.at(bare, "explain")).isNull();
+            assertThat(Json.at(bare, "threshold"))
+                .as("omitted, so the node's configured floor applies")
+                .isNull();
+            assertThat(Json.at(bare, "llm_threshold")).isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("a relevance floor that is not a finite number is refused before the node is asked")
+    void searchDocumentsRefusesANonNumericFloor() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            McpTools.ToolResult word = tools.call(McpTools.SEARCH_DOCUMENTS,
+                Map.of("query", "analytical engine", "threshold", "high"));
+            McpTools.ToolResult flag = tools.call(McpTools.SEARCH_DOCUMENTS,
+                Map.of("query", "analytical engine", "llm_threshold", true));
+            McpTools.ToolResult infinite = tools.call(McpTools.SEARCH_DOCUMENTS,
+                Map.of("query", "analytical engine", "threshold", Double.POSITIVE_INFINITY));
+
+            assertThat(word.isError()).isTrue();
+            assertThat(word.text()).contains("'threshold'").contains("number");
+            assertThat(flag.isError()).isTrue();
+            assertThat(flag.text()).contains("'llm_threshold'");
+            assertThat(infinite.isError()).isTrue();
+            assertThat(infinite.text()).contains("finite");
+            assertThat(node.requests()).isEmpty();
+        }
+    }
+
+    @Test
     @DisplayName("a search confined to sources sends them, and an unconfined one sends none")
     void searchDocumentsForwardsSources() throws IOException {
         assertThat(Json.objectAt(Json.objectAt(tool(McpTools.SEARCH_DOCUMENTS), "inputSchema"),

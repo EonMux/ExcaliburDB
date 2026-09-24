@@ -133,6 +133,46 @@ final class ToolArguments {
     }
 
     /**
+     * Reads a numeric argument that may be fractional, or null when the model sent none.
+     *
+     * <p>Only the type is checked here, with the same tolerance for a quoted number as
+     * {@link #wholeNumber}. The range is the node's to enforce: it refuses an out-of-range value
+     * with a message naming its bounds, and restating those bounds here would give the tool a
+     * second limit to drift from the HTTP one. A value that is not finite is refused, since JSON
+     * has no way to carry it.</p>
+     *
+     * @param args  The call's arguments
+     * @param field The field name
+     * @return The value, or null
+     * @throws IllegalArgumentException if it is present and is not a finite number
+     */
+    static Double number(Map<String, Object> args, String field) {
+        Object value = args.get(field);
+        if (value == null) {
+            return null;
+        }
+        double read;
+        if (value instanceof Number number) {
+            read = number.doubleValue();
+        } else if (value instanceof String text) {
+            try {
+                read = Double.parseDouble(text.trim());
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException(
+                    "Argument '" + field + "' must be a number, got: " + text, e);
+            }
+        } else {
+            throw new IllegalArgumentException(
+                "Argument '" + field + "' must be a number, got: " + value);
+        }
+        if (!Double.isFinite(read)) {
+            throw new IllegalArgumentException(
+                "Argument '" + field + "' must be a finite number, got: " + value);
+        }
+        return read;
+    }
+
+    /**
      * Reads a true/false argument, or null when the model sent none.
      *
      * <p>Null rather than false when absent, because false is a setting of its own: a caller

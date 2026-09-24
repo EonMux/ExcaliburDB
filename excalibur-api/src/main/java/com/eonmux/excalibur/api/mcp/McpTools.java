@@ -260,6 +260,22 @@ public final class McpTools {
                 ToolSchema.optional("snippet_chars", "integer",
                     "Width of each snippet in characters, from 16 up to the server's per-result "
                     + "limit. Only with snippet true. Omit for the server's default.", null),
+                ToolSchema.optional("explain", "boolean",
+                    "Say why each passage was returned: its 'explain' gives every signal that "
+                    + "found it with that signal's own rank and score, and the query terms the "
+                    + "passage contains; the reply's 'query_expansion' says whether the query "
+                    + "was widened. Useful for judging a surprising result, or why an expected "
+                    + "one is missing.", null),
+                ToolSchema.optional("threshold", "number",
+                    "Lowest meaning-similarity, from 0 to 1, a passage may have and still be "
+                    + "returned. It applies to the meaning signal only, before any fusion, so "
+                    + "it does not filter keyword-only matches and is not on the scale of a "
+                    + "'hybrid' score. Omit for the server's configured floor.", null),
+                ToolSchema.optional("llm_threshold", "number",
+                    "Lowest relevance, from 0 to 1, a passage may be judged to have by the "
+                    + "node's relevancy model and still be returned. It applies only when the "
+                    + "reply says 'llm_scored' true; a node with no relevancy model names it in "
+                    + "'ignored_fields'. Omit for the server's configured bar.", null),
                 ToolSchema.optional("source_ids", "array",
                     "Search only the documents of these sources, by the 'source_id' they "
                     + "were ingested under, as " + INGESTION_STATUS + " and " + LIST_DOCUMENTS
@@ -952,6 +968,9 @@ public final class McpTools {
         putWholeNumber(args, body, "timeout_ms");
         putFlag(args, body, "snippet");
         putWholeNumber(args, body, "snippet_chars");
+        putFlag(args, body, "explain");
+        putNumber(args, body, "threshold");
+        putNumber(args, body, "llm_threshold");
         putStrings(args, body, "source_ids");
         return answer(client.post("/v1/query", Json.write(body), null));
     }
@@ -1399,6 +1418,22 @@ public final class McpTools {
     private static void putWholeNumber(Map<String, Object> args, Map<String, Object> config,
                                        String field) {
         Integer value = ToolArguments.wholeNumber(args, field);
+        if (value != null) {
+            config.put(field, value);
+        }
+    }
+
+    /**
+     * Copies a numeric setting that may be fractional into a request body, absent staying
+     * absent.
+     *
+     * @param args   The call's arguments
+     * @param config The body being built
+     * @param field  The setting
+     */
+    private static void putNumber(Map<String, Object> args, Map<String, Object> config,
+                                  String field) {
+        Double value = ToolArguments.number(args, field);
         if (value != null) {
             config.put(field, value);
         }

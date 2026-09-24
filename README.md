@@ -3153,7 +3153,7 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `reindex_status` | `source_id` | How far a reindex has got, and whether it finished, failed or was cancelled |
 | `deregister_source` | **`source_id`** | Stops a source being crawled again; the documents already indexed stay |
 | `list_sources` | `source_id` | What each source was registered as — its type, namespace and settings — and whether the node still crawls it — `GET /v1/ingest` |
-| `search_documents` | **`query`**, `top_k`, `offset`, `timeout_ms`, `snippet`, `snippet_chars`, `source_ids` | Searches the indexed documents and returns the matching passages, best first. `offset` pages past the first `top_k`, `timeout_ms` bounds how long the search may run, `snippet` returns a window around the match (`snippet_chars` wide) instead of the whole chunk, and `source_ids` confines the search to those sources |
+| `search_documents` | **`query`**, `top_k`, `offset`, `timeout_ms`, `snippet`, `snippet_chars`, `explain`, `threshold`, `llm_threshold`, `source_ids` | Searches the indexed documents and returns the matching passages, best first. `offset` pages past the first `top_k`, `timeout_ms` bounds how long the search may run, `snippet` returns a window around the match (`snippet_chars` wide) instead of the whole chunk, `explain` says why each passage was returned, `threshold` and `llm_threshold` raise the similarity and relevancy-model floors a passage must clear, and `source_ids` confines the search to those sources |
 | `list_documents` | `source_id`, `limit`, `cursor` | The documents the node holds, a page at a time, with each one's chunk ids |
 | `fetch_documents` | **`document_ids`** | The text of chunks by their ids, in the order asked; `null` for one the node no longer holds |
 | `read_document` | **`source_id`**, **`document_id`**, `include_text`, `limit`, `cursor` | One document whole, its chunks in order with their text unless `include_text` is `false` — `GET /v1/documents/list?document_id=` |
@@ -3227,7 +3227,11 @@ what `erasure_status` reports.
 
 The two searches are not alternatives. `search_documents` returns the passages that match and
 needs nothing but an ingestion run - the adapter asks the node for the text, because a model has
-no way to resolve a chunk identifier against the store the corpus was ingested from;
+no way to resolve a chunk identifier against the store the corpus was ingested from. It takes
+every `/v1/query` field that changes what a question returns or how it is shown, and leaves out
+the ones that tune how the node goes about it - `oversampling_factor`, `include_partial_segments`
+and `enable_llm_scoring` trade latency against recall and belong to whoever runs the node, so a
+tool call gets the node's configured defaults for them;
 `search_graph` returns entities and the facts connecting them
 and needs a graph, which in turn needs a chat model and `excalibur.graph.extraction-enabled`, off
 by default. A model given only the graph search has nothing to reach the corpus with on an
@@ -3256,7 +3260,9 @@ blank name is left out rather than sent as an object the node would refuse.
 Arguments are checked before anything is sent. One of the wrong type - a number where a string is
 declared, a string where an array is - is returned as a tool error naming the argument rather than
 coerced or dropped, so a model learns what it got wrong. An integer argument accepts `5`, `5.0` or
-`"5"`, and refuses a fraction. A true/false argument accepts `true` or `"true"`, in any case, and
+`"5"`, and refuses a fraction. A number that may be fractional, such as `threshold`, accepts
+`0.5` or `"0.5"` and refuses anything that is not a finite number; its range is the node's to
+enforce, so a value outside it comes back as the node's `400`. A true/false argument accepts `true` or `"true"`, in any case, and
 refuses anything else - `1` and `"yes"` included - rather than guess which was meant. An array is
 forwarded element for element, exactly as the same body sent over HTTP would be: an empty one is
 never dropped, and a blank or space-padded element is neither dropped nor trimmed - what it means
