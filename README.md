@@ -1343,8 +1343,11 @@ at". A signal that was configured and then failed mid-query does not silently va
 field: a BM25 search that breaks or misses the request's budget leaves the vector answer intact and
 the response reports `"vector"`, because that is what ran. It runs the other way too: an embedding
 endpoint or vector pipeline that fails, or misses the deadline without a partial answer, leaves
-the query answered from BM25 with `"lexical"` - on a node with `excalibur.query.hybrid-retrieval=false`
-as well, which starts its BM25 search once the vector half has failed. See
+the query answered from the BM25 search running beside it, with `"lexical"`. A node with
+`excalibur.query.hybrid-retrieval=false` runs no BM25 search beside the vector half, so it starts
+one only when that half *fails* - an error, a refused call, an unusable embedding - with what is
+left of the deadline. A vector half that *misses* the deadline has used all of it, so such a node
+answers that query with the empty timed-out answer rather than from BM25. See
 [USAGE.md](USAGE.md#hybrid-retrieval--both-signals).
 
 ### Evaluating it

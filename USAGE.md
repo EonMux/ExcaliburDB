@@ -2009,8 +2009,9 @@ query instead of on embedding every document, which is the deployment this path 
 few dozen generated tokens per query against billions of embedded tokens per corpus.
 
 A node that does embed its corpus answers here too, one query at a time, when its vector half
-cannot answer: the embedding endpoint fails or misses the deadline, or the pipeline does. That
-answer has the same shape, with `timed_out` saying whether a deadline was the cause — see
+cannot answer: the embedding endpoint fails or misses the deadline, or the pipeline does - a missed
+deadline only on a node that fuses, since with `excalibur.query.hybrid-retrieval=false` no BM25
+search was running and none can start once the deadline is spent. That answer has the same shape, with `timed_out` saying whether a deadline was the cause — see
 [Hybrid retrieval](#hybrid-retrieval--both-signals) for each case.
 
 ### Hybrid retrieval — both signals
@@ -3966,7 +3967,10 @@ What each call does:
   rank) on a node with an embedding endpoint and a chunk index and
   `excalibur.query.hybrid-retrieval` on; `VECTOR` with it off; `LEXICAL` on a node that does not
   embed (the embedding endpoint disabled, or left at the hosted default with no key), or when the
-  endpoint fails or runs out of time mid-query. A node with
+  vector half fails or runs out of time mid-query - except that with
+  `excalibur.query.hybrid-retrieval` off no BM25 search runs beside the vector half, so only a
+  failure starts one, and a vector half that runs out of time answers `VECTOR`, empty and
+  `timedOut()`, as the route does. A node with
   neither signal refuses every query with `IllegalStateException`; `route()` on the node answers
   that before any query is made. The limits are the server's: `excalibur.api.max-query-chars`,
   `max-top-k` and `max-query-timeout-ms`, and `query(text, topK, timeout)` sets a budget below the
