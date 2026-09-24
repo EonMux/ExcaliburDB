@@ -163,7 +163,9 @@ public final class FsckOptionsParser {
               --repair                 Apply the repairs that can be shown to be safe. Off by
                                        default: without it the plan is printed and nothing is
                                        touched. Every repair is stated before it is made, and
-                                       no repair ever deletes anything.
+                                       no repair ever deletes anything. Like --json and
+                                       --strict, it takes no value: --repair=false is refused
+                                       with exit code 2.
               --quarantine-dir=<path>  Where damaged files are moved to. Defaults to a
                                        timestamped directory beside the data directory,
                                        whose parent must then be writable. Must be outside
@@ -176,12 +178,13 @@ public final class FsckOptionsParser {
               --json                   Emit the report as JSON instead of text.
               --strict                 Exit non-zero when any file could not be verified, not
                                        only when one is damaged.
-              --help, -h               Print this and do nothing else.
+              --help, -h, help         Print this and do nothing else.
 
             Exit codes:
               0  nothing damaged was found
               1  damage, or an inconsistency between files, was found
-              2  the command line was wrong, or the directory is not there
+              2  the command line was wrong, or the directory is not there or is not a
+                 directory
               3  the check could not be performed
               4  --repair was refused because a running node or another tool holds the
                  directory; nothing was checked or changed

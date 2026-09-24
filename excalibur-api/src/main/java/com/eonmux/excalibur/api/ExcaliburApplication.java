@@ -181,7 +181,7 @@ public final class ExcaliburApplication {
                                    --config=<file>. Without it the server reads
                                    %s from the working directory if it is
                                    there, and starts on the built-in defaults if it is not.
-              --help, -h           Print this and do nothing else.
+              --help, -h, help     Print this and do nothing else.
 
             Exit codes:
               0  the server stopped cleanly

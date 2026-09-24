@@ -347,9 +347,11 @@ docker run --rm -v excalibur-data:/var/lib/excalibur \
 ```
 
 All four take the data directory's lock, so none of them can run against a volume a node is
-running on: a repair exits `4` and a snapshot or restore `7`, naming the node's pid, and nothing
-is written. A check without `--repair` goes ahead with a warning. CI runs all four against a node
-the image started and stopped, and runs the repair once more with the node up to see it refused.
+running on: a repair exits `4` and a snapshot `7`, naming the node's pid, and nothing is written.
+A restore checks that its target is empty before it tries the lock, and a running node's volume is
+not, so it exits `4` — or `7`, naming the pid, under `--force`. A check without `--repair` goes
+ahead with a warning. CI runs all four against a node the image started and stopped, and runs the
+repair and the snapshot once more with the node up to see them refused.
 
 Nothing is baked in. The API binds `127.0.0.1` by default and binding anything else requires a
 bearer token and either TLS or an explicit `EXCALIBUR_API_ALLOW_PLAINTEXT=true` where something in
@@ -434,6 +436,10 @@ excalibur-fsck /var/lib/excalibur --json
 excalibur-fsck --help                          # the flags and the exit codes
 ```
 
+`--help`, `-h` or a bare `help`, anywhere on the line, prints the flags and exits `0` without
+reading the directory. `--repair`, `--json` and `--strict` take no value; `--repair=false` is
+refused with exit `2` rather than read as either `--repair` or its opposite.
+
 Without `--repair` it never opens a file for writing: most are mapped read-only — enforced by the
 kernel, not by intention, because several of the engine's own open paths stamp headers or migrate
 formats on the way in — and the rest are streamed past a digest without being mapped at all. It
@@ -516,7 +522,10 @@ begin it — is `CORRUPT`. The verdict on
 `erasure.log` also counts the outstanding entity erasures that name an id nothing in the namespace
 holds, which the node discharges when it next opens the namespace. The `erasure.interrupted`
 marker beside them is recognised as well; the node writes it empty and reads only whether it is
-there, so an empty one is `INTACT`. So is `asserted.last-id`, the checksummed record of the highest
+there, so an empty one is `INTACT`. So is `unpublished.changes`, the empty marker staging keeps
+from the first change after a publish until a build publishes every change, which says the served
+graph is behind its staged facts; a snapshot copies both markers, since the node reads them. So is
+`asserted.last-id`, the checksummed record of the highest
 fact id handed out (see [Stating facts](#stating-facts)): `INTACT` when it matches its checksum,
 otherwise `CORRUPT`, since the node asserts no fact in that namespace until it is restored or
 removed.
@@ -604,8 +613,8 @@ reads may be changing. The lock file is the node's, not data, and is left out of
 its journal, `.excalibur-restore`, still in the directory — is reported as damage and put to the
 operator: running the same `excalibur-backup restore` again finishes it.
 
-Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself
-failed, so nothing is known about the directory — which is not the same claim as `0` — and `4`
+Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, or the data directory
+is missing or not a directory, `3` the check itself failed, so nothing is known about the directory — which is not the same claim as `0` — and `4`
 `--repair` was refused because another process holds the directory.
 
 ### Snapshots — `excalibur-backup`
@@ -737,7 +746,9 @@ Exit codes: `0` done, `2` bad command line — including an `--out` inside `--da
 `--target` inside `--snapshot` (inside where the path really leads, through any symbolic link), and a path the platform cannot name — `3` the image did not verify
 and nothing was restored, `4` the restore target or the snapshot's `--out` is not empty, `5` the data directory
 moved while being copied, `6` a file could not be read or written — or a copy did not read back as
-what was written — `7` another process holds the data directory or the restore target, and
+what was written, the `--data-dir` is not there, the `--out` or the restore `--target` is a regular
+file, or the data directory holds the journal of a restore that did not finish, which a snapshot
+refuses to copy — `7` another process holds the data directory or the restore target, and
 nothing was written, and `70` something this build did not anticipate, reported rather than
 hidden.
 
@@ -746,7 +757,8 @@ hidden.
 Configuration is loaded from `excalibur.properties` in the working directory by default, or from
 the path given to `--config` (or `-c <path>`, or `--config=<path>`); an argument the server does
 not recognise, or a `--config` with no path after it, refuses to start rather than quietly using
-the defaults, and `--help` (or `-h`) prints the arguments without starting anything. One file is
+the defaults, and `--help` (or `-h`, or a bare `help`, anywhere on the line) prints the arguments
+without starting anything. One file is
 read, not a chain, and only from the filesystem. A file named with `--config` that is missing or
 cannot be read refuses to start; only the default path falls back, with a warning, to the built-in
 defaults, and only when there is no file there at all.
