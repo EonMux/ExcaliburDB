@@ -4089,12 +4089,15 @@ Every module meets it. The per-module exception map in `build.gradle.kts` is emp
 one number and no module is held to less than the rest — a floor left where coverage used to be
 is what lets it fall back there unnoticed, which is the one thing a floor exists to prevent.
 
-`excalibur-bench` is the permanent outlier. Most of it is JMH state classes, `@Benchmark` methods
-and runner `main`s, which exist to be executed by a benchmark run lasting minutes to hours — not by
-`check`. Its validators, report writers and result parsing are ordinary code and are tested; the
-harness around them deliberately is not, for the same reason JMH's generated classes are excluded
-from the reports altogether. Counting machine-written code measures code generation rather than
-testing, and including it drags the aggregate from the high seventies to 35%.
+What is measured leaves out three sets of classes, in the per-module reports, the floors and the
+aggregate alike: JMH's generated harness classes (`**/jmh_generated/**`) and anything else under a
+`generated` package, which are machine-written — counting them measures code generation rather
+than testing, and JMH's alone drag the aggregate from the high seventies to 35% — and the
+hand-written half of the same harness in `excalibur-bench`, `com.eonmux.excalibur.bench.benchmark`:
+the `@Benchmark` bodies, `@Setup` fixtures and `@State` classes, which are established by a trial
+lasting minutes to hours, and a unit test of which would either not run it or not be a unit test.
+The rest of `excalibur-bench` — the distance kernels, ground truth and recall, the validators,
+report writers, result parsing and runners — is ordinary code, counted and held to the same 80%.
 
 ```bash
 # Per-module reports for every module, plus the aggregate across them
@@ -4157,6 +4160,10 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 - `SegmentPrefilterLifecycleTest` - A segment's vector pre-filter lives and dies with the graph it is keyed against, including across a split
 - `AtomicDocumentWriterTest` - The write-log driver the other suites ingest through records true offsets and keeps each document's chunks contiguous
 - `VectorApiResolutionTest` - The test JVM resolves `jdk.incubator.vector`, so the SIMD kernels are what the suites exercise rather than the scalar fallback
+- `AutomaticGraphBuildIntegrationTest` - Over HTTP, a document ingested, replaced and removed reaches the served graph through the node's automatic build with no build asked for, and with automatic builds disabled the graph waits for one
+- `ReindexGraphIntegrationTest` - A reindex replaces a changed document's staged facts and withdraws a removed one's, so the graph stops answering with what the source no longer says
+- `ChunkAttributionNodeTest` - A vector hit names the chunk it embeds, fuses with the BM25 hit on that chunk and reads its text; a reposted or erased document leaves no vector rankable, and a directory an older build attributed by document is re-keyed to chunks
+- `FailureReportGeneratorTest` - The `util` helper that groups test failures into a categorised report
 
 ```bash
 ./gradlew :excalibur-integration:test
@@ -4194,15 +4201,21 @@ token, no LLM key, which still ingests lexically), indexes two documents through
 `POST /v1/documents`, and stops it with `SIGTERM` the way a scheduler would. `excalibur-fsck` must
 find nothing damaged in what it left; `excalibur-backup` must snapshot it, `verify --deep` the
 snapshot with nothing but the report on stdout, and `restore --deep` it into a directory
-`excalibur-fsck` passes too. That runs every format checker against the formats a node writes,
+`excalibur-fsck` passes too. A node is then started on the restored directory, must answer a
+`POST /v1/query` with the document indexed before the snapshot, and must stop cleanly on `SIGTERM`
+in turn. That runs every format checker against the formats a node writes,
 through the installed start scripts and the JVM flags they carry. It finishes with
 `./gradlew publishToMavenLocal`, the only thing that asks the library modules for a POM Maven can
 read.
 
 **Gates.** `./gradlew benchmarkTest`, the task `test` leaves out: the Cuckoo filter's false
-positive rate over a million items, HNSW recall@10 against brute force, the query pipeline's
-end-to-end recall@10 against brute force and against its own graphs, the point-lookup
-regression floor, and 300 MB of embedded chunks ingested by eight writers into a store running
+positive rate over a million items (`FPRateMeasurementTest`, and the `slow` method of
+`CuckooFilterTest` that holds it to 0.1% at a 0.95 load factor), HNSW recall@10 against brute
+force, the HNSW build-time and search-latency floor (`HnswThroughputRegressionTest`), the `slow`
+method of `PQConfigTest` that trains and encodes with a quantiser built from its configuration,
+the query pipeline's end-to-end recall@10 against brute force and against its own graphs, the
+point-lookup regression floor, `MultiThreadedPointLookupTest`'s check that one thread per core across
+sixteen segments looks up more in aggregate than one thread, and 300 MB of embedded chunks ingested by eight writers into a store running
 in a 256 MB heap (`SplitHeapBoundBenchmarkTest`, which forks that JVM itself). It is a job of its own because it takes minutes, and a timing gate going red
 should not make the build look as though the code failed to compile or pass. Running it on a
 shared runner is sound because of what those tests assert: the recall and false-positive gates are
@@ -4214,16 +4227,19 @@ question, answered on a machine whose clock you trust.
 **Image.** Builds the container image from the repository's `Dockerfile`, as `docker build .`
 does, starts it with the bind address, plaintext opt-in and token the image needs to come up,
 waits for `/health/ready` and for Docker to report the container `healthy` from its own
-`HEALTHCHECK`, checks that an `excalibur-fsck --repair` run against the live volume is refused
-with exit `4`, and stops the node the way a scheduler would. An image that builds and never
+`HEALTHCHECK`, indexes a document through the authenticated `POST /v1/documents` so the volume
+holds what a node wrote rather than only what it creates on start, checks that an
+`excalibur-fsck --repair` against the live volume is refused with exit `4` and an
+`excalibur-backup snapshot` with exit `7`, and stops the node the way a scheduler would, which must
+leave a segment file and the lexical store on the volume. An image that builds and never
 reports ready or healthy fails here. Then it runs the container commands [In a
 container](#in-a-container) documents against the stopped node's volume: an `excalibur-fsck
 --repair` into a mounted quarantine volume, after planting a staged file for it to set aside — it
 must arrive in the quarantine and be gone from the data directory, which must then check clean —
 an `excalibur-backup snapshot` into a backup volume, verified `--deep` from a second container,
 and an `excalibur-backup restore` of that image both over the node's own volume with `--force`
-and into a fresh volume, each of which must then check clean and start a node that reports
-healthy.
+and into a fresh volume, each of which must then check clean and hold no restore scratch. A node
+started on the fresh volume must report healthy and stop cleanly.
 
 ## FAQ
 
@@ -4563,18 +4579,22 @@ the only thing that runs them, and `:<module>:benchmarkTest` runs one module's.
 
 **Can I depend on these modules from Maven?**
 Not from Maven Central — nothing is published there. `./gradlew publishToMavenLocal` installs the
-sixteen library modules into `~/.m2`. The five that stay out are not libraries: `excalibur-bench`
-is a JMH harness whose entry points are benchmark runs, `excalibur-integration` and
-`excalibur-test-bootstrap` are test modules with nothing an embedder would depend on, and
-`excalibur-fsck` and `excalibur-backup` are commands that run against a stopped data directory —
-build them with `installDist` rather than depending on them. A
+sixteen library modules into `~/.m2`. The six that stay out are not libraries: `excalibur-bench`
+is a benchmark and evaluation harness whose entry points are runs, `excalibur-integration` and
+`excalibur-test-bootstrap` are test modules with nothing an embedder would depend on,
+`excalibur-coverage` is the build's own coverage reporting, and `excalibur-fsck` and
+`excalibur-backup` are commands that run against a stopped data directory — build them with
+`installDist` rather than depending on them. A
 composite build is the better option while you are also changing ExcaliburDB — see
 [USAGE.md](USAGE.md#programmatic-usage-jvm-embedded).
 
 **Is the coverage number in the report the whole project?**
-The aggregate is. Per-module floors are enforced by `check`, and JMH's generated harness classes
-are excluded everywhere — they are machine-written and counting them measures code generation
-rather than testing.
+The aggregate is. Per-module floors are enforced by `check`, and three sets of classes are excluded
+everywhere: JMH's generated harness classes and anything under a `generated` package, which are
+machine-written, so counting them measures code generation rather than testing, and
+`excalibur-bench`'s hand-written `@Benchmark`, `@Setup` and `@State` classes in
+`com.eonmux.excalibur.bench.benchmark`, which only a benchmark run exercises. See
+[Test Coverage](#test-coverage).
 
 ## License
 
