@@ -3,6 +3,7 @@ package com.eonmux.excalibur.query.visibility;
 import com.eonmux.excalibur.core.text.ChunkIdentifiers;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
+import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
 import com.eonmux.excalibur.query.QueryResultItem;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -67,6 +68,12 @@ public final class DocumentAtomicityFilter {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(DocumentAtomicityFilter.class);
 
+    /**
+     * The bound meaning "no epoch": the filter then only asks whether a document is whole and not
+     * being rewritten, never whether it was committed before some query began.
+     */
+    public static final long UNBOUNDED = Long.MAX_VALUE;
+
     private final DocumentVisibilityChecker visibilityChecker;
     private final DocumentVisibilityTracker legacyTracker;
 
@@ -93,7 +100,42 @@ public final class DocumentAtomicityFilter {
      */
     public DocumentAtomicityFilter(DocumentVisibilityTracker tracker) {
         this.legacyTracker = Objects.requireNonNull(tracker, "tracker must not be null");
-        this.visibilityChecker = new TrackerAdapter(tracker);
+        this.visibilityChecker = new DocumentVisibilityTrackerAdapter(tracker);
+    }
+
+    /**
+     * Whether filtering by a checker can change an answer at all.
+     *
+     * <p>False for no checker and for one holding nothing, committed or in flight. Every path that
+     * filters asks this one question rather than its own version of it: a path that skipped the
+     * filter whenever nothing was committed served every document a restarted node had
+     * recovered as in flight, since such a node has published nothing yet.</p>
+     *
+     * @param checker The checker the filter would consult, or null
+     * @return true when the filter should run
+     */
+    public static boolean appliesTo(DocumentVisibilityChecker checker) {
+        return checker != null && checker.hasTrackedDocuments();
+    }
+
+    /**
+     * The epoch to bound the filter by, for a query that captured {@code queryEpoch}.
+     *
+     * <p>The query's own epoch when the checker publishes on the clock that epoch came from, and
+     * {@link #UNBOUNDED} otherwise. Getting it wrong is silent in both directions: bounding by a
+     * foreign counter excludes documents arbitrarily, and never bounding gives up snapshot
+     * isolation without saying so. A negative epoch is no snapshot anyone captured and is
+     * treated as none.</p>
+     *
+     * @param checker    The checker the filter will consult, or null
+     * @param queryEpoch The epoch the query captured
+     * @return The bound to filter with
+     */
+    public static long boundFor(DocumentVisibilityChecker checker, long queryEpoch) {
+        if (checker == null || !checker.sharesNodeEpochClock()) {
+            return UNBOUNDED;
+        }
+        return queryEpoch >= 0 ? queryEpoch : UNBOUNDED;
     }
 
     /**
@@ -190,7 +232,32 @@ public final class DocumentAtomicityFilter {
                 result.segmentId(), result.nodeId());
             return true;
         }
+        return isDocumentKeyVisible(documentId, queryEpoch);
+    }
 
+    /**
+     * Checks whether a chunk, named by its chunk id, belongs to a document visible at the epoch.
+     *
+     * <p>The same rule {@link #isResultVisible} applies, for a path that ranks chunk ids rather
+     * than {@link QueryResultItem}s - the lexical index answers with the same ids the vector
+     * results carry, and a document is withheld from one exactly when it is from the other.</p>
+     *
+     * @param chunkId    The chunk id, or a document key, which passes through unchanged
+     * @param queryEpoch The bound, from {@link #boundFor}
+     * @return true if the chunk may be returned
+     * @throws NullPointerException     if chunkId is null
+     * @throws IllegalArgumentException if queryEpoch is negative
+     */
+    public boolean isChunkVisible(String chunkId, long queryEpoch) {
+        Objects.requireNonNull(chunkId, "chunkId must not be null");
+        if (queryEpoch < 0) {
+            throw new IllegalArgumentException("queryEpoch must be non-negative: " + queryEpoch);
+        }
+        return isDocumentKeyVisible(ChunkIdentifiers.documentKeyOfChunk(chunkId), queryEpoch);
+    }
+
+    /** The rule itself: a document the checker never saw passes, one it tracks must be visible. */
+    private boolean isDocumentKeyVisible(String documentId, long queryEpoch) {
         if (!visibilityChecker.isDocumentTracked(documentId)) {
             // Same reasoning, one step further in: the checker has never seen this document,
             // which is not the same as knowing it to be incomplete. These checkers are built
@@ -305,57 +372,6 @@ public final class DocumentAtomicityFilter {
      */
     public DocumentVisibilityTracker getTracker() {
         return legacyTracker;
-    }
-
-    /**
-     * Adapter to make DocumentVisibilityTracker implement DocumentVisibilityChecker.
-     */
-    private static class TrackerAdapter implements DocumentVisibilityChecker {
-        private final DocumentVisibilityTracker tracker;
-
-        TrackerAdapter(DocumentVisibilityTracker tracker) {
-            this.tracker = tracker;
-        }
-
-        @Override
-        public boolean isDocumentVisible(String documentId, long queryEpoch) {
-            return tracker.isDocumentFullyVisible(documentId, queryEpoch);
-        }
-
-        @Override
-        public boolean isChunkVisible(String chunkId, long queryEpoch) {
-            return tracker.isChunkVisible(chunkId, queryEpoch);
-        }
-
-        @Override
-        public List<String> filterPartialDocuments(List<String> chunkIds, long queryEpoch) {
-            return tracker.filterPartialDocuments(chunkIds, queryEpoch);
-        }
-
-        @Override
-        public java.util.Set<String> getVisibleDocuments(long queryEpoch) {
-            return tracker.getVisibleDocuments(queryEpoch);
-        }
-
-        @Override
-        public long currentEpoch() {
-            return tracker.currentEpoch();
-        }
-
-        @Override
-        public long getCommitEpoch(String documentId) {
-            return tracker.getCommitEpoch(documentId);
-        }
-
-        @Override
-        public int getChunkCount(String documentId) {
-            return tracker.getChunkCount(documentId);
-        }
-
-        @Override
-        public int getDocumentCount() {
-            return tracker.getDocumentCount();
-        }
     }
 
     /**
