@@ -1276,10 +1276,16 @@ weight of the expansions on any one term is held at `0.9`, and when it would pas
 expansion is scaled by the same factor, so the order the model asked for and the extra weight
 agreement earns both survive the ceiling.
 
-The call carries the query's deadline rather than the LLM client's, which is sized for ingestion —
-`excalibur.query.expansion-timeout-ms`, default 5000. A model slower than that costs the expansion
-and not the query. A query longer than `excalibur.api.max-query-chars` is refused outright; every
-query shorter than that is expanded, so one endpoint runs one retrieval strategy.
+The call carries the query's deadline rather than the LLM client's, which is sized for ingestion.
+It waits at most `excalibur.query.expansion-timeout-ms` (default 5000), and never more than half of
+what the request's `timeout_ms` leaves the BM25 search — after relevancy scoring's share is held
+back, when the answer is to be scored. Half, so the expansion can never leave the search less time
+than it took itself: the search it is there to improve keeps the other half whatever the corpus
+size, and a budget with nothing left in it skips the call. A model slower than that costs the
+expansion and not the query. The query is expanded once per search, however deep the search has
+to reach past documents it withholds. A query longer than `excalibur.api.max-query-chars` is
+refused outright; every query shorter than that is expanded, so one endpoint runs one retrieval
+strategy.
 
 Expansion belongs to the lexical path: it rewrites the terms BM25 is searched with. The deployment
 it is for by default has a chat model and no embedding pass — a chat endpoint in use,
@@ -1313,10 +1319,12 @@ query epoch, or the Lucene reader version — so an epoch crossing a manifest en
 any other change. Result text, snippets and explanations are read from storage on every answer, so
 quoted text can never be stale. An answer that is the product of a moment's trouble is never
 stored, so that trouble cannot be replayed as a persistent fault: a vector or hybrid answer that is
-degraded, timed out, cancelled or whose relevancy scoring fell back; a lexical answer that timed
-out, was cancelled, fell back or read less than the whole index (its `degraded` flag, set on every
-lexical answer, does not count); and a BM25 answer standing in for a failed vector half. See
-[USAGE.md](USAGE.md#the-query-cache).
+degraded, timed out, cancelled or whose relevancy scoring fell back; a lexical or hybrid answer
+whose query expansion fell back to the query as typed; a lexical answer that timed out, was
+cancelled, fell back or read less than the whole index (its `degraded` flag, set on every lexical
+answer, does not count); and a BM25 answer standing in for a failed vector half. A stored answer
+keeps the expansion it was searched with, so explaining a replay does not call the model again.
+See [USAGE.md](USAGE.md#the-query-cache).
 
 ### Degradation
 
@@ -1326,7 +1334,7 @@ retrieval:
 | Missing | Effect |
 |---------|--------|
 | Chat model | No expansion; plain BM25 on the query as typed |
-| Chat model slower than `excalibur.query.expansion-timeout-ms` | The call is abandoned; plain BM25 on the query as typed |
+| Chat model slower than `excalibur.query.expansion-timeout-ms`, or than half the search's budget | The call is abandoned; plain BM25 on the query as typed |
 | Embedding endpoint | No dense signal and no vector rerank; lexical and graph retrieval unaffected |
 | Graph | `/v1/graph/query` answers 503; `/v1/query` is unaffected, having never read the graph |
 | Expansion returns nothing usable | The original query is executed directly |
@@ -1349,6 +1357,11 @@ one only when that half *fails* - an error, a refused call, an unusable embeddin
 left of the deadline. A vector half that *misses* the deadline has used all of it, so such a node
 answers that query with the empty timed-out answer rather than from BM25. See
 [USAGE.md](USAGE.md#hybrid-retrieval--both-signals).
+
+An expansion that falls back is reported as well. The query was still answered, from the typed
+words alone, which is a weaker lexical signal than the node is configured to run: a hybrid answer
+whose BM25 half searched without its expansion reports `coverage.degraded: true`, an explained
+answer reports `query_expansion.status: "fell_back"`, and neither is cached.
 
 ### Evaluating it
 
@@ -2067,8 +2080,10 @@ search rather than resuming a cursor, because a ranked index has none, which is 
 `"explain": true` says why each result is there: `explain.signals` gives each contributing
 signal's own absolute rank and its score *on its own scale*, and `explain.matched_terms` names the
 query terms the passage actually contains. The response also carries `query_expansion` once, with
-a three-valued `status` — `applied`, `not_applied`, or `unreported` when this node cannot say,
-which is a different fact from the query not having been widened.
+a `status` of `applied`, `not_applied`, `fell_back` when the model could not widen the query and it
+was searched as typed, or `unreported` when this node cannot say, which is a different fact from
+the query not having been widened. It is read from the expansion the answer was searched with, a
+replayed answer included, so explaining never calls the model a second time.
 
 `retrieval` says which signals produced the answer, and is on every response. On a node holding
 both an embedding model and a chunk index it reads `hybrid`, each result additionally carries the

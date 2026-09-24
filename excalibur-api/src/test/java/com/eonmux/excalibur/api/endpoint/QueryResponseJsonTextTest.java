@@ -47,14 +47,14 @@ class QueryResponseJsonTextTest {
     private static String hybrid(QueryResponse vector, HybridFusion.Result result,
                                  QueryAnswer answer) {
         return QueryResponseJson.hybrid(
-            HybridResponse.unscored(vector, List.of(), List.of(result), 10), List.of(result),
+            HybridResponse.unscored(vector, List.of(), null, List.of(result), 10), List.of(result),
             answer);
     }
 
     /** Renders one BM25 hit. */
     private static String lexical(LexicalQueryService.Hit hit, QueryAnswer answer) {
-        return QueryResponseJson.lexical(new LexicalResponse("q", List.of(hit), true, COVERAGE,
-            false, false, false, false, 1L, false), List.of(hit), answer);
+        return QueryResponseJson.lexical(new LexicalResponse("q", List.of(hit), null, true,
+            COVERAGE, false, false, false, false, 1L, false), List.of(hit), answer);
     }
 
     private static QueryResponse response() {

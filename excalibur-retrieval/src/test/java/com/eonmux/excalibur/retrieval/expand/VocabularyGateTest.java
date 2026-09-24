@@ -110,9 +110,9 @@ class VocabularyGateTest {
         @DisplayName("a formulation the corpus cannot contain is never searched")
         void absentFormulationsAreDropped(@TempDir Path dir) throws Exception {
             try (LexicalIndex index = indexed(dir)) {
-                QueryExpander inventing = query -> List.of(
+                QueryExpander inventing = QueryExpander.infallible(query -> List.of(
                     SearchFormulation.original(query),
-                    new SearchFormulation("junzi xiaoren", 0.9));
+                    new SearchFormulation("junzi xiaoren", 0.9)));
 
                 RankedList gated = new ExpandedLexicalRanker(index, inventing,
                     "gated", new LuceneVocabulary(index))
@@ -127,9 +127,9 @@ class VocabularyGateTest {
         @DisplayName("a formulation the gate refuses is not searched")
         void refusedFormulationsAreNotSearched(@TempDir Path dir) throws Exception {
             try (LexicalIndex index = indexed(dir)) {
-                QueryExpander expanding = query -> List.of(
+                QueryExpander expanding = QueryExpander.infallible(query -> List.of(
                     SearchFormulation.original(query),
-                    new SearchFormulation("SIGKILL", 1.0));
+                    new SearchFormulation("SIGKILL", 1.0)));
                 // Refusing a term the corpus does hold is the only way to see the gate from
                 // outside it: a term the corpus lacks matches nothing whether or not it is
                 // searched, so gating it away changes the work done and not the answer.
@@ -156,9 +156,9 @@ class VocabularyGateTest {
                 index.put(2L, "the certificate chain could not be verified", "b");
                 index.refresh();
 
-                QueryExpander expanding = query -> List.of(
+                QueryExpander expanding = QueryExpander.infallible(query -> List.of(
                     SearchFormulation.original(query),
-                    new SearchFormulation("\u5185\u5b58\u4e0d\u8db3", 1.0));
+                    new SearchFormulation("\u5185\u5b58\u4e0d\u8db3", 1.0)));
 
                 RankedList gated = new ExpandedLexicalRanker(index, expanding,
                     "gated", new LuceneVocabulary(index))

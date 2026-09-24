@@ -230,7 +230,10 @@ public final class ExpandedLexicalRanker implements Ranker {
         String text = query.textIfPresent().orElseThrow(() -> new IllegalArgumentException(
             name + " needs query text, but this query carries none"));
 
-        List<SearchFormulation> formulations = expander.expand(text);
+        // Widened once by the caller when it carries the formulations, so every ranking of one
+        // search uses the same terms; widened here only for a caller that did not.
+        List<SearchFormulation> formulations = query.formulationsIfPresent()
+            .orElseGet(() -> expander.expand(text, QueryExpander.UNBOUNDED).formulations());
         if (formulations.isEmpty()) {
             return RankedList.empty(name);
         }

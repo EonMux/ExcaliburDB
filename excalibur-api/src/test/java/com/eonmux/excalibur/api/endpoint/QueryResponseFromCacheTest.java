@@ -71,7 +71,7 @@ class QueryResponseFromCacheTest {
         @DisplayName("reports the vector half's cache status")
         void hit() {
             assertThat(QueryResponseJson.hybrid(
-                    HybridResponse.unscored(response(true), List.of(), List.of(), 10),
+                    HybridResponse.unscored(response(true), List.of(), null, List.of(), 10),
                     List.of(), plainAnswer()))
                 .contains("\"from_cache\": true");
         }
@@ -82,8 +82,8 @@ class QueryResponseFromCacheTest {
     class Lexical {
 
         private LexicalResponse lexical(boolean fromCache) {
-            return new LexicalResponse("q-1", List.of(), true, FULL, false, false, false, false,
-                3L, fromCache);
+            return new LexicalResponse("q-1", List.of(), null, true, FULL, false, false, false,
+                false, 3L, fromCache);
         }
 
         @Test

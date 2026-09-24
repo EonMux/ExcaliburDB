@@ -17,6 +17,7 @@ import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -131,7 +132,7 @@ final class EmbeddedRetrieval {
             return lexicalOnly(search);
         }
         LexicalSignal signal = planned == SearchRoute.HYBRID
-            ? LexicalSignal.start(lexical, executor, text, scope, topK)
+            ? LexicalSignal.start(lexical, executor, text, scope, topK, budget(deadlineNanos))
             : null;
         try {
             return withVectors(search, signal);
@@ -175,14 +176,15 @@ final class EmbeddedRetrieval {
     private SearchAnswer lexicalOnly(Search search) throws InterruptedException {
         long deadlineNanos = search.deadlineNanos();
         LexicalSignal signal =
-            LexicalSignal.start(lexical, executor, search.text(), search.scope(), search.topK());
+            LexicalSignal.start(lexical, executor, search.text(), search.scope(), search.topK(),
+                budget(deadlineNanos));
         if (signal == null) {
             throw new IllegalStateException("Every BM25 search permit is in use; try again");
         }
         try {
-            List<LexicalQueryService.Hit> hits = signal.await(remainingMillis(deadlineNanos));
-            if (hits != null) {
-                return new SearchAnswer(SearchRoute.LEXICAL, lexicalHits(hits), false);
+            LexicalQueryService.Ranking ranking = signal.await(remainingMillis(deadlineNanos));
+            if (ranking != null) {
+                return new SearchAnswer(SearchRoute.LEXICAL, lexicalHits(ranking.hits()), false);
             }
             if (remainingMillis(deadlineNanos) == 0) {
                 return new SearchAnswer(SearchRoute.LEXICAL, List.of(), true);
@@ -223,11 +225,11 @@ final class EmbeddedRetrieval {
                 .build();
             QueryResponse response = pipeline.execute(request, token)
                 .get(budgetMs + PIPELINE_RESPONSE_GRACE_MILLIS, TimeUnit.MILLISECONDS);
-            List<LexicalQueryService.Hit> hits =
+            LexicalQueryService.Ranking ranking =
                 signal == null ? null : signal.await(remainingMillis(deadlineNanos));
-            if (hits != null) {
+            if (ranking != null) {
                 List<HybridFusion.Result> fused =
-                    HybridFusion.fuse(response.results(), hits, topK, lexical.rrfK());
+                    HybridFusion.fuse(response.results(), ranking.hits(), topK, lexical.rrfK());
                 return new SearchAnswer(SearchRoute.HYBRID, fusedHits(fused),
                     response.timedOut());
             }
@@ -296,14 +298,15 @@ final class EmbeddedRetrieval {
         boolean startedHere = false;
         if (signal == null && !timedOut && lexical != null && remainingMillis(deadlineNanos) > 0) {
             signal = LexicalSignal.start(lexical, executor, search.text(), search.scope(),
-                search.topK());
+                search.topK(), budget(deadlineNanos));
             startedHere = signal != null;
         }
         try {
-            List<LexicalQueryService.Hit> hits = signal == null ? null
+            LexicalQueryService.Ranking ranking = signal == null ? null
                 : timedOut ? signal.ready() : signal.await(remainingMillis(deadlineNanos));
-            if (hits != null) {
-                return new SearchAnswer(SearchRoute.LEXICAL, lexicalHits(hits), timedOut);
+            if (ranking != null) {
+                return new SearchAnswer(SearchRoute.LEXICAL, lexicalHits(ranking.hits()),
+                    timedOut);
             }
         } finally {
             if (startedHere) {
@@ -354,5 +357,10 @@ final class EmbeddedRetrieval {
 
     private static long remainingMillis(long deadlineNanos) {
         return Math.max(0, TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()));
+    }
+
+    /** What is left of the search's budget, for a BM25 search and its query expansion. */
+    private static Duration budget(long deadlineNanos) {
+        return Duration.ofMillis(remainingMillis(deadlineNanos));
     }
 }

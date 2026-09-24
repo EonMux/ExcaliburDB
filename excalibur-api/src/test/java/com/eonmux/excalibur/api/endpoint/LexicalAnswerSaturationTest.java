@@ -97,14 +97,14 @@ class LexicalAnswerSaturationTest {
         assertThat(status.getValue())
             .as("a saturated node refuses rather than piling another search on")
             .isEqualTo(503);
-        verify(lexical, never()).search(anyString(), anyInt(), any());
+        verify(lexical, never()).retrieve(anyString(), anyInt(), any(), any());
     }
 
     @Test
     @DisplayName("the permit is returned once the search has finished")
     void releasesThePermit() throws IOException {
         LexicalQueryService lexical = mock(LexicalQueryService.class);
-        when(lexical.search(anyString(), anyInt(), any())).thenReturn(List.of());
+        when(lexical.retrieve(anyString(), anyInt(), any(), any())).thenReturn(new LexicalQueryService.Ranking(List.of(), null));
         when(lexical.stats()).thenReturn(null);
 
         int before = LexicalSearchPermits.available();

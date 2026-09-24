@@ -148,7 +148,7 @@ class ChatBreakerRouteTest {
     void absentWithoutAChatModel(@TempDir Path root) throws IOException {
         // An expander with no model, and a sink whose extraction is off: no breaker exists, and
         // reporting a closed one would read as a healthy component that is not there.
-        QueryExpander plain = query -> List.of();
+        QueryExpander plain = QueryExpander.infallible(query -> List.of());
         server = server(CachingQueryExpander.over(plain), sink(root, RelationExtractor.none()));
         server.start();
 

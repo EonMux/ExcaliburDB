@@ -349,9 +349,9 @@ public record IngestionWiring(Config config,
             orchestrator.setLexicalRefreshIntervalMs(
                 config.ingest().getLexicalRefreshIntervalMs());
         }
-        // Remembered, and shared with the query route: the ranker expands to search and the
-        // response expands to report, and a second generation is a second bill and possibly
-        // different terms from the ones that actually ran.
+        // Remembered, so a caller paging through one question by offset pays for one expansion
+        // rather than one per page. The expander itself goes to the server only for the
+        // breaker state it reports; answers carry the expansion they were searched with.
         QueryExpander expander = CachingQueryExpander.over(
             createQueryExpander(capabilities, chatClientConfig));
         server.withLexicalQueryService(new LexicalQueryService(

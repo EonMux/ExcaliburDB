@@ -79,6 +79,29 @@ class LexicalVisibilityPagingTest {
             .containsExactly(chunkOf(9), chunkOf(10));
     }
 
+    /**
+     * Reaching deeper re-ranks the same query, not a new one: a second expansion would be a
+     * second model call per round, and could search each round for different terms.
+     */
+    @Test
+    @DisplayName("expands the query once however many rounds it reaches through")
+    void expandsOnceAcrossRounds() {
+        java.util.concurrent.atomic.AtomicInteger calls =
+            new java.util.concurrent.atomic.AtomicInteger();
+        LexicalQueryService widening = new LexicalQueryService(index,
+            com.eonmux.excalibur.retrieval.expand.QueryExpander.infallible(query -> {
+                calls.incrementAndGet();
+                return List.of(com.eonmux.excalibur.retrieval.expand.SearchFormulation
+                    .original(query));
+            }), List.of())
+            .withVisibility(new DocumentVisibilityTrackerAdapter(tracker));
+        hide(0, 1, 2, 3, 4, 5, 6, 7, 8);
+
+        assertThat(ids(widening.search("shared", 2)))
+            .containsExactly(chunkOf(9), chunkOf(10));
+        assertThat(calls.get()).isEqualTo(1);
+    }
+
     @Test
     @DisplayName("is short only when the index has no more visible matches")
     void shortOnlyWhenExhausted() {

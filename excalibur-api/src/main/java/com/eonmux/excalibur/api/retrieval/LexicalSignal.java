@@ -4,7 +4,7 @@ import com.eonmux.excalibur.core.text.SourceScope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.List;
+import java.time.Duration;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -39,10 +39,10 @@ public final class LexicalSignal {
     private static final Logger LOGGER = LoggerFactory.getLogger(LexicalSignal.class);
 
     private final LexicalQueryService service;
-    private final Future<List<LexicalQueryService.Hit>> pending;
+    private final Future<LexicalQueryService.Ranking> pending;
 
     private LexicalSignal(LexicalQueryService service,
-                          Future<List<LexicalQueryService.Hit>> pending) {
+                          Future<LexicalQueryService.Ranking> pending) {
         this.service = service;
         this.pending = pending;
     }
@@ -66,10 +66,12 @@ public final class LexicalSignal {
      *                 nothing below rank top-k can. Asking deeper buys ranks that cannot be
      *                 returned, and the service already over-fetches internally so the list is
      *                 not thinned by hits whose ids no longer resolve.
+     * @param budget   How long the request leaves the search, its query expansion included
      * @return The running search, or null when only the other signal will answer
      */
     public static LexicalSignal start(LexicalQueryService service, ExecutorService executor,
-                                      String query, SourceScope scope, int limit) {
+                                      String query, SourceScope scope, int limit,
+                                      Duration budget) {
         if (service == null || executor == null) {
             return null;
         }
@@ -80,7 +82,7 @@ public final class LexicalSignal {
         try {
             return new LexicalSignal(service, executor.submit(() -> {
                 try {
-                    return service.search(query, limit, scope);
+                    return service.retrieve(query, limit, scope, budget);
                 } finally {
                     LexicalSearchPermits.release();
                 }
@@ -119,10 +121,10 @@ public final class LexicalSignal {
      * Waits up to {@code budgetMs} for the search, degrading to null rather than throwing.
      *
      * @param budgetMs How long the request has left
-     * @return The hits, or null when this signal produced none
+     * @return The ranking and the expansion it searched, or null when this signal produced none
      * @throws InterruptedException if the request is interrupted while waiting
      */
-    public List<LexicalQueryService.Hit> await(long budgetMs) throws InterruptedException {
+    public LexicalQueryService.Ranking await(long budgetMs) throws InterruptedException {
         try {
             return pending.get(budgetMs, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
@@ -147,9 +149,10 @@ public final class LexicalSignal {
      * treated as having produced nothing: the request is already past its deadline, and waiting
      * longer to report a timeout is the wrong trade.</p>
      *
-     * @return The hits, or null when this signal has none to give yet
+     * @return The ranking and the expansion it searched, or null when this signal has none to
+     *         give yet
      */
-    public List<LexicalQueryService.Hit> ready() {
+    public LexicalQueryService.Ranking ready() {
         if (!pending.isDone() || pending.isCancelled()) {
             return null;
         }

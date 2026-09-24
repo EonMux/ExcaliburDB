@@ -51,14 +51,14 @@ class NativeChunkIndexTest {
     }
 
     private static QueryExpander expanding(String... alternatives) {
-        return text -> {
+        return QueryExpander.infallible(text -> {
             var formulations = new java.util.ArrayList<SearchFormulation>();
             formulations.add(SearchFormulation.original(text));
             for (String alternative : alternatives) {
                 formulations.add(new SearchFormulation(alternative, 0.8));
             }
             return formulations;
-        };
+        });
     }
 
     private static List<String> namesOf(NativeChunkIndex index, RankedList ranked) {
@@ -627,7 +627,7 @@ class NativeChunkIndexTest {
                 index.refresh();
                 epoch.incrementAndGet();
 
-                Ranker none = index.ranker(text -> List.of());
+                Ranker none = index.ranker(QueryExpander.infallible(text -> List.of()));
                 assertThat(none.rank(RetrievalQuery.ofText("memory"), 5).documents()).isEmpty();
                 assertThat(index.ranker(QueryExpander.identity())
                     .rank(RetrievalQuery.ofText("memory"), 0).documents()).isEmpty();

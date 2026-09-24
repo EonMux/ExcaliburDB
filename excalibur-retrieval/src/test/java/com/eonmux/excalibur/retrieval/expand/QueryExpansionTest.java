@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -36,6 +37,9 @@ class QueryExpansionTest {
     private static final String TLS_DOC =
         "The TLS handshake failed because the certificate chain could not be verified "
         + "against the configured trust store.";
+
+    /** A query budget longer than any expander here waits, so its own deadline decides. */
+    private static final Duration BUDGET = Duration.ofSeconds(30);
 
     private static LexicalIndex indexed(Path dir) throws Exception {
         LexicalIndex index = LexicalIndex.open(dir, 8.0);
@@ -71,7 +75,8 @@ class QueryExpansionTest {
         void originalAlwaysLeads() {
             List<SearchFormulation> out = expanderReturning(
                 "[{\"q\":\"OOM killer\",\"w\":0.9},{\"q\":\"ENOMEM\",\"w\":0.8}]")
-                .expand("why does my service die when the machine runs out of RAM?");
+                .expand("why does my service die when the machine runs out of RAM?", BUDGET)
+                .formulations();
 
             assertThat(out.get(0).text()).isEqualTo(
                 "why does my service die when the machine runs out of RAM?");
@@ -86,7 +91,7 @@ class QueryExpansionTest {
         void modelWeightsAreHonoured() {
             List<SearchFormulation> out = expanderReturning(
                 "[{\"q\":\"memory exhaustion\",\"w\":0.6},{\"q\":\"OOM killer\",\"w\":0.9}]")
-                .expand("service dies on low memory");
+                .expand("service dies on low memory", BUDGET).formulations();
 
             assertThat(out).hasSize(3);
             assertThat(out.get(1).text()).isEqualTo("OOM killer");
@@ -103,7 +108,7 @@ class QueryExpansionTest {
             List<SearchFormulation> out = expanderReturning(
                 "[{\"q\":\"OOM killer\",\"w\":0.9},{\"q\":\"literary analysis\",\"w\":0.4},"
                 + "{\"q\":\"plot summary\",\"w\":0.2}]")
-                .expand("service dies on low memory");
+                .expand("service dies on low memory", BUDGET).formulations();
 
             assertThat(out.stream().map(SearchFormulation::text))
                 .containsExactly("service dies on low memory", "OOM killer");
@@ -118,21 +123,81 @@ class QueryExpansionTest {
             when(broken.completeWithCircuitBreaker(anyString(), anyString(), any()))
                 .thenThrow(new IllegalStateException("circuit open"));
 
-            List<SearchFormulation> out = new LlmQueryExpander(broken).expand("out of memory");
+            Expansion out = new LlmQueryExpander(broken).expand("out of memory", BUDGET);
 
-            assertThat(out).singleElement()
+            assertThat(out.formulations()).singleElement()
                 .satisfies(f -> assertThat(f.text()).isEqualTo("out of memory"));
+            assertThat(out.fellBack())
+                .as("the query as typed is a fallback, not the model's judgement")
+                .isTrue();
         }
 
         @Test
         @DisplayName("unparseable or empty model output degrades to the original")
         void garbageDegradesToTheOriginal() {
             for (String junk : new String[] {"", "I think you mean OOM.", "[", "null", "{}"}) {
-                assertThat(expanderReturning(junk).expand("out of memory"))
+                Expansion out = expanderReturning(junk).expand("out of memory", BUDGET);
+                assertThat(out.formulations())
                     .as("model said: %s", junk)
                     .singleElement()
                     .satisfies(f -> assertThat(f.text()).isEqualTo("out of memory"));
+                assertThat(out.fellBack()).as("model said: %s", junk).isTrue();
             }
+        }
+
+        @Test
+        @DisplayName("an expansion the model answered is not a fallback")
+        void anAnsweredExpansionIsNotAFallback() {
+            assertThat(expanderReturning("[{\"q\":\"OOM killer\",\"w\":0.9}]")
+                .expand("out of memory", BUDGET).fellBack()).isFalse();
+        }
+
+        @Test
+        @DisplayName("a query budget shorter than the expander's own deadline bounds the call")
+        void theQueryBudgetBoundsTheCall() {
+            // An expansion that waited its own 5s inside a 2s query would time out the whole
+            // query; one bounded by the query's budget falls back and leaves BM25 its time.
+            LLMHttpClient slow = mock(LLMHttpClient.class);
+            when(slow.completeWithCircuitBreaker(anyString(), anyString(), any()))
+                .thenAnswer(invocation -> {
+                    Thread.sleep(30_000);
+                    return "[{\"q\":\"OOM killer\",\"w\":0.9}]";
+                });
+
+            long start = System.nanoTime();
+            Expansion out = new LlmQueryExpander(slow, 20_000L)
+                .expand("out of memory", Duration.ofMillis(200));
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+            assertThat(out.fellBack()).isTrue();
+            assertThat(elapsedMs)
+                .as("the query's budget, not the expander's 20s, decided how long to wait")
+                .isLessThan(5_000L);
+        }
+
+        @Test
+        @DisplayName("a spent budget falls back without calling the model")
+        void aSpentBudgetDoesNotCall() {
+            LLMHttpClient client = mock(LLMHttpClient.class);
+
+            Expansion out = new LlmQueryExpander(client).expand("out of memory", Duration.ZERO);
+
+            assertThat(out.fellBack()).isTrue();
+            assertThat(out.formulations()).containsExactly(
+                SearchFormulation.original("out of memory"));
+            org.mockito.Mockito.verifyNoInteractions(client);
+        }
+
+        @Test
+        @DisplayName("a query with no text is not widened and is not a fallback")
+        void aBlankQueryIsNotWidened() {
+            LLMHttpClient client = mock(LLMHttpClient.class);
+
+            Expansion out = new LlmQueryExpander(client).expand("  ", BUDGET);
+
+            assertThat(out.formulations()).isEmpty();
+            assertThat(out.fellBack()).isFalse();
+            org.mockito.Mockito.verifyNoInteractions(client);
         }
 
         @Test
@@ -140,7 +205,7 @@ class QueryExpansionTest {
         void toleratesRealisticModelOutput() {
             List<SearchFormulation> out = expanderReturning(
                 "```json\n[{\"q\":\"OOM killer\",\"w\":0.9},{\"q\":\"SIGKILL\",\"w\":0.7}")
-                .expand("service killed");
+                .expand("service killed", BUDGET).formulations();
 
             assertThat(out).hasSize(3);
             assertThat(out.stream().map(SearchFormulation::text))
@@ -151,7 +216,8 @@ class QueryExpansionTest {
         @DisplayName("an over-confident weight is clamped; an under-confident one is dropped")
         void weightsAreClampedThenFiltered() {
             List<SearchFormulation> out = expanderReturning(
-                "[{\"q\":\"OOM\",\"w\":5.0},{\"q\":\"ENOMEM\",\"w\":-2}]").expand("memory");
+                "[{\"q\":\"OOM\",\"w\":5.0},{\"q\":\"ENOMEM\",\"w\":-2}]")
+                .expand("memory", BUDGET).formulations();
 
             // 5.0 means "very sure" and is clamped to the ceiling; -2 is below any usable
             // confidence and is not searched at all.
@@ -169,7 +235,8 @@ class QueryExpansionTest {
             // discards every one, which turns the deployment whose entire semantic capability
             // is expansion into plain BM25 with nothing said about it.
             List<SearchFormulation> out = expanderReturning(
-                "[{\"q\":\"OOM killer\"},{\"q\":\"ENOMEM\"}]").expand("out of memory");
+                "[{\"q\":\"OOM killer\"},{\"q\":\"ENOMEM\"}]")
+                .expand("out of memory", BUDGET).formulations();
 
             assertThat(out.stream().map(SearchFormulation::text))
                 .containsExactly("out of memory", "OOM killer", "ENOMEM");
@@ -191,7 +258,7 @@ class QueryExpansionTest {
             assertThat(longQuery.length()).isGreaterThan(512);
 
             List<SearchFormulation> out = expanderReturning(
-                "[{\"q\":\"OOM killer\",\"w\":0.9}]").expand(longQuery);
+                "[{\"q\":\"OOM killer\",\"w\":0.9}]").expand(longQuery, BUDGET).formulations();
 
             assertThat(out.stream().map(SearchFormulation::text)).contains("OOM killer");
         }
@@ -211,7 +278,8 @@ class QueryExpansionTest {
 
             long start = System.nanoTime();
             List<SearchFormulation> out =
-                new LlmQueryExpander(slow, 300L).expand("out of memory");
+                new LlmQueryExpander(slow, 300L).expand("out of memory", BUDGET)
+                    .formulations();
             long elapsedMs = (System.nanoTime() - start) / 1_000_000;
 
             assertThat(out).singleElement()
@@ -239,7 +307,7 @@ class QueryExpansionTest {
                 new java.util.concurrent.atomic.AtomicReference<>();
             Thread search = new Thread(() -> {
                 try {
-                    new LlmQueryExpander(blocking, 30_000L).expand("out of memory");
+                    new LlmQueryExpander(blocking, 30_000L).expand("out of memory", BUDGET);
                 } catch (Throwable t) {
                     thrown.set(t);
                 }
@@ -263,7 +331,7 @@ class QueryExpansionTest {
         void duplicatesAreDropped() {
             List<SearchFormulation> out = expanderReturning(
                 "[{\"q\":\"OOM\",\"w\":0.9},{\"q\":\"oom\",\"w\":0.8},{\"q\":\"memory\",\"w\":0.7}]")
-                .expand("memory");
+                .expand("memory", BUDGET).formulations();
 
             assertThat(out.stream().map(f -> f.text().toLowerCase()).distinct().count())
                 .as("a duplicate is a second vote for the same evidence")
@@ -341,10 +409,10 @@ class QueryExpansionTest {
                 index.put(2L, "bravo filler one two three four", "corpus:bravo.txt:chunk:0");
                 index.refresh();
 
-                QueryExpander agreeing = text -> List.of(
+                QueryExpander agreeing = QueryExpander.infallible(text -> List.of(
                     SearchFormulation.original(text),
                     new SearchFormulation("bravo charlie", 0.9),
-                    new SearchFormulation("bravo delta", 0.9));
+                    new SearchFormulation("bravo delta", 0.9)));
 
                 RankedList out = new ExpandedLexicalRanker(index, agreeing)
                     .rank(RetrievalQuery.ofText("alpha"), 5);

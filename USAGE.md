@@ -1899,9 +1899,13 @@ Key fields:
   and case-insensitive, in the order you typed them — computed the same way on every retrieval
   path, so a vector-only answer explains its matches too.
 - **`query_expansion`** (response level, only with `"explain": true`) — what the query was widened
-  with, once for the answer rather than per result. `status` is `applied`, `not_applied` or
-  `unreported`; `unreported` means *this node cannot say* — no expander is wired, or no
-  query-widening signal ran — which is a different fact from "the query was not widened".
+  with, once for the answer rather than per result. `status` is `applied`, `not_applied`,
+  `fell_back` or `unreported`. `fell_back` means the node meant to widen the query and could not —
+  the model failed, ran out of time or answered with nothing usable — so it was searched as typed,
+  with an empty `terms`. `unreported` means *this node cannot say* — no expander is wired, or no
+  query-widening signal ran — which is a different fact from "the query was not widened". The
+  report is read from the expansion the answer was searched with, which a cached answer keeps, so
+  explaining an answer never calls the model again.
 - **`text_offset`** and **`highlights`** (per result, only with `"snippet": true`) — where the
   returned window starts in the chunk, and where the matched terms sit inside the window
   (`start`/`length`, relative to the `text` you were given). The window is a verbatim substring
@@ -2105,6 +2109,14 @@ call per query. It requires a chat endpoint in use. The retrieval harness in `ex
 measures the two side by side on your corpus; see
 [Evaluating it](README.md#evaluating-it).
 
+However it is reached, an expansion call waits at most `excalibur.query.expansion-timeout-ms` and
+never more than half of the budget the BM25 search was started with: what `timeout_ms` leaves,
+less relevancy scoring's share when the answer is to be scored. The other half is kept for the
+search, so a slow model cannot leave BM25 less time than the expansion took. A model that fails,
+runs out of that time or answers with nothing usable leaves the query searched as typed; the answer
+still comes back, is not cached, reports `query_expansion.status: "fell_back"` when explained, and
+on a hybrid answer marks `coverage.degraded: true`.
+
 A query longer than `excalibur.api.max-query-chars` is refused, on every route; there is no
 second, shorter bound for expansion. A hybrid answer carries `ignored_fields` like every other:
 `threshold` and `include_partial_segments` are applied to the vector signal before fusion, so they
@@ -2146,8 +2158,10 @@ Three things are deliberately never cached:
   text can never be stale.
 - **Answers that are the product of a moment's trouble.** A vector or hybrid answer is not
   stored when it is degraded, timed out or cancelled, or when its relevancy scoring fell back or ran
-  out of time. A lexical answer is not stored when it timed out or was cancelled, when its scoring
-  fell back, or when it read less than the whole index. Its `degraded` flag alone does not stop it:
+  out of time. A lexical or hybrid answer is not stored when its query expansion fell back to the
+  query as typed: the next caller asking is owed the widened search. A lexical answer is not stored
+  when it timed out or was cancelled, when its scoring fell back, or when it read less than the
+  whole index. Its `degraded` flag alone does not stop it:
   that flag is set on every lexical answer, saying the answer came from one signal, and is not a
   sign of trouble on a node that has only that one. And an answer from BM25 standing in for a
   failed vector half is never stored, because it is not the answer the node's cache key names.
