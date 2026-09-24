@@ -93,6 +93,14 @@ public enum FileKind {
     GRAPH_ERASURE_MARKER,
 
     /**
+     * {@code graph-staging/unpublished.changes}: the marker that says a tenant's staging holds
+     * changes its served graph does not have yet, which the node's automatic build publishes.
+     *
+     * <p>Empty by construction, for the reason {@link #GRAPH_ERASURE_MARKER} is.</p>
+     */
+    GRAPH_UNPUBLISHED_MARKER,
+
+    /**
      * A file of a tenant's built graph, {@code <namespace>/graph/}, or of a directory a publish,
      * a build or an erasure compaction leaves beside it.
      *

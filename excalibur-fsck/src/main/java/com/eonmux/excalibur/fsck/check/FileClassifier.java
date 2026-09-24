@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.fsck.check;
 
+import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.retrieval.lexical.native_.LexicalSidecars;
 
 import java.nio.file.Path;
@@ -56,6 +57,9 @@ public final class FileClassifier {
             }
             if (GraphStagingCheck.ERASURE_INTERRUPTED_MARKER.equals(name)) {
                 return FileKind.GRAPH_ERASURE_MARKER;
+            }
+            if (GraphStagingStore.UNPUBLISHED_MARKER.equals(name)) {
+                return FileKind.GRAPH_UNPUBLISHED_MARKER;
             }
         }
         FileKind byName = byFileName(name);

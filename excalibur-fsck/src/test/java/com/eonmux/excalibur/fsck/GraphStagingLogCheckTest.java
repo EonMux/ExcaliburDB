@@ -544,7 +544,7 @@ class GraphStagingLogCheckTest {
     }
 
     @Test
-    @DisplayName("a survey proves every staging log, and a repair plans nothing for them")
+    @DisplayName("a survey proves every staging log and marker, and a repair plans nothing")
     void aSurveyProvesTheStagingLogs() throws IOException {
         try (ErasureLog erasures = ErasureLog.open(staging.resolve(GraphStagingCheck.ERASURE_LOG))) {
             erasures.submit(new ErasureScope.Entity(0), Instant.EPOCH);
@@ -554,7 +554,8 @@ class GraphStagingLogCheckTest {
 
         assertThat(scan.files())
             .filteredOn(file -> file.relative().startsWith(STAGING))
-            .hasSize(5)
+            .as("five logs, and the marker saying their facts are not yet published")
+            .hasSize(6)
             .allSatisfy(file -> assertThat(file.status()).as(file.relative() + ": "
                 + file.detail()).isEqualTo(CheckStatus.INTACT));
         assertThat(scan.hasUnverified()).isFalse();
