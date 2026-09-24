@@ -37,6 +37,10 @@ dependencies {
     // their formats, so a verdict of sound is about bytes a node really writes. Only the tests
     // need it: verify reaches those logs through excalibur-fsck's dispatch, never by name.
     testImplementation(project(":excalibur-graph"))
+    // A registry or status history "from a newer build" is one version past what the owning
+    // class writes, so the tests name that version from the class rather than as a literal a
+    // format bump would silently turn into the current one.
+    testImplementation(project(":excalibur-ingest"))
 }
 
 // Two flags are not optional. --enable-preview because every class in this build is stamped

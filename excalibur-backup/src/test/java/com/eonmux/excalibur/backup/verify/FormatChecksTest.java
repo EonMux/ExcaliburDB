@@ -6,6 +6,8 @@ import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.staging.ExtractedTriple;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
+import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
+import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
 import com.eonmux.excalibur.retrieval.lexical.native_.LexicalSidecars;
 import com.eonmux.excalibur.retrieval.lexical.native_.SegmentManifest;
 import com.eonmux.excalibur.store.RoutingDirectory;
@@ -119,10 +121,11 @@ class FormatChecksTest {
     @Test
     @DisplayName("a registry at a version its reader refuses fails; a status history does not")
     void aRegistryFromANewerBuildFailsAndAStatusHistoryDoesNot() throws IOException {
-        Files.writeString(dataDir.resolve("document-registry"),
-            sealed(List.of("\\#document-registry|3"), 0));
-        Files.writeString(dataDir.resolve("source-status"),
-            sealed(List.of("\\#source-status|4", "docs|idle|1.0|420|0|7|0|1730000000000"), 1));
+        Files.writeString(dataDir.resolve("document-registry"), sealed(List.of(
+            DocumentRegistry.HEADER_MARKER + "|" + (DocumentRegistry.FORMAT_VERSION + 1)), 0));
+        Files.writeString(dataDir.resolve("source-status"), sealed(List.of(
+            SourceStatusFile.HEADER_MARKER + "|" + (SourceStatusFile.FORMAT_VERSION + 1),
+            "docs|idle|1.0|420|0|7|0|1730000000000"), 1));
 
         ContentCheck registry = check("document-registry");
         ContentCheck status = check("source-status");
