@@ -24,25 +24,30 @@ import java.util.OptionalLong;
  * {@code erasure} is null when the graph root could not be listed, which is a different statement
  * from a node that owes nothing.</p>
  *
- * @param namespaces The tenant registry: what is open and how often it evicts
- * @param budget     Mappings and descriptors against the process limits eviction defends
- * @param builds     Graph builds since startup
- * @param erasure    Erasure obligations across every namespace, or null if unreadable
- * @param ingest     What ingestion has staged into the graph, or null where it stages nothing
+ * @param namespaces      The tenant registry: what is open and how often it evicts
+ * @param budget          Mappings and descriptors against the process limits eviction defends
+ * @param builds          Graph builds asked for through {@code POST /v1/graph/build} since
+ *                        startup
+ * @param automaticBuilds Graph builds the node started by itself since startup
+ * @param erasure         Erasure obligations across every namespace, or null if unreadable
+ * @param ingest          What ingestion has staged into the graph, or null where it stages
+ *                        nothing
  * @author ExcaliburDB
  */
 public record GraphStats(NamespaceStats namespaces, BudgetStats budget, BuildStats builds,
-                         ErasureStats erasure, IngestStats ingest) {
+                         AutomaticBuildStats automaticBuilds, ErasureStats erasure,
+                         IngestStats ingest) {
 
     /**
      * Validates that the always-present blocks are present.
      *
-     * @throws NullPointerException if namespaces, budget or builds is null
+     * @throws NullPointerException if namespaces, budget, builds or automaticBuilds is null
      */
     public GraphStats {
         Objects.requireNonNull(namespaces, "namespaces cannot be null");
         Objects.requireNonNull(budget, "budget cannot be null");
         Objects.requireNonNull(builds, "builds cannot be null");
+        Objects.requireNonNull(automaticBuilds, "automaticBuilds cannot be null");
     }
 
     /**
@@ -96,7 +101,8 @@ public record GraphStats(NamespaceStats namespaces, BudgetStats budget, BuildSta
     }
 
     /**
-     * Graph builds since startup, across every namespace.
+     * Graph builds asked for through {@code POST /v1/graph/build} since startup, across every
+     * namespace.
      *
      * @param running   Whether one is in progress now
      * @param completed Builds that published a graph
@@ -109,6 +115,40 @@ public record GraphStats(NamespaceStats namespaces, BudgetStats budget, BuildSta
         public BuildStats {
             if (completed < 0 || failed < 0 || cancelled < 0) {
                 throw new IllegalArgumentException("build counts must not be negative");
+            }
+        }
+    }
+
+    /**
+     * Graph builds the node started by itself since startup, across every namespace.
+     *
+     * <p>Apart from {@link BuildStats} because they answer a different question. An explicit
+     * build is somebody asking; an automatic one is the node keeping each graph up with its
+     * staging, and a rising {@code failed} here is a graph falling behind with nobody asking
+     * for it. {@code superseded} is not a failure: an erasure was recorded while the build ran,
+     * so its publish was refused and the next build leaves that erasure out.</p>
+     *
+     * @param enabled    Whether {@code excalibur.graph.auto-build-enabled} is on, so a node
+     *                   that never builds by itself is not read as one that has had nothing to
+     *                   build
+     * @param running    How many are in progress now
+     * @param completed  Builds that published, or retired a graph whose facts were all
+     *                   withdrawn
+     * @param unchanged  Builds that found the graph already current once they held its lock
+     * @param failed     Builds that raised an error and published nothing
+     * @param cancelled  Builds stopped by the node shutting down
+     * @param superseded Builds whose publish an erasure recorded meanwhile refused
+     */
+    public record AutomaticBuildStats(boolean enabled, int running, long completed,
+                                      long unchanged, long failed, long cancelled,
+                                      long superseded) {
+
+        /** Validates that no count is negative. */
+        public AutomaticBuildStats {
+            if (running < 0 || completed < 0 || unchanged < 0 || failed < 0 || cancelled < 0
+                    || superseded < 0) {
+                throw new IllegalArgumentException(
+                    "automatic build counts must not be negative");
             }
         }
     }

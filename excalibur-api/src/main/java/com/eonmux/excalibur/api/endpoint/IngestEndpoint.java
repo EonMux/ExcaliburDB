@@ -90,12 +90,16 @@ import java.util.*;
  * {@code 400} rather than quietly given the shared namespace: a caller who asked for one tenant
  * and was given another has had its documents cross a tenancy boundary, and nothing later in the
  * pipeline could tell.</p>
- * <p>A namespace that does not exist yet is admitted before the source is registered: created,
- * or refused with {@code 404 namespace_not_found} when
+ * <p>A namespace that does not exist yet is admitted as part of the registration: created, or
+ * refused with {@code 404 namespace_not_found} when
  * {@code excalibur.graph.require-explicit-namespaces} is on and {@code 429
  * namespace_limit_reached} when the node holds {@code excalibur.graph.max-namespaces} already.
  * Refused at registration rather than when the crawl publishes, because by then the caller has
- * been told its source is registered and its documents would be staged nowhere.</p>
+ * been told its source is registered and its documents would be staged nowhere. And admitted
+ * only once the registration is known to go through - after every check this route and the
+ * registry make, in the same step as the registry's claim on the id - because a created
+ * namespace is a tenant, and a request refused as a duplicate, into a full registry, or as a
+ * replacement naming another namespace must not leave one behind.</p>
  *
  * <h2>Target Allow-Lists</h2>
  * <p>Both source types point the server at something a caller names, so both are
@@ -398,35 +402,29 @@ public class IngestEndpoint implements HttpHandler {
                 // here rather than discovered later.
                 if (inlineSourceIds != null && inlineSourceIds.isSupplied(request.sourceId())) {
                     closeQuietly(source);
-                    ResponseBody.sendError(exchange, 409, ErrorCode.SOURCE_KIND_CONFLICT, "Source '" + request.sourceId() + "' holds documents "
-                        + "supplied directly; a crawl registered under its id would remove them "
-                        + "on its first pass. Use a different source_id.");
+                    ResponseBody.sendError(exchange, 409, ErrorCode.SOURCE_KIND_CONFLICT,
+                        suppliedConflict(request.sourceId()));
                     return;
                 }
 
-                // Last before the claim, because admitting may create the namespace: a request
-                // refused for anything above leaves no directory behind it.
+                // Registration is a single atomic claim on the source ID: checking
+                // first and registering afterwards lets two concurrent requests both
+                // start ingestion and orphan one unclosed Source. The namespace is admitted
+                // inside that step, once the registry has found nothing to refuse, because
+                // admitting may create it and a request refused afterwards must leave no tenant
+                // behind.
+                SourceRegistry.Admission admission = admissionFor(replacing);
                 try {
-                    namespaceAdmission.admit(request.namespace());
+                    if (replacing) {
+                        sourceRegistry.replace(source, request, admission);
+                    } else {
+                        sourceRegistry.register(source, request, admission);
+                    }
                 } catch (NamespaceRefusedException e) {
                     closeQuietly(source);
                     ResponseBody.sendError(exchange, e.reason().statusCode(), e.reason().code(),
                         e.getMessage());
                     return;
-                } catch (IOException | RuntimeException e) {
-                    closeQuietly(source);
-                    throw e;
-                }
-
-                // Registration is a single atomic claim on the source ID: checking
-                // first and registering afterwards lets two concurrent requests both
-                // start ingestion and orphan one unclosed Source.
-                try {
-                    if (replacing) {
-                        sourceRegistry.replace(source, request);
-                    } else {
-                        sourceRegistry.register(source, request);
-                    }
                 } catch (SourceRegistrationException e) {
                     closeQuietly(source);
                     ResponseBody.sendError(exchange, e.reason().statusCode(), e.reason().code(),
@@ -446,25 +444,9 @@ public class IngestEndpoint implements HttpHandler {
                     closeQuietly(source);
                     sendError(exchange, 501, e.getMessage());
                     return;
-                } catch (RuntimeException e) {
+                } catch (IOException | RuntimeException e) {
                     closeQuietly(source);
                     throw e;
-                }
-
-                // Read again after the claim, not only before it. Both routes publish their
-                // claim before their last read - this one registers, the supplied route records
-                // - so whichever publishes second sees the first, and the pair can never both
-                // proceed. Checking only before registering leaves a window the whole length of
-                // a catalog write, and a crawl that wins it deletes the supplied documents on
-                // its first pass.
-                if (!replacing && inlineSourceIds != null
-                        && inlineSourceIds.isSupplied(request.sourceId())) {
-                    sourceRegistry.remove(request.sourceId());
-                    closeQuietly(source);
-                    sendError(exchange, 409, "Source '" + request.sourceId() + "' holds documents "
-                        + "supplied directly; a crawl registered under its id would remove them "
-                        + "on its first pass. Use a different source_id.");
-                    return;
                 }
 
                 // Send success response
@@ -495,6 +477,46 @@ public class IngestEndpoint implements HttpHandler {
             }
         }
         // MDC context is automatically cleared when ctx.close() is called
+    }
+
+    /**
+     * What a registration or replacement must pass once the registry holds its claim on the id.
+     *
+     * <p>For a registration, first that no documents were supplied directly under the id since
+     * the check above. Both routes publish their claim before their last read - the registry has
+     * claimed the id by now, the supplied route records before it reads - so whichever publishes
+     * second sees the first, and the pair can never both proceed. Checking only before
+     * registering would leave a window the whole length of a catalog write, and a crawl that won
+     * it would delete the supplied documents on its first pass. Read here, before anything is
+     * recorded or started, a registration that loses is given back without a crawl ever having
+     * begun.</p>
+     *
+     * <p>Then the namespace, last, since admitting it may create it.</p>
+     *
+     * @param replacing Whether the request replaces an existing registration
+     * @return The admission
+     */
+    private SourceRegistry.Admission admissionFor(boolean replacing) {
+        return descriptor -> {
+            if (!replacing && inlineSourceIds != null
+                    && inlineSourceIds.isSupplied(descriptor.sourceId())) {
+                throw new SourceRegistrationException(
+                    SourceRegistrationException.Reason.KIND_CONFLICT,
+                    suppliedConflict(descriptor.sourceId()));
+            }
+            namespaceAdmission.admit(descriptor.namespace());
+        };
+    }
+
+    /**
+     * Why a crawl may not be registered under an id documents were supplied under.
+     *
+     * @param sourceId The id
+     * @return The message the caller is answered with
+     */
+    private static String suppliedConflict(String sourceId) {
+        return "Source '" + sourceId + "' holds documents supplied directly; a crawl registered "
+            + "under its id would remove them on its first pass. Use a different source_id.";
     }
 
     /**

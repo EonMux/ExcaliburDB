@@ -36,9 +36,11 @@ class GraphFactsEndpointTest {
         + "\"relation\": \"Worked With\", \"object\": \"Charles Babbage\"}";
 
     private GraphRouteFixture fixture;
+    private Path root;
 
     @BeforeEach
     void setUp(@TempDir Path root) throws IOException {
+        this.root = root;
         fixture = new GraphRouteFixture(root);
     }
 
@@ -74,6 +76,35 @@ class GraphFactsEndpointTest {
     @Nested
     @DisplayName("asserting")
     class Asserting {
+
+        @Test
+        @DisplayName("a request refused by validation creates no namespace")
+        void aRefusedRequestCreatesNoNamespace() throws IOException {
+            List<String> refused = List.of(
+                "not json",
+                "[]",
+                "{\"subject\": \"A\", \"relation\": \"r\"}",
+                "{\"facts\": []}",
+                "{\"subject\": \"A\", \"relation\": \"r\", \"object\": \"B\", "
+                    + "\"valid_from\": \"yesterday\"}",
+                "{\"subject\": \"A\", \"relation\": \"r\", \"object\": \"B\", "
+                    + "\"confidence\": 2}");
+            for (String body : refused) {
+                GraphRouteFixture.Response response = fixture.assertFacts(body, "fresh");
+
+                assertThat(response.status()).as(body).isEqualTo(400);
+                assertThat(root.resolve("fresh"))
+                    .as("a request that fails leaves no tenant behind: %s", body)
+                    .doesNotExist();
+            }
+            assertThat(fixture.facts("POST", GraphFactsEndpoint.PATH + "/7",
+                ADA_WORKED_WITH_BABBAGE, "fresh").status()).isEqualTo(404);
+            assertThat(root.resolve("fresh")).doesNotExist();
+
+            assertThat(fixture.assertFacts(ADA_WORKED_WITH_BABBAGE, "fresh").status())
+                .as("one that is accepted creates it").isEqualTo(201);
+            assertThat(root.resolve("fresh")).isDirectory();
+        }
 
         @Test
         @DisplayName("a fact is staged under a fact id, cleaned as extraction cleans, and served "

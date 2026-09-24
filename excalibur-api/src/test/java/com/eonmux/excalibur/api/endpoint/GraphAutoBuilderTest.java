@@ -5,6 +5,7 @@ import com.eonmux.excalibur.api.bootstrap.GraphExtraction;
 import com.eonmux.excalibur.api.bootstrap.GraphFreshness;
 import com.eonmux.excalibur.config.GraphConfig;
 import com.eonmux.excalibur.graph.build.BuildCancelledException;
+import com.eonmux.excalibur.graph.staging.PublishRefusedException;
 import com.eonmux.excalibur.tenancy.NamespaceId;
 
 import org.junit.jupiter.api.AfterEach;
@@ -26,6 +27,7 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 
@@ -296,6 +298,141 @@ class GraphAutoBuilderTest {
     }
 
     @Nested
+    @DisplayName("Builds an erasure overtook")
+    class Superseded {
+
+        @Test
+        @DisplayName("a refused publish is superseded, not failed, and is retried at once")
+        void retriedAtOnce() throws InterruptedException {
+            namespaces.put(ACME, behind(T0, T0));
+            namespaces.refusals.set(1);
+            builder();
+            clock.advance(Duration.ofSeconds(60));
+
+            assertThat(builder.runPass()).containsExactly(ACME);
+            GraphAutoBuilder.Memory refused = awaitFinished(ACME);
+            assertThat(refused.lastResult()).isEqualTo(GraphAutoBuilder.RESULT_SUPERSEDED);
+            assertThat(refused.lastError()).as("nothing failed").isNull();
+            assertThat(refused.consecutiveFailures()).isZero();
+            assertThat(refused.consecutiveSupersessions()).isOne();
+            assertThat(refused.retryAtMs()).as("no backoff").isZero();
+            assertThat(builder.status(ACME).state()).isEqualTo(GraphAutoBuilder.STATE_PENDING);
+            assertThat(builder.counts().superseded()).isOne();
+            assertThat(builder.counts().failed()).isZero();
+
+            assertThat(builder.runPass()).as("due again on the very next pass")
+                .containsExactly(ACME);
+            GraphAutoBuilder.Memory rebuilt = awaitFinished(ACME);
+            assertThat(rebuilt.lastResult()).isEqualTo(GraphAutoBuilder.RESULT_COMPLETED);
+            assertThat(rebuilt.consecutiveSupersessions()).isZero();
+            assertThat(namespaces.builds).containsExactly(ACME);
+        }
+
+        @Test
+        @DisplayName("a refused publish keeps the debounce: busy staging still waits to be quiet")
+        void keepsTheDebounce() throws InterruptedException {
+            namespaces.put(ACME, behind(T0, T0));
+            namespaces.refusals.set(1);
+            builder();
+            clock.advance(Duration.ofSeconds(60));
+            assertThat(builder.runPass()).containsExactly(ACME);
+            awaitFinished(ACME);
+
+            // The erasure that overtook the build staged a change a moment ago.
+            namespaces.put(ACME, behind(T0, clock.instant()));
+            assertThat(builder.runPass()).as("staging is not quiet yet").isEmpty();
+
+            clock.advance(Duration.ofSeconds(60));
+            assertThat(builder.runPass()).containsExactly(ACME);
+            assertThat(awaitFinished(ACME).lastResult())
+                .isEqualTo(GraphAutoBuilder.RESULT_COMPLETED);
+        }
+
+        @Test
+        @DisplayName("refused again and again, the retries space out up to the maximum delay")
+        void escalates() throws InterruptedException {
+            namespaces.put(ACME, behind(T0, T0));
+            namespaces.refusals.set(Integer.MAX_VALUE);
+            builder();
+            clock.advance(Duration.ofSeconds(600));
+
+            assertThat(builder.runPass()).containsExactly(ACME);
+            assertThat(awaitFinished(ACME).retryAtMs()).as("the first is retried at once")
+                .isZero();
+
+            assertThat(builder.runPass()).containsExactly(ACME);
+            GraphAutoBuilder.Memory second = awaitFinished(ACME);
+            assertThat(second.consecutiveSupersessions()).isEqualTo(2);
+            assertThat(second.consecutiveFailures()).isZero();
+            assertThat(second.retryAtMs()).isEqualTo(clock.millis() + 60_000);
+            assertThat(builder.status(ACME).state())
+                .isEqualTo(GraphAutoBuilder.STATE_BACKING_OFF);
+            assertThat(builder.runPass()).as("overdue, but spaced out").isEmpty();
+
+            clock.advance(Duration.ofSeconds(60));
+            assertThat(builder.runPass()).containsExactly(ACME);
+            assertThat(awaitFinished(ACME).retryAtMs()).isEqualTo(clock.millis() + 120_000);
+            assertThat(builder.counts().superseded()).isEqualTo(3);
+            assertThat(builder.counts().failed()).isZero();
+        }
+
+        @Test
+        @DisplayName("the spacing starts at the debounce and stops at the maximum delay")
+        void escalationCeiling() {
+            builder();
+            assertThat(builder.supersededWait(1)).isEqualTo(Duration.ZERO);
+            assertThat(builder.supersededWait(2)).isEqualTo(Duration.ofSeconds(60));
+            assertThat(builder.supersededWait(3)).isEqualTo(Duration.ofSeconds(120));
+            assertThat(builder.supersededWait(6)).isEqualTo(Duration.ofSeconds(600));
+            assertThat(builder.supersededWait(60)).isEqualTo(Duration.ofSeconds(600));
+        }
+
+        @Test
+        @DisplayName("with no debounce the spacing starts at the pass interval")
+        void escalationWithoutDebounce() {
+            builder(new GraphAutoBuilder.Settings(true, Duration.ofSeconds(30), Duration.ZERO,
+                Duration.ofSeconds(600), 1, Duration.ofSeconds(60), Duration.ofSeconds(240)),
+                Optional.of(GraphExtraction.ACTIVE), id -> false);
+            assertThat(builder.supersededWait(2)).isEqualTo(Duration.ofSeconds(30));
+        }
+
+        @Test
+        @DisplayName("a refusal wrapped by the build still reads as superseded")
+        void wrappedRefusal() throws InterruptedException {
+            namespaces.put(ACME, behind(T0, T0));
+            namespaces.refusals.set(1);
+            namespaces.wrapRefusal = true;
+            builder();
+            clock.advance(Duration.ofSeconds(60));
+
+            assertThat(builder.runPass()).containsExactly(ACME);
+            assertThat(awaitFinished(ACME).lastResult())
+                .isEqualTo(GraphAutoBuilder.RESULT_SUPERSEDED);
+        }
+
+        @Test
+        @DisplayName("a build that reached its publish ends the failure streak")
+        void endsAFailureStreak() throws InterruptedException {
+            namespaces.put(ACME, behind(T0, T0));
+            namespaces.failWith = new IOException("embedding endpoint unavailable");
+            builder();
+            clock.advance(Duration.ofSeconds(60));
+            assertThat(builder.runPass()).containsExactly(ACME);
+            assertThat(awaitFinished(ACME).consecutiveFailures()).isOne();
+
+            namespaces.failWith = null;
+            namespaces.refusals.set(1);
+            clock.advance(Duration.ofSeconds(60));
+            assertThat(builder.runPass()).containsExactly(ACME);
+            GraphAutoBuilder.Memory refused = awaitFinished(ACME);
+
+            assertThat(refused.lastResult()).isEqualTo(GraphAutoBuilder.RESULT_SUPERSEDED);
+            assertThat(refused.consecutiveFailures()).isZero();
+            assertThat(refused.retryAtMs()).isZero();
+        }
+    }
+
+    @Nested
     @DisplayName("What holds a build back")
     class HeldBack {
 
@@ -422,6 +559,8 @@ class GraphAutoBuilderTest {
         volatile boolean currentOnceLocked;
         volatile boolean stopOnCancel;
         volatile CountDownLatch gate;
+        final AtomicInteger refusals = new AtomicInteger();
+        volatile boolean wrapRefusal;
 
         void put(NamespaceId id, GraphFreshness value) {
             freshness.put(id, value);
@@ -464,6 +603,14 @@ class GraphAutoBuilderTest {
             }
             if (currentOnceLocked) {
                 return Optional.empty();
+            }
+            if (refusals.getAndUpdate(left -> Math.max(0, left - 1)) > 0) {
+                PublishRefusedException refused = new PublishRefusedException(
+                    "erasure request(s) 7 were recorded while the graph was being built");
+                if (wrapRefusal) {
+                    throw new java.io.UncheckedIOException(refused);
+                }
+                throw refused;
             }
             if (failWith != null || id.equals(failFor)) {
                 throw failWith != null ? failWith : new IOException("build of " + id + " failed");

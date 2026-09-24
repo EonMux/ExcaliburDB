@@ -1525,6 +1525,11 @@ replaced document used to say. Staging records each change no published graph ha
 
 A failed automatic build is retried after `excalibur.graph.auto-build-failure-backoff-seconds`,
 doubling with each further failure up to `excalibur.graph.auto-build-max-failure-backoff-seconds`.
+An automatic build whose publish an erasure refused (below) has not failed: it ends `superseded`,
+counts toward no backoff, and the namespace is due again on the next pass, the new erasure left
+out. From the second refusal in a row the next attempt waits — the debounce (or the pass interval
+with no debounce), doubling up to `excalibur.graph.auto-build-max-delay-seconds` — so a namespace
+erased faster than it can be built is not rebuilt, and its embeddings paid for, on every pass.
 An erasure compaction is not a change to publish: it rewrites staging and the served graph alike.
 A build that finds every staged fact withdrawn — its documents all removed — stops serving the
 graph they built rather than going on answering from it.
@@ -1540,9 +1545,10 @@ prose from the entity documents and the vectors computed from them. While any ob
 by source or extractor version, prose staged before origins were recorded is left out too, since
 nothing can show it did not come from what was withdrawn. An obligation recorded while a build is
 running is not one it left out, so the build's publish — the renames that put it in place — is
-refused if one arrived: the build fails with an error saying so, publishes nothing, the graph it
-would have replaced goes on being served, and the namespace stays behind so the next build
-publishes without it. The renames and the check are one step against a new obligation, so a
+refused if one arrived: the build publishes nothing, the graph it would have replaced goes on
+being served, and the namespace stays behind so the next build publishes without it. An explicit
+build so refused ends `failed`, with an error naming the request; an automatic one ends
+`superseded` and is simply built again. The renames and the check are one step against a new obligation, so a
 request accepted after them is simply owed against the new graph. Leaving a fact out of a build
 does not discharge anything: staging still holds it, and the obligation stays `pending` until a
 compaction erases it there and records it met. `withheld_facts` on the build status counts what
@@ -1689,6 +1695,10 @@ the switch off too, so provisioning can create a tenant ahead of its first docum
 `shared` not counted: creating another past it — explicitly or by naming it — is refused with
 `429 namespace_limit_reached` and leaves nothing on disk, and dropping one makes room. Creating a
 namespace makes its directory and opens nothing, so it costs no open slot until something uses it.
+A request that fails creates nothing: a namespace is created only once the request is known to go
+through, so a registration refused as a duplicate, into a full registry or as a replacement naming
+another namespace, a build refused because one is running or the node is shutting down, and a
+body refused as malformed all leave the node's namespaces as they were.
 
 **What a namespace is not.** Namespaces partition the knowledge graph and nothing else. A node
 holds one corpus: every document, vector and lexical entry is searchable through `/v1/query` and
@@ -2504,6 +2514,8 @@ curl http://localhost:8080/v1/stats
                "mappingLimit": 65530, "limitRead": true, "graphDescriptors": 0,
                "processDescriptors": 412, "descriptorHighWater": 734003, "descriptorLimit": 1048576},
     "builds": {"running": false, "completed": 12, "failed": 0, "cancelled": 1},
+    "automaticBuilds": {"enabled": true, "running": 0, "completed": 184, "unchanged": 3,
+                        "failed": 0, "cancelled": 0, "superseded": 2},
     "erasure": {"namespacesOwing": 1, "outstanding": 2, "overdueNamespaces": 0,
                 "unreadableNamespaces": 0, "oldestAgeMs": 91000},
     "ingest": {"documentsSeen": 20412, "factsStaged": 131877, "unresolvedDocuments": 0,
@@ -2587,7 +2599,7 @@ curl http://localhost:8080/v1/graph/build/status
   "automatic": {"enabled": true, "state": "current", "debounce_seconds": 60,
                 "max_delay_seconds": 900, "last_started_at_ms": 1736899500000,
                 "last_finished_at_ms": 1736899560000, "last_result": "completed",
-                "consecutive_failures": 0}
+                "consecutive_failures": 0, "consecutive_supersessions": 0}
 }
 ```
 
@@ -2598,17 +2610,21 @@ the node — it saturates the same disk and the same embedding endpoint either w
 `withheld_facts` is how many staged facts the build left out because an outstanding erasure
 obligation covers them; they stay staged, and the obligation `pending`, until a compaction applies
 it. A build that would have published nothing else answers `"published": false` with a `message`
-saying so. A build overtaken by an obligation recorded while it ran ends `failed`, with an `error`
-naming the request, and publishes nothing; the next build leaves that obligation out too.
+saying so. An explicit build overtaken by an obligation recorded while it ran ends `failed`, with
+an `error` naming the request, and publishes nothing; the next build leaves that obligation out
+too. An automatic build overtaken the same way ends `superseded` rather than `failed`.
 
 The top-level fields describe the last build asked for. `freshness` says whether the served graph
 is behind what the namespace has staged — `behind_staging`, with `staged_changes_since_ms` and
 `last_staged_change_ms` when it is — and `automatic` what the node is doing about it: `state` is
 `current`, `pending` (waiting for the debounce or the maximum delay), `running`, `backing_off`
-(after a failure, until `next_attempt_at_ms`), `paused` (with `paused_reason`, while extraction is
-`missing_api_key` or `unavailable`), `withheld` or `disabled`; `last_result` is `completed`,
-`unchanged` (an explicit build got there first), `failed` (with `last_error`) or `cancelled`. See
-[Keeping the graph current](#keeping-the-graph-current).
+(after a failure, or after several builds in a row were superseded, until `next_attempt_at_ms`),
+`paused` (with `paused_reason`, while extraction is `missing_api_key` or `unavailable`), `withheld`
+or `disabled`; `last_result` is `completed`, `unchanged` (an explicit build got there first),
+`failed` (with `last_error`), `cancelled`, or `superseded` — an erasure was recorded while it ran,
+so its publish was refused and the next pass builds again without it; nothing failed.
+`consecutive_failures` and `consecutive_supersessions` count each in a row. `withheld_facts` on the
+top-level build is described above. See [Keeping the graph current](#keeping-the-graph-current).
 
 A node that has staged nothing keeps serving the graph it already had — replacing it with an empty
 one would turn every question into a refusal. Its status says so and why, from `extraction`:
@@ -4142,7 +4158,9 @@ The served graph is what the last build published. Read `freshness` and `automat
 means the node rebuilds once staging has been quiet for
 `excalibur.graph.auto-build-debounce-seconds`; `paused` means extraction is not active and nothing
 is built automatically until it is; `backing_off` means the last automatic build failed, and
-`last_error` says why; `disabled` means `excalibur.graph.auto-build-enabled=false`.
+`last_error` says why — or, with `last_result` `superseded`, that erasures keep arriving while it
+builds, and the attempts are being spaced out; `disabled` means
+`excalibur.graph.auto-build-enabled=false`.
 `POST /v1/graph/build` publishes it now in every case.
 
 **I set `excalibur.graph.extraction-enabled=true` and nothing is ever staged.**

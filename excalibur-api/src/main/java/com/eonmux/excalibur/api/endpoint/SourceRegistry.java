@@ -5,6 +5,7 @@ import com.eonmux.excalibur.ingest.source.SourceDescriptor;
 
 import com.eonmux.excalibur.tenancy.NamespaceId;
 
+import java.io.IOException;
 import java.util.Optional;
 import java.util.Set;
 
@@ -16,6 +17,34 @@ import java.util.Set;
  * one.</p>
  */
 public interface SourceRegistry extends AutoCloseable {
+
+    /**
+     * What a registration or a replacement must still pass once the registry has found nothing
+     * wrong with it: typically, admitting the namespace it names.
+     *
+     * <p>Asked by the registry rather than by its caller because admitting a namespace can create
+     * it, and a created namespace is a tenant - counted against the node's cap and listed to every
+     * caller. Asked first, a request the registry then refuses as a duplicate, into a full
+     * registry, or as a replacement naming another namespace would leave that tenant behind.
+     * Asked afterwards, from outside, it races the registrations, replacements and removals that
+     * decide whether the request is refused. So the registry asks it in the same step as its own
+     * checks, once the request is known to go through, and before it records or starts
+     * anything.</p>
+     */
+    @FunctionalInterface
+    interface Admission {
+
+        /** Admits everything, for a caller with nothing further to check. */
+        Admission NONE = descriptor -> { };
+
+        /**
+         * Lets the registration or replacement go ahead, or refuses it by throwing.
+         *
+         * @param descriptor What the source is being registered as
+         * @throws IOException if what it has to do, such as creating a namespace, failed
+         */
+        void admit(SourceDescriptor descriptor) throws IOException;
+    }
     /**
      * Registers a new source, atomically claiming its ID.
      *
@@ -47,6 +76,30 @@ public interface SourceRegistry extends AutoCloseable {
     }
 
     /**
+     * Registers a source and records what it was registered as, once {@code admission} lets it.
+     *
+     * <p>{@code admission} is asked once the id is claimed and before anything is recorded or
+     * started; when it throws, the claim is given back and the registration leaves nothing
+     * behind. See {@link Admission}.</p>
+     *
+     * <p>The default asks it first and then registers, which is the best a registry that cannot
+     * hold its claim across the question can do: a registration it then refuses has still been
+     * admitted. A registry that claims ids should override this.</p>
+     *
+     * @param source     The source to register
+     * @param descriptor What the source is registered as
+     * @param admission  What the registration must still pass
+     * @throws SourceRegistrationException if the ID is taken or the registry is full
+     * @throws SourceCatalogException      if the registration cannot be recorded
+     * @throws IOException                 if the admission failed
+     */
+    default void register(Source source, SourceDescriptor descriptor, Admission admission)
+            throws IOException {
+        admission.admit(descriptor);
+        register(source, descriptor);
+    }
+
+    /**
      * Replaces what a registered source is configured as, keeping everything else about it.
      *
      * <p>One step, not a removal followed by a registration. A removal clears the source's status
@@ -68,6 +121,30 @@ public interface SourceRegistry extends AutoCloseable {
      * @throws UnsupportedOperationException if this registry cannot replace a registration
      */
     default void replace(Source source, SourceDescriptor descriptor) {
+        throw new UnsupportedOperationException(
+            "This source registry cannot replace a registration in one step");
+    }
+
+    /**
+     * Replaces what a registered source is configured as, once {@code admission} lets it.
+     *
+     * <p>{@code admission} is asked once every check {@link #replace(Source, SourceDescriptor)}
+     * makes has passed and before the new configuration is recorded; when it throws, the
+     * registration is left as it was. See {@link Admission}.</p>
+     *
+     * <p>The default refuses, as {@link #replace(Source, SourceDescriptor)} does, and without
+     * asking: a replacement that cannot happen must not admit anything first.</p>
+     *
+     * @param source     The crawler built from the new configuration
+     * @param descriptor What the source is now registered as
+     * @param admission  What the replacement must still pass
+     * @throws SourceRegistrationException   as {@link #replace(Source, SourceDescriptor)}
+     * @throws SourceCatalogException        if the new configuration cannot be recorded
+     * @throws IOException                   if the admission failed
+     * @throws UnsupportedOperationException if this registry cannot replace a registration
+     */
+    default void replace(Source source, SourceDescriptor descriptor, Admission admission)
+            throws IOException {
         throw new UnsupportedOperationException(
             "This source registry cannot replace a registration in one step");
     }

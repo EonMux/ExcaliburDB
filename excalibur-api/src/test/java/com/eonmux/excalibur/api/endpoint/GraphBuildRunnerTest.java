@@ -89,6 +89,20 @@ class GraphBuildRunnerTest {
                 assertThat(runner.counts().running()).isFalse();
             }
         }
+
+        @Test
+        @DisplayName("a build asked for while the node shuts down admits nothing")
+        void shuttingDownAdmitsNothing() {
+            List<NamespaceId> admitted = new ArrayList<>();
+            GraphBuildRunner runner = new GraphBuildRunner((namespace, cancel) -> PUBLISHED,
+                Optional::empty, admitted::add);
+            assertThat(runner.drain(DRAIN_WAIT)).isTrue();
+
+            assertThatThrownBy(() -> runner.start(ACME))
+                .isInstanceOf(java.util.concurrent.RejectedExecutionException.class);
+            assertThat(admitted).as("a refused build leaves no tenant behind").isEmpty();
+            assertThat(runner.snapshot(ACME).state()).isEqualTo(GraphBuildRunner.STATE_IDLE);
+        }
     }
 
     private static final GraphBuildService.BuildOutcome PUBLISHED =
@@ -439,14 +453,16 @@ class GraphBuildRunnerTest {
         }
 
         @Test
-        @DisplayName("a build started after shutdown is refused rather than lost")
+        @DisplayName("a build asked for after shutdown is refused, and claims nothing")
         void startAfterClose() {
             GraphBuildRunner runner = new GraphBuildRunner((namespace, cancel) -> PUBLISHED);
             runner.close();
 
             assertThatThrownBy(() -> runner.start(ACME))
                 .isInstanceOf(java.util.concurrent.RejectedExecutionException.class);
-            assertThat(runner.snapshot(ACME).state()).isEqualTo(GraphBuildRunner.STATE_FAILED);
+            // Refused before the slot is claimed, as a build in the way is: no build began, so
+            // there is none to report, and the caller was told why.
+            assertThat(runner.snapshot(ACME).state()).isEqualTo(GraphBuildRunner.STATE_IDLE);
         }
     }
 
@@ -491,15 +507,15 @@ class GraphBuildRunnerTest {
         }
 
         @Test
-        @DisplayName("a build that could not even be scheduled is counted as failed")
-        void anUnschedulableBuildIsAFailure() {
+        @DisplayName("a build refused at shutdown is not counted, since none began")
+        void aRefusedBuildIsNotCounted() {
             GraphBuildRunner runner = new GraphBuildRunner((namespace, cancel) -> PUBLISHED);
             runner.close();
 
             assertThatThrownBy(() -> runner.start(ACME))
                 .isInstanceOf(java.util.concurrent.RejectedExecutionException.class);
             assertThat(runner.counts())
-                .isEqualTo(new GraphBuildRunner.Counts(false, 0, 1, 0));
+                .isEqualTo(new GraphBuildRunner.Counts(false, 0, 0, 0));
         }
 
         @Test

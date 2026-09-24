@@ -98,6 +98,10 @@ import java.util.function.Supplier;
  *       "descriptorHighWater": 716, "descriptorLimit": 1024
  *     },
  *     "builds": { "running": false, "completed": 4, "failed": 0, "cancelled": 1 },
+ *     "automaticBuilds": {
+ *       "enabled": true, "running": 0, "completed": 37, "unchanged": 2, "failed": 0,
+ *       "cancelled": 0, "superseded": 1
+ *     },
  *     "erasure": {
  *       "namespacesOwing": 1, "outstanding": 3, "overdueNamespaces": 0,
  *       "unreadableNamespaces": 0, "oldestAgeMs": 412000
@@ -115,7 +119,12 @@ import java.util.function.Supplier;
  * <p>Absent on a node that serves no graph of its own. Every figure is a total across
  * namespaces, never a row per namespace. {@code budget} carries both the graphs' share of the
  * mapping and descriptor limits and the whole process's, because the limits are the process's
- * and eviction can only give back the graphs' share. {@code erasure} is absent when the graph
+ * and eviction can only give back the graphs' share. {@code builds} counts the builds asked for
+ * through {@code POST /v1/graph/build} and {@code automaticBuilds} those the node started by
+ * itself to keep each graph up with its staging - {@code unchanged} when one found the graph
+ * already current, {@code superseded} when an erasure recorded while it ran refused its publish,
+ * which is not a failure: the next build leaves that erasure out. {@code erasure} is absent when
+ * the graph
  * root could not be listed, and {@code ingest} on a node whose ingestion stages no facts.
  * {@code ingest.sinkRefusals} counts documents the sink threw on instead of counting them under
  * one of its own reasons, which the sink is required never to do: a published document it threw
@@ -410,9 +419,29 @@ public class StatsEndpoint implements HttpHandler {
             .append("\"failed\": ").append(builds.failed()).append(", ")
             .append("\"cancelled\": ").append(builds.cancelled())
             .append("}");
+        appendAutomaticBuilds(sb, graph.automaticBuilds());
         appendGraphErasure(sb, graph.erasure());
         appendGraphIngest(sb, graph.ingest());
         sb.append("}");
+    }
+
+    /**
+     * The builds the node started by itself.
+     *
+     * @param sb        The body being built
+     * @param automatic Their counts
+     */
+    private static void appendAutomaticBuilds(StringBuilder sb,
+                                              GraphStats.AutomaticBuildStats automatic) {
+        sb.append(", \"automaticBuilds\": {")
+            .append("\"enabled\": ").append(automatic.enabled()).append(", ")
+            .append("\"running\": ").append(automatic.running()).append(", ")
+            .append("\"completed\": ").append(automatic.completed()).append(", ")
+            .append("\"unchanged\": ").append(automatic.unchanged()).append(", ")
+            .append("\"failed\": ").append(automatic.failed()).append(", ")
+            .append("\"cancelled\": ").append(automatic.cancelled()).append(", ")
+            .append("\"superseded\": ").append(automatic.superseded())
+            .append("}");
     }
 
     /**

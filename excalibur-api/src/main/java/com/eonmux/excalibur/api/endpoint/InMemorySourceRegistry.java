@@ -12,6 +12,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Map;
@@ -254,6 +255,36 @@ public class InMemorySourceRegistry implements SourceRegistry {
     }
 
     /**
+     * Registers a source once {@code admission} lets it, asking only after the id is claimed.
+     *
+     * <p>Under the lock registrations, replacements and removals share, so what the admission is
+     * told - that this registration goes through - cannot be changed by one of them in between.
+     * An admission that throws gives the claim back before anything is recorded or started.</p>
+     *
+     * @throws NullPointerException        if any argument is null
+     * @throws IllegalArgumentException    if the descriptor names a different source
+     * @throws SourceRegistrationException if the ID is taken or the registry is full
+     * @throws SourceCatalogException      if the registration cannot be recorded
+     * @throws IOException                 if the admission failed
+     */
+    @Override
+    public void register(Source source, SourceDescriptor descriptor, Admission admission)
+            throws IOException {
+        requireMatching(source, descriptor);
+        Objects.requireNonNull(admission, "admission must not be null");
+        synchronized (registrations) {
+            claim(source);
+            try {
+                admission.admit(descriptor);
+            } catch (IOException | RuntimeException | Error e) {
+                sources.remove(source.getSourceId(), source);
+                throw e;
+            }
+            admitClaimed(source, descriptor.namespace(), descriptor, Crawl.YES);
+        }
+    }
+
+    /**
      * Checks that a descriptor describes the source it arrived with.
      *
      * <p>The catalog is addressed by the same id as the registry and the re-crawl schedule. A
@@ -348,12 +379,21 @@ public class InMemorySourceRegistry implements SourceRegistry {
 
         synchronized (registrations) {
             claim(source);
-            if (toRecord != null) {
-                record(source, toRecord);
-            }
-            namespaces.put(source.getSourceId(), namespace);
-            start(source, crawl);
+            admitClaimed(source, namespace, toRecord, crawl);
         }
+    }
+
+    /**
+     * The rest of {@link #admit}, for a source whose id is already claimed. Called holding the
+     * registration lock.
+     */
+    private void admitClaimed(Source source, NamespaceId namespace, SourceDescriptor toRecord,
+                              Crawl crawl) {
+        if (toRecord != null) {
+            record(source, toRecord);
+        }
+        namespaces.put(source.getSourceId(), namespace);
+        start(source, crawl);
     }
 
     /**
@@ -381,7 +421,31 @@ public class InMemorySourceRegistry implements SourceRegistry {
      */
     @Override
     public void replace(Source source, SourceDescriptor descriptor) {
+        try {
+            replace(source, descriptor, Admission.NONE);
+        } catch (IOException e) {
+            throw new UncheckedIOException("admitting nothing cannot fail", e);
+        }
+    }
+
+    /**
+     * Replaces a registered source's configuration once {@code admission} lets it, asking only
+     * after every refusal {@link #replace(Source, SourceDescriptor)} can give has been ruled out.
+     *
+     * <p>Under the same lock as registrations and removals, and before the new configuration is
+     * recorded; an admission that throws leaves the registration exactly as it was.</p>
+     *
+     * @throws NullPointerException        if any argument is null
+     * @throws IllegalArgumentException    if the descriptor names a different source
+     * @throws SourceRegistrationException as {@link #replace(Source, SourceDescriptor)}
+     * @throws SourceCatalogException      if the new configuration cannot be recorded
+     * @throws IOException                 if the admission failed
+     */
+    @Override
+    public void replace(Source source, SourceDescriptor descriptor, Admission admission)
+            throws IOException {
         requireMatching(source, descriptor);
+        Objects.requireNonNull(admission, "admission must not be null");
         String sourceId = descriptor.sourceId();
         Source previous;
         synchronized (registrations) {
@@ -405,6 +469,7 @@ public class InMemorySourceRegistry implements SourceRegistry {
                 if (orchestrator != null && orchestrator.isIngestionActive(sourceId)) {
                     throw inFlight(sourceId, "crawl");
                 }
+                admission.admit(descriptor);
                 rerecord(descriptor);
                 sources.put(sourceId, source);
             } finally {

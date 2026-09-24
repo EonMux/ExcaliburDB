@@ -48,7 +48,8 @@ import java.util.concurrent.RejectedExecutionException;
  * {@code excalibur.graph.require-explicit-namespaces} is on ({@code 404 namespace_not_found}) or
  * the node holds {@code excalibur.graph.max-namespaces} already ({@code 429
  * namespace_limit_reached}). Asked before the build is claimed, so a refusal is this response
- * rather than a build that fails behind it.</p>
+ * rather than a build that fails behind it, and after the build is known to start: a request
+ * answered {@code 409 build_in_progress} or {@code 503 shutting_down} creates no namespace.</p>
  *
  * <h2>Response (accepted)</h2>
  * <pre>{@code

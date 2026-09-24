@@ -14,6 +14,7 @@ import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.staging.ExtractedTriple;
+import com.eonmux.excalibur.graph.staging.PublishRefusedException;
 import com.eonmux.excalibur.graph.store.MappedEdgeStore;
 import com.eonmux.excalibur.tenancy.MappingBudget;
 import com.eonmux.excalibur.tenancy.NamespaceId;
@@ -333,6 +334,19 @@ class GraphBuildEndpointTest {
         }
 
         @Test
+        @DisplayName("a build asked for during shutdown is 503, and creates no namespace")
+        void shuttingDownCreatesNothing() throws IOException {
+            runner.close();
+
+            Response refused = call(build, "POST", "fresh");
+
+            assertThat(refused.status()).isEqualTo(503);
+            assertThat(Json.stringAt(refused.json(), "code")).isEqualTo("shutting_down");
+            assertThat(root.resolve("fresh"))
+                .as("a request that fails leaves no tenant behind").doesNotExist();
+        }
+
+        @Test
         @DisplayName("a namespace the node will not create is refused before a build is claimed")
         void aRefusedNamespaceClaimsNothing() throws IOException {
             tenants.close();
@@ -500,10 +514,58 @@ class GraphBuildEndpointTest {
             assertThat((Long) path(built, "automatic.last_started_at_ms")).isPositive();
             assertThat((Long) path(built, "automatic.last_finished_at_ms")).isPositive();
             assertThat(path(built, "automatic.consecutive_failures")).isEqualTo(0L);
+            assertThat(path(built, "automatic.consecutive_supersessions")).isEqualTo(0L);
             assertThat(Json.stringAt(built, "state"))
                 .as("the top-level fields are the builds asked for, and none was")
                 .isEqualTo(GraphBuildRunner.STATE_IDLE);
             assertThat(graphDirectoryOf(NamespaceId.of("acme"))).isDirectory();
+        }
+
+        @Test
+        @DisplayName("an automatic build an erasure overtook is superseded, not failed")
+        void aSupersededBuildIsNotAFailure() throws IOException {
+            tenants.reportExtraction(GraphExtraction.ACTIVE);
+            sinkFor(NamespaceId.of("acme")).onDocumentPublished("docs:ada", "Ada knows Babbage.");
+            GraphAutoBuilder.Namespaces real = GraphAutoBuilder.over(tenants);
+            GraphAutoBuilder.Namespaces overtaken = new GraphAutoBuilder.Namespaces() {
+                @Override
+                public List<NamespaceId> list() throws IOException {
+                    return real.list();
+                }
+
+                @Override
+                public com.eonmux.excalibur.api.bootstrap.GraphFreshness freshness(
+                        NamespaceId id) throws IOException {
+                    return real.freshness(id);
+                }
+
+                @Override
+                public java.util.Optional<com.eonmux.excalibur.api.bootstrap.GraphBuildService
+                        .BuildOutcome> buildIfBehind(NamespaceId id,
+                                                     java.util.function.BooleanSupplier cancel)
+                        throws IOException {
+                    throw new PublishRefusedException("erasure request(s) 1 were recorded "
+                        + "while the graph was being built");
+                }
+            };
+            autoBuilder.close();
+            GraphBuildRunner current = runner;
+            autoBuilder = new GraphAutoBuilder(new GraphAutoBuilder.Settings(true,
+                Duration.ofSeconds(30), Duration.ZERO, Duration.ofSeconds(900), 1,
+                Duration.ofSeconds(60), Duration.ofSeconds(3600)), overtaken,
+                current::extraction, id -> current.snapshot(id).isRunning(), Clock.systemUTC());
+            status = new GraphBuildStatusEndpoint(runner, autoBuilder);
+
+            assertThat(autoBuilder.runPass()).containsExactly(NamespaceId.of("acme"));
+            Object json = awaitAutomatic("acme", GraphAutoBuilder.RESULT_SUPERSEDED);
+
+            assertThat((String) path(json, "automatic.state"))
+                .as("due again, not backing off").isEqualTo(GraphAutoBuilder.STATE_PENDING);
+            assertThat(path(json, "automatic.consecutive_failures")).isEqualTo(0L);
+            assertThat(path(json, "automatic.consecutive_supersessions")).isEqualTo(1L);
+            assertThat(path(json, "automatic.last_error")).isNull();
+            assertThat(path(json, "automatic.next_attempt_at_ms")).isNull();
+            assertThat(path(json, "freshness.behind_staging")).isEqualTo(Boolean.TRUE);
         }
 
         @Test

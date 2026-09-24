@@ -58,6 +58,7 @@ class GraphStatsExpositionTest {
 
     private GraphTenants tenants;
     private GraphBuildRunner builds;
+    private GraphAutoBuilder autoBuilds;
     private NamespaceRoutingGraphIngestSink sink;
     private NodeStatsCollector collector;
 
@@ -87,6 +88,10 @@ class GraphStatsExpositionTest {
         builds = mock(GraphBuildRunner.class);
         when(builds.counts()).thenReturn(new GraphBuildRunner.Counts(true, 4, 2, 1));
 
+        autoBuilds = mock(GraphAutoBuilder.class);
+        when(autoBuilds.enabled()).thenReturn(true);
+        when(autoBuilds.counts()).thenReturn(new GraphAutoBuilder.Counts(2, 11, 3, 6, 1, 8));
+
         sink = mock(NamespaceRoutingGraphIngestSink.class);
         when(sink.documentsSeen()).thenReturn(100L);
         when(sink.factsStaged()).thenReturn(640L);
@@ -96,6 +101,16 @@ class GraphStatsExpositionTest {
         when(sink.withdrawalFailures()).thenReturn(5L);
     }
 
+    /** A reader over every source, on a node whose ingestion stages facts. */
+    private GraphStatsReader reader() {
+        return new GraphStatsReader(tenants, builds, autoBuilds, sink, () -> 4L);
+    }
+
+    /** A reader on a node whose ingestion stages nothing. */
+    private GraphStatsReader readerWithoutIngest() {
+        return new GraphStatsReader(tenants, builds, autoBuilds, null, null);
+    }
+
     @Nested
     @DisplayName("reading")
     class Reading {
@@ -103,12 +118,14 @@ class GraphStatsExpositionTest {
         @Test
         @DisplayName("reads each block from the component that owns it")
         void readsEveryBlock() {
-            GraphStats stats = new GraphStatsReader(tenants, builds, sink, () -> 4L).read();
+            GraphStats stats = reader().read();
 
             assertThat(stats.namespaces()).isEqualTo(new GraphStats.NamespaceStats(2, 8, 5));
             assertThat(stats.budget()).isEqualTo(new GraphStats.BudgetStats(30,
                 OptionalLong.of(400), 700, 1_000, true, 6, OptionalLong.of(120), 350, 500));
             assertThat(stats.builds()).isEqualTo(new GraphStats.BuildStats(true, 4, 2, 1));
+            assertThat(stats.automaticBuilds())
+                .isEqualTo(new GraphStats.AutomaticBuildStats(true, 2, 11, 3, 6, 1, 8));
             assertThat(stats.erasure().namespacesOwing()).isEqualTo(3);
             assertThat(stats.erasure().outstanding()).isEqualTo(7);
             assertThat(stats.erasure().overdueNamespaces()).isEqualTo(1);
@@ -123,7 +140,7 @@ class GraphStatsExpositionTest {
         void unreadableBacklogIsAbsent() throws IOException {
             when(tenants.erasureBacklog()).thenThrow(new IOException("root unreadable"));
 
-            GraphStats stats = new GraphStatsReader(tenants, builds, sink, () -> 4L).read();
+            GraphStats stats = reader().read();
 
             assertThat(stats.erasure()).isNull();
             assertThat(stats.namespaces()).isNotNull();
@@ -132,7 +149,7 @@ class GraphStatsExpositionTest {
         @Test
         @DisplayName("a node whose ingestion stages nothing has no ingest block")
         void noSinkNoIngest() {
-            assertThat(new GraphStatsReader(tenants, builds, null, null).read().ingest()).isNull();
+            assertThat(readerWithoutIngest().read().ingest()).isNull();
         }
 
         @Test
@@ -141,7 +158,7 @@ class GraphStatsExpositionTest {
             when(tenants.erasureBacklog()).thenReturn(new GraphTenants.ErasureBacklog(0, 0, 0, 0,
                 Optional.empty(), Duration.ofHours(1)));
 
-            GraphStats stats = new GraphStatsReader(tenants, builds, sink, () -> 4L).read();
+            GraphStats stats = reader().read();
 
             assertThat(stats.erasure().oldestAgeMs()).isEmpty();
         }
@@ -149,11 +166,17 @@ class GraphStatsExpositionTest {
         @Test
         @DisplayName("needs the tenants and the builds")
         void requiresItsSources() {
-            assertThatThrownBy(() -> new GraphStatsReader(null, builds, sink, () -> 4L))
+            assertThatThrownBy(() ->
+                    new GraphStatsReader(null, builds, autoBuilds, sink, () -> 4L))
                 .isInstanceOf(NullPointerException.class);
-            assertThatThrownBy(() -> new GraphStatsReader(tenants, null, sink, () -> 4L))
+            assertThatThrownBy(() ->
+                    new GraphStatsReader(tenants, null, autoBuilds, sink, () -> 4L))
                 .isInstanceOf(NullPointerException.class);
-            assertThatThrownBy(() -> new GraphStatsReader(tenants, builds, sink, null))
+            assertThatThrownBy(() ->
+                    new GraphStatsReader(tenants, builds, null, sink, () -> 4L))
+                .isInstanceOf(NullPointerException.class);
+            assertThatThrownBy(() ->
+                    new GraphStatsReader(tenants, builds, autoBuilds, sink, null))
                 .as("a node that stages facts must say where refusals are counted")
                 .isInstanceOf(NullPointerException.class);
         }
@@ -162,7 +185,7 @@ class GraphStatsExpositionTest {
         @DisplayName("a graph that fails to report leaves the rest of the stats standing")
         void aFailingGraphIsAbsent() {
             when(tenants.budget()).thenThrow(new IllegalStateException("closed"));
-            collector.withGraph(new GraphStatsReader(tenants, builds, sink, () -> 4L));
+            collector.withGraph(reader());
 
             NodeStats stats = collector.collect();
 
@@ -178,7 +201,7 @@ class GraphStatsExpositionTest {
         @Test
         @DisplayName("carries every block, under the names the docs give them")
         void rendersEveryBlock() throws IOException {
-            collector.withGraph(new GraphStatsReader(tenants, builds, sink, () -> 4L));
+            collector.withGraph(reader());
 
             JsonNode graph = stats().path("graph");
 
@@ -203,6 +226,15 @@ class GraphStatsExpositionTest {
             assertThat(buildBlock.path("failed").asLong()).isEqualTo(2);
             assertThat(buildBlock.path("cancelled").asLong()).isEqualTo(1);
 
+            JsonNode automatic = graph.path("automaticBuilds");
+            assertThat(automatic.path("enabled").asBoolean()).isTrue();
+            assertThat(automatic.path("running").asInt()).isEqualTo(2);
+            assertThat(automatic.path("completed").asLong()).isEqualTo(11);
+            assertThat(automatic.path("unchanged").asLong()).isEqualTo(3);
+            assertThat(automatic.path("failed").asLong()).isEqualTo(6);
+            assertThat(automatic.path("cancelled").asLong()).isEqualTo(1);
+            assertThat(automatic.path("superseded").asLong()).isEqualTo(8);
+
             JsonNode erasure = graph.path("erasure");
             assertThat(erasure.path("namespacesOwing").asInt()).isEqualTo(3);
             assertThat(erasure.path("outstanding").asLong()).isEqualTo(7);
@@ -222,13 +254,26 @@ class GraphStatsExpositionTest {
         }
 
         @Test
+        @DisplayName("automatic builds turned off still report, as disabled")
+        void automaticBuildsDisabled() throws IOException {
+            when(autoBuilds.enabled()).thenReturn(false);
+            when(autoBuilds.counts()).thenReturn(new GraphAutoBuilder.Counts(0, 0, 0, 0, 0, 0));
+            collector.withGraph(reader());
+
+            JsonNode automatic = stats().path("graph").path("automaticBuilds");
+
+            assertThat(automatic.path("enabled").asBoolean()).isFalse();
+            assertThat(automatic.path("completed").asLong()).isZero();
+        }
+
+        @Test
         @DisplayName("an unknown figure is null, and an absent block is missing")
         void unknownIsNull() throws IOException {
             MappingBudget unmeasured = MappingBudget.of(1_000, 0.7, 0);
             when(tenants.budget()).thenReturn(unmeasured);
             when(tenants.erasureBacklog()).thenReturn(new GraphTenants.ErasureBacklog(0, 0, 0, 0,
                 Optional.empty(), Duration.ofHours(1)));
-            collector.withGraph(new GraphStatsReader(tenants, builds, null, null));
+            collector.withGraph(readerWithoutIngest());
 
             JsonNode graph = stats().path("graph");
 
@@ -256,7 +301,7 @@ class GraphStatsExpositionTest {
         @Test
         @DisplayName("exposes every figure as a series, totalled across namespaces")
         void exposesEverySeries() throws IOException {
-            collector.withGraph(new GraphStatsReader(tenants, builds, sink, () -> 4L));
+            collector.withGraph(reader());
 
             String body = scrape();
 
@@ -268,6 +313,13 @@ class GraphStatsExpositionTest {
                 "excalibur_graph_builds_total{outcome=\"completed\"} 4",
                 "excalibur_graph_builds_total{outcome=\"failed\"} 2",
                 "excalibur_graph_builds_total{outcome=\"cancelled\"} 1",
+                "excalibur_graph_auto_build_enabled 1",
+                "excalibur_graph_auto_builds_running 2",
+                "excalibur_graph_auto_builds_total{outcome=\"completed\"} 11",
+                "excalibur_graph_auto_builds_total{outcome=\"unchanged\"} 3",
+                "excalibur_graph_auto_builds_total{outcome=\"failed\"} 6",
+                "excalibur_graph_auto_builds_total{outcome=\"cancelled\"} 1",
+                "excalibur_graph_auto_builds_total{outcome=\"superseded\"} 8",
                 "excalibur_mappings{scope=\"graphs\"} 30",
                 "excalibur_mappings{scope=\"process\"} 400",
                 "excalibur_mappings_high_water 700",
@@ -297,7 +349,7 @@ class GraphStatsExpositionTest {
         @Test
         @DisplayName("no series carries a namespace, so the series count is fixed")
         void noNamespaceLabel() throws IOException {
-            collector.withGraph(new GraphStatsReader(tenants, builds, sink, () -> 4L));
+            collector.withGraph(reader());
 
             assertThat(scrape()).doesNotContain("namespace=");
         }
@@ -306,7 +358,7 @@ class GraphStatsExpositionTest {
         @DisplayName("omits what it cannot measure rather than exporting a zero")
         void omitsTheUnknown() throws IOException {
             when(tenants.budget()).thenReturn(MappingBudget.of(1_000, 0.7, 0));
-            collector.withGraph(new GraphStatsReader(tenants, builds, null, null));
+            collector.withGraph(readerWithoutIngest());
 
             String body = scrape();
 
@@ -321,7 +373,7 @@ class GraphStatsExpositionTest {
         @DisplayName("omits the erasure series when the backlog could not be read")
         void omitsAnUnreadableBacklog() throws IOException {
             when(tenants.erasureBacklog()).thenThrow(new IOException("root unreadable"));
-            collector.withGraph(new GraphStatsReader(tenants, builds, sink, () -> 4L));
+            collector.withGraph(reader());
 
             assertThat(scrape()).doesNotContain("excalibur_graph_erasure");
         }
@@ -338,7 +390,7 @@ class GraphStatsExpositionTest {
         @Test
         @DisplayName("still declares each family once and writes every sample well formed")
         void staysWellFormed() throws IOException {
-            collector.withGraph(new GraphStatsReader(tenants, builds, sink, () -> 4L));
+            collector.withGraph(reader());
 
             String body = scrape();
 
@@ -365,13 +417,21 @@ class GraphStatsExpositionTest {
         GraphStats.BudgetStats budget = new GraphStats.BudgetStats(0, OptionalLong.empty(), 0, 1,
             false, 0, OptionalLong.empty(), 0, 0);
         GraphStats.BuildStats buildStats = new GraphStats.BuildStats(false, 0, 0, 0);
+        GraphStats.AutomaticBuildStats automatic =
+            new GraphStats.AutomaticBuildStats(true, 0, 0, 0, 0, 0, 0);
 
-        assertThatThrownBy(() -> new GraphStats(null, budget, buildStats, null, null))
+        assertThatThrownBy(() -> new GraphStats(null, budget, buildStats, automatic, null, null))
             .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> new GraphStats(namespaces, null, buildStats, null, null))
+        assertThatThrownBy(() -> new GraphStats(namespaces, null, buildStats, automatic, null,
+            null)).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> new GraphStats(namespaces, budget, null, automatic, null, null))
             .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> new GraphStats(namespaces, budget, null, null, null))
+        assertThatThrownBy(() -> new GraphStats(namespaces, budget, buildStats, null, null, null))
             .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> new GraphStats.AutomaticBuildStats(true, -1, 0, 0, 0, 0, 0))
+            .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new GraphStats.AutomaticBuildStats(true, 0, 0, 0, 0, 0, -1))
+            .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new GraphStats.NamespaceStats(-1, 0, 0))
             .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new GraphStats.NamespaceStats(0, 0, -1))

@@ -60,7 +60,8 @@ import java.util.Optional;
  *     "state": "pending",
  *     "debounce_seconds": 60,
  *     "max_delay_seconds": 900,
- *     "consecutive_failures": 0
+ *     "consecutive_failures": 0,
+ *     "consecutive_supersessions": 0
  *   }
  * }
  * }</pre>
@@ -89,9 +90,11 @@ import java.util.Optional;
  * erasure obligation covers them - a retracted fact, an erased entity's, a withdrawn document's -
  * which staging still holds until a compaction applies the obligation. A build never publishes
  * those, and a build that would have published nothing else retires the graph that held them.
- * An obligation recorded while a build runs fails that build, with an {@code error} saying so,
- * rather than letting it publish what it read before the obligation existed; the graph it would
- * have replaced goes on being served and stays behind, so the next build publishes without it.</p>
+ * An obligation recorded while a build runs refuses that build's publish rather than letting it
+ * publish what it read before the obligation existed; the graph it would have replaced goes on
+ * being served and stays behind, so the next build publishes without it. An explicit build so
+ * refused ends {@code failed}, with an {@code error} saying which erasure overtook it; an
+ * automatic one ends {@code superseded}, below.</p>
  *
  * <h2>Whether the graph is current</h2>
  * <p>{@code freshness} says whether the served graph is behind what the namespace has staged:
@@ -107,12 +110,18 @@ import java.util.Optional;
  * {@code paused_reason}, while extraction is {@code missing_api_key} or {@code unavailable};
  * {@code current}; {@code pending} while the graph is behind and waits for staging to be quiet
  * for {@code debounce_seconds} or for its oldest change to reach {@code max_delay_seconds};
- * {@code running}; {@code backing_off} after a failed automatic build, until
- * {@code next_attempt_at_ms}; and {@code withheld}. {@code last_started_at_ms},
- * {@code last_finished_at_ms}, {@code last_result} ({@code completed}, {@code unchanged},
- * {@code failed} or {@code cancelled}) and {@code last_error} describe the last automatic build
- * of the namespace, and {@code consecutive_failures} how many in a row have failed. The
- * top-level fields describe the last build asked for through {@code POST /v1/graph/build}.</p>
+ * {@code running}; {@code backing_off} after a failed automatic build, or after several in a row
+ * were superseded, until {@code next_attempt_at_ms}; and {@code withheld}.
+ * {@code last_started_at_ms}, {@code last_finished_at_ms}, {@code last_result}
+ * ({@code completed}, {@code unchanged}, {@code failed}, {@code cancelled} or
+ * {@code superseded}) and {@code last_error} describe the last automatic build of the
+ * namespace, {@code consecutive_failures} how many in a row have failed, and
+ * {@code consecutive_supersessions} how many in a row an erasure overtook. A superseded build is
+ * not a failure: its publish was refused because an erasure was recorded while it ran, and the
+ * namespace is due again on the next pass, the new erasure left out. Only from the second in a
+ * row does the next attempt wait - the debounce, doubling up to {@code max_delay_seconds} - so
+ * a namespace erased faster than it can be built is not rebuilt on every pass. The top-level
+ * fields describe the last build asked for through {@code POST /v1/graph/build}.</p>
  *
  * <p>A cancelled build reports {@code "published": false} for a different reason: it stopped
  * before the rename that would have published it. There is no partial graph to describe,
@@ -211,7 +220,9 @@ public final class GraphBuildStatusEndpoint implements HttpHandler {
             json.append(", \"last_error\": \"").append(JsonText.escape(memory.lastError()))
                 .append('"');
         }
-        json.append(", \"consecutive_failures\": ").append(memory.consecutiveFailures());
+        json.append(", \"consecutive_failures\": ").append(memory.consecutiveFailures())
+            .append(", \"consecutive_supersessions\": ")
+            .append(memory.consecutiveSupersessions());
         if (memory.retryAtMs() > 0) {
             json.append(", \"next_attempt_at_ms\": ").append(memory.retryAtMs());
         }

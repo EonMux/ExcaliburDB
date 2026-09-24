@@ -32,6 +32,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -155,6 +156,33 @@ class GraphErasureEndpointTest {
             assertThat(response.status()).isEqualTo(429);
             assertThat(Json.at(response.json(), "code")).isEqualTo("namespace_limit_reached");
             assertThat(call("POST", SOURCE, "first").status()).isEqualTo(202);
+        }
+    }
+
+    @Nested
+    @DisplayName("a request refused by validation")
+    class RefusedByValidation {
+
+        @Test
+        @DisplayName("a malformed source or extractor scope creates no namespace")
+        void createsNoNamespace() throws IOException {
+            List<String> refused = List.of(
+                "{\"scope\": \"source\", \"source_type\": \"DOCUMENT\"}",
+                "{\"scope\": \"source\", \"source_type\": \"NOT_A_TYPE\", \"source_id\": 1}",
+                "{\"scope\": \"extractor\"}",
+                "{\"scope\": \"source\", \"source_type\": \"DOCUMENT\", \"source_id\": 1, "
+                    + "\"compact\": \"soon\"}",
+                "{\"scope\": \"nobody\"}",
+                "not json");
+            for (String body : refused) {
+                Response response = call("POST", body, "fresh");
+
+                assertThat(response.status()).as(body).isEqualTo(400);
+                assertThat(root.resolve("fresh"))
+                    .as("a request that fails leaves no tenant behind: %s", body)
+                    .doesNotExist();
+            }
+            assertThat(tenants.exists(NamespaceId.of("fresh"))).isFalse();
         }
     }
 
