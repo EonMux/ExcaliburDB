@@ -36,7 +36,18 @@ import java.util.*;
  *
  * <p>The same path answers {@code DELETE} through
  * {@link SourceDeregisterEndpoint}, which stops crawling a source and keeps
- * what it indexed. One resource, two verbs.</p>
+ * what it indexed.</p>
+ *
+ * <h2>Replacing a Registration</h2>
+ * <p>{@code PUT} takes the same body, is validated the same way - the same required fields, the
+ * same bounds, the same allow-lists - and replaces the configuration of the source already
+ * registered under {@code config.source_id} through {@link SourceRegistry#replace}. The id, the
+ * namespace, the status history, the place in the re-crawl schedule and the indexed documents
+ * all stay; the new configuration is recorded in the source catalog before the live source is
+ * swapped, and the next crawl uses it. No crawl is started. The answer is {@code 404} for an id
+ * nothing is registered under, and {@code 409} while a crawl or reindex of the source is running
+ * or when the namespace header names a different namespace from the one the source was
+ * registered in.</p>
  *
  * <h2>Request Format</h2>
  * <pre>{@code
@@ -276,7 +287,8 @@ public class IngestEndpoint implements HttpHandler {
     public void handle(HttpExchange exchange) throws IOException {
         String method = exchange.getRequestMethod();
 
-        if (!"POST".equalsIgnoreCase(method)) {
+        boolean replacing = "PUT".equalsIgnoreCase(method);
+        if (!replacing && !"POST".equalsIgnoreCase(method)) {
             sendError(exchange, 405, "Method Not Allowed");
             return;
         }
@@ -314,8 +326,9 @@ public class IngestEndpoint implements HttpHandler {
                 // Set source ID in MDC for per-source logging
                 StructuredLoggingHelper.setSourceId(request.sourceId());
 
-                LOGGER.info("Registering ingestion source: type={}, namespace={}",
-                    request.sourceType(), request.namespace());
+                LOGGER.info("{} ingestion source: type={}, namespace={}",
+                    replacing ? "Replacing" : "Registering", request.sourceType(),
+                    request.namespace());
 
                 // Build the source. The target is validated against the configured
                 // allow-lists first, so an unknown root or host never reaches a crawler.
@@ -353,7 +366,11 @@ public class IngestEndpoint implements HttpHandler {
                 // first and registering afterwards lets two concurrent requests both
                 // start ingestion and orphan one unclosed Source.
                 try {
-                    sourceRegistry.register(source, request);
+                    if (replacing) {
+                        sourceRegistry.replace(source, request);
+                    } else {
+                        sourceRegistry.register(source, request);
+                    }
                 } catch (SourceRegistrationException e) {
                     closeQuietly(source);
                     sendError(exchange, e.reason().statusCode(), e.getMessage());
@@ -368,6 +385,10 @@ public class IngestEndpoint implements HttpHandler {
                     sendError(exchange, SourceCatalogException.STATUS_CODE,
                         SourceCatalogException.CLIENT_MESSAGE);
                     return;
+                } catch (UnsupportedOperationException e) {
+                    closeQuietly(source);
+                    sendError(exchange, 501, e.getMessage());
+                    return;
                 } catch (RuntimeException e) {
                     closeQuietly(source);
                     throw e;
@@ -379,7 +400,8 @@ public class IngestEndpoint implements HttpHandler {
                 // proceed. Checking only before registering leaves a window the whole length of
                 // a catalog write, and a crawl that wins it deletes the supplied documents on
                 // its first pass.
-                if (inlineSourceIds != null && inlineSourceIds.isSupplied(request.sourceId())) {
+                if (!replacing && inlineSourceIds != null
+                        && inlineSourceIds.isSupplied(request.sourceId())) {
                     sourceRegistry.remove(request.sourceId());
                     closeQuietly(source);
                     sendError(exchange, 409, "Source '" + request.sourceId() + "' holds documents "
@@ -392,11 +414,13 @@ public class IngestEndpoint implements HttpHandler {
                 IngestResponse response = new IngestResponse(
                     request.sourceId(),
                     request.sourceType(),
-                    "registered"
+                    replacing ? "updated" : "registered"
                 );
                 sendResponse(exchange, 200, response);
 
-                LOGGER.info("Source registered successfully");
+                LOGGER.info(replacing ? "Source configuration replaced"
+                    : "Source registered successfully");
+
 
             } catch (RequestBody.TooLargeException e) {
                 // Well-formed and too big is not the same failure as malformed: 400 tells the

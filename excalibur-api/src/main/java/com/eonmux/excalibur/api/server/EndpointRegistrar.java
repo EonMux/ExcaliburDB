@@ -858,8 +858,8 @@ final class EndpointRegistrar {
     }
 
     /**
-     * Registers {@code /v1/ingest}: POST registers a source, GET reads the registrations back,
-     * DELETE stops crawling one.
+     * Registers {@code /v1/ingest}: POST registers a source, PUT replaces its configuration, GET
+     * reads the registrations back, DELETE stops crawling one.
      *
      * <p>The two that mutate are charged against the mutate budget and the read-back against the
      * read one; the same shape {@code /v1/query} uses for query and cancel.
@@ -872,6 +872,11 @@ final class EndpointRegistrar {
         target.createContext("/v1/ingest", wrapHandler(exactPath("/v1/ingest", createMethodRouter(
             Map.of(
                 "POST", audited("source.register",
+                    guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint)),
+                // The same endpoint and the same namespace-honouring guard as POST: a replacement
+                // is validated exactly as a registration is, and the header is how it proves it
+                // is not moving the source to another tenant.
+                "PUT", audited("source.update",
                     guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint)),
                 // The read budget, like every other read-back: an operator asking what a source
                 // was registered as is not changing anything, and charging it against the
@@ -888,7 +893,8 @@ final class EndpointRegistrar {
                     new SourceDeregisterEndpoint(in.ingestSourceRegistry())))),
             guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                 "Method Not Allowed - Use GET to read the registrations, POST to register a "
-                    + "source or DELETE to stop crawling one"))), notFound)));
+                    + "source, PUT to replace its configuration or DELETE to stop crawling it"))),
+            notFound)));
         target.createContext("/v1/ingest/run",
             wrapHandler(exactPath("/v1/ingest/run", onlyMethod("DELETE", audited("ingest.cancel",
                 corpusRoute(RequestGuard.Access.MUTATE,

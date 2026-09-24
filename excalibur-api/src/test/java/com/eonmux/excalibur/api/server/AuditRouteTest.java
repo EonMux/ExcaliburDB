@@ -149,6 +149,19 @@ class AuditRouteTest {
     }
 
     @Test
+    @DisplayName("a replacement of a source's configuration is recorded as an update of it")
+    void replacementIsAudited() throws IOException {
+        Answer refused = call("PUT", "/v1/ingest", "{\"source_type\": \"filesystem\", "
+            + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"/nowhere\"}}", TOKEN, null);
+
+        assertThat(refused.status()).as("no root is allow-listed on this node").isEqualTo(403);
+        assertThat(recorded()).singleElement().satisfies(event -> assertThat(event)
+            .containsEntry("audit_action", "source.update")
+            .containsEntry("audit_targets", Map.of("source_id", "docs",
+                "source_type", "filesystem", "namespace", "shared")));
+    }
+
+    @Test
     @DisplayName("reads are not audited, and a method a path does not serve is not either")
     void readsAreNotAudited() throws IOException {
         call("GET", "/v1/stats", null, TOKEN, null);

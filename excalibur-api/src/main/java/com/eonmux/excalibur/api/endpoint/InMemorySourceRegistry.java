@@ -37,7 +37,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>In memory is where the sources live, not where the fact of their registration is kept. When
  * a {@link SourceCatalog} is configured via {@link #setSourceCatalog(SourceCatalog)}, every
- * registration is written to it and every removal taken back out, and {@link #restore(Source)}
+ * registration and replacement is written to it and every removal taken back out, and {@link #restore(Source)}
  * brings a recorded one back at startup. Without a catalog the registrations last as long as the
  * process.</p>
  */
@@ -57,6 +57,16 @@ public class InMemorySourceRegistry implements SourceRegistry {
      * catalog stages where it staged before the restart.</p>
      */
     private final ConcurrentHashMap<String, NamespaceId> namespaces = new ConcurrentHashMap<>();
+
+    /**
+     * Held while a registration, a replacement or a removal changes which source an id names.
+     *
+     * <p>Each of them writes the catalog and then the live map, and a replacement also decides
+     * from the live map that nothing is crawling the source it swaps. Interleaved, a removal
+     * could forget the record a replacement then writes back, or a registration could start a
+     * crawl through a source a replacement has just closed. Lookups never take it.</p>
+     */
+    private final Object registrations = new Object();
 
     /**
      * How long a removal waits, by default, for a reindex of the source to stop.
@@ -336,12 +346,125 @@ public class InMemorySourceRegistry implements SourceRegistry {
         Objects.requireNonNull(source, "Source cannot be null");
         Objects.requireNonNull(namespace, "namespace cannot be null");
 
-        claim(source);
-        if (toRecord != null) {
-            record(source, toRecord);
+        synchronized (registrations) {
+            claim(source);
+            if (toRecord != null) {
+                record(source, toRecord);
+            }
+            namespaces.put(source.getSourceId(), namespace);
+            start(source, crawl);
         }
-        namespaces.put(source.getSourceId(), namespace);
-        start(source, crawl);
+    }
+
+    /**
+     * Replaces what a registered source is configured as, keeping its id, namespace, status
+     * history, place in the re-crawl schedule and indexed documents.
+     *
+     * <p>Refused while the source is being crawled or reindexed: a run already reading through
+     * the old source would go on with the old configuration and then have that source closed
+     * under it. The reindex claim is held for the whole swap, so no scheduled or requested
+     * reindex can start half-way through it, and no crawl can start either - the only thing that
+     * starts one is a registration, which cannot claim an id that is taken.</p>
+     *
+     * <p>The catalog is written before the live source is swapped, and a write that fails leaves
+     * both the record and the live source as they were. The old source is closed once nothing
+     * can reach it any more.</p>
+     *
+     * @param source     The crawler built from the new configuration
+     * @param descriptor What the source is now registered as
+     * @throws NullPointerException        if either argument is null
+     * @throws IllegalArgumentException    if the descriptor names a different source
+     * @throws SourceRegistrationException if no source is registered under the id, the
+     *                                     namespace differs, a crawl or reindex of it is running,
+     *                                     or the node is shutting down
+     * @throws SourceCatalogException      if the new configuration cannot be recorded
+     */
+    @Override
+    public void replace(Source source, SourceDescriptor descriptor) {
+        requireMatching(source, descriptor);
+        String sourceId = descriptor.sourceId();
+        Source previous;
+        synchronized (registrations) {
+            previous = sources.get(sourceId);
+            if (previous == null) {
+                throw new SourceRegistrationException(SourceRegistrationException.Reason.UNKNOWN,
+                    "No source is registered under '" + sourceId + "'. Register it with POST.");
+            }
+            NamespaceId current = namespaces.getOrDefault(sourceId, NamespaceId.SHARED);
+            if (!current.equals(descriptor.namespace())) {
+                throw new SourceRegistrationException(
+                    SourceRegistrationException.Reason.NAMESPACE_MISMATCH,
+                    "Source '" + sourceId + "' belongs to namespace '" + current.value()
+                        + "'. A replacement keeps the namespace its documents were staged into; "
+                        + "send the same X-Excalibur-Namespace, or deregister the source and "
+                        + "register it again in the other namespace.");
+            }
+            ReindexCoordinator.Lease lease = claimReindex(sourceId);
+            try {
+                IngestionOrchestrator orchestrator = this.ingestionOrchestrator;
+                if (orchestrator != null && orchestrator.isIngestionActive(sourceId)) {
+                    throw inFlight(sourceId, "crawl");
+                }
+                rerecord(descriptor);
+                sources.put(sourceId, source);
+            } finally {
+                if (lease != null) {
+                    lease.release();
+                }
+            }
+        }
+        closeSource(sourceId, previous);
+        LOGGER.info("Replaced the configuration of source {}; its next crawl uses it", sourceId);
+    }
+
+    /**
+     * Takes the reindex claim on a source for the length of a replacement.
+     *
+     * @param sourceId The source being replaced
+     * @return The claim, or null on a node that does not reindex
+     * @throws SourceRegistrationException if a reindex of the source is running, or the node is
+     *                                     shutting down
+     */
+    private ReindexCoordinator.Lease claimReindex(String sourceId) {
+        ReindexCoordinator coordinator = this.reindexCoordinator;
+        if (coordinator == null) {
+            return null;
+        }
+        ReindexCoordinator.Lease lease = coordinator.tryAcquire(sourceId);
+        if (lease != null) {
+            return lease;
+        }
+        if (!coordinator.isAccepting()) {
+            throw new SourceRegistrationException(
+                SourceRegistrationException.Reason.SHUTTING_DOWN,
+                "The node is shutting down and replaces no source configuration");
+        }
+        throw inFlight(sourceId, "reindex");
+    }
+
+    private static SourceRegistrationException inFlight(String sourceId, String run) {
+        return new SourceRegistrationException(SourceRegistrationException.Reason.IN_FLIGHT,
+            "A " + run + " of source '" + sourceId + "' is running with its current "
+                + "configuration. Send the replacement again once it has finished.");
+    }
+
+    /**
+     * Writes a replacement registration over the one the catalog holds.
+     *
+     * <p>Unlike {@link #record(Source, SourceDescriptor)}, a failure gives nothing up: the source
+     * was registered before the replacement was asked for and stays registered as it was.</p>
+     */
+    private void rerecord(SourceDescriptor descriptor) {
+        SourceCatalog catalog = this.sourceCatalog;
+        if (catalog == null) {
+            return;
+        }
+        try {
+            catalog.record(descriptor);
+        } catch (IOException e) {
+            throw new SourceCatalogException(
+                "Could not record the new configuration of source " + descriptor.sourceId(), e);
+        }
     }
 
     /**
@@ -505,10 +628,13 @@ public class InMemorySourceRegistry implements SourceRegistry {
         // The catalog first. A removal it will not accept leaves the source registered and the
         // caller told so, which is recoverable; stopping the crawl and keeping the record is not -
         // the source comes back at the next restart with nothing to say why.
-        boolean recorded = forget(sourceId);
-
-        Source removed = sources.remove(sourceId);
-        namespaces.remove(sourceId);
+        boolean recorded;
+        Source removed;
+        synchronized (registrations) {
+            recorded = forget(sourceId);
+            removed = sources.remove(sourceId);
+            namespaces.remove(sourceId);
+        }
         if (removed == null) {
             // A record with no live source behind it is still a registration someone made: the
             // node could not rebuild the crawler at startup, and this is what cancels it.

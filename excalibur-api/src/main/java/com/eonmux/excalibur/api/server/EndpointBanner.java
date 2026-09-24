@@ -64,6 +64,7 @@ final class EndpointBanner {
             lines.add(route("POST", "/v1/documents", "Index documents sent in the request"));
         }
         lines.add(route("POST", "/v1/ingest", "Register an ingestion source"));
+        lines.add(route("PUT", "/v1/ingest", "Replace a registered source's configuration"));
         lines.add(route("GET", "/v1/ingest", "Read back what each source was registered as"));
         lines.add(route("DELETE", "/v1/ingest", "Stop crawling a source"));
         lines.add(route("DELETE", "/v1/ingest/run", "Stop the ingestion run, keep the source"));
