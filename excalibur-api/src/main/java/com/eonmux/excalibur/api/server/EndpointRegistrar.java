@@ -1149,7 +1149,7 @@ final class EndpointRegistrar {
                         new GraphBuildEndpoint(graphBuildRunner))),
                     "DELETE", audited("graph.build.cancel",
                         guard.protect(RequestGuard.Access.MUTATE,
-                            new GraphBuildCancelEndpoint(graphBuildRunner))),
+                            new GraphBuildCancelEndpoint(graphBuildRunner, graphAutoBuilder))),
                     guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                         "Method Not Allowed - Use POST to start a graph build or DELETE to "
                             + "stop the one in progress"))),

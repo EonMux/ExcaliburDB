@@ -103,7 +103,7 @@ class GraphBuildEndpointTest {
             current::extraction, id -> current.snapshot(id).isRunning(), Clock.systemUTC());
         build = new GraphBuildEndpoint(runner);
         status = new GraphBuildStatusEndpoint(runner, autoBuilder);
-        cancel = new GraphBuildCancelEndpoint(runner);
+        cancel = new GraphBuildCancelEndpoint(runner, autoBuilder);
     }
 
     @AfterEach
@@ -837,6 +837,114 @@ class GraphBuildEndpointTest {
 
             release.countDown();
             awaitState("acme", GraphBuildRunner.STATE_COMPLETED);
+        }
+
+        @Test
+        @DisplayName("an automatic build in progress is stopped too, publishes nothing, and is "
+            + "deferred rather than restarted")
+        void anAutomaticBuildIsStopped() throws IOException {
+            NamespaceId namespace = NamespaceId.of("acme");
+            tenants.reportExtraction(GraphExtraction.ACTIVE);
+            stage(namespace, "Ada", "knows", "Babbage");
+            CountDownLatch entered = new CountDownLatch(1);
+            GraphAutoBuilder.Namespaces real = GraphAutoBuilder.over(tenants);
+            // Held until the stop arrives, then handed to the real build, which reads the stop
+            // at its first boundary - so what is exercised is the real build's cancellation.
+            GraphAutoBuilder.Namespaces held = new GraphAutoBuilder.Namespaces() {
+                @Override
+                public List<NamespaceId> list() throws IOException {
+                    return real.list();
+                }
+
+                @Override
+                public com.eonmux.excalibur.api.bootstrap.GraphFreshness freshness(
+                        NamespaceId id) throws IOException {
+                    return real.freshness(id);
+                }
+
+                @Override
+                public java.util.Optional<com.eonmux.excalibur.api.bootstrap.GraphBuildService
+                        .BuildOutcome> buildIfBehind(NamespaceId id,
+                                                     java.util.function.BooleanSupplier stop)
+                        throws IOException {
+                    entered.countDown();
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+                    while (!stop.getAsBoolean() && System.nanoTime() < deadline) {
+                        Thread.onSpinWait();
+                    }
+                    return real.buildIfBehind(id, stop);
+                }
+            };
+            autoBuilder.close();
+            GraphBuildRunner current = runner;
+            autoBuilder = new GraphAutoBuilder(new GraphAutoBuilder.Settings(true,
+                Duration.ofSeconds(30), Duration.ZERO, Duration.ofSeconds(900), 1,
+                Duration.ofSeconds(60), Duration.ofSeconds(3600)), held,
+                current::extraction, id -> current.snapshot(id).isRunning(), Clock.systemUTC());
+            status = new GraphBuildStatusEndpoint(runner, autoBuilder);
+            cancel = new GraphBuildCancelEndpoint(runner, autoBuilder);
+
+            assertThat(autoBuilder.runPass()).containsExactly(namespace);
+            await(entered);
+
+            Response stopped = call(cancel, "DELETE", "acme");
+            assertThat(stopped.status()).isEqualTo(200);
+            assertThat(Json.at(stopped.json(), "cancelled")).isEqualTo(Boolean.TRUE);
+            assertThat(Json.at(stopped.json(), "automatic")).isEqualTo(Boolean.TRUE);
+            assertThat(Json.at(stopped.json(), "explicit")).isEqualTo(Boolean.FALSE);
+            assertThat(Json.stringAt(stopped.json(), "message")).contains("900");
+
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+            Object json = call(status, "GET", "acme").json();
+            while (!GraphAutoBuilder.RESULT_CANCELLED.equals(
+                    Json.stringAt(Json.at(json, "automatic"), "last_result"))
+                    && System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+                json = call(status, "GET", "acme").json();
+            }
+            Object automatic = Json.at(json, "automatic");
+            assertThat(Json.stringAt(automatic, "last_result"))
+                .isEqualTo(GraphAutoBuilder.RESULT_CANCELLED);
+            assertThat(Json.stringAt(automatic, "state"))
+                .isEqualTo(GraphAutoBuilder.STATE_DEFERRED);
+            assertThat((Long) Json.at(automatic, "next_attempt_at_ms"))
+                .isGreaterThan((Long) Json.at(automatic, "last_finished_at_ms"));
+            assertThat(Json.at(automatic, "consecutive_failures")).isEqualTo(0L);
+            assertThat(Json.at(Json.at(json, "freshness"), "behind_staging"))
+                .as("what it would have published is still staged, and still owed")
+                .isEqualTo(Boolean.TRUE);
+            assertThat(Json.stringAt(json, "state"))
+                .as("the top-level fields are the builds asked for, and none was")
+                .isEqualTo(GraphBuildRunner.STATE_IDLE);
+            assertThat(graphDirectoryOf(namespace)).as("nothing was published").doesNotExist();
+            assertThat(autoBuilder.runPass()).as("not restarted on the next pass").isEmpty();
+        }
+
+        @Test
+        @DisplayName("the answer says which build was asked to stop")
+        void theAnswerNamesTheBuild() throws IOException {
+            CountDownLatch entered = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            useRunner(new GraphBuildRunner(gate(entered, release)));
+            call(build, "POST", "acme");
+            await(entered);
+
+            Object json = call(cancel, "DELETE", "acme").json();
+            release.countDown();
+
+            assertThat(Json.at(json, "cancelled")).isEqualTo(Boolean.TRUE);
+            assertThat(Json.at(json, "explicit")).isEqualTo(Boolean.TRUE);
+            assertThat(Json.at(json, "automatic")).isEqualTo(Boolean.FALSE);
+            awaitState("acme", GraphBuildRunner.STATE_COMPLETED);
+        }
+
+        @Test
+        @DisplayName("a null runner or automatic build is refused at construction")
+        void nullCollaboratorsAreRefused() {
+            assertThatThrownBy(() -> new GraphBuildCancelEndpoint(null, autoBuilder))
+                .isInstanceOf(NullPointerException.class);
+            assertThatThrownBy(() -> new GraphBuildCancelEndpoint(runner, null))
+                .isInstanceOf(NullPointerException.class);
         }
     }
 

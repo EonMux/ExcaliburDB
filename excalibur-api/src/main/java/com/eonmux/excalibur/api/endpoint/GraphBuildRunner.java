@@ -417,6 +417,10 @@ public final class GraphBuildRunner implements AutoCloseable {
      * {@value GraphTenants#NAMESPACE_HEADER} header of one tenant must not be able to end
      * another tenant's build by sending a DELETE at the wrong moment.</p>
      *
+     * <p>Only the builds this runner started. An automatic build of the same namespace is the
+     * {@link GraphAutoBuilder}'s to stop, through {@link GraphAutoBuilder#cancel}; the route
+     * asks both, so it stops whichever is in progress.</p>
+     *
      * @param namespace Whose build to stop
      * @return true if that namespace's build was in progress and has been asked to stop
      * @throws NullPointerException if namespace is null

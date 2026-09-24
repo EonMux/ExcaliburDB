@@ -468,7 +468,7 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `DELETE` | `/v1/graph/facts` | bearer | Retract every asserted fact stating the `subject`, `relation` and `object` given as query parameters. `202`; served until a compaction applies it, which `compact=true` runs now |
 | `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | Retract one asserted fact, by its id. `202`; served until a compaction applies it, which `compact=true` runs now |
 | `POST` | `/v1/graph/build` | bearer | Start publishing the facts ingestion has staged as the served graph. `202`; the build runs behind the response. `409` while one is already running |
-| `DELETE` | `/v1/graph/build` | bearer | Stop the build in progress. It publishes nothing; the namespace keeps the graph it had |
+| `DELETE` | `/v1/graph/build` | bearer | Stop the namespace's build in progress, whether `POST` or the node's automatic build started it. It publishes nothing; the namespace keeps the graph it had. See [Stop a graph build](#stop-a-graph-build) |
 | `GET` | `/v1/graph/build/status` | bearer | What the build is doing, what the last one published, whether the served graph is behind what is staged, and what the node's automatic build is doing about it |
 | `POST` | `/v1/graph/erasure` | bearer | Record an obligation to erase, and compact when it is due. `404` for an entity, by name or `entity_id`, that nothing in the namespace holds, and nothing is recorded |
 | `GET` | `/v1/graph/erasure` | bearer | The namespace's outstanding and recently discharged erasure obligations, a page at a time (`state`, `limit`, default 100, at most 1000; `cursor`) |
@@ -2965,7 +2965,7 @@ across namespaces, never a row per namespace — which namespace owes what is
 - `namespaces.evictions` climbing steadily means the working set does not fit `excalibur.graph.max-open-namespaces` or the mapping budget, and every eviction is a reopen some request pays for.
 - `budget` sets two shares against each limit. `graphMappings` and `graphDescriptors` are what eviction can give back; `processMappings` and `processDescriptors` are the whole process — segments, vector graphs, the chunk index and the JVM itself — which is what the kernel limit is measured against. Graph eviction starts when the whole process crosses `mappingHighWater`. A process figure is `null` where the platform cannot be asked, and `descriptorLimit` is `0` where no descriptor limit is enforced.
 - `builds` counts builds asked for through `POST /v1/graph/build` since startup, by how they ended. A cancelled build is one somebody asked to stop, not a failure.
-- `automaticBuilds` counts the builds the node started by itself to keep each graph up with its staging: `running` now (several can run, up to `excalibur.graph.auto-build-max-concurrent`), then `completed`, `unchanged` (the graph was already current once the build held its lock), `failed`, `cancelled` (stopped by shutdown) and `superseded` — an erasure recorded while the build ran refused its publish, and the next build leaves it out. Superseded is not a failure; a steadily rising count means a namespace is being erased faster than it can be built. `enabled` is `false` when `excalibur.graph.auto-build-enabled` is off, so a node that never builds by itself is not mistaken for one with nothing to build. A rising `failed` here is a graph falling behind with nobody asking for it.
+- `automaticBuilds` counts the builds the node started by itself to keep each graph up with its staging: `running` now (several can run, up to `excalibur.graph.auto-build-max-concurrent`), then `completed`, `unchanged` (the graph was already current once the build held its lock), `failed`, `cancelled` (stopped by `DELETE /v1/graph/build` or by shutdown) and `superseded` — an erasure recorded while the build ran refused its publish, and the next build leaves it out. Superseded is not a failure; a steadily rising count means a namespace is being erased faster than it can be built. `enabled` is `false` when `excalibur.graph.auto-build-enabled` is off, so a node that never builds by itself is not mistaken for one with nothing to build. A rising `failed` here is a graph falling behind with nobody asking for it.
 - `erasure` is the graph's erasure backlog across every namespace on disk, resident or not. Compare `oldestAgeMs` against `excalibur.graph.erasure-max-latency-seconds`; `overdueNamespaces` is how many have already missed it. `unreadableNamespaces` are namespaces whose log could not be read, and so are in none of the other figures. `oldestAgeMs` is `null` when nothing is owed. The block is absent when the graph root cannot be listed, which is not the same as owing nothing.
 - `ingest` is present only where ingestion stages facts into the graph (a chat model is configured). `unresolvedDocuments`, `extractionFailures` and `tenantFailures` count documents the graph did not take: no registered source named their namespace, the extractor failed on them, or their namespace would not open — or no longer exists and the node would not recreate it, having been dropped on a node that requires explicit creation or has reached `excalibur.graph.max-namespaces`. A published one among them is searchable and its facts are missing, and it is not offered to the graph again unless it changes; nothing else shows that. A replaced or removed one whose namespace would not open still owes the withdrawal of what was staged from it: that is handed to the namespace when it next opens, which the erasure sweep keeps trying, and only a restart before then loses it — the log says so at `ERROR`, naming the document.
 - `sinkRefusals` counts reports the graph sink threw on instead of counting under one of those reasons. It should stay `0`: the sink is required to absorb its own failures, and one that throws has left a published document's facts missing, or a removed document's staged facts neither withdrawn nor owed. The log names each document.
@@ -3117,6 +3117,50 @@ curl http://localhost:8080/v1/compact/status
   upgrades all of them.
 
 Only the most recent run is kept; the next one replaces it.
+
+### Stop a graph build
+
+A graph build replays every staged fact, indexes the prose behind them and embeds every entity —
+minutes of saturated I/O and embedding calls on a large corpus. `DELETE /v1/graph/build` stops the
+build in progress for the namespace `X-Excalibur-Namespace` names, whether `POST /v1/graph/build`
+started it or the node did by itself (see [Keeping the graph current](README.md#keeping-the-graph-current)).
+
+```bash
+curl -X DELETE http://localhost:8080/v1/graph/build \
+  -H "Authorization: Bearer $EXCALIBUR_API_AUTH_TOKEN" \
+  -H "X-Excalibur-Namespace: acme"
+```
+
+**Response — `200 OK`**
+
+```json
+{"cancelled": true, "explicit": false, "automatic": true,
+ "message": "The graph build was asked to stop; poll /v1/graph/build/status for when it has. Nothing it had assembled is published. The staged changes stay staged and are built automatically no sooner than 900s after it stops, or at once by POST /v1/graph/build."}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `cancelled` | Whether any build of the namespace was asked to stop — `explicit` or `automatic` |
+| `explicit` | Whether a build started by `POST /v1/graph/build` was asked to stop |
+| `automatic` | Whether a build the node started by itself was asked to stop |
+| `message` | What happens next, or that no build of the namespace was running |
+
+`"cancelled": false` means no build of that namespace was running — an answer rather than an
+error, and one given even while another namespace builds, since a caller holding one tenant's
+header cannot stop another tenant's build. It is charged against the mutate budget like starting
+one.
+
+The build is *asked* to stop and ends at its next staged fact, snippet or embedded entity. It
+publishes nothing: a build assembles beside the served graph and replaces it in one rename, so the
+namespace goes on serving the graph it had. The readback is `GET /v1/graph/build/status`: an
+explicit build reads `"state": "cancelled"` once it has stopped; an automatic one reads, in the
+`automatic` block, `"last_result": "cancelled"` and `"state": "deferred"` with
+`next_attempt_at_ms`. A stopped automatic build is not restarted on the next pass, and its changes
+are not dropped: they stay staged, the graph stays `behind_staging`, and the node builds them
+automatically once `excalibur.graph.auto-build-max-delay-seconds` has passed since the stop —
+sooner if `POST /v1/graph/build` asks. A stop is not a failure: it neither adds to
+`consecutive_failures` nor resets it, and a second stop defers by the same amount rather than
+doubling.
 
 ### Audit log
 
