@@ -144,11 +144,17 @@ class GraphFactsRoutesTest {
         try {
             assertThat(send("DELETE", TRIPLE, null).statusCode()).isEqualTo(202);
 
+            // The assertion's own audit event is written once its response has gone, so it can
+            // land after the appender is attached; only the retraction's events are read.
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
             List<ILoggingEvent> seen;
             do {
                 synchronized (events) {
-                    seen = List.copyOf(events.list);
+                    seen = events.list.stream()
+                        .filter(event -> event.getKeyValuePairs().stream().anyMatch(pair ->
+                            "audit_action".equals(pair.key)
+                                && "graph.facts.retract".equals(pair.value)))
+                        .toList();
                 }
             } while (seen.isEmpty() && System.nanoTime() < deadline);
 

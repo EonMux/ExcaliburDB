@@ -91,7 +91,7 @@ class TenantedGraphRouteTest {
     }
 
     @Test
-    @DisplayName("an erasure request reads back by its id, and the collection still refuses GET")
+    @DisplayName("an erasure request reads back by its id and in the listing, and the collection refuses PUT")
     void erasureStatusIsRouted() throws IOException {
         Response accepted = send("POST", "/v1/graph/erasure",
             "{\"scope\":\"source\",\"source_type\":\"DOCUMENT\",\"source_id\":1}");
@@ -101,7 +101,10 @@ class TenantedGraphRouteTest {
 
         assertThat(status.status()).isEqualTo(200);
         assertThat(status.body()).contains("\"state\": \"pending\"");
-        assertThat(send("GET", "/v1/graph/erasure", null).status()).isEqualTo(405);
+        Response listed = send("GET", "/v1/graph/erasure", null);
+        assertThat(listed.status()).isEqualTo(200);
+        assertThat(listed.body()).contains("\"request_id\": " + id);
+        assertThat(send("PUT", "/v1/graph/erasure", "{}").status()).isEqualTo(405);
         assertThat(send("POST", "/v1/graph/erasure/" + id, "{}").status()).isEqualTo(405);
         assertThat(send("GET", "/v1/graph/erasure/424242", null).status()).isEqualTo(404);
     }
