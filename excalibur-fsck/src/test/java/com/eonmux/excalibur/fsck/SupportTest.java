@@ -5,6 +5,8 @@ import com.eonmux.excalibur.fsck.check.FileKind;
 import com.eonmux.excalibur.fsck.report.Json;
 import com.eonmux.excalibur.fsck.repair.Quarantine;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
@@ -117,6 +119,15 @@ class SupportTest {
         assertThatThrownBy(() -> FsckOptionsParser.parse(new String[] { "/a", "/b" }))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("second");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "--repair=false", "--repair=no", "--strict=0", "--json=true", "--repair=" })
+    void aFlagThatTakesNoValueIsRefusedWithOne(String flag) {
+        // --repair=false must never be read as --repair
+        assertThatThrownBy(() -> FsckOptionsParser.parse(new String[] { "/tmp", flag }))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("takes no value");
     }
 
     @Test

@@ -42,9 +42,9 @@ public final class FsckOptionsParser {
                 continue;
             }
             switch (flagName(arg)) {
-                case "--repair" -> repair = true;
-                case "--json" -> json = true;
-                case "--strict" -> strict = true;
+                case "--repair" -> repair = switchOn(arg);
+                case "--json" -> json = switchOn(arg);
+                case "--strict" -> strict = switchOn(arg);
                 case "--quarantine-dir" -> quarantine = Path.of(flagValue(arg));
                 default -> throw new IllegalArgumentException("Unknown option: " + arg);
             }
@@ -70,6 +70,25 @@ public final class FsckOptionsParser {
                 "Only one data directory may be checked at a time; got a second: " + arg);
         }
         return Path.of(arg);
+    }
+
+    /**
+     * Turns on a flag that takes no value, refusing one written with a value.
+     *
+     * <p>A value is refused rather than read, whatever it says: {@code --repair=false} taken as
+     * {@code --repair} would change files an operator asked to leave alone, and taken as its
+     * negation would be a second spelling nothing else in the tool accepts.</p>
+     *
+     * @param arg The argument
+     * @return true
+     * @throws IllegalArgumentException if the argument carries {@code =value}
+     */
+    private static boolean switchOn(String arg) {
+        if (arg.indexOf('=') >= 0) {
+            throw new IllegalArgumentException(
+                flagName(arg) + " takes no value; give it bare, or leave it out: " + arg);
+        }
+        return true;
     }
 
     /**
