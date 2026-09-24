@@ -1,5 +1,9 @@
 package com.eonmux.excalibur.api.bootstrap;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.graph.erasure.ErasureScope;
 import com.eonmux.excalibur.graph.provenance.Provenance;
@@ -13,10 +17,12 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -95,6 +101,31 @@ class GraphNamespaceLifecycleTest {
 
                 assertThat(tenants.namespacesOnDisk()).containsExactly(NamespaceId.SHARED);
             }
+        }
+
+        @Test
+        @DisplayName("a mounted volume's lost+found is the filesystem's: not a namespace, not logged")
+        void aVolumesLostAndFoundIsNotANamespace(@TempDir Path root) throws IOException {
+            Path lostAndFound = Files.createDirectories(root.resolve("lost+found"));
+            ListAppender<ILoggingEvent> events = new ListAppender<>();
+            events.start();
+            Logger logger = (Logger) LoggerFactory.getLogger(GraphTenants.class);
+            Level level = logger.getLevel();
+            logger.setLevel(Level.DEBUG);
+            logger.addAppender(events);
+            Files.setPosixFilePermissions(lostAndFound, PosixFilePermissions.fromString("---------"));
+            try (GraphTenants tenants = tenants(root, 4)) {
+                assertThat(tenants.namespacesOnDisk()).containsExactly(NamespaceId.SHARED);
+                assertThat(tenants.describeNamespaces()).extracting(summary -> summary.id())
+                    .containsExactly(NamespaceId.SHARED);
+            } finally {
+                Files.setPosixFilePermissions(lostAndFound, PosixFilePermissions.fromString("rwx------"));
+                logger.detachAppender(events);
+                logger.setLevel(level);
+            }
+
+            assertThat(events.list).extracting(ILoggingEvent::getFormattedMessage)
+                .noneMatch(message -> message.contains("lost+found"));
         }
 
         @Test

@@ -92,6 +92,9 @@ public final class Usage {
           the target's data is left exactly as it was. A term sketch in an image an
           earlier build took is verified with the image and not restored.
 
+          The lost+found of a filesystem mounted at the target is the filesystem's: it
+          does not make the target hold something, and it is never moved or replaced.
+
         """;
 
     /** The synopsis of all three, for the full text. */

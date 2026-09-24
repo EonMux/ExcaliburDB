@@ -175,6 +175,23 @@ class BackupCliTest {
     }
 
     @Test
+    @DisplayName("restoring onto a fresh volume holding only its lost+found needs no --force")
+    void aFreshVolumeNeedsNoForce() throws IOException {
+        Path dataDir = DataDirectoryFixture.syntheticDirectory(tempDir.resolve("data"));
+        Path snapshotDir = tempDir.resolve("snap");
+        run("snapshot", "--data-dir", dataDir.toString(), "--out", snapshotDir.toString());
+        Path target = Files.createDirectories(tempDir.resolve("volume"));
+        DataDirectoryFixture.writeRandom(target.resolve("lost+found/#12"), 64, 6L);
+
+        Run restore = run("restore", "--snapshot", snapshotDir.toString(),
+            "--target", target.toString());
+
+        assertThat(restore.code()).isEqualTo(ExitCode.OK.code());
+        assertThat(target.resolve("lost+found/#12")).exists();
+        assertThat(target.resolve("catalog.dat")).exists();
+    }
+
+    @Test
     @DisplayName("snapshotting into a non-empty directory exits with the not-empty code")
     void nonEmptySnapshotDestinationHasTheNotEmptyCode() throws IOException {
         Path dataDir = DataDirectoryFixture.syntheticDirectory(tempDir.resolve("data"));

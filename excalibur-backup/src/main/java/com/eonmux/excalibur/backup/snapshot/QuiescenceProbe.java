@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.backup.snapshot;
 
+import com.eonmux.excalibur.core.datadir.DataDirectoryContents;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -55,15 +57,10 @@ public final class QuiescenceProbe {
      */
     public static DirectoryFingerprint fingerprint(Path dataDir) throws IOException {
         Objects.requireNonNull(dataDir, "dataDir");
-        List<Path> files;
-        try (var walk = Files.walk(dataDir)) {
-            // Not the lock file, whose record changes whenever a holder takes it, and not a
-            // restore's scratch: neither is copied, so neither moving tears the image.
-            files = walk.filter(Files::isRegularFile)
-                .filter(file -> !com.eonmux.excalibur.core.datadir.ReservedNames.isReserved(
-                    dataDir.relativize(file).toString().replace('\\', '/')))
-                .toList();
-        }
+        // Not the lock file, whose record changes whenever a holder takes it, not a restore's
+        // scratch, and not the filesystem's lost+found: none is copied, so none moving tears the
+        // image.
+        List<Path> files = DataDirectoryContents.regularFiles(dataDir);
         var observed = new TreeMap<String, FileStat>();
         for (Path file : files) {
             String path = dataDir.relativize(file).toString().replace('\\', '/');

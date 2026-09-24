@@ -3118,7 +3118,7 @@ $B restore --snapshot /backups/excalibur-2026-09-14 --target /var/lib/excalibur/
 An image that does not verify is refused and the target is left exactly as it was — exit 3, and
 nothing written. A target that already holds something needs `--force`, because a restore
 replaces a data directory wholesale rather than merging into one; a lock file a stopped node left
-does not count. A target a node, a repair or another restore holds is refused with exit 7.
+does not count, and nor does the `lost+found` of a filesystem mounted at the target. A target a node, a repair or another restore holds is refused with exit 7.
 Afterwards, start the node against it: it rediscovers the segments from the catalog, replays each
 write log, and serves the same answers the node it was taken from served. No import step and no
 reindex.
@@ -3137,6 +3137,19 @@ journal, `.excalibur-restore`, before it starts:
 | on a crash while entries move | a mixture, with the journal | the node refuses to start on it and `excalibur-fsck` reports it; run the same restore again, which completes it — or, if it was unwinding, undoes it — before anything else |
 
 At no point are the previous contents deleted before every entry of the image is in place.
+
+A data directory mounted from a disk or ext4 volume of its own holds that filesystem's
+`lost+found`, owned by root and unreadable to the node's user. It belongs to the filesystem, so
+none of the tools treats it as data: `snapshot` neither opens nor copies it, `restore` leaves it
+where it is — it is never moved into the scratch directories, and a target holding nothing else
+but a stopped node's lock file is empty, so a fresh volume needs no `--force` — `excalibur-fsck`
+does not report it, and the node does not take it for a namespace. What is recognised is a
+directory named `lost+found` directly in the data directory, whether or not that directory is a
+mount root when the tool runs; a regular file of that name, or one deeper down, is treated like
+any other file. Because no image carries a `lost+found`, an image taken on one volume restores
+onto another, or onto a plain directory, and each target keeps its own; an image an older build
+took that does carry one is verified and restored without it. A snapshot's `--out` can be a
+freshly mounted backup volume that holds only its `lost+found`.
 
 **Take the image with the node stopped.** The state is spread over many files, written two
 different ways: the catalog, the manifests and the registries are replaced by an atomic rename,

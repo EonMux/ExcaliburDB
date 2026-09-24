@@ -643,6 +643,21 @@ into place, one rename each. That is a sequence, not one atomic step, so each ph
   image was fully staged, back to the previous contents when it was unwinding — and says which.
   Re-running the same restore is therefore the recovery.
 
+A data directory that is the root of a filesystem of its own — a disk or an ext4 volume mounted at
+it — holds the `lost+found` the filesystem was made with, owned by root and unreadable to the
+node's user. It is the filesystem's, not the store's, and every tool treats it so: a snapshot
+neither opens nor copies it, a restore neither moves nor replaces it and a target holding only it
+(and the lock a stopped node left) is empty, so a fresh volume needs no `--force`;
+`excalibur-fsck` does not survey or report it, and the node does not take it for a namespace or
+log about it. The rule is a directory named `lost+found` directly in the data directory, whether
+or not the directory is a mount root at the moment — a mount root cannot be told reliably from
+the JVM, and an image moved between volumes must mean the same thing on each. A regular file of
+that name, or the name deeper down, is treated like any other file. An image never carries a
+`lost+found`, so one taken on one volume restores onto another, or onto a plain directory, leaving
+each target's own where it was; an older image that does carry one is verified and then restored
+without it. A snapshot's `--out` may likewise be a freshly mounted backup volume holding only its
+`lost+found`.
+
 **The node must be stopped.** Nothing in this engine orders one file against another, so a clean
 shutdown is the only moment at which every file describes the same instant. A node holds an
 exclusive operating-system lock on its data directory (`.excalibur-lock`, taken with

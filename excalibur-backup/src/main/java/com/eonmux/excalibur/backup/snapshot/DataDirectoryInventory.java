@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.backup.snapshot;
 
+import com.eonmux.excalibur.core.datadir.DataDirectoryContents;
+import com.eonmux.excalibur.core.datadir.FilesystemEntries;
 import com.eonmux.excalibur.core.datadir.ReservedNames;
 import com.eonmux.excalibur.store.ObsoleteSidecars;
 
@@ -30,7 +32,10 @@ import java.util.Objects;
  * takes, and a restore's journal and scratch ({@link ReservedNames}) - are left out of the
  * inventory entirely, rather than listed as omitted. They describe a process, not the store: an
  * image carrying the lock file would hand a stale holder's record to whatever restored it, and
- * listing it as omitted on every snapshot would be noise about a file that is always there.</p>
+ * listing it as omitted on every snapshot would be noise about a file that is always there.
+ * The same goes for the {@code lost+found} of a filesystem mounted at the data directory
+ * ({@link FilesystemEntries}): it is the filesystem's, it is unreadable to the node's user, and
+ * it is never opened, so an image taken on one volume carries nothing of it to another.</p>
  *
  * <h2>Why the classification is a table and not a filter</h2>
  * <p>An unrecognised file is kept, not dropped. A build newer than this tool will write
@@ -80,7 +85,7 @@ public final class DataDirectoryInventory {
      * Walks a data directory and classifies every regular file under it that holds data.
      *
      * @param dataDir The directory
-     * @return Every file but the reserved entries, in sorted path order
+     * @return Every file but the reserved entries and the filesystem's own, in sorted path order
      * @throws IOException          if the directory cannot be walked
      * @throws NullPointerException if dataDir is null
      */
@@ -89,14 +94,11 @@ public final class DataDirectoryInventory {
         if (!Files.isDirectory(dataDir)) {
             throw new IOException("Not a data directory: " + dataDir);
         }
-        try (var walk = Files.walk(dataDir)) {
-            return walk.filter(Files::isRegularFile)
-                .map(file -> relativize(dataDir, file))
-                .filter(path -> !ReservedNames.isReserved(path))
-                .sorted(Comparator.naturalOrder())
-                .map(path -> new ClassifiedFile(path, classify(path), reason(path)))
-                .toList();
-        }
+        return DataDirectoryContents.regularFiles(dataDir).stream()
+            .map(file -> relativize(dataDir, file))
+            .sorted(Comparator.naturalOrder())
+            .map(path -> new ClassifiedFile(path, classify(path), reason(path)))
+            .toList();
     }
 
     /**

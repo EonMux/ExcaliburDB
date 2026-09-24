@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.bootstrap;
 
 import com.eonmux.excalibur.config.Config;
+import com.eonmux.excalibur.core.datadir.DataDirectoryContents;
 import com.eonmux.excalibur.graph.erasure.ErasureLog;
 import com.eonmux.excalibur.tenancy.MappingBudget;
 import com.eonmux.excalibur.tenancy.NamespaceId;
@@ -34,7 +35,6 @@ import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
-import java.util.stream.Stream;
 
 /**
  * Every namespace's graph, bounded by what the kernel will let this process map.
@@ -839,22 +839,22 @@ public final class GraphTenants implements AutoCloseable {
      * name that {@link NamespaceId#of} refuses cannot be a namespace this node created, so it is
      * something an operator or a restore put there, and inventing an identifier for it would put
      * a name into a list that {@link #drop(NamespaceId)} would then refuse or, worse, resolve
-     * somewhere else.</p>
+     * somewhere else. The entries that are not data at all - the lock file, a restore's scratch
+     * and the {@code lost+found} of a volume mounted at the root - are not considered, so they are
+     * not logged about on every pass either.</p>
      *
      * @return The namespaces, in identifier order
      * @throws IOException if the root cannot be listed
      */
     public List<NamespaceId> namespacesOnDisk() throws IOException {
         List<NamespaceId> found = new ArrayList<>();
-        try (Stream<Path> entries = Files.list(root)) {
-            for (Path entry : entries.toList()) {
-                if (!Files.isDirectory(entry)) {
-                    continue;
-                }
-                NamespaceId id = namespaceOfDirectory(entry.getFileName().toString());
-                if (id != null) {
-                    found.add(id);
-                }
+        for (Path entry : DataDirectoryContents.entries(root)) {
+            if (!Files.isDirectory(entry)) {
+                continue;
+            }
+            NamespaceId id = namespaceOfDirectory(entry.getFileName().toString());
+            if (id != null) {
+                found.add(id);
             }
         }
         found.sort(Comparator.naturalOrder());

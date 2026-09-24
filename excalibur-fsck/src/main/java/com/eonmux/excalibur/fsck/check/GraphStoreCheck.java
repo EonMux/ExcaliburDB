@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.fsck.check;
 
+import com.eonmux.excalibur.core.datadir.DataDirectoryContents;
 import com.eonmux.excalibur.core.integrity.IntegrityReport;
 import com.eonmux.excalibur.graph.erasure.EdgeStoreCompactor;
 import com.eonmux.excalibur.graph.file.LogInspection;
@@ -236,13 +237,12 @@ public final class GraphStoreCheck {
         if (!Files.isDirectory(dataDirectory)) {
             return List.of();
         }
-        try (Stream<Path> listing = Files.list(dataDirectory)) {
+        try {
             // A restore's scratch is a copy of a whole data directory, not a namespace, and is
-            // reported as the restore's by the scan.
-            return listing.filter(Files::isDirectory)
-                .filter(path -> !com.eonmux.excalibur.core.datadir.ReservedNames.isReserved(
-                    path.getFileName().toString()))
-                .sorted().toList();
+            // reported as the restore's by the scan; a mounted volume's lost+found is the
+            // filesystem's.
+            return DataDirectoryContents.entries(dataDirectory).stream()
+                .filter(Files::isDirectory).toList();
         } catch (IOException | UncheckedIOException e) {
             return List.of();
         }

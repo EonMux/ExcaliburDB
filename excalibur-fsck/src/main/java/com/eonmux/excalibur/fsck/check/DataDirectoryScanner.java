@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.fsck.check;
 
+import com.eonmux.excalibur.core.datadir.DataDirectoryContents;
+import com.eonmux.excalibur.core.datadir.FilesystemEntries;
 import com.eonmux.excalibur.core.datadir.InterruptedRestore;
 import com.eonmux.excalibur.core.datadir.ReservedNames;
 
@@ -47,7 +49,9 @@ public final class DataDirectoryScanner {
      * those are left out of the per-file report: the lock describes a process, and a restore's
      * scratch is a second copy of a data directory, each of whose files would otherwise be
      * judged as though the node read it. What a restore left behind is reported instead as one
-     * finding about the restore.</p>
+     * finding about the restore. The {@code lost+found} of a volume mounted at the directory
+     * ({@link FilesystemEntries}) is not surveyed or reported at all: it is the filesystem's, and
+     * the node's user cannot open it.</p>
      *
      * @param dataDirectory The directory to survey
      */
@@ -120,20 +124,11 @@ public final class DataDirectoryScanner {
     /**
      * Lists every regular file under the data directory that holds data.
      *
-     * @return The files, in walk order, less the reserved entries
+     * @return The files, in walk order, less the reserved entries and the filesystem's own
      * @throws IOException if the tree cannot be walked
      */
     private List<Path> listFiles() throws IOException {
-        List<Path> files = new ArrayList<>();
-        try (var stream = Files.walk(dataDirectory)) {
-            for (Path path : stream.toList()) {
-                if (Files.isRegularFile(path) && !ReservedNames.isReserved(
-                        FileClassifier.relativise(dataDirectory, path))) {
-                    files.add(path);
-                }
-            }
-        }
-        return files;
+        return DataDirectoryContents.regularFiles(dataDirectory);
     }
 
     /**

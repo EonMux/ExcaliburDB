@@ -9,7 +9,13 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -67,6 +73,44 @@ class SegmentDiscoveryTest {
         assertEquals(0, segments.get(0).segmentIndex());
         assertEquals(segmentPath, segments.get(0).path());
         assertTrue(segments.get(0).fileSize() > 0);
+    }
+
+    @Test
+    void scanDirectory_shouldPassOverAMountedVolumesLostAndFoundWithoutWarning() throws IOException {
+        Path segmentPath = tempDir.resolve("segment_0.dat");
+        createTestSegmentFile(segmentPath, 1024 * 1024);
+        Path lostAndFound = Files.createDirectories(tempDir.resolve("lost+found"));
+        List<LogRecord> warnings = new ArrayList<>();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord logRecord) {
+                if (logRecord.getLevel().intValue() >= Level.WARNING.intValue()) {
+                    warnings.add(logRecord);
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        Logger logger = Logger.getLogger(SegmentDiscovery.class.getName());
+        logger.addHandler(handler);
+        Files.setPosixFilePermissions(lostAndFound, PosixFilePermissions.fromString("---------"));
+        try {
+            List<SegmentDiscovery.DiscoveredSegment> segments =
+                new SegmentDiscovery(tempDir).scanDirectory();
+
+            assertEquals(1, segments.size());
+            assertEquals(segmentPath, segments.get(0).path());
+            assertTrue(warnings.isEmpty(), () -> "warned: " + warnings.get(0).getMessage());
+        } finally {
+            Files.setPosixFilePermissions(lostAndFound, PosixFilePermissions.fromString("rwx------"));
+            logger.removeHandler(handler);
+        }
     }
 
     @Test
