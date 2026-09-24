@@ -254,8 +254,8 @@ public final class IngestConfig {
     }
 
     /**
-     * How long a published document may wait, while its ingestion run goes on, before a refresh
-     * makes it lexically searchable. A run also refreshes when it ends or is stopped.
+     * How long a published document may wait, while its ingestion or reindex run goes on, before
+     * a refresh makes it lexically searchable. A run also refreshes when it ends or is stopped.
      *
      * @return The interval in milliseconds
      */

@@ -15,6 +15,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 
@@ -35,10 +36,19 @@ import java.util.function.Function;
  * reindexer that could erase but never reclaim would meet the visibility half of the promise and
  * never the disk half.</p>
  *
+ * <h2>When a run's writes become searchable</h2>
+ * <p>On the interval ingestion refreshes on, {@code excalibur.ingest.lexical-refresh-interval-ms},
+ * and when the run ends. A refresh publishes a segment on the native engine and reopens a reader
+ * on Lucene, so it is paced rather than made per document; refreshing only at the end kept every
+ * document a long re-crawl had republished out of BM25 until the last one was done, and on a
+ * lexical-only node out of search. A refresh is only ever made between documents, and each
+ * document reaches the index in one {@link ChunkIndex#addDocument} call, so no refresh publishes
+ * part of one.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent use. The wiring is held in volatile fields because it is set after
  * construction, by the bootstrap that opens the index; the index itself carries its own
- * guarantees.</p>
+ * guarantees. A {@link Pacing} belongs to the one run that asked for it.</p>
  */
 final class ReindexLexicalIndex {
 
@@ -49,6 +59,73 @@ final class ReindexLexicalIndex {
 
     /** Reads a surviving chunk's text back out of storage, for the index's compaction. */
     private volatile Function<String, String> storedText;
+
+    /** Longest a document a run in progress has published waits to become searchable. */
+    private volatile long refreshIntervalNanos = TimeUnit.MILLISECONDS.toNanos(
+        IngestionOrchestrator.DEFAULT_LEXICAL_REFRESH_INTERVAL_MS);
+
+    /**
+     * Sets how long a document a run in progress has published may wait to become lexically
+     * searchable.
+     *
+     * @param intervalMs The interval in milliseconds
+     * @throws IllegalArgumentException if the interval is not positive
+     */
+    void refreshEvery(long intervalMs) {
+        if (intervalMs <= 0) {
+            throw new IllegalArgumentException(
+                "lexical refresh interval must be positive: " + intervalMs);
+        }
+        this.refreshIntervalNanos = TimeUnit.MILLISECONDS.toNanos(intervalMs);
+    }
+
+    /**
+     * Starts pacing the refreshes of one run.
+     *
+     * @return A pacing whose interval starts now
+     */
+    Pacing pacing() {
+        return new Pacing();
+    }
+
+    /**
+     * Refreshes one run's writes once the interval has passed since the last time it did.
+     *
+     * <p>Not thread-safe: a run calls it from its own thread, between documents.</p>
+     */
+    final class Pacing {
+
+        private long lastRefresh = System.nanoTime();
+
+        private Pacing() {
+        }
+
+        /**
+         * Publishes what the run has written and reclaims what it erased, if the interval has
+         * passed.
+         *
+         * <p>Call it between documents, never inside one. A refresh that fails is logged and the
+         * run goes on: the documents stay published and become searchable at the next refresh,
+         * which is a delay, whereas failing the run would abandon the documents it had not
+         * reached for the sake of ones it already had.</p>
+         *
+         * @param sourceId      The source being reindexed, for the log
+         * @param stopRequested Answers true once a compaction should end without publishing
+         */
+        void refreshIfDue(String sourceId, BooleanSupplier stopRequested) {
+            if (index == null || System.nanoTime() - lastRefresh < refreshIntervalNanos) {
+                return;
+            }
+            try {
+                settle(stopRequested);
+            } catch (RuntimeException e) {
+                LOG.warn("Lexical index not refreshed partway through reindexing {}; the "
+                    + "documents republished so far become searchable by BM25 at the next "
+                    + "refresh: {}", sourceId, e.getMessage());
+            }
+            lastRefresh = System.nanoTime();
+        }
+    }
 
     /**
      * Wires the index this reindex must keep in step with storage.
@@ -132,9 +209,11 @@ final class ReindexLexicalIndex {
     /**
      * Publishes this run's writes and reclaims what it erased, if that is now due.
      *
-     * <p>Both at the end of the run for the reason the ingestion pipeline does it there: a
-     * refresh is what makes a batch searchable at one instant, and a run that has just erased
-     * documents is the moment there is something to reclaim.</p>
+     * <p>At the end of the run, and on its {@link Pacing} before then, for the reasons the
+     * ingestion pipeline does both: a refresh is what makes a batch searchable at one instant,
+     * and a run that has just erased documents is the moment there is something to reclaim.
+     * Compaction is asked each time rather than only at the end, because every refresh on the
+     * native engine adds a segment; the usual answer is that nothing is due.</p>
      *
      * <p>The compaction reads {@code stopRequested} where it can end without publishing anything
      * half-done, so a stopped or shutting-down run is not held for a rewrite of the whole index;

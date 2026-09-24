@@ -1008,7 +1008,7 @@ above; nothing resolves them from the file or the environment.
 | `excalibur.ingest.lexical-tombstone-ratio` | 0.2 | Tombstoned fraction at which reclaiming repays the rewrite. Above 0, at most 1 |
 | `excalibur.ingest.lexical-max-latency-seconds` | 3600 | How long an erased chunk may remain on disk before cost stops being a consideration. Checked every tenth of it by a sweep, so the bound holds on an idle node. At least 1 |
 | `excalibur.ingest.lexical-max-segments` | 16 | Segments tolerated before the smallest are merged. At least 1 |
-| `excalibur.ingest.lexical-refresh-interval-ms` | 30000 | Longest a document published by a run still in progress waits to become searchable by BM25. A run also refreshes when it ends or is stopped. At least 1000 |
+| `excalibur.ingest.lexical-refresh-interval-ms` | 30000 | Longest a document published by a run still in progress — an ingestion or a re-crawl — waits to become searchable by BM25. A run also refreshes when it ends or is stopped. At least 1000 |
 
 The two engines are alternatives, not layers. The native one stores postings and reads a chunk's
 text back from storage when a compaction needs it, so the corpus exists once; Lucene keeps a second
@@ -1093,7 +1093,8 @@ document that is rolled back never reaches the index at all. Half a document is 
 rather than a partial one. A run refreshes every `excalibur.ingest.lexical-refresh-interval-ms`
 (30 seconds by default) while it is running, and again when it ends, is stopped or fails, so a
 crawl that runs for days is searchable as it goes rather than only when it finishes, and whatever a
-stopped run published is searchable once it stops. Publication is at the epoch *after* the current
+stopped run published is searchable once it stops. A re-crawl paces its refreshes the same way,
+between documents, through its removals as well as its rewrites. Publication is at the epoch *after* the current
 one, so a query already running does not acquire results halfway through.
 
 **Reingestion.** A chunk identifier names one chunk, so indexing it again is a new version rather

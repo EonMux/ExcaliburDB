@@ -361,6 +361,22 @@ public class DocumentReindexer {
     }
 
     /**
+     * Sets how long a document a reindex in progress has republished may wait to become
+     * lexically searchable.
+     *
+     * <p>The interval ingestion refreshes on, {@code excalibur.ingest.lexical-refresh-interval-ms},
+     * so a re-crawl publishes its documents to BM25 on the same schedule as the crawl that first
+     * indexed them; {@link IngestionOrchestrator#DEFAULT_LEXICAL_REFRESH_INTERVAL_MS} until it is
+     * set. A run also refreshes when it ends or is stopped.</p>
+     *
+     * @param intervalMs The interval in milliseconds
+     * @throws IllegalArgumentException if the interval is not positive
+     */
+    public void setLexicalRefreshIntervalMs(long intervalMs) {
+        lexical.refreshEvery(intervalMs);
+    }
+
+    /**
      * Wires the eraser that retires a removed document's graph nodes.
      *
      * @param vectorEraser The eraser, or null on a node that keeps no vector index

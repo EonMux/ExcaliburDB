@@ -73,6 +73,12 @@ import java.util.concurrent.atomic.AtomicInteger;
  * would be. Passed over as unchanged, a source that times out on every request would report a
  * clean run that looked at nothing.</p>
  *
+ * <h2>When its writes become searchable</h2>
+ * <p>The lexical index is refreshed between documents once the interval ingestion uses has
+ * passed, in every phase, and once more when the pass ends; see {@link ReindexLexicalIndex}.
+ * Every other signal serves a republished document as soon as it is published, and a long pass
+ * that left BM25 behind until its end would serve the same corpus two ways for hours.</p>
+ *
  * <h2>Stopping</h2>
  * <p>The pass is stopped through its {@link StopSignal}, read between documents; see
  * {@link ReindexCancellation} for why never by an interrupt and why never inside a document. A
@@ -239,18 +245,22 @@ final class SourceReindexPass {
 
         int chunksTombstoned = 0;
         Removals removals = new Removals();
+        ReindexLexicalIndex.Pacing pacing = lexical.pacing();
         ReindexCancelledException cancelled = null;
         try {
             // Only removals are safe to apply before the replacement content exists: a changed
             // document removed now and then failing to re-embed would be lost in both forms.
             // Changed documents retire their surplus chunks once the replacement is written,
             // inside the step; see SupersededVersion.
-            removeDeleted(sourceId, changeSet, stop, removals, resultBuilder);
+            removeDeleted(sourceId, changeSet, stop, pacing, removals, resultBuilder);
 
             for (String newDocId : changeSet.getNewDocuments()) {
                 // Before the fetch, so a run that has been asked to stop starts no new work.
                 ReindexCancellation.checkpoint(stop, sourceId, documentsDone.get(),
                     documentsTotal);
+                // After the checkpoint, which clears an interrupt that would close the index's
+                // channels, and between documents, so no refresh publishes part of one.
+                pacing.refreshIfDue(sourceId, stop);
                 try {
                     FetchedDocument fetched = stop.interruptibly(() -> source.fetch(newDocId));
                     DocumentResult docResult =
@@ -289,6 +299,7 @@ final class SourceReindexPass {
             for (ChangeSet.ChangedDocument changed : changeSet.getChangedDocuments()) {
                 ReindexCancellation.checkpoint(stop, sourceId, documentsDone.get(),
                     documentsTotal);
+                pacing.refreshIfDue(sourceId, stop);
                 try {
                     FetchedDocument fetched =
                         stop.interruptibly(() -> source.fetch(changed.getDocumentId()));
@@ -379,14 +390,19 @@ final class SourceReindexPass {
      * removed whole under its lock - and the next reindex detects the documents this one did not
      * reach as deleted again.</p>
      *
+     * <p>Refreshes the lexical index on the run's pacing between removals, so a source that
+     * dropped most of its documents stops answering for them as the run goes.</p>
+     *
      * @throws ReindexCancelledException if the run was asked to stop
      */
     private void removeDeleted(String sourceId, ChangeSet changeSet, StopSignal stop,
-                               Removals removals, ReindexResult.Builder resultBuilder) {
+                               ReindexLexicalIndex.Pacing pacing, Removals removals,
+                               ReindexResult.Builder resultBuilder) {
         List<DocumentMetadata> deleted = changeSet.getDeletedDocuments();
         int considered = 0;
         for (DocumentMetadata listed : deleted) {
             ReindexCancellation.checkpoint(stop, sourceId, considered++, deleted.size());
+            pacing.refreshIfDue(sourceId, stop);
             String documentKey = ChunkIdentifiers.documentKey(sourceId, listed.getDocumentId());
             Removed removed = DocumentLocks.shared().inDocument(documentKey,
                 () -> removeIfUnchanged(sourceId, documentKey, listed));
