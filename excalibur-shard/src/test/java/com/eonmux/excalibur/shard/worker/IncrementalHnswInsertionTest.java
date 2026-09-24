@@ -24,9 +24,9 @@ import java.util.Random;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Integration tests for Feature 31: Incremental HNSW Insertion.
+ * Integration tests for incremental HNSW insertion.
  *
- * <h2>Feature 31 Requirements</h2>
+ * <h2>Requirements</h2>
  * <blockquote>
  *   Incremental insertion: Vectors added to graph without full rebuild.
  *   Soft-delete (tombstone + skip during traversal).
@@ -73,11 +73,11 @@ class IncrementalHnswInsertionTest {
     }
 
     // =====================================================================================
-    // FEATURE 31.1: insertWithResult() - Single Vector Incremental Insertion
+    // insertWithResult() - Single Vector Incremental Insertion
     // =====================================================================================
 
     @Nested
-    @DisplayName("Feature 31.1: insertWithResult() - Single Vector Insertion")
+    @DisplayName("insertWithResult() - Single Vector Insertion")
     class SingleVectorInsertion {
 
         /**
@@ -182,11 +182,11 @@ class IncrementalHnswInsertionTest {
     }
 
     // =====================================================================================
-    // FEATURE 31.2: insertBatchWithResults() - Batch Incremental Insertion
+    // insertBatchWithResults() - Batch Incremental Insertion
     // =====================================================================================
 
     @Nested
-    @DisplayName("Feature 31.2: insertBatchWithResults() - Batch Insertion via Incremental Path")
+    @DisplayName("insertBatchWithResults() - Batch Insertion via Incremental Path")
     class BatchInsertion {
 
         /**
@@ -294,11 +294,11 @@ class IncrementalHnswInsertionTest {
     }
 
     // =====================================================================================
-    // FEATURE 31.3: TailOffsetTracker Integration
+    // TailOffsetTracker Integration
     // =====================================================================================
 
     @Nested
-    @DisplayName("Feature 31.3: TailOffsetTracker - Integration with Incremental Insertion")
+    @DisplayName("TailOffsetTracker - Integration with Incremental Insertion")
     class TailOffsetTrackerIntegration {
 
         /**
@@ -370,11 +370,11 @@ class IncrementalHnswInsertionTest {
     }
 
     // =====================================================================================
-    // FEATURE 31.4: HnswIntegrationWorker End-to-End
+    // HnswIntegrationWorker End-to-End
     // =====================================================================================
 
     @Nested
-    @DisplayName("Feature 31.4: HnswIntegrationWorker - End-to-End Integration")
+    @DisplayName("HnswIntegrationWorker - End-to-End Integration")
     class HnswIntegrationWorkerEndToEnd {
 
         /**
@@ -440,11 +440,11 @@ class IncrementalHnswInsertionTest {
     }
 
     // =====================================================================================
-    // FEATURE 31.5: Soft-Delete (Tombstone) Integration
+    // Soft-Delete (Tombstone) Integration
     // =====================================================================================
 
     @Nested
-    @DisplayName("Feature 31.5: Soft-Delete with Incremental Insertion")
+    @DisplayName("Soft-Delete with Incremental Insertion")
     class SoftDeleteIntegration {
 
         /**

@@ -15,7 +15,7 @@ import static org.assertj.core.data.Offset.offset;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Verification test for Feature 22: Locality-Sensitive Hashing (LSH)
+ * Verification test for Locality-Sensitive Hashing (LSH).
  *
  * <p>This test verifies that the LSH implementation meets all requirements:</p>
  * <ul>

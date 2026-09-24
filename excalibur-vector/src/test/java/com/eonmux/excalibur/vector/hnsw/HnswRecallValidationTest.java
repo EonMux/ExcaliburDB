@@ -19,8 +19,7 @@ import static org.assertj.core.api.Assertions.*;
 /**
  * Validates HNSW recall@10 meets the ≥99% target.
  *
- * <p>This test verifies the Phase 4 requirement that the default HNSW configuration
- * achieves at least 99% recall@10.</p>
+ * <p>This test holds the default HNSW configuration to at least 99% recall@10.</p>
  *
  * <h2>Test Methodology</h2>
  * <ol>

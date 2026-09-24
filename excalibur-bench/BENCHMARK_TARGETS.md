@@ -68,7 +68,7 @@ so a figure within about 10% of its target should be re-measured before drawing 
 
 ### Storage: "≥1B ops/sec"
 
-The PROJECT GOAL specified "≥1B ops/sec" for storage point lookups. 1B ops/sec is 1 ns per
+The aspirational figure for storage point lookups is ≥1B ops/sec. 1B ops/sec is 1 ns per
 lookup - three to five CPU cycles - and every hit verifies a slot checksum and an entry CRC32
 before its value is returned, which alone costs about 25 ns. The gated target is therefore
 **10M lookups/sec on one thread**, with the page cache hot.
@@ -85,7 +85,7 @@ still gates isotropic data at 2,000 × 64, where the guarantee holds.
 
 ---
 
-## Phase 1: Core Primitives
+## Core Primitives
 
 ### Hash Function Speed (XxHash64)
 
@@ -135,7 +135,7 @@ caches; the lower end is a 16 MB file.
 
 ---
 
-## Phase 2: Storage Engine
+## Storage Engine
 
 ### Point Lookup Throughput
 
@@ -166,7 +166,7 @@ pays, and was corrected to 10M.
 
 ---
 
-## Phase 3: Probabilistic Structures
+## Probabilistic Structures
 
 ### Cuckoo Filter Lookup Throughput
 
@@ -244,7 +244,7 @@ its trial only when the rate is significantly above that bound.
 
 ---
 
-## Phase 4: Vector Index
+## Vector Index
 
 ### HNSW Recall@10
 
@@ -308,7 +308,7 @@ same code and share the floor. Only the `*_scalar` variants differ.
 
 ---
 
-## Phase 6: Query Pipeline
+## Query Pipeline
 
 ### Tail Scan Throughput
 
@@ -333,7 +333,7 @@ distance, dominates there.
 
 ---
 
-## Phase 10: End-to-End Query
+## End-to-End Query
 
 ### Query Latency (p50/p99)
 
@@ -367,22 +367,22 @@ distance, dominates there.
 
 | Category | Benchmark | Target | Actual | Status |
 |----------|-----------|--------|--------|--------|
-| **Phase 1: Hash** | XxHash64 (`hashLong`) | ≥500M ops/sec | 729-733M ops/sec | ✅ |
-| **Phase 1: Hash** | Bulk (`hashByteArray`) | ≥1 GB/sec | 1.43-4.25 GB/sec | ✅ |
-| **Phase 1: MappedFile** | Sequential Read | ≥1 GB/sec | 2.25-85.2 GB/sec | ✅ |
-| **Phase 1: MappedFile** | Sequential Write | ≥500 MB/sec | 2.47-69.2 GB/sec | ✅ |
-| **Phase 2: Storage** | Point Lookup | ≥10M ops/sec | 11.3-21.3M ops/sec | ✅ |
-| **Phase 3: Cuckoo** | Lookup | ≥5M ops/sec | 6.6-42.6M ops/sec | ✅ |
-| **Phase 3: Cuckoo** | Insert | ≥1M ops/sec | 9.4-18.2M ops/sec | ✅ |
-| **Phase 3: Cuckoo** | FP Rate | ≤0.1% | ≤0.099% at 0.95 load | ✅ |
-| **Phase 3: Cuckoo** | Delete (reference) | ≥1M ops/sec | 7.1-13.0M ops/sec | ✅ |
-| **Phase 4: HNSW** | Recall@10 at efSearch 200 | ≥99% | 100% | ✅ |
-| **Phase 4: HNSW** | Search Latency | ≤10 ms | 0.05-0.61 ms | ✅ |
-| **Phase 4: Distance** | Per-component rate | ≥1.5G components/sec | 2.38-6.38G components/sec | ✅ |
-| **Phase 6: Tail Scan** | Throughput | ≥1M entries/sec | 1.04-3.86M entries/sec | ✅ |
-| **Phase 10: E2E Query** | Latency p50 | ≤10 ms | 0.16-0.73 ms | ✅ |
-| **Phase 10: E2E Query** | Latency p99 | ≤50 ms | 0.33-1.14 ms | ✅ |
-| **Phase 10: E2E Query** | Throughput (reference) | ≥1,000 QPS | 1.2K-5.7K QPS | ✅ |
+| **Hash** | XxHash64 (`hashLong`) | ≥500M ops/sec | 729-733M ops/sec | ✅ |
+| **Hash** | Bulk (`hashByteArray`) | ≥1 GB/sec | 1.43-4.25 GB/sec | ✅ |
+| **MappedFile** | Sequential Read | ≥1 GB/sec | 2.25-85.2 GB/sec | ✅ |
+| **MappedFile** | Sequential Write | ≥500 MB/sec | 2.47-69.2 GB/sec | ✅ |
+| **Storage** | Point Lookup | ≥10M ops/sec | 11.3-21.3M ops/sec | ✅ |
+| **Cuckoo** | Lookup | ≥5M ops/sec | 6.6-42.6M ops/sec | ✅ |
+| **Cuckoo** | Insert | ≥1M ops/sec | 9.4-18.2M ops/sec | ✅ |
+| **Cuckoo** | FP Rate | ≤0.1% | ≤0.099% at 0.95 load | ✅ |
+| **Cuckoo** | Delete (reference) | ≥1M ops/sec | 7.1-13.0M ops/sec | ✅ |
+| **HNSW** | Recall@10 at efSearch 200 | ≥99% | 100% | ✅ |
+| **HNSW** | Search Latency | ≤10 ms | 0.05-0.61 ms | ✅ |
+| **Distance** | Per-component rate | ≥1.5G components/sec | 2.38-6.38G components/sec | ✅ |
+| **Tail Scan** | Throughput | ≥1M entries/sec | 1.04-3.86M entries/sec | ✅ |
+| **E2E Query** | Latency p50 | ≤10 ms | 0.16-0.73 ms | ✅ |
+| **E2E Query** | Latency p99 | ≤50 ms | 0.33-1.14 ms | ✅ |
+| **E2E Query** | Throughput (reference) | ≥1,000 QPS | 1.2K-5.7K QPS | ✅ |
 
 ---
 

@@ -54,9 +54,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Integration tests for Phase 10 Feature 85: Live Indexing.
+ * Integration tests for live indexing.
  *
- * <h2>Phase 10 Requirement</h2>
+ * <h2>Requirement</h2>
  * <blockquote>
  *   Live indexing: Issue queries concurrently with ongoing ingestion on separate threads.
  *   Verify: (a) no exceptions, (b) results progressively improve as indexing completes,
@@ -141,13 +141,13 @@ class LiveIndexingIntegrationTest {
     }
 
     // =====================================================================================
-    // FEATURE 85: LIVE INDEXING INTEGRATION TEST
+    // LIVE INDEXING INTEGRATION TEST
     // =====================================================================================
 
     /**
      * Test: Full live indexing verification - all four requirements.
      *
-     * <p>This is the PRIMARY Feature 85 test that verifies all four Phase 10 requirements:</p>
+     * <p>This is the primary live indexing test; it verifies all four requirements:</p>
      * <ul>
      *   <li>(a) no exceptions during concurrent ingestion and querying</li>
      *   <li>(b) results progressively improve as indexing completes</li>
@@ -164,7 +164,7 @@ class LiveIndexingIntegrationTest {
      * </ul>
      */
     @Test
-    @DisplayName("Feature 85: Live indexing - all four requirements verified")
+    @DisplayName("Live indexing - all four requirements verified")
     void feature85_LiveIndexing_AllRequirementsVerified() throws Exception {
         // Create HNSW graph
         HnswConfig config = HnswConfig.create(dimension);
@@ -416,7 +416,7 @@ class LiveIndexingIntegrationTest {
 
         // ==================== VERIFICATION ====================
 
-        System.out.println("\n=== FEATURE 85: LIVE INDEXING TEST RESULTS ===\n");
+        System.out.println("\n=== LIVE INDEXING TEST RESULTS ===\n");
 
         System.out.println("(a) NO EXCEPTIONS:");
         System.out.println("    Exceptions: " + exceptionCount.get());

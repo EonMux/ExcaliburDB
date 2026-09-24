@@ -13,7 +13,7 @@ import com.eonmux.excalibur.bench.kernel.EmbeddingCorpus;
  * JMH Benchmark Runner for HNSW recall@10 validation.
  *
  * <p>This runner executes the HNSW recall benchmark to validate that the
- * default configuration achieves ≥99% recall@10 as required by Phase 4.</p>
+ * default configuration achieves the ≥99% recall@10 target.</p>
  *
  * <h2>Usage</h2>
  * <pre>

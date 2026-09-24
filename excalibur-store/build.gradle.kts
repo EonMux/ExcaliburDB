@@ -1,4 +1,4 @@
-// excalibur-store (Phase 2) - Storage Engine
+// excalibur-store - Storage Engine
 plugins {
     `java-library`
 }
@@ -18,13 +18,13 @@ dependencies {
     // SLF4J API for logging
     implementation("org.slf4j:slf4j-api:2.0.16")
 
-    // Phase 1 dependencies
+    // Core primitives
     implementation(project(":excalibur-core"))
 
-    // Phase 3 dependencies (for LSH integration)
+    // LSH integration
     implementation(project(":excalibur-filter"))
 
-    // Phase 4 dependencies (for HNSW graph integration)
+    // HNSW graph integration
     implementation(project(":excalibur-vector"))
 
     // Test dependencies

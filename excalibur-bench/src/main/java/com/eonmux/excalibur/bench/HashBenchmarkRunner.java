@@ -8,7 +8,7 @@ import org.openjdk.jmh.runner.options.TimeValue;
 /**
  * JMH Benchmark Runner for XxHash64 hash function speed benchmarks.
  *
- * <p>Validates Phase 1 requirement: "Benchmark hash function speed via JMH."</p>
+ * <p>Measures hash function speed via JMH.</p>
  *
  * <h2>Usage</h2>
  * <pre>

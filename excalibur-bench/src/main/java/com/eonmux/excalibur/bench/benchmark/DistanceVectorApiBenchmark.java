@@ -52,7 +52,6 @@ import java.util.concurrent.TimeUnit;
  * Scalar implementations are pure functions with no shared state.</p>
  *
  * @author ExcaliburDB
- * @since Phase 10
  */
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.SECONDS)

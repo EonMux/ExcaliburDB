@@ -13,8 +13,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * JMH benchmark for vector distance functions.
  *
- * <p>Measures throughput of distance/similarity computations to validate
- * the Phase 4 requirement for high-performance vector operations.</p>
+ * <p>Measures throughput of distance/similarity computations.</p>
  *
  * <h2>Performance Targets</h2>
  * <ul>

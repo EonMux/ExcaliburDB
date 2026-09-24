@@ -1,4 +1,4 @@
-// excalibur-core (Phase 1) - Core Primitives
+// excalibur-core - Core Primitives
 plugins {
     `java-library`
 }

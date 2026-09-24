@@ -421,7 +421,7 @@ class FullPipelineIntegrationTest {
         /**
          * Test: Full pipeline verifies that retrieved content matches ingested content.
          *
-         * <p>This test is the PRIMARY Phase 10 integration test for verifying
+         * <p>This is the primary integration test for verifying
          * the full pipeline: ingest documents → query → verify results contain expected content.</p>
          *
          * <p><strong>Domain Correctness:</strong> This test verifies that:</p>

@@ -8,7 +8,7 @@ package com.eonmux.excalibur.bench.metric;
  * <ul>
  *   <li>FP rate must be in range [0.0, 1.0] (probability value)</li>
  *   <li>FP rate must be finite (not NaN or Infinite)</li>
- *   <li>FP rate should be ≤ 0.001 (0.1%) per PROJECT GOAL specification</li>
+ *   <li>FP rate should be ≤ 0.001 (0.1%), the Cuckoo filter FP target</li>
  * </ul>
  *
  * <h2>Domain Correctness Rules</h2>
@@ -16,7 +16,7 @@ package com.eonmux.excalibur.bench.metric;
  *   <li>FP rate represents a probability: the fraction of non-existent items incorrectly reported as present</li>
  *   <li>FP rate = false_positives / total_negative_queries</li>
  *   <li>Valid range: 0.0 (no false positives) to 1.0 (all queries are false positives)</li>
- *   <li>PROJECT GOAL target: ≤ 0.001 (0.1%) at 95% load factor with 13-bit fingerprints</li>
+ *   <li>Target: ≤ 0.001 (0.1%) at 95% load factor with 13-bit fingerprints</li>
  * </ul>
  *
  * <h2>Mathematical Background</h2>
@@ -31,13 +31,11 @@ package com.eonmux.excalibur.bench.metric;
  * <p>This class is immutable and all methods are thread-safe.</p>
  *
  * @author ExcaliburDB
- * @since Phase 10
  */
 public final class FPRateValidator {
 
     /**
-     * Maximum acceptable FP rate per PROJECT GOAL specification.
-     * Spec requirement: "Target FP rate ≤0.1%"
+     * Maximum acceptable FP rate for the Cuckoo filter (0.1%).
      */
     public static final double MAX_FP_RATE = 0.001; // 0.1%
 
@@ -129,7 +127,7 @@ public final class FPRateValidator {
     }
 
     /**
-     * Validates an FP rate value against the PROJECT GOAL specification (≤0.1%).
+     * Validates an FP rate value against the 0.1% target.
      *
      * <p>This is the primary validation method for Cuckoo filter benchmarks.</p>
      *
@@ -201,7 +199,7 @@ public final class FPRateValidator {
     }
 
     /**
-     * Checks if an FP rate value meets the PROJECT GOAL specification (≤0.1%).
+     * Checks if an FP rate value meets the 0.1% target.
      *
      * @param fpRate the FP rate value to check
      * @return true if FP rate meets specification
@@ -281,7 +279,7 @@ public final class FPRateValidator {
     }
 
     /**
-     * Asserts that an FP rate value meets the PROJECT GOAL specification, throwing if not.
+     * Asserts that an FP rate value meets the 0.1% target, throwing if not.
      *
      * @param fpRate the FP rate value to validate
      * @throws IllegalStateException if validation fails or spec is not met

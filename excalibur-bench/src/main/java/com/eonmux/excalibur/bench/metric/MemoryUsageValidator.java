@@ -30,7 +30,6 @@ import java.lang.management.MemoryUsage;
  * are taken atomically to ensure consistency.</p>
  *
  * @author ExcaliburDB
- * @since Phase 10
  */
 public final class MemoryUsageValidator {
 

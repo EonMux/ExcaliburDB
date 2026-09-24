@@ -51,7 +51,7 @@ public class BatchHandler {
     /**
      * Fixed token overhead for the prompt template (system message, instructions, etc.).
      * Domain correctness: this accounts for the non-candidate portion of the prompt.
-     * Estimated based on the Phase 7 prompt template.
+     * Estimated from the relevancy prompt template in {@link LLMHttpClient}.
      */
     private static final int PROMPT_OVERHEAD_TOKENS = 150;
 

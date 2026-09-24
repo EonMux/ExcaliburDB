@@ -52,7 +52,7 @@ public final class BenchmarkTargetRegistry {
     static {
         List<TargetConfig> targets = new ArrayList<>();
 
-        // ===== Storage (Phase 2) - Mode.Throughput, JMH unit ops/s =====
+        // ===== Storage - Mode.Throughput, JMH unit ops/s =====
         targets.add(throughputTarget(".*PointLookupBenchmark\\.sequentialLookupFast",
             10_000_000.0, "Realistic single-threaded target"));
         targets.add(throughputTarget(".*PointLookupBenchmark\\.randomLookupFast",
@@ -68,7 +68,7 @@ public final class BenchmarkTargetRegistry {
         targets.add(throughputTarget(".*SegmentBenchmark\\.(sequentialLookup|randomLookup)",
             10_000_000.0, "Segment lookup throughput"));
 
-        // ===== Cuckoo Filter (Phase 3) =====
+        // ===== Cuckoo Filter =====
         // Both targets are per lookup and per insert. The methods that make several calls per
         // invocation (lookupMixed, batchLookupHit, batchInsert100, batchInsert1000,
         // insertVariedKeySizes) declare @OperationsPerInvocation, so JMH already reports them
@@ -78,7 +78,7 @@ public final class BenchmarkTargetRegistry {
         targets.add(throughputTarget(".*CuckooFilterInsertBenchmark\\..*[Ii]nsert.*",
             1_000_000.0, "Insert throughput at every load factor up to 0.95"));
 
-        // ===== HNSW (Phase 4) =====
+        // ===== HNSW =====
         // Recall is not a JMH score: HnswRecallBenchmark runs in AverageTime mode, so its
         // primary score is ms/op. The 99% recall@10 requirement is enforced where it can
         // actually fail - HnswRecallBenchmark.setup() aborts the trial below target - and
@@ -86,7 +86,7 @@ public final class BenchmarkTargetRegistry {
         targets.add(latencyTarget(".*HnswRecallBenchmark\\.searchLatency",
             10.0, "HNSW search latency target"));
 
-        // ===== Distance Functions (Phase 4) =====
+        // ===== Distance Functions =====
         // One op is one distance between two vectors of `dimension` components, and the
         // benchmarks sweep dimension from 64 to 1536: ops/sec falls in proportion to the
         // dimension, so a flat ops/sec threshold was a different demand at every parameter
@@ -103,14 +103,14 @@ public final class BenchmarkTargetRegistry {
         targets.add(componentRateTarget(".*DistanceVectorApiBenchmark\\.(cosine|l2|innerProduct)_vectorApi",
             "Vector API distance throughput per vector component"));
 
-        // ===== Tail Scan (Phase 6) =====
+        // ===== Tail Scan =====
         // One op scans the whole tail, and the benchmark sweeps tailSize from 100 to 50,000
         // entries, so the size-independent rate is entries/sec.
         targets.add(new TargetConfig(".*TailScanBenchmark\\.tailScan_(l2|cosine|largeK)",
             PRIMARY_METRIC, 1_000_000.0, true, MetricUnits.ENTRIES_PER_SEC, "tailSize",
             "Tail scan brute-force throughput per entry"));
 
-        // ===== End-to-End Query (Phase 10) - Mode.SampleTime, percentiles are secondary metrics =====
+        // ===== End-to-End Query - Mode.SampleTime, percentiles are secondary metrics =====
         targets.add(new TargetConfig(".*EndToEndQueryBenchmark\\.fullQueryPipeline",
             "p50", 10.0, false, "ms", null,
             "End-to-end query latency p50 target"));
@@ -118,9 +118,9 @@ public final class BenchmarkTargetRegistry {
             "p99", 50.0, false, "ms", null,
             "End-to-end query latency p99 target"));
 
-        // ===== Hash Functions (Phase 1) =====
+        // ===== Hash Functions =====
         // hashLong hashes a fixed 8-byte input, so ops/sec is well defined for it and
-        // carries the documented 500M ops/sec Phase 1 target directly.
+        // carries the documented 500M ops/sec target directly.
         targets.add(throughputTarget(".*HashBenchmark\\.hashLong",
             500_000_000.0, "Hash function throughput on a fixed 8-byte input"));
         // hashByteArray sweeps keySize from 8 B to 4 KB, so an ops/sec threshold would
@@ -130,7 +130,7 @@ public final class BenchmarkTargetRegistry {
             PRIMARY_METRIC, 1_000_000_000.0, true, MetricUnits.BYTES_PER_SEC, "keySize",
             "Hash function bulk throughput"));
 
-        // ===== MappedFile (Phase 1) =====
+        // ===== MappedFile =====
         // One op walks the whole file - the benchmark loops until the offset passes fileSize -
         // so fileSize is what a single operation transfers. Scaling by bufferSize instead
         // understated the rate by fileSize/bufferSize, which is up to 262144x across the swept

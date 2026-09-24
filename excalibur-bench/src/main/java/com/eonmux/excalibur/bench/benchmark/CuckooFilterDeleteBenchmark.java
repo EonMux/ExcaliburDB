@@ -11,8 +11,7 @@ import java.util.concurrent.TimeUnit;
  * JMH benchmark for Cuckoo Filter delete throughput at various load factors.
  *
  * <h2>Purpose</h2>
- * <p>Measures delete operations per second at different load factors to validate
- * the Phase 3 requirement for high-performance Cuckoo Filter deletion operations.
+ * <p>Measures delete operations per second at different load factors.
  * Cuckoo filters support O(1) deletion without false negatives, unlike Bloom filters.</p>
  *
  * <h2>Benchmark Scenarios</h2>

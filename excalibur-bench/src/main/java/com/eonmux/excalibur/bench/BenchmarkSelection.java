@@ -12,8 +12,6 @@ import java.util.Locale;
  * looks like a measurement of the thing that was asked for. Separating it lets the
  * mapping be asserted against the real benchmark classes in milliseconds instead of
  * being discovered after a multi-minute run measured the wrong code.</p>
- *
- * @since Phase 10
  */
 public final class BenchmarkSelection {
 

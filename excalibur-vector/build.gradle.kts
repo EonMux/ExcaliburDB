@@ -1,4 +1,4 @@
-// excalibur-vector (Phase 4) - Vector Index
+// excalibur-vector - Vector Index
 plugins {
     `java-library`
 }
@@ -12,11 +12,11 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
 
-    // Phase 1 dependency. api, not implementation: IntegrityReport is the declared return
+    // Core primitives. api, not implementation: IntegrityReport is the declared return
     // type of HnswGraph.verifyIntegrity and its siblings, so a module that calls one cannot
     // name what it gets back without core on its own compile classpath.
     api(project(":excalibur-core"))
-    // Phase 3 dependency
+    // Probabilistic structures
     implementation(project(":excalibur-filter"))
     // Config module for Config.Shard
     implementation(project(":excalibur-config"))

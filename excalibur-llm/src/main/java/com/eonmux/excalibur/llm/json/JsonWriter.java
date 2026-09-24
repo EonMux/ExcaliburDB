@@ -8,7 +8,7 @@ import java.util.Objects;
 /**
  * Hand-rolled JSON writer for constructing request bodies.
  *
- * <p>Per the Phase 7 specification, this implementation avoids external JSON libraries
+ * <p>This implementation avoids external JSON libraries
  * (no Jackson, no Gson) and produces valid UTF-8 encoded JSON with properly escaped strings.</p>
  *
  * <h2>Thread Safety</h2>

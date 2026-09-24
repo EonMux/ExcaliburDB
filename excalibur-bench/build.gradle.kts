@@ -1,4 +1,4 @@
-// excalibur-bench (Phase 10) - Benchmarks
+// excalibur-bench - Benchmarks
 plugins {
     `java-library`
     application
@@ -36,25 +36,25 @@ dependencies {
     // Apache Commons Math3 for JMH statistical summaries
     implementation("org.apache.commons:commons-math3:3.6.1")
 
-    // Phase 1 core dependency for memory-mapped I/O
+    // Core primitives for memory-mapped I/O
     implementation(project(":excalibur-core"))
 
-    // Phase 2 dependency for Segment benchmarks
+    // Storage engine for Segment benchmarks
     implementation(project(":excalibur-store"))
 
-    // Phase 3 dependency for Cuckoo Filter benchmarks
+    // Probabilistic structures for Cuckoo Filter benchmarks
     implementation(project(":excalibur-filter"))
 
-    // Phase 4 dependency for Vector Distance benchmarks
+    // Vector index for distance benchmarks
     implementation(project(":excalibur-vector"))
 
-    // Phase 5 dependency for Shard (VisibilityTracker)
+    // Index orchestration (VisibilityTracker)
     implementation(project(":excalibur-shard"))
 
-    // Phase 6 dependency for Tail Scan benchmarks
+    // Query pipeline for Tail Scan benchmarks
     implementation(project(":excalibur-query"))
 
-    // Phase 8 dependency for Ingestion (DocumentVisibilityChecker)
+    // Ingestion (DocumentVisibilityChecker)
     implementation(project(":excalibur-ingest"))
     implementation(project(":excalibur-retrieval"))
 
@@ -152,13 +152,13 @@ tasks.register<JavaExec>("runHnswRecallBenchmark") {
 // Task to run the JMH benchmark for MappedFile read/write throughput
 tasks.register<JavaExec>("runMappedFileBenchmark") {
     group = "benchmark"
-    description = "Runs the JMH benchmark for MappedFile read/write throughput (Phase 1)"
+    description = "Runs the JMH benchmark for MappedFile read/write throughput"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.MappedFileBenchmarkRunner")
     jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g")
 }
 
-// Task to run the JMH benchmark for Hash function speed (Phase 1 requirement)
+// Task to run the JMH benchmark for Hash function speed
 tasks.register<JavaExec>("runHashBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for XxHash64 hash function speed"
@@ -167,7 +167,7 @@ tasks.register<JavaExec>("runHashBenchmark") {
     jvmArgs = benchmarkJvmFlags + listOf("-Xms1g", "-Xmx1g")
 }
 
-// Task to run the JMH benchmark for Tail Scan throughput (Phase 6)
+// Task to run the JMH benchmark for Tail Scan throughput
 tasks.register<JavaExec>("runTailScanBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for tail scan brute-force throughput at varying tail sizes"
@@ -176,7 +176,7 @@ tasks.register<JavaExec>("runTailScanBenchmark") {
     jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g")
 }
 
-// Task to run the JMH benchmark for end-to-end query latency (Phase 10)
+// Task to run the JMH benchmark for end-to-end query latency
 tasks.register<JavaExec>("runEndToEndQueryBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for end-to-end query latency p50/p99"
@@ -185,7 +185,7 @@ tasks.register<JavaExec>("runEndToEndQueryBenchmark") {
     jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g")
 }
 
-// Task to run the JMH benchmark for Point Lookup throughput (Phase 10 - Feature 97)
+// Task to run the JMH benchmark for Point Lookup throughput
 tasks.register<JavaExec>("runPointLookupBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for point lookup throughput (target: >=10M ops/sec)"
@@ -194,7 +194,7 @@ tasks.register<JavaExec>("runPointLookupBenchmark") {
     jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g", "-XX:+UseTransparentHugePages")
 }
 
-// Task to run the JMH benchmark for Distance Vector API comparison (Phase 10)
+// Task to run the JMH benchmark for Distance Vector API comparison
 tasks.register<JavaExec>("runDistanceVectorApiBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark comparing scalar vs Vector API distance computation"
@@ -203,7 +203,7 @@ tasks.register<JavaExec>("runDistanceVectorApiBenchmark") {
     jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g")
 }
 
-// Task to run benchmarks with structured result capture (Phase 10)
+// Task to run benchmarks with structured result capture
 tasks.register<JavaExec>("runBenchmarksWithCapture") {
     group = "benchmark"
     description = "Runs all benchmarks and captures results in JSON, Markdown, CSV, and text formats"

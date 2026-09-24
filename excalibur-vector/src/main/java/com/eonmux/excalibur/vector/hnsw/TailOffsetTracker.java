@@ -23,12 +23,12 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * {@code HnswIntegrationWorker} passes offsets.</p>
  *
  * <h2>Purpose</h2>
- * <p>This offset is critical for the live-indexing tail scan (Phase 6):
+ * <p>This offset is critical for the live-indexing tail scan:
  * <ul>
  *   <li>When {@code lastIntegratedOffset < segment.writeLogHead}, a brute-force
  *       tail scan is performed over the un-integrated portion of the write log</li>
  *   <li>The tail scan computes exact distances on full-precision vectors</li>
- *   <li>Tail size is bounded by backpressure (Phase 5)</li>
+ *   <li>Tail size is bounded by backpressure</li>
  * </ul>
  * </p>
  *

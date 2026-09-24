@@ -646,7 +646,7 @@ class LLMUnavailabilityIntegrationTest {
         /**
          * Test: Kill LLM endpoint mid-query and verify circuit breaker + vector-only fallback.
          *
-         * <p>This is the CRITICAL test for Phase 10 integration: verifies the full pipeline
+         * <p>Verifies the full pipeline
          * fallback behavior when LLM scoring is requested but the endpoint dies mid-query.</p>
          *
          * <p>Domain correctness:</p>

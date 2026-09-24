@@ -39,7 +39,7 @@ public final class TokenEstimator {
 
     /**
      * Characters per token ratio for approximation.
-     * Domain correctness: this is the exact divisor specified in the Phase 7 spec.
+     * Four characters per token is the usual approximation for English text.
      */
     private static final double CHARACTERS_PER_TOKEN = 4.0;
 

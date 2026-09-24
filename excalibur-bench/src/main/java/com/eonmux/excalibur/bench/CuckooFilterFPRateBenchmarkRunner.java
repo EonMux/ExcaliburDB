@@ -40,8 +40,7 @@ import org.openjdk.jmh.runner.options.TimeValue;
 public class CuckooFilterFPRateBenchmarkRunner {
 
     /**
-     * Maximum acceptable false positive rate per specification.
-     * Spec requirement: "Target FP rate ≤0.1%"
+     * Maximum acceptable false positive rate for the Cuckoo filter (0.1%).
      */
     public static final double MAX_ACCEPTABLE_FP_RATE = 0.001; // 0.1%
 

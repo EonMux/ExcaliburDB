@@ -1,4 +1,4 @@
-// excalibur-query (Phase 6) - Query Pipeline
+// excalibur-query - Query Pipeline
 plugins {
     `java-library`
 }
@@ -18,18 +18,18 @@ dependencies {
     // Configuration module
     implementation(project(":excalibur-config"))
 
-    // Phase 2 (Storage Engine - needed for WriteLog access)
+    // Storage engine (WriteLog access)
     implementation(project(":excalibur-store"))
 
-    // Phase 3, 4, 5 dependencies
+    // Probabilistic structures, vector index, and index orchestration
     implementation(project(":excalibur-filter"))
     implementation(project(":excalibur-vector"))
     implementation(project(":excalibur-shard"))
 
-    // Phase 7 (LLM Client - for relevancy scoring)
+    // LLM client (relevancy scoring)
     implementation(project(":excalibur-llm"))
 
-    // Phase 8 dependency for document visibility tracking
+    // Ingestion (document visibility tracking)
     implementation(project(":excalibur-ingest"))
 
     // Metrics module for JMX observability

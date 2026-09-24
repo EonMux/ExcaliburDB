@@ -244,7 +244,7 @@ public class StorageEngine implements AutoCloseable {
      * - lastIntegratedOffset
      * - lastCompactionTime
      *
-     * This catalog is used by the Index Orchestration module (Phase 5) for
+     * This catalog is used by the index orchestration module (excalibur-shard) for
      * segment discovery, lifecycle management, and visibility tracking.</p>
      */
     final SegmentCatalog catalog;

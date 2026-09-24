@@ -30,7 +30,6 @@ package com.eonmux.excalibur.bench.metric;
  * <p>This class is immutable and all methods are thread-safe.</p>
  *
  * @author ExcaliburDB
- * @since Phase 10
  */
 public final class ThroughputValidator {
 
@@ -70,11 +69,12 @@ public final class ThroughputValidator {
     /**
      * Target throughput for point lookups (10M ops/sec).
      *
-     * <p>Interpreted from PROJECT GOAL "&gt;=1B ops/sec" as a realistic single-threaded target,
-     * and met: on a quiet machine the reference workload measures 10.5 to 10.9 M ops/sec at
-     * steady state. Compliance is reported through {@link BenchmarkTargetRegistry} on the JMH
-     * path, which is where a wall-clock target belongs - JMH forks a fresh JVM, warms it, repeats
-     * the trial and reports the interval it measured.</p>
+     * <p>Interpreted from the aspirational "&gt;=1B ops/sec" figure as a realistic
+     * single-threaded target, and met: on a quiet machine the reference workload measures
+     * 10.5 to 10.9 M ops/sec at steady state. Compliance is reported through
+     * {@link BenchmarkTargetRegistry} on the JMH path, which is where a wall-clock target
+     * belongs - JMH forks a fresh JVM, warms it, repeats the trial and reports the interval it
+     * measured.</p>
      *
      * <p><strong>The operating point is part of the target.</strong> A point lookup is a probe
      * into a hash table, so how fast one is depends on how much of that table is in cache. This

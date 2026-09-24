@@ -540,7 +540,7 @@ class QueryPipelineTest {
     }
 
     /**
-     * Tests for Feature 89: LLM Unavailability Fallback.
+     * Tests for the LLM unavailability fallback.
      *
      * <p>These tests verify that when LLM scoring is enabled but fails,
      * the query pipeline gracefully falls back to vector-only ranking
@@ -554,7 +554,7 @@ class QueryPipelineTest {
      * </ul>
      */
     @Nested
-    @DisplayName("LLM Fallback (Feature 89)")
+    @DisplayName("LLM Fallback")
     class LlmFallback {
 
         @Test
@@ -588,7 +588,7 @@ class QueryPipelineTest {
             assertThat(good.degraded()).isFalse();
             assertThat(good.estimatedCorpusCoverage()).isEqualTo(1.0);
 
-            // Test 2: Good coverage, LLM fallback -> degraded=true (Feature 89 fix)
+            // Test 2: Good coverage, LLM fallback -> degraded=true
             IndexCoverage withLlmFallback = IndexCoverage.builder()
                 .totalSegments(10)
                 .activeSegments(10)
