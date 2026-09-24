@@ -115,9 +115,7 @@ public final class ReindexerFactory {
 
         DocumentBatchPublisher batchPublisher = new DocumentBatchPublisher(
             indexOrchestrator.getVisibilityTracker(),
-            registry,
-            () -> { /* write log sync is performed by the storage engine */ },
-            null
+            registry
         );
 
         boolean rollingReplacement = volumeManager != null && storageEngine.getCatalog() != null;

@@ -101,13 +101,13 @@ class ChangeDetectionTest {
     }
 
     @Test
-    void testRemoveBySource() {
+    void testRemoveDocumentLeavesOtherSourcesAlone() {
         registry.register(createMetadata("source1", "doc1"));
-        registry.register(createMetadata("source1", "doc2"));
         registry.register(createMetadata("source2", "doc1"));
 
-        int removed = registry.removeBySource("source1");
-        assertEquals(2, removed);
+        assertNotNull(registry.remove("source1", "doc1"));
+        assertNull(registry.remove("source1", "doc1"));
+
         assertEquals(0, registry.size("source1"));
         assertEquals(1, registry.size("source2"));
     }
@@ -507,10 +507,9 @@ class ChangeDetectionTest {
     // ==================== UpsertHandler Tests ====================
 
     @Test
-    void testUpsertHandlerTombstonesChunks() {
-        // Track tombstoned chunks
+    void testUpsertHandlerTombstonesObsoleteChunks() {
         List<String> tombstonedChunks = new java.util.ArrayList<>();
-        
+
         UpsertHandler.StorageAdapter storageAdapter = key -> {
             tombstonedChunks.add(new String(key, StandardCharsets.UTF_8));
             return true;
@@ -518,27 +517,11 @@ class ChangeDetectionTest {
 
         UpsertHandler handler = new UpsertHandler(registry, storageAdapter);
 
-        DocumentMetadata oldMeta = DocumentMetadata.builder()
-            .sourceId("source1")
-            .documentId("doc1")
-            .addChunkId("chunk1")
-            .addChunkId("chunk2")
-            .build();
+        int tombstoned = handler.tombstoneObsoleteChunks(
+            List.of("chunk1", "chunk2", "chunk3"), List.of("chunk1"));
 
-        DocumentMetadata.FetchedDocumentInfo fetchedInfo = 
-            new DocumentMetadata.FetchedDocumentInfo(2000L, 9999L, 100);
-
-        ChangeSet changeSet = ChangeSet.builder("source1")
-            .addChanged("doc1", oldMeta, fetchedInfo)
-            .build();
-
-        UpsertHandler.UpsertResult result = handler.processChanges(changeSet);
-
-        assertEquals(1, result.getDocumentsChanged());
-        assertEquals(2, result.getChunksTombstoned());
-        assertEquals(2, tombstonedChunks.size());
-        assertTrue(tombstonedChunks.contains("chunk1"));
-        assertTrue(tombstonedChunks.contains("chunk2"));
+        assertEquals(2, tombstoned);
+        assertEquals(List.of("chunk2", "chunk3"), tombstonedChunks);
     }
 
     @Test
@@ -554,13 +537,10 @@ class ChangeDetectionTest {
 
         UpsertHandler handler = new UpsertHandler(registry, key -> true);
 
-        ChangeSet changeSet = ChangeSet.builder("source1")
-            .addDeleted(deletedMeta)
-            .build();
-
-        UpsertHandler.UpsertResult result = handler.processChanges(changeSet);
+        UpsertHandler.UpsertResult result = handler.removeDocument(deletedMeta);
 
         assertEquals(1, result.getDocumentsDeleted());
+        assertEquals(1, result.getChunksTombstoned());
         assertNull(registry.get("source1", "doc1")); // Removed from registry
     }
 
@@ -572,20 +552,14 @@ class ChangeDetectionTest {
 
         UpsertHandler handler = new UpsertHandler(registry, failingStorage);
 
-        DocumentMetadata oldMeta = DocumentMetadata.builder()
+        DocumentMetadata deletedMeta = DocumentMetadata.builder()
             .sourceId("source1")
             .documentId("doc1")
             .addChunkId("chunk1")
             .build();
+        registry.register(deletedMeta);
 
-        DocumentMetadata.FetchedDocumentInfo fetchedInfo = 
-            new DocumentMetadata.FetchedDocumentInfo(2000L, 9999L, 100);
-
-        ChangeSet changeSet = ChangeSet.builder("source1")
-            .addChanged("doc1", oldMeta, fetchedInfo)
-            .build();
-
-        UpsertHandler.UpsertResult result = handler.processChanges(changeSet);
+        UpsertHandler.UpsertResult result = handler.removeDocument(deletedMeta);
 
         assertTrue(result.hasErrors());
         assertEquals(1, result.getErrors().size());

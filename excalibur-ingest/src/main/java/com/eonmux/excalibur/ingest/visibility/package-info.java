@@ -1,33 +1,38 @@
 /**
  * Document-atomic visibility tracking for the ingestion pipeline.
  *
- * <p>This package provides the mechanism to ensure queries never see
- * partially-ingested documents. When a document's chunks are published
- * to the visibility epoch, the {@link com.eonmux.excalibur.ingest.visibility.DocumentVisibilityRegistry}
- * records the epoch at which the entire document becomes visible.</p>
+ * <p>This package provides the mechanism that keeps queries from seeing partially-ingested
+ * documents. The {@link com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker}
+ * is it: one per node, built on the node's visibility clock, and consulted by the query
+ * pipeline's atomicity filter through a
+ * {@link com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker}
+ * ({@link com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter}).</p>
  *
  * <h2>Document Atomicity Contract</h2>
  * <p>A document's chunks become visible to queries atomically:</p>
  * <ol>
- *   <li>All chunks are written to the write log with contiguous offsets</li>
- *   <li>Write log is synced (fsync)</li>
- *   <li>Visibility epoch is advanced</li>
- *   <li>Document is registered in the visibility registry at the new epoch</li>
+ *   <li>The document is marked in flight ({@code beginIngestion}); the mark is journalled by
+ *       the {@link com.eonmux.excalibur.ingest.visibility.InFlightDocumentJournal} before the
+ *       first chunk is written, so a restart keeps a half-written document hidden</li>
+ *   <li>Every chunk is written to storage, each one durable in its segment's write-ahead log
+ *       before the write returns</li>
+ *   <li>The node visibility epoch is advanced</li>
+ *   <li>The document is registered with its complete chunk set at the new epoch, which clears
+ *       the in-flight mark</li>
  * </ol>
  *
  * <h2>Query Integration</h2>
- * <p>Queries use the visibility registry to filter out partial documents:</p>
+ * <p>The atomicity filter derives a document key from each result and asks the checker:</p>
+ * <ul>
+ *   <li>a document registered at an epoch no later than the query's is returned whole;</li>
+ *   <li>a document registered after the query's epoch, or still in flight, is withheld whole;</li>
+ *   <li>a document the tracker does not know - written by a previous process, or forgotten to
+ *       retention once long published - passes through, because a document that is whole is
+ *       the only kind that can be unknown.</li>
+ * </ul>
  * <pre>{@code
- * // In query pipeline:
- * long queryEpoch = visibilityTracker.captureEpoch();
- * 
- * // For each chunk found in write log or HNSW:
- * String documentId = visibilityRegistry.getDocumentForChunk(chunkId);
- * if (visibilityRegistry.isVisibleAt(documentId, queryEpoch)) {
- *     // Include all chunks of this document
- * } else {
- *     // Exclude all chunks - document not fully visible yet
- * }
+ * long queryEpoch = nodeVisibility.captureEpoch();
+ * List<QueryResultItem> whole = atomicityFilter.filterPartialDocuments(results, queryEpoch);
  * }</pre>
  *
  * @author ExcaliburDB

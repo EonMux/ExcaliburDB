@@ -19,7 +19,6 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -118,16 +117,16 @@ class PublicationFailureAccountingTest {
             .isNull();
     }
 
-    /** A publisher that refuses everything, as one whose write log will not sync does. */
+    /** A publisher that refuses everything, as one whose epoch cannot advance does. */
     private static final class RefusingPublisher extends DocumentBatchPublisher {
 
         RefusingPublisher(VisibilityTracker visibility, DocumentRegistry registry) {
-            super(visibility, registry, () -> { }, new ReentrantLock());
+            super(visibility, registry);
         }
 
         @Override
         public PublicationResult publish(DocumentBatchBuffer buffer, DocumentMetadata metadata) {
-            throw new PublicationException("write log did not sync");
+            throw new PublicationException("publication refused");
         }
     }
 

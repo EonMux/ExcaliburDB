@@ -1,7 +1,9 @@
 package com.eonmux.excalibur.query.visibility;
 
+import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker;
-import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityRegistry;
+import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
+import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
 import com.eonmux.excalibur.query.QueryResultItem;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -13,10 +15,9 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Integration tests for document atomicity using DocumentVisibilityRegistry.
- *
- * <p>Tests verify that the document-atomic visibility guarantee is enforced
- * when using DocumentVisibilityRegistry with DocumentAtomicityFilter.</p>
+ * Integration tests for document atomicity as a node enforces it: a
+ * {@link DocumentVisibilityTracker}, exposed through its adapter, behind the
+ * {@link DocumentAtomicityFilter}.
  *
  * <h2>Document Atomicity Guarantee</h2>
  * <p>A document is considered "atomically visible" when:</p>
@@ -29,23 +30,17 @@ import static org.junit.jupiter.api.Assertions.*;
  * @author ExcaliburDB
  * @since 8.0
  */
-class DocumentAtomicityRegistryIntegrationTest {
+class DocumentAtomicityTrackerIntegrationTest {
 
-    private DocumentVisibilityRegistry registry;
+    private DocumentVisibilityTracker tracker;
+    private DocumentVisibilityChecker checker;
     private DocumentAtomicityFilter filter;
 
     @BeforeEach
     void setUp() {
-        registry = new DocumentVisibilityRegistry();
-        filter = new DocumentAtomicityFilter((DocumentVisibilityChecker) registry);
-    }
-
-    @Test
-    void testConstructorWithRegistry() {
-        DocumentVisibilityChecker checker = registry;
-        DocumentAtomicityFilter filterFromChecker = new DocumentAtomicityFilter(checker);
-        assertNotNull(filterFromChecker);
-        assertSame(checker, filterFromChecker.getVisibilityChecker());
+        tracker = new DocumentVisibilityTracker(new DocumentRegistry());
+        checker = new DocumentVisibilityTrackerAdapter(tracker);
+        filter = new DocumentAtomicityFilter(checker);
     }
 
     @Test
@@ -62,28 +57,28 @@ class DocumentAtomicityRegistryIntegrationTest {
         List<QueryResultItem> filtered = filter.filterPartialDocuments(Arrays.asList(r1, r2), 10L);
 
         assertEquals(2, filtered.size(),
-            "A document this registry has never seen is not the same as one it knows to be "
-                + "incomplete. The registry is built in memory as documents are published, so "
+            "A document the tracker has never seen is not the same as one it knows to be "
+                + "incomplete. The tracker is built in memory as documents are published, so "
                 + "after a restart everything written earlier is unknown -- excluding those "
                 + "would drop them from every result once one new document arrives.");
     }
 
     @Test
-    void testFilterPartialDocuments_tombstonedIsExcludedNotForgotten() {
-        registry.registerDocument("1", List.of("1:0"), 5L);
-        registry.tombstoneDocument("1");
+    void testFilterPartialDocuments_inFlightDocumentIsExcluded() {
+        tracker.beginIngestion("1", 2);
+        tracker.addPendingChunk("1", "1:chunk:0");
 
         List<QueryResultItem> filtered =
             filter.filterPartialDocuments(List.of(createResult(1L, 0.5f)), 10L);
 
         assertTrue(filtered.isEmpty(),
-            "A deleted document is known and deliberately invisible; forgetting it entirely "
-                + "would make it indistinguishable from an unknown one and bring it back");
+            "A document whose ingestion has begun and not been published is known and "
+                + "incomplete, so none of it may be returned");
     }
 
     @Test
     void testFilterPartialDocuments_resultWithoutDocumentIdPassesThrough() {
-        registry.registerDocument("1", List.of("1:0"), 5L);
+        tracker.registerDocument("1", List.of("1:chunk:0"), 5L);
 
         // A result with no document identity - a write-log tail-scan hit whose key could
         // not be decoded, for instance - is not something the atomicity model can classify.
@@ -97,8 +92,8 @@ class DocumentAtomicityRegistryIntegrationTest {
 
     @Test
     void testFilterPartialDocuments_allVisible() {
-        registry.registerDocument("1", List.of("1:0", "1:1"), 5L);
-        registry.registerDocument("2", List.of("2:0", "2:1"), 5L);
+        tracker.registerDocument("1", List.of("1:chunk:0", "1:chunk:1"), 5L);
+        tracker.registerDocument("2", List.of("2:chunk:0", "2:chunk:1"), 5L);
 
         QueryResultItem r1 = createResult(1L, 0.5f);
         QueryResultItem r2 = createResult(2L, 0.4f);
@@ -110,8 +105,8 @@ class DocumentAtomicityRegistryIntegrationTest {
 
     @Test
     void testFilterPartialDocuments_mixedVisibility() {
-        registry.registerDocument("1", List.of("1:0"), 5L);
-        registry.registerDocument("2", List.of("2:0"), 15L);
+        tracker.registerDocument("1", List.of("1:chunk:0"), 5L);
+        tracker.registerDocument("2", List.of("2:chunk:0"), 15L);
 
         QueryResultItem visible = createResult(1L, 0.5f);
         QueryResultItem notYetVisible = createResult(2L, 0.4f);
@@ -125,9 +120,9 @@ class DocumentAtomicityRegistryIntegrationTest {
 
     @Test
     void testFilterPartialDocuments_epochBasedVisibility() {
-        registry.registerDocument("1", List.of("1:0"), 5L);
-        registry.registerDocument("2", List.of("2:0"), 10L);
-        registry.registerDocument("3", List.of("3:0"), 15L);
+        tracker.registerDocument("1", List.of("1:chunk:0"), 5L);
+        tracker.registerDocument("2", List.of("2:chunk:0"), 10L);
+        tracker.registerDocument("3", List.of("3:chunk:0"), 15L);
 
         QueryResultItem r1 = createResult(1L, 0.5f);
         QueryResultItem r2 = createResult(2L, 0.4f);
@@ -147,28 +142,12 @@ class DocumentAtomicityRegistryIntegrationTest {
     }
 
     @Test
-    void testFilterPartialDocuments_tombstonedDocumentNotVisible() {
-        registry.registerDocument("1", List.of("1:0"), 5L);
-        registry.registerDocument("2", List.of("2:0"), 5L);
-
-        registry.tombstoneDocument("2");
-
-        QueryResultItem r1 = createResult(1L, 0.5f);
-        QueryResultItem r2 = createResult(2L, 0.4f);
-
-        List<QueryResultItem> filtered = filter.filterPartialDocuments(Arrays.asList(r1, r2), 10L);
-
-        assertEquals(1, filtered.size());
-        assertEquals(1L, filtered.get(0).documentId());
-    }
-
-    @Test
     void testVerifyAtomicity() {
         // Document 2 is registered but not yet visible at the query epoch, which is what the
-        // verification is meant to count. An unregistered document would not be: the registry
+        // verification is meant to count. An unregistered document would not be: the tracker
         // has no opinion about it.
-        registry.registerDocument("1", List.of("1:0"), 5L);
-        registry.registerDocument("2", List.of("2:0"), 15L);
+        tracker.registerDocument("1", List.of("1:chunk:0"), 5L);
+        tracker.registerDocument("2", List.of("2:chunk:0"), 15L);
 
         QueryResultItem visible = createResult(1L, 0.5f);
         QueryResultItem partial = createResult(2L, 0.4f);
@@ -185,8 +164,8 @@ class DocumentAtomicityRegistryIntegrationTest {
 
     @Test
     void testIsResultVisible() {
-        registry.registerDocument("1", List.of("1:0"), 5L);
-        registry.registerDocument("2", List.of("2:0"), 15L);
+        tracker.registerDocument("1", List.of("1:chunk:0"), 5L);
+        tracker.registerDocument("2", List.of("2:chunk:0"), 15L);
 
         QueryResultItem visible = createResult(1L, 0.5f);
         QueryResultItem notYetVisible = createResult(2L, 0.4f);
@@ -195,22 +174,24 @@ class DocumentAtomicityRegistryIntegrationTest {
         assertTrue(filter.isResultVisible(visible, 10L));
         assertFalse(filter.isResultVisible(notYetVisible, 10L), "registered, epoch not reached");
         assertFalse(filter.isResultVisible(visible, 3L), "query started before the commit");
-        assertTrue(filter.isResultVisible(unknown, 10L), "the registry has no opinion about it");
+        assertTrue(filter.isResultVisible(unknown, 10L), "the tracker has no opinion about it");
     }
 
     @Test
     void testFilterChunkIds() {
-        registry.registerDocument("doc1", List.of("doc1:0", "doc1:1", "doc1:2"), 5L);
+        tracker.registerDocument("doc1",
+            List.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"), 5L);
 
-        List<String> chunks = Arrays.asList("doc1:0", "doc1:1", "doc1:2", "doc2:0");
+        List<String> chunks = Arrays.asList(
+            "doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2", "doc2:chunk:0");
 
         List<String> filtered = filter.filterChunkIds(chunks, 10L);
 
         assertEquals(3, filtered.size());
-        assertTrue(filtered.contains("doc1:0"));
-        assertTrue(filtered.contains("doc1:1"));
-        assertTrue(filtered.contains("doc1:2"));
-        assertFalse(filtered.contains("doc2:0"));
+        assertTrue(filtered.contains("doc1:chunk:0"));
+        assertTrue(filtered.contains("doc1:chunk:1"));
+        assertTrue(filtered.contains("doc1:chunk:2"));
+        assertFalse(filtered.contains("doc2:chunk:0"));
     }
 
     @Test
@@ -226,9 +207,7 @@ class DocumentAtomicityRegistryIntegrationTest {
 
     @Test
     void testGetVisibilityChecker() {
-        DocumentVisibilityChecker checker = filter.getVisibilityChecker();
-        assertNotNull(checker);
-        assertSame(registry, checker);
+        assertSame(checker, filter.getVisibilityChecker());
     }
 
     @Test

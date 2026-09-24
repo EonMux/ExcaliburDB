@@ -225,7 +225,7 @@ public class DocumentReindexer {
      * <ul>
      *   <li>All chunks for a document become visible at the same epoch</li>
      *   <li>No partial documents in query results</li>
-     *   <li>Write log sync before epoch advancement</li>
+     *   <li>Every chunk durable in the write log before the epoch that publishes it</li>
      * </ul>
      *
      * @param chunker Text chunker for splitting documents

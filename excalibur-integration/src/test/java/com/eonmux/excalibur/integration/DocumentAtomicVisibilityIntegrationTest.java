@@ -29,7 +29,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -76,14 +75,7 @@ class DocumentAtomicVisibilityIntegrationTest {
         documentRegistry = new DocumentRegistry();
         visibilityTracker = new TestVisibilityTracker();
         
-        publisher = new DocumentBatchPublisher(
-            visibilityTracker,
-            documentRegistry,
-            // com.eonmux.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
-            // durability barrier is already satisfied before the adapter runs.
-            () -> { },
-            new ReentrantLock()
-        );
+        publisher = new DocumentBatchPublisher(visibilityTracker, documentRegistry);
     }
 
     @AfterEach
@@ -521,51 +513,6 @@ class DocumentAtomicVisibilityIntegrationTest {
             DocumentBatchBuffer.State.PUBLISHED, 
             DocumentBatchBuffer.State.FAILED
         );
-    }
-
-    /**
-     * Test: Verify bulk atomic publication.
-     */
-    @Test
-    void testBulkAtomicPublication() throws IOException {
-        int numDocuments = 5;
-        List<DocumentBatchBuffer> buffers = new ArrayList<>();
-        List<DocumentMetadata> metadataList = new ArrayList<>();
-        
-        for (int d = 0; d < numDocuments; d++) {
-            String documentId = "doc-bulk-" + d;
-            DocumentBatchBuffer buffer = new DocumentBatchBuffer(documentId, "test-source");
-            
-            List<TextChunk> chunks = createChunks(documentId, 3);
-            for (int i = 0; i < chunks.size(); i++) {
-                TextChunk chunk = chunks.get(i);
-                String chunkId = documentId + ":" + i;
-                buffer.addChunk(chunkId, chunk, writeLog.writeOffset());
-            }
-            buffer.seal();
-            buffers.add(buffer);
-            
-            DocumentMetadata metadata = DocumentMetadata.builder()
-                .sourceId("test-source")
-                .documentId(documentId)
-                .lastModifiedMillis(System.currentTimeMillis())
-                .contentHash((long) d * 1000)
-                .contentLength(1000)
-                .indexTimeMillis(System.currentTimeMillis())
-                .build();
-            metadataList.add(metadata);
-        }
-        
-        long epochBefore = visibilityTracker.currentEpoch();
-        
-        DocumentBatchPublisher.BulkPublicationResult result = publisher.publishBulk(buffers, metadataList);
-        
-        assertThat(result.epoch()).isGreaterThanOrEqualTo(epochBefore);
-        assertThat(result.documentCount()).isEqualTo(numDocuments);
-        assertThat(result.totalChunks()).isEqualTo(numDocuments * 3);
-        
-        System.out.println("Bulk publication verified: " + result.documentCount() + 
-            " documents with " + result.totalChunks() + " total chunks at epoch " + result.epoch());
     }
 
     /**

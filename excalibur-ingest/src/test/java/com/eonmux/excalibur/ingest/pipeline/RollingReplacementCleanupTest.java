@@ -15,7 +15,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -53,8 +52,7 @@ class RollingReplacementCleanupTest {
             new UpsertHandler(registry, writer),
             registry,
             writer,
-            new DocumentBatchPublisher(visibility, registry, () -> { },
-                new ReentrantLock()),
+            new DocumentBatchPublisher(visibility, registry),
             catalog,
             visibility);
     }

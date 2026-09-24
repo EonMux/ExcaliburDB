@@ -209,29 +209,6 @@ public class VisibilityTracker implements com.eonmux.excalibur.store.VisibilityT
         return newEpoch;
     }
 
-    /**
-     * Advances the epoch if the current value matches the expected value.
-     *
-     * <p>This is a conditional advance that can be used for optimistic updates.</p>
-     *
-     * <p><strong>Domain Correctness:</strong> Validates that the expected epoch is
-     * non-negative and that the advancement maintains monotonicity.</p>
-     *
-     * @param expectedEpoch The expected current epoch (must be non-negative)
-     * @return true if the epoch was advanced, false if the current epoch didn't match
-     * @throws IllegalArgumentException if expectedEpoch is negative
-     */
-    public boolean compareAndAdvanceEpoch(long expectedEpoch) {
-        if (expectedEpoch < 0) {
-            throw new IllegalArgumentException("Expected epoch must be non-negative: " + expectedEpoch);
-        }
-        boolean success = globalEpoch.compareAndSet(expectedEpoch, expectedEpoch + 1);
-        if (success) {
-            LOGGER.trace("Epoch advanced from {} to {} via CAS", expectedEpoch, expectedEpoch + 1);
-        }
-        return success;
-    }
-
     // ==================== Segment Registration ====================
 
     /**

@@ -166,25 +166,6 @@ public final class SegmentCandidate {
     }
 
     /**
-     * Creates a new SegmentCandidate with the specified LSH index.
-     *
-     * @param lshIndex The LSH index for the segment (may be null)
-     * @return A new SegmentCandidate with the LSH index
-     */
-    public SegmentCandidate withLshIndex(LshIndex lshIndex) {
-        return new SegmentCandidate(segmentId, segment, graph, state, lshIndex, lshCandidates);
-    }
-
-    /**
-     * Checks if this candidate has an LSH index.
-     *
-     * @return true if LSH index is available, false otherwise
-     */
-    public boolean hasLshIndex() {
-        return lshIndex != null;
-    }
-
-    /**
      * Checks if this candidate carries node IDs its LSH index named.
      *
      * @return true if LSH candidates are available (non-empty), false otherwise

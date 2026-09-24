@@ -52,7 +52,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -122,14 +121,7 @@ class EpochIsolationIntegrationTest {
         // Create ingestion infrastructure
         documentWriter = new AtomicDocumentWriter(writeLog);
         documentRegistry = new DocumentRegistry();
-        publisher = new DocumentBatchPublisher(
-            visibilityTracker,
-            documentRegistry,
-            // com.eonmux.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
-            // durability barrier is already satisfied before the adapter runs.
-            () -> { },
-            new ReentrantLock()
-        );
+        publisher = new DocumentBatchPublisher(visibilityTracker, documentRegistry);
     }
 
     @AfterEach
