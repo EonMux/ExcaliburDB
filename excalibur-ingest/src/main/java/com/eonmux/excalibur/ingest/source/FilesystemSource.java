@@ -42,7 +42,8 @@ import java.util.stream.StreamSupport;
  *   <li>Root path must be an existing, readable directory</li>
  *   <li>File extensions are case-insensitive (e.g., ".TXT" == ".txt")</li>
  *   <li>Maximum file size: 100 MiB, the largest document ingestion indexes (configurable
- *       downwards)</li>
+ *       downwards). A larger file is still listed, and refused when it is fetched, so a run
+ *       counts it failed rather than a re-crawl taking it as deleted</li>
  *   <li>Symlinks are not followed by default (configurable). When they are followed, a path
  *       whose real location lies outside the root is not part of the source</li>
  *   <li>Hidden files are excluded by default (configurable), and so is everything under a
@@ -515,10 +516,10 @@ public class FilesystemSource implements Source {
      * relativises cleanly against the root - the textual path stays inside while the bytes come
      * from outside. Comparing real path against real root is what actually closes that.</p>
      *
-     * <p>A path whose real location cannot be read is refused too. That is not the transient
-     * error {@link #shouldProcessFile} deliberately keeps: a file that cannot be shown to lie
-     * inside the source may lie outside it, and indexing the contents of an unknown file is
-     * worse than leaving one file out of the crawl.</p>
+     * <p>A path whose real location cannot be read is refused too, although a file this node
+     * merely cannot read is kept in the crawl and left for its fetch to fail: a file that cannot
+     * be shown to lie inside the source may lie outside it, and indexing the contents of an
+     * unknown file is worse than leaving one file out of the crawl.</p>
      */
     private boolean staysInsideRoot(Path path) {
         return containment(path) == Containment.INSIDE;
@@ -554,51 +555,43 @@ public class FilesystemSource implements Source {
     /** Where a path reached by following links lies; see {@link #containment}. */
     private enum Containment { INSIDE, OUTSIDE, GONE, UNRESOLVED }
 
+    /**
+     * Decides whether a path the walk reached is a document of this source.
+     *
+     * <p>What this admits is also what tells a re-crawl which documents still exist: a registered
+     * document absent from the crawl is taken as deleted and its chunks are tombstoned. So it
+     * judges only what makes a path part of the source - a regular file, reached as the source is
+     * configured to reach it, visible, of an included extension, inside the root - and never
+     * whether the file can be indexed as it now stands, nor anything it would have to read the
+     * file's attributes to know. A file that grew past {@code maxFileSize} is still listed and
+     * refused by {@link #fetch}: a re-crawl keeps the version it indexed before and counts the
+     * document failed, as it does an HTTP response grown past its limit, where leaving it out of
+     * the listing erased it. A file whose attributes this node cannot read is likewise kept, for
+     * its fetch to fail, rather than read as a deletion over a transient permission or network
+     * error.</p>
+     *
+     * @param path        A path the walk reached
+     * @param linkOptions How links are treated, as the source is configured
+     * @return Whether the path is one of this source's documents
+     */
     private boolean shouldProcessFile(Path path, LinkOption[] linkOptions) {
-        try {
-            if (!Files.isRegularFile(path, linkOptions)) {
-                return false;
-            }
-
-            if (!followSymlinks && Files.isSymbolicLink(path)) {
-                return false;
-            }
-
-            if (!includeHidden && isHidden(path)) {
-                return false;
-            }
-
-            if (!includedExtensions.isEmpty()) {
-                String extension = getExtension(path);
-                if (!includedExtensions.contains(extension)) {
-                    return false;
-                }
-            }
-
-            if (followSymlinks && !staysInsideRoot(path)) {
-                return false;
-            }
-
-            long size = Files.size(path);
-            if (size > maxFileSize) {
-                LOG.debug("Skipping file exceeding max size: {} ({} > {})", path, size, maxFileSize);
-                return false;
-            }
-
-            return true;
-
-        } catch (IOException e) {
-            // Kept in the crawl, not skipped. What this filter emits is also what tells a
-            // re-crawl which documents still exist: a registered document absent from the crawl
-            // is taken as deleted and its chunks are tombstoned. A file that was genuinely
-            // deleted never reaches this method - it is not in the directory listing to begin
-            // with - so every path that does reach it exists, and reading a transient
-            // permission or network error as a deletion destroys live data over a blip.
-            // Keeping it costs at most one failed fetch, which the run already reports.
-            LOG.warn("Could not inspect {}: {}. Keeping it in the crawl: a file this node "
-                + "cannot read is not a file that has been deleted.", path, e.getMessage());
-            return true;
+        if (!Files.isRegularFile(path, linkOptions)) {
+            return false;
         }
+
+        if (!followSymlinks && Files.isSymbolicLink(path)) {
+            return false;
+        }
+
+        if (!includeHidden && isHidden(path)) {
+            return false;
+        }
+
+        if (!includedExtensions.isEmpty() && !includedExtensions.contains(getExtension(path))) {
+            return false;
+        }
+
+        return !followSymlinks || staysInsideRoot(path);
     }
 
     private boolean isHidden(Path path) {
@@ -776,7 +769,11 @@ public class FilesystemSource implements Source {
         }
 
         /**
-         * Sets the largest file the walk lists; a larger one is never read.
+         * Sets the largest file the source reads.
+         *
+         * <p>A larger file is still listed by the crawl and refused when it is fetched, so a run
+         * counts it failed and a re-crawl keeps whatever version of it was indexed before it
+         * grew, rather than taking it as deleted.</p>
          *
          * @param maxBytes The bound, at most {@link DocumentLimits#MAX_DOCUMENT_BYTES}, which
          *                 is also the default; {@link #build()} refuses a larger one

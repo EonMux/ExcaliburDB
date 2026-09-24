@@ -469,7 +469,7 @@ class FilesystemSourceTest {
             .build();
 
         assertThatThrownBy(() -> source.fetch("large.txt"))
-            .isInstanceOf(SourceException.class)
+            .isInstanceOf(DocumentRefusedException.class)
             .hasMessageContaining("too large");
     }
 

@@ -709,7 +709,7 @@ curl -X POST http://localhost:8080/v1/ingest \
 | `max_depth` | integer | 100 | Directory levels below the root to descend, 1 to 1000 |
 | `follow_symlinks` | bool | `false` | Whether the walk descends through symbolic links. A link whose real target lies outside the root is skipped whatever this is set to, so a link cannot be used to read a directory the allow-list does not permit |
 | `include_hidden` | bool | `false` | Whether dot-files are indexed. While `false`, the walk does not enter a dot-directory either, so `.config/notes.md` is left out with its directory. The root itself is never judged: registering `~/.notes` indexes what is in it |
-| `max_file_bytes` | integer | 104857600 | Largest single file read, 1 byte to 100 MiB — the [largest document the node indexes](#document-size-limits). A larger file is never listed or read, so it is neither indexed nor truncated |
+| `max_file_bytes` | integer | 104857600 | Largest single file read, 1 byte to 100 MiB — the [largest document the node indexes](#document-size-limits). A larger file is listed but never read, so it is neither indexed nor truncated; it counts in `documents_failed` |
 | `charset` | string | UTF-8 | The encoding a file is read in when it carries no byte-order mark, by any name or alias the JVM knows (`windows-1252`, `latin1`, `UTF-16LE`). A file that does carry a mark is read in the encoding the mark names, whatever is declared here: the mark was written by the program that encoded that file, the declaration by someone describing the whole directory. An unknown name is a `400`, never a quiet fall-back to UTF-8, and the name is stored and read back in its canonical form |
 
 A value outside its range is answered `400` rather than clamped: clamping would register the
@@ -850,17 +850,17 @@ a crawled file, a fetched page, or one supplied to `POST /v1/documents`:
 
 At the default chunk size (512 tokens, 64 overlapping) the chunk limit is the one a text document
 meets first, at roughly 18 MB. A document over the chunk limit, or an HTTP response over the byte
-limit, is counted in `documents_failed` on the first crawl and on every re-crawl alike, and
-nothing of that version is searchable; on a re-crawl the version indexed before it stays, as for
-any document a re-crawl fails on. A file over a filesystem source's `max_file_bytes` is different:
-the walk does not list it (below), so a re-crawl takes a file that grew past it as gone and
-removes the version indexed before. A larger document has to be split before it is ingested.
+limit, or a file over a filesystem source's `max_file_bytes`, is counted in `documents_failed`
+on the first crawl and on every re-crawl alike, and nothing of that version is searchable; on a
+re-crawl the version indexed before it stays, as for any document a re-crawl fails on — a file
+that grew past `max_file_bytes` is still there, and is not taken as deleted. A larger document has
+to be split before it is ingested.
 
 `max_file_bytes` and `max_response_bytes` cannot be set past the byte limit, since a larger file or
-body could only be read to be discarded. A filesystem walk never lists a file over its
-`max_file_bytes`, so such a file is not read, not counted as failed and not counted in
-`entries_skipped`; an HTTP response over `max_response_bytes` is stopped as soon as it passes the
-bound and counts as a failed document. A registration recorded by an earlier version with a larger
+body could only be read to be discarded. A filesystem crawl lists a file over its
+`max_file_bytes` and does not read it: it counts as a failed document, not in `entries_skipped`,
+and the reason, `File too large`, is in the node's log. An HTTP response over `max_response_bytes`
+is stopped as soon as it passes the bound and counts as a failed document the same way. A registration recorded by an earlier version with a larger
 value is restored at the limit, with a warning in the log, rather than refused.
 
 ### Error responses
