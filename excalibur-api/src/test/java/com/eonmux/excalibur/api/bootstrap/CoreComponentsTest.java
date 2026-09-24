@@ -21,6 +21,8 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests for the storage stack the whole server is built on.
@@ -49,6 +51,23 @@ class CoreComponentsTest {
             }
             components = null;
         }
+    }
+
+    /**
+     * The storage engine cannot run on ByteBuffer segments. Refused deeper down, the failure
+     * names neither the property that forced them nor the flag that grants native access, and
+     * follows a line announcing the fallback as though it were in use.
+     */
+    @Test
+    @DisplayName("a JVM without Panama FFM is refused in one line naming both causes")
+    void withoutPanamaTheNodeIsRefused() {
+        assertThatThrownBy(() -> CoreComponents.requirePanama(false))
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("com.eonmux.excalibur.useFallback")
+            .hasMessageContaining("--enable-native-access")
+            .satisfies(e -> assertThat(e.getMessage()).doesNotContain("\n"));
+        assertThatCode(() -> CoreComponents.requirePanama(true))
+            .doesNotThrowAnyException();
     }
 
     @Test

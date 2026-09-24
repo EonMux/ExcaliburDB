@@ -65,8 +65,8 @@ import java.util.Objects;
  * @param documentVisibilityTracker Holds the registry that says which documents this node has
  * @param graphTenants              Every open namespace graph
  * @param storageEngine             Storage, closed after every reader has drained
- * @param arena                     The shared arena backing the mappings, or null on the
- *                                  ByteBuffer fallback
+ * @param arena                     The shared arena backing the mappings, or null when
+ *                                  there is none to close
  * @param shutdownTimeout           The whole shutdown's deadline, from
  *                                  {@link ShutdownBudget#configuredTimeout}
  * @author ExcaliburDB

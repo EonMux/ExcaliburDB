@@ -368,8 +368,9 @@ public class StorageEngine implements AutoCloseable {
         this.usingPanama = MemorySegmentFactory.isPanamaAvailable();
         if (!usingPanama) {
             throw new IllegalStateException(
-                "StorageEngine requires Panama FFM (Java 21+ with native access enabled). "
-                + "The ByteBuffer fallback cannot back Segment or WriteLog mappings.");
+                "StorageEngine requires Panama FFM and has no ByteBuffer implementation: remove "
+                + "-Dcom.eonmux.excalibur.useFallback=true if it is set, and otherwise start the "
+                + "JVM with --enable-native-access=ALL-UNNAMED");
         }
         this.arena = Arena.ofShared();
         this.ownsArena = true;
