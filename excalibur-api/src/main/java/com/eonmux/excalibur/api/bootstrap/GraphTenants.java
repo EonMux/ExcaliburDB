@@ -23,9 +23,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
@@ -1211,6 +1213,31 @@ public final class GraphTenants implements AutoCloseable {
             }
         }
         return ErasureLog.statusOf(GraphTenant.erasureLogOf(graphDirectoryOf(id)), requestId);
+    }
+
+    /**
+     * Where several erasure requests of a namespace stand, read once, without creating or
+     * opening anything.
+     *
+     * @param id         The namespace
+     * @param requestIds Ids the namespace handed out
+     * @return The status of each id the namespace handed out; the others, and every id of a
+     *         namespace that does not exist, are absent
+     * @throws IOException if the namespace's log exists and cannot be read
+     * @see #erasureStatus(NamespaceId, long)
+     */
+    public Map<Long, ErasureLog.RequestStatus> erasureStatuses(NamespaceId id,
+                                                               Collection<Long> requestIds)
+            throws IOException {
+        Objects.requireNonNull(id, "id must not be null");
+        Objects.requireNonNull(requestIds, "requestIds must not be null");
+        Optional<NamespaceRegistry.Lease<GraphTenant>> resident = registry.borrowResident(id);
+        if (resident.isPresent()) {
+            try (NamespaceRegistry.Lease<GraphTenant> held = resident.get()) {
+                return held.resource().erasureService().statuses(requestIds);
+            }
+        }
+        return ErasureLog.statusesOf(GraphTenant.erasureLogOf(graphDirectoryOf(id)), requestIds);
     }
 
     /**

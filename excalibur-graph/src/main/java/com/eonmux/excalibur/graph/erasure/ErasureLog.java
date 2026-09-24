@@ -401,20 +401,39 @@ public final class ErasureLog implements AutoCloseable {
      * @throws NullPointerException if {@code file} is null
      */
     public static Optional<RequestStatus> statusOf(Path file, long id) throws IOException {
+        return Optional.ofNullable(statusesOf(file, List.of(id)).get(id));
+    }
+
+    /**
+     * Where several requests of a log stand, from one read of the file.
+     *
+     * <p>{@link #statusOf} per id would replay the whole log once per id, and a document
+     * erasure submits one request per document it removed.</p>
+     *
+     * @param file The log file; need not exist
+     * @param ids  The request ids
+     * @return The status of each id this log handed out; an id it never did is absent
+     * @throws IOException if the file exists and is not an erasure log this build can read
+     * @throws LogCorruptionException if damage has an intact record behind it
+     * @throws NullPointerException if {@code file} or {@code ids} is null
+     */
+    public static Map<Long, RequestStatus> statusesOf(Path file, Collection<Long> ids)
+            throws IOException {
         Objects.requireNonNull(file, "file must not be null");
+        Objects.requireNonNull(ids, "ids must not be null");
         if (!Files.exists(file)) {
-            return Optional.empty();
+            return Map.of();
         }
         if (Files.size(file) < HEADER_BYTES) {
             // A torn creation has handed out nothing; anything else that short is refused as
             // the open refuses it.
             inspectLog(file);
-            return Optional.empty();
+            return Map.of();
         }
         Replay replay = replay(file);
         TailIntegrity.requireTornTail(file, "erasure log", replay.contents(),
             replay.validBytes(), ErasureLog::recordStartsAt);
-        return statusIn(id, replay.outstanding(), replay.completed(), replay.nextId());
+        return statusesIn(ids, replay.outstanding(), replay.completed(), replay.nextId());
     }
 
     /**
@@ -427,6 +446,31 @@ public final class ErasureLog implements AutoCloseable {
         synchronized (appendLock) {
             return statusIn(id, outstanding, completed, nextId);
         }
+    }
+
+    /**
+     * Where several requests stand, read under one hold of the log.
+     *
+     * @param ids The request ids
+     * @return The status of each id this log handed out; an id it never did is absent
+     * @throws NullPointerException if {@code ids} is null
+     */
+    public Map<Long, RequestStatus> statuses(Collection<Long> ids) {
+        Objects.requireNonNull(ids, "ids must not be null");
+        synchronized (appendLock) {
+            return statusesIn(ids, outstanding, completed, nextId);
+        }
+    }
+
+    private static Map<Long, RequestStatus> statusesIn(Collection<Long> ids,
+                                                       Map<Long, ErasureRequest> owed,
+                                                       Map<Long, RequestStatus> done,
+                                                       long nextId) {
+        Map<Long, RequestStatus> statuses = new LinkedHashMap<>();
+        for (long id : ids) {
+            statusIn(id, owed, done, nextId).ifPresent(status -> statuses.put(id, status));
+        }
+        return statuses;
     }
 
     /**

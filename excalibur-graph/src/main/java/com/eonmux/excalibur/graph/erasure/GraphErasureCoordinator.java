@@ -831,6 +831,16 @@ public final class GraphErasureCoordinator {
         return log.status(requestId);
     }
 
+    /**
+     * Where several requests stand.
+     *
+     * @param requestIds Ids {@link #submit} returned
+     * @return The status of each id ever handed out; the others are absent
+     */
+    public Map<Long, ErasureLog.RequestStatus> statuses(Collection<Long> requestIds) {
+        return log.statuses(requestIds);
+    }
+
     @Override
     public String toString() {
         return "GraphErasureCoordinator[" + log.outstandingCount() + " outstanding]";

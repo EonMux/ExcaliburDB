@@ -5,6 +5,7 @@ import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
+import com.eonmux.excalibur.ingest.registry.ErasureReceiptFile;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
@@ -20,12 +21,14 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -253,6 +256,43 @@ class ExcaliburDBServerErasureRouteTest {
             .isTrue();
         assertThat(server.getIngestSourceRegistry().isRegistered("docs")).isFalse();
         assertThat(storage).isEmpty();
+    }
+
+    @Test
+    @DisplayName("an erasure's receipt reads back over HTTP, and needs a token to")
+    void receiptReadsBack(@TempDir Path dataDir) throws Exception {
+        UpsertHandler.StorageAdapter adapter =
+            key -> storage.remove(new String(key, StandardCharsets.UTF_8)) != null;
+        server = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
+        server.withSecurity(ApiSecurityConfig.builder().authToken(TOKEN).build());
+        server.withDocumentErasure(new DocumentErasureService(registry, adapter, null, null));
+        server.withErasureReceipts(ErasureReceiptFile.open(dataDir));
+        server.start();
+        ingest("docs", "handbook.md", 1);
+
+        JsonNode erased = new ObjectMapper().readTree(post(
+            "{\"source_id\": \"docs\", \"document_id\": \"handbook.md\"}", TOKEN).body());
+        String id = erased.get("request_id").asText();
+
+        Response status = call("/v1/erasure/" + id, "GET", "", TOKEN);
+        assertThat(status.status()).isEqualTo(200);
+        assertThat(new ObjectMapper().readTree(status.body()).get("state").asText())
+            .isEqualTo("discharged");
+        assertThat(call("/v1/erasure/" + id, "GET", "", null).status()).isEqualTo(401);
+        assertThat(call("/v1/erasure/unknown", "GET", "", TOKEN).status()).isEqualTo(404);
+        assertThat(call("/v1/erasure/" + id, "POST", "{}", TOKEN).status()).isEqualTo(405);
+    }
+
+    @Test
+    @DisplayName("a node keeping no receipts says so rather than denying the route exists")
+    void noReceiptsIsUnavailable() throws Exception {
+        startWithErasure();
+
+        Response response = post("{\"source_id\": \"docs\", \"document_id\": \"a.md\"}", TOKEN);
+
+        assertThat(new ObjectMapper().readTree(response.body()).get("request_id").isNull())
+            .isTrue();
+        assertThat(call("/v1/erasure/anything", "GET", "", TOKEN).status()).isEqualTo(503);
     }
 
     @Test

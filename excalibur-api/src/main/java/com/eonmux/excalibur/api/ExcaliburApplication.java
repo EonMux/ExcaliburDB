@@ -653,6 +653,10 @@ public final class ExcaliburApplication {
             com.eonmux.excalibur.ingest.lexical.StoredChunkText.of(storageEngine),
             documentVisibilityTracker,
             com.eonmux.excalibur.ingest.erasure.SegmentVectorEraser.of(storageEngine)));
+        // Beside the source catalog, so an erasure's caller can still ask about it after a
+        // restart; see GET /v1/erasure/{request_id}.
+        srv.withErasureReceipts(
+            com.eonmux.excalibur.ingest.registry.ErasureReceiptFile.open(dataDirectory));
     }
 
     /**

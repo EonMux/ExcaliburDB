@@ -11,6 +11,8 @@ import com.eonmux.excalibur.api.endpoint.CompactionEndpoint;
 import com.eonmux.excalibur.api.endpoint.CompactionRunner;
 import com.eonmux.excalibur.api.endpoint.CompactionStatusEndpoint;
 import com.eonmux.excalibur.api.endpoint.DocumentErasureEndpoint;
+import com.eonmux.excalibur.api.endpoint.DocumentErasureStatusEndpoint;
+
 import com.eonmux.excalibur.api.endpoint.DocumentFetchEndpoint;
 import com.eonmux.excalibur.api.endpoint.DocumentListEndpoint;
 import com.eonmux.excalibur.api.endpoint.DocumentUpsertEndpoint;
@@ -58,6 +60,7 @@ import com.eonmux.excalibur.ingest.lexical.StoredChunkText;
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
+import com.eonmux.excalibur.ingest.registry.ErasureReceiptFile;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
 import com.eonmux.excalibur.ingest.source.SourceResolver;
 import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
@@ -76,6 +79,7 @@ import com.eonmux.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Clock;
 import java.util.Objects;
 import java.util.function.DoubleSupplier;
 import java.util.function.Function;
@@ -169,6 +173,8 @@ final class EndpointRegistrar {
      * @param graphIngestSink      What ingestion stages facts through, or null
      * @param graphPipeline        A graph pipeline somebody else owns, or null
      * @param documentRegistry     What this node has ingested, or null
+     * @param erasureReceipts      Where each document erasure leaves the receipt
+     *                             {@code GET /v1/erasure/{request_id}} reads, or null for none
      */
     record Inputs(ApiSecurityConfig security,
                   Config config,
@@ -193,7 +199,8 @@ final class EndpointRegistrar {
                   GraphTenants graphTenants,
                   NamespaceRoutingGraphIngestSink graphIngestSink,
                   GraphRagPipeline graphPipeline,
-                  DocumentRegistry documentRegistry) {
+                  DocumentRegistry documentRegistry,
+                  ErasureReceiptFile erasureReceipts) {
     }
 
     /**
@@ -1000,10 +1007,25 @@ final class EndpointRegistrar {
         if (in.documentErasure() == null) {
             return;
         }
-        target.createContext("/v1/erasure", wrapHandler(exactPath("/v1/erasure",
-            onlyMethod("POST", audited("erasure.documents", corpusRoute(RequestGuard.Access.MUTATE,
-                new DocumentErasureEndpoint(in.documentErasure(), in.ingestSourceRegistry(),
-                    suppliedSources, in.graphTenants())))), notFound)));
+        // One context for the collection and its members: POST on the collection erases, GET on
+        // a member reads back where an erasure stands. The readback is a read, so polling it is
+        // not rationed against the mutate budget. A node wired without receipts answers it 503,
+        // naming what it lacks, rather than 404 for a route the API has.
+        HttpHandler status = onlyMethod("GET", corpusRoute(RequestGuard.Access.READ,
+            in.erasureReceipts() == null
+                ? unavailable("Service Unavailable - this node keeps no erasure receipts, so "
+                    + "it cannot say where an erasure stands")
+                : new DocumentErasureStatusEndpoint(in.erasureReceipts(), in.documentErasure(),
+                    in.graphTenants())));
+        target.createContext("/v1/erasure", wrapHandler(pathOrChild("/v1/erasure",
+            exactPath("/v1/erasure",
+                onlyMethod("POST", audited("erasure.documents",
+                    corpusRoute(RequestGuard.Access.MUTATE,
+                        new DocumentErasureEndpoint(in.documentErasure(),
+                            in.ingestSourceRegistry(), suppliedSources, in.graphTenants(),
+                            in.erasureReceipts(), Clock.systemUTC())))),
+                status),
+            notFound)));
     }
 
     /**

@@ -20,6 +20,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.locks.ReentrantLock;
@@ -383,17 +384,15 @@ public final class GraphErasureService {
      * @return true when none of them is still owed
      */
     private boolean allDischarged(List<Long> requestIds) {
+        Map<Long, ErasureLog.RequestStatus> statuses = statuses(requestIds);
         for (long id : requestIds) {
-            boolean discharged = status(id)
-                .map(status -> status.state() == ErasureLog.State.DISCHARGED)
-                .orElse(false);
-            if (!discharged) {
+            ErasureLog.RequestStatus status = statuses.get(id);
+            if (status == null || status.state() != ErasureLog.State.DISCHARGED) {
                 return false;
             }
         }
         return true;
     }
-
 
     /**
      * Runs a compaction if the policy says one is due.
@@ -540,6 +539,16 @@ public final class GraphErasureService {
      */
     public Optional<ErasureLog.RequestStatus> status(long requestId) {
         return coordinator.status(requestId);
+    }
+
+    /**
+     * Where several obligations stand.
+     *
+     * @param requestIds Ids {@link #submit} returned
+     * @return The status of each id this namespace handed out; the others are absent
+     */
+    public Map<Long, ErasureLog.RequestStatus> statuses(Collection<Long> requestIds) {
+        return coordinator.statuses(requestIds);
     }
 
     /**

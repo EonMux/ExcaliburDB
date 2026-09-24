@@ -79,6 +79,8 @@ final class EndpointBanner {
         lines.add(route("GET", "/v1/compact/status", "What the last compaction did"));
         if (routes.erasure()) {
             lines.add(route("POST", "/v1/erasure", "Remove named documents from the corpus"));
+            lines.add(route("GET", "/v1/erasure/{request_id}",
+                "Where one document erasure stands"));
         }
         if (routes.graphTenanted() || routes.graphQueryOnly()) {
             lines.add(route("POST", "/v1/graph/query", "Answer a question from the graph"));

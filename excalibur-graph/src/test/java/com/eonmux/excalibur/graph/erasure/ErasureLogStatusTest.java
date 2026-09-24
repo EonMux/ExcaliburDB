@@ -115,6 +115,43 @@ class ErasureLogStatusTest {
     }
 
     @Nested
+    @DisplayName("several at once")
+    class Batch {
+
+        @Test
+        @DisplayName("the open log and the file answer a batch the same way, leaving out ids "
+            + "never handed out")
+        void batchesAgree(@TempDir Path dir) throws IOException {
+            List<Long> asked = new ArrayList<>();
+            java.util.Map<Long, ErasureLog.RequestStatus> fromOpen;
+            try (ErasureLog log = ErasureLog.open(logFile(dir))) {
+                long done = log.submit(new ErasureScope.Entity(1), REQUESTED);
+                long owed = log.submit(
+                    new ErasureScope.Source(SourceType.DOCUMENT, 7), REQUESTED);
+                log.complete(List.of(done), APPLIED);
+                asked.addAll(List.of(done, owed, owed + 100));
+
+                fromOpen = log.statuses(asked);
+            }
+
+            java.util.Map<Long, ErasureLog.RequestStatus> fromFile =
+                ErasureLog.statusesOf(logFile(dir), asked);
+
+            assertThat(fromOpen).containsOnlyKeys(asked.get(0), asked.get(1));
+            assertThat(fromOpen.get(asked.get(0)).state())
+                .isEqualTo(ErasureLog.State.DISCHARGED);
+            assertThat(fromOpen.get(asked.get(1)).state()).isEqualTo(ErasureLog.State.PENDING);
+            assertThat(fromFile).isEqualTo(fromOpen);
+        }
+
+        @Test
+        @DisplayName("a log that was never written answers an empty batch")
+        void absentFile(@TempDir Path dir) throws IOException {
+            assertThat(ErasureLog.statusesOf(logFile(dir), List.of(1L, 2L))).isEmpty();
+        }
+    }
+
+    @Nested
     @DisplayName("across a restart")
     class Restart {
 

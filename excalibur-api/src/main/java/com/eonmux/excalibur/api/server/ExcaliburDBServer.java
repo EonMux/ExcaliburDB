@@ -16,7 +16,9 @@ import com.eonmux.excalibur.ingest.lsh.LshIngestionService;
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
+import com.eonmux.excalibur.ingest.registry.ErasureReceiptFile;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
+
 import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
 import com.eonmux.excalibur.ingest.source.SourceResolver;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
@@ -298,6 +300,18 @@ public class ExcaliburDBServer {
     public void withDocumentErasure(DocumentErasureService service) {
         requireNotStarted("erasure");
         wiring.withDocumentErasure(service);
+    }
+
+    /**
+     * Keeps a receipt for every document erasure, and serves {@code GET /v1/erasure/{request_id}}
+     * from them.
+     *
+     * @param receipts Where the receipts are recorded
+     * @throws IllegalStateException if the server is already running
+     */
+    public void withErasureReceipts(ErasureReceiptFile receipts) {
+        requireNotStarted("erasure receipts");
+        wiring.withErasureReceipts(receipts);
     }
 
     /**
