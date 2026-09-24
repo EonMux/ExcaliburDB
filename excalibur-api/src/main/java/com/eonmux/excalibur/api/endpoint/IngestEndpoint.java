@@ -382,6 +382,12 @@ public class IngestEndpoint implements HttpHandler {
                 Source source;
                 try {
                     source = sourceFactory.create(request);
+                    try {
+                        SourceFactory.requireListable(source);
+                    } catch (SourceConfigurationException e) {
+                        closeQuietly(source);
+                        throw e;
+                    }
                 } catch (IngestTargetRejectedException e) {
                     ResponseBody.sendError(exchange, 403, ErrorCode.TARGET_NOT_ALLOWED,
                         e.getMessage());

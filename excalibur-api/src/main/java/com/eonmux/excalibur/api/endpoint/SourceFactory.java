@@ -154,6 +154,24 @@ public final class SourceFactory {
     }
 
     /**
+     * Refuses a newly registered source that could never list a document.
+     *
+     * <p>Asked of a registration or a replacement only, never of a source restored at startup:
+     * one already recorded has to come back as it was, so it can be deregistered or replaced,
+     * where refusing it would leave its id held by a registration nothing can reach.</p>
+     *
+     * @param source A source {@link #create} built for a request
+     * @throws SourceConfigurationException naming the setting that keeps everything out
+     */
+    public static void requireListable(Source source) {
+        if (source instanceof HttpSource http) {
+            http.basePageRefusal().ifPresent(why -> {
+                throw new SourceConfigurationException(why);
+            });
+        }
+    }
+
+    /**
      * Builds the source a registration describes.
      *
      * @param descriptor What the source was registered as

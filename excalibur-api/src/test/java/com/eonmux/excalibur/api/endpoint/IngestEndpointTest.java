@@ -423,6 +423,45 @@ class IngestEndpointTest {
 
             assertThat(response.status()).isNotEqualTo(400);
         }
+
+        @Test
+        @DisplayName("refuses a crawl whose own base page its path patterns exclude")
+        void refusesACrawlThatExcludesItsBasePage() throws IOException {
+            Response response = post(crawlable(), null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://example.com/docs/\", "
+                + "\"included_path_patterns\": [\"/guide\"]}}", null);
+
+            assertThat(response.status())
+                .as("the walk starts at the base page, so a crawl that may not request it lists "
+                    + "nothing, ever, while reporting itself registered")
+                .isEqualTo(400);
+            assertThat(response.body()).contains("base_url").contains("included_path_patterns");
+            assertThat(registry.isRegistered("site")).isFalse();
+        }
+
+        @Test
+        @DisplayName("refuses a crawl under a path the default exclusions leave out, naming them")
+        void refusesACrawlUnderADefaultExclusion() throws IOException {
+            Response response = post(crawlable(), null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://example.com/api/reference/\"}}", null);
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("excluded_path_patterns").contains("/api");
+            assertThat(registry.isRegistered("site")).isFalse();
+        }
+
+        @Test
+        @DisplayName("accepts a crawl under a default exclusion once its exclusions are stated")
+        void acceptsACrawlWithItsOwnExclusions() throws IOException {
+            Response response = post(crawlable(), null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://example.com/api/reference/\", "
+                + "\"excluded_path_patterns\": [\"/admin\"]}}", null);
+
+            assertThat(response.status()).isNotEqualTo(400);
+        }
     }
 
     @Nested
@@ -1369,6 +1408,11 @@ class IngestEndpointTest {
     /**
      * Posts {@code requestBody} to an endpoint whose allow-list holds {@code root}.
      */
+    /** A node that may crawl example.com, so a crawl's own settings are what is judged. */
+    private static ApiSecurityConfig crawlable() {
+        return ApiSecurityConfig.builder().allowIngestHost("example.com").build();
+    }
+
     private Response post(Path root, InlineSourceIds supplied, String requestBody)
             throws IOException {
         return post(root, supplied, requestBody, null);

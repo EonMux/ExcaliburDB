@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -141,6 +142,10 @@ public class HttpSource implements Source {
     /** Five requests a second, unless a deployment says otherwise. */
     private static final Duration DEFAULT_CRAWL_DELAY = Duration.ofMillis(200);
     private static final int DEFAULT_MAX_DEPTH = 3;
+
+    /** The paths a crawl keeps out when its registration names none of its own. */
+    private static final Set<String> DEFAULT_EXCLUDED_PATH_PATTERNS =
+        Set.of("/api", "/admin", "/login", "/logout");
     private static final String DEFAULT_USER_AGENT = "ExcaliburDB/1.0";
 
     /**
@@ -1393,30 +1398,56 @@ public class HttpSource implements Source {
                 return false;
             }
 
-            for (String excluded : excludedPathPatterns) {
-                if (path.contains(excluded)) {
-                    return false;
-                }
-            }
-
-            if (!includedPathPatterns.isEmpty()) {
-                boolean matchesAny = false;
-                for (String included : includedPathPatterns) {
-                    if (path.contains(included)) {
-                        matchesAny = true;
-                        break;
-                    }
-                }
-                if (!matchesAny) {
-                    return false;
-                }
-            }
-
-            return true;
+            return pathRefusal(path) == null;
 
         } catch (IllegalArgumentException e) {
             return false;
         }
+    }
+
+    /**
+     * Why the path patterns keep a path out of the crawl, if they do.
+     *
+     * @param path A decoded URL path under the base path
+     * @return The reason, naming the setting that refuses it, or null when the patterns admit it
+     */
+    private String pathRefusal(String path) {
+        for (String excluded : excludedPathPatterns) {
+            if (path.contains(excluded)) {
+                return "the path '" + path + "' contains '" + excluded + "', one of "
+                    + "excluded_path_patterns " + new TreeSet<>(excludedPathPatterns)
+                    + " (which are " + DEFAULT_EXCLUDED_PATH_PATTERNS.stream().sorted().toList()
+                    + " when a registration gives none)";
+            }
+        }
+        if (!includedPathPatterns.isEmpty()
+                && includedPathPatterns.stream().noneMatch(path::contains)) {
+            return "the path '" + path + "' contains none of included_path_patterns "
+                + new TreeSet<>(includedPathPatterns);
+        }
+        return null;
+    }
+
+    /**
+     * Why this crawl's path patterns keep out the page its base URL names, if they do.
+     *
+     * <p>The walk starts at that page and reaches every other one through its links, so a crawl
+     * that may not request it lists nothing and never will, while each run of it succeeds. That is
+     * a registration to refuse when it is made - which is why this is asked separately rather than
+     * checked when the source is built: a registration already recorded has to come back at
+     * startup as it was, to be deregistered or replaced.</p>
+     *
+     * @return The reason, naming the setting that refuses the page, or empty when it is crawled
+     */
+    public Optional<String> basePageRefusal() {
+        String path;
+        try {
+            path = URI.create(normalizeUrl(baseUri.toString())).normalize().getPath();
+        } catch (IllegalArgumentException e) {
+            return Optional.empty();
+        }
+        String reason = pathRefusal(path == null || path.isEmpty() ? "/" : path);
+        return Optional.ofNullable(reason).map(why -> "base_url is never crawled: " + why);
     }
 
     /**
@@ -1641,7 +1672,7 @@ public class HttpSource implements Source {
         private Set<String> allowedDomains = Set.of();
         private boolean allowPrivateAddresses = false;
         private Set<String> includedPathPatterns = Set.of();
-        private Set<String> excludedPathPatterns = Set.of("/api", "/admin", "/login", "/logout");
+        private Set<String> excludedPathPatterns = DEFAULT_EXCLUDED_PATH_PATTERNS;
         private Set<String> includedContentTypes = Set.of();
         private int maxDepth = DEFAULT_MAX_DEPTH;
         private int maxDocuments = DEFAULT_MAX_DOCUMENTS;

@@ -785,6 +785,14 @@ redirect out of the base path fails that document rather than fetching it. `robo
 one request outside the base path, read at the root of each origin. Hosts resolving to any
 non-public address are refused whatever the allow-list says.
 
+The walk starts at the `base_url` page and reaches every other page through links, so the path
+patterns must admit that page. A registration or replacement whose patterns keep it out is a `400`
+naming the pattern: `https://example.com/api/reference/` under the default exclusions, or
+`included_path_patterns: ["/guide"]` over a base of `/docs/`. Give the crawl its own
+`excluded_path_patterns`, or a base page the inclusions admit. A pattern still applies to every
+page the walk reaches, so pages reached only through a page the patterns keep out are not crawled
+either.
+
 #### robots.txt
 
 Unless `respect_robots_txt` is `false`, the crawl follows each site's `robots.txt` as

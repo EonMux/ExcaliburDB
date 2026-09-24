@@ -401,6 +401,47 @@ class HttpSourceTest {
     }
 
     @Nested
+    @DisplayName("Base page refusal")
+    class BasePageRefusalTest {
+
+        private HttpSource over(String base, Set<String> included, Set<String> excluded) {
+            return HttpSource.builder()
+                .allowPrivateAddresses(true)
+                .sourceId("refusal")
+                .baseUrl(base)
+                .includedPathPatterns(included)
+                .excludedPathPatterns(excluded)
+                .build();
+        }
+
+        @Test
+        @DisplayName("names nothing when the patterns admit the base page")
+        void admitted() {
+            try (HttpSource admitted = over(baseUrl + "/docs/", Set.of("/docs"), Set.of("/api"))) {
+                assertThat(admitted.basePageRefusal()).isEmpty();
+            }
+        }
+
+        @Test
+        @DisplayName("names the exclusion that keeps the base page out")
+        void excluded() {
+            try (HttpSource excluded = over(baseUrl + "/api/v2/", Set.of(), Set.of("/api"))) {
+                assertThat(excluded.basePageRefusal()).get().asString()
+                    .contains("base_url").contains("'/api'").contains("excluded_path_patterns");
+            }
+        }
+
+        @Test
+        @DisplayName("says when no inclusion admits the base page")
+        void notIncluded() {
+            try (HttpSource notIncluded = over(baseUrl + "/docs/", Set.of("/guide"), Set.of())) {
+                assertThat(notIncluded.basePageRefusal()).get().asString()
+                    .contains("included_path_patterns").contains("/guide");
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("Crawl Budget")
     class CrawlBudgetTest {
 
