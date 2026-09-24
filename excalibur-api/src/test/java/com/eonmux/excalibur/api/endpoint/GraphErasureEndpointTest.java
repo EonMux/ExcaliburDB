@@ -119,6 +119,46 @@ class GraphErasureEndpointTest {
     }
 
     @Nested
+    @DisplayName("a namespace the node will not create")
+    class RefusedNamespace {
+
+        @Test
+        @DisplayName("a source scope in a namespace nobody created is refused, and recorded nowhere")
+        void aSourceScopeIsRefused() throws IOException {
+            tenants.close();
+            tenants = new GraphTenants(root, new Config(new HashMap<>(Map.of(
+                "excalibur.graph.ram-buffer-mb", "4.0",
+                "excalibur.graph.require-explicit-namespaces", "true"))),
+                MappingBudget.detect(), 4);
+            endpoint = new GraphErasureEndpoint(tenants);
+
+            Response response = call("POST", SOURCE, "acmee");
+
+            assertThat(response.status()).isEqualTo(404);
+            assertThat(Json.at(response.json(), "code")).isEqualTo("namespace_not_found");
+            assertThat(root.resolve("acmee")).doesNotExist();
+        }
+
+        @Test
+        @DisplayName("past the cap, a source scope that would create a namespace is refused")
+        void theCapIsAnswered() throws IOException {
+            tenants.close();
+            tenants = new GraphTenants(root, new Config(new HashMap<>(Map.of(
+                "excalibur.graph.ram-buffer-mb", "4.0",
+                "excalibur.graph.max-namespaces", "1"))),
+                MappingBudget.detect(), 4);
+            endpoint = new GraphErasureEndpoint(tenants);
+            assertThat(call("POST", SOURCE, "first").status()).isEqualTo(202);
+
+            Response response = call("POST", SOURCE, "second");
+
+            assertThat(response.status()).isEqualTo(429);
+            assertThat(Json.at(response.json(), "code")).isEqualTo("namespace_limit_reached");
+            assertThat(call("POST", SOURCE, "first").status()).isEqualTo(202);
+        }
+    }
+
+    @Nested
     @DisplayName("accepting an obligation")
     class Accepting {
 
@@ -688,6 +728,7 @@ class GraphErasureEndpointTest {
                 "{\"scope\": \"entity\", \"entity_name\": \"Ada Quazzlethorpe\"}");
 
             assertThat(response.status()).isEqualTo(409);
+            assertThat(Json.at(response.json(), "code")).isEqualTo("ambiguous_entity");
             assertThat(Json.at(response.json(), "candidates"))
                 .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.LIST)
                 .hasSize(2);

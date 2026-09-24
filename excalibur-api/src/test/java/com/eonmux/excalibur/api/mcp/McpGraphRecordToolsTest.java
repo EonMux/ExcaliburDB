@@ -47,7 +47,7 @@ class McpGraphRecordToolsTest {
             StubNode.Received request = node.onlyRequest();
             assertThat(request.method()).isEqualTo("GET");
             assertThat(request.path()).isEqualTo("/v1/graph/entities");
-            assertThat(request.query()).isEqualTo("name=Ada+Lovelace&limit=5");
+            assertThat(request.query()).isEqualTo("name=Ada Lovelace&limit=5");
             assertThat(request.headers()).containsEntry(ExcaliburClient.NAMESPACE_HEADER,
                 "tenant-a");
             assertThat(result.isError()).isFalse();
@@ -91,7 +91,7 @@ class McpGraphRecordToolsTest {
             StubNode.Received request = node.onlyRequest();
             assertThat(request.path()).isEqualTo("/v1/graph/entities/42/edges");
             assertThat(request.query()).isEqualTo(
-                "relation=worked+with&direction=in&as_of=1840-01-01&cursor=ZTpvOjE6MjoxCg");
+                "relation=worked with&direction=in&as_of=1840-01-01&cursor=ZTpvOjE6MjoxCg");
         }
     }
 

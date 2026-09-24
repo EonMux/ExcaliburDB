@@ -45,7 +45,12 @@ class McpToolsTest {
                 McpTools.INGESTION_STATUS, McpTools.CRAWL_WEBSITE, McpTools.DEREGISTER_SOURCE,
                 McpTools.REINDEX_SOURCE, McpTools.REINDEX_STATUS, McpTools.GRAPH_BUILD_STATUS,
                 McpTools.FIND_GRAPH_ENTITIES, McpTools.GRAPH_ENTITY_EDGES,
-                McpTools.ASSERT_GRAPH_FACTS);
+                McpTools.ASSERT_GRAPH_FACTS,
+                McpTools.LIST_DOCUMENTS, McpTools.FETCH_DOCUMENTS, McpTools.LIST_NAMESPACES,
+                McpTools.CREATE_NAMESPACE, McpTools.LIST_QUERIES, McpTools.CANCEL_QUERY,
+                McpTools.CANCEL_INGESTION, McpTools.CANCEL_REINDEX, McpTools.CANCEL_COMPACTION,
+                McpTools.CANCEL_GRAPH_BUILD, McpTools.ERASE_DOCUMENTS, McpTools.DELETE_NAMESPACE,
+                McpTools.READ_DOCUMENT, McpTools.ERASURE_STATUS);
         for (Object described : catalogue) {
             assertThat(Json.stringAt(described, "name")).isNotBlank();
             assertThat(Json.stringAt(described, "description"))

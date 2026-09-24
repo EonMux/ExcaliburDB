@@ -387,4 +387,53 @@ class GraphEntitiesEndpointTest {
             assertThat(response.string("error")).isEqualTo(GraphQueryEndpoint.NO_GRAPH);
         }
     }
+
+    @Nested
+    @DisplayName("error codes")
+    class ErrorCodes {
+
+        @Test
+        @DisplayName("no graph being served is graph_not_served, as the query says it")
+        void noGraph() throws IOException {
+            GraphRouteFixture.Response response = fixture.get(PATH);
+
+            assertThat(response.status()).isEqualTo(503);
+            assertThat(response.string("code")).isEqualTo("graph_not_served");
+        }
+
+        @Test
+        @DisplayName("an id the served graph does not hold is entity_not_found")
+        void unknownEntity() throws IOException {
+            stageAndBuild();
+
+            for (String uri : List.of(PATH + "/999999", PATH + "/999999/edges")) {
+                GraphRouteFixture.Response response = fixture.get(uri);
+                assertThat(response.status()).as(uri).isEqualTo(404);
+                assertThat(response.string("code")).as(uri).isEqualTo("entity_not_found");
+            }
+        }
+
+        @Test
+        @DisplayName("a malformed namespace is invalid_namespace, a malformed query "
+            + "invalid_request, and a path naming no route not_found")
+        void refusals() throws IOException {
+            stageAndBuild();
+
+            GraphRouteFixture.Response namespace = fixture.get(PATH, "Not A Namespace");
+            assertThat(namespace.status()).isEqualTo(400);
+            assertThat(namespace.string("code")).isEqualTo("invalid_namespace");
+
+            GraphRouteFixture.Response query = fixture.get(PATH + "?name=a&prefix=b");
+            assertThat(query.status()).isEqualTo(400);
+            assertThat(query.string("code")).isEqualTo("invalid_request");
+
+            GraphRouteFixture.Response route = fixture.get(PATH + "/1/friends");
+            assertThat(route.status()).isEqualTo(404);
+            assertThat(route.string("code")).isEqualTo("not_found");
+
+            GraphRouteFixture.Response method = fixture.entities("POST", PATH);
+            assertThat(method.status()).isEqualTo(405);
+            assertThat(method.string("code")).isEqualTo("method_not_allowed");
+        }
+    }
 }

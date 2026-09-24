@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.sun.net.httpserver.HttpExchange;
 
@@ -39,4 +40,17 @@ interface QueryReply {
     static QueryReply error(int status, String message) {
         return exchange -> ResponseBody.sendError(exchange, status, message);
     }
+
+    /**
+     * A reply that refuses the query for a cause the status alone does not name.
+     *
+     * @param status  The HTTP status
+     * @param code    The machine-readable cause
+     * @param message The reason, as the client will read it
+     * @return The reply
+     */
+    static QueryReply error(int status, ErrorCode code, String message) {
+        return exchange -> ResponseBody.sendError(exchange, status, code, message);
+    }
+
 }

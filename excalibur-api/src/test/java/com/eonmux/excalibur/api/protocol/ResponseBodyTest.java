@@ -31,6 +31,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ResponseBodyTest {
 
     private static final String BODY = "{\"live\": true}";
+    private static final String REFUSAL = "{\"error\": \"Not Found\"}";
+    private static final String CODED_REFUSAL =
+        "{\"error\": \"Not Found\", \"code\": \"not_found\"}";
 
     private HttpServer server;
     private final AtomicReference<Throwable> handlerFailure = new AtomicReference<>();
@@ -46,6 +49,8 @@ class ResponseBodyTest {
                 throw t;
             }
         });
+        server.createContext("/refused", exchange ->
+            ResponseBody.sendJson(exchange, 404, REFUSAL));
         server.start();
     }
 
@@ -85,10 +90,34 @@ class ResponseBodyTest {
         assertThat(handlerFailure.get()).isNull();
     }
 
+    @Test
+    @DisplayName("an error written without a code reaches the client with its status's default")
+    void errorGainsItsCode() throws Exception {
+        HttpResponse<String> response = send("GET", "/refused", HttpResponse.BodyHandlers.ofString());
+
+        assertThat(response.statusCode()).isEqualTo(404);
+        assertThat(response.body()).isEqualTo(CODED_REFUSAL);
+    }
+
+    @Test
+    @DisplayName("a HEAD error reports the length of the body its GET carries, code included")
+    void headErrorLengthIncludesTheCode() throws Exception {
+        HttpResponse<Void> response =
+            send("HEAD", "/refused", HttpResponse.BodyHandlers.discarding());
+
+        assertThat(response.headers().firstValue("Content-Length"))
+            .contains(String.valueOf(CODED_REFUSAL.getBytes(StandardCharsets.UTF_8).length));
+    }
+
     private <T> HttpResponse<T> send(String method, HttpResponse.BodyHandler<T> handler)
             throws Exception {
+        return send(method, "/probe", handler);
+    }
+
+    private <T> HttpResponse<T> send(String method, String path,
+                                     HttpResponse.BodyHandler<T> handler) throws Exception {
         HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/probe"))
+            .uri(URI.create("http://127.0.0.1:" + server.getAddress().getPort() + path))
             .method(method, HttpRequest.BodyPublishers.noBody())
             .timeout(Duration.ofSeconds(10))
             .build();

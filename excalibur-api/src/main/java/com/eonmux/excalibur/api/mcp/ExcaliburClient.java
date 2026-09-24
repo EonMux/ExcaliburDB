@@ -10,6 +10,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
+import java.util.StringJoiner;
 
 /**
  * The HTTP calls the MCP tools make against a running node.
@@ -227,11 +228,11 @@ public final class ExcaliburClient {
     }
 
     /**
-     * Reads from the node with any number of query parameters.
+     * Reads from the node with several query parameters.
      *
      * @param path      The route to read
-     * @param query     Parameter names to values, sent in iteration order; a null value is
-     *                  left out, so an argument the caller did not give leaves the node's default
+     * @param query     Parameter names to values, in the order to send them; a null value is left
+     *                  out rather than sent empty
      * @param namespace The namespace to read in, or null to send none
      * @return The node's answer
      * @throws IOException          if the node cannot be reached
@@ -239,22 +240,64 @@ public final class ExcaliburClient {
      */
     public Response get(String path, Map<String, String> query, String namespace)
             throws IOException, InterruptedException {
-        StringBuilder target = new StringBuilder(path);
-        char separator = '?';
-        for (Map.Entry<String, String> parameter : query.entrySet()) {
-            if (parameter.getValue() == null) {
-                continue;
+        StringJoiner parameters = new StringJoiner("&");
+        query.forEach((name, value) -> {
+            if (value != null) {
+                parameters.add(encode(name) + "=" + encode(value));
             }
-            target.append(separator)
-                .append(URLEncoder.encode(parameter.getKey(), StandardCharsets.UTF_8))
-                .append('=')
-                .append(URLEncoder.encode(parameter.getValue(), StandardCharsets.UTF_8));
-            separator = '&';
-        }
+        });
+        String target = parameters.length() == 0 ? path : path + "?" + parameters;
         return send(HttpRequest.newBuilder()
-            .uri(baseUri.resolve(target.toString()))
+            .uri(baseUri.resolve(target))
             .timeout(timeout)
             .GET(), namespace);
+    }
+
+    /**
+     * PUTs to a path with no body, for a route that names its subject in the path.
+     *
+     * @param path      Path on the node, beginning with {@code /}
+     * @param namespace Namespace to scope the call to, or null to send none
+     * @return The node's answer
+     * @throws IOException          if the node cannot be reached
+     * @throws InterruptedException if the calling thread is interrupted
+     */
+    public Response put(String path, String namespace) throws IOException, InterruptedException {
+        return send(HttpRequest.newBuilder()
+            .uri(baseUri.resolve(path))
+            .timeout(timeout)
+            .PUT(HttpRequest.BodyPublishers.noBody()), namespace);
+    }
+
+    /**
+     * DELETEs a path with no body, for a route that names its subject in the path or has only
+     * one thing to stop.
+     *
+     * @param path      Path on the node, beginning with {@code /}
+     * @param namespace Namespace to scope the call to, or null to send none
+     * @return The node's answer
+     * @throws IOException          if the node cannot be reached
+     * @throws InterruptedException if the calling thread is interrupted
+     */
+    public Response delete(String path, String namespace)
+            throws IOException, InterruptedException {
+        return send(HttpRequest.newBuilder()
+            .uri(baseUri.resolve(path))
+            .timeout(timeout)
+            .DELETE(), namespace);
+    }
+
+    /**
+     * Percent-encodes one query-string or path component.
+     *
+     * <p>A space becomes {@code %20} rather than the form encoding's {@code +}, which is a space
+     * only in a query string and a literal plus in a path.</p>
+     *
+     * @param value The raw component
+     * @return It, encoded
+     */
+    static String encode(String value) {
+        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
     }
 
     private Response send(HttpRequest.Builder request, String namespace)

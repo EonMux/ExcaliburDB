@@ -263,22 +263,48 @@ class GraphBuildEndpointTest {
         }
 
         @Test
-        @DisplayName("a namespace that cannot be opened fails the build, and the acceptance "
+        @DisplayName("a namespace that cannot be created is refused at once, and the answer "
             + "describes no filesystem")
-        void anUnopenableNamespaceFailsTheBuild() throws IOException {
-            // A regular file where the namespace's directory belongs. The registry wraps the
-            // failure as an UncheckedIOException, which is not an IOException - so a runner
-            // that caught only the latter would lose the run with no state to read back.
+        void anUncreatableNamespaceIsRefused() throws IOException {
+            // A regular file where the namespace's directory belongs. The namespace is admitted
+            // before the build is claimed, so creating it fails on this request rather than
+            // behind a 202, and nothing is left claimed.
             Files.writeString(root.resolve("acme"), "not a directory");
 
-            Response accepted = call(build, "POST", "acme");
+            Response refused = call(build, "POST", "acme");
 
-            assertThat(accepted.status()).isEqualTo(202);
-            assertThat(accepted.body())
-                .as("the path it will fail on belongs in the log, not in the acceptance")
-                .doesNotContain("acme/graph");
-            Object json = awaitState("acme", GraphBuildRunner.STATE_FAILED);
-            assertThat(Json.stringAt(json, "error")).isNotBlank();
+            assertThat(refused.status()).isEqualTo(500);
+            assertThat(refused.body())
+                .as("the path it failed on belongs in the log, not in the answer")
+                .doesNotContain(root.toString());
+            assertThat(Json.stringAt(call(status, "GET", "acme").json(), "state"))
+                .isEqualTo(GraphBuildRunner.STATE_IDLE);
+            assertThat(call(build, "POST", "beta").status())
+                .as("the refusal claimed nothing, so the next build starts")
+                .isEqualTo(202);
+        }
+
+        @Test
+        @DisplayName("a namespace the node will not create is refused before a build is claimed")
+        void aRefusedNamespaceClaimsNothing() throws IOException {
+            tenants.close();
+            tenants = new GraphTenants(root, new Config(new HashMap<>(Map.of(
+                "excalibur.graph.ram-buffer-mb", "4.0",
+                "excalibur.graph.require-explicit-namespaces", "true"))),
+                MappingBudget.detect(), 4);
+            useRunner(new GraphBuildRunner(tenants));
+
+            Response refused = call(build, "POST", "acmee");
+
+            assertThat(refused.status()).isEqualTo(404);
+            assertThat(Json.stringAt(refused.json(), "code")).isEqualTo("namespace_not_found");
+            assertThat(root.resolve("acmee")).doesNotExist();
+            assertThat(Json.stringAt(call(status, "GET", "acmee").json(), "state"))
+                .isEqualTo(GraphBuildRunner.STATE_IDLE);
+
+            tenants.create(NamespaceId.of("acme"));
+            assertThat(call(build, "POST", "acme").status()).isEqualTo(202);
+            awaitState("acme", GraphBuildRunner.STATE_COMPLETED);
         }
 
         @Test

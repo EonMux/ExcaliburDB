@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.RequestBody;
 
 import com.sun.net.httpserver.HttpExchange;
@@ -448,7 +449,8 @@ public class QueryEndpoint implements HttpHandler {
                         return;
                     }
                     LOGGER.error("Query endpoint is not ready: {}", UNCONFIGURED_QUERY_REASON);
-                    sendError(exchange, 503, UNCONFIGURED_QUERY_REASON);
+                    ResponseBody.sendError(exchange, 503, ErrorCode.NOT_CONFIGURED,
+                        UNCONFIGURED_QUERY_REASON);
                     return;
                 }
 
@@ -809,7 +811,7 @@ public class QueryEndpoint implements HttpHandler {
             Thread.currentThread().interrupt();
             pipelineToken.cancel("Query interrupted");
             LOGGER.warn("Query interrupted");
-            return QueryReply.error(503, "Query interrupted");
+            return QueryReply.error(503, ErrorCode.SHUTTING_DOWN, "Query interrupted");
         } catch (ExecutionException e) {
             // A rejected key, an open circuit breaker, a 429, a 5xx, or a pipeline that
             // threw. None of those is a fact about the corpus, and BM25 needs no

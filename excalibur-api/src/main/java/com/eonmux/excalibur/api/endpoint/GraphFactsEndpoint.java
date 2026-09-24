@@ -5,7 +5,9 @@ import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphErasureService;
 import com.eonmux.excalibur.api.bootstrap.GraphTenant;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.bootstrap.NamespaceRefusedException;
 import com.eonmux.excalibur.api.mcp.Json;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.QueryParams;
 import com.eonmux.excalibur.api.protocol.RequestBody;
@@ -132,18 +134,29 @@ public final class GraphFactsEndpoint implements HttpHandler {
         }
 
         NamespaceId namespace;
-        List<AssertedFact> facts;
         try {
             namespace = namespaceOf(exchange);
+        } catch (IllegalArgumentException e) {
+            sendError(exchange, 400, ErrorCode.INVALID_NAMESPACE, e.getMessage());
+            return;
+        }
+        List<AssertedFact> facts;
+        try {
             facts = factsFrom(body);
         } catch (IllegalArgumentException | Json.JsonException e) {
             sendError(exchange, 400, e.getMessage());
             return;
         }
 
+        // Borrowing admits the namespace: a name nobody created is refused where the node
+        // requires explicit creation, and one past the node's cap is refused everywhere, before
+        // anything is staged or any directory is made.
         List<Long> ids;
         try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(namespace)) {
             ids = lease.resource().staging().assertFacts(facts);
+        } catch (NamespaceRefusedException e) {
+            sendError(exchange, e.reason().statusCode(), e.reason().code(), e.getMessage());
+            return;
         } catch (IOException | RuntimeException e) {
             LOGGER.error("asserting {} facts into namespace {} failed", facts.size(), namespace, e);
             sendError(exchange, 500, "Internal Server Error");
@@ -279,10 +292,15 @@ public final class GraphFactsEndpoint implements HttpHandler {
             return;
         }
         NamespaceId namespace;
+        try {
+            namespace = namespaceOf(exchange);
+        } catch (IllegalArgumentException e) {
+            sendError(exchange, 400, ErrorCode.INVALID_NAMESPACE, e.getMessage());
+            return;
+        }
         Retraction retraction;
         boolean compactNow;
         try {
-            namespace = namespaceOf(exchange);
             retraction = Retraction.parse(path, exchange.getRequestURI().getRawQuery());
             compactNow = compactFrom(exchange.getRequestURI().getRawQuery());
         } catch (IllegalArgumentException e) {
@@ -296,13 +314,13 @@ public final class GraphFactsEndpoint implements HttpHandler {
             Optional<NamespaceRegistry.Lease<GraphTenant>> borrowed =
                 tenants.borrowIfPresent(namespace);
             if (borrowed.isEmpty()) {
-                sendError(exchange, 404, retraction.notFound());
+                sendError(exchange, 404, ErrorCode.FACT_NOT_FOUND, retraction.notFound());
                 return;
             }
             try (NamespaceRegistry.Lease<GraphTenant> lease = borrowed.get()) {
                 List<Long> factIds = retraction.matching(lease.resource().staging());
                 if (factIds.isEmpty()) {
-                    sendError(exchange, 404, retraction.notFound());
+                    sendError(exchange, 404, ErrorCode.FACT_NOT_FOUND, retraction.notFound());
                     return;
                 }
                 accept(exchange, namespace, lease.resource().erasureService(), factIds,
@@ -491,5 +509,10 @@ public final class GraphFactsEndpoint implements HttpHandler {
             throws IOException {
         ResponseBody.sendJson(exchange, status, "{\"error\":" + GraphCatalogJson.quoted(message)
             + "}");
+    }
+
+    private static void sendError(HttpExchange exchange, int status, ErrorCode code,
+                                  String message) throws IOException {
+        ResponseBody.sendError(exchange, status, code, message);
     }
 }

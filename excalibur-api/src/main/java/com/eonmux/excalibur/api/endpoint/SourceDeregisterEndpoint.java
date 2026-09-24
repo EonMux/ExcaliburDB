@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.eonmux.excalibur.api.audit.AuditLog;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.RequestBody;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -99,15 +100,15 @@ public class SourceDeregisterEndpoint implements HttpHandler {
             // would leave the caller believing a crawl had stopped that restarts itself at the
             // next boot; the detail is for the log, and the response names no path.
             LOGGER.error("Source deregistration could not be recorded: {}", e.getMessage(), e);
-            ResponseBody.sendJson(exchange, SourceCatalogException.STATUS_CODE,
-                "{\"error\": \"" + SourceCatalogException.CLIENT_MESSAGE + "\"}");
+            ResponseBody.sendError(exchange, SourceCatalogException.STATUS_CODE,
+                ErrorCode.CATALOG_UNAVAILABLE, SourceCatalogException.CLIENT_MESSAGE);
             return;
         }
         if (!removed) {
             // 404, not a quiet success: a caller stopping a crawl needs to know whether they named
             // a source this node was actually crawling, or misspelled one that still is.
-            ResponseBody.sendJson(exchange, 404,
-                "{\"error\": \"Source not registered: " + JsonText.escape(sourceId) + "\"}");
+            ResponseBody.sendError(exchange, 404, ErrorCode.SOURCE_NOT_FOUND,
+                "Source not registered: " + sourceId);
             return;
         }
 

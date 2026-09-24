@@ -3,7 +3,7 @@ package com.eonmux.excalibur.api.server;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
-import com.eonmux.excalibur.api.protocol.JsonText;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.api.security.RequestGuard;
 import com.eonmux.excalibur.tenancy.NamespaceId;
@@ -11,11 +11,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeSet;
 
 /**
  * The combinators every route on this node is built from.
@@ -69,19 +69,51 @@ final class HttpRouting {
     }
 
     /**
-     * Serves a context for its own path and for the paths directly beneath it.
+     * Serves a collection and its members: the context's own path, and one segment beneath it.
      *
-     * <p>For {@code /v1/query}, whose cancel route carries the query id in the path. Anything
-     * deeper than one segment, or under a longer prefix that merely starts the same way, is
-     * still 404.</p>
+     * <p>For {@code /v1/query}, whose cancel route carries the query id in the path, and
+     * {@code /v1/graph/namespaces}, whose members are the namespaces. The two are separate paths
+     * with separate method tables, so each answers a method it does not serve with its own 405
+     * and {@code Allow} - a DELETE of the collection or a GET of a member is refused by the
+     * routing, before the guard, rather than reaching a handler that can only refuse it after
+     * authentication. An empty member segment, anything deeper than one segment, and a longer
+     * prefix that merely starts the same way are 404.</p>
+     *
+     * @param context    The path this context is registered under
+     * @param collection What serves the context's own path
+     * @param member     What serves {@code context/{segment}}
+     * @param notFound   What answers every other path reaching this context
+     * @return A handler dispatching on which of the two paths a request names
+     */
+    static HttpHandler collectionAndMember(String context, HttpHandler collection,
+                                           HttpHandler member, HttpHandler notFound) {
+        return exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if (isExactly(context, path)) {
+                collection.handle(exchange);
+            } else if (isMember(context, path)) {
+                member.handle(exchange);
+            } else {
+                notFound.handle(exchange);
+            }
+        };
+    }
+
+    /**
+     * Serves a context's own path and every path beneath it, for a handler that parses the rest.
+     *
+     * <p>For {@code /v1/graph/entities}, whose routes are an entity and its edges, two and three
+     * segments deep. Only the paths are handed on: the method table wrapped in {@code delegate}
+     * still answers a method none of them serves, so a 405 is decided before the guard here as
+     * it is everywhere else. A longer prefix that merely starts the same way is 404.</p>
      *
      * @param context  The path this context is registered under
-     * @param delegate What serves the path and its children
+     * @param delegate What serves the path and everything beneath it
      * @param notFound What answers every other path reaching this context
      * @return A handler that answers 404 for paths outside the context
      */
-    static HttpHandler pathOrChild(String context, HttpHandler delegate,
-                                   HttpHandler notFound) {
+    static HttpHandler pathAndBelow(String context, HttpHandler delegate,
+                                    HttpHandler notFound) {
         return exchange -> {
             String path = exchange.getRequestURI().getPath();
             if (isExactly(context, path) || path.startsWith(context + "/")) {
@@ -90,6 +122,16 @@ final class HttpRouting {
                 notFound.handle(exchange);
             }
         };
+    }
+
+    /** Whether a path names exactly one non-empty segment beneath a context. */
+    private static boolean isMember(String context, String path) {
+        String prefix = context + "/";
+        if (!path.startsWith(prefix)) {
+            return false;
+        }
+        String segment = path.substring(prefix.length());
+        return !segment.isEmpty() && segment.indexOf('/') < 0;
     }
 
     /** Whether a request path is a context's own path, with or without one trailing slash. */
@@ -165,6 +207,10 @@ final class HttpRouting {
      * {@link RequestGuard} decision, including the fall-through, so a method the route does not
      * serve is still charged for.</p>
      *
+     * <p>The fall-through is handed the exchange with {@code Allow} already set to the methods
+     * this router serves, as RFC 9110 requires of a 405: the table is the one place that knows
+     * them, so no route has to repeat its method list in a header it could let drift.</p>
+     *
      * @param handlers  The handler for each method, keyed by method name
      * @param otherwise The handler for every other method
      * @return A handler that dispatches on the request method
@@ -177,10 +223,17 @@ final class HttpRouting {
         Map<String, HttpHandler> byMethod = new HashMap<>();
         handlers.forEach((method, handler) -> byMethod.put(
             method.toUpperCase(Locale.ROOT), Objects.requireNonNull(handler, method)));
+        Objects.requireNonNull(otherwise, "otherwise cannot be null");
+        String allow = String.join(", ", new TreeSet<>(byMethod.keySet()));
         return exchange -> {
             HttpHandler handler = byMethod.get(
                 exchange.getRequestMethod().toUpperCase(Locale.ROOT));
-            (handler == null ? otherwise : handler).handle(exchange);
+            if (handler == null) {
+                exchange.getResponseHeaders().set("Allow", allow);
+                otherwise.handle(exchange);
+                return;
+            }
+            handler.handle(exchange);
         };
     }
 
@@ -205,7 +258,7 @@ final class HttpRouting {
      * @return A handler for a method this node cannot serve
      */
     static HttpHandler unavailable(String message) {
-        return exchange -> sendError(exchange, 503, message);
+        return exchange -> ResponseBody.sendError(exchange, 503, ErrorCode.NOT_CONFIGURED, message);
     }
 
     /**
@@ -240,7 +293,8 @@ final class HttpRouting {
             // The name the caller sent is deliberately not echoed. It is attacker-controlled
             // text on a path that answers before any other validation, and naming the header
             // is what the caller needs to fix the request.
-            sendError(exchange, 400, GraphTenants.NAMESPACE_HEADER + " named a namespace, and "
+            ResponseBody.sendError(exchange, 400, ErrorCode.NAMESPACE_NOT_ACCEPTED,
+                GraphTenants.NAMESPACE_HEADER + " named a namespace, and "
                 + "this route serves the shared corpus rather than any one namespace. "
                 + "Namespaces are honoured on the /v1/graph/* routes and on POST /v1/ingest, "
                 + "which records the one a source stages into; remove the header or "
@@ -262,10 +316,6 @@ final class HttpRouting {
      */
     private static void sendError(HttpExchange exchange, int statusCode, String message)
             throws IOException {
-        String json = String.format("{\"error\": \"%s\"}", JsonText.escape(message));
-        byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
-
-        exchange.getResponseHeaders().set("Content-Type", "application/json");
-        ResponseBody.send(exchange, statusCode, bytes);
+        ResponseBody.sendError(exchange, statusCode, message);
     }
 }

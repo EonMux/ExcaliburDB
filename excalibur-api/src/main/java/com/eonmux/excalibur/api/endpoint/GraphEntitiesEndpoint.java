@@ -5,6 +5,7 @@ import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphRagHolder;
 import com.eonmux.excalibur.api.bootstrap.GraphTenant;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.QueryParams;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.graph.browse.CatalogEdge;
@@ -93,17 +94,22 @@ public final class GraphEntitiesEndpoint implements HttpHandler {
             return;
         }
         Request request;
-        NamespaceId namespace;
         try {
             request = Request.parse(exchange.getRequestURI().getPath(),
                 exchange.getRequestURI().getRawQuery());
-            namespace = GraphTenants.namespaceOf(
-                exchange.getRequestHeaders().getFirst(GraphTenants.NAMESPACE_HEADER));
         } catch (NotARoute e) {
             sendError(exchange, 404, e.getMessage());
             return;
         } catch (IllegalArgumentException e) {
             sendError(exchange, 400, e.getMessage());
+            return;
+        }
+        NamespaceId namespace;
+        try {
+            namespace = GraphTenants.namespaceOf(
+                exchange.getRequestHeaders().getFirst(GraphTenants.NAMESPACE_HEADER));
+        } catch (IllegalArgumentException e) {
+            ResponseBody.sendError(exchange, 400, ErrorCode.INVALID_NAMESPACE, e.getMessage());
             return;
         }
 
@@ -133,8 +139,9 @@ public final class GraphEntitiesEndpoint implements HttpHandler {
             try (GraphRagHolder.Reading held = reading.get()) {
                 Optional<String> found = request.answer(held.catalog(), namespace);
                 status = found.isPresent() ? 200 : 404;
-                body = found.orElseGet(() -> errorJson("no entity " + request.entityId()
-                    + " in the graph this namespace serves"));
+                body = found.orElseGet(() -> ResponseBody.errorJson(
+                    ErrorCode.ENTITY_NOT_FOUND, "no entity " + request.entityId()
+                        + " in the graph this namespace serves"));
             }
         } catch (IllegalArgumentException e) {
             sendError(exchange, 400, e.getMessage());
@@ -292,6 +299,7 @@ public final class GraphEntitiesEndpoint implements HttpHandler {
      * @throws IOException if the response cannot be written
      */
     private static void sendNoGraph(HttpExchange exchange) throws IOException {
-        sendError(exchange, 503, GraphQueryEndpoint.NO_GRAPH);
+        ResponseBody.sendError(exchange, 503, ErrorCode.GRAPH_NOT_SERVED,
+            GraphQueryEndpoint.NO_GRAPH);
     }
 }

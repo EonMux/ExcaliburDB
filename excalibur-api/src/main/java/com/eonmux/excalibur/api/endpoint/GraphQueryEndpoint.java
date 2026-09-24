@@ -7,6 +7,7 @@ import java.util.concurrent.CancellationException;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.api.protocol.RequestBody;
@@ -389,7 +390,8 @@ public class GraphQueryEndpoint implements HttpHandler {
                 exchange.getRequestHeaders().getFirst(
                     com.eonmux.excalibur.api.bootstrap.GraphTenants.NAMESPACE_HEADER));
         } catch (IllegalArgumentException e) {
-            return new Reply(400, "{\"error\":" + quoted(e.getMessage()) + "}");
+            return new Reply(400,
+                ResponseBody.errorJson(ErrorCode.INVALID_NAMESPACE, e.getMessage()));
         }
 
         java.util.Optional<
@@ -459,7 +461,7 @@ public class GraphQueryEndpoint implements HttpHandler {
      * @return The refusal
      */
     private static Reply noGraph() {
-        return new Reply(503, "{\"error\":" + quoted(NO_GRAPH) + "}");
+        return new Reply(503, ResponseBody.errorJson(ErrorCode.GRAPH_NOT_SERVED, NO_GRAPH));
     }
 
     /**

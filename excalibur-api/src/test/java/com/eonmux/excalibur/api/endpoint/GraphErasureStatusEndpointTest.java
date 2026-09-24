@@ -185,6 +185,8 @@ class GraphErasureStatusEndpointTest {
 
         assertThat(get("/v1/graph/erasure/5000", "acme").getResponseCode()).isEqualTo(404);
         assertThat(get("/v1/graph/erasure/1", "nobody").getResponseCode()).isEqualTo(404);
+        assertThat(Json.stringAt(Json.parse(get("/v1/graph/erasure/5000", "acme").responseText()),
+            "code")).isEqualTo("erasure_not_found");
         assertThat(Files.exists(NamespaceId.of("nobody").directoryUnder(root))).isFalse();
     }
 
@@ -196,7 +198,12 @@ class GraphErasureStatusEndpointTest {
             "/v1/graph/erasure/99999999999999999999"}) {
             assertThat(get(path, null).getResponseCode()).as(path).isEqualTo(400);
         }
-        assertThat(get("/v1/graph/erasure/1", "../escape").getResponseCode()).isEqualTo(400);
+        StubExchange namespace = get("/v1/graph/erasure/1", "../escape");
+        assertThat(namespace.getResponseCode()).isEqualTo(400);
+        assertThat(Json.stringAt(Json.parse(namespace.responseText()), "code"))
+            .isEqualTo("invalid_namespace");
+        assertThat(Json.stringAt(Json.parse(get("/v1/graph/erasure/abc", null).responseText()),
+            "code")).isEqualTo("invalid_request");
     }
 
     @Test

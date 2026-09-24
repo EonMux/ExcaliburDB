@@ -2,6 +2,7 @@ package com.eonmux.excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.QueryParams;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -126,8 +127,8 @@ public class SourceListEndpoint implements HttpHandler {
     private void sendOne(HttpExchange exchange, String sourceId) throws IOException {
         Entry entry = entries().get(sourceId);
         if (entry == null) {
-            ResponseBody.sendJson(exchange, 404,
-                "{\"error\": \"Source not registered: " + JsonText.escape(sourceId) + "\"}");
+            ResponseBody.sendError(exchange, 404, ErrorCode.SOURCE_NOT_FOUND,
+                "Source not registered: " + sourceId);
             return;
         }
         ResponseBody.sendJson(exchange, 200, toJson(entry));

@@ -4,6 +4,7 @@ import com.eonmux.excalibur.api.audit.AuditLog;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.tenancy.NamespaceId;
@@ -90,8 +91,7 @@ public final class GraphBuildCancelEndpoint implements HttpHandler {
                 exchange.getRequestHeaders().getFirst(GraphTenants.NAMESPACE_HEADER));
             AuditLog.target(exchange, "namespace", namespace.value());
         } catch (IllegalArgumentException e) {
-            ResponseBody.sendJson(exchange, 400,
-                "{\"error\": \"" + JsonText.escape(e.getMessage()) + "\"}");
+            ResponseBody.sendError(exchange, 400, ErrorCode.INVALID_NAMESPACE, e.getMessage());
             return;
         }
 

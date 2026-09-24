@@ -267,6 +267,8 @@ class ConfigSectionEqualityTest {
             v("singleValuedRelations", "excalibur.graph.single-valued-relations", "employer,spouse"),
             v("entityVectorsEnabled", "excalibur.graph.entity-vectors-enabled", "false"),
             v("maxOpenNamespaces", "excalibur.graph.max-open-namespaces", "32"),
+            v("maxNamespaces", "excalibur.graph.max-namespaces", "12"),
+            v("requireExplicitNamespaces", "excalibur.graph.require-explicit-namespaces", "true"),
             v("hotNamespaces", "excalibur.graph.hot-namespaces", "alpha,beta"),
             v("coldNamespaces", "excalibur.graph.cold-namespaces", "gamma"),
             v("erasureTombstoneRatio", "excalibur.graph.erasure-tombstone-ratio", "0.5"),

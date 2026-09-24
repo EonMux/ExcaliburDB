@@ -263,7 +263,10 @@ class DocumentErasureStatusEndpointTest {
     @Test
     @DisplayName("an unknown id is a 404, a malformed one a 400, and only GET is served")
     void refusals() throws IOException {
-        assertThat(status("/v1/erasure/nope", service).getResponseCode()).isEqualTo(404);
+        StubExchange unknown = status("/v1/erasure/nope", service);
+        assertThat(unknown.getResponseCode()).isEqualTo(404);
+        assertThat(Json.stringAt(Json.parse(unknown.responseText()), "code"))
+            .isEqualTo("erasure_not_found");
         for (String path : new String[] {"/v1/erasure/", "/v1/erasure/a/b",
             "/v1/erasure/bad%20id", "/v1/erasure/" + "x".repeat(65)}) {
             assertThat(status(path, service).getResponseCode()).as(path).isEqualTo(400);

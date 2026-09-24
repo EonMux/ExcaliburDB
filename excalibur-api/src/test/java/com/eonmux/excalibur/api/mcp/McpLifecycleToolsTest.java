@@ -204,15 +204,16 @@ class McpLifecycleToolsTest {
     }
 
     @Test
-    @DisplayName("neither erasure route became a tool")
-    void erasureStaysBehindTheHttpApi() {
+    @DisplayName("graph erasure stays behind the HTTP API")
+    void graphErasureStaysBehindTheHttpApi() {
         List<String> registered = McpTools.catalogue().stream()
             .map(described -> Json.stringAt(described, "name"))
             .toList();
 
         assertThat(registered)
-            .as("these destroy data to honour a right-to-be-forgotten request, and the cost "
-                + "of a wrong call is not bounded by retrying")
-            .doesNotContain("erase_documents", "erase_graph", "erase");
+            .as("it removes facts by entity or extractor version, which a model cannot relate "
+                + "to anything it ingested, and the cost of a wrong call is not bounded by "
+                + "retrying")
+            .doesNotContain("erase_graph", "erase");
     }
 }

@@ -90,6 +90,33 @@ class NamespaceRoutingGraphIngestSinkTest {
     }
 
     @Test
+    @DisplayName("a namespace the node refuses stages nothing, and owes no withdrawal")
+    void aRefusedNamespaceStagesNothing(@TempDir Path root) throws IOException {
+        // A source registered into a namespace that was dropped since, on a node that does not
+        // create namespaces on demand: nothing is staged there, so nothing is owed there either.
+        NamespaceId gone = NamespaceId.of("gone");
+        Map<String, String> props = new HashMap<>(Map.of(
+            "excalibur.graph.ram-buffer-mb", "4.0",
+            "excalibur.graph.require-explicit-namespaces", "true"));
+        try (GraphTenants tenants = new GraphTenants(root, new Config(props),
+                MappingBudget.detect(), 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("docs", gone)), oneFact());
+
+            sink.onDocumentPublished("docs:ada", "Ada knows Babbage.");
+            sink.onDocumentRemoved("docs:ada");
+
+            assertThat(sink.factsStaged()).isZero();
+            assertThat(sink.tenantFailures()).isEqualTo(2);
+            assertThat(tenants.unrecordedWithdrawals())
+                .as("a withdrawal owed to a namespace that does not exist would be retried by "
+                    + "every sweep for the life of the process")
+                .isZero();
+            assertThat(root.resolve("gone")).doesNotExist();
+        }
+    }
+
+    @Test
     @DisplayName("stages a document's facts as stated on the document's own date")
     void carriesTheDocumentDate(@TempDir Path root) throws IOException {
         // The date is what orders two documents' values of a single-valued relation; lost on the

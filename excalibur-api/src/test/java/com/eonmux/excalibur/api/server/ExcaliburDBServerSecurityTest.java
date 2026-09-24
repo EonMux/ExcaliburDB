@@ -137,7 +137,7 @@ class ExcaliburDBServerSecurityTest {
             HttpURLConnection conn = get("/v1/stats", null);
 
             assertThat(conn.getResponseCode()).isEqualTo(401);
-            assertThat(readError(conn)).isEqualTo("{\"error\": \"Authentication failed\"}");
+            assertThat(readError(conn)).isEqualTo("{\"error\": \"Authentication failed\", \"code\": \"unauthorized\"}");
         }
     }
 

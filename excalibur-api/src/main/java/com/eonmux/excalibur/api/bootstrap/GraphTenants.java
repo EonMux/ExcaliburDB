@@ -12,6 +12,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -25,6 +26,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -88,6 +90,15 @@ import java.util.function.BooleanSupplier;
  * inventory that cannot be acted on is a report nobody can use, and a delete over a set nobody
  * can enumerate cannot be aimed.</p>
  *
+ * <h2>What bounds creating one</h2>
+ * <p>Every route that would create a namespace as a side effect of naming it goes through
+ * {@link #admit(NamespaceId)}, directly or by {@link #borrow(NamespaceId)}. Two controls live
+ * there: {@code excalibur.graph.max-namespaces} caps how many tenant namespaces exist, so a caller
+ * cannot create them without end, and {@code excalibur.graph.require-explicit-namespaces} makes
+ * {@link #create(NamespaceId)} the only way one comes into being, so a typo in a header is refused
+ * rather than becoming a tenant. Both are refused with a {@link NamespaceRefusedException} and
+ * leave nothing on disk.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent use.</p>
  *
@@ -139,6 +150,17 @@ public final class GraphTenants implements AutoCloseable {
     private final MappingBudget budget;
     private final Duration erasureMaxLatency;
     private final int maxOpen;
+    private final int maxNamespaces;
+    private final boolean requireExplicitNamespaces;
+
+    /**
+     * Held while a namespace directory is counted and created.
+     *
+     * <p>The count and the create have to be one step, or two requests naming two new namespaces
+     * on a node one short of the cap would both find room. Only creation takes it: a namespace
+     * that already exists is admitted on a {@code stat}, without waiting behind anybody.</p>
+     */
+    private final Object creation = new Object();
     private final int reopensPerSweep;
     private final ScheduledExecutorService erasureSweep;
 
@@ -234,6 +256,8 @@ public final class GraphTenants implements AutoCloseable {
         this.erasureMaxLatency =
             Duration.ofSeconds(config.graph().getErasureMaxLatencySeconds());
         this.maxOpen = maxOpen;
+        this.maxNamespaces = config.graph().getMaxNamespaces();
+        this.requireExplicitNamespaces = config.graph().isRequireExplicitNamespaces();
         this.models = GraphModelClients.forConfig(config);
         this.extraction = GraphExtraction.of(config.graph().isExtractionEnabled(),
             config.llm().chatEndpoint().status(), false);
@@ -640,11 +664,124 @@ public final class GraphTenants implements AutoCloseable {
      * try-with-resources - as soon as the operation is done, because a lease held open pins a
      * namespace against eviction and the budget it is meant to protect.</p>
      *
+     * <p>A namespace that does not exist yet is created here, which is how naming one in a header
+     * brings it into being - and so it is admitted first: refused when
+     * {@code excalibur.graph.require-explicit-namespaces} is on or the node already holds
+     * {@code excalibur.graph.max-namespaces} of them. See {@link #admit(NamespaceId)}.</p>
+     *
      * @param id The namespace
      * @return The lease; close it when done
+     * @throws NamespaceRefusedException if the namespace does not exist and may not be created
+     * @throws UncheckedIOException      if it cannot be created or opened
      */
     public NamespaceRegistry.Lease<GraphTenant> borrow(NamespaceId id) {
-        return registry.borrow(Objects.requireNonNull(id, "id must not be null"));
+        Objects.requireNonNull(id, "id must not be null");
+        try {
+            admit(id);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return registry.borrow(id);
+    }
+
+    /**
+     * Whether a namespace exists on this node.
+     *
+     * @param id The namespace
+     * @return true for the shared namespace, and for any whose directory is under the root
+     */
+    public boolean exists(NamespaceId id) {
+        Objects.requireNonNull(id, "id must not be null");
+        return id.isShared() || Files.isDirectory(id.directoryUnder(root));
+    }
+
+    /**
+     * Makes sure a namespace a request named exists, creating it if this node creates namespaces
+     * on demand.
+     *
+     * <p>The one gate every implicit creation passes. A namespace that exists is admitted on a
+     * {@code stat}. One that does not is refused outright when
+     * {@code excalibur.graph.require-explicit-namespaces} is on - a caller with a typo in its
+     * header is told the namespace does not exist rather than being handed a new, empty tenant
+     * its documents then vanish into - and is otherwise created under the cap, as
+     * {@link #create(NamespaceId)} does.</p>
+     *
+     * <p>Creating reserves the name and nothing else: the directory is made, and the tenant is
+     * opened only when something borrows it.</p>
+     *
+     * @param id The namespace
+     * @throws NamespaceRefusedException if it does not exist and may not be created
+     * @throws IOException               if its directory cannot be created
+     */
+    public void admit(NamespaceId id) throws IOException {
+        if (exists(id)) {
+            return;
+        }
+        if (requireExplicitNamespaces) {
+            throw new NamespaceRefusedException(id, NamespaceRefusedException.Reason.NOT_CREATED,
+                "No namespace named \"" + id.value() + "\" exists on this node, and namespaces "
+                    + "are not created on demand here: create it with PUT /v1/graph/namespaces/"
+                    + id.value() + " first");
+        }
+        create(id);
+    }
+
+    /**
+     * Creates a namespace, whether or not this node creates them on demand.
+     *
+     * <p>What {@code PUT /v1/graph/namespaces/{namespace}} does. It makes the namespace's directory
+     * and opens nothing, so creating one ahead of its first document costs no open slot and no
+     * share of the mapping budget.</p>
+     *
+     * <p>Bounded by {@code excalibur.graph.max-namespaces}, counted over the tenant namespaces on
+     * disk - the shared one excluded - and checked under a lock together with the create, so
+     * concurrent requests cannot overshoot it. A drop racing a request for the same namespace can
+     * let the registry recreate a directory past this gate, the race {@link #drop(NamespaceId)}
+     * already documents; it can overshoot the cap by the namespaces being dropped, never grow
+     * without bound.</p>
+     *
+     * @param id The namespace
+     * @return true if it was created, false if it already existed
+     * @throws NamespaceRefusedException if the node already holds as many as it may
+     * @throws IOException               if the directory cannot be created or the root listed
+     */
+    public boolean create(NamespaceId id) throws IOException {
+        if (exists(id)) {
+            return false;
+        }
+        Path directory = id.directoryUnder(root);
+        synchronized (creation) {
+            if (Files.isDirectory(directory)) {
+                return false;
+            }
+            int held = namespaceCount();
+            if (held >= maxNamespaces) {
+                LOGGER.warn("refused to create namespace {}: this node holds {} of at most {}",
+                    id, held, maxNamespaces);
+                throw new NamespaceRefusedException(id,
+                    NamespaceRefusedException.Reason.LIMIT_REACHED,
+                    "This node already holds " + held + " namespaces, the most "
+                        + "excalibur.graph.max-namespaces allows (" + maxNamespaces + "); drop one "
+                        + "before creating \"" + id.value() + "\"");
+            }
+            Files.createDirectories(directory);
+        }
+        LOGGER.info("namespace {} created", id);
+        return true;
+    }
+
+    /**
+     * How many tenant namespaces exist on disk: every one but the shared namespace.
+     *
+     * @return The count {@code excalibur.graph.max-namespaces} is held against
+     * @throws IOException if the root cannot be listed
+     */
+    public int namespaceCount() throws IOException {
+        int count = 0;
+        for (NamespaceId id : namespacesOnDisk()) {
+            count += id.isShared() ? 0 : 1;
+        }
+        return count;
     }
 
     /**
@@ -934,6 +1071,82 @@ public final class GraphTenants implements AutoCloseable {
             summaries.add(describe(id));
         }
         return List.copyOf(summaries);
+    }
+
+    /**
+     * One page of the namespace inventory.
+     *
+     * @param namespaces The namespaces on this page, in identifier order
+     * @param total      How many namespaces exist on disk, the shared one included
+     * @param next       The last namespace of this page when more follow it, to continue after;
+     *                   empty on the last page
+     */
+    public record NamespacePage(List<NamespaceSummary> namespaces, int total,
+                                Optional<NamespaceId> next) {
+
+        public NamespacePage {
+            namespaces = List.copyOf(namespaces);
+            Objects.requireNonNull(next, "next must not be null");
+        }
+    }
+
+    /**
+     * Describes one page of the namespaces on disk.
+     *
+     * <p>{@link #describeNamespaces()} reads two logs per namespace, which is affordable for an
+     * inventory and not for one a caller may make as large as {@code excalibur.graph.max-namespaces}
+     * in a single response. Only the page is described; the rest of the inventory costs a
+     * directory listing, which is also where {@link NamespacePage#total()} comes from.</p>
+     *
+     * <p>The cursor is the last namespace of the previous page and the page starts strictly after
+     * it, so a namespace dropped between two pages does not stop the walk, one created behind the
+     * cursor is not shown twice, and one created ahead of it is shown later.</p>
+     *
+     * @param cursor The namespace to continue after, or null or blank to start at the beginning
+     * @param limit  Most namespaces the page may carry
+     * @return The page
+     * @throws IllegalArgumentException if the cursor is not a namespace name or the limit is
+     *                                  below one
+     * @throws IOException              if the root cannot be listed
+     */
+    public NamespacePage describeNamespaces(String cursor, int limit) throws IOException {
+        if (limit < 1) {
+            throw new IllegalArgumentException("limit must be at least 1, got: " + limit);
+        }
+        List<NamespaceId> all = namespacesOnDisk();
+        int start = 0;
+        if (cursor != null && !cursor.isBlank()) {
+            int found = Collections.binarySearch(all, cursorOf(cursor.trim()));
+            start = found >= 0 ? found + 1 : -found - 1;
+        }
+        int end = (int) Math.min(all.size(), (long) start + limit);
+        List<NamespaceSummary> summaries = new ArrayList<>(Math.max(0, end - start));
+        for (NamespaceId id : all.subList(start, end)) {
+            summaries.add(describe(id));
+        }
+        Optional<NamespaceId> next = end < all.size()
+            ? Optional.of(all.get(end - 1))
+            : Optional.empty();
+        return new NamespacePage(summaries, all.size(), next);
+    }
+
+    /**
+     * Reads a listing cursor, which is a namespace name.
+     *
+     * @param cursor What the request carried
+     * @return The namespace it names
+     * @throws IllegalArgumentException if it names none
+     */
+    private static NamespaceId cursorOf(String cursor) {
+        if (NamespaceId.SHARED.value().equals(cursor)) {
+            return NamespaceId.SHARED;
+        }
+        try {
+            return NamespaceId.of(cursor);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("cursor must be a namespace name, as a previous "
+                + "page's next_cursor is; start the listing again without it", e);
+        }
     }
 
     /**

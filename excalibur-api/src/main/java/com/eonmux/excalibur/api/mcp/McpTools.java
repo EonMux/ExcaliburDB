@@ -6,9 +6,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.regex.Pattern;
 
 import com.eonmux.excalibur.graph.browse.EdgeDirection;
 import com.eonmux.excalibur.retrieval.pipeline.TraversalDirection;
+import com.eonmux.excalibur.tenancy.NamespaceId;
 
 /**
  * What a model can do with an ExcaliburDB node, and how each of those maps onto its HTTP API.
@@ -36,13 +38,27 @@ import com.eonmux.excalibur.retrieval.pipeline.TraversalDirection;
  * {@code excalibur.graph.extraction-enabled}, off by default. A tool set with only the graph
  * search leaves a model on an ordinary node with no way to reach the corpus at all.</p>
  *
- * <h2>What is deliberately not here</h2>
- * <p>Neither erasure route is a tool: not {@code POST /v1/erasure}, which removes a document from
- * the corpus, and not {@code POST /v1/graph/erasure}, which removes facts from the graph. They
- * exist to honour a right-to-be-forgotten request and they destroy data to do it, which makes them
- * the calls whose cost of being made wrongly is not bounded by retrying. A model asked to tidy up a
- * corpus would have every reason to reach for them. They stay behind the HTTP API, where a person
- * issues them.</p>
+ * <h2>The destructive tools, and what guards them</h2>
+ * <p>Two tools destroy data: {@link #ERASE_DOCUMENTS}, over {@code POST /v1/erasure}, and
+ * {@link #DELETE_NAMESPACE}, over {@code DELETE /v1/graph/namespaces/{namespace}}. They are the
+ * calls whose cost of being made wrongly is not bounded by retrying, and they are here anyway
+ * because an agent operating a corpus on somebody's behalf is exactly who will be asked to forget
+ * a document or offboard a tenant - and one that cannot has to hand the request to a person with
+ * a shell, which is no safer, only slower.</p>
+ *
+ * <p>What stands between a model and an accidental erasure is the same on both. Each requires a
+ * {@code confirm} argument that repeats, exactly, what is about to be destroyed - the
+ * {@code source_id}, or the namespace - checked here before anything is sent, so a model that
+ * reached for the wrong tool with the right identifier, or filled the identifier in from a
+ * default, is refused rather than obeyed. Neither falls back on the configured default namespace,
+ * and each description says the call is irreversible and is to be made only when the user has
+ * explicitly asked for it. No other tool takes a confirmation, so its presence is itself the
+ * signal that a call destroys something.</p>
+ *
+ * <p>{@code POST /v1/graph/erasure} is still not a tool. It erases a person from the graph by
+ * name or entity id, which means choosing among people who share a name - a judgement a model
+ * would make on the evidence of the graph it is erasing from. Erasing a document already
+ * withdraws every fact extracted from it, which is the erasure a model is asked for.</p>
  *
  * <p>Nor is retracting an asserted fact. {@link #ASSERT_GRAPH_FACTS} is here because stating a
  * fact is additive and, until a build, invisible; {@code DELETE /v1/graph/facts} is not, because
@@ -50,12 +66,11 @@ import com.eonmux.excalibur.retrieval.pipeline.TraversalDirection;
  * subject, relation and object retracts every asserted statement of that triple, including ones a
  * person made. It stays with the erasure routes.</p>
  *
- * <p>{@link #DEREGISTER_SOURCE} is not one of them, though it was held back for a while on the
- * same reasoning. It destroys nothing - {@code DELETE /v1/ingest} keeps every document the
- * source contributed - and what it does do, stop the corpus following its source, is exactly
- * what a model has to be able to do to correct its own mistake. Its description says both
- * halves, because a model that thinks it erases the corpus will not reach for it and one that
- * thinks it changes nothing will reach for it too readily.</p>
+ * <p>{@link #DEREGISTER_SOURCE} and the {@code cancel_*} tools destroy nothing. Deregistering
+ * keeps every document the source contributed, and a cancelled run keeps what it had already
+ * done, so none of them needs a confirmation; their descriptions say what they keep, because a
+ * model that thinks a call erases will not reach for it and one that thinks it changes nothing
+ * will reach for it too readily.</p>
  *
  * <h2>Descriptions are the interface</h2>
  * <p>A tool's description is not documentation, it is the only thing the model reads before
@@ -107,6 +122,57 @@ public final class McpTools {
 
     /** Report how a re-crawl is going. */
     public static final String REINDEX_STATUS = "reindex_status";
+
+    /** Erase documents from the corpus and the graph. Destructive. */
+    public static final String ERASE_DOCUMENTS = "erase_documents";
+
+    /** List the documents the node holds, a page at a time. */
+    public static final String LIST_DOCUMENTS = "list_documents";
+
+    /** Read the text of chunks by their identifiers. */
+    public static final String FETCH_DOCUMENTS = "fetch_documents";
+
+    /** List the graph namespaces the node holds, a page at a time. */
+    public static final String LIST_NAMESPACES = "list_namespaces";
+
+    /** Create a graph namespace. */
+    public static final String CREATE_NAMESPACE = "create_namespace";
+
+    /** Remove a graph namespace entirely. Destructive. */
+    public static final String DELETE_NAMESPACE = "delete_namespace";
+
+    /** List the queries in flight. */
+    public static final String LIST_QUERIES = "list_queries";
+
+    /** Cancel a query in flight. */
+    public static final String CANCEL_QUERY = "cancel_query";
+
+    /** Stop a source's ingestion run, keeping the source registered. */
+    public static final String CANCEL_INGESTION = "cancel_ingestion";
+
+    /** Stop a source's re-crawl. */
+    public static final String CANCEL_REINDEX = "cancel_reindex";
+
+    /** Stop the compaction in progress. */
+    public static final String CANCEL_COMPACTION = "cancel_compaction";
+
+    /** Stop the graph build in progress. */
+    public static final String CANCEL_GRAPH_BUILD = "cancel_graph_build";
+
+    /** Read one document's chunks, in the order it was chunked. */
+    public static final String READ_DOCUMENT = "read_document";
+
+    /** Read back where an erasure stands. */
+    public static final String ERASURE_STATUS = "erasure_status";
+
+    /** The argument a destructive tool requires, repeating what it destroys. */
+    static final String CONFIRM = "confirm";
+
+    /**
+     * What an id the node issued looks like - a query's, or an erasure's receipt. Both are UUIDs,
+     * and each goes into a path, so nothing that could name another path segment is let through.
+     */
+    private static final Pattern ISSUED_ID = Pattern.compile("[A-Za-z0-9-]{1,64}");
 
     /** Find entities in the served graph by name, and learn their ids. */
     public static final String FIND_GRAPH_ENTITIES = "find_graph_entities";
@@ -161,7 +227,24 @@ public final class McpTools {
                     + "index, and fuses the two when it has both; 'retrieval' in the reply says "
                     + "which answered."),
                 ToolSchema.optional("top_k", "integer",
-                    "How many passages to return. Omit for the server's default.", null))));
+                    "How many passages to return. Omit for the server's default.", null),
+                ToolSchema.optional("offset", "integer",
+                    "How many results to skip before this page, for the next page of the same "
+                    + "search: pass the reply's page.next_offset, which is null when there is "
+                    + "no further page. offset plus top_k may not exceed 1000. Omit for the "
+                    + "first page.", null),
+                ToolSchema.optional("timeout_ms", "integer",
+                    "Longest the search may take, in milliseconds. A search that runs out "
+                    + "returns what it found so far with 'timed_out' true and 'coverage' below "
+                    + "1, rather than failing. The node caps it (60000 by default) and refuses "
+                    + "more. Omit for the server's default.", null),
+                ToolSchema.optional("snippet", "boolean",
+                    "Return the part of each passage the query matched, with 'highlights' "
+                    + "marking the matched terms, instead of the passage from its start. Useful "
+                    + "when passages are long and the match is deep inside them.", null),
+                ToolSchema.optional("snippet_chars", "integer",
+                    "Width of each snippet in characters, from 16 up to the server's per-result "
+                    + "limit. Only with snippet true. Omit for the server's default.", null))));
 
         tools.add(ToolSchema.tool(SEARCH_GRAPH,
             "Answer a question from the knowledge graph built out of the ingested documents. "
@@ -403,7 +486,8 @@ public final class McpTools {
 
         tools.add(ToolSchema.tool(DEREGISTER_SOURCE,
             "Stop crawling a source. Its indexed documents are kept and stay searchable - this "
-            + "does not erase anything, and there is no tool here that does. Use it when a "
+            + "does not erase anything; " + ERASE_DOCUMENTS + " does, and only when a user has "
+            + "asked for that. Use it when a "
             + "source was registered against the wrong target, or should simply no longer be "
             + "followed; afterwards its id is free to register again. It stops the re-crawl "
             + "schedule too, so the index will not follow that source any further: prefer "
@@ -510,7 +594,217 @@ public final class McpTools {
                     "Namespace to stage into. Omit for the configured default, or the shared "
                     + "one.", null))));
 
+        addReadingTools(tools);
+        addStoppingTools(tools);
+        addDestructiveTools(tools);
         return tools;
+    }
+
+    /**
+     * The tools that read back what the node holds.
+     *
+     * @param tools The catalogue being built
+     */
+    private static void addReadingTools(List<Object> tools) {
+        tools.add(ToolSchema.tool(LIST_DOCUMENTS,
+            "List the documents this node holds, a page at a time, with each one's 'source_id', "
+            + "'document_id' and the 'chunk_ids' its text was split into - the identifiers "
+            + FETCH_DOCUMENTS + " reads and " + SEARCH_DOCUMENTS + " answers with. Includes "
+            + "everything ingested before the node last restarted. Pass the reply's "
+            + "'next_cursor' back as 'cursor' for the next page, and stop when it is null; "
+            + "'total' says how many there are in all. A 404 means the node keeps no document "
+            + "registry, not that it is empty.",
+            ToolSchema.object(
+                ToolSchema.optional("source_id", "string",
+                    "List only this source's documents. Omit for every source.", null),
+                ToolSchema.optional("limit", "integer",
+                    "Most documents per page, from 1 to 1000. Omit for the server's default "
+                    + "of 100.", null),
+                ToolSchema.optional("cursor", "string",
+                    "The previous page's 'next_cursor', to continue from it. Opaque: pass it "
+                    + "back exactly as received. Omit for the first page.", null))));
+
+        tools.add(ToolSchema.tool(FETCH_DOCUMENTS,
+            "Read the text of chunks by their identifiers, for results kept from an earlier "
+            + SEARCH_DOCUMENTS + " or chunk ids from " + LIST_DOCUMENTS + ". Every identifier "
+            + "asked for comes back, in the order asked; 'text' is null for one the node no "
+            + "longer holds, and 'documents_not_found' counts them. 'text_truncated' true means "
+            + "the text was clipped to the server's per-result limit.",
+            ToolSchema.object(
+                ToolSchema.requiredArray("document_ids",
+                    "Chunk identifiers, as search results and chunk_ids give them, e.g. "
+                    + "'notes:handbook.md:chunk:2'. At most 1000, none repeated.", "string"))));
+
+        tools.add(ToolSchema.tool(LIST_NAMESPACES,
+            "List the graph namespaces this node holds, a page at a time, with whether each is "
+            + "open, whether a graph has been built in it, how many facts it has staged and how "
+            + "many erasure obligations it still owes. 'shared' is the namespace every call "
+            + "without one uses. Pass 'next_cursor' back as 'cursor' for the next page, and stop "
+            + "when it is null; 'total' counts them all.",
+            ToolSchema.object(
+                ToolSchema.optional("limit", "integer",
+                    "Most namespaces per page, from 1 to 1000. Omit for the server's default "
+                    + "of 100.", null),
+                ToolSchema.optional("cursor", "string",
+                    "The previous page's 'next_cursor', to continue from it. Omit for the "
+                    + "first page.", null))));
+
+        tools.add(ToolSchema.tool(CREATE_NAMESPACE,
+            "Create a graph namespace, before ingesting into it. A node configured to require "
+            + "explicit creation refuses to ingest into, build, assert facts into or record "
+            + "erasures in a namespace nobody created, with a 404 'namespace_not_found'; this "
+            + "is how one is created there. Elsewhere naming a namespace creates it, and this "
+            + "only does so ahead of time. Answers 201 when it created the namespace and 200 "
+            + "when it already existed. A 429 'namespace_limit_reached' means the node holds as "
+            + "many as it is allowed.",
+            ToolSchema.object(
+                ToolSchema.required("namespace", "string",
+                    "The namespace to create: lowercase letters, digits, '-' and '_', starting "
+                    + "with a letter or digit, at most 64 characters."))));
+
+        tools.add(ToolSchema.tool(READ_DOCUMENT,
+            "Read one document whole: its chunks in the order it was chunked, each with its "
+            + "'position', 'chunk_id' and 'text', plus the document's 'chunk_count', length, "
+            + "hash and when it was indexed. Name it by the 'source_id' and 'document_id' "
+            + LIST_DOCUMENTS + " reports - a document id is unique only within its source. "
+            + "Pages by chunks: pass 'next_cursor' back as 'cursor' until it is null. "
+            + "'text_truncated' true means a chunk's text was clipped to the server's per-result "
+            + "limit. A 404 means the node holds no such document.",
+            ToolSchema.object(
+                ToolSchema.required("source_id", "string",
+                    "The source the document belongs to."),
+                ToolSchema.required("document_id", "string",
+                    "The document, as it was ingested under the source, e.g. 'guide.md'."),
+                ToolSchema.optional("include_text", "boolean",
+                    "Omit, or send true, for each chunk's text; false for the chunk ids alone, "
+                    + "which pages further.", null),
+                ToolSchema.optional("limit", "integer",
+                    "Most chunks per page. Omit for the server's default.", null),
+                ToolSchema.optional("cursor", "string",
+                    "The previous page's 'next_cursor', passed back unchanged. Omit for the "
+                    + "first page.", null))));
+
+        tools.add(ToolSchema.tool(ERASURE_STATUS,
+            "Read back where an erasure made by " + ERASE_DOCUMENTS + " stands, by the "
+            + "'request_id' its reply carried. 'state' is 'discharged' when every part the node "
+            + "tracks is done; 'applied' when nothing is searchable or served any more and the "
+            + "index has still to reclaim the space; 'pending' while the graph still owes "
+            + "withdrawals; 'incomplete' when some documents could not be removed and the "
+            + "erasure has to be repeated for them. 'remaining' says what is still owed. It "
+            + "names no documents. A 404 means the node keeps no receipt with that id - only "
+            + "the most recent erasures are kept.",
+            ToolSchema.object(
+                ToolSchema.required("request_id", "string",
+                    "The 'request_id' " + ERASE_DOCUMENTS + " answered with."))));
+    }
+
+    /**
+     * The tools that stop work in progress. None destroys anything.
+     *
+     * @param tools The catalogue being built
+     */
+    private static void addStoppingTools(List<Object> tools) {
+        tools.add(ToolSchema.tool(LIST_QUERIES,
+            "List the searches running on the node right now, longest-running first, with the "
+            + "'query_id' " + CANCEL_QUERY + " takes and how long each has run.",
+            ToolSchema.object()));
+
+        tools.add(ToolSchema.tool(CANCEL_QUERY,
+            "Cancel a search that is still running. The search answers with no results and "
+            + "'cancelled' true. 'cancelled' false in this reply means it had already finished "
+            + "or been cancelled; a 404 means no running query has that id. Find the id with "
+            + LIST_QUERIES + ".",
+            ToolSchema.object(
+                ToolSchema.required("query_id", "string",
+                    "The query's id, as " + LIST_QUERIES + " reports it."))));
+
+        tools.add(ToolSchema.tool(CANCEL_INGESTION,
+            "Stop a source's ingestion run in flight - a crawl that is too slow or hammering a "
+            + "site. The source stays registered and keeps every document already indexed; it "
+            + "is crawled again at its next scheduled interval, and " + DEREGISTER_SOURCE
+            + " is how to stop that too. The run stops at its next checkpoint, so poll "
+            + INGESTION_STATUS + " for when it has. 'stopped' false means nothing was running.",
+            ToolSchema.object(
+                ToolSchema.required("source_id", "string",
+                    "The source whose run to stop, as it was registered."))));
+
+        tools.add(ToolSchema.tool(CANCEL_REINDEX,
+            "Stop a source's re-crawl started by " + REINDEX_SOURCE + ". It stops at the next "
+            + "document boundary and keeps every document it had already re-indexed; the rest "
+            + "stay on their previous version. Poll " + REINDEX_STATUS + " for when it has "
+            + "ended. 'cancelled' false means no re-crawl of that source was running.",
+            ToolSchema.object(
+                ToolSchema.required("source_id", "string",
+                    "The source whose re-crawl to stop, as it was registered."))));
+
+        tools.add(ToolSchema.tool(CANCEL_COMPACTION,
+            "Stop the compaction an operator started, which rewrites the index and can saturate "
+            + "the disk for minutes. It stops at the next segment boundary and keeps what it had "
+            + "already reclaimed; nothing is lost. The background sweeps carry on. 'cancelled' "
+            + "false means none was running.",
+            ToolSchema.object()));
+
+        tools.add(ToolSchema.tool(CANCEL_GRAPH_BUILD,
+            "Stop the graph build started by " + BUILD_GRAPH + ". A stopped build publishes "
+            + "nothing: the namespace keeps serving the graph it had, and the staged facts are "
+            + "kept for the next build. Poll " + GRAPH_BUILD_STATUS + " until its state is "
+            + "'cancelled'.",
+            ToolSchema.object(
+                ToolSchema.optional("namespace", "string",
+                    "Namespace whose build to stop. Omit for the configured default, or the "
+                    + "shared one.", null))));
+    }
+
+    /**
+     * The tools that destroy data, each gated on a confirmation that repeats what it destroys.
+     *
+     * @param tools The catalogue being built
+     */
+    private static void addDestructiveTools(List<Object> tools) {
+        tools.add(ToolSchema.tool(ERASE_DOCUMENTS,
+            "Permanently erase documents: their text and vectors leave the corpus, they stop "
+            + "matching searches, and every fact extracted from them is withdrawn from the "
+            + "graph. Irreversible - there is nothing to restore from. Call it only when the user "
+            + "has explicitly asked for these documents to be erased; to refresh changed "
+            + "content use " + REINDEX_SOURCE + ", and to stop following a source use "
+            + DEREGISTER_SOURCE + ", neither of which erases anything. Name the documents in "
+            + "'document_ids', or erase everything the source holds with scope 'source', which "
+            + "also deregisters it and erases at most 1000 documents per call - repeat until "
+            + "'documents_remaining' is 0. 'documents_not_found' counts ids the node never held. "
+            + "A 202 means the corpus half is done and the graph half is still queued; "
+            + "'graph_erasure_complete' says when it is not, and " + ERASURE_STATUS + " with "
+            + "the reply's 'request_id' says when it has finished.",
+            ToolSchema.object(
+                ToolSchema.required("source_id", "string",
+                    "The source the documents belong to."),
+                ToolSchema.optional("document_ids", "array",
+                    "The documents to erase, by the document_id they were ingested under (not "
+                    + "chunk ids), at most 1000. Omit only with scope 'source'.", "string"),
+                ToolSchema.optionalChoice("scope",
+                    "'source' to erase every document the source holds. Never combined with "
+                    + "document_ids.", List.of("source")),
+                ToolSchema.optional("compact", "boolean",
+                    "Rewrite the index before answering, so the text is off disk now rather "
+                    + "than at the next scheduled compaction. Slower. Omit to leave that to the "
+                    + "schedule.", null),
+                ToolSchema.required(CONFIRM, "string",
+                    "Repeat the source_id exactly, to confirm this irreversible erasure. A "
+                    + "value that differs refuses the call and nothing is erased."))));
+
+        tools.add(ToolSchema.tool(DELETE_NAMESPACE,
+            "Permanently remove a graph namespace: its graph, every fact staged in it and its "
+            + "log of erasures still owed. Irreversible - there is nothing to restore from. Call "
+            + "it only when the user has explicitly asked for this namespace to be removed. It "
+            + "never falls back on a default namespace: name it. The reply accounts for what was "
+            + "destroyed. 'shared' cannot be removed (409), and a namespace that does not exist "
+            + "is a 404. The documents in the corpus are not touched - " + ERASE_DOCUMENTS
+            + " erases those.",
+            ToolSchema.object(
+                ToolSchema.required("namespace", "string",
+                    "The namespace to remove."),
+                ToolSchema.required(CONFIRM, "string",
+                    "Repeat the namespace exactly, to confirm this irreversible removal. A value "
+                    + "that differs refuses the call and nothing is removed."))));
     }
 
     /**
@@ -535,6 +829,20 @@ public final class McpTools {
                 case REINDEX_SOURCE -> reindexSource(args);
                 case REINDEX_STATUS -> reindexStatus(args);
                 case DEREGISTER_SOURCE -> deregisterSource(args);
+                case LIST_DOCUMENTS -> listDocuments(args);
+                case FETCH_DOCUMENTS -> fetchDocuments(args);
+                case LIST_NAMESPACES -> listNamespaces(args);
+                case CREATE_NAMESPACE -> createNamespace(args);
+                case LIST_QUERIES -> answer(client.get("/v1/query/status", Map.of(), null));
+                case READ_DOCUMENT -> readDocument(args);
+                case ERASURE_STATUS -> erasureStatus(args);
+                case CANCEL_QUERY -> cancelQuery(args);
+                case CANCEL_INGESTION -> stopSource("/v1/ingest/run", args);
+                case CANCEL_REINDEX -> stopSource("/v1/reindex", args);
+                case CANCEL_COMPACTION -> answer(client.delete("/v1/compact", null));
+                case CANCEL_GRAPH_BUILD -> answer(client.delete("/v1/graph/build", scope(args)));
+                case ERASE_DOCUMENTS -> eraseDocuments(args);
+                case DELETE_NAMESPACE -> deleteNamespace(args);
                 case FIND_GRAPH_ENTITIES -> findGraphEntities(args);
                 case GRAPH_ENTITY_EDGES -> graphEntityEdges(args);
                 case ASSERT_GRAPH_FACTS -> assertGraphFacts(args);
@@ -563,11 +871,197 @@ public final class McpTools {
         body.put("include_text", true);
         // Omitted rather than defaulted here: the node has a configured default, and sending one
         // of this adapter's own would quietly override whatever the operator set.
-        Integer topK = ToolArguments.wholeNumber(args, "top_k");
-        if (topK != null) {
-            body.put("top_k", topK);
-        }
+        putWholeNumber(args, body, "top_k");
+        putWholeNumber(args, body, "offset");
+        putWholeNumber(args, body, "timeout_ms");
+        putFlag(args, body, "snippet");
+        putWholeNumber(args, body, "snippet_chars");
         return answer(client.post("/v1/query", Json.write(body), null));
+    }
+
+    private ToolResult listDocuments(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        return answer(client.get("/v1/documents/list", page(args, "source_id"), null));
+    }
+
+    private ToolResult fetchDocuments(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        // Refused here for the reason add_documents refuses an empty batch: the node would say
+        // the same thing one round trip later.
+        List<String> ids = ToolArguments.optionalStringList(args, "document_ids");
+        if (ids == null || ids.isEmpty()) {
+            return ToolResult.error("'document_ids' is required and must name at least one chunk.");
+        }
+        Map<String, Object> body = Json.object();
+        body.put("document_ids", ids);
+        return answer(client.post("/v1/documents/fetch", Json.write(body), null));
+    }
+
+    private ToolResult listNamespaces(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        return answer(client.get("/v1/graph/namespaces", page(args, null), null));
+    }
+
+    private ToolResult createNamespace(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        return answer(client.put(namespacePath(namedNamespace(args)), null));
+    }
+
+    private ToolResult cancelQuery(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        String queryId = issuedId(args, "query_id", LIST_QUERIES);
+        return answer(client.delete("/v1/query/" + queryId, null));
+    }
+
+    private ToolResult readDocument(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        Map<String, String> query = new LinkedHashMap<>();
+        query.put("source_id", ToolArguments.requiredString(args, "source_id"));
+        query.put("document_id", ToolArguments.requiredString(args, "document_id"));
+        // On unless the model turns it off, for search_documents' reason: an id is nothing a
+        // model can read, so a read of a document that answered ids alone would answer nothing.
+        Boolean includeText = ToolArguments.optionalBoolean(args, "include_text");
+        query.put("include_text", String.valueOf(includeText == null || includeText));
+        query.putAll(page(args, null));
+        return answer(client.get("/v1/documents/list", query, null));
+    }
+
+    private ToolResult erasureStatus(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        String requestId = issuedId(args, "request_id", ERASE_DOCUMENTS);
+        return answer(client.get("/v1/erasure/" + requestId, Map.of(), null));
+    }
+
+    /**
+     * Reads an id the node issued, which the call puts into a path.
+     *
+     * @param args     The call's arguments
+     * @param field    The argument holding it
+     * @param issuedBy The tool whose reply carries it, for the message
+     * @return The id
+     * @throws IllegalArgumentException if it is absent or could name a different path
+     */
+    private static String issuedId(Map<String, Object> args, String field, String issuedBy) {
+        String id = ToolArguments.requiredString(args, field);
+        if (!ISSUED_ID.matcher(id).matches()) {
+            throw new IllegalArgumentException("Argument '" + field + "' is not an id the node "
+                + "issued, got: " + id + ". Use one " + issuedBy + " reported.");
+        }
+        return id;
+    }
+
+    /**
+     * Asks a source's run to stop, on the route that names the source in its body.
+     *
+     * @param path The route: the ingestion run's or the re-crawl's
+     * @param args The call's arguments
+     * @return What the node said
+     */
+    private ToolResult stopSource(String path, Map<String, Object> args)
+            throws IOException, InterruptedException {
+        Map<String, Object> body = Json.object();
+        body.put("source_id", ToolArguments.requiredString(args, "source_id"));
+        return answer(client.delete(path, Json.write(body), null));
+    }
+
+    private ToolResult eraseDocuments(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        String sourceId = ToolArguments.requiredString(args, "source_id");
+        List<String> documentIds = ToolArguments.optionalStringList(args, "document_ids");
+        String scope = ToolArguments.optionalString(args, "scope");
+        if (scope != null && !"source".equals(scope)) {
+            throw new IllegalArgumentException(
+                "Argument 'scope' can only be 'source', got: " + scope);
+        }
+        boolean wholeSource = scope != null;
+        // Checked before the confirmation, so a call that could not have been sent is told what
+        // to fix rather than only that the confirmation was wrong.
+        if (wholeSource && documentIds != null) {
+            throw new IllegalArgumentException("Send either 'document_ids' or scope 'source', "
+                + "not both: they erase different amounts.");
+        }
+        if (!wholeSource && (documentIds == null || documentIds.isEmpty())) {
+            throw new IllegalArgumentException("Name the documents to erase in 'document_ids', "
+                + "or send scope 'source' to erase everything the source holds.");
+        }
+        requireConfirmation(args, sourceId, "source_id");
+
+        Map<String, Object> body = Json.object();
+        body.put("source_id", sourceId);
+        if (wholeSource) {
+            body.put("scope", scope);
+        } else {
+            body.put("document_ids", documentIds);
+        }
+        putFlag(args, body, "compact");
+        return answer(client.post("/v1/erasure", Json.write(body), null));
+    }
+
+    private ToolResult deleteNamespace(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        String namespace = namedNamespace(args);
+        requireConfirmation(args, namespace, "namespace");
+        return answer(client.delete(namespacePath(namespace), null));
+    }
+
+    /**
+     * Refuses a destructive call whose confirmation does not repeat what it destroys.
+     *
+     * @param args     The call's arguments
+     * @param expected What {@code confirm} has to say
+     * @param field    The argument it repeats, for the message
+     * @throws IllegalArgumentException if it is absent or says anything else
+     */
+    private static void requireConfirmation(Map<String, Object> args, String expected,
+                                            String field) {
+        if (!expected.equals(ToolArguments.optionalString(args, CONFIRM))) {
+            throw new IllegalArgumentException("This call is irreversible, so '" + CONFIRM
+                + "' must repeat the " + field + " exactly: \"" + expected + "\". Nothing was "
+                + "sent. Make this call only if the user explicitly asked for it.");
+        }
+    }
+
+    /**
+     * Reads the namespace a namespace-management call names, which it must name itself.
+     *
+     * <p>Never the configured default: a drop that fell back on one would remove a namespace
+     * the model never mentioned. Checked against the node's own rule because it goes into a
+     * path, where {@code ..} or a separator would name a different route; {@code shared} is
+     * passed through for the node to answer, since the rule refuses it only so no tenant can
+     * claim it.</p>
+     *
+     * @param args The call's arguments
+     * @return The namespace
+     * @throws IllegalArgumentException if it is absent or is not a namespace name
+     */
+    private static String namedNamespace(Map<String, Object> args) {
+        String namespace = ToolArguments.requiredString(args, "namespace");
+        if (!NamespaceId.SHARED.value().equals(namespace)) {
+            NamespaceId.of(namespace);
+        }
+        return namespace;
+    }
+
+    private static String namespacePath(String namespace) {
+        return "/v1/graph/namespaces/" + ExcaliburClient.encode(namespace);
+    }
+
+    /**
+     * The paging parameters of a listing, absent staying absent.
+     *
+     * @param args   The call's arguments
+     * @param filter A string filter the listing also takes, or null
+     * @return The parameters, in the order they are sent
+     */
+    private static Map<String, String> page(Map<String, Object> args, String filter) {
+        Map<String, String> query = new LinkedHashMap<>();
+        if (filter != null) {
+            query.put(filter, ToolArguments.optionalString(args, filter));
+        }
+        Integer limit = ToolArguments.wholeNumber(args, "limit");
+        query.put("limit", limit != null ? limit.toString() : null);
+        query.put("cursor", ToolArguments.optionalString(args, "cursor"));
+        return query;
     }
 
     private ToolResult searchGraph(Map<String, Object> args)
@@ -791,13 +1285,13 @@ public final class McpTools {
     }
 
     /**
-     * Copies a whole-number setting into a source configuration, absent staying absent.
+     * Copies a whole-number setting into a request body, absent staying absent.
      *
      * <p>Absent matters: the node has a configured default for every one of these, and sending
      * a value this adapter invented would quietly overrule whatever the operator set.</p>
      *
      * @param args   The call's arguments
-     * @param config The configuration being built
+     * @param config The body being built
      * @param field  The setting
      */
     private static void putWholeNumber(Map<String, Object> args, Map<String, Object> config,
@@ -809,13 +1303,13 @@ public final class McpTools {
     }
 
     /**
-     * Copies a true/false setting into a source configuration, absent staying absent.
+     * Copies a true/false setting into a request body, absent staying absent.
      *
      * <p>False is forwarded, not dropped: it is a setting the model made, and the node's
      * default is only what applies when none was made.</p>
      *
      * @param args   The call's arguments
-     * @param config The configuration being built
+     * @param config The body being built
      * @param field  The setting
      */
     private static void putFlag(Map<String, Object> args, Map<String, Object> config,

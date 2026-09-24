@@ -362,6 +362,23 @@ public final class JsonText {
     }
 
     /**
+     * Where the value of a top-level member ends.
+     *
+     * <p>For a writer that adds a member beside an existing one without re-encoding the body:
+     * the index returned is where a {@code , "name": value} pair can be inserted so that it
+     * follows the member it belongs with.</p>
+     *
+     * @param json  The JSON document
+     * @param field The member name
+     * @return Index just past the member's value, or -1 when there is no such member or the
+     *         document is malformed
+     */
+    public static int valueEnd(String json, String field) {
+        int start = valueStart(json, field);
+        return start < 0 ? -1 : endOfValue(json, start);
+    }
+
+    /**
      * Extracts an integer field.
      *
      * @param json         The JSON document

@@ -454,27 +454,37 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `GET` | `/v1/graph/build/status` | bearer | What the build is doing, what the last one published, whether the served graph is behind what is staged, and what the node's automatic build is doing about it |
 | `POST` | `/v1/graph/erasure` | bearer | Record an obligation to erase, and compact when it is due. `404` for an entity, by name or `entity_id`, that nothing in the namespace holds, and nothing is recorded |
 | `GET` | `/v1/graph/erasure/{request_id}` | bearer | Where one graph erasure obligation stands, in the namespace the header names |
-| `GET` | `/v1/graph/namespaces` | bearer | Every namespace on disk: whether it is open, whether it has built a graph, what it has staged, whether its graph is behind that, and what it still owes |
+| `GET` | `/v1/graph/namespaces` | bearer | The namespaces on disk, a page at a time (`limit`, default 100, at most 1000; `cursor`): whether each is open, whether it has built a graph, what it has staged, whether its graph is behind that, and what it still owes |
+| `PUT` | `/v1/graph/namespaces/{namespace}` | bearer | Create a namespace. `201` when created, `200` when it already existed; `429 namespace_limit_reached` past `excalibur.graph.max-namespaces` |
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | Remove a namespace entirely - its graph, its staged facts and its erasure log. Irreversible; `409` for `shared` |
 
 All request/response bodies are JSON. Request size limit: **1 MB**, and a body over it is refused with `413` by every endpoint that reads one - split the payload rather than retrying it. The `GET` routes read no body, and neither do `POST` and `DELETE /v1/drain`,
 `DELETE /v1/query/{query_id}`, `DELETE /v1/compact`,
-`DELETE /v1/graph/namespaces/{namespace}`, `DELETE /v1/graph/build`, `POST /v1/graph/build` or
-`DELETE /v1/graph/facts`, so none of them ever produces a `413`.
+`PUT` and `DELETE /v1/graph/namespaces/{namespace}`, `DELETE /v1/graph/build`,
+`POST /v1/graph/build` or `DELETE /v1/graph/facts`, so none of them ever produces a `413`.
 
 A method a registered path does not serve is answered `405` on every path, and it is answered
 before authentication: the `405` is a routing answer, decided by the path and the method alone, so
 it tells an anonymous caller nothing a token would protect — the route table above already says
 which methods each path takes. It is still charged, against the read budget, so an anonymous
-caller cannot spend routing decisions at line rate for free. That holds for the single-method
-routes as much as for the ones that answer two or three methods: `GET /v1/stats`, `GET /metrics`,
-`GET /v1/version`, `GET /v1/query/status`, `DELETE /v1/ingest/run`, `GET /v1/ingest/status`,
-`GET /v1/documents/list`, `GET /v1/reindex/status`, `POST /v1/erasure`,
-`GET /v1/erasure/{request_id}`, `GET /v1/compact/status`, `POST /v1/graph/query`,
-`GET /v1/graph/entities`, `GET /v1/graph/build/status`, `POST /v1/graph/erasure` and
-`GET /v1/graph/erasure/{request_id}` each answer any
-other method with `405` rather than `401`, and a wrong method on a mutating route costs a read, not
-a mutation. A path that is not registered at all is `404`.
+caller cannot spend routing decisions at line rate for free. Every `405` carries an `Allow` header
+naming the methods the path does serve, and `"code": "method_not_allowed"`. That holds for the
+single-method routes as much as for the ones that answer two or three methods: `GET /health`,
+`GET /health/ready`, `GET /v1/stats`, `GET /metrics`, `GET /v1/version`, `GET /v1/query/status`,
+`DELETE /v1/ingest/run`, `GET /v1/ingest/status`, `GET /v1/documents/list`,
+`GET /v1/reindex/status`, `POST /v1/erasure`, `GET /v1/erasure/{request_id}`,
+`GET /v1/compact/status`, `POST /v1/graph/query`, `GET /v1/graph/entities` and every path beneath
+it, `GET /v1/graph/build/status`, `POST /v1/graph/erasure` and `GET /v1/graph/erasure/{request_id}`
+each answer any other method with `405` rather than `401`, and a wrong method on a mutating route
+costs a read, not a mutation. A collection and its members are separate paths with separate
+methods: `/v1/query` serves `POST` and `/v1/query/{query_id}` serves `DELETE`, so `DELETE /v1/query`
+with no id is a `405` naming `POST`; `/v1/erasure` and `/v1/graph/erasure` serve `POST` and their
+members `GET`; `/v1/graph/facts` serves `POST` and `/v1/graph/facts/{fact_id}` serves `DELETE`;
+`/v1/graph/namespaces` serves `GET` and `/v1/graph/namespaces/{namespace}` serves `PUT` and
+`DELETE`, so a `DELETE` of the collection or a `GET` of one namespace is a `405` as well. A path
+that is not registered at all — including anything deeper than one segment beneath a collection —
+is `404`. `HEAD` is not served on any route and is answered `405` like any other method a path does
+not take.
 
 Four routes that change what is registered — `POST /v1/ingest`, `PUT /v1/ingest`,
 `DELETE /v1/ingest` and `POST /v1/erasure` — answer `503` when the change could not be recorded
@@ -495,9 +505,14 @@ optional value.
 
 `X-Excalibur-Namespace` names the graph namespace a request belongs to. It is read by the
 `/v1/graph/*` routes and by `POST /v1/ingest`, which binds the registered source to that namespace
-for the life of the registration — every document it crawls is staged there. `PUT /v1/ingest`
-reads it too, and refuses with `409` a replacement that names a namespace other than the one the
-source was registered in. A node holds one
+for the life of the registration — every document it crawls is staged there. Naming a namespace
+that does not exist creates it, unless `excalibur.graph.require-explicit-namespaces` is on: then
+only `PUT /v1/graph/namespaces/{namespace}` creates one, and every other route answers a name
+nobody created with `404 namespace_not_found`, so a typo cannot become a tenant. Either way the
+node holds at most `excalibur.graph.max-namespaces` of them besides `shared`, and refuses another
+with `429 namespace_limit_reached`.
+`PUT /v1/ingest` reads it too, and refuses with `409 source_namespace_mismatch` a replacement that
+names a namespace other than the one the source was registered in. A node holds one
 corpus, so every other `/v1` route answers `400` when a request names a namespace rather than
 quietly serving the shared index — set the header to `shared` or leave it off. The probes and node-level routes (`/health`, `/health/ready`, `/metrics`,
 `/v1/version`, `/v1/drain`) ignore it. A namespace is not a security boundary: the node has one
@@ -512,6 +527,68 @@ the entity listings, their cursors and filters, and
 [Stating facts](README.md#stating-facts) covers asserting and retracting facts: what a fact id is,
 why a stated fact is not served until the next build, and why a retracted one is served until a
 compaction applies the retraction.
+
+### Error codes
+
+Every error response — any status of `400` or above whose body is an error — is a JSON object with
+two members a client can rely on, plus whatever a route adds beside them:
+
+```json
+{"error": "Source not found: project-docs", "code": "source_not_found"}
+```
+
+`error` is prose for a person, and its wording may change between releases. `code` is for a
+program: a snake_case name that is never reworded or reused for a different cause, so branch on
+`code` (and the status), never on `error`. Members a route adds — the `candidates` of an ambiguous
+graph erasure, the `namespace` of a refused drop — are kept alongside. The probes are the exception
+by design: a `503` from `/health/ready` is a readiness report (`{"ready": false, "failed": [...]}`),
+not an error, and carries no `code`.
+
+A route that cannot tell causes apart answers with the default for its status; a route that can
+names the cause. A client that does not recognise a code should fall back to the status's default
+below, because new specific codes may be added.
+
+| Code | Status | Meaning |
+|---|---|---|
+| `invalid_request` | 400 | Malformed body, missing field, field of the wrong type or out of range. The default for `400` |
+| `invalid_namespace` | 400 | `X-Excalibur-Namespace`, or a namespace in a path, is not a legal namespace id |
+| `namespace_not_accepted` | 400 | `X-Excalibur-Namespace` named a tenant on a route that serves the shared corpus |
+| `unauthorized` | 401 | Missing or wrong bearer token |
+| `forbidden` | 403 | Understood and not permitted. The default for `403` |
+| `target_not_allowed` | 403 | An ingest `root_path` or `base_url` outside the allow-lists |
+| `not_found` | 404 | No such path, or nothing under the name the request gave. The default for `404` |
+| `source_not_found` | 404 | No source is registered under that `source_id` |
+| `query_not_found` | 404 | No query in flight has that id |
+| `namespace_not_found` | 404 | No namespace by that name exists — including one that must be created with `PUT /v1/graph/namespaces/{namespace}` first |
+| `entity_not_found` | 404 | No entity in the namespace has that name or `entity_id`, or the served graph holds no entity with that id |
+| `fact_not_found` | 404 | No asserted fact in the namespace has that `fact_id`, or states that subject, relation and object |
+| `erasure_not_found` | 404 | No erasure receipt or graph erasure request has that id - never issued, or older than the receipts kept |
+| `method_not_allowed` | 405 | The path exists and does not serve this method; the `Allow` header lists the ones it does |
+| `timeout` | 408, 504 | The work did not finish within the time it was given |
+| `conflict` | 409 | The request conflicts with the node's current state. The default for `409` |
+| `source_exists` | 409 | A source is already registered under that `source_id` |
+| `source_kind_conflict` | 409 | The `source_id` belongs to the other kind of source — a crawl versus documents supplied directly |
+| `source_busy` | 409 | `PUT /v1/ingest` while a crawl or re-index of the source is running; replace it once that ends |
+| `source_namespace_mismatch` | 409 | `PUT /v1/ingest` names a namespace other than the one the source was registered in |
+| `reindex_in_progress` | 409 | A re-index of that source is already running; poll its status instead |
+| `compaction_in_progress` | 409 | A compaction is already running |
+| `build_in_progress` | 409 | A graph build is already running |
+| `ambiguous_entity` | 409 | A name matches more than one entity; `candidates` lists their ids |
+| `namespace_protected` | 409 | The `shared` namespace cannot be dropped |
+| `payload_too_large` | 413 | The body is over the 1 MB limit |
+| `unprocessable` | 422 | Well formed, and cannot be served as asked |
+| `rate_limited` | 429 | The caller's read or mutate budget is spent; wait `Retry-After` seconds |
+| `source_limit_reached` | 429 | The node holds `excalibur.ingest.max-sources` sources already. Clears when one is removed, not with time |
+| `namespace_limit_reached` | 429 | The node holds `excalibur.graph.max-namespaces` namespaces already. Clears when one is dropped, not with time |
+| `internal_error` | 500 | The node failed; the reason is in its log, never in the body |
+| `unavailable` | 503 | The node cannot serve this now. The default for `503` |
+| `not_configured` | 503 | The node was started without what the operation needs — an embedding client or lexical index, an ingestion pipeline, a reindexer |
+| `graph_not_served` | 503 | No graph has been built for this namespace yet; `POST /v1/graph/build` |
+| `saturated` | 503 | Every permit for the work is taken; retry with backoff |
+| `shutting_down` | 503 | The node is shutting down and refuses new work; retry against another node |
+| `catalog_unavailable` | 503 | A registration change could not be recorded in the source catalog, so it was not applied |
+| `client_error` | other 4xx | Any other client error |
+| `server_error` | other 5xx | Any other server error |
 
 ### Authentication
 
@@ -757,18 +834,18 @@ value is restored at the limit, with a warning in the log, rather than refused.
 
 ### Error responses
 
-All ingest errors use the common envelope `{"error": "<message>"}` with the appropriate HTTP status code.
+All ingest errors use the common envelope `{"error": "<message>", "code": "<code>"}` with the appropriate HTTP status code; see [Error codes](#error-codes) for every code.
 
 **`409 Conflict` — source already registered**
 
 ```json
-{"error": "Source already registered: project-docs"}
+{"error": "Source already registered: project-docs", "code": "source_exists"}
 ```
 
 **`409 Conflict` — documents were supplied under that id**
 
 ```json
-{"error": "Source 'notes' holds documents supplied directly; a crawl registered under its id would remove them on its first pass. Use a different source_id."}
+{"error": "Source 'notes' holds documents supplied directly; a crawl registered under its id would remove them on its first pass. Use a different source_id.", "code": "source_kind_conflict"}
 ```
 
 A crawl decides for itself what its source holds, and its first pass removes every document under
@@ -780,13 +857,13 @@ rather than relying on the refusal.
 **`400 Bad Request` — missing or invalid field**
 
 ```json
-{"error": "Bad Request: Field 'config.source_id' is required"}
+{"error": "Bad Request: Field 'config.source_id' is required", "code": "invalid_request"}
 ```
 
 **`400 Bad Request` — a filesystem filter sent to an HTTP crawl**
 
 ```json
-{"error": "Bad Request: Field 'config.included_extensions' applies to a filesystem walk only: an HTTP crawl matches URLs, which have neither a file extension nor a directory, no symbolic links, and no local file to size. Remove it, or register this source with the source_type it belongs to."}
+{"error": "Bad Request: Field 'config.included_extensions' applies to a filesystem walk only: an HTTP crawl matches URLs, which have neither a file extension nor a directory, no symbolic links, and no local file to size. Remove it, or register this source with the source_type it belongs to.", "code": "invalid_request"}
 ```
 
 Refused rather than dropped. The crawler has a URL and a host policy, not a directory tree, so
@@ -797,7 +874,7 @@ been discarded.
 **`400 Bad Request` — `source_id` longer than 256 characters**
 
 ```json
-{"error": "Bad Request: 'config.source_id' must be at most 256 characters: 300"}
+{"error": "Bad Request: 'config.source_id' must be at most 256 characters: 300", "code": "invalid_request"}
 ```
 
 A source id is copied into every document's registry record and printed with every log line about
@@ -823,7 +900,7 @@ source is deregistered, not when time passes.
 **`405 Method Not Allowed` — a method other than GET, POST or DELETE**
 
 ```json
-{"error": "Method Not Allowed - Use GET to read the registrations, POST to register a source or DELETE to stop crawling one"}
+{"error": "Method Not Allowed - Use GET to read the registrations, POST to register a source or DELETE to stop crawling one", "code": "method_not_allowed"}
 ```
 
 Unauthenticated, and charged against the read budget: which handler serves a request is decided
@@ -920,14 +997,15 @@ now. The whole configuration is replaced, not merged — a setting left out of t
 to its default. `source_type` may change too; the next crawl then removes whatever the old
 configuration indexed that the new one does not find.
 
-**Error — `404 Not Found`** — no source is running under that id. A catalog record the node could
-not start at boot (`registered: false` on `GET /v1/ingest`) is not running either; register it
+**Error — `404 Not Found`** (`source_not_found`) — no source is running under that id. A catalog
+record the node could not start at boot (`registered: false` on `GET /v1/ingest`) is not running either; register it
 again with `POST`.
 
-**Error — `409 Conflict`** — a crawl or re-index of the source is running, and would carry on with
+**Error — `409 Conflict`** (`source_busy`) — a crawl or re-index of the source is running, and would carry on with
 the configuration it started with; send the replacement again once it has finished, or stop it —
-a crawl with `DELETE /v1/ingest/run`, a re-index with `DELETE /v1/reindex`. Also `409` when `X-Excalibur-Namespace` names a namespace other than
-the one the source was registered in: its documents' facts are already staged there, and moving a
+a crawl with `DELETE /v1/ingest/run`, a re-index with `DELETE /v1/reindex`. Also `409`
+(`source_namespace_mismatch`) when `X-Excalibur-Namespace` names a namespace other than the one the
+source was registered in: its documents' facts are already staged there, and moving a
 source is a deregistration and a new registration.
 
 **Error — `400 Bad Request`**, **`403 Forbidden`**, **`413 Payload Too Large`** — as for
@@ -1037,7 +1115,7 @@ filesystem source. A `robots.txt` the site cannot serve is a different case, rep
 **Response — `404 Not Found`** (unknown source)
 
 ```json
-{"error": "Source not found: project-docs"}
+{"error": "Source not found: project-docs", "code": "source_not_found"}
 ```
 
 `state` is one of `idle`, `crawling`, `embedding`, `indexing`, or `unconfigured`. `progress` is
@@ -1229,19 +1307,19 @@ or erased while the reindex ran is left alone — the later write stands — and
 it afresh.
 
 ```json
-{"error": "Source not found: unknown-source. Only a source registered with POST /v1/ingest can be reindexed; documents supplied with POST /v1/documents are replaced by posting them again"}
+{"error": "Source not found: unknown-source. Only a source registered with POST /v1/ingest can be reindexed; documents supplied with POST /v1/documents are replaced by posting them again", "code": "source_not_found"}
 ```
 
 **Error — `409 Conflict` (reindex already running for that source)**
 
 ```json
-{"error": "Reindex already in progress for source: project-docs"}
+{"error": "Reindex already in progress for source: project-docs", "code": "reindex_in_progress"}
 ```
 
 **Error — `405 Method Not Allowed` — a method other than POST or DELETE**
 
 ```json
-{"error": "Method Not Allowed - Use POST to start a reindex or DELETE to stop one"}
+{"error": "Method Not Allowed - Use POST to start a reindex or DELETE to stop one", "code": "method_not_allowed"}
 ```
 
 **Error — `400 Bad Request`** — the body is not JSON, or `source_id` is missing, not a string, or
@@ -1335,7 +1413,7 @@ each of them is written. `progress` is their ratio and nothing else.
 **Error — `404 Not Found`**
 
 ```json
-{"error": "No reindex has been run for source: project-docs"}
+{"error": "No reindex has been run for source: project-docs", "code": "not_found"}
 ```
 
 **Error — `400 Bad Request`** — the `source_id` parameter is not a legal source id.
@@ -1592,7 +1670,7 @@ the document.
 **Error — `400 Bad Request`**
 
 ```json
-{"error": "'document_id' or a non-empty 'document_ids' array is required"}
+{"error": "'document_id' or a non-empty 'document_ids' array is required", "code": "invalid_request"}
 ```
 
 The same `400` answers a body that is not JSON, a field of the wrong type, more than 1000 ids, or an
@@ -2078,13 +2156,13 @@ no size fixes that one.
 **`400 Bad Request` — missing `query` field**
 
 ```json
-{"error": "Bad Request: Field 'query' is required and must be non-empty"}
+{"error": "Bad Request: Field 'query' is required and must be non-empty", "code": "invalid_request"}
 ```
 
 **`400 Bad Request` — `query` longer than `excalibur.api.max-query-chars`**
 
 ```json
-{"error": "Bad Request: Field 'query' must be at most 8192 characters: 40000"}
+{"error": "Bad Request: Field 'query' must be at most 8192 characters: 40000", "code": "invalid_request"}
 ```
 
 The query text is the body of the embedding call, and on the lexical path of the expansion call as
@@ -2094,7 +2172,7 @@ which is the largest unit anything in the index was embedded as.
 **`503 Service Unavailable` — no retrieval path configured**
 
 ```json
-{"error": "Server is not configured for text queries: this node has neither an embedding client nor a lexical index, so there is no index to search. Configure an embedding endpoint (excalibur.llm.embedding-base-url or excalibur.llm.base-url, with excalibur.llm.api-key for the hosted default) so the server can embed queries with the same model that ingestion uses, or see the startup log for why the chunk lexical index was not opened."}
+{"error": "Server is not configured for text queries: this node has neither an embedding client nor a lexical index, so there is no index to search. Configure an embedding endpoint (excalibur.llm.embedding-base-url or excalibur.llm.base-url, with excalibur.llm.api-key for the hosted default) so the server can embed queries with the same model that ingestion uses, or see the startup log for why the chunk lexical index was not opened.", "code": "not_configured"}
 ```
 
 A missing embedding endpoint alone does not produce this: without one the node answers from BM25
@@ -2106,7 +2184,7 @@ actionable; the reason the index would not open is in the startup log.
 **`400 Bad Request` — `explain` or `snippet` on a query of more than 64 distinct terms**
 
 ```json
-{"error": "Bad Request: the query holds 71 distinct terms and at most 64 can be explained or highlighted: shorten the query, or drop 'explain' and 'snippet'"}
+{"error": "Bad Request: the query holds 71 distinct terms and at most 64 can be explained or highlighted: shorten the query, or drop 'explain' and 'snippet'", "code": "invalid_request"}
 ```
 
 Each term is looked for in every returned passage, so the count bounds the work a single request
@@ -2115,13 +2193,13 @@ can ask for. Without `explain` and `snippet` the query is not held to it.
 **`413 Payload Too Large` — the body is over 1 MB**
 
 ```json
-{"error": "Request body too large (max 1048576 bytes)"}
+{"error": "Request body too large (max 1048576 bytes)", "code": "payload_too_large"}
 ```
 
 **`500 Internal Server Error` — the search failed**
 
 ```json
-{"error": "Query execution failed"}
+{"error": "Query execution failed", "code": "internal_error"}
 ```
 
 The vector half failed and BM25 could not answer in its place, or, on a node with no embedding
@@ -2130,7 +2208,7 @@ client, the BM25 search itself failed. The reason is in the node's log, not the 
 **`503 Service Unavailable` — the query service is saturated**
 
 ```json
-{"error": "Query service is saturated"}
+{"error": "Query service is saturated", "code": "saturated"}
 ```
 
 Only on a node with no embedding client: BM25 is its only signal, and every permit for a
@@ -2140,7 +2218,7 @@ BM25 half instead and answers from vectors.
 **`503 Service Unavailable` — the query service is not available, or was interrupted**
 
 ```json
-{"error": "Query service is not available"}
+{"error": "Query service is not available", "code": "unavailable"}
 ```
 
 The embedding came back unusable and BM25 could not answer in its place, or the node is not ready
@@ -2150,13 +2228,13 @@ down. Retry against a node that is up.
 **`401 Unauthorized` — missing or wrong bearer token**
 
 ```json
-{"error": "Authentication failed"}
+{"error": "Authentication failed", "code": "unauthorized"}
 ```
 
 **`429 Too Many Requests` — rate limit exceeded**
 
 ```json
-{"error": "Rate limit exceeded"}
+{"error": "Rate limit exceeded", "code": "rate_limited"}
 ```
 
 Carries a `Retry-After` header. Reads and mutations have separate budgets.
@@ -2164,7 +2242,7 @@ Carries a `Retry-After` header. Reads and mutations have separate budgets.
 **`405 Method Not Allowed` — a method other than POST or DELETE**
 
 ```json
-{"error": "Method Not Allowed - Use POST for queries or DELETE for cancellation"}
+{"error": "Method Not Allowed - Use POST for queries, or DELETE /v1/query/{query_id} for cancellation", "code": "method_not_allowed"}
 ```
 
 Unauthenticated, and charged against the read budget: which handler serves a request is decided
@@ -2348,14 +2426,17 @@ curl -X DELETE http://localhost:8080/v1/query/b3d9f4a0-1e2c-4a7b-9c3d-5e6f7a8b9c
 **Response — `404 Not Found`** (unknown or already-completed query)
 
 ```json
-{"error": "Query not found or already completed"}
+{"error": "Query not found or already completed", "code": "query_not_found"}
 ```
 
-**Response — `400 Bad Request`** (missing query ID in path)
+**Response — `405 Method Not Allowed`** (no query ID in the path)
 
 ```json
-{"error": "Bad Request - Query ID is required in path (e.g., /v1/query/{query_id})"}
+{"error": "Method Not Allowed - Use POST for queries, or DELETE /v1/query/{query_id} for cancellation", "code": "method_not_allowed"}
 ```
+
+`DELETE /v1/query` names the collection, which serves only `POST`, so it is answered by the routing
+before authentication, with `Allow: POST`.
 
 Use the `query_id` returned in the original query response. Cancellation is cooperative and
 propagates through all query pipeline stages, both signals of a hybrid query, and the relevancy
@@ -2696,7 +2777,7 @@ across namespaces, never a row per namespace — which namespace owes what is
 - `budget` sets two shares against each limit. `graphMappings` and `graphDescriptors` are what eviction can give back; `processMappings` and `processDescriptors` are the whole process — segments, vector graphs, the chunk index and the JVM itself — which is what the kernel limit is measured against. Graph eviction starts when the whole process crosses `mappingHighWater`. A process figure is `null` where the platform cannot be asked, and `descriptorLimit` is `0` where no descriptor limit is enforced.
 - `builds` counts builds since startup by how they ended. A cancelled build is one somebody asked to stop, not a failure.
 - `erasure` is the graph's erasure backlog across every namespace on disk, resident or not. Compare `oldestAgeMs` against `excalibur.graph.erasure-max-latency-seconds`; `overdueNamespaces` is how many have already missed it. `unreadableNamespaces` are namespaces whose log could not be read, and so are in none of the other figures. `oldestAgeMs` is `null` when nothing is owed. The block is absent when the graph root cannot be listed, which is not the same as owing nothing.
-- `ingest` is present only where ingestion stages facts into the graph (a chat model is configured). `unresolvedDocuments`, `extractionFailures` and `tenantFailures` count documents the graph did not take: no registered source named their namespace, the extractor failed on them, or their namespace would not open. A published one among them is searchable and its facts are missing, and it is not offered to the graph again unless it changes; nothing else shows that. A replaced or removed one whose namespace would not open still owes the withdrawal of what was staged from it: that is handed to the namespace when it next opens, which the erasure sweep keeps trying, and only a restart before then loses it — the log says so at `ERROR`, naming the document.
+- `ingest` is present only where ingestion stages facts into the graph (a chat model is configured). `unresolvedDocuments`, `extractionFailures` and `tenantFailures` count documents the graph did not take: no registered source named their namespace, the extractor failed on them, or their namespace would not open — or no longer exists and the node would not recreate it, having been dropped on a node that requires explicit creation or has reached `excalibur.graph.max-namespaces`. A published one among them is searchable and its facts are missing, and it is not offered to the graph again unless it changes; nothing else shows that. A replaced or removed one whose namespace would not open still owes the withdrawal of what was staged from it: that is handed to the namespace when it next opens, which the erasure sweep keeps trying, and only a restart before then loses it — the log says so at `ERROR`, naming the document.
 - `sinkRefusals` counts reports the graph sink threw on instead of counting under one of those reasons. It should stay `0`: the sink is required to absorb its own failures, and one that throws has left a published document's facts missing, or a removed document's staged facts neither withdrawn nor owed. The log names each document.
 - `withdrawalFailures` counts the times a replaced or removed document's staged facts could not be withdrawn when it was reported. None of them is dropped. Each is recorded in the namespace's `graph-staging/withdrawals.log` and retried until it is made: when the namespace next opens, on the erasure sweep over the namespaces that are resident, before every build, and whenever the document is reported again. Nothing newer is staged for that document until then, because the retry withdraws by document and would take a newer version's facts with the old ones. A build tries the withdrawal first and, if it is still refused, publishes what the document used to say, so a figure that keeps climbing means the staging logs are refusing to be rewritten; the log names each document.
 
@@ -2874,7 +2955,7 @@ limited, because the guard runs inside the audit and not before it. Reads are no
 | `compaction.start`, `compaction.cancel` | `POST`, `DELETE /v1/compact` |
 | `graph.build.start`, `graph.build.cancel` | `POST`, `DELETE /v1/graph/build` |
 | `graph.facts.assert`, `graph.facts.retract` | `POST /v1/graph/facts`, `DELETE /v1/graph/facts/{fact_id}` |
-| `graph.namespace.delete` | `DELETE /v1/graph/namespaces/{namespace}` |
+| `graph.namespace.create`, `graph.namespace.delete` | `PUT`, `DELETE /v1/graph/namespaces/{namespace}` |
 | `query.cancel` | `DELETE /v1/query/{query_id}` |
 | `node.drain`, `node.undrain` | `POST`, `DELETE /v1/drain` |
 

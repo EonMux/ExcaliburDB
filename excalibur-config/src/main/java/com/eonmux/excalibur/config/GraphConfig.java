@@ -129,6 +129,27 @@ public final class GraphConfig {
     public static final int DEFAULT_MAX_OPEN_NAMESPACES = 16;
 
     /**
+     * How many tenant namespaces a node holds on disk before it refuses to create another.
+     *
+     * <p>A namespace is a directory, a staging log and an erasure log, and it is brought into
+     * being by a name in a request header. Without a bound, any caller able to mutate can create
+     * them without end - one per request, each costing the disk and every later sweep over the
+     * graph root something. Ten thousand is far past what a deployment reaches by design and
+     * short of what a runaway client reaches by accident. The shared namespace is not counted.</p>
+     */
+    public static final int DEFAULT_MAX_NAMESPACES = 10_000;
+
+    /**
+     * Whether a namespace must be created explicitly before any request may use it.
+     *
+     * <p>Off by default, because a node upgraded into this release must keep answering the
+     * requests it answered before. On, a namespace exists only once
+     * {@code PUT /v1/graph/namespaces/{namespace}} has created it, so a typo in a header is
+     * refused rather than becoming a tenant nobody meant to create.</p>
+     */
+    public static final boolean DEFAULT_REQUIRE_EXPLICIT_NAMESPACES = false;
+
+    /**
      * Tombstoned fraction of the store at which erasure compaction becomes worthwhile.
      *
      * <p>A compaction rewrites the whole store, so running one per request would make erasure
@@ -201,6 +222,8 @@ public final class GraphConfig {
     private final List<String> singleValuedRelations;
     private final boolean entityVectorsEnabled;
     private final int maxOpenNamespaces;
+    private final int maxNamespaces;
+    private final boolean requireExplicitNamespaces;
     private final List<String> hotNamespaces;
     private final List<String> coldNamespaces;
     private final double erasureTombstoneRatio;
@@ -229,6 +252,11 @@ public final class GraphConfig {
             props, "excalibur.graph.entity-vectors-enabled", DEFAULT_ENTITY_VECTORS_ENABLED);
         this.maxOpenNamespaces = ConfigBounds.atLeast(
             props, "excalibur.graph.max-open-namespaces", DEFAULT_MAX_OPEN_NAMESPACES, 1);
+        this.maxNamespaces = ConfigBounds.atLeast(
+            props, "excalibur.graph.max-namespaces", DEFAULT_MAX_NAMESPACES, 1);
+        this.requireExplicitNamespaces = PropertyParser.parseBoolean(
+            props, "excalibur.graph.require-explicit-namespaces",
+            DEFAULT_REQUIRE_EXPLICIT_NAMESPACES);
         this.erasureTombstoneRatio = requirePositiveFraction(PropertyParser.parseDouble(
             props, "excalibur.graph.erasure-tombstone-ratio",
             DEFAULT_ERASURE_TOMBSTONE_RATIO), "erasure-tombstone-ratio");
@@ -484,6 +512,24 @@ public final class GraphConfig {
     }
 
     /**
+     * How many tenant namespaces may exist on disk before another is refused.
+     *
+     * @return The bound, not counting the shared namespace
+     */
+    public int getMaxNamespaces() {
+        return maxNamespaces;
+    }
+
+    /**
+     * Whether a namespace must be created explicitly before a request may use it.
+     *
+     * @return true when naming an unknown namespace in a header is refused rather than creating it
+     */
+    public boolean isRequireExplicitNamespaces() {
+        return requireExplicitNamespaces;
+    }
+
+    /**
      * Tombstoned fraction of the store at which an erasure compaction becomes worthwhile.
      *
      * @return The ratio, in [0, 1]
@@ -625,6 +671,8 @@ public final class GraphConfig {
             && extractorVersion == other.extractorVersion
             && entityVectorsEnabled == other.entityVectorsEnabled
             && maxOpenNamespaces == other.maxOpenNamespaces
+            && maxNamespaces == other.maxNamespaces
+            && requireExplicitNamespaces == other.requireExplicitNamespaces
             && Double.compare(erasureTombstoneRatio, other.erasureTombstoneRatio) == 0
             && erasureMaxLatencySeconds == other.erasureMaxLatencySeconds
             && autoBuildEnabled == other.autoBuildEnabled
@@ -647,6 +695,7 @@ public final class GraphConfig {
             maxAmbiguousCandidates, contextTokenBudget, topK, rerankOverFetch, maxFrontier,
             maxWalkFacts, ramBufferMb,
             extractionEnabled, extractorVersion, entityVectorsEnabled, maxOpenNamespaces,
+            maxNamespaces, requireExplicitNamespaces,
             erasureTombstoneRatio, erasureMaxLatencySeconds, singleValuedRelations,
             hotNamespaces, coldNamespaces, autoBuildEnabled, autoBuildIntervalSeconds,
             autoBuildDebounceSeconds, autoBuildMaxDelaySeconds, autoBuildMaxConcurrent,

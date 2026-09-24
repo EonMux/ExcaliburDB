@@ -4,6 +4,8 @@ import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.bootstrap.NamespaceRefusedException;
+import com.eonmux.excalibur.config.IngestConfig;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.security.IngestTargetValidator;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
@@ -29,6 +31,8 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -808,7 +812,8 @@ class IngestEndpointTest {
             Response response = register(root, "notes", supplied);
 
             assertThat(response.status()).isEqualTo(409);
-            assertThat(response.body()).contains("notes");
+            assertThat(response.body()).contains("notes")
+                .contains("\"code\": \"source_kind_conflict\"");
             // Not registered: a crawl that was refused must not be crawling.
             assertThat(registry.isRegistered("notes")).isFalse();
         }
@@ -928,6 +933,37 @@ class IngestEndpointTest {
             assertThat(registry.namespaceOf("docs")).contains(NamespaceId.SHARED);
         }
 
+        @Test
+        @DisplayName("admits the namespace it registers into, before registering")
+        void admitsTheNamespace(@TempDir Path root) throws IOException {
+            List<NamespaceId> admitted = new ArrayList<>();
+
+            Response response = post(ApiSecurityConfig.builder().allowIngestRoot(root).build(),
+                null, body(root, "docs"), "acme", admitted::add);
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(admitted).containsExactly(NamespaceId.of("acme"));
+        }
+
+        @Test
+        @DisplayName("a namespace the node refuses registers nothing, and says why")
+        void aRefusedNamespaceRegistersNothing(@TempDir Path root) throws IOException {
+            // Refused at registration, not when the crawl publishes: by then the caller has been
+            // told its source is registered, and its documents would be staged nowhere.
+            for (NamespaceRefusedException.Reason reason : NamespaceRefusedException.Reason.values()) {
+                Response response = post(ApiSecurityConfig.builder().allowIngestRoot(root).build(),
+                    null, body(root, "docs"), "acmee", namespace -> {
+                        throw new NamespaceRefusedException(namespace, reason, "refused " + reason);
+                    });
+
+                assertThat(response.status()).as(reason.name()).isEqualTo(reason.statusCode());
+                assertThat(response.body())
+                    .contains("\"code\": \"" + reason.code().wireName() + "\"")
+                    .contains("refused " + reason);
+                assertThat(registry.getAllSourceIds()).isEmpty();
+            }
+        }
+
         /** A filesystem registration for {@code root} under {@code sourceId}. */
         private String body(Path root, String sourceId) {
             return "{\"source_type\": \"filesystem\", \"config\": {"
@@ -970,6 +1006,7 @@ class IngestEndpointTest {
             Response response = put(root, body(root, "docs"), null);
 
             assertThat(response.status()).isEqualTo(404);
+            assertThat(response.body()).contains("\"code\": \"source_not_found\"");
             assertThat(registry.getAllSourceIds()).isEmpty();
         }
 
@@ -982,7 +1019,8 @@ class IngestEndpointTest {
             Response response = put(root, body(root, "docs"), "acme");
 
             assertThat(response.status()).isEqualTo(409);
-            assertThat(response.body()).contains("namespace");
+            assertThat(response.body()).contains("namespace")
+                .contains("\"code\": \"source_namespace_mismatch\"");
             assertThat(registry.get("docs")).isSameAs(original);
         }
 
@@ -998,6 +1036,7 @@ class IngestEndpointTest {
             Response response = put(root, body(root, "docs"), null);
 
             assertThat(response.status()).isEqualTo(409);
+            assertThat(response.body()).contains("\"code\": \"source_busy\"");
             assertThat(registry.get("docs")).isSameAs(original);
         }
 
@@ -1114,7 +1153,17 @@ class IngestEndpointTest {
      */
     private Response post(ApiSecurityConfig security, InlineSourceIds supplied,
                           String requestBody, String namespace) throws IOException {
-        return send("POST", registry, security, supplied, requestBody, namespace);
+        return post(security, supplied, requestBody, namespace, NamespaceAdmission.ANY);
+    }
+
+    /**
+     * Posts {@code requestBody} to an endpoint enforcing {@code security} that admits namespaces
+     * through {@code admission}.
+     */
+    private Response post(ApiSecurityConfig security, InlineSourceIds supplied,
+                          String requestBody, String namespace, NamespaceAdmission admission)
+            throws IOException {
+        return send("POST", registry, security, supplied, requestBody, namespace, admission);
     }
 
     /**
@@ -1124,8 +1173,21 @@ class IngestEndpointTest {
     private static Response send(String method, SourceRegistry sources,
                                  ApiSecurityConfig security, InlineSourceIds supplied,
                                  String requestBody, String namespace) throws IOException {
+        return send(method, sources, security, supplied, requestBody, namespace,
+            NamespaceAdmission.ANY);
+    }
+
+    /**
+     * Sends {@code requestBody} with {@code method} to an endpoint over {@code sources} enforcing
+     * {@code security} that admits namespaces through {@code admission}.
+     */
+    private static Response send(String method, SourceRegistry sources,
+                                 ApiSecurityConfig security, InlineSourceIds supplied,
+                                 String requestBody, String namespace,
+                                 NamespaceAdmission admission) throws IOException {
         IngestEndpoint endpoint = new IngestEndpoint(sources, null, null,
-            new IngestTargetValidator(security), supplied);
+            new IngestTargetValidator(security), supplied, IngestConfig.DEFAULT_CRAWL_DELAY_MS,
+            admission);
 
         HttpExchange exchange = mock(HttpExchange.class);
         ByteArrayOutputStream responseBody = new ByteArrayOutputStream();

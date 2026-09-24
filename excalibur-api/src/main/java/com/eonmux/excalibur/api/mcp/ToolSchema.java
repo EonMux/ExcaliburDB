@@ -167,6 +167,18 @@ final class ToolSchema {
     }
 
     /**
+     * An array property the model must supply, with its element type declared.
+     *
+     * @param name        The field name
+     * @param description What the array is for
+     * @param itemType    The element type
+     * @return The property
+     */
+    static Property requiredArray(String name, String description, String itemType) {
+        return new Property(name, propertySchema("array", description, itemType), true);
+    }
+
+    /**
      * Assembles an object schema out of its properties.
      *
      * @param properties The properties, in the order a model should read them

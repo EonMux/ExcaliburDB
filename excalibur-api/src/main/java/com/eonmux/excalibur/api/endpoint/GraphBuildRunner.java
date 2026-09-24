@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.eonmux.excalibur.api.bootstrap.GraphBuildService;
 import com.eonmux.excalibur.api.bootstrap.GraphExtraction;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.bootstrap.NamespaceRefusedException;
 
 import com.eonmux.excalibur.graph.build.BuildCancelledException;
 import com.eonmux.excalibur.tenancy.NamespaceId;
@@ -11,6 +12,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -166,6 +168,7 @@ public final class GraphBuildRunner implements AutoCloseable {
 
     private final Build build;
     private final Supplier<Optional<GraphExtraction>> extraction;
+    private final NamespaceAdmission admission;
     private final ExecutorService executor;
     private final Object lock = new Object();
 
@@ -212,7 +215,7 @@ public final class GraphBuildRunner implements AutoCloseable {
      * @throws NullPointerException if tenants is null
      */
     public GraphBuildRunner(GraphTenants tenants) {
-        this(over(tenants), () -> Optional.of(tenants.extraction()));
+        this(over(tenants), () -> Optional.of(tenants.extraction()), tenants::admit);
     }
 
     /**
@@ -235,8 +238,25 @@ public final class GraphBuildRunner implements AutoCloseable {
      * @throws NullPointerException if either is null
      */
     public GraphBuildRunner(Build build, Supplier<Optional<GraphExtraction>> extraction) {
+        this(build, extraction, NamespaceAdmission.ANY);
+    }
+
+    /**
+     * Creates a runner over the given build work that admits a namespace before building it.
+     *
+     * @param build      What building one namespace's graph does
+     * @param extraction Whether ingestion on this node extracts facts, read on every request
+     *                   because ingestion is wired after the routes are
+     * @param admission  Whether a namespace may be built at all, asked before a build is claimed
+     *                   so a refused one is answered to the caller rather than failing behind
+     *                   the {@code 202}
+     * @throws NullPointerException if any is null
+     */
+    public GraphBuildRunner(Build build, Supplier<Optional<GraphExtraction>> extraction,
+                            NamespaceAdmission admission) {
         this.build = Objects.requireNonNull(build, "build cannot be null");
         this.extraction = Objects.requireNonNull(extraction, "extraction cannot be null");
+        this.admission = Objects.requireNonNull(admission, "admission cannot be null");
         this.executor = Executors.newSingleThreadExecutor(task -> {
             Thread thread = new Thread(task, "graph-build");
             thread.setDaemon(true);
@@ -259,9 +279,14 @@ public final class GraphBuildRunner implements AutoCloseable {
     /**
      * Starts a build of one namespace, unless the node is already building something.
      *
+     * <p>The namespace is admitted once the slot is known to be free and before it is claimed,
+     * so a refused namespace claims nothing and a build that is in the way creates nothing.</p>
+     *
      * @param namespace Whose graph to build
      * @return What was started, or what is in the way
      * @throws NullPointerException if namespace is null
+     * @throws NamespaceRefusedException if the namespace does not exist and may not be created
+     * @throws UncheckedIOException if the namespace could not be created
      * @throws java.util.concurrent.RejectedExecutionException if the node is shutting down
      */
     public Claim start(NamespaceId namespace) {
@@ -271,6 +296,11 @@ public final class GraphBuildRunner implements AutoCloseable {
         synchronized (lock) {
             if (inFlight != null) {
                 return new Claim(null, inFlight);
+            }
+            try {
+                admission.admit(namespace);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
             }
             inFlight = started;
             remembered.put(namespace, started);

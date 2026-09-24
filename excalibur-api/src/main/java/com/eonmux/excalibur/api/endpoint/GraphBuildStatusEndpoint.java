@@ -6,6 +6,7 @@ import com.eonmux.excalibur.api.bootstrap.GraphBuildService;
 import com.eonmux.excalibur.api.bootstrap.GraphExtraction;
 import com.eonmux.excalibur.api.bootstrap.GraphFreshness;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.tenancy.NamespaceId;
@@ -146,8 +147,7 @@ public final class GraphBuildStatusEndpoint implements HttpHandler {
             namespace = GraphTenants.namespaceOf(
                 exchange.getRequestHeaders().getFirst(GraphTenants.NAMESPACE_HEADER));
         } catch (IllegalArgumentException e) {
-            ResponseBody.sendJson(exchange, 400,
-                "{\"error\": \"" + JsonText.escape(e.getMessage()) + "\"}");
+            ResponseBody.sendError(exchange, 400, ErrorCode.INVALID_NAMESPACE, e.getMessage());
             return;
         }
 

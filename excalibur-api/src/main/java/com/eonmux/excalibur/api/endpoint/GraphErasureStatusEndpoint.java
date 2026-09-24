@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.graph.erasure.ErasureLog;
@@ -92,14 +93,18 @@ public class GraphErasureStatusEndpoint implements HttpHandler {
         }
 
         long requestId;
-        NamespaceId namespace;
         try {
             requestId = requestIdOf(exchange.getRequestURI().getPath(), COLLECTION_PATH);
+        } catch (IllegalArgumentException e) {
+            ResponseBody.sendError(exchange, 400, ErrorCode.INVALID_REQUEST, e.getMessage());
+            return;
+        }
+        NamespaceId namespace;
+        try {
             namespace = GraphTenants.namespaceOf(
                 exchange.getRequestHeaders().getFirst(GraphTenants.NAMESPACE_HEADER));
         } catch (IllegalArgumentException e) {
-            ResponseBody.sendJson(exchange, 400,
-                "{\"error\": \"" + JsonText.escape(e.getMessage()) + "\"}");
+            ResponseBody.sendError(exchange, 400, ErrorCode.INVALID_NAMESPACE, e.getMessage());
             return;
         }
 
@@ -114,8 +119,8 @@ public class GraphErasureStatusEndpoint implements HttpHandler {
             return;
         }
         if (status.isEmpty()) {
-            ResponseBody.sendJson(exchange, 404, "{\"error\": \"No erasure request "
-                + requestId + " in this namespace\"}");
+            ResponseBody.sendError(exchange, 404, ErrorCode.ERASURE_NOT_FOUND,
+                "No erasure request " + requestId + " in this namespace");
             return;
         }
 

@@ -53,6 +53,17 @@ class ConfigGraphTest {
         }
 
         @Test
+        @DisplayName("namespaces are capped, and may still be created by naming them")
+        void namespaceCreationDefaults() {
+            // Implicit creation stays on by default, so a node upgraded into this release keeps
+            // answering the requests it answered before; the cap is what bounds it.
+            GraphConfig settings = graph(Map.of());
+
+            assertThat(settings.getMaxNamespaces()).isEqualTo(GraphConfig.DEFAULT_MAX_NAMESPACES);
+            assertThat(settings.isRequireExplicitNamespaces()).isFalse();
+        }
+
+        @Test
         @DisplayName("the score gates default to values that mean something on the unit relevance scale")
         void scoreGatesDefaultOnTheUnitScale() {
             // Retrieval reports relevance in [0, 1]: a share of the attainable BM25 score, or a
@@ -101,6 +112,17 @@ class ConfigGraphTest {
             assertThat(settings.getMaxAmbiguousCandidates()).isEqualTo(3);
             assertThat(settings.getConfidenceTemperature()).isEqualTo(2.5);
             assertThat(settings.getRamBufferMb()).isEqualTo(64.0);
+        }
+
+        @Test
+        @DisplayName("the namespace cap and the explicit-creation switch are read")
+        void namespaceCreationKeys() {
+            GraphConfig settings = graph(Map.of(
+                "excalibur.graph.max-namespaces", "3",
+                "excalibur.graph.require-explicit-namespaces", "true"));
+
+            assertThat(settings.getMaxNamespaces()).isEqualTo(3);
+            assertThat(settings.isRequireExplicitNamespaces()).isTrue();
         }
 
         @Test
@@ -241,6 +263,15 @@ class ConfigGraphTest {
         }
 
         @Test
+        @DisplayName("a namespace cap below one is refused")
+        void namespaceCapBelowOne() {
+            // Zero would refuse every tenant while the node reported a healthy configuration.
+            assertThatThrownBy(() -> graph(Map.of("excalibur.graph.max-namespaces", "0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max-namespaces");
+        }
+
+        @Test
         @DisplayName("a non-positive RAM buffer is refused")
         void nonPositiveRamBuffer() {
             assertThatThrownBy(() -> graph(Map.of("excalibur.graph.ram-buffer-mb", "0")))
@@ -359,6 +390,8 @@ class ConfigGraphTest {
                 Map.entry("excalibur.graph.hot-namespaces", "vip"),
                 Map.entry("excalibur.graph.cold-namespaces", "bulk-import"),
                 Map.entry("excalibur.graph.max-open-namespaces", "32"),
+                Map.entry("excalibur.graph.max-namespaces", "12"),
+                Map.entry("excalibur.graph.require-explicit-namespaces", "true"),
                 Map.entry("excalibur.graph.erasure-tombstone-ratio", "0.4"),
                 Map.entry("excalibur.graph.erasure-max-latency-seconds", "600"),
                 Map.entry("excalibur.graph.auto-build-enabled", "false"),
