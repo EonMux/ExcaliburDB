@@ -3,6 +3,9 @@ package com.eonmux.excalibur.retrieval.build;
 import com.eonmux.excalibur.graph.file.Durability;
 import com.eonmux.excalibur.graph.staging.GraphBuilder;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
+import com.eonmux.excalibur.graph.staging.PublishFence;
+import com.eonmux.excalibur.graph.staging.PublishRefusedException;
+import com.eonmux.excalibur.graph.staging.StagedErasure;
 import com.eonmux.excalibur.graph.temporal.SupersessionPolicy;
 import com.eonmux.excalibur.graph.vector.EntityVectorWriter;
 import com.eonmux.excalibur.retrieval.lexical.LexicalIndex;
@@ -83,10 +86,12 @@ public final class GraphDirectoryBuilder {
      * @param relations how many relations were named
      * @param indexed   how many entities got a text document
      * @param embedded  how many entities got a vector
+     * @param withheld  how many staged facts were left out because an outstanding erasure
+     *                  obligation covers them
      * @param directory where it was published
      */
     public record BuildResult(long edges, int entities, int relations, int indexed,
-                              long embedded, Path directory) {
+                              long embedded, long withheld, Path directory) {
 
         /** Whether anything was published. */
         public boolean published() {
@@ -162,32 +167,83 @@ public final class GraphDirectoryBuilder {
                                          SupersessionPolicy supersession, double ramBufferMb,
                                          EntityEmbedder embedder, int dimension,
                                          GraphBuilder.Opener<T> opener) throws IOException {
+        return build(staging, target, supersession, ramBufferMb, embedder, dimension, opener,
+            PublishFence.NONE);
+    }
+
+    /**
+     * As {@link #build(GraphStagingStore, Path, SupersessionPolicy, double, EntityEmbedder, int,
+     * GraphBuilder.Opener)}, leaving out what {@code fence} withholds and publishing through it.
+     *
+     * <h3>Every artifact leaves the same things out</h3>
+     * <p>A fact the fence withholds is not in the store, a name it withholds is its erased
+     * placeholder in the dictionary and in the label index, and a snippet it withholds is in
+     * neither the entity documents nor the vectors computed from them. Leaving a fact out of the
+     * store alone would still publish the name and the prose it came with, which is what an
+     * erasure of a person is most about.</p>
+     *
+     * <h3>A refused publish</h3>
+     * <p>The scratch directory is discarded before the refusal propagates: it was assembled
+     * from staging read before the refusing obligation existed, so it may hold what that
+     * obligation covers, and nothing will serve it.</p>
+     *
+     * @param <T>          What the caller serves the graph through
+     * @param staging      The facts and the text to build from
+     * @param target       Where the graph is served from
+     * @param supersession Which relations hold one value at a time
+     * @param ramBufferMb  Lucene write buffer, in megabytes
+     * @param embedder     Produces entity vectors, or null to build without them
+     * @param dimension    The dimension those vectors have
+     * @param opener       Opens the published directory, before the previous one is deleted
+     * @param fence        What to leave out, and the gate the publish passes through
+     * @return What was built, and what the opener returned
+     * @throws PublishRefusedException if an erasure was recorded while the graph was being
+     *                                 built; nothing was published
+     * @throws IOException if any artifact cannot be written, published or opened
+     * @throws NullPointerException if staging, target, supersession, opener or fence is null
+     */
+    public static <T> Published<T> build(GraphStagingStore staging, Path target,
+                                         SupersessionPolicy supersession, double ramBufferMb,
+                                         EntityEmbedder embedder, int dimension,
+                                         GraphBuilder.Opener<T> opener, PublishFence fence)
+            throws IOException {
         Objects.requireNonNull(staging, "staging must not be null");
         Objects.requireNonNull(target, "target must not be null");
         Objects.requireNonNull(supersession, "supersession must not be null");
         Objects.requireNonNull(opener, "opener must not be null");
+        Objects.requireNonNull(fence, "fence must not be null");
 
-        GraphBuilder.BuildResult store = GraphBuilder.buildInto(staging, target, supersession);
+        StagedErasure withheld = fence.withheld();
+        GraphBuilder.BuildResult store =
+            GraphBuilder.buildInto(staging, target, supersession, withheld);
         if (store.edges() == 0) {
-            LOGGER.info("nothing staged for {}; leaving the existing graph in place", target);
-            return new Published<>(
-                new BuildResult(0, store.entities(), store.relations(), 0, 0, target), null);
+            LOGGER.info("nothing to publish for {}; leaving the existing graph in place", target);
+            return new Published<>(new BuildResult(0, store.entities(), store.relations(), 0, 0,
+                store.withheld(), target), null);
         }
 
         Path scratch = GraphBuilder.scratchFor(target);
-        int indexed = writeLexicalIndexes(staging, scratch, ramBufferMb);
+        List<String> documents = entityDocuments(staging, withheld);
+        int indexed = writeLexicalIndexes(GraphBuilder.entityLabels(staging, withheld),
+            documents, scratch, ramBufferMb);
         // Into the same scratch directory, so the vectors are published by the same rename as
         // the store they describe. Vectors that arrived a moment later would be vectors for the
         // previous numbering, and an entity id is always a valid entity id.
         long embedded = embedder == null
             ? 0
-            : writeEntityVectors(entityDocuments(staging), scratch, embedder, dimension);
-        T opened = GraphBuilder.publish(scratch, target, Durability.DEVICE, opener);
+            : writeEntityVectors(documents, scratch, embedder, dimension);
+        T opened;
+        try {
+            opened = GraphBuilder.publish(scratch, target, Durability.DEVICE, opener, fence);
+        } catch (PublishRefusedException refused) {
+            GraphBuilder.discard(scratch);
+            throw refused;
+        }
 
         LOGGER.info("published graph at {}: {} facts, {} entities ({} with text), {} relations",
             target, store.edges(), store.entities(), indexed, store.relations());
         return new Published<>(new BuildResult(store.edges(), store.entities(),
-            store.relations(), indexed, embedded, target), opened);
+            store.relations(), indexed, embedded, store.withheld(), target), opened);
     }
 
     /**
@@ -258,10 +314,8 @@ public final class GraphDirectoryBuilder {
      * @return How many entities got a text document
      * @throws IOException if an index cannot be written
      */
-    private static int writeLexicalIndexes(GraphStagingStore staging, Path scratch,
-                                           double ramBufferMb) throws IOException {
-        List<String> labels = staging.entityLabels();
-
+    private static int writeLexicalIndexes(List<String> labels, List<String> documents,
+                                           Path scratch, double ramBufferMb) throws IOException {
         try (LexicalIndex labelIndex = LexicalIndex.open(scratch.resolve(LABEL_INDEX),
                 ramBufferMb)) {
             for (int id = 0; id < labels.size(); id++) {
@@ -269,8 +323,6 @@ public final class GraphDirectoryBuilder {
             }
             labelIndex.commit();
         }
-
-        List<String> documents = entityDocuments(staging);
 
         try (LexicalIndex documentIndex = LexicalIndex.open(scratch.resolve(DOCUMENT_INDEX),
                 ramBufferMb)) {
@@ -300,10 +352,31 @@ public final class GraphDirectoryBuilder {
      * @throws IOException if the staged text cannot be read
      */
     public static List<String> entityDocuments(GraphStagingStore staging) throws IOException {
-        List<String> labels = staging.entityLabels();
+        return entityDocuments(staging, StagedErasure.NOTHING);
+    }
+
+    /**
+     * The text that describes each entity, in id order, leaving out what {@code withheld}
+     * covers: a snippet it covers is part of no document, and an entity whose document falls
+     * back to its label falls back to the label a build publishes - the erased placeholder when
+     * the name is withheld.
+     *
+     * @param staging  The staged text
+     * @param withheld What to leave out
+     * @return One document per entity id
+     * @throws IOException if the staged text cannot be read
+     * @throws NullPointerException if an argument is null
+     */
+    public static List<String> entityDocuments(GraphStagingStore staging,
+                                               StagedErasure withheld) throws IOException {
+        Objects.requireNonNull(withheld, "withheld must not be null");
+        List<String> labels = GraphBuilder.entityLabels(staging, withheld);
 
         Map<Integer, StringBuilder> texts = new HashMap<>();
-        staging.forEachEntityText((entityId, snippet) -> {
+        staging.forEachEntityText((entityId, snippet, provenance) -> {
+            if (withheld.erasesSnippet(entityId, provenance)) {
+                return;
+            }
             StringBuilder document = texts.computeIfAbsent(entityId, id -> new StringBuilder());
             if (document.length() >= MAX_ENTITY_TEXT_CHARS) {
                 return;

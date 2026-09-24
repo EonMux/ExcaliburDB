@@ -28,6 +28,9 @@ import com.eonmux.excalibur.graph.file.LogHeader;
 import com.eonmux.excalibur.graph.file.LogInspection;
 import com.eonmux.excalibur.graph.file.TailIntegrity;
 import com.eonmux.excalibur.graph.provenance.SourceType;
+import com.eonmux.excalibur.graph.staging.PublishFence;
+import com.eonmux.excalibur.graph.staging.PublishRefusedException;
+import com.eonmux.excalibur.graph.staging.StagedErasure;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -816,6 +819,94 @@ public final class ErasureLog implements AutoCloseable {
                 .map(ErasureRequest::requestedAt)
                 .min(Instant::compareTo);
             return new Pending(outstanding.size(), oldest);
+        }
+    }
+
+    /**
+     * What a build starting now must leave out, and the gate its publish must pass.
+     *
+     * <h3>Why the log is what fences a build</h3>
+     * <p>An obligation is owed from the moment {@link #submit} returns its id, and the staged
+     * records it covers stay in staging until a compaction erases them. A build in between reads
+     * them. So the build is handed everything outstanding now to leave out, and its renames run
+     * through {@link PublishFence#swap}, which holds the same lock {@link #submit} does and
+     * refuses them if an id was handed out since this was taken. A request accepted while a build
+     * runs therefore either stops that build publishing or, if it arrives once the renames have
+     * begun, is accepted after the new graph is in place - an obligation against a served graph
+     * like any other, which the next compaction applies. Either way no build publishes what an
+     * obligation recorded before its publish covers. The renames are two directory moves and a
+     * directory sync, so a submit waits for no more than that.</p>
+     *
+     * <h3>Why nothing is completed</h3>
+     * <p>Leaving a fact out of one graph is not erasing it: staging still holds it, and so may a
+     * copy of an earlier graph. A fence therefore never marks a request discharged; only the
+     * compaction that removes those does.</p>
+     *
+     * @return The fence, over the requests outstanding as this returns
+     * @throws IllegalStateException if the log is closed
+     */
+    public PublishFence fence() {
+        synchronized (appendLock) {
+            requireOpen();
+            List<ErasureScope> scopes = new ArrayList<>(outstanding.size());
+            for (ErasureRequest request : outstanding.values()) {
+                scopes.add(request.scope());
+            }
+            StagedErasure withheld = scopes.isEmpty()
+                ? StagedErasure.NOTHING
+                : ScopedStagedErasure.withheldFromBuild(scopes);
+            return new Fence(withheld, scopes.size(), nextId);
+        }
+    }
+
+    /**
+     * The fence {@link #fence()} hands out: what was owed, and the next id as it stood then.
+     *
+     * <p>An id at or past {@code nextIdThen} is a request the build did not withhold. Completions
+     * are not compared: a request completed since the fence was taken has had staging erased
+     * under it, so withholding it as well costs nothing.</p>
+     */
+    private final class Fence implements PublishFence {
+
+        private final StagedErasure withheld;
+        private final int obligations;
+        private final long nextIdThen;
+
+        Fence(StagedErasure withheld, int obligations, long nextIdThen) {
+            this.withheld = withheld;
+            this.obligations = obligations;
+            this.nextIdThen = nextIdThen;
+        }
+
+        @Override
+        public StagedErasure withheld() {
+            return withheld;
+        }
+
+        @Override
+        public int obligations() {
+            return obligations;
+        }
+
+        @Override
+        public void swap(Swap swap) throws IOException {
+            Objects.requireNonNull(swap, "swap must not be null");
+            synchronized (appendLock) {
+                requireOpen();
+                if (nextId != nextIdThen) {
+                    throw new PublishRefusedException("erasure request(s) " + nextIdThen
+                        + (nextId - 1 > nextIdThen ? ".." + (nextId - 1) : "")
+                        + " of " + path + " were recorded while the graph was being built, "
+                        + "which read staging before them; nothing was published, and a build "
+                        + "started now leaves out what they cover");
+                }
+                swap.run();
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "ErasureLog.Fence[" + obligations + " withheld, next id " + nextIdThen + "]";
         }
     }
 
