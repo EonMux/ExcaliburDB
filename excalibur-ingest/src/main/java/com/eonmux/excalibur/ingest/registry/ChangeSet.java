@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.ingest.registry;
 
+import com.eonmux.excalibur.ingest.source.ListingGaps;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -9,12 +11,13 @@ import java.util.Objects;
  * Represents the result of change detection between a crawl and the document registry.
  *
  * <h2>Categories</h2>
- * <p>A ChangeSet categorizes documents into five groups:
+ * <p>A ChangeSet categorizes documents into six groups:
  * <ul>
  *   <li><strong>New documents:</strong> Documents that exist in the crawl but not in the registry</li>
  *   <li><strong>Changed documents:</strong> Documents that exist in both but have different content
  *       (see {@link DocumentMetadata#isChanged})</li>
- *   <li><strong>Deleted documents:</strong> Documents that exist in the registry but not in the crawl</li>
+ *   <li><strong>Deleted documents:</strong> Documents that exist in the registry but not in a
+ *       complete crawl, and listed documents the source answered for as gone or forbidden</li>
  *   <li><strong>Unchecked documents:</strong> Documents in both that the source could not be
  *       asked about - a timeout, a server error, a {@code 304} to a request that asked
  *       nothing. Whether they changed is unknown, so their indexed version is kept; they are
@@ -24,6 +27,11 @@ import java.util.Objects;
  *       a content type the source excludes, a {@code 403}. Unlike an unchecked document the
  *       question was answered, so they are failures with a reason rather than unknowns; their
  *       indexed version is kept all the same, as for any document a run fails on</li>
+ *   <li><strong>Kept unlisted documents:</strong> Documents in the registry and not in the
+ *       crawl, when the crawl reported {@linkplain #getListingGaps() gaps} in its listing. A
+ *       listing that could not see everything cannot say they are gone, so they are kept as
+ *       they are indexed rather than deleted, and listed so the run can say so. Neither
+ *       crawled nor failed: they were not asked about at all</li>
  * </ul>
  * <p>Every other document in both is unchanged: its source confirmed the indexed version is
  * current.</p>
@@ -51,6 +59,8 @@ public final class ChangeSet {
     private final List<DocumentMetadata> deletedDocuments;
     private final List<String> uncheckedDocuments;
     private final List<RefusedDocument> refusedDocuments;
+    private final List<String> keptUnlistedDocuments;
+    private final ListingGaps listingGaps;
     private final int totalCrawled;
     private final int totalRegistered;
 
@@ -61,6 +71,8 @@ public final class ChangeSet {
         this.deletedDocuments = List.copyOf(builder.deletedDocuments);
         this.uncheckedDocuments = List.copyOf(builder.uncheckedDocuments);
         this.refusedDocuments = List.copyOf(builder.refusedDocuments);
+        this.keptUnlistedDocuments = List.copyOf(builder.keptUnlistedDocuments);
+        this.listingGaps = builder.listingGaps;
         this.totalCrawled = builder.totalCrawled;
         this.totalRegistered = builder.totalRegistered;
     }
@@ -126,6 +138,28 @@ public final class ChangeSet {
     }
 
     /**
+     * Returns the registered documents the crawl did not list and could not be taken as deleted,
+     * because its listing had gaps.
+     *
+     * <p>Each is kept as it is indexed. Empty whenever the listing was complete: a document it
+     * missed then is deleted.</p>
+     *
+     * @return Unmodifiable list of document IDs, in registry order
+     */
+    public List<String> getKeptUnlistedDocuments() {
+        return keptUnlistedDocuments;
+    }
+
+    /**
+     * Returns where the crawl's listing could not see, as its source reported.
+     *
+     * @return The gaps, {@link ListingGaps#NONE} for a complete listing
+     */
+    public ListingGaps getListingGaps() {
+        return listingGaps;
+    }
+
+    /**
      * Returns the count of new documents.
      *
      * @return New document count
@@ -171,9 +205,19 @@ public final class ChangeSet {
     }
 
     /**
+     * Returns the count of documents kept because the listing that missed them had gaps.
+     *
+     * @return Kept unlisted document count
+     */
+    public int getKeptUnlistedCount() {
+        return keptUnlistedDocuments.size();
+    }
+
+    /**
      * Returns how many registered documents the source confirmed are current.
      *
-     * <p>What the crawl listed less what is new, changed, refused or could not be checked.</p>
+     * <p>What the crawl listed less what is new, changed, refused or could not be checked. A
+     * document kept unlisted is not in it: it was never among what the crawl listed.</p>
      *
      * @return Unchanged document count
      */
@@ -202,13 +246,14 @@ public final class ChangeSet {
 
     /**
      * Checks if there is anything for a run to act on or report: a new, changed, deleted,
-     * unchecked or refused document.
+     * unchecked, refused or kept unlisted document.
      *
      * @return true if there are any
      */
     public boolean hasChanges() {
         return !newDocuments.isEmpty() || !changedDocuments.isEmpty() || !deletedDocuments.isEmpty()
-            || !uncheckedDocuments.isEmpty() || !refusedDocuments.isEmpty();
+            || !uncheckedDocuments.isEmpty() || !refusedDocuments.isEmpty()
+            || !keptUnlistedDocuments.isEmpty();
     }
 
     /**
@@ -249,9 +294,10 @@ public final class ChangeSet {
     @Override
     public String toString() {
         return String.format("ChangeSet[sourceId=%s, new=%d, changed=%d, deleted=%d, unchecked=%d, "
-                + "crawled=%d, registered=%d]",
+                + "refused=%d, keptUnlisted=%d, crawled=%d, registered=%d, gaps=%d]",
             sourceId, getNewCount(), getChangedCount(), getDeletedCount(), getUncheckedCount(),
-            totalCrawled, totalRegistered);
+            getRefusedCount(), getKeptUnlistedCount(), totalCrawled, totalRegistered,
+            listingGaps.count());
     }
 
     /**
@@ -334,6 +380,8 @@ public final class ChangeSet {
         private final List<DocumentMetadata> deletedDocuments = new ArrayList<>();
         private final List<String> uncheckedDocuments = new ArrayList<>();
         private final List<RefusedDocument> refusedDocuments = new ArrayList<>();
+        private final List<String> keptUnlistedDocuments = new ArrayList<>();
+        private ListingGaps listingGaps = ListingGaps.NONE;
         private int totalCrawled = 0;
         private int totalRegistered = 0;
 
@@ -404,6 +452,31 @@ public final class ChangeSet {
          */
         public Builder addRefused(String documentId, String reason) {
             refusedDocuments.add(new RefusedDocument(documentId, reason));
+            return this;
+        }
+
+        /**
+         * Adds a registered document the crawl did not list and that is kept, because the
+         * listing had gaps.
+         *
+         * @param documentId The document ID
+         * @return This builder
+         */
+        public Builder addKeptUnlisted(String documentId) {
+            Objects.requireNonNull(documentId, "documentId must not be null");
+            keptUnlistedDocuments.add(documentId);
+            return this;
+        }
+
+        /**
+         * Sets where the crawl's listing could not see.
+         *
+         * @param gaps What the source reported
+         * @return This builder
+         * @throws NullPointerException if gaps is null
+         */
+        public Builder listingGaps(ListingGaps gaps) {
+            this.listingGaps = Objects.requireNonNull(gaps, "gaps must not be null");
             return this;
         }
 

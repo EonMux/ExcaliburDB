@@ -135,6 +135,9 @@ class IngestionPipelineTest {
         /** URLs the crawl itself left out because their publisher forbids fetching them. */
         private volatile long crawlDisallowed;
         private final java.util.Set<String> fetchDisallowed = ConcurrentHashMap.newKeySet();
+        /** Where the crawl's listing could not see. */
+        private volatile com.eonmux.excalibur.ingest.source.ListingGaps listingGaps =
+            com.eonmux.excalibur.ingest.source.ListingGaps.NONE;
 
         FakeSource(String sourceId, Map<String, String> documents) {
             this.sourceId = sourceId;
@@ -201,6 +204,11 @@ class IngestionPipelineTest {
         @Override
         public long getDisallowedCount() {
             return crawlDisallowed + fetchDisallowed.size();
+        }
+
+        @Override
+        public com.eonmux.excalibur.ingest.source.ListingGaps getListingGaps() {
+            return listingGaps;
         }
 
         @Override
@@ -591,6 +599,52 @@ class IngestionPipelineTest {
                 .isNotNull()
                 .contains("2 of 2");
             assertThat(status.ingested).isZero();
+        }
+
+        @Test
+        @DisplayName("a run whose listing had gaps says so, naming them, though it dropped nothing")
+        void aListingWithGapsIsNotReportedClean() {
+            FakeSource source = new FakeSource("docs", Map.of("a.txt", "real text here"));
+            source.listingGaps = gaps("https://docs.example/hub", "links not read: HTTP 503");
+
+            RecordingStatus status = ingest(orchestrator(), source);
+
+            assertThat(status.error)
+                .contains("listing is incomplete")
+                .contains("https://docs.example/hub (links not read: HTTP 503)");
+            assertThat(status.failed).isZero();
+            assertThat(status.states.get(status.states.size() - 1)).isEqualTo("idle");
+        }
+
+        @Test
+        @DisplayName("a run that dropped documents over a listing with gaps says both")
+        void droppedDocumentsAndGapsAreBothReported() {
+            FakeSource source = new FakeSource("docs", Map.of("a.txt", "!fail"));
+            source.listingGaps = gaps("https://docs.example/", "links not read: HTTP 500");
+
+            RecordingStatus status = ingest(orchestrator(), source);
+
+            assertThat(status.error).contains("1 of 1").contains("listing is incomplete");
+        }
+
+        @Test
+        @DisplayName("a crawl that listed nothing over a listing with gaps says so")
+        void anEmptyListingWithGapsSaysSo() {
+            FakeSource source = new FakeSource("docs", Map.of());
+            source.listingGaps = gaps("broken-link.txt", "real location not resolved");
+
+            RecordingStatus status = ingest(orchestrator(), source);
+
+            assertThat(status.error).contains("broken-link.txt (real location not resolved)");
+            assertThat(status.state).isEqualTo("idle");
+        }
+
+        private static com.eonmux.excalibur.ingest.source.ListingGaps gaps(String location,
+                                                                           String reason) {
+            com.eonmux.excalibur.ingest.source.ListingGaps.Recorder recorder =
+                new com.eonmux.excalibur.ingest.source.ListingGaps.Recorder();
+            recorder.record(location, reason);
+            return recorder.snapshot();
         }
 
         @Test

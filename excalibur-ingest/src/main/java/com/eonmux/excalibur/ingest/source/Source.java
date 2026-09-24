@@ -191,6 +191,32 @@ public interface Source extends Closeable {
     }
 
     /**
+     * Where the current run's listing could not see, which makes it less than the whole source.
+     *
+     * <p>The current run is the one the most recent {@link #crawl()} began, as for
+     * {@link #getDisallowedCount()}; read once that crawl's stream has been consumed, it covers
+     * every place the crawl met. A gap is a place the crawl could not read and so could not list
+     * what lies behind it - for an HTTP source, a page whose links could not be read because its
+     * server failed, timed out, refused the credentials or sent more than the source reads; for a
+     * directory, a file whose attributes or real location could not be read. A place that answered is
+     * never a gap, however little it held: a page that is gone ({@code 404}, {@code 410}) or is
+     * not HTML genuinely links to nothing, and a directory that is empty lists nothing.</p>
+     *
+     * <p>A listing with gaps is sound for what it lists and silent about the rest, so change
+     * detection classifies every listed document as usual and does not take a registered
+     * document the listing missed for one the source deleted: it is kept, and reported with the
+     * gaps. A crawl that cannot be trusted at all ends in an {@link IncompleteCrawlException}
+     * instead, and a robots.txt that cannot be read fails the crawl, because both leave nothing
+     * sound to act on.</p>
+     *
+     * @return The gaps, {@link ListingGaps#NONE} for a listing that saw everything; this default
+     *         for a source whose listing cannot fall short
+     */
+    default ListingGaps getListingGaps() {
+        return ListingGaps.NONE;
+    }
+
+    /**
      * Returns the total number of documents in this source, if known.
      *
      * <p>Some sources can efficiently determine document count without

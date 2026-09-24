@@ -8,6 +8,7 @@ import com.eonmux.excalibur.ingest.registry.ChangeDetector;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
+import com.eonmux.excalibur.ingest.source.ListingGaps;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
 import com.eonmux.excalibur.llm.client.LLMHttpClient;
@@ -222,6 +223,22 @@ public class DocumentReindexer {
          *                           {@link ReindexResult#UNCHECKED_SAMPLE_SIZE}, in crawl order
          */
         default void documentsUnchecked(long documentsUnchecked, List<String> sample) {
+        }
+
+        /**
+         * Reports that the run's listing of its source had gaps, and what that kept.
+         *
+         * <p>Called once, before the first document, and only for a listing with gaps; see
+         * {@link Source#getListingGaps()}. The documents the listing missed are kept as they are
+         * indexed rather than removed, and are not failures: nothing was asked of them.</p>
+         *
+         * <p>Must not throw, and must not block, for the reason {@link #documentsDone}
+         * gives.</p>
+         *
+         * @param gaps                 Where the listing could not see
+         * @param documentsKeptUnlisted Registered documents it did not list, kept
+         */
+        default void listingIncomplete(ListingGaps gaps, long documentsKeptUnlisted) {
         }
     }
 
@@ -969,6 +986,8 @@ public class DocumentReindexer {
         private final int documentsUnchecked;
         private final List<String> uncheckedSample;
         private final int documentsUnchanged;
+        private final int documentsKeptUnlisted;
+        private final ListingGaps listingGaps;
         private final long elapsedMillis;
         private final List<OperationError> errors;
 
@@ -982,6 +1001,8 @@ public class DocumentReindexer {
             this.documentsUnchecked = builder.documentsUnchecked;
             this.uncheckedSample = List.copyOf(builder.uncheckedSample);
             this.documentsUnchanged = builder.documentsUnchanged;
+            this.documentsKeptUnlisted = builder.documentsKeptUnlisted;
+            this.listingGaps = builder.listingGaps;
             this.documentsTombstoned = builder.documentsTombstoned;
             this.chunksCreated = builder.chunksCreated;
             this.chunksTombstoned = builder.chunksTombstoned;
@@ -1098,6 +1119,28 @@ public class DocumentReindexer {
             return documentsUnchanged;
         }
 
+        /**
+         * Registered documents the run's listing did not include, kept because it had gaps.
+         *
+         * <p>Neither failed nor unchanged - nothing was asked of them - and never removed: a
+         * listing that could not see everything cannot say they are gone. Zero whenever
+         * {@link #getListingGaps()} is complete.</p>
+         *
+         * @return How many documents were kept unlisted
+         */
+        public int getDocumentsKeptUnlisted() {
+            return documentsKeptUnlisted;
+        }
+
+        /**
+         * Where the run's listing of its source could not see.
+         *
+         * @return The gaps, {@link ListingGaps#NONE} for a complete listing
+         */
+        public ListingGaps getListingGaps() {
+            return listingGaps;
+        }
+
         public long getElapsedMillis() {
             return elapsedMillis;
         }
@@ -1121,11 +1164,11 @@ public class DocumentReindexer {
         @Override
         public String toString() {
             return String.format("ReindexResult[source=%s, indexed=%d, skipped=%d, failed=%d, " +
-                "unchecked=%d, unchanged=%d, tombstoned=%d, chunksCreated=%d, chunksTombstoned=%d, " +
-                "chunksFailed=%d, errors=%d, elapsed=%dms]",
+                "unchecked=%d, unchanged=%d, keptUnlisted=%d, tombstoned=%d, chunksCreated=%d, " +
+                "chunksTombstoned=%d, chunksFailed=%d, errors=%d, elapsed=%dms]",
                 sourceId, documentsIndexed, documentsSkipped, documentsFailed, documentsUnchecked,
-                documentsUnchanged, documentsTombstoned, chunksCreated, chunksTombstoned,
-                chunksFailed, errors.size(), elapsedMillis);
+                documentsUnchanged, documentsKeptUnlisted, documentsTombstoned, chunksCreated,
+                chunksTombstoned, chunksFailed, errors.size(), elapsedMillis);
         }
 
         public static Builder builder(String sourceId) {
@@ -1147,6 +1190,8 @@ public class DocumentReindexer {
             private int documentsUnchecked = 0;
             private final List<String> uncheckedSample = new ArrayList<>();
             private int documentsUnchanged = 0;
+            private int documentsKeptUnlisted = 0;
+            private ListingGaps listingGaps = ListingGaps.NONE;
             private final List<OperationError> errors = new ArrayList<>();
 
             public Builder(String sourceId) {
@@ -1186,6 +1231,21 @@ public class DocumentReindexer {
              */
             public Builder documentsUnchanged(int count) {
                 this.documentsUnchanged = count;
+                return this;
+            }
+
+            /**
+             * Sets where the run's listing could not see, and how many registered documents it
+             * missed and kept for that reason.
+             *
+             * @param gaps         What the source reported
+             * @param keptUnlisted The documents kept
+             * @return This builder
+             * @throws NullPointerException if gaps is null
+             */
+            public Builder listingIncomplete(ListingGaps gaps, int keptUnlisted) {
+                this.listingGaps = Objects.requireNonNull(gaps, "gaps must not be null");
+                this.documentsKeptUnlisted = keptUnlisted;
                 return this;
             }
 

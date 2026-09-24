@@ -127,6 +127,12 @@ public class FilesystemSource implements Source {
     private final Charset charset;
     private volatile boolean closed = false;
 
+    /**
+     * The files the current run could not judge, and so left out of its listing; replaced when
+     * a crawl begins.
+     */
+    private volatile ListingGaps.Recorder listingGaps = new ListingGaps.Recorder();
+
     private FilesystemSource(Builder builder) {
         this.sourceId = Objects.requireNonNull(builder.sourceId, "sourceId must not be null");
         if (sourceId.isEmpty()) {
@@ -191,11 +197,13 @@ public class FilesystemSource implements Source {
         LOG.info("Starting crawl for source {}: {}", sourceId, rootPath);
 
         LinkOption[] linkOptions = linkOptions();
+        ListingGaps.Recorder gaps = new ListingGaps.Recorder();
+        listingGaps = gaps;
 
         try {
             return walk()
                 .map(this::stillListing)
-                .filter(path -> shouldProcessFile(path, linkOptions))
+                .filter(path -> shouldProcessFile(path, linkOptions, gaps))
                 .map(this::toDocumentId)
                 .filter(Objects::nonNull)
                 .onClose(() -> LOG.debug("Crawl completed for source {}", sourceId));
@@ -264,7 +272,7 @@ public class FilesystemSource implements Source {
             LinkOption[] linkOptions = linkOptions();
 
             long count = paths
-                .filter(path -> shouldProcessFile(path, linkOptions))
+                .filter(path -> shouldProcessFile(path, linkOptions, null))
                 .count();
 
             LOG.debug("Document count for source {}: {}", sourceId, count);
@@ -290,7 +298,7 @@ public class FilesystemSource implements Source {
             LinkOption[] linkOptions = linkOptions();
 
             long totalSize = paths
-                .filter(path -> shouldProcessFile(path, linkOptions))
+                .filter(path -> shouldProcessFile(path, linkOptions, null))
                 .mapToLong(path -> {
                     try {
                         return Files.size(path);
@@ -508,6 +516,21 @@ public class FilesystemSource implements Source {
     }
 
     /**
+     * The files the latest crawl left out because it could not judge them: their attributes
+     * could not be read, or, following links, their real location could not be resolved.
+     *
+     * <p>Read once the crawl's stream has been consumed, since the walk is lazy. Every other
+     * way a walk can fall short - a directory that cannot be listed, a symlink cycle, the source
+     * closed underneath it - ends the crawl with an error instead, because what was listed up
+     * to then says nothing about the rest of the tree. A file that cannot be judged says nothing
+     * about any other file, so the listing stays sound around it.</p>
+     */
+    @Override
+    public ListingGaps getListingGaps() {
+        return listingGaps.snapshot();
+    }
+
+    /**
      * Decides whether a path reached by following links is still part of this source.
      *
      * <p>Containment is a property of the file, not of the name it was reached by. A deployment
@@ -519,10 +542,23 @@ public class FilesystemSource implements Source {
      * <p>A path whose real location cannot be read is refused too, although a file this node
      * merely cannot read is kept in the crawl and left for its fetch to fail: a file that cannot
      * be shown to lie inside the source may lie outside it, and indexing the contents of an
-     * unknown file is worse than leaving one file out of the crawl.</p>
+     * unknown file is worse than leaving one file out of the crawl. Left out, it is a gap in
+     * the listing rather than a deletion: the question of where it lies went unanswered, so a
+     * re-crawl keeps whatever version of it was indexed, and reports the gap.</p>
+     *
+     * @param path A path reached by following links
+     * @param gaps Told of a path whose real location could not be resolved, or null when the walk
+     *             is not a crawl
      */
-    private boolean staysInsideRoot(Path path) {
-        return containment(path) == Containment.INSIDE;
+    private boolean staysInsideRoot(Path path, ListingGaps.Recorder gaps) {
+        Containment where = containment(path);
+        if (where == Containment.UNRESOLVED && gaps != null) {
+            String documentId = toDocumentId(path);
+            if (documentId != null) {
+                gaps.record(documentId, "real location not resolved");
+            }
+        }
+        return where == Containment.INSIDE;
     }
 
     /**
@@ -566,19 +602,24 @@ public class FilesystemSource implements Source {
      * file's attributes to know. A file that grew past {@code maxFileSize} is still listed and
      * refused by {@link #fetch}: a re-crawl keeps the version it indexed before and counts the
      * document failed, as it does an HTTP response grown past its limit, where leaving it out of
-     * the listing erased it. A file whose attributes this node cannot read is likewise kept, for
-     * its fetch to fail, rather than read as a deletion over a transient permission or network
-     * error.</p>
+     * the listing erased it.</p>
+     *
+     * <p>Whether it is a regular file does need its attributes, and there the answer is
+     * sometimes that there is none: a path that is gone - a link to nothing, a file deleted as
+     * the walk passed - is not a document, and leaves the listing. Attributes that could not be
+     * read for any other reason - a link into a directory this node may not search, a network
+     * mount that failed - say nothing about the file, so it is left out as a gap in the listing
+     * rather than as a deletion: a re-crawl keeps the version indexed before, and reports the
+     * gap. The name tests go first, so a file the source would never list is never a gap.</p>
      *
      * @param path        A path the walk reached
      * @param linkOptions How links are treated, as the source is configured
+     * @param gaps        Told of a file left out because it could not be judged, or null when
+     *                    the walk is not a crawl
      * @return Whether the path is one of this source's documents
      */
-    private boolean shouldProcessFile(Path path, LinkOption[] linkOptions) {
-        if (!Files.isRegularFile(path, linkOptions)) {
-            return false;
-        }
-
+    private boolean shouldProcessFile(Path path, LinkOption[] linkOptions,
+                                      ListingGaps.Recorder gaps) {
         if (!followSymlinks && Files.isSymbolicLink(path)) {
             return false;
         }
@@ -591,7 +632,41 @@ public class FilesystemSource implements Source {
             return false;
         }
 
-        return !followSymlinks || staysInsideRoot(path);
+        if (!isRegularFile(path, linkOptions, gaps)) {
+            return false;
+        }
+
+        return !followSymlinks || staysInsideRoot(path, gaps);
+    }
+
+    /**
+     * Whether a path is a regular file, recording a gap when that cannot be told.
+     *
+     * @param path        A path the walk reached
+     * @param linkOptions How links are treated, as the source is configured
+     * @param gaps        Told of a path whose attributes could not be read, or null
+     * @return true for a regular file; false for anything else, for a path that is gone, and for
+     *         one whose attributes could not be read
+     */
+    private boolean isRegularFile(Path path, LinkOption[] linkOptions,
+                                  ListingGaps.Recorder gaps) {
+        try {
+            return Files.readAttributes(path, BasicFileAttributes.class, linkOptions)
+                .isRegularFile();
+        } catch (NoSuchFileException e) {
+            return false;
+        } catch (IOException e) {
+            LOG.warn("Leaving {} out of the listing of source {}: its attributes could not be "
+                + "read ({}); a version already indexed is kept", path, sourceId, e.toString());
+            if (gaps != null) {
+                String documentId = toDocumentId(path);
+                if (documentId != null) {
+                    gaps.record(documentId, "attributes not read: "
+                        + e.getClass().getSimpleName());
+                }
+            }
+            return false;
+        }
     }
 
     private boolean isHidden(Path path) {
