@@ -112,15 +112,24 @@ final class CorpusFingerprint {
     /**
      * Fingerprints the corpus as a query starting now would read it.
      *
+     * @return The fingerprint, or {@link CorpusVersion#UNREADABLE} if it could not be taken
+     */
+    CorpusVersion current() {
+        return at(visibilityTracker.currentEpoch());
+    }
+
+    /**
+     * Fingerprints the corpus as a query reading at {@code epoch} would read it.
+     *
      * <p>Any failure yields {@link CorpusVersion#UNREADABLE} rather than a partial digest.
      * A digest missing one segment is indistinguishable from a digest of a corpus without it,
      * which would let the cache serve an answer across the very change it failed to read.</p>
      *
+     * @param epoch The visibility epoch whose segments are fingerprinted
      * @return The fingerprint, or {@link CorpusVersion#UNREADABLE} if it could not be taken
      */
-    CorpusVersion current() {
+    CorpusVersion at(long epoch) {
         try {
-            long epoch = visibilityTracker.currentEpoch();
             Set<Long> visible = visibilityTracker.visibleSegments(epoch);
             SegmentCatalog catalog = storageEngine.getCatalog();
 

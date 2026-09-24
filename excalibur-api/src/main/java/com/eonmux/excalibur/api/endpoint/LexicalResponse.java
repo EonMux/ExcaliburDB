@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.eonmux.excalibur.api.retrieval.LexicalQueryService;
 import com.eonmux.excalibur.query.IndexCoverage;
 import com.eonmux.excalibur.query.cache.CachedAnswer;
+import com.eonmux.excalibur.retrieval.expand.Expansion;
 
 import java.util.List;
 
@@ -20,10 +21,15 @@ import java.util.List;
  * the answer came from fewer signals than a fully configured node would use, which is a fact
  * about the node and as true of the next request as of this one. What makes a lexical answer a
  * report of one moment's trouble is a search that did not reach the whole index, a deadline, a
- * withdrawal, or a relevancy scorer that fell back; any one of those keeps it out.</p>
+ * withdrawal, a relevancy scorer that fell back, or a query expansion that fell back; any one of
+ * those keeps it out. An expansion that fell back searched the query as typed because the model
+ * could not be had, and the next caller asking the same question is owed a search the model
+ * does widen.</p>
  *
  * @param queryId           The identifier this query was registered under, or null once stored
  * @param hits              The ranking, best first, as deep as the request's page needs
+ * @param expansion         What the query was widened into before it was searched, or null
+ *                          when the index's service cannot say
  * @param exhausted         Whether retrieval came back shallower than it was asked for, so
  *                          nothing past this ranking was left unconsidered - what lets the
  *                          total be exact; see {@link #total}
@@ -37,6 +43,7 @@ import java.util.List;
  * @author ExcaliburDB
  */
 public record LexicalResponse(String queryId, List<LexicalQueryService.Hit> hits,
+                              Expansion expansion,
                               boolean exhausted, IndexCoverage coverage, boolean timedOut, boolean cancelled,
                               boolean llmScored, boolean relevancyFellBack, long queryTimeMs,
                               boolean fromCache) implements CachedAnswer {
@@ -67,9 +74,18 @@ public record LexicalResponse(String queryId, List<LexicalQueryService.Hit> hits
             exhausted && ResultTotal.searchWasComplete(coverage, timedOut, cancelled));
     }
 
+    /**
+     * Whether the search meant to widen the query and could not, and so searched it as typed.
+     *
+     * @return true when the expansion fell back
+     */
+    public boolean expansionFellBack() {
+        return expansion != null && expansion.fellBack();
+    }
+
     @Override
     public boolean cacheable() {
-        return !timedOut && !cancelled && !relevancyFellBack
+        return !timedOut && !cancelled && !relevancyFellBack && !expansionFellBack()
             && coverage.estimatedCorpusCoverage() >= 1.0;
     }
 
@@ -80,8 +96,8 @@ public record LexicalResponse(String queryId, List<LexicalQueryService.Hit> hits
 
     @Override
     public LexicalResponse servedFromCache() {
-        return new LexicalResponse(queryId, hits, exhausted, coverage, timedOut, cancelled, llmScored,
-            relevancyFellBack, queryTimeMs, true);
+        return new LexicalResponse(queryId, hits, expansion, exhausted, coverage, timedOut,
+            cancelled, llmScored, relevancyFellBack, queryTimeMs, true);
     }
 
     /**
@@ -91,8 +107,8 @@ public record LexicalResponse(String queryId, List<LexicalQueryService.Hit> hits
      * @return A copy carrying it
      */
     public LexicalResponse withQueryId(String id) {
-        return new LexicalResponse(id, hits, exhausted, coverage, timedOut, cancelled, llmScored,
-            relevancyFellBack, queryTimeMs, fromCache);
+        return new LexicalResponse(id, hits, expansion, exhausted, coverage, timedOut,
+            cancelled, llmScored, relevancyFellBack, queryTimeMs, fromCache);
     }
 
     /**
@@ -102,7 +118,7 @@ public record LexicalResponse(String queryId, List<LexicalQueryService.Hit> hits
      * @return A copy carrying it
      */
     public LexicalResponse withQueryTimeMs(long ms) {
-        return new LexicalResponse(queryId, hits, exhausted, coverage, timedOut, cancelled, llmScored,
-            relevancyFellBack, ms, fromCache);
+        return new LexicalResponse(queryId, hits, expansion, exhausted, coverage, timedOut,
+            cancelled, llmScored, relevancyFellBack, ms, fromCache);
     }
 }

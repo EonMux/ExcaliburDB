@@ -491,16 +491,21 @@ public class QueryEndpoint implements HttpHandler {
                 // the way does not change which answer was asked for.
                 String route = hybridRetrieval && lexical != null
                     ? QueryResponseJson.HYBRID : QueryResponseJson.VECTOR;
+                // One epoch for the whole answer: the vector half, the BM25 half and the
+                // fingerprint below all read the corpus as of this moment, so a publication
+                // landing mid-query cannot put two corpora into one fused ranking, or store an
+                // answer under a fingerprint of a corpus it was not computed from.
+                long epoch = queryPipeline.captureEpoch();
                 Request request = new Request(queryId, correlationId, startTime, requestBody,
                     parsed, context, route, lexical, lexicalAnswer.plan(parsed),
-                    parsed.enableLlmScoring() && queryPipeline.getLlmScorer() != null);
+                    parsed.enableLlmScoring() && queryPipeline.getLlmScorer() != null, epoch);
                 // Fingerprinted before the search and stored against afterwards. Taking the
                 // fingerprint again at store time would let a document ingested while this
                 // query ran make a pre-ingest answer look like a post-ingest one. Looked up
                 // before either signal starts, so a held answer costs no embedding call, no
                 // segment fan-out, no BM25 search and no relevancy model.
                 QueryCacheLookup lookup = QueryCacheLookup.of(resultCache, queryPipeline,
-                    lexical, route, parsed, context, exchange);
+                    lexical, route, epoch, parsed, context, exchange);
                 if (answeredFromCache(exchange, lookup, request)) {
                     return;
                 }
@@ -568,24 +573,6 @@ public class QueryEndpoint implements HttpHandler {
     }
 
     /**
-     * Points this endpoint at the expander its searching half widens queries with.
-     *
-     * <p>Must be the very instance the lexical index was given, and that instance must
-     * remember what it produced - see {@code CachingQueryExpander}. Expansion is a generation
-     * from a chat model: a second, separate expander here would bill the operator twice and
-     * report terms the search never used.</p>
-     *
-     * <p>Without it an explained answer reports the expansion as {@code unreported} rather
-     * than as absent, because "this node widened nothing" and "this node cannot say what it
-     * widened" are different facts about a ranking.</p>
-     *
-     * @param expander The expander, or null on a node that reports nothing about expansion
-     */
-    public void setQueryExpander(com.eonmux.excalibur.retrieval.expand.QueryExpander expander) {
-        this.contexts.expander(expander);
-    }
-
-    /**
      * One request, as every exit of it needs to know it.
      *
      * @param queryId        The identifier the query is registered under
@@ -600,12 +587,13 @@ public class QueryEndpoint implements HttpHandler {
      * @param plan           How an answer the pipeline does not score is scored
      * @param scoringPlanned Whether this request's answer is to be scored by anything - the
      *                       pipeline's Stage 4 or {@link RelevancyScoring}
+     * @param epoch          The visibility epoch every part of the answer reads at
      */
     private record Request(String queryId, String correlationId, long startTime,
                            String requestBody, QueryRequestParser.ParsedQuery parsed,
                            QueryContext context, String route,
                            com.eonmux.excalibur.api.retrieval.LexicalQueryService lexical,
-                           RelevancyScoring.Plan plan, boolean scoringPlanned) {
+                           RelevancyScoring.Plan plan, boolean scoringPlanned, long epoch) {
 
         long deadlineNanos() {
             return startTime + TimeUnit.MILLISECONDS.toNanos(parsed.timeoutMs());
@@ -768,16 +756,19 @@ public class QueryEndpoint implements HttpHandler {
             long retrievalDeadlineNanos = System.nanoTime()
                 + TimeUnit.MILLISECONDS.toNanos(budgetMs);
             QueryRequest pipelineRequest = pipelineQuery(context, parsed, plan, candidates)
-                .toRequest(vector, request.correlationId(), budgetMs, limits.maxTopK());
+                .toRequest(vector, request.correlationId(), budgetMs, limits.maxTopK(),
+                    request.epoch());
             CompletableFuture<QueryResponse> future =
                 queryPipeline.execute(pipelineRequest, pipelineToken);
 
             QueryResponse response = future.get(
                 budgetMs + PIPELINE_RESPONSE_GRACE_MILLIS, TimeUnit.MILLISECONDS);
             response = response.withQueryId(queryId);
-            List<com.eonmux.excalibur.api.retrieval.LexicalQueryService.Hit> hits =
+            com.eonmux.excalibur.api.retrieval.LexicalQueryService.Ranking ranking =
                 lexicalSignal == null ? null
                     : lexicalSignal.await(Deadline.remainingMillis(retrievalDeadlineNanos));
+            List<com.eonmux.excalibur.api.retrieval.LexicalQueryService.Hit> hits =
+                ranking == null ? null : ranking.hits();
             List<com.eonmux.excalibur.api.retrieval.HybridFusion.Result> fused =
                 fuse(lexicalSignal, response.results(), hits, candidates);
             if (fused != null) {
@@ -788,13 +779,15 @@ public class QueryEndpoint implements HttpHandler {
                     return cancelledReply(request);
                 }
                 HybridResponse fusedAnswer = new HybridResponse(
-                    response.withQueryTimeMs(request.elapsedMs()), hits, scored.ranking(),
+                    response.withQueryTimeMs(request.elapsedMs()), hits, ranking.expansion(),
+                    scored.ranking(),
                     fused.size() < candidates && response.retrievalExhausted(),
                     scored.scored(), scored.fellBack(),
                     scored.timedOut());
                 // Refused by the cache unless the search reached the whole corpus it
                 // meant to, inside its deadline, against the corpus it was fingerprinted
-                // at, and any scoring it was due finished. A degraded answer replayed to
+                // at, widened the query as this node does, and any scoring it was due
+                // finished. A degraded answer replayed to
                 // later callers turns one moment's trouble into a persistent fault.
                 lookup.keep(QueryResponseJson.HYBRID, fusedAnswer);
                 return answered -> sendHybrid(answered, fusedAnswer, request);
@@ -964,7 +957,7 @@ public class QueryEndpoint implements HttpHandler {
             context.page(fused.size()).slice(fused);
         QueryExplanation explanation = context.explaining()
             ? QueryExplainer.hybrid(page, response.vector().results(), response.lexical(),
-                context.passages(), context.expansion(true))
+                context.passages(), context.expansion(response.expansion()))
             : null;
         sendJson(exchange, 200, QueryResponseJson.hybrid(response, page,
             context.answer(fused.size(), response.total(context.depth()), explanation)
@@ -998,7 +991,7 @@ public class QueryEndpoint implements HttpHandler {
         List<QueryResultItem> page = context.page(produced.size()).slice(produced);
         QueryExplanation explanation = context.explaining()
             ? QueryExplainer.vector(page, context.offset(), context.passages(),
-                context.expansion(false))
+                context.expansion(null))
             : null;
         sendJson(exchange, 200, QueryResponseJson.vector(response, page,
             context.answer(produced.size(), complete, explanation).ignoring(request.ignored())));
@@ -1041,7 +1034,8 @@ public class QueryEndpoint implements HttpHandler {
                 && Deadline.remainingMillis(deadlineNanos) > 0) {
             signal = com.eonmux.excalibur.api.retrieval.LexicalSignal.start(request.lexical(),
                 executorService, request.parsed().query(), request.parsed().sourceScope(),
-                plan.candidates(request.context().depth()));
+                plan.candidates(request.context().depth()), lexicalBudget(request, plan),
+                request.epoch());
             startedHere = signal != null;
             if (startedHere) {
                 withdrawal.addListener(signal::cancel);
@@ -1094,7 +1088,24 @@ public class QueryEndpoint implements HttpHandler {
             return null;
         }
         return com.eonmux.excalibur.api.retrieval.LexicalSignal.start(request.lexical(),
-            executorService, request.parsed().query(), request.parsed().sourceScope(), depth);
+            executorService, request.parsed().query(), request.parsed().sourceScope(), depth,
+            lexicalBudget(request, request.plan()), request.epoch());
+    }
+
+    /**
+     * How long a BM25 search started now has, its query expansion included.
+     *
+     * <p>What is left of the request's deadline, less the model's share when the answer is to
+     * be scored afterwards - the same bound the vector half is given, so neither signal is
+     * allowed to spend the time relevancy scoring was promised.</p>
+     *
+     * @param request The request
+     * @param plan    How the answer is scored
+     * @return The search's budget, zero when the deadline has already passed
+     */
+    private static Duration lexicalBudget(Request request, RelevancyScoring.Plan plan) {
+        return Duration.ofMillis(
+            plan.retrievalBudgetMs(Deadline.remainingMillis(request.deadlineNanos())));
     }
 
     /**

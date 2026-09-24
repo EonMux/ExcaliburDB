@@ -170,7 +170,8 @@ final class EndpointRegistrar {
      * @param queryRegistry        In-flight queries, for cancellation
      * @param embeddingClient      Embeds raw query text, or null when this node cannot
      * @param lexicalQueryService  Lexical retrieval, or null when this node keeps no index
-     * @param queryExpander       The expander the lexical half widens queries with, or null
+     * @param queryExpander        The expander the lexical half widens queries with, for the
+     *                             breaker state health reports, or null
      * @param chunkIndex           The chunk lexical index stats report on, or null
      * @param ingestSourceRegistry Where ingestion sources are registered
      * @param sourceCatalog        Where registrations are recorded across restarts, or null
@@ -373,9 +374,6 @@ final class EndpointRegistrar {
         // the same thing - the chunk id ingestion assigned - which is what makes them fusible
         // rather than two id spaces to reconcile.
         queryHandler.setLexicalQueryService(in.lexicalQueryService());
-        // The same instance the index was given, so an explained answer can say what the
-        // query was widened with without generating a second, different expansion.
-        queryHandler.setQueryExpander(in.queryExpander());
         queryHandler.setChunkText(chunkText);
         // Valid only while the corpus fingerprint an answer was computed against is unchanged,
         // which is re-read from the live corpus on every lookup rather than trusted from when

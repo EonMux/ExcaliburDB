@@ -81,20 +81,22 @@ record QueryCacheLookup(QueryResultCache cache, QueryCacheKey key, CorpusVersion
      *                 routes; may be null on the vector route
      * @param route    The route this node answers by: {@link QueryResponseJson#VECTOR},
      *                 {@link QueryResponseJson#LEXICAL} or {@link QueryResponseJson#HYBRID}
+     * @param epoch    The visibility epoch the request's search reads at, which the fingerprint
+     *                 is taken at so it describes the corpus the answer is computed from
      * @param parsed   The validated search fields
      * @param context  The validated presentation fields
      * @param exchange The request, for the credential it presented
      * @return The lookup, which on a node without a cache is {@link #NONE}
      */
     static QueryCacheLookup of(QueryResultCache cache, QueryPipeline pipeline,
-                               LexicalQueryService lexical, String route,
+                               LexicalQueryService lexical, String route, long epoch,
                                QueryRequestParser.ParsedQuery parsed, QueryContext context,
                                HttpExchange exchange) {
         if (cache == null) {
             return NONE;
         }
         return new QueryCacheLookup(cache, keyOf(parsed, context, route, exchange),
-            versionOf(pipeline, lexical, route), route);
+            versionOf(pipeline, lexical, route, epoch), route);
     }
 
     /**
@@ -137,8 +139,8 @@ record QueryCacheLookup(QueryResultCache cache, QueryCacheKey key, CorpusVersion
      * @return The fingerprint; {@link CorpusVersion#UNREADABLE} when any part cannot be read
      */
     private static CorpusVersion versionOf(QueryPipeline pipeline, LexicalQueryService lexical,
-                                           String route) {
-        CorpusVersion segments = pipeline.corpusVersion();
+                                           String route, long epoch) {
+        CorpusVersion segments = pipeline.corpusVersion(epoch);
         if (segments == null) {
             return CorpusVersion.UNREADABLE;
         }
@@ -150,7 +152,7 @@ record QueryCacheLookup(QueryResultCache cache, QueryCacheKey key, CorpusVersion
         }
         OptionalLong lexicalVersion;
         try {
-            lexicalVersion = lexical.searchVersion();
+            lexicalVersion = lexical.searchVersion(epoch);
         } catch (RuntimeException e) {
             // Not a reason to fail the query, which can still search. It is a reason not to
             // cache: an index that cannot say what it would read cannot be shown unchanged.

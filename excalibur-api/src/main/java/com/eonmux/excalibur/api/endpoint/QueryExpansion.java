@@ -1,6 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
-import com.eonmux.excalibur.retrieval.expand.QueryExpander;
+import com.eonmux.excalibur.retrieval.expand.Expansion;
 import com.eonmux.excalibur.retrieval.expand.SearchFormulation;
 
 import org.slf4j.Logger;
@@ -23,13 +23,22 @@ import java.util.List;
  * <p>The query is widened once, before a single document is looked at. Repeating the list on
  * every result would say it happened per result, which is both larger and false.</p>
  *
- * <h2>Three states, not two</h2>
- * <p>"Not widened" and "cannot say" are different facts and are named differently. A node with
- * no expander did not widen the query; a node whose lexical half never ran cannot report what
- * its expander would have done; an empty list under either would read as the first. The status
- * is what keeps a caller from inferring one from the other.</p>
+ * <h2>Four states, not two</h2>
+ * <p>"Not widened", "could not be widened" and "cannot say" are different facts and are named
+ * differently. A node whose expander adds nothing did not widen the query; a node whose model
+ * failed, was too slow or answered with nothing usable meant to and could not, and searched the
+ * query as typed; a node whose lexical half never ran, or that wires no expander, cannot report
+ * what an expander would have done. An empty list under any of them would read as the first.
+ * The status is what keeps a caller from inferring one from another.</p>
  *
- * @param status    {@link #APPLIED}, {@link #NOT_APPLIED} or {@link #UNREPORTED}
+ * <h2>Read from the answer, never generated again</h2>
+ * <p>The report is built from the expansion the search carried with it, which a cached answer
+ * keeps too. Expansion is a generation from a chat model: asking again to describe it would
+ * bill the operator for a second call, on a replayed answer for a call the replay existed to
+ * save, and could describe terms the search never used.</p>
+ *
+ * @param status    {@link #APPLIED}, {@link #NOT_APPLIED}, {@link #FELL_BACK} or
+ *                  {@link #UNREPORTED}
  * @param terms     The terms the query was widened with, the typed query itself excluded
  * @param truncated Whether terms were left out to meet {@link #MAX_TERMS}
  */
@@ -42,6 +51,12 @@ public record QueryExpansion(String status, List<Term> terms, boolean truncated)
 
     /** The query was searched as typed: this node widens nothing, or widened nothing here. */
     public static final String NOT_APPLIED = "not_applied";
+
+    /**
+     * The node widens queries and could not widen this one - its model failed, was too slow, or
+     * answered with nothing usable - so the query was searched as typed.
+     */
+    public static final String FELL_BACK = "fell_back";
 
     /** This answer cannot say: no expander was wired, or no signal that uses one ran. */
     public static final String UNREPORTED = "unreported";
@@ -78,33 +93,21 @@ public record QueryExpansion(String status, List<Term> terms, boolean truncated)
     }
 
     /**
-     * What one query was widened into, as the expander that ran has it.
+     * What one query was widened into, as the search that answered it used it.
      *
-     * <p>The expander must be the very instance the searching half was given, and must
-     * remember its answers - see {@code CachingQueryExpander}. Expansion is a generation from
-     * a chat model: asking a second time would both bill the operator twice and risk reporting
-     * an expansion that is not the one the search used.</p>
-     *
-     * <p>Never fails a query. An expander that throws leaves the answer unable to say what it
-     * widened the query with, which is a worse answer and not a failed one.</p>
-     *
-     * @param expander  The expander the searching half used, or null when none was wired
-     * @param query     The query text, as validated
-     * @param expanding Whether a signal that widens queries actually ran for this answer
+     * @param used  The expansion the lexical search carried, or null when no search that widens
+     *              queries ran for this answer or its service wires no expander
+     * @param query The query text, as validated
      * @return The report, never null
      */
-    public static QueryExpansion of(QueryExpander expander, String query, boolean expanding) {
-        if (expander == null || !expanding || query == null) {
+    public static QueryExpansion of(Expansion used, String query) {
+        if (used == null || query == null) {
             return UNKNOWN;
         }
-        List<SearchFormulation> formulations;
-        try {
-            formulations = expander.expand(query);
-        } catch (RuntimeException e) {
-            LOGGER.warn("Could not report what the query was widened with: {}", e.getMessage());
-            return UNKNOWN;
+        if (used.fellBack()) {
+            return new QueryExpansion(FELL_BACK, List.of(), false);
         }
-        return report(formulations, query);
+        return report(used.formulations(), query);
     }
 
     /**

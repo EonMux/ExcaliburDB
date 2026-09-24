@@ -2,7 +2,6 @@ package com.eonmux.excalibur.api.endpoint;
 
 import com.eonmux.excalibur.api.retrieval.ResultText;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
-import com.eonmux.excalibur.retrieval.expand.QueryExpander;
 import com.eonmux.excalibur.retrieval.snippet.QueryTerms;
 
 import java.util.List;
@@ -13,24 +12,22 @@ import java.util.function.Function;
  * What a node can offer a request beyond the search, and what it therefore has to refuse.
  *
  * <h2>Why a node-level object</h2>
- * <p>Two of the three things a request can ask for here depend on what is inside this node
- * rather than on what was asked. Result text and matched terms need chunk storage, which a
- * query router does not keep; the expansion report needs the expander the searching half was
- * given, which a node with no model to call does not have. Both are wired after the handler
- * exists and both are read by every request, so they live in one place that the query path
- * and the BM25-only path share - a refusal that only one of them makes is the difference
- * between a node that cannot serve a field and a node that serves it on alternate requests.</p>
+ * <p>Result text and matched terms depend on what is inside this node rather than on what was
+ * asked: both need chunk storage, which a query router does not keep. The chunk-text source is
+ * wired after the handler exists and is read by every request, so it lives in one place that the
+ * query path and the BM25-only path share - a refusal that only one of them makes is the
+ * difference between a node that cannot serve a field and a node that serves it on alternate
+ * requests. The expansion report needs nothing from the node: it is read from the answer.</p>
  *
  * <h2>Thread Safety</h2>
- * <p>This class is thread-safe. The two collaborators are set during startup and read by every
- * request, so they are volatile; everything built per request is built fresh.</p>
+ * <p>This class is thread-safe. The chunk-text source is set during startup and read by every
+ * request, so it is volatile; everything built per request is built fresh.</p>
  */
 final class QueryContexts {
 
     private final ApiSecurityConfig limits;
     private final ResultText resultText;
     private volatile Function<String, String> chunkText;
-    private volatile QueryExpander expander;
 
     /**
      * Creates the factory over a deployment's bounds.
@@ -67,15 +64,6 @@ final class QueryContexts {
     }
 
     /**
-     * Gives this node the expander its searching half widens queries with.
-     *
-     * @param expander The expander, or null when nothing is to be reported about expansion
-     */
-    void expander(QueryExpander expander) {
-        this.expander = expander;
-    }
-
-    /**
      * Resolves one request's presentation fields, refusing what this node cannot serve.
      *
      * @param requestBody The raw request
@@ -100,7 +88,7 @@ final class QueryContexts {
         return new QueryContext(options,
             ResultPassages.forRequest(source, limits.maxResultTextChars(), parsed.includeText(),
                 options, terms),
-            this.expander, parsed.query(), parsed.topK());
+            parsed.query(), parsed.topK());
     }
 
     /**

@@ -1967,9 +1967,13 @@ Key fields:
   and case-insensitive, in the order you typed them — computed the same way on every retrieval
   path, so a vector-only answer explains its matches too.
 - **`query_expansion`** (response level, only with `"explain": true`) — what the query was widened
-  with, once for the answer rather than per result. `status` is `applied`, `not_applied` or
-  `unreported`; `unreported` means *this node cannot say* — no expander is wired, or no
-  query-widening signal ran — which is a different fact from "the query was not widened".
+  with, once for the answer rather than per result. `status` is `applied`, `not_applied`,
+  `fell_back` or `unreported`. `fell_back` means the node meant to widen the query and could not —
+  the model failed, ran out of time or answered with nothing usable — so it was searched as typed,
+  with an empty `terms`. `unreported` means *this node cannot say* — no expander is wired, or no
+  query-widening signal ran — which is a different fact from "the query was not widened". The
+  report is read from the expansion the answer was searched with, which a cached answer keeps, so
+  explaining an answer never calls the model again.
 - **`text_offset`** and **`highlights`** (per result, only with `"snippet": true`) — where the
   returned window starts in the chunk, and where the matched terms sit inside the window
   (`start`/`length`, relative to the `text` you were given). The window is a verbatim substring
@@ -2077,8 +2081,9 @@ query instead of on embedding every document, which is the deployment this path 
 few dozen generated tokens per query against billions of embedded tokens per corpus.
 
 A node that does embed its corpus answers here too, one query at a time, when its vector half
-cannot answer: the embedding endpoint fails or misses the deadline, or the pipeline does. That
-answer has the same shape, with `timed_out` saying whether a deadline was the cause — see
+cannot answer: the embedding endpoint fails or misses the deadline, or the pipeline does - a missed
+deadline only on a node that fuses, since with `excalibur.query.hybrid-retrieval=false` no BM25
+search was running and none can start once the deadline is spent. That answer has the same shape, with `timed_out` saying whether a deadline was the cause — see
 [Hybrid retrieval](#hybrid-retrieval--both-signals) for each case.
 
 ### Hybrid retrieval — both signals
@@ -2172,6 +2177,14 @@ call per query. It requires a chat endpoint in use. The retrieval harness in `ex
 measures the two side by side on your corpus; see
 [Evaluating it](README.md#evaluating-it).
 
+However it is reached, an expansion call waits at most `excalibur.query.expansion-timeout-ms` and
+never more than half of the budget the BM25 search was started with: what `timeout_ms` leaves,
+less relevancy scoring's share when the answer is to be scored. The other half is kept for the
+search, so a slow model cannot leave BM25 less time than the expansion took. A model that fails,
+runs out of that time or answers with nothing usable leaves the query searched as typed; the answer
+still comes back, is not cached, reports `query_expansion.status: "fell_back"` when explained, and
+on a hybrid answer marks `coverage.degraded: true`.
+
 A query longer than `excalibur.api.max-query-chars` is refused, on every route; there is no
 second, shorter bound for expansion. A hybrid answer carries `ignored_fields` like every other:
 `threshold` and `include_partial_segments` are applied to the vector signal before fusion, so they
@@ -2203,9 +2216,11 @@ fingerprint move exactly when an answer would.
 Vector, hybrid and lexical answers are all cached, after relevancy scoring, keyed on everything
 that changes the answer — the query, the route, the depth and every scoring and filtering field.
 A lexical or hybrid answer is fingerprinted twice: the segments as above, and the lexical index as
-a search started now would see it — the manifest entries visible at the query epoch on the native
-engine, the reader version on Lucene — so an epoch crossing a manifest entry discards it like any
-other change.
+the search sees it — the manifest entries visible at the query's epoch on the native engine, the
+reader version on Lucene — so an epoch crossing a manifest entry discards it like any other change.
+The query captures one epoch when it arrives, and the fingerprints, the vector half and every BM25
+ranking all read at it, so an answer is stored under the corpus it was computed from even when a
+publication lands while it runs.
 
 Three things are deliberately never cached:
 
@@ -2213,8 +2228,10 @@ Three things are deliberately never cached:
   text can never be stale.
 - **Answers that are the product of a moment's trouble.** A vector or hybrid answer is not
   stored when it is degraded, timed out or cancelled, or when its relevancy scoring fell back or ran
-  out of time. A lexical answer is not stored when it timed out or was cancelled, when its scoring
-  fell back, or when it read less than the whole index. Its `degraded` flag alone does not stop it:
+  out of time. A lexical or hybrid answer is not stored when its query expansion fell back to the
+  query as typed: the next caller asking is owed the widened search. A lexical answer is not stored
+  when it timed out or was cancelled, when its scoring fell back, or when it read less than the
+  whole index. Its `degraded` flag alone does not stop it:
   that flag is set on every lexical answer, saying the answer came from one signal, and is not a
   sign of trouble on a node that has only that one. And an answer from BM25 standing in for a
   failed vector half is never stored, because it is not the answer the node's cache key names.
@@ -4036,12 +4053,17 @@ What each call does:
   rank) on a node with an embedding endpoint and a chunk index and
   `excalibur.query.hybrid-retrieval` on; `VECTOR` with it off; `LEXICAL` on a node that does not
   embed (the embedding endpoint disabled, or left at the hosted default with no key), or when the
-  endpoint fails or runs out of time mid-query. A node with
+  vector half fails or runs out of time mid-query - except that with
+  `excalibur.query.hybrid-retrieval` off no BM25 search runs beside the vector half, so only a
+  failure starts one, and a vector half that runs out of time answers `VECTOR`, empty and
+  `timedOut()`, as the route does. A node with
   neither signal refuses every query with `IllegalStateException`; `route()` on the node answers
   that before any query is made. The limits are the server's: `excalibur.api.max-query-chars`,
   `max-top-k` and `max-query-timeout-ms`, and `query(text, topK, timeout)` sets a budget below the
   default, and `query(text, topK, timeout, sourceIds)` searches only the documents of those
-  sources, as `source_ids` does on the route. Each `SearchHit` carries the chunk id, its score,
+  sources, as `source_ids` does on the route — and refuses, with `IllegalArgumentException`, the
+  lists the route refuses: empty, more than 1000 ids, or an id that is null, blank or longer than
+  256 characters. Each `SearchHit` carries the chunk id, its score,
   the signals that found it and the chunk's text; `timedOut()` on the answer says the budget ran
   out and the hits are what was found before it did.
 - **`fetch(chunkId)`** reads a chunk's text back. **`documents()`** and **`documents(sourceId)`**

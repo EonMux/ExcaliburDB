@@ -165,6 +165,29 @@ class ExcaliburEmbeddedTest {
         }
 
         @Test
+        @DisplayName("refuses the source lists POST /v1/query refuses, naming what is wrong")
+        void sourceListBounds() throws Exception {
+            try (ExcaliburEmbedded db = lexicalNode().open()) {
+                Duration budget = Duration.ofSeconds(10);
+                assertThatThrownBy(() -> db.query("cold", 5, budget, List.of("team", " ")))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("blank");
+                assertThatThrownBy(() -> db.query("cold", 5, budget, List.of("s".repeat(257))))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("at most 256 characters");
+                assertThatThrownBy(() -> db.query("cold", 5, budget,
+                        java.util.stream.IntStream.range(0, 1_001).mapToObj(i -> "s" + i)
+                            .toList()))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("at most 1000 sources");
+                assertThatThrownBy(() -> db.query("cold", 5, budget,
+                        java.util.Arrays.asList("team", null)))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("null");
+            }
+        }
+
+        @Test
         @DisplayName("keeps what it was given across a restart, and replaces and erases it after")
         void survivesARestart() throws Exception {
             try (ExcaliburEmbedded db = lexicalNode().open()) {

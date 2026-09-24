@@ -433,6 +433,38 @@ public final class ChunkLexicalIndex implements ChunkIndex {
     }
 
     /**
+     * {@inheritDoc}
+     *
+     * <p>Holds the reader published by the last refresh for the whole search, so a refresh
+     * during it does not change what a deeper ranking reads. Lucene publishes at a refresh
+     * rather than at an epoch, so {@link #view(long)} is this same view: the held reader is this
+     * engine's equivalent of a fixed epoch. An index never refreshed has no reader to hold, and
+     * its view searches the live index, which finds nothing.</p>
+     */
+    @Override
+    public View view() {
+        Optional<LexicalIndex.Lease> leased = index.tryAcquire();
+        if (leased.isEmpty()) {
+            return ChunkIndex.super.view();
+        }
+        LexicalIndex.Lease lease = leased.get();
+        return new View() {
+            @Override
+            public com.eonmux.excalibur.retrieval.rank.Ranker ranker(
+                    com.eonmux.excalibur.retrieval.expand.QueryExpander expander,
+                    java.util.function.Predicate<String> admits) {
+                return new com.eonmux.excalibur.retrieval.expand.ExpandedLexicalRanker(index,
+                    expander).admitting(admits).reading(lease);
+            }
+
+            @Override
+            public void close() {
+                lease.close();
+            }
+        };
+    }
+
+    /**
      * Force-merges the segments holding erased chunks, if the policy says it is due.
      *
      * <p>Lucene reclaims deletions on its own merge schedule, which is the right default for

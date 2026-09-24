@@ -75,6 +75,8 @@ class DocumentVisibilityRouteTest {
         QueryPipeline queryPipeline = mock(QueryPipeline.class, Answers.RETURNS_SELF);
         EpochTickScheduler scheduler = mock(EpochTickScheduler.class);
         when(indexOrchestrator.getVisibilityTracker()).thenReturn(clock);
+        // A query reads at the epoch the pipeline captures, which is the node's own clock.
+        when(queryPipeline.captureEpoch()).thenAnswer(invocation -> clock.captureEpoch());
         when(indexOrchestrator.getEpochTickScheduler()).thenReturn(scheduler);
         when(scheduler.getTickIntervalMs()).thenReturn(100L);
         when(storageEngine.getCatalog()).thenReturn(catalog);

@@ -17,6 +17,7 @@ import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -130,12 +131,15 @@ final class EmbeddedRetrieval {
         }
         long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
         SearchRoute planned = route().orElseThrow(() -> new IllegalStateException(NO_SIGNAL));
-        Search search = new Search(text, topK, scope, deadlineNanos);
+        // One epoch for both signals, as the query route pins one: the two halves of a fused
+        // answer read the same corpus.
+        Search search = new Search(text, topK, scope, deadlineNanos, pipeline.captureEpoch());
         if (planned == SearchRoute.LEXICAL) {
             return lexicalOnly(search);
         }
         LexicalSignal signal = planned == SearchRoute.HYBRID
-            ? LexicalSignal.start(lexical, executor, text, scope, topK)
+            ? LexicalSignal.start(lexical, executor, text, scope, topK, budget(deadlineNanos),
+                search.epoch())
             : null;
         try {
             return withVectors(search, signal);
@@ -171,22 +175,25 @@ final class EmbeddedRetrieval {
      * @param topK          Most hits to return
      * @param scope         The sources the answer is drawn from
      * @param deadlineNanos {@link System#nanoTime()} value the search must finish by
+     * @param epoch         The visibility epoch both signals read the corpus at
      */
-    private record Search(String text, int topK, SourceScope scope, long deadlineNanos) {
+    private record Search(String text, int topK, SourceScope scope, long deadlineNanos,
+                          long epoch) {
     }
 
     /** A node with no vectors: BM25 is the whole answer. */
     private SearchAnswer lexicalOnly(Search search) throws InterruptedException {
         long deadlineNanos = search.deadlineNanos();
         LexicalSignal signal =
-            LexicalSignal.start(lexical, executor, search.text(), search.scope(), search.topK());
+            LexicalSignal.start(lexical, executor, search.text(), search.scope(), search.topK(),
+                budget(deadlineNanos), search.epoch());
         if (signal == null) {
             throw new IllegalStateException("Every BM25 search permit is in use; try again");
         }
         try {
-            List<LexicalQueryService.Hit> hits = signal.await(remainingMillis(deadlineNanos));
-            if (hits != null) {
-                return new SearchAnswer(SearchRoute.LEXICAL, lexicalHits(hits), false);
+            LexicalQueryService.Ranking ranking = signal.await(remainingMillis(deadlineNanos));
+            if (ranking != null) {
+                return new SearchAnswer(SearchRoute.LEXICAL, lexicalHits(ranking.hits()), false);
             }
             if (remainingMillis(deadlineNanos) == 0) {
                 return new SearchAnswer(SearchRoute.LEXICAL, List.of(), true);
@@ -223,15 +230,16 @@ final class EmbeddedRetrieval {
                 // A hit an embedder cannot name is one it cannot fetch or erase.
                 .requireNamedResults(true)
                 .sourceScope(search.scope())
+                .readEpoch(search.epoch())
                 .maxSearchDepth(Math.min(limits.maxTopK(), QueryRequest.MAX_TOP_K))
                 .build();
             QueryResponse response = pipeline.execute(request, token)
                 .get(budgetMs + PIPELINE_RESPONSE_GRACE_MILLIS, TimeUnit.MILLISECONDS);
-            List<LexicalQueryService.Hit> hits =
+            LexicalQueryService.Ranking ranking =
                 signal == null ? null : signal.await(remainingMillis(deadlineNanos));
-            if (hits != null) {
+            if (ranking != null) {
                 List<HybridFusion.Result> fused =
-                    HybridFusion.fuse(response.results(), hits, topK, lexical.rrfK());
+                    HybridFusion.fuse(response.results(), ranking.hits(), topK, lexical.rrfK());
                 return new SearchAnswer(SearchRoute.HYBRID, fusedHits(fused),
                     response.timedOut());
             }
@@ -300,14 +308,15 @@ final class EmbeddedRetrieval {
         boolean startedHere = false;
         if (signal == null && !timedOut && lexical != null && remainingMillis(deadlineNanos) > 0) {
             signal = LexicalSignal.start(lexical, executor, search.text(), search.scope(),
-                search.topK());
+                search.topK(), budget(deadlineNanos), search.epoch());
             startedHere = signal != null;
         }
         try {
-            List<LexicalQueryService.Hit> hits = signal == null ? null
+            LexicalQueryService.Ranking ranking = signal == null ? null
                 : timedOut ? signal.ready() : signal.await(remainingMillis(deadlineNanos));
-            if (hits != null) {
-                return new SearchAnswer(SearchRoute.LEXICAL, lexicalHits(hits), timedOut);
+            if (ranking != null) {
+                return new SearchAnswer(SearchRoute.LEXICAL, lexicalHits(ranking.hits()),
+                    timedOut);
             }
         } finally {
             if (startedHere) {
@@ -358,5 +367,10 @@ final class EmbeddedRetrieval {
 
     private static long remainingMillis(long deadlineNanos) {
         return Math.max(0, TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()));
+    }
+
+    /** What is left of the search's budget, for a BM25 search and its query expansion. */
+    private static Duration budget(long deadlineNanos) {
+        return Duration.ofMillis(remainingMillis(deadlineNanos));
     }
 }

@@ -183,11 +183,43 @@ class QueryPipelineSegmentSelectionTest {
     }
 
     /**
+     * Two halves of one answer read one corpus only if both read at one epoch, so a query that
+     * fixed its epoch must not see a segment published after it, however far the epoch has
+     * moved on by the time stage 0 runs.
+     */
+    @Test
+    @DisplayName("a query that fixed its epoch reads the segments visible at that epoch")
+    void aFixedEpochIsRead() throws IOException {
+        register(1L, LifecycleState.ACTIVE, true);
+        visibility.advanceEpoch();
+        visibility.advanceEpoch();
+        register(2L, LifecycleState.ACTIVE, true, 2L);
+
+        QueryResponse pinned = pipeline.executeSync(QueryRequest.builder()
+            .queryVector(vector()).topK(5).readEpoch(1L).build(), new CancellationToken());
+        QueryResponse current = pipeline.executeSync(permissive(), new CancellationToken());
+
+        assertThat(pinned.coverage().segmentsSearched())
+            .as("the segment published at epoch 2 is not part of the corpus as of epoch 1")
+            .isEqualTo(1);
+        assertThat(current.coverage().segmentsSearched()).isEqualTo(2);
+        assertThat(pipeline.captureEpoch()).isEqualTo(2L);
+        assertThat(pipeline.corpusVersion(1L)).isNotEqualTo(pipeline.corpusVersion(2L));
+        assertThat(pipeline.corpusVersion(2L)).isEqualTo(pipeline.corpusVersion());
+    }
+
+    /**
      * Registers a segment with the catalog, the visibility tracker and the engine's segment map,
      * driven to {@code state} through the transitions the catalog actually permits.
      */
     private void register(long segmentId, LifecycleState state, boolean withGraph)
             throws IOException {
+        register(segmentId, state, withGraph, 0L);
+    }
+
+    /** As above, visible from {@code createdAt} rather than from the first epoch. */
+    private void register(long segmentId, LifecycleState state, boolean withGraph,
+                          long createdAt) throws IOException {
         catalog.add(segmentId, tempDir.resolve("vol-" + segmentId + ".dat"));
         if (state != LifecycleState.INDEXING) {
             catalog.completeIndexing(segmentId);
@@ -198,7 +230,7 @@ class QueryPipelineSegmentSelectionTest {
         if (state == LifecycleState.COMPACTING) {
             catalog.beginCompaction(segmentId);
         }
-        visibility.registerSegment(segmentId, 0L);
+        visibility.registerSegment(segmentId, createdAt);
         segments.put(segmentId, segment("s-" + segmentId + ".dat"));
         if (withGraph) {
             graphs.put(segmentId, graph("g-" + segmentId + ".hnsw"));

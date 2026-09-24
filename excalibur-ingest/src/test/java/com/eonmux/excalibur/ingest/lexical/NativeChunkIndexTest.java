@@ -51,14 +51,14 @@ class NativeChunkIndexTest {
     }
 
     private static QueryExpander expanding(String... alternatives) {
-        return text -> {
+        return QueryExpander.infallible(text -> {
             var formulations = new java.util.ArrayList<SearchFormulation>();
             formulations.add(SearchFormulation.original(text));
             for (String alternative : alternatives) {
                 formulations.add(new SearchFormulation(alternative, 0.8));
             }
             return formulations;
-        };
+        });
     }
 
     private static List<String> namesOf(NativeChunkIndex index, RankedList ranked) {
@@ -145,6 +145,44 @@ class NativeChunkIndexTest {
                     .isEmpty();
                 assertThat(namesOf(index, ranker.rank(RetrievalQuery.ofText("certificate"), 5)))
                     .containsExactly("kb:a.txt:chunk:0");
+            }
+        }
+
+        /**
+         * A search that ranks more than once, or is fused with a vector half read at its own
+         * epoch, has to read one corpus: a view fixed at an epoch keeps reading it, gate and
+         * postings both, while the epoch moves past a publication.
+         */
+        @Test
+        @DisplayName("a view reads the epoch it was fixed at, however far the epoch moves")
+        void aViewReadsItsOwnEpoch(@TempDir Path dir) throws Exception {
+            AtomicLong epoch = new AtomicLong(5);
+            try (NativeChunkIndex index =
+                     NativeChunkIndex.open(dir, epoch::get, 4, standard())) {
+                index.add("kb:a.txt:chunk:0", "the handshake failed");
+                index.refresh();
+                epoch.incrementAndGet();
+                java.util.OptionalLong before = index.searchVersion();
+
+                try (ChunkIndex.View fixed = index.view(); ChunkIndex.View atSix = index.view(6)) {
+                    index.add("kb:b.txt:chunk:0", "the handshake timed out");
+                    index.refresh();
+                    epoch.incrementAndGet();
+
+                    for (ChunkIndex.View view : List.of(fixed, atSix)) {
+                        Ranker ranker = view.ranker(expanding("timed out"), null);
+                        assertThat(namesOf(index,
+                            ranker.rank(RetrievalQuery.ofText("handshake"), 5)))
+                            .as("the chunk published after the view's epoch is not in its corpus")
+                            .containsExactly("kb:a.txt:chunk:0");
+                    }
+                }
+
+                assertThat(index.searchVersion(6)).isEqualTo(before);
+                assertThat(index.searchVersion()).isNotEqualTo(before);
+                assertThat(namesOf(index, index.ranker(QueryExpander.identity())
+                    .rank(RetrievalQuery.ofText("handshake"), 5)))
+                    .containsExactlyInAnyOrder("kb:a.txt:chunk:0", "kb:b.txt:chunk:0");
             }
         }
 
@@ -627,7 +665,7 @@ class NativeChunkIndexTest {
                 index.refresh();
                 epoch.incrementAndGet();
 
-                Ranker none = index.ranker(text -> List.of());
+                Ranker none = index.ranker(QueryExpander.infallible(text -> List.of()));
                 assertThat(none.rank(RetrievalQuery.ofText("memory"), 5).documents()).isEmpty();
                 assertThat(index.ranker(QueryExpander.identity())
                     .rank(RetrievalQuery.ofText("memory"), 0).documents()).isEmpty();

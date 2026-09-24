@@ -36,14 +36,14 @@ class NativeChunkRankerTest {
 
     /** An expander whose generated formulations all agree on one term. */
     private static QueryExpander agreeingOn(String shared, double weight, String... rest) {
-        return text -> {
+        return QueryExpander.infallible(text -> {
             List<SearchFormulation> out = new java.util.ArrayList<>();
             out.add(SearchFormulation.original(text));
             for (String tail : rest) {
                 out.add(new SearchFormulation(shared + " " + tail, weight));
             }
             return out;
-        };
+        });
     }
 
     private static NativeChunkIndex twoComparableChunks(Path dir) throws Exception {
@@ -85,11 +85,11 @@ class NativeChunkRankerTest {
             index.refresh();
             epoch.incrementAndGet();
 
-            QueryExpander expander = text -> List.of(
+            QueryExpander expander = QueryExpander.infallible(text -> List.of(
                 SearchFormulation.original(text),
                 new SearchFormulation("bravo charlie", 0.9),
                 new SearchFormulation("bravo delta", 0.9),
-                new SearchFormulation("echo foxtrot", 0.9));
+                new SearchFormulation("echo foxtrot", 0.9)));
 
             RankedList out = index.ranker(expander).rank(RetrievalQuery.ofText("alpha"), 5);
 

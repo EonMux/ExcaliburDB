@@ -4,6 +4,7 @@ import com.eonmux.excalibur.core.text.SourceScope;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -15,6 +16,7 @@ import java.util.concurrent.locks.LockSupport;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -37,7 +39,7 @@ class LexicalSignalTest {
         CountDownLatch finished = new CountDownLatch(1);
         AtomicBoolean interrupted = new AtomicBoolean();
         LexicalQueryService service = mock(LexicalQueryService.class);
-        when(service.search(anyString(), anyInt(), any())).thenAnswer(invocation -> {
+        when(service.retrieve(anyString(), anyInt(), any(), any(), anyLong())).thenAnswer(invocation -> {
             searching.countDown();
             try {
                 // Stands in for index reads, which never look at the interrupt flag.
@@ -49,12 +51,13 @@ class LexicalSignalTest {
             } finally {
                 finished.countDown();
             }
-            return List.of();
+            return new LexicalQueryService.Ranking(List.of(), null);
         });
         ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
         try {
             LexicalSignal signal =
-                LexicalSignal.start(service, executor, "query", SourceScope.ALL, 10);
+                LexicalSignal.start(service, executor, "query", SourceScope.ALL, 10,
+                    Duration.ofSeconds(30), 1L);
             assertThat(signal).isNotNull();
             assertThat(searching.await(5, TimeUnit.SECONDS)).isTrue();
 

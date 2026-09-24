@@ -7,7 +7,7 @@ import com.eonmux.excalibur.query.QueryOptions;
 import com.eonmux.excalibur.query.QueryRequest;
 import com.eonmux.excalibur.config.Config;
 
-import java.util.List;
+import java.util.Arrays;
 import java.util.Objects;
 
 /**
@@ -202,27 +202,8 @@ public final class QueryRequestParser {
         if (named == null) {
             return SourceScope.ALL;
         }
-        if (named.length == 0) {
-            throw new IllegalArgumentException(
-                "Field 'source_ids' must name at least one source when present");
-        }
-        // Each named source is a prefix every candidate is compared against; SourceScope.of
-        // holds the bound, and this names the field in the message.
-        if (named.length > SourceScope.MAX_SOURCES) {
-            throw new IllegalArgumentException("Field 'source_ids' must name at most "
-                + SourceScope.MAX_SOURCES + " sources: " + named.length);
-        }
-        for (String sourceId : named) {
-            if (sourceId.isBlank()) {
-                throw new IllegalArgumentException(
-                    "Field 'source_ids' must not contain a blank source id");
-            }
-            String violation = SourceIds.violation(sourceId, "source_ids");
-            if (violation != null) {
-                throw new IllegalArgumentException(violation);
-            }
-        }
-        return SourceScope.of(List.of(named));
+        // The rule an embedded node's scoped query is held to as well.
+        return SourceIds.scope(Arrays.asList(named), "source_ids");
     }
 
     /**
@@ -277,10 +258,12 @@ public final class QueryRequestParser {
          * @param maxDepth      The deepest the pipeline may rank to fill the answer past
          *                      documents it withholds - the node's {@code max-top-k}, the bound
          *                      on how deep any page may reach
+         * @param readEpoch     The visibility epoch the search reads at, shared with the BM25
+         *                      half and the cache fingerprint of the same request
          * @return The pipeline request
          */
         public QueryRequest toRequest(float[] vector, String correlationId, long budgetMs,
-                                      int maxDepth) {
+                                      int maxDepth, long readEpoch) {
             return QueryRequest.builder()
                 .queryText(query)
                 .queryVector(vector)
@@ -297,6 +280,7 @@ public final class QueryRequestParser {
                 .requireNamedResults(true)
                 .sourceScope(sourceScope)
                 .maxSearchDepth(Math.min(maxDepth, QueryRequest.MAX_TOP_K))
+                .readEpoch(readEpoch)
                 .build();
         }
     }

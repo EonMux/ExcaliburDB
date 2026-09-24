@@ -5,6 +5,8 @@ import com.eonmux.excalibur.api.retrieval.LexicalQueryService;
 import com.eonmux.excalibur.query.IndexCoverage;
 import com.eonmux.excalibur.query.QueryResponse;
 import com.eonmux.excalibur.query.QueryResultItem;
+import com.eonmux.excalibur.retrieval.expand.Expansion;
+import com.eonmux.excalibur.retrieval.expand.SearchFormulation;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -33,9 +35,15 @@ class CachedAnswersTest {
     private static final List<LexicalQueryService.Hit> TWO =
         List.of(new LexicalQueryService.Hit("a", 0.9), new LexicalQueryService.Hit("b", 0.4));
 
+    /** What a search that could not widen its query searched instead: the query as typed. */
+    private static final Expansion FELL_BACK = Expansion.fellBack("q");
+
+    private static final Expansion WIDENED = Expansion.of(List.of(SearchFormulation.original("q"),
+        new SearchFormulation("widened", 0.8)));
+
     private static LexicalResponse lexical(IndexCoverage coverage, boolean timedOut,
                                            boolean cancelled, boolean fellBack) {
-        return new LexicalResponse("q-1", TWO, true, coverage, timedOut, cancelled, false,
+        return new LexicalResponse("q-1", TWO, null, true, coverage, timedOut, cancelled, false,
             fellBack, 5L, false);
     }
 
@@ -69,6 +77,22 @@ class CachedAnswersTest {
         }
 
         @Test
+        @DisplayName("may not be replayed when its query expansion fell back")
+        void notCacheableWhenTheExpansionFellBack() {
+            LexicalResponse unwidened = new LexicalResponse(null, TWO, FELL_BACK, true,
+                LEXICAL_FULL, false, false, false, false, 1L, false);
+            LexicalResponse widened = new LexicalResponse(null, TWO, WIDENED, true,
+                LEXICAL_FULL, false, false, false, false, 1L, false);
+
+            assertThat(unwidened.expansionFellBack()).isTrue();
+            assertThat(unwidened.cacheable()).isFalse();
+            assertThat(widened.cacheable()).isTrue();
+            assertThat(widened.forStorage().servedFromCache().expansion())
+                .as("a replay is explained from the expansion it was searched with")
+                .isEqualTo(WIDENED);
+        }
+
+        @Test
         @DisplayName("forgets the query id it was computed under, and says so when replayed")
         void storageAndReplay() {
             LexicalResponse stored = lexical(LEXICAL_FULL, false, false, false).forStorage();
@@ -86,9 +110,9 @@ class CachedAnswersTest {
         @Test
         @DisplayName("gives an exact total only when retrieval ran out of candidates")
         void exactOnlyWhenExhausted() {
-            LexicalResponse exhausted = new LexicalResponse(null, TWO, true, LEXICAL_FULL,
+            LexicalResponse exhausted = new LexicalResponse(null, TWO, null, true, LEXICAL_FULL,
                 false, false, true, false, 1L, false);
-            LexicalResponse cut = new LexicalResponse(null, TWO, false, LEXICAL_FULL,
+            LexicalResponse cut = new LexicalResponse(null, TWO, null, false, LEXICAL_FULL,
                 false, false, true, false, 1L, false);
 
             assertThat(exhausted.total(10).relation()).isEqualTo(ResultTotal.EXACT);
@@ -100,7 +124,7 @@ class CachedAnswersTest {
         @Test
         @DisplayName("requires a coverage block")
         void requiresCoverage() {
-            assertThatThrownBy(() -> new LexicalResponse(null, TWO, true, null, false, false,
+            assertThatThrownBy(() -> new LexicalResponse(null, TWO, null, true, null, false, false,
                 false, false, 1L, false)).isInstanceOf(IllegalArgumentException.class);
         }
     }
@@ -116,7 +140,7 @@ class CachedAnswersTest {
             List.of(new HybridFusion.Result("a", 0.03, 1L, List.of("vector", "bm25")));
 
         private HybridResponse answer(boolean fellBack, boolean timedOut) {
-            return new HybridResponse(vector, TWO, fused, true, true, fellBack, timedOut);
+            return new HybridResponse(vector, TWO, null, fused, true, true, fellBack, timedOut);
         }
 
         @Test
@@ -136,6 +160,19 @@ class CachedAnswersTest {
         }
 
         @Test
+        @DisplayName("is degraded, and not replayed, when its BM25 half's expansion fell back")
+        void degradedWhenTheExpansionFellBack() {
+            HybridResponse unwidened = new HybridResponse(vector, TWO, FELL_BACK, fused, true,
+                true, false, false);
+
+            assertThat(unwidened.coverage().degraded()).isTrue();
+            assertThat(unwidened.cacheable()).isFalse();
+            assertThat(unwidened.timedOut()).isFalse();
+            assertThat(new HybridResponse(vector, TWO, WIDENED, fused, true, true, false, false)
+                .cacheable()).isTrue();
+        }
+
+        @Test
         @DisplayName("reports a timeout, and is not replayed, when scoring ran out of time")
         void timedOutWhenScoringWasTooSlow() {
             HybridResponse slow = answer(false, true);
@@ -151,7 +188,7 @@ class CachedAnswersTest {
         void notCacheableOverADegradedVectorSearch() {
             QueryResponse partial = vector.withCoverage(VECTOR_FULL.orDegraded(true));
 
-            assertThat(new HybridResponse(partial, TWO, fused, true, false, false, false)
+            assertThat(new HybridResponse(partial, TWO, null, fused, true, false, false, false)
                 .cacheable()).isFalse();
         }
 
@@ -174,7 +211,7 @@ class CachedAnswersTest {
         @Test
         @DisplayName("an unscored fusion shorter than asked for is an exact total")
         void unscoredShortFusionIsExact() {
-            HybridResponse unscored = HybridResponse.unscored(vector, TWO, fused, 10);
+            HybridResponse unscored = HybridResponse.unscored(vector, TWO, null, fused, 10);
 
             assertThat(unscored.total(10).relation()).isEqualTo(ResultTotal.EXACT);
             assertThat(unscored.llmScored()).isFalse();

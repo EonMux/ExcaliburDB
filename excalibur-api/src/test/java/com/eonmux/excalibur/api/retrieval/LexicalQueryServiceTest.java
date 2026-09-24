@@ -1,6 +1,8 @@
 package com.eonmux.excalibur.api.retrieval;
 
+import com.eonmux.excalibur.core.text.SourceScope;
 import com.eonmux.excalibur.ingest.lexical.ChunkLexicalIndex;
+import com.eonmux.excalibur.retrieval.expand.Expansion;
 import com.eonmux.excalibur.retrieval.expand.QueryExpander;
 import com.eonmux.excalibur.retrieval.expand.SearchFormulation;
 
@@ -10,6 +12,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -98,6 +102,38 @@ class LexicalQueryServiceTest {
             }
         }
 
+        /**
+         * The query route hands the vector half and this search one epoch. A chunk published
+         * after it is not part of that corpus, however far the epoch has moved by the time the
+         * search runs, and the fingerprint at that epoch describes what the search read.
+         */
+        @Test
+        @DisplayName("a search at a fixed epoch reads that epoch's corpus and version")
+        void aFixedEpochIsRead(@TempDir Path dir) throws Exception {
+            java.util.concurrent.atomic.AtomicLong epoch =
+                new java.util.concurrent.atomic.AtomicLong(1);
+            try (com.eonmux.excalibur.ingest.lexical.NativeChunkIndex index =
+                     nativeIndexed(dir, epoch)) {
+                LexicalQueryService service = new LexicalQueryService(index, null, List.of());
+                long pinned = epoch.get();
+                java.util.OptionalLong version = service.searchVersion(pinned);
+
+                index.add("kb:tls2.txt:chunk:0", "a second certificate chain was verified");
+                index.refresh();
+                epoch.incrementAndGet();
+
+                List<LexicalQueryService.Hit> atPinned = service.retrieve(
+                    "certificate chain verified", 5, SourceScope.ALL, Duration.ofSeconds(1),
+                    pinned).hits();
+
+                assertThat(atPinned).extracting(LexicalQueryService.Hit::chunkId)
+                    .containsExactly("kb:tls.txt:chunk:0");
+                assertThat(service.search("certificate chain verified", 5)).hasSize(2);
+                assertThat(service.searchVersion(pinned)).isEqualTo(version);
+                assertThat(service.searchVersion()).isNotEqualTo(version);
+            }
+        }
+
         @Test
         @DisplayName("a query for words the corpus lacks returns nothing, not something")
         void absentWordsFindNothing(@TempDir Path dir) throws Exception {
@@ -145,9 +181,9 @@ class LexicalQueryServiceTest {
         void expansionAddsRecall(@TempDir Path dir) throws Exception {
             try (ChunkLexicalIndex index = indexed(dir)) {
                 // The query shares no terms with the document; the expansion does.
-                QueryExpander expander = query -> List.of(
+                QueryExpander expander = QueryExpander.infallible(query -> List.of(
                     SearchFormulation.original(query),
-                    new SearchFormulation("OOM killer SIGKILL", 0.9));
+                    new SearchFormulation("OOM killer SIGKILL", 0.9)));
 
                 List<LexicalQueryService.Hit> plain =
                     new LexicalQueryService(index, null, List.of())
@@ -181,6 +217,47 @@ class LexicalQueryServiceTest {
             try (ChunkLexicalIndex index = indexed(dir)) {
                 assertThat(new LexicalQueryService(index, null, List.of()).indexedChunks())
                     .isEqualTo(3);
+            }
+        }
+
+        @Test
+        @DisplayName("the expansion is given half of the search's budget, and none once it is spent")
+        void theExpansionGetsHalfTheBudget(@TempDir Path dir) throws Exception {
+            List<Duration> budgets = new ArrayList<>();
+            QueryExpander expander = (query, budget) -> {
+                budgets.add(budget);
+                return Expansion.of(List.of(SearchFormulation.original(query)));
+            };
+            try (ChunkLexicalIndex index = indexed(dir)) {
+                LexicalQueryService service = new LexicalQueryService(index, expander, List.of());
+
+                service.retrieve("certificate chain", 3, SourceScope.ALL, Duration.ofSeconds(4));
+                service.retrieve("certificate chain", 3, SourceScope.ALL, Duration.ofMillis(-5));
+
+                assertThat(budgets).containsExactly(Duration.ofSeconds(2), Duration.ZERO);
+            }
+        }
+
+        @Test
+        @DisplayName("a ranking carries the expansion it was searched with")
+        void aRankingCarriesItsExpansion(@TempDir Path dir) throws Exception {
+            try (ChunkLexicalIndex index = indexed(dir)) {
+                Expansion fellBack = new LexicalQueryService(index,
+                    (query, budget) -> Expansion.fellBack(query), List.of())
+                    .retrieve("OOM killer", 3, SourceScope.ALL, Duration.ofSeconds(1))
+                    .expansion();
+                LexicalQueryService.Ranking unwidened = new LexicalQueryService(index, null,
+                    List.of()).retrieve("OOM killer", 3, SourceScope.ALL, Duration.ofSeconds(1));
+
+                assertThat(fellBack.fellBack()).isTrue();
+                assertThat(fellBack.formulations())
+                    .containsExactly(SearchFormulation.original("OOM killer"));
+                assertThat(unwidened.hits()).as("the query as typed is still searched")
+                    .isNotEmpty();
+                assertThat(unwidened.expansion())
+                    .as("a service with no expander cannot say what one would have done")
+                    .isNull();
+                assertThat(unwidened.expansionFellBack()).isFalse();
             }
         }
     }

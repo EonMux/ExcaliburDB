@@ -2,6 +2,7 @@ package com.eonmux.excalibur.api.embedded;
 
 import com.eonmux.excalibur.api.bootstrap.ApiConfigKeys;
 import com.eonmux.excalibur.api.bootstrap.NodeAssembly;
+import com.eonmux.excalibur.api.endpoint.SourceIds;
 import com.eonmux.excalibur.api.retrieval.VisibleChunkText;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.server.InProcessServices;
@@ -259,8 +260,10 @@ public final class ExcaliburEmbedded implements AutoCloseable {
      * @param sourceIds The sources to answer from; at least one
      * @return The hits, best first, and the route that produced them
      * @throws IllegalArgumentException if the text is blank, a bound is violated, or sourceIds
-     *                                  is empty, names a blank id or names more than
-     *                                  {@link SourceScope#MAX_SOURCES}
+     *                                  is refused as {@code source_ids} is on the route: empty,
+     *                                  naming more than {@link SourceScope#MAX_SOURCES}, or
+     *                                  naming an id that is null, blank or longer than
+     *                                  {@link Source#MAX_ID_LENGTH}
      * @throws IllegalStateException    if the node is closed, has no signal to search, or every
      *                                  signal it has failed
      * @throws InterruptedException     if the calling thread is interrupted while it waits
@@ -269,7 +272,8 @@ public final class ExcaliburEmbedded implements AutoCloseable {
                               Collection<String> sourceIds) throws InterruptedException {
         requireOpen();
         Objects.requireNonNull(timeout, "timeout cannot be null");
-        return retrieval.search(text, topK, timeout.toMillis(), SourceScope.of(sourceIds));
+        return retrieval.search(text, topK, timeout.toMillis(),
+            SourceIds.scope(sourceIds, "sourceIds"));
     }
 
     /**

@@ -261,6 +261,54 @@ class ChunkLexicalIndexTest {
     }
 
     @Nested
+    @DisplayName("Views")
+    class Views {
+
+        /**
+         * Lucene publishes at a refresh rather than at an epoch, so the reader a view holds is
+         * what keeps every ranking of one search on one published state.
+         */
+        @Test
+        @DisplayName("a view keeps reading the reader it was opened on across a refresh")
+        void aViewHoldsItsReader(@TempDir Path dir) throws Exception {
+            try (ChunkLexicalIndex index = open(dir)) {
+                index.add("kb:a.txt:chunk:0", "the TLS handshake failed");
+                index.refresh();
+                java.util.OptionalLong before = index.searchVersion();
+
+                try (ChunkIndex.View view = index.view(42)) {
+                    index.add("kb:b.txt:chunk:0", "the handshake timed out");
+                    index.refresh();
+
+                    assertThat(view.ranker(QueryExpander.identity(), null)
+                        .rank(RetrievalQuery.ofText("handshake"), 10).documents())
+                        .as("the chunk published by the later refresh is not in the view")
+                        .hasSize(1);
+                    assertThat(hits(index, "handshake")).isEqualTo(2);
+                }
+
+                assertThat(index.searchVersion(42))
+                    .as("no epoch to read at: the version a search started now reads")
+                    .isEqualTo(index.searchVersion())
+                    .isNotEqualTo(before);
+            }
+        }
+
+        @Test
+        @DisplayName("a view of an index never refreshed finds nothing")
+        void aViewOfAnUnrefreshedIndex(@TempDir Path dir) throws Exception {
+            try (ChunkLexicalIndex index = open(dir)) {
+                index.add("kb:a.txt:chunk:0", "the TLS handshake failed");
+
+                try (ChunkIndex.View view = index.view()) {
+                    assertThat(view.ranker(QueryExpander.identity(), null)
+                        .rank(RetrievalQuery.ofText("handshake"), 10).documents()).isEmpty();
+                }
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("Identifier collisions")
     class Collisions {
 

@@ -254,6 +254,71 @@ public interface ChunkIndex extends AutoCloseable {
      */
     Ranker ranker(QueryExpander expander, java.util.function.Predicate<String> admits);
 
+    /**
+     * One search's fixed view of this index.
+     *
+     * <p>A search can rank more than once - deeper, past hits it withholds - and it is fused with
+     * the vector half of a hybrid answer and stored under a fingerprint taken before it ran. All
+     * of that describes one answer only if every ranking reads the same published state: an
+     * epoch crossing a publication between two rankings would fill the deeper page from a corpus
+     * the first page was not ranked against. The view is what holds that state still.</p>
+     *
+     * <p>Close it when the search is done; what it holds - a Lucene reader, for one - is
+     * released then.</p>
+     */
+    interface View extends AutoCloseable {
+
+        /**
+         * This view's retrieval signal over the chunks a filter admits.
+         *
+         * @param expander The expander doing the semantic work
+         * @param admits   Whether a chunk, by its id, may be returned; null admits every chunk
+         * @return A ranker reading only the state this view holds
+         */
+        Ranker ranker(QueryExpander expander, java.util.function.Predicate<String> admits);
+
+        @Override
+        void close();
+    }
+
+    /**
+     * A view of the state a search started now would read.
+     *
+     * <p>By default a view of the live index, for an implementation that holds no state a search
+     * could read inconsistently.</p>
+     *
+     * @return The view; close it when the search is done
+     */
+    default View view() {
+        return new View() {
+            @Override
+            public Ranker ranker(QueryExpander expander,
+                                 java.util.function.Predicate<String> admits) {
+                return ChunkIndex.this.ranker(expander, admits);
+            }
+
+            @Override
+            public void close() {
+                // Holds nothing.
+            }
+        };
+    }
+
+    /**
+     * A view of the state a search reading at a visibility epoch reads.
+     *
+     * <p>For a search that has to read the same moment of the corpus as something else - the
+     * vector half of a hybrid answer, the fingerprint its cache entry is stored under. An index
+     * whose publications are not tied to epochs has no state at an epoch to offer, and gives
+     * {@link #view()}: the reader it holds for the whole search is its equivalent.</p>
+     *
+     * @param epoch The visibility epoch the search reads at
+     * @return The view; close it when the search is done
+     */
+    default View view(long epoch) {
+        return view();
+    }
+
     /** Which engine backs this index, for startup logging and diagnostics. */
     String engine();
 
@@ -282,6 +347,21 @@ public interface ChunkIndex extends AutoCloseable {
      */
     default OptionalLong searchVersion() {
         return OptionalLong.empty();
+    }
+
+    /**
+     * Which published state of the index a search reading at a visibility epoch would read.
+     *
+     * <p>As {@link #searchVersion()}, for a search whose view was fixed at that epoch - see
+     * {@link #view(long)} - so the fingerprint and the search describe the same state. An index
+     * whose publications are not tied to epochs answers {@link #searchVersion()}.</p>
+     *
+     * @param epoch The visibility epoch the search reads at
+     * @return A value that changes whenever such a search's answer can, or empty when this index
+     *         cannot tell
+     */
+    default OptionalLong searchVersion(long epoch) {
+        return searchVersion();
     }
 
     @Override

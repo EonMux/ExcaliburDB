@@ -415,12 +415,17 @@ public final class NativeChunkIndex implements ChunkIndex {
         }
     }
 
-    /** Searches the published corpus at the current epoch. */
-    List<LexicalStore.Hit> search(String[] terms, double[] weights, int limit,
+    /** The visibility epoch a search started now reads at. */
+    long currentEpoch() {
+        return epochs.getAsLong();
+    }
+
+    /** Searches the corpus published as of {@code epoch}. */
+    List<LexicalStore.Hit> search(String[] terms, double[] weights, int limit, long epoch,
                                   java.util.function.Predicate<String> admits) throws IOException {
         lock.readLock().lock();
         try {
-            return store.search(terms, weights, limit, epochs.getAsLong(), admits);
+            return store.search(terms, weights, limit, epoch, admits);
         } finally {
             lock.readLock().unlock();
         }
@@ -434,19 +439,30 @@ public final class NativeChunkIndex implements ChunkIndex {
      */
     @Override
     public java.util.OptionalLong searchVersion() {
+        return searchVersion(epochs.getAsLong());
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>A digest of the segments visible at {@code epoch}, read under the same lock a search
+     * at that epoch reads them.</p>
+     */
+    @Override
+    public java.util.OptionalLong searchVersion(long epoch) {
         lock.readLock().lock();
         try {
-            return java.util.OptionalLong.of(store.searchVersion(epochs.getAsLong()));
+            return java.util.OptionalLong.of(store.searchVersion(epoch));
         } finally {
             lock.readLock().unlock();
         }
     }
 
-    /** Whether any published segment holds this term. */
-    boolean knowsTerm(String term) throws IOException {
+    /** Whether any segment published as of {@code epoch} holds this term. */
+    boolean knowsTerm(String term, long epoch) throws IOException {
         lock.readLock().lock();
         try {
-            return store.knowsTerm(term, epochs.getAsLong());
+            return store.knowsTerm(term, epoch);
         } finally {
             lock.readLock().unlock();
         }
@@ -497,7 +513,43 @@ public final class NativeChunkIndex implements ChunkIndex {
 
     @Override
     public Ranker ranker(QueryExpander expander, java.util.function.Predicate<String> admits) {
-        return new NativeChunkRanker(this, expander, admits);
+        return new NativeChunkRanker(this, expander, admits, this::currentEpoch);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Fixed at the epoch current now.</p>
+     */
+    @Override
+    public View view() {
+        return view(epochs.getAsLong());
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Every ranking the view hands out searches, and gates its expansions against, the
+     * segments published as of {@code epoch}. A compaction keeps what a reader that far behind
+     * the current epoch can see - its floor trails the current epoch by the reader lag this index
+     * was opened with - so a search pinned at its own start reads the same postings throughout.
+     * Nothing is held, so closing it is free.</p>
+     */
+    @Override
+    public View view(long epoch) {
+        return new View() {
+            @Override
+            public Ranker ranker(QueryExpander expander,
+                                 java.util.function.Predicate<String> admits) {
+                return new NativeChunkRanker(NativeChunkIndex.this, expander, admits,
+                    () -> epoch);
+            }
+
+            @Override
+            public void close() {
+                // Holds nothing: the epoch is the whole of the view.
+            }
+        };
     }
 
     @Override

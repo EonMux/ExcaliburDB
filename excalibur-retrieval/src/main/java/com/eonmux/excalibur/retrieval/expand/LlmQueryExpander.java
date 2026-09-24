@@ -6,6 +6,7 @@ import com.eonmux.excalibur.llm.client.LLMHttpClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -35,15 +36,19 @@ import java.util.concurrent.TimeoutException;
  * outvote the words actually typed.</p>
  *
  * <h2>Failure</h2>
- * <p>Every failure returns the original query alone. A model that is down, slow, or returns
- * something unparseable costs the expansion, never the search - which is the difference between
- * this being an optimisation and being a dependency.</p>
+ * <p>Every failure returns the original query alone, marked {@link Expansion#fellBack()}. A
+ * model that is down, slow, behind an open breaker, or returns something unparseable costs the
+ * expansion, never the search - which is the difference between this being an optimisation and
+ * being a dependency. The mark is what keeps the fallback from being remembered as though the
+ * model had judged the query needed no widening.</p>
  *
  * <p>"Slow" is enforced here rather than left to the client. The client's timeout is sized for
  * ingestion, where nothing is holding a socket open, and it is spent again on each retry; one
  * call on that budget outlasts every query budget the API will accept, so the caller gets an
  * empty timed-out answer while the abandoned search keeps running behind a concurrency permit
- * that says it is free. The deadline below is the query's, and the call is abandoned on it.</p>
+ * that says it is free. The call is abandoned at the sooner of this expander's own deadline and
+ * the budget the query hands it, so an expansion that runs out leaves the query its time to be
+ * searched as typed.</p>
  *
  * <p>An interrupt is the one thing that is not degraded. It means the request this expansion
  * belongs to has been withdrawn, and returning the original query would have the search carry
@@ -96,7 +101,8 @@ public final class LlmQueryExpander implements QueryExpander {
      * local endpoint, so this is roughly twice the headroom it needs while leaving the larger
      * part of a default 30 second query budget to the retrieval the expansion is for. It is a
      * query-path deadline, not the client's own: the difference is whether somebody is waiting
-     * on the socket.</p>
+     * on the socket. A query whose own budget leaves less than this bounds the call instead -
+     * see {@link #expand}.</p>
      */
     public static final long DEFAULT_TIMEOUT_MS = 5_000L;
 
@@ -174,51 +180,69 @@ public final class LlmQueryExpander implements QueryExpander {
         return client.getCircuitBreaker();
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Waits for the model no longer than the shorter of this expander's own deadline and
+     * {@code budget}. A budget with no whole millisecond left in it is not spent on a call that
+     * cannot come back in time: the query is searched as typed, as it would be after one.</p>
+     *
+     * @throws CancellationException if the calling request was withdrawn while waiting
+     */
     @Override
-    public List<SearchFormulation> expand(String query) {
+    public Expansion expand(String query, Duration budget) {
         if (query == null || query.isBlank()) {
-            return List.of();
+            return Expansion.of(List.of());
         }
+        Objects.requireNonNull(budget, "budget must not be null");
         String trimmed = query.trim();
-        List<SearchFormulation> out = new ArrayList<>();
-        out.add(SearchFormulation.original(trimmed));
+        long waitMs = budget.compareTo(Duration.ofMillis(timeoutMs)) < 0
+            ? budget.toMillis() : timeoutMs;
+        if (waitMs < 1) {
+            LOGGER.warn("No time was left in the query's budget to expand it; this query is "
+                + "searched as plain BM25");
+            return Expansion.fellBack(trimmed);
+        }
 
-        String response = ask(trimmed);
+        String response = ask(trimmed, waitMs);
         if (response == null) {
-            return List.copyOf(out);
+            return Expansion.fellBack(trimmed);
         }
         List<SearchFormulation> parsed = parse(response, trimmed);
         if (parsed.isEmpty()) {
             LOGGER.warn("The chat model returned nothing usable for expansion; this query is "
                 + "searched as plain BM25");
-            return List.copyOf(out);
+            return Expansion.fellBack(trimmed);
         }
+        List<SearchFormulation> out = new ArrayList<>(1 + parsed.size());
+        out.add(SearchFormulation.original(trimmed));
         out.addAll(parsed);
-        return List.copyOf(out.subList(0, Math.min(out.size(), maxFormulations)));
+        return Expansion.of(out.subList(0, Math.min(out.size(), maxFormulations)));
     }
 
     /**
-     * Asks the model, abandoning the call when the query's own deadline passes.
+     * Asks the model, abandoning the call when the wait runs out.
      *
      * <p>On its own thread because the client offers no per-call deadline: its timeout belongs
      * to the configuration, is sized for ingestion, and is spent again on every retry. The
      * cancellation interrupts the HTTP call rather than leaving it running for a reply nothing
      * will read.</p>
      *
-     * @param query The query to expand
+     * @param query  The query to expand
+     * @param waitMs How long to wait for the reply, at least one millisecond
      * @return The model's reply, or null when it could not be had in time
      * @throws CancellationException if the calling request was withdrawn while waiting
      */
-    private String ask(String query) {
+    private String ask(String query, long waitMs) {
         FutureTask<String> call = new FutureTask<>(() -> client.completeWithCircuitBreaker(
             String.format(Locale.ROOT, INSTRUCTION, maxFormulations - 1), query, null));
         Thread.ofVirtual().name("query-expansion").start(call);
         try {
-            return call.get(timeoutMs, TimeUnit.MILLISECONDS);
+            return call.get(waitMs, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
             call.cancel(true);
             LOGGER.warn("The chat model did not answer inside the {}ms expansion budget; this "
-                + "query is searched as plain BM25", timeoutMs);
+                + "query is searched as plain BM25", waitMs);
         } catch (ExecutionException e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             LOGGER.debug("Query expansion unavailable, searching the query as typed: {}",

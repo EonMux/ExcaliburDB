@@ -1,6 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
-import com.eonmux.excalibur.retrieval.expand.QueryExpander;
+import com.eonmux.excalibur.retrieval.expand.Expansion;
 
 /**
  * What one request asked for beyond the search, resolved before the search runs.
@@ -21,12 +21,11 @@ import com.eonmux.excalibur.retrieval.expand.QueryExpander;
  *
  * @param options  The presentation fields, already validated
  * @param passages Reads each result's text, or null when nothing needs it
- * @param expander The expander the searching half uses, or null when this node wires none
  * @param query    The query text, as validated
  * @param topK     The page size the request asked for
  */
 public record QueryContext(QuerySearchOptions options, ResultPassages passages,
-                           QueryExpander expander, String query, int topK) {
+                           String query, int topK) {
 
     /**
      * Checks the context describes a request that can be answered.
@@ -126,10 +125,14 @@ public record QueryContext(QuerySearchOptions options, ResultPassages passages,
     /**
      * What the query was widened with, for an answer that asked to be explained.
      *
-     * @param widened Whether a signal that widens queries actually ran for this answer
+     * <p>Read from the expansion the answer carries - searched or replayed from the cache -
+     * rather than by asking the expander again; see {@link QueryExpansion}.</p>
+     *
+     * @param used The expansion the answer's lexical search used, or null when no such search
+     *             ran or it cannot say
      * @return The report, never null
      */
-    public QueryExpansion expansion(boolean widened) {
-        return QueryExpansion.of(expander, query, widened);
+    public QueryExpansion expansion(Expansion used) {
+        return QueryExpansion.of(used, query);
     }
 }
