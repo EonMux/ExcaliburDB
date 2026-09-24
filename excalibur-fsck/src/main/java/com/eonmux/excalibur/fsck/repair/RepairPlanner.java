@@ -243,7 +243,8 @@ public final class RepairPlanner {
      * @return What to weigh
      */
     private static String unrepairableAdvice(FileCheck file) {
-        if (FileClassifier.classify(file.relative()) == FileKind.HNSW_STAGED_DOCUMENT_MAP) {
+        FileKind kind = FileClassifier.classify(file.relative());
+        if (kind == FileKind.HNSW_STAGED_DOCUMENT_MAP) {
             return file.relative() + " is damaged: " + file.detail() + ". It is not moved "
                 + "aside automatically, and it must not be: the graph beside it already holds "
                 + "the compacted numbering, and without this file the node would serve that "
@@ -252,13 +253,24 @@ public final class RepairPlanner {
                 + "mappings together from a backup, or rebuild the segment's vector index by "
                 + "reindexing it";
         }
-        if (FileClassifier.classify(file.relative()) == FileKind.GRAPH_STAGING_LOG) {
+        if (kind == FileKind.GRAPH_STAGING_LOG) {
             return stagingLogAdvice(file);
         }
-        if (FileClassifier.classify(file.relative()) == FileKind.LEXICAL_STORE_PART) {
+        if (kind == FileKind.LEXICAL_STORE_PART || kind == FileKind.LUCENE_CHUNK_ERASURE_LOG) {
             return lexicalSidecarAdvice(file);
         }
-        if (FileClassifier.classify(file.relative()) == FileKind.WRITE_AHEAD_LOG) {
+        if (FileClassifier.LUCENE_CHUNK_DIRECTORY.equals(file.relative())) {
+            return file.relative() + " is damaged: " + file.detail() + ". It is not moved aside "
+                + "automatically: the index may still hold text an accepted erasure has not yet "
+                + "reclaimed, and a quarantined copy would keep it past the point the erasure "
+                + "promised it gone. The node will not open an index whose commit fails its "
+                + "checksums. The index is derived from the chunk text in storage, which an "
+                + "erasure empties first: with the node stopped, delete the whole "
+                + FileClassifier.LUCENE_CHUNK_DIRECTORY + " directory - its erasure log with it, "
+                + "since every promise in the log is about text in this index - and rebuild the "
+                + "keyword index by reindexing, or restore the directory whole from a backup";
+        }
+        if (kind == FileKind.WRITE_AHEAD_LOG) {
             return file.relative() + " is damaged in a way no repair here can act on: "
                 + file.detail() + ". It is not moved aside automatically, and it must not be: "
                 + "the sound records behind the damage were fsynced and acknowledged before "

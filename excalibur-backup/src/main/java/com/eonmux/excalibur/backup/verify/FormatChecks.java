@@ -13,6 +13,7 @@ import com.eonmux.excalibur.fsck.check.FindingSeverity;
 import com.eonmux.excalibur.fsck.check.GraphStoreCheck;
 import com.eonmux.excalibur.fsck.check.LexicalStoreCheck;
 import com.eonmux.excalibur.fsck.check.LshTableCheck;
+import com.eonmux.excalibur.fsck.check.LuceneChunkIndexCheck;
 import com.eonmux.excalibur.store.Segment;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.SegmentIntegrityReport;
@@ -55,7 +56,9 @@ import java.util.Optional;
  * require; the in-flight ingest journal, whose every line carries its own checksum; the graph staging logs; the
  * native lexical store, which is checked as a whole by {@link #withLexicalStore} because its
  * manifest - verified against the checksum on its end line - the segments it names, the key
- * table and tombstones beside each, and its erasure log are one structure; and each tenant's
+ * table and tombstones beside each, and its erasure log are one structure; the Lucene chunk
+ * index, checked as a whole from its commit point by {@link #withLuceneChunkIndex}, and the
+ * erasure log beside it, line by line; and each tenant's
  * built graph, checked as a whole by {@link #withGraphStores} because its descriptor and
  * dictionaries record what every other file of it must hold, and because what a directory
  * beside it is depends on its neighbours. The same dispatch is what {@code excalibur-fsck}
@@ -167,6 +170,40 @@ public final class FormatChecks {
         }
         inspection.verdicts().forEach(verdict -> folded.add(fromFsck(verdict)));
         inspection.findings().forEach(finding -> folded.add(fromFinding(finding)));
+        return List.copyOf(folded);
+    }
+
+    /**
+     * Replaces the per-file verdicts on the Lucene chunk index's files with the verdict on the
+     * index as a whole.
+     *
+     * <p>Every file under {@code lucene-chunks} but the erasure log is, taken alone, a part of an
+     * index with nothing to prove. The index is verified from its commit point, with the footer
+     * of every file every segment is made of checked against the checksum in it, and that
+     * verdict speaks for all of them. The erasure log keeps its own verdict, reached line by line
+     * by the parser the index opens it with.</p>
+     *
+     * @param payloadRoot The payload root
+     * @param checks      The per-file verdicts on the image
+     * @return The same verdicts with the index's folded in, unchanged if the image holds none
+     * @throws NullPointerException if either argument is null
+     */
+    public static List<ContentCheck> withLuceneChunkIndex(Path payloadRoot,
+                                                          List<ContentCheck> checks) {
+        Objects.requireNonNull(payloadRoot, "payloadRoot");
+        Objects.requireNonNull(checks, "checks");
+        Optional<LuceneChunkIndexCheck.LuceneChunkInspection> index =
+            FileInspector.luceneChunkIndex(payloadRoot);
+        if (index.isEmpty()) {
+            return List.copyOf(checks);
+        }
+        List<ContentCheck> folded = new ArrayList<>(checks.size());
+        for (ContentCheck check : checks) {
+            if (!index.get().covers(check.path())) {
+                folded.add(check);
+            }
+        }
+        folded.add(fromFsck(index.get().index()));
         return List.copyOf(folded);
     }
 

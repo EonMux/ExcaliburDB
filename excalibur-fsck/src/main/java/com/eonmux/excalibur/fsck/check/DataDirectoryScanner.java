@@ -18,7 +18,7 @@ import java.util.Objects;
  *
  * <p>Which checker a file belongs to is decided by {@link FileInspector}, the same dispatch
  * {@code excalibur-backup verify --deep} uses, so this class owns only what is true of a
- * directory rather than of a file: the walk, the lexical store as a whole, and the checks
+ * directory rather than of a file: the walk, the lexical indexes as a whole, and the checks
  * made between files.</p>
  *
  * <p>Enumerates rather than expects. A node's directory holds whatever the builds that ran
@@ -85,6 +85,7 @@ public final class DataDirectoryScanner {
             }
         }
         addLexicalStore(files, findings);
+        addLuceneChunkIndex(files);
         addGraphStores(files);
         files.sort(Comparator.comparing(FileCheck::relative));
         findings.addAll(new CrossFileChecks(dataDirectory).run(files, catalogRows, routingSlots));
@@ -105,6 +106,18 @@ public final class DataDirectoryScanner {
             files.removeIf(file -> inspection.covers(file.relative()));
             files.addAll(inspection.verdicts());
             findings.addAll(inspection.findings());
+        });
+    }
+
+    /**
+     * Checks the Lucene chunk index, if the directory has one.
+     *
+     * @param files Where the index's verdict replaces the per-file ones it covers
+     */
+    private void addLuceneChunkIndex(List<FileCheck> files) {
+        FileInspector.luceneChunkIndex(dataDirectory).ifPresent(inspection -> {
+            files.removeIf(file -> inspection.covers(file.relative()));
+            files.add(inspection.index());
         });
     }
 

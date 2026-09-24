@@ -52,7 +52,7 @@ class DataDirectoryInventoryTest {
         "shared/graph.building/rel_fwd.csr,    REBUILDABLE",
         "shared/graph.compacting/valid_to.col, REBUILDABLE",
         "shared/graph.building/edgestore.meta.tmp, TRANSIENT",
-        "segment_0.pqcb,                       REBUILDABLE",
+        "segment_0.hnsw.pqcb,                  REBUILDABLE",
         "segment_0.tfs,                        OBSOLETE",
         "segment_12.tfs,                       OBSOLETE",
         "segment_0.tfs.0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11.tmp, OBSOLETE",
@@ -62,14 +62,18 @@ class DataDirectoryInventoryTest {
         "source-status.tmp,                    TRANSIENT",
         "erasure-receipts.tmp,                 TRANSIENT",
         "segment_0.dat.compact,                TRANSIENT",
-        "segment_0.wal.old,                    TRANSIENT",
+        "segment_0.wal.old,                    AUTHORITATIVE",
         "segment_0.dat.left,                   TRANSIENT",
         "segment_0.dat.right,                  TRANSIENT",
-        "segment_0.pqcb.tmp,                   TRANSIENT",
+        "segment_0.hnsw.pqcb.tmp,              TRANSIENT",
         "chunk-index/.compact-seg-0,           TRANSIENT",
         "chunk-index/seg-0.tomb.tmp,           TRANSIENT",
         "shared/graph-staging/triples.log.erasing, TRANSIENT",
-        "shared/graph/edges.csr.building,      TRANSIENT",
+        "shared/graph/edges.csr.building,      REBUILDABLE",
+        "document-registry.3.new,              TRANSIENT",
+        "shared/graph-staging/asserted.last-id.writing, TRANSIENT",
+        "lucene-chunks/_0.cfs,                 REBUILDABLE",
+        "lucene-chunks/erasure.log,            REBUILDABLE",
         "java_pid4242.hprof,                   DIAGNOSTIC",
         "oom.hprof,                            DIAGNOSTIC",
         "chunk-index/java_pid7.hprof,          DIAGNOSTIC",
@@ -86,6 +90,27 @@ class DataDirectoryInventoryTest {
     void unknownFilesAreKept() {
         assertThat(DataDirectoryInventory.classify("something-a-future-build-writes"))
             .isEqualTo(Inclusion.AUTHORITATIVE);
+    }
+
+    @Test
+    @DisplayName("a lexical index's erasure log is left out only with the index it is about")
+    void anErasureLogTravelsWithItsIndex() {
+        for (String directory : new String[] {"chunk-index", "lucene-chunks"}) {
+            Inclusion log = DataDirectoryInventory.classify(directory + "/erasure.log");
+
+            assertThat(log).as(directory).isEqualTo(Inclusion.REBUILDABLE);
+            assertThat(log).as(directory)
+                .isEqualTo(DataDirectoryInventory.classify(directory + "/segments_1"));
+            assertThat(DataDirectoryInventory.reason(directory + "/erasure.log")).as(directory)
+                .contains("never without it", "an erasure empties first");
+        }
+    }
+
+    @Test
+    @DisplayName("an unrecognised file's reason says it is kept because it is unrecognised")
+    void anUnrecognisedFileSaysSo() {
+        assertThat(DataDirectoryInventory.reason("something-a-future-build-writes"))
+            .contains("recognises");
     }
 
     @Test

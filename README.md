@@ -537,6 +537,16 @@ graph staging log's unfinished rewrite (`triples.log.erasing`, `triples.log.rewr
 `entity_text.log.rewriting`, `entities.labels.rewriting`, `relations.labels.rewriting`), which the
 node deletes when it opens the namespace; it is reported as a staging leftover and left alone.
 
+A node on the Lucene lexical engine (`excalibur.ingest.lexical-engine=lucene`) keeps its keyword
+index in `lucene-chunks/` instead of `chunk-index/`, and that directory is checked too. The index
+is checked as one structure, from its commit point, with every file of every segment weighed
+against the checksum in its footer: one verdict, reported under `lucene-chunks`, speaks for every
+file in it. `CORRUPT` there is damage, since the node will not open a commit that fails its
+checksums. A directory holding only Lucene's `write.lock` is one a node created and never
+committed, and has no index to judge. The index's `erasure.log` is the native store's format,
+written by the same code, and is verified line by line by the parser the index opens it with;
+damage to it is damage, since the index does not open until the log reads cleanly.
+
 Repair is off by default: without `--repair` the plan is printed and nothing is touched. With it,
 the tool writes, and each write is stated before it is made. **No repair ever deletes anything.**
 A damaged file, an index whose segment is gone, or a staged file a rename never published is moved
@@ -548,15 +558,18 @@ opcode cleared, the same one-byte write the log itself makes when an append fail
 the log reads as ending before it. What it will not attempt matters as much as what it will: a
 damaged `catalog.dat`, a damaged `routing.dir`, a routing slot pointing at a missing segment, a
 write-ahead log damaged in the middle, a damaged lexical store `manifest`, damaged lexical key
-tables, tombstones or `erasure.log`, or a damaged graph staging log are all reported under *needs
-an operator* and left alone — a tombstone file or erasure log moved out of the way reads as nothing
+tables, tombstones or `erasure.log`, a damaged Lucene chunk index or its `erasure.log`, or a damaged
+graph staging log are all reported under *needs an operator* and left alone — a tombstone file or erasure log moved out of the way reads as nothing
 ever having been erased. Which hash slot belongs to which segment after a split is not
 recoverable from file names — that is why the directory is written down — and the records behind
 damage in a log were fsynced and acknowledged, so trimming past them would destroy committed
 writes. A log damaged in the middle is not moved aside either, for the same reason: setting the
 file aside sets those records aside with it, and unlike an index, nothing rebuilds a log. Nor is a
 lexical manifest: a store without one opens as a new, empty index and deletes every segment the
-empty manifest does not name. Nor is a staging log: nothing rebuilds one and the node opens a
+empty manifest does not name. Nor is the Lucene chunk index: it may still hold text an accepted
+erasure has not yet reclaimed, and a quarantined copy would keep that text; the plan says to delete
+`lucene-chunks/` whole, its erasure log with it, and reindex, or to restore it from a backup. Nor is
+a staging log: nothing rebuilds one and the node opens a
 missing one as empty, so moved aside, a label interner would hand its ids out again under the
 published graph, the triple log would empty the next build, and the erasure and withdrawal logs
 would forget what is still owed. A damaged lexical segment, by contrast, is moved aside like any
@@ -625,6 +638,7 @@ already there when it was copied verifies faithfully:
 | the in-flight journal | `excalibur-fsck`, read-only | every line against the CRC32C it ends with. A complete line that fails its checksum fails the image, since the node refuses to start on it; a last line cut short is an append that never finished, and does not. A version 1 journal carries no checksum and is reported unproven |
 | `routing.dir` | `excalibur-fsck`, read-only | a CRC32C over the whole file. One an older build wrote carries none and is well-formed at best, until the node next writes the directory |
 | a lexical store file beside no segment the manifest names | `excalibur-fsck`, read-only | nothing — nothing names it, so it is well-formed at best |
+| the Lucene chunk index (`lucene-chunks/`) | `excalibur-fsck`, read-only, as one structure | every file of every segment the commit point names against the checksum in its footer, reported as one verdict on the directory; and every line of its `erasure.log` against its own CRC32C, by the parser the index opens it with. Damage to either fails the image |
 
 The engine's own checkers run on a scratch copy because several of them repair what they open;
 `excalibur-fsck`'s are the ones it surveys a live directory with, so the two tools cannot disagree
@@ -682,9 +696,13 @@ is no online-backup mode, and a half-barrier that stopped the background workers
 path kept accepting writes would be worse than none: it would look like a consistent image and
 not be one.
 
-`--exclude-derived` leaves out what something will rebuild — the lexical chunk index, a tenant's
-built edge store and the quantiser codebooks. The HNSW graphs and their document
-mappings are never left out, derived though they are, because **nothing rebuilds them**: deleting a
+`--exclude-derived` leaves out what something will rebuild — the lexical chunk index
+(`chunk-index/`, or `lucene-chunks/` under the Lucene engine), a tenant's built edge store and the
+quantiser codebooks. A lexical index's `erasure.log` is left out with the index and never without
+it: every promise in it is about text in that index, an erasure empties storage before it records
+the promise, so the reindex that rebuilds the index reads nothing the log would have removed — and
+an image holding the index without its log would restore text an accepted erasure promised gone.
+The HNSW graphs and their document mappings are never left out, derived though they are, because **nothing rebuilds them**: deleting a
 `.hnsw` gives an empty graph attached to a populated segment, not a repopulated one. That includes
 a `segment_<N>.hnsw.compact.docmap` an interrupted compaction staged — alone, it is the only mapping
 that matches a graph whose swap already completed. The write-ahead logs are
@@ -692,12 +710,20 @@ never left out either — a segment's data file is forced only on flush, every l
 fsynced before it is acknowledged, and the graph integration cursor points into the log.
 
 Three things are never copied, whatever the flags, and each is reported under `omitted` with the
-reason: staged names a crash left behind (`TRANSIENT`), which nothing reads; JVM heap dumps
-(`*.hprof`, `DIAGNOSTIC`), which are a record of a process rather than state and roughly the size
-of its heap; and the term sketches an earlier build kept beside its segments (`segment_<N>.tfs`,
+reason: staged names a crash left behind (`TRANSIENT`) — a `.tmp`, a compaction's `.compact` or
+`.compact-*`, a split's `segment_<N>.dat.left` and `.right`, the document registry's
+`document-registry.<N>.new`, a staging log's `.rewriting` or `.erasing`, the fact id floor's
+`asserted.last-id.writing`, a graph build's `.body` and `.assembled` — which nothing reads; JVM
+heap dumps (`*.hprof`, `DIAGNOSTIC`), which are a record of a process rather than state and roughly
+the size of its heap; and the term sketches an earlier build kept beside its segments (`segment_<N>.tfs`,
 `OBSOLETE`), which nothing in this build reads and the node deletes when it starts. An image an
 earlier build took may name those sketches: a restore verifies them with the rest of the image,
 since the manifest certifies their bytes, and then leaves them out of the restored directory.
+What a file is comes from the same classification `excalibur-fsck` surveys a directory with, so the
+two tools cannot disagree about it: what a snapshot leaves out as scratch is exactly what
+`excalibur-fsck` reports as a staging leftover, apart from a compaction's staged
+`segment_<N>.hnsw.compact`, which is copied with the staged mapping whose meaning it decides. A file
+neither recognises is kept.
 
 `excalibur-backup <command> --help` (or `-h`) prints that command's options and the exit codes, and
 exits `0` without touching anything; `excalibur-backup --help` prints all three.

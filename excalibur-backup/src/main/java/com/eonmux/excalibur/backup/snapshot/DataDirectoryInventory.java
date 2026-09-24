@@ -3,7 +3,9 @@ package com.eonmux.excalibur.backup.snapshot;
 import com.eonmux.excalibur.core.datadir.DataDirectoryContents;
 import com.eonmux.excalibur.core.datadir.FilesystemEntries;
 import com.eonmux.excalibur.core.datadir.ReservedNames;
-import com.eonmux.excalibur.store.ObsoleteSidecars;
+import com.eonmux.excalibur.fsck.check.FileClassifier;
+import com.eonmux.excalibur.fsck.check.FileKind;
+import com.eonmux.excalibur.retrieval.lexical.native_.DocumentErasureLog;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -22,7 +24,9 @@ import java.util.Objects;
  * {@code source-status}, how each source's last crawl ended, which exists nowhere else and so is
  * kept like the catalog beside it; {@code erasure-receipts}, what each document erasure asked
  * for and which graph requests it queued, so that where it stands can still be answered after a
- * restore; {@code chunk-index/}; and a directory per tenant namespace
+ * restore; the lexical index, {@code chunk-index/} or, under the Lucene engine,
+ * {@code lucene-chunks/}, either with the erasure log it still owes; and a directory per tenant
+ * namespace
  * holding {@code graph-staging/} and, once a build has run, {@code graph/}. A directory an
  * earlier build wrote may also hold {@code segment_N.tfs}, a term sketch this build has no use
  * for; it is {@link Inclusion#OBSOLETE} and never copied.</p>
@@ -47,36 +51,6 @@ import java.util.Objects;
  * @author ExcaliburDB
  */
 public final class DataDirectoryInventory {
-
-    /** Names a staged write takes while it is not yet published. */
-    private static final List<String> TRANSIENT_SUFFIXES = List.of(
-        ".tmp", ".staging", ".old", ".compact", ".left", ".right", ".building", ".previous",
-        ".body", ".assembled", ".erasing", ".rewriting");
-
-    /** The suffix the JVM gives a heap dump, whatever else the dump is called. */
-    private static final String HEAP_DUMP_SUFFIX = ".hprof";
-
-    /** Scratch directories the lexical store builds a compaction into. */
-    private static final String SCRATCH_PREFIX = ".compact-";
-
-    /** The derived lexical index, rebuildable by a reindex. */
-    private static final String LEXICAL_DIRECTORY = "chunk-index";
-
-    /** A tenant's built edge store, rebuildable from that tenant's staging logs. */
-    private static final String BUILT_GRAPH_DIRECTORY = "graph";
-
-    /**
-     * What begins the name of each directory a publish, a build or an erasure compaction leaves
-     * beside a tenant's built graph: {@code graph.previous}, {@code graph.retired},
-     * {@code graph.building} and {@code graph.compacting}.
-     */
-    private static final String BUILT_GRAPH_SIBLING_PREFIX = BUILT_GRAPH_DIRECTORY + ".";
-
-    /** The quantiser codebook sidecar, rebuildable by retraining. */
-    private static final String CODEBOOK_SUFFIX = ".pqcb";
-
-    /** The mapping an HNSW compaction stages in the compacted numbering. */
-    private static final String STAGED_MAPPING_SUFFIX = ".hnsw.compact.docmap";
 
     private DataDirectoryInventory() {
     }
@@ -104,38 +78,48 @@ public final class DataDirectoryInventory {
     /**
      * Decides what one relative path is.
      *
-     * <p>The order of the tests is load-bearing. A heap dump is recognised first, wherever
-     * it sits and whatever precedes its suffix, because the JVM names it and nothing about
-     * the directory it landed in makes it that directory's state. An obsolete file is
-     * recognised next, before the staged-name test its staging name would otherwise match,
-     * so that it is reported as what it is. An HNSW file is recognised before the
-     * staged-name test, because a graph staged by an interrupted compaction ends in
-     * {@code .compact} and is part of the recovery record rather than scratch; and scratch
-     * is recognised before the lexical directory, because the lexical store stages its
-     * compactions inside it.</p>
+     * <p>Not decided here. What a file is comes from {@code excalibur-fsck}'s
+     * {@link FileClassifier}, the classification that tool surveys a live directory with and
+     * that {@code verify --deep} dispatches an image's files by; this only says what a snapshot
+     * does with each kind. A second set of name rules would drift from the first, and the two
+     * tools would then disagree about a file - one calling scratch what the other copies and
+     * restores, or one keeping as state what the other reports as a leftover.</p>
      *
      * @param relativePath Path relative to the data directory, forward-slashed
      * @return What the file is
-     * @throws NullPointerException if relativePath is null
+     * @throws IllegalArgumentException if the path is the data directory's lock, which describes a
+     *                                  process rather than the store and is never inventoried
+     * @throws NullPointerException     if relativePath is null
      */
     public static Inclusion classify(String relativePath) {
         Objects.requireNonNull(relativePath, "relativePath");
-        if (relativePath.endsWith(HEAP_DUMP_SUFFIX)) {
-            return Inclusion.DIAGNOSTIC;
-        }
-        if (ObsoleteSidecars.isObsolete(nameOf(relativePath))) {
-            return Inclusion.OBSOLETE;
-        }
-        if (isVectorIndex(relativePath)) {
-            return Inclusion.REQUIRED_DERIVED;
-        }
-        if (isStagedName(relativePath)) {
-            return Inclusion.TRANSIENT;
-        }
-        if (isRebuildable(relativePath)) {
-            return Inclusion.REBUILDABLE;
-        }
-        return Inclusion.AUTHORITATIVE;
+        FileKind kind = FileClassifier.classify(relativePath);
+        return switch (kind) {
+            case CATALOG, ROUTING_DIRECTORY, SEGMENT_DATA, WRITE_AHEAD_LOG, LSH_TABLE,
+                 DOCUMENT_REGISTRY, IN_FLIGHT_JOURNAL, SOURCE_CATALOG, SOURCE_STATUS,
+                 ERASURE_RECEIPTS, GRAPH_STAGING_LOG, GRAPH_ERASURE_MARKER,
+                 GRAPH_UNPUBLISHED_MARKER, UNRECOGNISED -> Inclusion.AUTHORITATIVE;
+            case HNSW_GRAPH, HNSW_DOCUMENT_MAP, HNSW_STAGED_DOCUMENT_MAP ->
+                Inclusion.REQUIRED_DERIVED;
+            case PQ_CODEBOOK, LEXICAL_STORE_PART, LEXICAL_KEY_LOOKUP, LUCENE_CHUNK_INDEX_PART,
+                 LUCENE_CHUNK_ERASURE_LOG -> Inclusion.REBUILDABLE;
+            // Kept or left out with the graph it sits in, since what recovery does with a
+            // directory beside the graph depends on whether the graph is there - but a staged
+            // name inside one is scratch like any other.
+            case GRAPH_STORE_PART -> FileKind.isLeftover(nameOf(relativePath))
+                ? Inclusion.TRANSIENT : Inclusion.REBUILDABLE;
+            // The staged graph is scratch, and still copied: the staged mapping beside it means
+            // "discard both" only while the graph is there, and alone it would be installed over
+            // the live mapping by the restored node.
+            case STAGING_LEFTOVER ->
+                FileKind.SEGMENT_STAGED_GRAPH_NAME.matcher(nameOf(relativePath)).matches()
+                    ? Inclusion.REQUIRED_DERIVED : Inclusion.TRANSIENT;
+            case DIAGNOSTIC_DUMP -> Inclusion.DIAGNOSTIC;
+            case OBSOLETE -> Inclusion.OBSOLETE;
+            case NODE_LOCK -> throw new IllegalArgumentException(relativePath + " is the data "
+                + "directory's lock, which describes a process rather than the store and is "
+                + "never inventoried");
+        };
     }
 
     /**
@@ -145,12 +129,24 @@ public final class DataDirectoryInventory {
      * @return Why the file is treated the way it is
      */
     public static String reason(String relativePath) {
-        if (relativePath.endsWith(STAGED_MAPPING_SUFFIX)) {
+        FileKind kind = FileClassifier.classify(relativePath);
+        if (kind == FileKind.HNSW_STAGED_DOCUMENT_MAP) {
             return "the node mapping - each node's chunk, or its document in a file an older "
                 + "build wrote - that an interrupted HNSW compaction staged; with "
                 + "its compacted graph beside it the node discards both, and without it the "
                 + "graph swap completed and this is the only mapping that matches the graph, "
                 + "which the node installs on open - so it is copied either way";
+        }
+        if (kind == FileKind.UNRECOGNISED) {
+            return "nothing in this build recognises it, so it is kept: a newer build may write "
+                + "state under a name this one has never heard of, and leaving it out would "
+                + "restore a node missing it";
+        }
+        if (kind == FileKind.LUCENE_CHUNK_ERASURE_LOG || isNativeErasureLog(relativePath)) {
+            return "the erasures the lexical index has accepted and not yet reclaimed; kept or "
+                + "left out with that index and never without it, since every promise in it is "
+                + "about text in that index, and a reindex rebuilds the index from storage, "
+                + "which an erasure empties first";
         }
         return switch (classify(relativePath)) {
             case REQUIRED_DERIVED -> "vector index; derived from the segments in principle, "
@@ -170,49 +166,13 @@ public final class DataDirectoryInventory {
     }
 
     /**
-     * Reports whether a path is an HNSW graph, its mapping, or a staged pair of either.
+     * Reports whether a path is the native lexical store's erasure log.
      *
      * @param path The relative path
-     * @return true if it belongs to the vector index
+     * @return true for {@code chunk-index/erasure.log}
      */
-    private static boolean isVectorIndex(String path) {
-        return path.endsWith(".hnsw") || path.endsWith(".hnsw.docmap")
-            || path.endsWith(".hnsw.compact") || path.endsWith(".hnsw.compact.docmap");
-    }
-
-    /**
-     * Reports whether a path is a staged write rather than published state.
-     *
-     * @param path The relative path
-     * @return true if it is scratch
-     */
-    private static boolean isStagedName(String path) {
-        String name = path.substring(path.lastIndexOf('/') + 1);
-        if (name.startsWith(SCRATCH_PREFIX)) {
-            return true;
-        }
-        return TRANSIENT_SUFFIXES.stream().anyMatch(path::endsWith);
-    }
-
-    /**
-     * Reports whether a path is derived state something will rebuild.
-     *
-     * @param path The relative path
-     * @return true if a reindex, a graph build or a retrain would produce it again
-     */
-    private static boolean isRebuildable(String path) {
-        if (path.endsWith(CODEBOOK_SUFFIX)) {
-            return true;
-        }
-        String[] segments = path.split("/");
-        if (segments.length > 1 && segments[0].equals(LEXICAL_DIRECTORY)) {
-            return true;
-        }
-        // The directories beside the graph hold copies of it or scratch toward the next one,
-        // derived from staging like the graph itself; kept or left out with it, since what
-        // recovery does with each depends on whether the graph is there.
-        return segments.length > 2 && (segments[1].equals(BUILT_GRAPH_DIRECTORY)
-            || segments[1].startsWith(BUILT_GRAPH_SIBLING_PREFIX));
+    private static boolean isNativeErasureLog(String path) {
+        return path.equals(FileClassifier.LEXICAL_STORE_DIRECTORY + "/" + DocumentErasureLog.FILE);
     }
 
     /**

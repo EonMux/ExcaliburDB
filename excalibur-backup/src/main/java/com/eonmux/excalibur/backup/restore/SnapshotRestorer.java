@@ -16,6 +16,7 @@ import com.eonmux.excalibur.core.datadir.DataDirectoryLock;
 import com.eonmux.excalibur.core.datadir.DataDirectoryLockedException;
 import com.eonmux.excalibur.core.datadir.FilesystemEntries;
 import com.eonmux.excalibur.core.datadir.ReservedNames;
+import com.eonmux.excalibur.fsck.check.FileClassifier;
 import com.eonmux.excalibur.store.ObsoleteSidecars;
 
 import java.io.IOException;
@@ -638,8 +639,11 @@ public final class SnapshotRestorer {
      */
     private static List<String> rebuildRequired(SnapshotManifest manifest) {
         List<String> required = new ArrayList<>();
-        boolean hasLexical = manifest.files().stream()
-            .anyMatch(entry -> entry.path().startsWith("chunk-index/"));
+        // Either engine's index: a node reads only the one it is configured for, and an image
+        // holds whichever that was.
+        boolean hasLexical = manifest.files().stream().map(FileEntry::path).anyMatch(path ->
+            path.startsWith(FileClassifier.LEXICAL_STORE_DIRECTORY + "/")
+                || path.startsWith(FileClassifier.LUCENE_CHUNK_DIRECTORY + "/"));
         boolean hasCodebooks = manifest.files().stream()
             .anyMatch(entry -> entry.path().endsWith(".pqcb"));
         boolean hasStaging = manifest.files().stream()

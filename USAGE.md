@@ -3193,7 +3193,11 @@ the copy verifies faithfully without it:
   lexical store is checked as one structure — its manifest against the CRC32C on its last line,
   every column of every segment the manifest names, each named segment's key table against
   `seg-N.keysum` and its tombstones against their CRC32C, and every line of `erasure.log`
-  against its own; the graph erasure ledger has every record checked. A term sketch an earlier
+  against its own; the Lucene chunk index, `lucene-chunks/`, which a node on the Lucene engine
+  keeps instead, is checked as one structure too — every file of every segment its commit point
+  names against the checksum in its footer, reported as one verdict on the directory — and its
+  `erasure.log` line by line, by the parser the index opens it with; the graph erasure ledger has
+  every record checked. A term sketch an earlier
   build kept beside a segment (`segment_<N>.tfs`), in an image that build took, is reported healthy
   and unproven: nothing in this build reads it, so its contents prove nothing either way, though its
   length and digests are still held to the manifest like every file's. A compaction's
@@ -3291,21 +3295,30 @@ If a hot copy is the only option, take it knowing what it is worth. Every write-
 fsynced before it is acknowledged, so the acknowledged writes are on disk; what an inconsistent
 copy loses is whatever the catalog and the segments disagree about, not the corpus.
 
-`--exclude-derived` leaves out what something will rebuild — the lexical chunk index, a tenant's
-built edge store and the quantiser codebooks — at the cost of a reindex and a graph build on the
-far side. The HNSW graphs and their node mappings are never left out, derived though they
+`--exclude-derived` leaves out what something will rebuild — the lexical chunk index
+(`chunk-index/`, or `lucene-chunks/` under the Lucene engine), a tenant's built edge store and the
+quantiser codebooks — at the cost of a reindex and a graph build on the far side. A lexical index's
+`erasure.log` goes with the index and never without it: its promises are all about text in that
+index, and an erasure empties storage first, so the reindex that rebuilds the index reads nothing
+they would have removed. The HNSW graphs and their node mappings are never left out, derived though they
 are, because nothing rebuilds them: deleting a `.hnsw` gives an empty graph attached to a
 populated segment, not a repopulated one. A mapping an interrupted compaction staged
 (`segment_<N>.hnsw.compact.docmap`) is kept with them for the reason below. The write-ahead logs
 are never left out either.
 
 Three things are never copied, and each is reported under `omitted` with the reason: staged names
-a crash left behind, which nothing reads; JVM heap dumps (`*.hprof`), which are a record of a
+a crash left behind — a `.tmp`, a compaction's `.compact` or `.compact-*`, a split's
+`segment_<N>.dat.left` and `.right`, `document-registry.<N>.new`, a staging log's `.rewriting` or
+`.erasing`, `asserted.last-id.writing`, a graph build's `.body` and `.assembled` — which nothing
+reads; JVM heap dumps (`*.hprof`), which are a record of a
 process rather than state and roughly the size of its heap; and the term sketches an earlier build
 kept beside its segments (`segment_<N>.tfs`, reported `OBSOLETE`), which nothing in this build reads
 and the node deletes when it starts. A restore of an image an earlier build took verifies those
 sketches with the rest of the image, since the manifest certifies their bytes, and then leaves them
-out of the restored directory.
+out of the restored directory. What each file is comes from the classification `excalibur-fsck`
+surveys a directory with, so what a snapshot leaves out as scratch is exactly what fsck reports as a
+staging leftover — apart from a compaction's staged `segment_<N>.hnsw.compact`, copied with the
+staged mapping whose meaning it decides — and a file neither recognises is kept.
 
 `excalibur-backup <command> --help` prints that command's options and the exit codes, and exits
 `0` without touching anything.
@@ -3449,6 +3462,15 @@ node runs before it serves one:
   may hold what an erasure removed, so neither is moved.
 - Any other file in a graph directory is `UNCHECKED`; the next build replaces the directory whole.
 
+A node on the Lucene lexical engine keeps its keyword index in `lucene-chunks/`, and fsck checks
+that directory the way it checks a graph's Lucene indexes: from the commit point, every file of
+every segment against the CRC32 in its footer, reported as one verdict on `lucene-chunks`. It is
+`CORRUPT` when a file fails its footer, a file the commit names is missing, or files are there with
+no commit point at all; the node will not open such an index. A directory holding only Lucene's
+`write.lock` was created and never committed, and is not judged. The `erasure.log` beside the index
+is the native store's format and is checked line by line, by the parser the index opens it with.
+Damage to either goes to an operator (below), never into the quarantine.
+
 Three files are judged by what the node does with them rather than by name alone:
 
 - **`chunk-index/seg-N.keymap`, a lexical segment's lookup table**, is a derived file the store
@@ -3528,6 +3550,8 @@ quarantine and the original directory removed. What it refuses to attempt matter
 | A write-ahead log whose header is damaged, with records behind it | The version the header names cannot be believed, and the records behind it were acknowledged. It is damage, not a newer build's log — whose header's checksum would match — so restore the segment from a backup or a replica |
 | A damaged `segment_<N>.hnsw.compact.docmap` with no `.hnsw.compact` beside it | The graph already holds the compacted numbering, and without this mapping it would be served through the pre-compaction one — wrong documents rather than an error. Restore the graph and both mappings together, or reindex the segment |
 | A damaged lexical store `manifest` | A store without its manifest opens as a new, empty index and deletes every segment the empty manifest does not name. Restore the manifest from a backup, or remove the whole `chunk-index` directory and reindex |
+| A damaged Lucene chunk index (`lucene-chunks`) | The node will not open a commit that fails its checksums, but the index may still hold text an accepted erasure has not yet reclaimed, and a quarantined copy would keep it. With the node stopped, delete the whole `lucene-chunks` directory — its `erasure.log` with it, since every promise there is about text in this index — and reindex, or restore the directory whole from a backup |
+| A damaged `erasure.log`, in `chunk-index` or `lucene-chunks` | Every promise in it was forced to disk before its caller was told the erasure was accepted, and a log that is not there owes nothing, so every erasure it holds would lapse. The keyword index does not open until the log reads cleanly. Restore it from a backup |
 | A damaged built graph with a `graph.previous` or `graph.retired` beside it | With the graph moved away the node would restore that copy and serve it, and a copy an erasure compaction replaced still holds what the erasure removed. Start the node once, which deletes the copy beside a served graph, or delete the copy, then repair again — or `POST /v1/graph/build`, which replaces the damaged graph without either. The move is checked again as it is made |
 | A damaged built graph beside a damaged label interner | The graph's dictionary may be all that still names the ids past the interner's damage. Moved away, the node would cut those ids off and hand them to new labels, serving one entity under another's name. Restore the namespace's `graph-staging` directory and graph from a backup. The move is checked again as it is made |
 | A damaged graph staging log | Nothing rebuilds one, and the node opens a missing one as empty. Moved aside, a label interner hands its ids out again under the published graph, so entities are served under other entities' names; `triples.log` empties the next graph build; `entity_text.log` leaves entities nothing to be ranked or embedded by; `erasure.log` and `withdrawals.log` forget what is still owed. Restore the namespace's `graph-staging` directory from a backup, all its logs together, since they refer to one another by id |
