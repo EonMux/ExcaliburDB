@@ -728,19 +728,6 @@ final class EndpointRegistrar {
     }
 
     /**
-     * Routes a path that serves one method.
-     *
-     * <p>Every other method is answered 405 by a handler of its own, behind the public guard,
-     * as the multi-method routes do. Left to the route's handler, the 405 would be served beneath
-     * the route's guard instead: an anonymous caller would be answered 401 for a method the path
-     * does not serve at all, and a wrong method on a mutating route would be charged to the much
-     * smaller mutate budget.</p>
-     *
-     * @param method  The one method the path serves
-     * @param guarded The path's handler, already guarded
-     * @return A handler dispatching {@code method} to the route and refusing the rest
-     */
-    /**
      * Records every request reaching a mutating route in the audit trail.
      *
      * <p>Outside the guard, so a request it refuses - unauthenticated, or over the mutate budget -
@@ -755,6 +742,19 @@ final class EndpointRegistrar {
         return AuditLog.audited(action, guarded);
     }
 
+    /**
+     * Routes a path that serves one method.
+     *
+     * <p>Every other method is answered 405 by a handler of its own, behind the public guard,
+     * as the multi-method routes do. Left to the route's handler, the 405 would be served beneath
+     * the route's guard instead: an anonymous caller would be answered 401 for a method the path
+     * does not serve at all, and a wrong method on a mutating route would be charged to the much
+     * smaller mutate budget.</p>
+     *
+     * @param method  The one method the path serves
+     * @param guarded The path's handler, already guarded
+     * @return A handler dispatching {@code method} to the route and refusing the rest
+     */
     private HttpHandler onlyMethod(String method, HttpHandler guarded) {
 
         return createMethodRouter(Map.of(method, guarded),
