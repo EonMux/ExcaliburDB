@@ -43,7 +43,7 @@ public final class MinimalGraph {
     public static void write(Path directory, boolean withVectors) throws IOException {
         EdgeStoreWriter edges = new EdgeStoreWriter();
         edges.add(ADA, COLLABORATED_WITH, BABBAGE, Integer.MIN_VALUE, TemporalFilter.OPEN,
-            new Provenance(SourceType.KNOWLEDGE_BASE, 1, 96, 7));
+            new Provenance(SourceType.USER_ASSERTED, 1, 96, 7));
         edges.build(directory, 8);
 
         try (LexicalIndex documents = LexicalIndex.open(

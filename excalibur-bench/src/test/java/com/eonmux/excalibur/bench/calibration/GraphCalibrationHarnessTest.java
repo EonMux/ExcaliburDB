@@ -52,9 +52,9 @@ class GraphCalibrationHarnessTest {
     private static void buildGraph(Path directory) throws IOException {
         EdgeStoreWriter edges = new EdgeStoreWriter();
         edges.add(ADA, COLLABORATED_WITH, BABBAGE, Integer.MIN_VALUE, TemporalFilter.OPEN,
-            new Provenance(SourceType.KNOWLEDGE_BASE, 1, 96, 7));
+            new Provenance(SourceType.USER_ASSERTED, 1, 96, 7));
         edges.add(TURING, COLLABORATED_WITH, NEWMAN, Integer.MIN_VALUE, TemporalFilter.OPEN,
-            new Provenance(SourceType.KNOWLEDGE_BASE, 1, 88, 7));
+            new Provenance(SourceType.USER_ASSERTED, 1, 88, 7));
         edges.add(HOPPER, COLLABORATED_WITH, AIKEN, Integer.MIN_VALUE, TemporalFilter.OPEN,
             new Provenance(SourceType.DOCUMENT, 2, 41, 7));
         edges.build(directory, 8);

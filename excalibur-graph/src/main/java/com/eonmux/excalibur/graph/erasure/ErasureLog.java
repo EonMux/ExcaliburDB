@@ -52,7 +52,7 @@ import org.slf4j.LoggerFactory;
  * complete body: [0x02][count : int32][id : int64] * count
  *
  * scope: [0x01][entityId : int64]
- *      | [0x02][sourceType ordinal : int8][sourceId : int64]
+ *      | [0x02][sourceType code : int8][sourceId : int64]
  *      | [0x03][extractorVersion : int32]
  * </pre>
  *
@@ -813,8 +813,14 @@ public final class ErasureLog implements AutoCloseable {
                 case RECORD_SUBMIT -> {
                     long id = record.getLong();
                     Instant requestedAt = Instant.ofEpochSecond(record.getLong(), record.getInt());
-                    outstanding.put(id,
-                        new ErasureRequest(id, decodeScope(path, record), requestedAt));
+                    ErasureScope scope = decodeScope(path, record);
+                    if (scope != null) {
+                        outstanding.put(id, new ErasureRequest(id, scope, requestedAt));
+                    } else if (path != SCANNING) {
+                        LOGGER.info("erasure request {} in {} names a retired source type, which "
+                            + "nothing this build stores can carry; there is nothing left for it "
+                            + "to erase, so it is not outstanding", id, path);
+                    }
                     return id + 1;
                 }
                 case RECORD_COMPLETE -> {
@@ -837,13 +843,26 @@ public final class ErasureLog implements AutoCloseable {
         }
     }
 
+    /**
+     * Decodes the scope of a submitted request.
+     *
+     * @param path   The file, for error messages
+     * @param record The body, positioned at the scope
+     * @return The scope, or null for a source scope naming a retired source type
+     * @throws IOException if the scope is intact but this build cannot interpret it
+     */
     private static ErasureScope decodeScope(Path path, ByteBuffer record) throws IOException {
         byte discriminator = record.get();
         return switch (discriminator) {
             case SCOPE_ENTITY -> new ErasureScope.Entity(record.getLong());
             case SCOPE_SOURCE -> {
-                SourceType type = decodeSourceType(path, record.get());
-                yield new ErasureScope.Source(type, record.getLong());
+                byte stored = record.get();
+                long sourceId = record.getLong();
+                // An earlier build accepted requests naming these types, and nothing ever
+                // stored a fact carrying one; there is nothing such a request could still erase.
+                yield SourceType.isRetired(stored)
+                    ? null
+                    : new ErasureScope.Source(decodeSourceType(path, stored), sourceId);
             }
             case SCOPE_EXTRACTOR_VERSION -> new ErasureScope.ExtractorVersion(record.getInt());
             default -> throw new IOException("erasure log " + path + " holds an intact request of "
@@ -861,13 +880,9 @@ public final class ErasureLog implements AutoCloseable {
      * for while leaving the one they did ask for on disk.
      */
     private static SourceType decodeSourceType(Path path, byte stored) throws IOException {
-        int ordinal = stored & 0xFF;
-        SourceType[] all = SourceType.values();
-        if (ordinal >= all.length) {
-            throw new IOException("erasure log " + path + " names source type ordinal " + ordinal
-                + ", which this build does not know; it was written by a newer build");
-        }
-        return all[ordinal];
+        return SourceType.decode(stored).orElseThrow(() -> new IOException("erasure log " + path
+            + " names source type code " + (stored & 0xFF) + ", which this build does not "
+            + "know; it was written by a newer build"));
     }
 
     @Override

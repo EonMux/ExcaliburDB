@@ -86,7 +86,7 @@ class TripleLogUpgradeTest {
     }
 
     private static final Provenance FIRST = Provenance.of(SourceType.DOCUMENT, 11, 0.8, 3);
-    private static final Provenance SECOND = Provenance.of(SourceType.CONVERSATION, 22, 0.6, 4);
+    private static final Provenance SECOND = Provenance.of(SourceType.USER_ASSERTED, 22, 0.6, 4);
 
     /** Everything a replay reports about one fact. */
     private record Replayed(int subject, int relation, int object, int validFrom, int validTo,

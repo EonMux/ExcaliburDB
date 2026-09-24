@@ -67,7 +67,7 @@ class McpGraphConversationTest {
 
     @BeforeEach
     void start(@TempDir Path root) throws IOException {
-        Provenance curated = new Provenance(SourceType.KNOWLEDGE_BASE, 1, 96, 7);
+        Provenance curated = new Provenance(SourceType.USER_ASSERTED, 1, 96, 7);
         EdgeStoreWriter writer = new EdgeStoreWriter();
         writer.add(ADA, AUTHORED, NOTE_G, Integer.MIN_VALUE, TemporalFilter.OPEN, curated);
         writer.add(BABBAGE, DESIGNED, ENGINE, Integer.MIN_VALUE, TemporalFilter.OPEN, curated);

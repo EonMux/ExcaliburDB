@@ -19,7 +19,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class AggregationTest {
 
-    private static final Provenance CURATED = new Provenance(SourceType.KNOWLEDGE_BASE, 1, 90, 1);
+    private static final Provenance CURATED = new Provenance(SourceType.USER_ASSERTED, 1, 90, 1);
 
     private static int day(int year) {
         return Math.toIntExact(LocalDate.of(year, 1, 1).toEpochDay());

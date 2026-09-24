@@ -12,6 +12,8 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.zip.CRC32;
 
+import com.eonmux.excalibur.graph.provenance.SourceType;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -21,7 +23,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *
  * <p>The log tolerates a torn tail, because a process killed mid-append is ordinary and the
  * obligations before the tear are intact. It tolerates nothing else. A record that checksums
- * correctly and carries a type, a scope discriminator or a source-type ordinal this build does not
+ * correctly and carries a type, a scope discriminator or a source-type code this build does not
  * know was written by something that understood more than this build does - and every one of those
  * bytes decides which edges get destroyed. Skipping such a record would leave data a client was
  * told would be erased; coercing it would erase edges nobody named.</p>
@@ -70,10 +72,10 @@ class ErasureLogRejectionTest {
      * the scope discriminator and its payload.</p>
      *
      * @param scope         The scope discriminator
-     * @param sourceOrdinal The source-type ordinal, used only by the source scope
+     * @param sourceCode    The source-type code, used only by the source scope
      * @return The record body
      */
-    private static byte[] submitBody(byte scope, byte sourceOrdinal) {
+    private static byte[] submitBody(byte scope, byte sourceCode) {
         ByteBuffer body = ByteBuffer.allocate(64).order(ByteOrder.BIG_ENDIAN);
         body.put((byte) 0x01);
         body.putLong(1L);
@@ -81,7 +83,7 @@ class ErasureLogRejectionTest {
         body.putInt(0);
         body.put(scope);
         if (scope == 0x02) {
-            body.put(sourceOrdinal);
+            body.put(sourceCode);
             body.putLong(7L);
         } else if (scope == 0x03) {
             body.putInt(7);
@@ -140,10 +142,10 @@ class ErasureLogRejectionTest {
     }
 
     @Test
-    @DisplayName("a source-type ordinal this build does not know is refused, not coerced")
+    @DisplayName("a source-type code this build does not know is refused, not coerced")
     void anUnknownSourceTypeIsRefused(@TempDir Path dir) throws IOException {
         Path file = logFile(dir);
-        // SourceType.fromByte maps an unrecognised ordinal to UNKNOWN. Here the ordinal chooses
+        // SourceType.fromByte maps an unrecognised code to UNKNOWN. Here the code chooses
         // which edges are destroyed, so coercing it would erase a different tenant's data than
         // the request named.
         writeLogWith(file, ErasureLog.VERSION, submitBody((byte) 0x02, (byte) 0x5A));
@@ -151,6 +153,39 @@ class ErasureLogRejectionTest {
         assertThatThrownBy(() -> ErasureLog.open(file))
             .isInstanceOf(IOException.class)
             .hasMessageContaining("source type");
+    }
+
+    @Test
+    @DisplayName("a request naming a retired source type is read and owes nothing")
+    void aRetiredSourceTypeOwesNothing(@TempDir Path dir) throws IOException {
+        Path file = logFile(dir);
+        writeLogWith(file, ErasureLog.VERSION,
+            submitBody((byte) 0x02, (byte) SourceType.RETIRED_CONVERSATION));
+
+        try (ErasureLog log = ErasureLog.open(file)) {
+            assertThat(log.outstandingCount()).isZero();
+            assertThat(log.submit(new ErasureScope.Source(SourceType.DOCUMENT, 7L),
+                java.time.Instant.EPOCH))
+                .as("the retired request's id stays spent")
+                .isEqualTo(2L);
+        }
+        assertThat(ErasureLog.inspect(file).count())
+            .as("only the request submitted since is owed")
+            .isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("a source request is decoded by the type's code, not its position")
+    void aSourceTypeIsDecodedByCode(@TempDir Path dir) throws IOException {
+        Path file = logFile(dir);
+        writeLogWith(file, ErasureLog.VERSION,
+            submitBody((byte) 0x02, SourceType.USER_ASSERTED.toByte()));
+
+        try (ErasureLog log = ErasureLog.open(file)) {
+            assertThat(log.outstanding()).singleElement()
+                .extracting(ErasureRequest::scope)
+                .isEqualTo(new ErasureScope.Source(SourceType.USER_ASSERTED, 7L));
+        }
     }
 
     @Test
