@@ -22,10 +22,30 @@
 # the handshake without one: give the probe one with EXCALIBUR_HEALTHCHECK_CLIENT_CERT and
 # EXCALIBUR_HEALTHCHECK_CLIENT_KEY (PEM paths inside the container).
 #
+# EXCALIBUR_HEALTHCHECK_TIMEOUT bounds the probe's request, in seconds (a positive number,
+# fractions allowed; 4 by default). It has to stay under the HEALTHCHECK's own --timeout (5s in
+# the image): a probe that outlives that is killed by Docker mid-request, and the failure is
+# recorded with no reason. To allow a slower answer raise both - the variable, and the check's
+# timeout with `docker run --health-timeout` or `healthcheck: timeout:` in a compose file. A value
+# that is not a positive number is refused with that reason, rather than handed to curl to fail
+# on with a message about its own arguments.
+#
 # Exits 0 when /health answers 2xx, non-zero otherwise, with the reason on stderr - which
 # `docker inspect` shows under .State.Health.Log.
 
 set -u
+
+timeout="${EXCALIBUR_HEALTHCHECK_TIMEOUT:-4}"
+case "$timeout" in
+  '' | *[!0-9.]* | .* | *. | *.*.*) timeout_valid=false ;;
+  *[1-9]*) timeout_valid=true ;;
+  *) timeout_valid=false ;;
+esac
+if [ "$timeout_valid" != true ]; then
+  echo "excalibur-healthcheck: EXCALIBUR_HEALTHCHECK_TIMEOUT must be a positive number of" \
+    "seconds, such as 4 or 2.5; got '$timeout'" >&2
+  exit 1
+fi
 
 data_dir="${EXCALIBUR_DATA_DIR:-/var/lib/excalibur}"
 lock="$data_dir/.excalibur-lock"
@@ -44,7 +64,7 @@ if [ -z "$url" ]; then
 fi
 
 set -- --fail --silent --show-error --output /dev/null --noproxy '*' \
-  --max-time "${EXCALIBUR_HEALTHCHECK_TIMEOUT:-4}"
+  --max-time "$timeout"
 case "$url" in
   https://*)
     set -- "$@" --insecure

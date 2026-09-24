@@ -371,8 +371,11 @@ reads only a status code. A node that requires client certificates (`tls-client-
 needs the probe given one, with `EXCALIBUR_HEALTHCHECK_CLIENT_CERT` and
 `EXCALIBUR_HEALTHCHECK_CLIENT_KEY`. `EXCALIBUR_HEALTHCHECK_TIMEOUT` bounds each probe's request
 in seconds, 4 by default: under the `HEALTHCHECK`'s own 5s, so a slow answer is reported by the
-probe as a failure rather than killed by Docker mid-request. Raise the two together. A tool container started with `--entrypoint` inherits the
-check as well; pass it `--no-healthcheck`, or ignore its health.
+probe as a failure rather than killed by Docker mid-request. Raise the two together: the variable,
+and Docker's timeout with `docker run --health-timeout 15s` or `timeout: 15s` under a compose
+service's `healthcheck:`. A value that is not a positive number of seconds (fractions allowed) fails
+the check with that reason in `docker inspect`. A tool container started with `--entrypoint`
+inherits the check as well; pass it `--no-healthcheck`, or ignore its health.
 
 ### Stopping the node
 
