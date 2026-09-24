@@ -1936,7 +1936,7 @@ curl -X POST http://localhost:8080/v1/query \
 | `timeout_ms` | int | `excalibur.visibility.query-timeout-ms` (`30000`) | Partial results returned if exceeded. Capped by `excalibur.api.max-query-timeout-ms` (`60000`); asking for more is a `400`. |
 | `include_partial_segments` | bool | `true` | Include segments that are still indexing. |
 | `enable_llm_scoring` | bool | `true` | Re-rank the top candidates with the LLM. On a vector answer the pipeline scores them; on a hybrid answer the fused list is scored after fusion; on a lexical answer the BM25 candidates are scored. `llm_scored` on the response says whether it happened. On a node with no chat model it has no effect and the field is named in `ignored_fields`; `coverage.degraded` stays `false`, because the node is running as configured rather than failing. |
-| `llm_threshold` | float | `excalibur.llm.relevancy-threshold` (`0.3`) | Score a candidate must reach in the LLM re-rank to survive it, on every route. Outside `[0.0, 1.0]` is a `400`. Inert when `enable_llm_scoring` is false; named in `ignored_fields` when the node cannot score. |
+| `llm_threshold` | float | `excalibur.llm.relevancy-threshold` (`0.3`) | Score a candidate must reach in the LLM re-rank to survive it, on every route. Outside `[0.0, 1.0]` is a `400`. Inert when no re-rank runs, and then named in `ignored_fields`: when `enable_llm_scoring` is false as well as when the node cannot score. |
 | `oversampling_factor` | int | `2` | How many times the requested depth is ranked before the LLM re-rank narrows the list back down, on every route; it also widens each segment's HNSW search. Higher trades latency for recall. Named in `ignored_fields` only on a lexical answer with no scoring. Must be at least 1 and at most `excalibur.api.max-oversampling-factor` (16); outside that is a `400`. |
 | `include_text` | bool | `false` | Return each result's text alongside its identifier. Every result then carries `text` (`null` when the node no longer holds that chunk) and `text_truncated`. Text past `excalibur.api.max-result-text-chars` (4096) is clipped. A node with no chunk storage answers `400`. |
 | `offset` | int | `0` | Skip this many results before the page. A ranked index has no cursor to resume from, so the engine is searched to `offset + top_k` and the page sliced out of it — which is why `offset + top_k` must not exceed `excalibur.api.max-top-k` (1000); past it is a `400`. Negative is a `400`. |
@@ -2267,7 +2267,8 @@ on a hybrid answer marks `coverage.degraded: true`.
 A query longer than `excalibur.api.max-query-chars` is refused, on every route; there is no
 second, shorter bound for expansion. A hybrid answer carries `ignored_fields` like every other:
 `threshold` and `include_partial_segments` are applied to the vector signal before fusion, so they
-never appear in it, and the scoring fields appear only on a node with no chat model.
+never appear in it, and the scoring fields appear only when the answer is not scored:
+`enable_llm_scoring` on a node with no chat model, `llm_threshold` whenever no re-rank runs.
 
 ### The query cache
 
