@@ -16,7 +16,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * Whether a configuration file that will not load is fatal depends on who chose its name.
  *
- * <p>A node that starts on the packaged defaults is not the node the operator configured: it has
+ * <p>A node that starts on the built-in defaults is not the node the operator configured: it has
  * no allowed ingest roots, the shipped index tuning, and a loopback bind. Doing that because a
  * path was mistyped, and saying so in one WARN line among the startup banner, is the same class
  * of failure the listening port already refuses - a node that starts, reports itself healthy, and
@@ -67,7 +67,7 @@ class ConfigSourceTest {
         void danglingFlagIsRefused() {
             assertThatThrownBy(() ->
                 ExcaliburApplication.configSource(new String[] {"--config"}))
-                .as("the operator asked for a configuration file; starting on the packaged "
+                .as("the operator asked for a configuration file; starting on the built-in "
                     + "defaults instead starts a different node than the one asked for")
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("--config");
@@ -128,7 +128,35 @@ class ConfigSourceTest {
                 new ExcaliburApplication.ConfigSource(missing, true)))
                 .isInstanceOf(IOException.class)
                 .hasMessageContaining(missing)
-                .hasMessageContaining("packaged defaults");
+                .hasMessageContaining("built-in defaults");
+        }
+
+        @Test
+        @DisplayName("a named file missing from disk is not read from the jar instead")
+        void namedAndMissingIsNotReadFromTheClasspath() {
+            // Relative, and the name of the copy excalibur-api carries on its classpath. The test's
+            // working directory has no such file, so the operator's file is missing - and a lookup
+            // that fell back to the classpath would start the node on a file nobody wrote.
+            assertThat(java.nio.file.Files.exists(Path.of("excalibur.properties"))).isFalse();
+
+            assertThatThrownBy(() -> ExcaliburApplication.loadConfiguration(
+                new ExcaliburApplication.ConfigSource("excalibur.properties", true)))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("excalibur.properties");
+        }
+
+        @Test
+        @DisplayName("a file at the default path that cannot be read refuses to start")
+        void unnamedAndUnreadableIsFatal(@TempDir Path dir) throws IOException {
+            // Absence is the one thing the default path may fall back from. A file that is there
+            // was put there for this node, and starting without it runs a node nobody configured.
+            String unreadable = Files.createDirectory(dir.resolve("excalibur.properties")).toString();
+
+            assertThatThrownBy(() -> ExcaliburApplication.loadConfiguration(
+                new ExcaliburApplication.ConfigSource(unreadable, false)))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining(unreadable)
+                .hasMessageContaining("built-in defaults");
         }
 
         @Test

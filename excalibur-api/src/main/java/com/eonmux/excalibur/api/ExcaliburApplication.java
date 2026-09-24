@@ -24,6 +24,7 @@ import org.slf4j.bridge.SLF4JBridgeHandler;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
@@ -179,7 +180,7 @@ public final class ExcaliburApplication {
               --config, -c <file>  Read settings from this file. Also accepted as
                                    --config=<file>. Without it the server reads
                                    %s from the working directory if it is
-                                   there, and starts on the packaged defaults if it is not.
+                                   there, and starts on the built-in defaults if it is not.
               --help, -h           Print this and do nothing else.
 
             Exit codes:
@@ -339,7 +340,8 @@ public final class ExcaliburApplication {
      *
      * @param source Where the configuration is read from
      * @return Loaded configuration
-     * @throws IOException if a file the operator named cannot be read
+     * @throws IOException if a file the operator named is missing or cannot be read, or a file
+     *         at the default path is there and cannot be read
      * @throws IllegalStateException if configuration validation fails
      */
     static Config loadConfiguration(ConfigSource source) throws IOException {
@@ -349,24 +351,25 @@ public final class ExcaliburApplication {
         Config cfg;
         try {
             cfg = ConfigLoader.load(configPath, System.getenv());
-        } catch (IOException e) {
-            // A path the operator typed is not a suggestion. Starting on the packaged defaults
+        } catch (NoSuchFileException e) {
+            // A path the operator typed is not a suggestion. Starting on the built-in defaults
             // instead gives a node with no allowed ingest roots, the shipped index tuning and a
             // loopback bind - one that comes up, reports itself healthy, and is configured by
             // nobody. That is harder to diagnose than not starting, which is the same argument
             // ListenPort makes for refusing a port it cannot parse.
             if (source.named()) {
-                throw new IOException("Configuration file named on the command line could not be"
-                    + " read: " + configPath + ". Refusing to start on the packaged defaults,"
-                    + " which would run a node this deployment did not configure.", e);
+                throw refusal(configPath, e);
             }
-            LOGGER.warn("No configuration file at the default path {}; using defaults. {}",
-                configPath, e.getMessage());
+            LOGGER.warn("No configuration file at the default path {}; using the built-in"
+                + " defaults and the EXCALIBUR_* environment", configPath);
             cfg = new Config(configPath, System.getenv(), new java.util.HashMap<>());
             // ConfigLoader does this on the path it owns; this path bypasses it, and the
             // environment can carry the same typo a file can.
-            com.eonmux.excalibur.config.ConfigLoader.reportUnrecognisedKeys(
-                configPath, cfg.getEffectiveProperties());
+            ConfigLoader.reportUnrecognisedKeys(configPath, cfg.getEffectiveProperties());
+        } catch (IOException e) {
+            // Present and unreadable is never the absence the default path is allowed: whoever
+            // put a file there meant this node to run on it, and it cannot.
+            throw refusal(configPath, e);
         }
 
         // The excalibur.api.* half, which the config module deliberately does not judge because
@@ -381,6 +384,19 @@ public final class ExcaliburApplication {
             cfg.visibility().getEpochTickMs(),
             cfg.health().getReadinessThreshold());
         return cfg;
+    }
+
+    /**
+     * The failure for a configuration file that is there to be read, and could not be.
+     *
+     * @param configPath The file
+     * @param cause      Why it could not be read
+     * @return The exception to throw
+     */
+    private static IOException refusal(String configPath, IOException cause) {
+        return new IOException("Configuration file could not be read: " + configPath
+            + ". Refusing to start on the built-in defaults, which would run a node this"
+            + " deployment did not configure.", cause);
     }
 
     /**

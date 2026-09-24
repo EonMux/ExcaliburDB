@@ -26,8 +26,9 @@
 # All three are in excalibur-api/build.gradle.kts's applicationDefaultJvmArgs, so this image
 # launches the jar the way the generated start scripts launch it.
 #
-# Configuration: excalibur.properties is read from the working directory, then from the
-# classpath (the packaged default in excalibur-api/src/main/resources). Any setting can be
+# Configuration: excalibur.properties is read from the working directory (/var/lib/excalibur)
+# if it is there; without one the node starts on its built-in defaults. `--config <file>` names
+# another, and a named file that cannot be read refuses to start. Any setting can be
 # supplied from the environment instead - EXCALIBUR_<SECTION>_<NAME>, upper-cased with
 # hyphens as underscores, overrides the file (com.eonmux.excalibur.config.EnvOverrides). No secret is
 # baked into this image: pass excalibur.llm.api-key as EXCALIBUR_LLM_API_KEY at run time.

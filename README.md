@@ -714,12 +714,12 @@ hidden.
 ## Configuration
 
 Configuration is loaded from `excalibur.properties` in the working directory by default, or from
-the path given to `--config` (or `--config=<path>`); an argument the server does not recognise,
-or a `--config` with no path after it, refuses to start rather than quietly using the defaults,
-and `--help` prints the arguments without starting anything. One file is read, not a chain: when
-the path is not on the filesystem it is looked up on the classpath, where the jar carries its own
-`excalibur.properties`. A file named with `--config` that cannot be read refuses to start; only the
-default path falls back, with a warning, to the built-in defaults.
+the path given to `--config` (or `-c <path>`, or `--config=<path>`); an argument the server does
+not recognise, or a `--config` with no path after it, refuses to start rather than quietly using
+the defaults, and `--help` (or `-h`) prints the arguments without starting anything. One file is
+read, not a chain, and only from the filesystem. A file named with `--config` that is missing or
+cannot be read refuses to start; only the default path falls back, with a warning, to the built-in
+defaults, and only when there is no file there at all.
 Copy `excalibur.properties.example` to start; the working copy is
 gitignored, because it is the file a key ends up in.
 
@@ -3904,7 +3904,7 @@ runs the commands this README documents rather than a private variant of them. I
 (`:excalibur-api:shadowJar`, `:excalibur-fsck:installDist`, `:excalibur-backup:installDist`),
 because `installDist` is not part of `build` and a module with no build script would leave `build`
 green while those resolved to no such task. Then it smoke-tests the operator tools against a data
-directory a real node wrote: it starts the shadow jar on its packaged default (loopback, no
+directory a real node wrote: it starts the shadow jar on its built-in defaults (loopback, no
 token, no LLM key, which still ingests lexically), indexes two documents through the synchronous
 `POST /v1/documents`, and stops it with `SIGTERM` the way a scheduler would. `excalibur-fsck` must
 find nothing damaged in what it left; `excalibur-backup` must snapshot it, `verify --deep` the

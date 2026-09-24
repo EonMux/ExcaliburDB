@@ -302,13 +302,14 @@ Configuration comes from three sources, each overriding the one before it:
 2. **One** properties file
 3. Environment variables prefixed with `EXCALIBUR_`
 
-Step 2 is one file, not a chain. The path is whatever `--config <path>` gives, defaulting to
-`excalibur.properties`; it is read from the filesystem if it exists there, and otherwise from the
-classpath under the same name — the jar carries its own `excalibur.properties`, so a node started
-with no file beside it runs on that one. A file on the classpath does **not** layer underneath a
-filesystem one — the first that resolves is the only one read. A path named with `--config` that
-cannot be read refuses to start, because starting on the packaged defaults would run a node nobody
-configured; only the default path falls back to the built-in defaults, with a warning.
+Step 2 is one file, not a chain. The path is whatever `--config <path>` (or `-c <path>`, or
+`--config=<path>`) gives, defaulting to `excalibur.properties` in the working directory, and it is
+read from the filesystem only — nothing is looked up on the classpath. A path named with
+`--config` that is missing or cannot be read refuses to start, because starting on the built-in
+defaults would run a node nobody configured. Only the default path falls back: when there is no
+file there at all, the node logs a warning and starts on the built-in defaults and the
+environment. A file at the default path that is there but cannot be read refuses to start like a
+named one.
 
 The file is `key=value` lines, split at the first `=`. A line whose first character is `#` or `;`
 is a comment, and that is the only kind of comment there is: everything after the `=` is the value,

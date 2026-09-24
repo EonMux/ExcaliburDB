@@ -68,6 +68,36 @@ class ConfigLoaderTest {
         }
 
         @Test
+        @DisplayName("reports an absent file as NoSuchFileException, so a caller can tell it from an unreadable one")
+        void reportsAbsenceDistinctly() {
+            assertThatThrownBy(() -> ConfigLoader.load(
+                tempDir.resolve("absent.properties").toString(), Collections.emptyMap()))
+                .isInstanceOf(java.nio.file.NoSuchFileException.class);
+        }
+
+        @Test
+        @DisplayName("does not read a file of that name from the classpath instead")
+        void neverFallsBackToTheClasspath() {
+            // classpath-only.properties is a test resource and is not on the filesystem. A loader
+            // that looked it up on the classpath would start a node on a file the operator never
+            // wrote whenever the one they named was missing.
+            assertThatThrownBy(() -> ConfigLoader.load("classpath-only.properties",
+                Collections.emptyMap()))
+                .isInstanceOf(java.nio.file.NoSuchFileException.class);
+        }
+
+        @Test
+        @DisplayName("a file that is present but unreadable is not reported as absent")
+        void unreadableIsNotAbsent() throws IOException {
+            // A directory stands in for an unreadable file: it exists, and opening it to read fails.
+            Path directory = Files.createDirectory(tempDir.resolve("a-directory.properties"));
+
+            assertThatThrownBy(() -> ConfigLoader.load(directory.toString(), Collections.emptyMap()))
+                .isInstanceOf(IOException.class)
+                .isNotInstanceOf(java.nio.file.NoSuchFileException.class);
+        }
+
+        @Test
         @DisplayName("loads config from filesystem")
         void loadsConfigFromFilesystem() throws IOException {
             String content = """
