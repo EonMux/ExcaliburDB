@@ -323,7 +323,7 @@ stripped from a value.
 Three variables are read directly rather than as overrides of a key: `EXCALIBUR_PORT` (the listen
 port, taking precedence over `excalibur.api.port`), `EXCALIBUR_DATA_DIR` (the data directory,
 default `./data`; there is no property for it) and `EXCALIBUR_LOG_LEVEL` (the root log level,
-default `INFO`). Two other processes read variables of their own under the same prefix, and the
+default `INFO`; blank, or a value that is not a level, is `INFO` with a warning at startup). Two other processes read variables of their own under the same prefix, and the
 node ignores them: the MCP server's `EXCALIBUR_URL`, `EXCALIBUR_NAMESPACE` and
 `EXCALIBUR_MCP_TIMEOUT_SECONDS` (it also reads `EXCALIBUR_API_AUTH_TOKEN`, as the token it
 presents), and the container health check's `EXCALIBUR_HEALTHCHECK_TIMEOUT`,

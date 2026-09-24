@@ -51,6 +51,8 @@ dependencies {
 
     // Logback for structured logging
     runtimeOnly("ch.qos.logback:logback-classic:1.5.12")
+    // Compiled against for LogLevelProperty alone, the property definer logback.xml names
+    compileOnly("ch.qos.logback:logback-core:1.5.12")
 
     // Logstash encoder for JSON structured logging
     runtimeOnly("net.logstash.logback:logstash-logback-encoder:8.0")

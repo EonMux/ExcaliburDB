@@ -798,7 +798,7 @@ count as unset in the same way, with a warning naming the variable:
 |----------|---------|
 | `EXCALIBUR_PORT` | Listen port; checked before `excalibur.api.port` |
 | `EXCALIBUR_DATA_DIR` | Where segments, indexes and the graph live. Default `./data`, created if absent. There is no property for it |
-| `EXCALIBUR_LOG_LEVEL` | Root log level, read by `logback.xml` at startup. Default `INFO` |
+| `EXCALIBUR_LOG_LEVEL` | Root log level, read by `logback.xml` at startup: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`, `OFF` or `ALL`, in any case. Default `INFO`, which is also what a blank value or one that is not a level gets, with a warning at startup |
 
 `EXCALIBUR_API_AUTH_TOKEN` is not among them: it is the ordinary environment override of
 `excalibur.api.auth-token`, and setting either turns authentication on. The MCP server reads a

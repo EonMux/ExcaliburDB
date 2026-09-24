@@ -12,7 +12,8 @@
     - Use StructuredLoggingHelper for safe MDC management
 
     Environment Variables:
-    - EXCALIBUR_LOG_LEVEL: Root log level (default: INFO), read once at startup.
+    - EXCALIBUR_LOG_LEVEL: Root log level (default: INFO), read once at startup. Blank, or
+      not a level, is INFO with a warning.
 
     To change the level on a running node, use the logback JMX MBean registered below rather than
     editing this file: it ships inside the fat JAR and cannot be edited in place.
@@ -67,8 +68,12 @@
     -->
     <jmxConfigurator/>
 
-    <!-- Read log level from environment variable, default to INFO -->
-    <property name="LOG_LEVEL" value="${EXCALIBUR_LOG_LEVEL:-INFO}" />
+    <!--
+        The root level, from EXCALIBUR_LOG_LEVEL. Not ${EXCALIBUR_LOG_LEVEL:-INFO}: that default
+        covers only an unset variable, and logback reads a blank or misspelt level as DEBUG.
+        LogLevelProperty resolves both to INFO, with a warning.
+    -->
+    <define name="LOG_LEVEL" class="com.eonmux.excalibur.api.bootstrap.LogLevelProperty" />
 
     <!-- Console appender with JSON format for production -->
     <appender name="JSON_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
