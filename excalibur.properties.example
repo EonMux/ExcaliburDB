@@ -247,7 +247,8 @@ excalibur.graph.auto-build-max-delay-seconds=900
 # left to it.
 excalibur.graph.auto-build-max-concurrent=1
 # After a failed automatic build a namespace waits this long, doubling with each further failure
-# up to the maximum.
+# up to the maximum. The maximum must be at least the first wait - a smaller one refuses to
+# start - and when it is not set it is 3600 or the first wait, whichever is larger.
 excalibur.graph.auto-build-failure-backoff-seconds=60
 excalibur.graph.auto-build-max-failure-backoff-seconds=3600
 

@@ -920,7 +920,7 @@ it does read.
 | `excalibur.graph.auto-build-max-delay-seconds` | 900 | Longest an unpublished change waits however busy staging stays: past it the namespace is rebuilt without waiting for quiet. At least 1 |
 | `excalibur.graph.auto-build-max-concurrent` | 1 | Most automatic builds at once across the node. At least 1 |
 | `excalibur.graph.auto-build-failure-backoff-seconds` | 60 | Wait after a failed automatic build before the namespace is tried again, doubling with each further failure. At least 1 |
-| `excalibur.graph.auto-build-max-failure-backoff-seconds` | 3600 | Longest that wait grows to. At least `excalibur.graph.auto-build-failure-backoff-seconds` |
+| `excalibur.graph.auto-build-max-failure-backoff-seconds` | 3600 | Longest that wait grows to. At least `excalibur.graph.auto-build-failure-backoff-seconds`: set below it, the node refuses to start; unset, it is 3600 or that first wait, whichever is larger |
 | `excalibur.graph.top-k` | 10 | Documents each retrieval signal contributes before fusion. At least 1 |
 | `excalibur.graph.rerank-over-fetch` | 4 | Candidates the full-precision reranker reads per result it returns. Reranking can only reorder what it is given, so this is what lets an entity that term overlap ranked poorly be rescued by its vector. At least 1 |
 | `excalibur.graph.max-frontier` | 1000 | Most new entities one hop of a graph walk admits. When a hop reaches more, it keeps those reached along the strongest edge — highest extraction confidence, then latest valid-time start, then lowest entity id — so a hub cannot make one question read the graph, and a capped answer is the same every time. The entities the question named are always admitted. At least 1 |

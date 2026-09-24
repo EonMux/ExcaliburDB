@@ -356,7 +356,34 @@ class ConfigGraphTest {
                 "excalibur.graph.auto-build-failure-backoff-seconds", "60",
                 "excalibur.graph.auto-build-max-failure-backoff-seconds", "30")))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("auto-build-max-failure-backoff-seconds");
+                .hasMessageContaining("excalibur.graph.auto-build-max-failure-backoff-seconds")
+                .as("the refusal names the setting it is measured against, since that is the "
+                    + "one the operator may have meant to change")
+                .hasMessageContaining("excalibur.graph.auto-build-failure-backoff-seconds");
+        }
+
+        @Test
+        @DisplayName("an unset backoff ceiling follows a first step above 3600 upward")
+        void unsetCeilingFollowsTheFirstStep() {
+            GraphConfig raised = graph(Map.of(
+                "excalibur.graph.auto-build-failure-backoff-seconds", "7200"));
+
+            assertThat(raised.getAutoBuildMaxFailureBackoffSeconds())
+                .as("refusing a key nobody set would make raising the first step alone fatal")
+                .isEqualTo(7200);
+            assertThat(graph(Map.of("excalibur.graph.auto-build-failure-backoff-seconds", "600"))
+                .getAutoBuildMaxFailureBackoffSeconds())
+                .isEqualTo(GraphConfig.DEFAULT_AUTO_BUILD_MAX_FAILURE_BACKOFF_SECONDS);
+        }
+
+        @Test
+        @DisplayName("a backoff ceiling equal to its first step is accepted")
+        void ceilingEqualToFirstStep() {
+            GraphConfig graph = graph(Map.of(
+                "excalibur.graph.auto-build-failure-backoff-seconds", "120",
+                "excalibur.graph.auto-build-max-failure-backoff-seconds", "120"));
+
+            assertThat(graph.getAutoBuildMaxFailureBackoffSeconds()).isEqualTo(120);
         }
     }
 
