@@ -842,6 +842,20 @@ public final class GraphErasureCoordinator {
         return log.statuses(requestIds);
     }
 
+    /**
+     * A page of the requests the log can describe: every outstanding one and the most recently
+     * discharged.
+     *
+     * @param state Only requests in this state, or null for both
+     * @param after List only ids above this one; 0 for the first page
+     * @param limit Most requests the page carries
+     * @return The page
+     * @see ErasureLog#requests(ErasureLog.State, long, int)
+     */
+    public ErasureLog.RequestPage requests(ErasureLog.State state, long after, int limit) {
+        return log.requests(state, after, limit);
+    }
+
     @Override
     public String toString() {
         return "GraphErasureCoordinator[" + log.outstandingCount() + " outstanding]";

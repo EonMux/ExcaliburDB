@@ -1163,6 +1163,8 @@ out of the store and the staged facts, then `discharged` with `discharged_at_ms`
 namespace's own erasure log, so it survives a restart. The completion of the most recent 1024
 requests per namespace is kept in full; an older one still answers `discharged`, with no scope,
 no timestamps and `detail_retained: false`. A request id the namespace never issued is `404`.
+`GET /v1/graph/erasure` lists them for a caller that no longer holds the ids: every outstanding
+obligation and the 1024 most recently discharged, each spelled as the member route spells it.
 
 What no erasure can reach is the source itself. A document removed here and still served by the
 directory or website it was crawled from comes back on the next re-crawl. That half of an obligation
@@ -1460,6 +1462,7 @@ separate so a burst of writes cannot starve ordinary reads.
 | `DELETE` | `/v1/graph/build` | bearer | mutate | Stop the build in progress. It publishes nothing, and the namespace keeps serving the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | read | What the build is doing, and what the last one published |
 | `POST` | `/v1/graph/erasure` | bearer | mutate | Record an obligation to erase, and compact when it is due |
+| `GET` | `/v1/graph/erasure` | bearer | read | The obligations of the namespace `X-Excalibur-Namespace` names — every outstanding one and the 1024 most recently discharged, narrowed by `state`, paged by `limit` and `cursor` |
 | `GET` | `/v1/graph/erasure/{request_id}` | bearer | read | Where one graph erasure obligation stands: `pending` or `discharged`, with timestamps, in the namespace `X-Excalibur-Namespace` names |
 | `GET` | `/v1/graph/entities` | bearer | read | Entities in the served graph by exact `name` or `prefix`, or all of them, in name order — paged by `limit` and `cursor` |
 | `GET` | `/v1/graph/entities/{id}` | bearer | read | One entity, its edges counted by relation and direction. `404` for an id the served graph does not hold |
@@ -2866,6 +2869,21 @@ curl http://localhost:8080/v1/graph/erasure/7
 the scope selects are gone from the served graph and from the staged facts. An entity erased by
 name reports its `entity_id`, never the name.
 
+Without the id, list what the namespace owes — `state` narrows it to `pending` or `discharged`,
+and `limit` and `cursor` page it as every other listing does:
+
+```bash
+curl 'http://localhost:8080/v1/graph/erasure?state=pending'
+```
+
+```json
+{"namespace": "shared",
+ "requests": [{"request_id": 7, "state": "pending", "scope": "entity", "entity_id": 42,
+               "requested_at_ms": 1756649000000, "discharged_at_ms": null,
+               "detail_retained": true}],
+ "count": 1, "total": 1, "next_cursor": null}
+```
+
 In the source scope, `N` names one ingested document, not a registered source: it is the XxHash64
 (seed 0) of the UTF-8 bytes of the document's key, `<source_id>:<document_id>` — `my-docs:guide.md`
 for the document whose chunks come back from `/v1/query` as `my-docs:guide.md:chunk:N`. It is
@@ -3171,7 +3189,7 @@ asked for it. `delete_namespace` never falls back on `EXCALIBUR_NAMESPACE`, and 
 tool puts in a path is checked against the node's naming rule first, so `..` or a `/` cannot turn
 it into a different route; the ids `cancel_query` and `erasure_status` put in a path are held to
 the shape the node issues them in, for the same reason. Graph erasure (`POST /v1/graph/erasure`)
-and its read-back stay operator-only: its obligations come from graph erasures and fact
+and its read-backs, the listing and the per-request status, stay operator-only: its obligations come from graph erasures and fact
 retractions, neither of which is a tool, and the graph half of a document erasure is already in
 what `erasure_status` reports.
 

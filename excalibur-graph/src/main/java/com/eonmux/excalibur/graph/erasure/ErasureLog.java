@@ -19,8 +19,10 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.zip.CRC32;
 
 import com.eonmux.excalibur.graph.file.LogCorruptionException;
@@ -463,6 +465,130 @@ public final class ErasureLog implements AutoCloseable {
         synchronized (appendLock) {
             return statusesIn(ids, outstanding, completed, nextId);
         }
+    }
+
+    /**
+     * One page of the requests a log can describe, in id order.
+     *
+     * @param requests The page, lowest id first, each with the detail {@link #status} gives it
+     * @param total    How many requests the listing holds across every page: each outstanding
+     *                 one and each retained completion, narrowed to the state asked for
+     * @param next     The id the next page starts after, or empty on the last page
+     */
+    public record RequestPage(List<RequestStatus> requests, int total, Optional<Long> next) {
+
+        /**
+         * @throws NullPointerException     if a part is null
+         * @throws IllegalArgumentException if the total is negative
+         */
+        public RequestPage {
+            requests = List.copyOf(requests);
+            Objects.requireNonNull(next, "next must not be null");
+            if (total < 0) {
+                throw new IllegalArgumentException("total must not be negative");
+            }
+        }
+    }
+
+    /**
+     * A page of the requests this log can describe: every outstanding one and the
+     * {@value #RETAINED_COMPLETIONS} most recently completed.
+     *
+     * <p>A request completed before those is not listed, though {@link #status} still reports it
+     * discharged: nothing of it is remembered but its id, and a listing of bare ids would only
+     * count the numbers below the next one to be handed out.</p>
+     *
+     * @param state Only requests in this state, or null for both
+     * @param after List only ids above this one; 0 for the first page
+     * @param limit Most requests the page carries
+     * @return The page, and where the next one starts
+     * @throws IllegalArgumentException if {@code limit} is not positive or {@code after} is
+     *                                  negative
+     */
+    public RequestPage requests(State state, long after, int limit) {
+        synchronized (appendLock) {
+            return pageIn(outstanding, completed, state, after, limit);
+        }
+    }
+
+    /**
+     * A page of the requests of a log, read from the file without taking it over.
+     *
+     * <p>For a namespace nothing has open, as {@link #statusesOf} is: answering exactly what
+     * {@link #requests} would answer had the log been opened.</p>
+     *
+     * @param file  The log file; need not exist
+     * @param state Only requests in this state, or null for both
+     * @param after List only ids above this one; 0 for the first page
+     * @param limit Most requests the page carries
+     * @return The page; empty when the file does not exist
+     * @throws IOException if the file exists and is not an erasure log this build can read
+     * @throws LogCorruptionException if damage has an intact record behind it
+     * @throws IllegalArgumentException if {@code limit} is not positive or {@code after} is
+     *                                  negative
+     * @throws NullPointerException if {@code file} is null
+     */
+    public static RequestPage requestsOf(Path file, State state, long after, int limit)
+            throws IOException {
+        Objects.requireNonNull(file, "file must not be null");
+        if (!Files.exists(file)) {
+            return pageIn(Map.of(), Map.of(), state, after, limit);
+        }
+        if (Files.size(file) < HEADER_BYTES) {
+            // A torn creation has handed out nothing; anything else that short is refused as
+            // the open refuses it.
+            inspectLog(file);
+            return pageIn(Map.of(), Map.of(), state, after, limit);
+        }
+        Replay replay = replay(file);
+        TailIntegrity.requireTornTail(file, "erasure log", replay.contents(),
+            replay.validBytes(), ErasureLog::recordStartsAt);
+        return pageIn(replay.outstanding(), replay.completed(), state, after, limit);
+    }
+
+    /**
+     * Answers {@link #requests} from a log's state, whether replayed from the file or held open.
+     *
+     * <p>Completions are retained in the order they completed, not by id, so the two are merged
+     * by id here. Both are bounded - the outstanding requests by what the namespace owes, the
+     * completions by {@value #RETAINED_COMPLETIONS} - so the merge is too.</p>
+     *
+     * @param owed  What is outstanding
+     * @param done  The retained completions
+     * @param state Only requests in this state, or null for both
+     * @param after List only ids above this one
+     * @param limit Most requests the page carries
+     * @return The page
+     */
+    private static RequestPage pageIn(Map<Long, ErasureRequest> owed,
+                                      Map<Long, RequestStatus> done, State state, long after,
+                                      int limit) {
+        if (limit < 1) {
+            throw new IllegalArgumentException("limit must be positive, got " + limit);
+        }
+        if (after < 0) {
+            throw new IllegalArgumentException("after must not be negative, got " + after);
+        }
+        NavigableMap<Long, RequestStatus> listed = new TreeMap<>();
+        if (state != State.DISCHARGED) {
+            owed.values().forEach(request -> listed.put(request.id(),
+                RequestStatus.pending(request)));
+        }
+        if (state != State.PENDING) {
+            listed.putAll(done);
+        }
+        List<RequestStatus> page = new ArrayList<>(Math.min(limit, listed.size()));
+        for (RequestStatus status : listed.tailMap(after, false).values()) {
+            if (page.size() == limit) {
+                break;
+            }
+            page.add(status);
+        }
+        Optional<Long> next = page.size() == limit
+                && listed.higherKey(page.getLast().id()) != null
+            ? Optional.of(page.getLast().id())
+            : Optional.empty();
+        return new RequestPage(page, listed.size(), next);
     }
 
     private static Map<Long, RequestStatus> statusesIn(Collection<Long> ids,

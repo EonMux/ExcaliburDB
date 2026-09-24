@@ -145,7 +145,7 @@ class RouteMethodSweepTest {
         Map<String, String> allowByRequest = new LinkedHashMap<>();
         allowByRequest.put("GET /v1/erasure", "POST");
         allowByRequest.put("PUT /v1/erasure/receipt-1", "GET");
-        allowByRequest.put("GET /v1/graph/erasure", "POST");
+        allowByRequest.put("PUT /v1/graph/erasure", "GET, POST");
         allowByRequest.put("DELETE /v1/graph/erasure/5", "GET");
         allowByRequest.put("GET /v1/graph/facts", "DELETE, POST");
         allowByRequest.put("POST /v1/graph/facts/7", "DELETE");
@@ -164,6 +164,12 @@ class RouteMethodSweepTest {
         }
         assertThat(anonymous("GET", "/v1/graph/entities/1/edges").statusCode())
             .as("a served method on a deep entity path reaches authentication")
+            .isEqualTo(401);
+        assertThat(anonymous("GET", "/v1/graph/erasure").statusCode())
+            .as("listing the obligations is served, and guarded")
+            .isEqualTo(401);
+        assertThat(anonymous("DELETE", "/v1/graph/facts").statusCode())
+            .as("retracting by triple is served, and guarded")
             .isEqualTo(401);
         assertThat(anonymous("DELETE", "/v1/graph/facts/7/again").statusCode())
             .as("anything deeper than a member is not a route")

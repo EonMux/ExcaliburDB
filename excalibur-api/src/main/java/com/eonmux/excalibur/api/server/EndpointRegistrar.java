@@ -24,6 +24,7 @@ import com.eonmux.excalibur.api.endpoint.GraphBuildRunner;
 import com.eonmux.excalibur.api.endpoint.GraphBuildStatusEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphEntitiesEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphErasureEndpoint;
+import com.eonmux.excalibur.api.endpoint.GraphErasureListEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphErasureStatusEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphFactsEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespaceCreateEndpoint;
@@ -1163,13 +1164,21 @@ final class EndpointRegistrar {
                     new GraphBuildStatusEndpoint(graphBuildRunner, graphAutoBuilder))),
                 notFound)));
             // One context for the collection and its members: POST on the collection records an
-            // obligation, GET on a member reads back where one stands. The readback is a read, so
-            // polling a deadline is not rationed against the mutate budget.
+            // obligation and GET on it lists them, GET on a member reads back where one stands.
+            // Both reads are reads, so polling a deadline is not rationed against the mutate
+            // budget.
             target.createContext("/v1/graph/erasure", wrapHandler(
                 collectionAndMember("/v1/graph/erasure",
-                    onlyMethod("POST", audited("erasure.graph",
-                        guard.protect(RequestGuard.Access.MUTATE,
-                            new GraphErasureEndpoint(in.graphTenants())))),
+                    createMethodRouter(
+                        Map.of(
+                            "POST", audited("erasure.graph",
+                                guard.protect(RequestGuard.Access.MUTATE,
+                                    new GraphErasureEndpoint(in.graphTenants()))),
+                            "GET", guard.protect(RequestGuard.Access.READ,
+                                new GraphErasureListEndpoint(in.graphTenants()))),
+                        guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
+                            "Method Not Allowed - Use POST /v1/graph/erasure to record an "
+                                + "obligation or GET to list them"))),
                     onlyMethod("GET", guard.protect(RequestGuard.Access.READ,
                         new GraphErasureStatusEndpoint(in.graphTenants()))),
                     notFound)));

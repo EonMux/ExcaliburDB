@@ -110,6 +110,8 @@ class EndpointBannerTest {
             assertThat(lines).anyMatch(line -> line.contains("/v1/graph/build"));
             assertThat(lines).anyMatch(line -> line.contains("/v1/graph/erasure"));
             assertThat(lines).anyMatch(line -> line.contains("GET")
+                && line.contains("/v1/graph/erasure "));
+            assertThat(lines).anyMatch(line -> line.contains("GET")
                 && line.contains("/v1/graph/namespaces "));
             assertThat(lines).anyMatch(line -> line.contains("DELETE")
                 && line.contains("/v1/graph/namespaces/{namespace}"));

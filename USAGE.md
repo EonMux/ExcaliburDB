@@ -455,6 +455,7 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `DELETE` | `/v1/graph/build` | bearer | Stop the build in progress. It publishes nothing; the namespace keeps the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | What the build is doing, what the last one published, whether the served graph is behind what is staged, and what the node's automatic build is doing about it |
 | `POST` | `/v1/graph/erasure` | bearer | Record an obligation to erase, and compact when it is due. `404` for an entity, by name or `entity_id`, that nothing in the namespace holds, and nothing is recorded |
+| `GET` | `/v1/graph/erasure` | bearer | The namespace's outstanding and recently discharged erasure obligations, a page at a time (`state`, `limit`, default 100, at most 1000; `cursor`) |
 | `GET` | `/v1/graph/erasure/{request_id}` | bearer | Where one graph erasure obligation stands, in the namespace the header names |
 | `GET` | `/v1/graph/namespaces` | bearer | The namespaces on disk, a page at a time (`limit`, default 100, at most 1000; `cursor`): whether each is open, whether it has built a graph, what it has staged, whether its graph is behind that, and what it still owes |
 | `PUT` | `/v1/graph/namespaces/{namespace}` | bearer | Create a namespace. `201` when created, `200` when it already existed; `429 namespace_limit_reached` past `excalibur.graph.max-namespaces` |
@@ -476,12 +477,12 @@ single-method routes as much as for the ones that answer two or three methods: `
 `DELETE /v1/ingest/run`, `GET /v1/ingest/status`, `GET /v1/documents/list`,
 `GET /v1/reindex/status`, `POST /v1/erasure`, `GET /v1/erasure/{request_id}`,
 `GET /v1/compact/status`, `POST /v1/graph/query`, `GET /v1/graph/entities` and every path beneath
-it, `GET /v1/graph/build/status`, `POST /v1/graph/erasure` and `GET /v1/graph/erasure/{request_id}`
-each answer any other method with `405` rather than `401`, and a wrong method on a mutating route
+it, `GET /v1/graph/build/status`, `POST` and `GET /v1/graph/erasure` and
+`GET /v1/graph/erasure/{request_id}` each answer any other method with `405` rather than `401`, and a wrong method on a mutating route
 costs a read, not a mutation. A collection and its members are separate paths with separate
 methods: `/v1/query` serves `POST` and `/v1/query/{query_id}` serves `DELETE`, so `DELETE /v1/query`
-with no id is a `405` naming `POST`; `/v1/erasure` and `/v1/graph/erasure` serve `POST` and their
-members `GET`; `/v1/graph/facts` serves `POST` and `DELETE` (by subject, relation and object) and
+with no id is a `405` naming `POST`; `/v1/erasure` serves `POST` and its members `GET`;
+`/v1/graph/erasure` serves `POST` and `GET` (the listing) and its members `GET`; `/v1/graph/facts` serves `POST` and `DELETE` (by subject, relation and object) and
 `/v1/graph/facts/{fact_id}` serves `DELETE`;
 `/v1/graph/namespaces` serves `GET` and `/v1/graph/namespaces/{namespace}` serves `PUT` and
 `DELETE`, so a `DELETE` of the collection or a `GET` of one namespace is a `405` as well. A path
@@ -1759,6 +1760,32 @@ are per namespace — and answers `pending` or `discharged`, with `requested_at_
 requests of each namespace keep that detail; an older one still answers `discharged`, with its
 scope and timestamps null and `detail_retained: false`. An id the namespace never issued, or a
 namespace that does not exist, is `404`.
+
+A caller that does not hold the ids lists them instead, with the same header:
+
+```bash
+curl 'http://localhost:8080/v1/graph/erasure?state=pending&limit=100' \
+  -H 'X-Excalibur-Namespace: acme'
+```
+
+```json
+{"namespace": "acme",
+ "requests": [{"request_id": 7, "state": "pending", "scope": "entity", "entity_id": 42,
+               "requested_at_ms": 1756649000000, "discharged_at_ms": null,
+               "detail_retained": true}],
+ "count": 1, "total": 1, "next_cursor": null}
+```
+
+Each request is spelled exactly as the member route spells it, in id order — the order they were
+accepted. `state` narrows the listing to `pending` or `discharged`; absent, it holds both. `limit`
+is 100 by default and at most 1000, and a larger one is refused rather than trimmed; `cursor`
+continues after the previous page's `next_cursor`, which is `null` on the last page, and `total`
+counts the whole listing. It holds every outstanding obligation and the 1024 most recently
+discharged — those whose scope and timestamps the log still keeps; an older one is not listed,
+though its id still answers `discharged`. Nothing listed carries a name, only the ids a scope is
+recorded by. A namespace that does not exist lists nothing, as one that never owed anything does,
+and asking opens or creates nothing. **Error — `400`** — a `state`, `limit` or `cursor` that is
+not one of those, or an unusable namespace header.
 
 ---
 
