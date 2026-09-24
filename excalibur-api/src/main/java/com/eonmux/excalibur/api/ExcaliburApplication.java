@@ -315,6 +315,7 @@ public final class ExcaliburApplication {
         // precedence -- and the setting it most affects is the auth token.
         this.apiSecurity = ApiSecurityConfig.fromConfig(config);
         this.apiSecurity.requireSafeToServe();
+        ApiSecurityConfig.reportTokenFromFile(config);
         LOGGER.info("API security policy: {}", apiSecurity);
 
         // Initialize data directory

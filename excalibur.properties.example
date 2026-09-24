@@ -56,7 +56,8 @@ excalibur.api.shutdown-timeout-seconds=30
 # refuses to start rather than serving the network unauthenticated or in cleartext.
 excalibur.api.bind-address=127.0.0.1
 # Never set the auth token here. Supply it as the EXCALIBUR_API_AUTH_TOKEN environment
-# variable, which is the environment override of this key. Setting it turns authentication on:
+# variable, which is the environment override of this key; a token set here works, and the node
+# warns about it at every start. Setting it turns authentication on:
 # every endpoint except GET /health and GET /health/ready then requires it as a bearer token (a
 # method a path does not serve is still answered 405 without one). Unset, the API is unauthenticated -- which is safe only
 # because the bind policy above will not let it listen anywhere but loopback without one.

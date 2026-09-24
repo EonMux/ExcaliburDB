@@ -2,9 +2,11 @@ package com.eonmux.excalibur.config;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 
@@ -104,6 +106,23 @@ final class EnvOverrides {
             }
         });
         return prefixed;
+    }
+
+    /**
+     * The keys the environment sets: those of every <code>EXCALIBUR_*</code> variable that is
+     * not empty, and so overrides the file.
+     *
+     * @param environment Environment variables, keyed by variable name
+     * @return The keys, whether or not anything reads them
+     */
+    static Set<String> overriddenKeys(Map<String, String> environment) {
+        Set<String> keys = new HashSet<>();
+        prefixed(environment).forEach((name, value) -> {
+            if (value != null && !value.isBlank()) {
+                keys.add(toPropertyKey(name));
+            }
+        });
+        return keys;
     }
 
     /**

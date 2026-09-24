@@ -307,6 +307,26 @@ class ConfigLoaderTest {
         }
 
         @Test
+        @DisplayName("records which keys the environment supplied")
+        void recordsWhichKeysTheEnvironmentSupplied() throws IOException {
+            Files.writeString(configFile, """
+                excalibur.query.top-k-default=7
+                excalibur.llm.api-key=from-the-file
+                excalibur.llm.chat-model=from-the-file
+                """);
+
+            Config config = ConfigLoader.load(configFile.toString(), Map.of(
+                "EXCALIBUR_QUERY_TOP_K_DEFAULT", "9",
+                "EXCALIBUR_LLM_API_KEY", ""));
+
+            assertThat(config.isSetByEnvironment("excalibur.query.top-k-default")).isTrue();
+            assertThat(config.isSetByEnvironment("excalibur.llm.api-key"))
+                .as("an empty variable overrides nothing, so the value is still the file's")
+                .isFalse();
+            assertThat(config.isSetByEnvironment("excalibur.llm.chat-model")).isFalse();
+        }
+
+        @Test
         @DisplayName("an empty variable for a key the file does not set leaves the default")
         void anEmptyVariableLeavesTheDefault() throws IOException {
             Files.writeString(configFile, "excalibur.visibility.epoch-tick-ms=100\n");

@@ -843,7 +843,7 @@ it does read.
 | `excalibur.health.healthy-threshold` | 0.9 | The same check at a higher bar, reported as `healthy`. 0.0 to 1.0 |
 | `excalibur.health.max-latency-ms` | 5000 | A `/health` response slower than this reports `healthy: false`. 100 to 60000 |
 | `excalibur.health.min-free-disk-ratio` | 0.05 | `/health/ready` answers 503 with `disk` in `failed` below this share of volume capacity being free — the point past which a compaction's replacement segment can no longer be relied on to fit. 0.0 to 1.0 |
-| `excalibur.api.auth-token` | _(none)_ | Bearer token. Supply as `EXCALIBUR_API_AUTH_TOKEN`, not in this file |
+| `excalibur.api.auth-token` | _(none)_ | Bearer token. Supply as `EXCALIBUR_API_AUTH_TOKEN`, not in this file; one read from the file works, with a warning at startup |
 | `excalibur.api.bind-address` | `127.0.0.1` | Interface to bind. Anything else also requires an auth token and TLS |
 | `excalibur.api.allow-plaintext` | `false` | Permit a non-loopback bind without TLS, for a proxy that terminates it |
 | `excalibur.api.tls-keystore` | _(none)_ | Keystore with the server certificate and key. Setting it enables TLS |
@@ -1868,6 +1868,10 @@ Supply the token through the environment, never the properties file:
 ```bash
 export EXCALIBUR_API_AUTH_TOKEN='...'
 ```
+
+A token in the file still works - refusing it would break every deployment that already keeps it
+there - but the node logs a warning at startup for as long as the token is read from the file
+rather than the environment.
 
 ```
 Authorization: Bearer <token>

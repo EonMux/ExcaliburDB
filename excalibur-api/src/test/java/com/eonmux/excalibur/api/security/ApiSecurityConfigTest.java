@@ -375,6 +375,44 @@ class ApiSecurityConfigTest {
         }
     }
 
+    @Nested
+    @DisplayName("Where the token came from")
+    class TokenSource {
+
+        private List<String> warningsFor(Config config) throws Exception {
+            return warningsFrom(ApiSecurityConfig.class.getName(),
+                () -> ApiSecurityConfig.reportTokenFromFile(config));
+        }
+
+        @Test
+        @DisplayName("a token read from the properties file is accepted, with a warning")
+        void fileTokenWarns() throws Exception {
+            Config config = new Config("excalibur.properties", Map.of(),
+                Map.of(ApiSecurityConfig.KEY_AUTH_TOKEN, "in-the-file"));
+
+            assertThat(ApiSecurityConfig.fromConfig(config).isAuthenticationRequired()).isTrue();
+            assertThat(warningsFor(config)).anyMatch(message ->
+                message.contains(ApiSecurityConfig.KEY_AUTH_TOKEN)
+                    && message.contains("EXCALIBUR_API_AUTH_TOKEN"));
+        }
+
+        @Test
+        @DisplayName("a token from the environment draws no warning, even over one in the file")
+        void environmentTokenIsQuiet() throws Exception {
+            Config config = new Config("excalibur.properties",
+                Map.of("EXCALIBUR_API_AUTH_TOKEN", "from-env"),
+                Map.of(ApiSecurityConfig.KEY_AUTH_TOKEN, "in-the-file"));
+
+            assertThat(warningsFor(config)).isEmpty();
+        }
+
+        @Test
+        @DisplayName("no token draws no warning here")
+        void noTokenIsQuiet() throws Exception {
+            assertThat(warningsFor(new Config(new HashMap<>()))).isEmpty();
+        }
+    }
+
     /** Something that may throw, run while a logger's output is captured. */
     @FunctionalInterface
     private interface Action {

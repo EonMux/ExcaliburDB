@@ -4,6 +4,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Configuration data class representing all ExcaliburDB settings.
@@ -46,6 +47,9 @@ public final class Config {
     /** The file's properties with the environment applied; see {@link #getEffectiveProperties()}. */
     private final Map<String, String> effectiveProperties;
 
+    /** The keys whose effective value an environment variable supplied. */
+    private final Set<String> environmentKeys;
+
     /**
      * Creates a new Config instance from a properties map.
      *
@@ -85,6 +89,8 @@ public final class Config {
         Map<String, String> effectiveProps = EnvOverrides.apply(props,
             envOverrides != null ? envOverrides : Collections.emptyMap());
         this.effectiveProperties = Collections.unmodifiableMap(new HashMap<>(effectiveProps));
+        this.environmentKeys = Set.copyOf(EnvOverrides.overriddenKeys(
+            envOverrides != null ? envOverrides : Collections.emptyMap()));
         this.visibility = new VisibilityConfig(effectiveProps);
         this.ingest = new IngestConfig(effectiveProps);
         this.health = new HealthConfig(effectiveProps);
@@ -157,6 +163,20 @@ public final class Config {
      */
     public Map<String, String> getEffectiveProperties() {
         return effectiveProperties;
+    }
+
+    /**
+     * Whether the key's effective value came from an {@code EXCALIBUR_*} variable rather than the
+     * properties file.
+     *
+     * <p>For a setting whose source matters as much as its value: a secret belongs in the
+     * environment, and one read from the file is worth a word at startup even though it works.</p>
+     *
+     * @param key A property key
+     * @return true if a variable that is not empty set it
+     */
+    public boolean isSetByEnvironment(String key) {
+        return environmentKeys.contains(key);
     }
 
     @Override
