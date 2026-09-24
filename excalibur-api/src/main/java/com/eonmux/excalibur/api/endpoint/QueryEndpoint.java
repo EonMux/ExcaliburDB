@@ -752,7 +752,7 @@ public class QueryEndpoint implements HttpHandler {
             long retrievalDeadlineNanos = System.nanoTime()
                 + TimeUnit.MILLISECONDS.toNanos(budgetMs);
             QueryRequest pipelineRequest = pipelineQuery(context, parsed, plan, candidates)
-                .toRequest(vector, request.correlationId(), budgetMs);
+                .toRequest(vector, request.correlationId(), budgetMs, limits.maxTopK());
             CompletableFuture<QueryResponse> future =
                 queryPipeline.execute(pipelineRequest, pipelineToken);
 
@@ -773,7 +773,8 @@ public class QueryEndpoint implements HttpHandler {
                 }
                 HybridResponse fusedAnswer = new HybridResponse(
                     response.withQueryTimeMs(request.elapsedMs()), hits, scored.ranking(),
-                    fused.size() < candidates, scored.scored(), scored.fellBack(),
+                    fused.size() < candidates && response.retrievalExhausted(),
+                    scored.scored(), scored.fellBack(),
                     scored.timedOut());
                 // Refused by the cache unless the search reached the whole corpus it
                 // meant to, inside its deadline, against the corpus it was fingerprinted
@@ -876,9 +877,9 @@ public class QueryEndpoint implements HttpHandler {
      * <p>The pipeline was asked for the fused candidate set unscored, and then BM25 produced
      * nothing to fuse. The candidates are scored here instead, so a request that asked for
      * relevancy scoring gets it whichever signal ended up answering, and are cut to the page's
-     * depth either way. Whether retrieval ran out of candidates is then this method's to say:
-     * the pipeline was asked for the candidate set, and a set shorter than that was
-     * everything there was.</p>
+     * depth either way. Whether retrieval ran out of candidates stays the pipeline's to say: it
+     * was asked for the candidate set, and it alone knows whether a set shorter than that was
+     * everything there was or where a bound stopped it.</p>
      *
      * @param response      What the pipeline produced
      * @param plan          How this request is scored here, {@code NONE} when the pipeline did
@@ -902,7 +903,6 @@ public class QueryEndpoint implements HttpHandler {
         }
         return response.withResults(scored.ranking())
             .withLlmScored(scored.scored())
-            .withRetrievalExhausted(response.results().size() < plan.candidates(depth))
             .withCoverage(response.coverage().orDegraded(scored.degraded()))
             .withTimedOut(response.timedOut() || scored.timedOut())
             .withQueryTimeMs(request.elapsedMs());
@@ -962,11 +962,12 @@ public class QueryEndpoint implements HttpHandler {
      * ones.
      *
      * <p>A search that was cut short cannot establish that there was nothing more to find, so
-     * its total is a floor however many results it came back with. A relevancy-scored answer
-     * can, when retrieval had run out of candidates: its threshold then chose from everything
-     * there was, so a short list is the whole of what passed. When retrieval had not, a short
-     * list says only that few of the candidates passed, not that nothing past them would
-     * have.</p>
+     * its total is a floor however many results it came back with. Otherwise a short answer is
+     * the end of the matches only when retrieval ran out of candidates - which the pipeline
+     * reports, having ranked deeper past any documents it withheld until the answer was full or
+     * the segments ran dry. A short list it did not run out on - stopped by its depth ceiling,
+     * or narrowed by a relevancy threshold, or by results it could not name - says only that
+     * few of the candidates made it, not that nothing past them would have.</p>
      *
      * @param exchange The request to answer
      * @param response The vector answer, searched or held
@@ -976,7 +977,7 @@ public class QueryEndpoint implements HttpHandler {
     private void sendVector(HttpExchange exchange, QueryResponse response, Request request)
             throws IOException {
         QueryContext context = request.context();
-        boolean complete = (!response.llmScored() || response.retrievalExhausted())
+        boolean complete = response.retrievalExhausted()
             && ResultTotal.searchWasComplete(
                 response.coverage(), response.timedOut(), response.cancelled());
         List<QueryResultItem> produced = response.results();

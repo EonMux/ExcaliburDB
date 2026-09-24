@@ -199,9 +199,13 @@ public final class QueryRequestParser {
          * @param correlationId Correlation ID for logging
          * @param budgetMs      What is left of the request's timeout, which is what the pipeline
          *                      has to work with rather than the timeout as asked for
+         * @param maxDepth      The deepest the pipeline may rank to fill the answer past
+         *                      documents it withholds - the node's {@code max-top-k}, the bound
+         *                      on how deep any page may reach
          * @return The pipeline request
          */
-        public QueryRequest toRequest(float[] vector, String correlationId, long budgetMs) {
+        public QueryRequest toRequest(float[] vector, String correlationId, long budgetMs,
+                                      int maxDepth) {
             return QueryRequest.builder()
                 .queryText(query)
                 .queryVector(vector)
@@ -216,6 +220,7 @@ public final class QueryRequestParser {
                 // A client can only use a result it can name: the node id a result falls back
                 // to without one is renumbered by compaction and names nothing it can fetch.
                 .requireNamedResults(true)
+                .maxSearchDepth(Math.min(maxDepth, QueryRequest.MAX_TOP_K))
                 .build();
         }
     }

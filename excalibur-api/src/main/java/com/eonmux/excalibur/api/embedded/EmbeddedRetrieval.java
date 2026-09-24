@@ -192,6 +192,7 @@ final class EmbeddedRetrieval {
                 .oversamplingFactor(QueryOptions.DEFAULT_OVERSAMPLING_FACTOR)
                 // A hit an embedder cannot name is one it cannot fetch or erase.
                 .requireNamedResults(true)
+                .maxSearchDepth(Math.min(limits.maxTopK(), QueryRequest.MAX_TOP_K))
                 .build();
             QueryResponse response = pipeline.execute(request, token)
                 .get(budgetMs + PIPELINE_RESPONSE_GRACE_MILLIS, TimeUnit.MILLISECONDS);

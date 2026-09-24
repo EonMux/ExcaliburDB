@@ -82,6 +82,11 @@ class QueryPaginationTest {
         return new QueryResponse(items, coverage, 12L, false, false);
     }
 
+    /** What a search of the whole corpus that ran out of matches answers with. */
+    private static QueryResponse ranOut(int hits) {
+        return answerOf(hits, whole()).withRetrievalExhausted(true);
+    }
+
     private String answer(String requestJson, QueryResponse pipelineAnswer) throws IOException {
         ByteArrayOutputStream body = new ByteArrayOutputStream();
         HttpExchange exchange = exchange(requestJson, body);
@@ -117,14 +122,14 @@ class QueryPaginationTest {
     }
 
     /**
-     * The engine was asked for ten and produced three, so there is no eleventh it declined to
-     * mention: it ran out of matches. That is the one case where the count is a fact rather
+     * The engine was asked for ten, produced three and says it ran out of matches, so there is
+     * no eleventh it declined to mention. That is the one case where the count is a fact rather
      * than a floor, and saying "exact" is what lets a caller render "3 results" at all.
      */
     @Test
     @DisplayName("a page the engine could not fill reports an exact total")
     void anUnfilledPageIsAnExactTotal() throws IOException {
-        String json = answer("{\"query\": \"oom\", \"top_k\": 10}", answerOf(3, whole()));
+        String json = answer("{\"query\": \"oom\", \"top_k\": 10}", ranOut(3));
 
         assertThat(json).contains("\"result_total\": {\"value\": 3, \"relation\": \"exact\"}");
     }
@@ -163,7 +168,7 @@ class QueryPaginationTest {
     @Test
     @DisplayName("an empty answer from a whole-corpus search reports an exact zero")
     void anEmptyWholeCorpusAnswerIsExactlyZero() throws IOException {
-        String json = answer("{\"query\": \"oom\", \"top_k\": 10}", answerOf(0, whole()));
+        String json = answer("{\"query\": \"oom\", \"top_k\": 10}", ranOut(0));
 
         assertThat(json).contains("\"result_total\": {\"value\": 0, \"relation\": \"exact\"}");
     }
@@ -202,7 +207,7 @@ class QueryPaginationTest {
     @DisplayName("an offset past the end returns an empty page and no next offset")
     void anOffsetPastTheEndIsEmpty() throws IOException {
         String json = answer("{\"query\": \"oom\", \"top_k\": 2, \"offset\": 8}",
-            answerOf(3, whole()));
+            ranOut(3));
 
         assertThat(json).contains("\"returned\": 0, \"next_offset\": null");
         assertThat(json).contains("\"result_total\": {\"value\": 3, \"relation\": \"exact\"}");

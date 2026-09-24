@@ -3596,10 +3596,14 @@ The system uses epoch-based visibility tracking to ensure:
 Document atomicity holds on every route that answers from the corpus, not only vector search. A
 BM25 answer, both halves of a hybrid one, and the embedded node's searches leave out the chunks of
 a document that is in flight or was published after the query began, by the same rule the vector
-pipeline applies. Withholding does not shorten an answer: a lexical search that left hits out ranks
-deeper and fills `top_k` from below them, so `next_offset` and an `exact` `result_total` still mean
-what they say, and the extra depth grows with how much of the corpus is being rewritten at that
-moment rather than with its size. Text is read back the same way: a result's `text`, and a chunk
+pipeline applies. Withholding does not shorten an answer: a vector or lexical search that left hits
+out ranks deeper and fills `top_k` from below them, so `next_offset` and an `exact` `result_total`
+still mean what they say, and the extra depth grows with how much of the corpus is being rewritten
+at that moment rather than with its size. Each deeper round is at least twice as deep as the last
+and runs only when something was withheld; a vector round searches the same snapshot again inside
+the request's deadline, with each segment's beam (`ef`) and its LSH-named candidates measured
+against the new depth, and never deeper than `excalibur.api.max-top-k`. A round the deadline
+catches is dropped, and the answer it leaves is marked timed out with an `at_least` total. Text is read back the same way: a result's `text`, and a chunk
 read through `GET /v1/documents`, `POST /v1/documents/fetch` or `GET /v1/documents/list`, is `null`
 while its document is being rewritten, rather than part of one version and part of the next. The
 listing's own fields - chunk ids, count and content hash - come from the document registry, which

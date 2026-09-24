@@ -1883,8 +1883,10 @@ Key fields:
   threshold shortened is `exact` only when retrieval had also run out of candidates; otherwise its
   total is `at_least`, because the model judged only the candidates it was shown.
   A document being rewritten is left out of every answer until its new version is published, and
-  a BM25 or hybrid search that left one out fills the page from the matches below it, so neither
-  a short page nor an `exact` total is caused by withholding.
+  a vector, BM25 or hybrid search that left one out fills the page from the matches below it —
+  ranking deeper, no deeper than `excalibur.api.max-top-k` and inside the request's deadline — so
+  neither a short page nor an `exact` total is caused by withholding. A vector answer is `exact`
+  only when every segment ran out of matches before the depth it was asked for.
 - **`explain`** (per result, only with `"explain": true`) — `signals` gives each contributing
   signal's own `rank` (absolute, from the start of the whole ranking, not of the page) and `score`
   **on that signal's own scale**: a similarity for `vector`, and for `bm25` whatever the lexical
