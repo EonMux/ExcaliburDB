@@ -3577,6 +3577,18 @@ The system uses epoch-based visibility tracking to ensure:
   rewritten, by a re-post or a reindex, is withheld until its new version is published whole
 - Monotonic epoch advancement
 
+Document atomicity holds on every route that answers from the corpus, not only vector search. A
+BM25 answer, both halves of a hybrid one, and the embedded node's searches leave out the chunks of
+a document that is in flight or was published after the query began, by the same rule the vector
+pipeline applies. Withholding does not shorten an answer: a lexical search that left hits out ranks
+deeper and fills `top_k` from below them, so `next_offset` and an `exact` `result_total` still mean
+what they say, and the extra depth grows with how much of the corpus is being rewritten at that
+moment rather than with its size. Text is read back the same way: a result's `text`, and a chunk
+read through `GET /v1/documents`, `POST /v1/documents/fetch` or `GET /v1/documents/list`, is `null`
+while its document is being rewritten, rather than part of one version and part of the next. The
+listing's own fields - chunk ids, count and content hash - come from the document registry, which
+only ever holds a whole published version, and are served throughout.
+
 ## Development
 
 ### Project Structure
