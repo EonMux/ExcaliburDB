@@ -10,6 +10,7 @@ import com.eonmux.excalibur.backup.manifest.ManifestCodec;
 import com.eonmux.excalibur.backup.manifest.SnapshotManifest;
 import com.eonmux.excalibur.core.datadir.DataDirectoryLock;
 import com.eonmux.excalibur.core.datadir.DataDirectoryLockedException;
+import com.eonmux.excalibur.core.datadir.FilesystemEntries;
 import com.eonmux.excalibur.core.datadir.InterruptedRestore;
 import com.eonmux.excalibur.core.datadir.LockHolder;
 import com.eonmux.excalibur.store.catalog.CatalogFile;
@@ -279,7 +280,10 @@ public final class SnapshotWriter {
      *
      * <p>A snapshot is never a merge. A destination holding files from an earlier image
      * would produce a directory the manifest describes only part of, and verification
-     * would then be reporting on a mixture.</p>
+     * would then be reporting on a mixture. The {@code lost+found} of a volume mounted there is
+     * the filesystem's rather than an earlier image's ({@link FilesystemEntries}), so a freshly
+     * made backup volume is an empty destination; the image is written beside it and never
+     * reads it.</p>
      *
      * @param destination Where the image is to go
      * @throws SnapshotRefusedException if it exists and is not empty
@@ -295,7 +299,7 @@ public final class SnapshotWriter {
                 + " is a file");
         }
         try (var entries = Files.list(destination)) {
-            if (entries.findAny().isPresent()) {
+            if (entries.anyMatch(entry -> !FilesystemEntries.isFilesystemEntry(entry))) {
                 throw new SnapshotRefusedException(
                     SnapshotRefusedException.Reason.DESTINATION_NOT_EMPTY,
                     destination + " already holds something. A snapshot never merges into an "

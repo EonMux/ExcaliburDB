@@ -11,8 +11,10 @@ import com.eonmux.excalibur.backup.snapshot.SnapshotLayout;
 import com.eonmux.excalibur.backup.verify.Problem;
 import com.eonmux.excalibur.backup.verify.SnapshotVerifier;
 import com.eonmux.excalibur.backup.verify.VerificationReport;
+import com.eonmux.excalibur.core.datadir.DataDirectoryContents;
 import com.eonmux.excalibur.core.datadir.DataDirectoryLock;
 import com.eonmux.excalibur.core.datadir.DataDirectoryLockedException;
+import com.eonmux.excalibur.core.datadir.FilesystemEntries;
 import com.eonmux.excalibur.core.datadir.ReservedNames;
 import com.eonmux.excalibur.store.ObsoleteSidecars;
 
@@ -41,6 +43,14 @@ import java.util.Optional;
  * someone else and a sibling would sit on another filesystem, where no rename reaches. Only the
  * target has to be writable, and only the target's filesystem needs room for the image beside
  * what it holds.</p>
+ *
+ * <h2>What in the target is the filesystem's</h2>
+ * <p>A target that is the root of a mounted volume holds that filesystem's {@code lost+found}
+ * ({@link FilesystemEntries}), owned by root and movable by no one else. It is not the store's,
+ * so it is never moved aside or replaced, it does not make the target hold anything, and it
+ * stays where it is through the restore, an unwinding and the recovery of an interrupted one. An
+ * image never carries one; if an image an earlier build took does, it is verified with the rest
+ * of the image and then not written, since the target's filesystem has its own.</p>
  *
  * <h2>The target has one owner while this runs</h2>
  * <p>The restore takes the target's {@link DataDirectoryLock} before it writes anything and
@@ -301,7 +311,7 @@ public final class SnapshotRestorer {
      */
     private void displace(Path target, RestoreJournal journal) throws IOException {
         Path displaced = Files.createDirectories(journal.displacedIn(target));
-        moveEntries(target, displaced);
+        moveEntries(DataDirectoryContents.entries(target), displaced);
         AtomicPublish.syncDirectory(displaced);
         AtomicPublish.syncDirectory(target);
     }
@@ -314,7 +324,7 @@ public final class SnapshotRestorer {
      * @throws IOException if an entry will not move
      */
     private void installStaged(Path target, RestoreJournal journal) throws IOException {
-        moveEntries(journal.stagingIn(target), target);
+        moveEntries(scratchEntries(journal.stagingIn(target)), target);
         AtomicPublish.syncDirectory(target);
     }
 
@@ -371,11 +381,11 @@ public final class SnapshotRestorer {
         RestoreJournal undisplacing = journal;
         if (journal.phase() == RestoreJournal.Phase.UNINSTALLING) {
             Files.createDirectories(journal.stagingIn(target));
-            moveEntries(target, journal.stagingIn(target));
+            moveEntries(DataDirectoryContents.entries(target), journal.stagingIn(target));
             undisplacing = journal.at(RestoreJournal.Phase.UNDISPLACING);
             undisplacing.write(target);
         }
-        moveEntries(undisplacing.displacedIn(target), target);
+        moveEntries(scratchEntries(undisplacing.displacedIn(target)), target);
         AtomicPublish.syncDirectory(target);
         AtomicPublish.deleteTree(undisplacing.stagingIn(target));
         AtomicPublish.deleteTree(undisplacing.displacedIn(target));
@@ -383,22 +393,34 @@ public final class SnapshotRestorer {
     }
 
     /**
-     * Moves every entry of one directory into another, leaving out the reserved entries of a
-     * target: its lock, its journal and the restore's own scratch.
+     * Lists every entry of one of a restore's scratch directories.
      *
-     * @param from The directory emptied; nothing happens if it is absent
-     * @param to   The directory filled
-     * @throws IOException if an entry will not move
+     * <p>Everything in it is the restore's to move: the staged image, or what the target held
+     * before, which was listed without the target's reserved entries and its filesystem's own.
+     * The reserved names are still left out, as they were of every listing before this one.</p>
+     *
+     * @param scratch The directory; nothing is listed if it is absent
+     * @return Its entries, in name order
+     * @throws IOException if it cannot be listed
      */
-    private void moveEntries(Path from, Path to) throws IOException {
-        if (!Files.isDirectory(from)) {
-            return;
+    private static List<Path> scratchEntries(Path scratch) throws IOException {
+        if (!Files.isDirectory(scratch)) {
+            return List.of();
         }
-        List<Path> entries;
-        try (var listing = Files.list(from)) {
-            entries = listing.filter(entry ->
+        try (var listing = Files.list(scratch)) {
+            return listing.filter(entry ->
                 !ReservedNames.isReserved(entry.getFileName().toString())).sorted().toList();
         }
+    }
+
+    /**
+     * Moves each of the given entries into a directory, under its own name.
+     *
+     * @param entries What to move
+     * @param to      The directory filled
+     * @throws IOException if an entry will not move
+     */
+    private void moveEntries(List<Path> entries, Path to) throws IOException {
         for (Path entry : entries) {
             mover.move(entry, to.resolve(entry.getFileName().toString()));
         }
@@ -486,8 +508,9 @@ public final class SnapshotRestorer {
     /**
      * Refuses a target that holds anything, unless told not to.
      *
-     * <p>The reserved entries do not count: a directory holding only the lock file a stopped
-     * node left is as empty as one that never held a node.</p>
+     * <p>The reserved entries do not count, and nor does a mounted filesystem's own directory: a
+     * directory holding only the lock file a stopped node left, or a freshly made volume holding
+     * only its {@code lost+found}, is as empty as one that never held a node.</p>
      *
      * @param target            The data directory to produce, which exists
      * @param overwriteNonEmpty Whether the operator asked for it to be replaced
@@ -496,11 +519,8 @@ public final class SnapshotRestorer {
      */
     private static void requireUsableTarget(Path target, boolean overwriteNonEmpty)
         throws IOException {
-        try (var entries = Files.list(target)) {
-            if (overwriteNonEmpty || entries.allMatch(entry ->
-                    ReservedNames.isReserved(entry.getFileName().toString()))) {
-                return;
-            }
+        if (overwriteNonEmpty || !DataDirectoryContents.holdsData(target)) {
+            return;
         }
         throw new RestoreRefusedException(RestoreRefusedException.Reason.TARGET_NOT_EMPTY,
             target + " is not empty. A restore replaces a data directory wholesale rather "
@@ -514,7 +534,10 @@ public final class SnapshotRestorer {
      * <p>An image an earlier build took carries each segment's term sketch,
      * {@code segment_N.tfs}, which nothing in this build reads. It is verified with the rest of
      * the image, since its bytes are part of what the image certifies, and then left out of the
-     * restored directory rather than written where the node would remove it as it starts.</p>
+     * restored directory rather than written where the node would remove it as it starts. A file
+     * under {@code lost+found/}, which an earlier build could have copied from a volume whose
+     * {@code lost+found} it could read, is left out the same way: it was that filesystem's, and
+     * the target's filesystem has its own.</p>
      *
      * @param manifest What the image contains
      * @return The entries to write into the restored directory
@@ -523,6 +546,7 @@ public final class SnapshotRestorer {
         return manifest.files().stream()
             .filter(entry -> !ObsoleteSidecars.isObsolete(
                 entry.path().substring(entry.path().lastIndexOf('/') + 1)))
+            .filter(entry -> !FilesystemEntries.isWithinFilesystemEntry(entry.path()))
             .toList();
     }
 
