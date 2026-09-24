@@ -310,12 +310,11 @@ final class ToolArguments {
      * and returns them ready to forward.
      *
      * <p>For the arrays whose elements the node reads member by member - a supplied document, an
-     * asserted fact. Those routes ignore a member they do not read, so a misspelt one would reach
-     * the node as an absent one and the call would succeed without it: {@code "valid_until"}
-     * stages a fact that still holds, {@code "last_modified"} dates a document's facts on the day
-     * they are staged. Every member is therefore checked here, as {@link #requireKnown} checks a
-     * tool's own arguments: that it is declared, that a required one is present, and that its
-     * value has the declared type.</p>
+     * asserted fact. The node refuses a member those routes do not read, but only with a message
+     * about its own request body, after the call has gone out; checked here against the schema
+     * the tool advertised, the refusal names the argument and element the model wrote, as
+     * {@link #requireKnown} does for a tool's own arguments: that each member is declared, that a
+     * required one is present, and that its value has the declared type.</p>
      *
      * <p>A value is forwarded as written, with one exception: a whole number given as
      * {@code 5.0} or {@code "5"} is sent as {@code 5}, and a number given as {@code "0.5"} as

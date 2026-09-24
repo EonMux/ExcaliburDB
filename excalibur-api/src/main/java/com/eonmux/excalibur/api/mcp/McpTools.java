@@ -1476,10 +1476,10 @@ public final class McpTools {
 
     private ToolResult assertGraphFacts(Map<String, Object> args)
             throws IOException, InterruptedException {
-        // Each fact's members are checked against the schema here, since the route ignores one it
-        // does not read. What they say is the node's to judge: it cleans and bounds each fact
-        // exactly as it does an extracted one, and answers the first it refuses naming the fact
-        // and the field.
+        // Each fact's members are checked against the schema here, so a misspelt one is named in
+        // the tool's own terms before anything is sent. What they say is the node's to judge: it
+        // cleans and bounds each fact exactly as it does an extracted one, and answers the first
+        // it refuses naming the fact and the field.
         List<Object> facts = ToolArguments.optionalList(args, "facts");
         if (facts == null || facts.isEmpty()) {
             return ToolResult.error("'facts' is required and must carry at least one fact.");

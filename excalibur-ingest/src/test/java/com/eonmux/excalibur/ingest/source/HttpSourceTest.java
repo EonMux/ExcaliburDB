@@ -462,6 +462,9 @@ class HttpSourceTest {
             var docs = source.crawl().toList();
 
             assertThat(docs).hasSize(3);
+            // What the budget left unread may still be there: not a listing to delete by
+            assertThat(source.getListingGaps().isComplete()).isFalse();
+            assertThat(source.getListingGaps().describe()).contains("budget");
         }
 
         @Test
@@ -482,6 +485,7 @@ class HttpSourceTest {
 
             // Every leaf, and the hub the walk started from
             assertThat(docs).hasSize(HubHandler.LEAF_COUNT + 1).contains(baseUrl + "/hub/");
+            assertThat(source.getListingGaps().isComplete()).isTrue();
         }
     }
 

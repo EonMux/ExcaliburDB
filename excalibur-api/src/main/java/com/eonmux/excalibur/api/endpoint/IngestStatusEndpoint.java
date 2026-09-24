@@ -303,8 +303,10 @@ public class IngestStatusEndpoint implements HttpHandler {
          *
          * <p>Not {@link #lastUpdatedMs}: a run stopped, broken or cut short also updates the
          * status on its way out. This is what the re-crawl schedule of a source restored at
-         * startup counts its interval from, so it has to move only for a crawl whose listing was
-         * whole and whose documents were all dealt with.</p>
+         * startup counts its interval from, so it moves only for a crawl that went through every
+         * document its listing named, indexing or failing each. Failed documents and a listing with
+         * gaps do not hold it back: a run that ran to its end is retried on the interval, and only
+         * one that never did is due again at the first check after a restart.</p>
          */
         private volatile long lastCompletedMs;
 

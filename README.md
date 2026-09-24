@@ -2263,7 +2263,7 @@ rather than a silent clamp:
 | `charset` | filesystem | any encoding the JVM supports | The encoding a file without a byte-order mark is read in; UTF-8 when absent. A name the node cannot decode is a 400, not a silent fall-back to UTF-8. Recorded under its canonical name, which is what `GET /v1/ingest` shows. Refused on an HTTP crawl, whose responses each name their own encoding — see [What gets indexed](#what-gets-indexed) |
 | `included_path_patterns` | http | — | Substrings a URL path must contain to be crawled |
 | `excluded_path_patterns` | http | — | Substrings that keep a URL path out of the crawl; `/api`, `/admin`, `/login` and `/logout` when absent. Given, it replaces that list, and `[]` clears it. A registration whose patterns keep out the `base_url` page itself is a 400 naming the pattern, since the walk starts there and would list nothing |
-| `max_documents` | http | 1 – 10000000 | How many pages one crawl fetches |
+| `max_documents` | http | 1 – 10000000 | How many pages one crawl fetches. A crawl that reaches it has not listed the whole site, so a re-crawl keeps the indexed pages it did not reach rather than removing them |
 | `max_response_bytes` | http | 1 – 100 MiB | Largest single response body held; 10 MiB when absent. A larger body fails that document. The ceiling is the largest document the node indexes (see below) |
 | `timeout_seconds` | http | 1 – 600 | How long one request may take |
 | `user_agent` | http | ≤ 200 chars | What the crawl identifies itself as. Screened for header injection |

@@ -761,7 +761,7 @@ curl -X POST http://localhost:8080/v1/ingest \
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `max_depth` | integer | 3 | Link hops followed from the base URL, 0 to 1000 |
-| `max_documents` | integer | 10000 | Pages fetched before the crawl stops, 1 to 10000000 |
+| `max_documents` | integer | 10000 | Pages fetched before the crawl stops, 1 to 10000000. A crawl that stops here has not listed the whole site, so it is a [gap in the listing](#pages-whose-links-cannot-be-read): a re-crawl keeps the indexed pages it did not reach rather than removing them |
 | `max_response_bytes` | integer | 10485760 | Largest response body held, 1 byte to 100 MiB — the [largest document the node indexes](#document-size-limits). A larger body fails that page's document; it is never truncated |
 | `timeout_seconds` | integer | 30 | Budget for one request, 1 to 600 |
 | `included_path_patterns` | array of string | _(all)_ | A URL path must contain one of these substrings to be crawled. Plain substrings, not globs or regexes |
@@ -851,6 +851,12 @@ until a crawl reads it. On a re-crawl it decides what is removed — see
 [Re-index a source](#re-index-a-source) below. A page that answers `404`, `410` or any other
 `4xx`, redirects somewhere the crawl does not follow, or is not HTML did answer, links to nothing,
 and is no gap.
+
+A crawl that reaches `max_documents` is a gap too, named after the base URL
+(`"crawl budget of 10000 documents reached"`): the walk stopped with pages still to reach, and which
+pages fit inside the budget can change from one run to the next. So a source larger than its budget
+is never pruned by a re-crawl; raise the budget, or narrow the crawl with its path patterns, for
+removals to be taken up again.
 
 Settings that belong to the other source type are refused here with a `400` rather than accepted
 and ignored, in both directions: `included_extensions`, `excluded_directories`,

@@ -408,6 +408,10 @@ public class HttpSource implements Source {
             if (found.size() >= maxDocuments) {
                 LOG.warn("Crawl budget of {} documents reached for source {}; stopping walk",
                     maxDocuments, sourceId);
+                // Whatever the walk had yet to reach may still be served, and which pages fall
+                // inside the budget can differ from one run to the next. Read as a whole listing,
+                // this would delete every indexed page the walk stopped short of.
+                gaps.record(start, "crawl budget of " + maxDocuments + " documents reached");
                 break;
             }
 
