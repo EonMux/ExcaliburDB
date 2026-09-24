@@ -678,7 +678,12 @@ Register a source with `POST /v1/ingest`. Ingestion runs in the background after
 
 A registration lasts until it is cancelled, not until the process ends: it is written to
 `<data dir>/source-catalog` before the response is sent, and a restarted node puts every record
-back on the re-crawl schedule. Only `DELETE /v1/ingest` or a source-scoped erasure removes it.
+back on the re-crawl schedule without crawling it on the way up. Each source's interval runs on
+from its last crawl that ran to its end, as recorded in `<data dir>/source-status`, so restarting
+a node does not postpone its re-crawls; a source whose interval passed while the node was down,
+or whose first crawl the restart cut short, is re-crawled at the first check after startup, about
+a minute in, one source after another. Only `DELETE /v1/ingest` or a source-scoped erasure
+removes it.
 Registrations are restored through the same allow-lists a fresh request would meet, so a source
 whose root or host is no longer permitted is left on the catalog and not crawled, with a warning
 naming it at startup — allow the target again, or `DELETE /v1/ingest` to cancel it for good.
@@ -715,7 +720,7 @@ wherever the node was started.
 | `max_depth` | integer | 100 | Directory levels below the root to descend, 1 to 1000 |
 | `follow_symlinks` | bool | `false` | Whether the walk descends through symbolic links. A link whose real target lies outside the root is skipped whatever this is set to, so a link cannot be used to read a directory the allow-list does not permit |
 | `include_hidden` | bool | `false` | Whether dot-files are indexed. While `false`, the walk does not enter a dot-directory either, so `.config/notes.md` is left out with its directory. The root itself is never judged: registering `~/.notes` indexes what is in it |
-| `max_file_bytes` | integer | 104857600 | Largest single file read, 1 byte to 100 MiB — the [largest document the node indexes](#document-size-limits). A larger file is never listed or read, so it is neither indexed nor truncated |
+| `max_file_bytes` | integer | 104857600 | Largest single file read, 1 byte to 100 MiB — the [largest document the node indexes](#document-size-limits). A larger file is listed but never read, so it is neither indexed nor truncated; it counts in `documents_failed` |
 | `charset` | string | UTF-8 | The encoding a file is read in when it carries no byte-order mark, by any name or alias the JVM knows (`windows-1252`, `latin1`, `UTF-16LE`). A file that does carry a mark is read in the encoding the mark names, whatever is declared here: the mark was written by the program that encoded that file, the declaration by someone describing the whole directory. An unknown name is a `400`, never a quiet fall-back to UTF-8, and the name is stored and read back in its canonical form |
 
 A value outside its range is answered `400` rather than clamped: clamping would register the
@@ -856,17 +861,17 @@ a crawled file, a fetched page, or one supplied to `POST /v1/documents`:
 
 At the default chunk size (512 tokens, 64 overlapping) the chunk limit is the one a text document
 meets first, at roughly 18 MB. A document over the chunk limit, or an HTTP response over the byte
-limit, is counted in `documents_failed` on the first crawl and on every re-crawl alike, and
-nothing of that version is searchable; on a re-crawl the version indexed before it stays, as for
-any document a re-crawl fails on. A file over a filesystem source's `max_file_bytes` is different:
-the walk does not list it (below), so a re-crawl takes a file that grew past it as gone and
-removes the version indexed before. A larger document has to be split before it is ingested.
+limit, or a file over a filesystem source's `max_file_bytes`, is counted in `documents_failed`
+on the first crawl and on every re-crawl alike, and nothing of that version is searchable; on a
+re-crawl the version indexed before it stays, as for any document a re-crawl fails on — a file
+that grew past `max_file_bytes` is still there, and is not taken as deleted. A larger document has
+to be split before it is ingested.
 
 `max_file_bytes` and `max_response_bytes` cannot be set past the byte limit, since a larger file or
-body could only be read to be discarded. A filesystem walk never lists a file over its
-`max_file_bytes`, so such a file is not read, not counted as failed and not counted in
-`entries_skipped`; an HTTP response over `max_response_bytes` is stopped as soon as it passes the
-bound and counts as a failed document. A registration recorded by an earlier version with a larger
+body could only be read to be discarded. A filesystem crawl lists a file over its
+`max_file_bytes` and does not read it: it counts as a failed document, not in `entries_skipped`,
+and the reason, `File too large`, is in the node's log. An HTTP response over `max_response_bytes`
+is stopped as soon as it passes the bound and counts as a failed document the same way. A registration recorded by an earlier version with a larger
 value is restored at the limit, with a warning in the log, rather than refused.
 
 ### Error responses
@@ -3710,7 +3715,8 @@ Three files are judged by what the node does with them rather than by name alone
   ever having been erased, and the names are the one part of a segment nothing reconstructs.
 - **`source-status`, how each source's last crawl ended**, is not derived and nothing rebuilds it,
   but nothing the node serves depends on it either: a node that cannot trust it logs that, treats
-  the history as empty, and reports each source from its next run. So a `source-status` its
+  the history as empty, reports each source from its next run, and re-crawls each at the first
+  check after startup, since no finished crawl of it is on record. So a `source-status` its
   reader will not take — a record count that disagrees with its records, a checksum that does not
   match its bytes, no header, or a version it does not read — is reported `CORRUPT`, counted with the
   lookup tables under `corruptRebuiltOnOpen` rather than as damage, and moved aside by the repair
@@ -4012,14 +4018,17 @@ taken before the upgrade.
 
 **`<data dir>/source-status` — no step required.** A build older than the file never wrote it,
 so a directory it left has none, and every source reports from its next run exactly as it did
-before the upgrade; the file appears when the first run ends. The file is version 4, which adds
-each source's `documents_failed` to what version 3 held; a version 3 history is read with that
-count as 0. Its marker, `\#end|<count>|<crc>`, carries a CRC32C of every byte before it; a history
-whose checksum does not match is logged and treated as empty, as any history the node cannot read
-is. Versions 1 and 2 carry no checksum and are read as before. Every older version is rewritten at
-version 4 when the next run ends. An older build does not read version 4: it logs the file as
-unreadable and starts with no history, so rolling back loses the record of each source's last run,
-never indexed data, unless a pre-upgrade image is restored.
+before the upgrade; the file appears when the first run ends. The file is version 5, which adds
+when each source's last crawl ran to its end — what its re-crawl interval counts from across a
+restart — to what version 4 held; a version 4 or older history is read with none on record, so
+each source is re-crawled once at the first check after the upgrade. Version 4 added each source's
+`documents_failed` to what version 3 held; a version 3 history is read with that count as 0. Its
+marker, `\#end|<count>|<crc>`, carries a CRC32C of every byte before it; a history whose checksum
+does not match is logged and treated as empty, as any history the node cannot read is. Versions 1
+and 2 carry no checksum and are read as before. Every older version is rewritten at version 5 when
+the next run ends. An older build does not read version 5: it logs the file as unreadable and
+starts with no history, so rolling back loses the record of each source's last run, never indexed
+data, unless a pre-upgrade image is restored.
 
 **`<data dir>/erasure-receipts` — no step required.** A build older than the file never wrote it;
 the first `POST /v1/erasure` after the upgrade creates it, and erasures made before then have no

@@ -211,7 +211,7 @@ class IngestStatusDurabilityTest {
     @DisplayName("a history in a state this build does not report is read as a finished run")
     void anUnknownStateIsNotReportedAsRunning() throws IOException {
         SourceStatusFile.open(dataDir).write(List.of(new SourceStatusFile.Entry(
-            "docs", "embedding", 0.4, 4, 6, 0, 0, 0, LONG_AGO, null)));
+            "docs", "embedding", 0.4, 4, 6, 0, 0, 0, LONG_AGO, 0L, null)));
 
         IngestStatusEndpoint.IngestionStatus after = node().restore("docs");
 

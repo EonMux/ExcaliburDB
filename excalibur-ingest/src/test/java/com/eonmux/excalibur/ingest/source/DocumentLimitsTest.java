@@ -46,8 +46,10 @@ class DocumentLimitsTest {
     }
 
     @Test
-    @DisplayName("a file over the walk's bound is never listed, so it is never read")
-    void anOversizedFileIsNotListed(@TempDir Path root) throws Exception {
+    @DisplayName("a file over the walk's bound is listed, and refused rather than read")
+    void anOversizedFileIsListedAndRefused(@TempDir Path root) throws Exception {
+        // Listed because what a crawl lists is what a re-crawl subtracts from the registry: a
+        // file left out for its size would be tombstoned as though it had been deleted.
         Files.writeString(root.resolve("small.txt"), "x".repeat(10));
         Files.writeString(root.resolve("large.txt"), "x".repeat(1000));
         FilesystemSource source = FilesystemSource.builder()
@@ -58,7 +60,10 @@ class DocumentLimitsTest {
             listed = crawl.toList();
         }
 
-        assertThat(listed).containsExactly("small.txt");
+        assertThat(listed).containsExactlyInAnyOrder("small.txt", "large.txt");
+        assertThatThrownBy(() -> source.fetch("large.txt"))
+            .isInstanceOf(DocumentRefusedException.class)
+            .hasMessageContaining("too large");
     }
 
     @Test

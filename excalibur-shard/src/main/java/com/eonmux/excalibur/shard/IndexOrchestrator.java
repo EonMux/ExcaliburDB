@@ -35,7 +35,7 @@ import java.util.function.BooleanSupplier;
  * that perform asynchronous index operations:</p>
  * <ul>
  *   <li>{@link HnswIntegrationWorker} - Integrates write log entries into HNSW graph</li>
- *   <li>{@link SegmentReindexScheduler} - Schedules stale segment re-indexing</li>
+ *   <li>{@link SegmentReindexScheduler} - Re-crawls each registered source on its interval</li>
  *   <li>{@link EpochTickScheduler} - Advances visibility epoch periodically</li>
  *   <li>{@link HnswCompactionWorker} - Compacts HNSW graphs by removing tombstoned nodes</li>
  * </ul>

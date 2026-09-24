@@ -106,6 +106,8 @@ class SourceDurabilityTest {
             .as("a caller told its source is registered must not lose it to the next restart")
             .isFalse();
         verify(scheduler, never()).registerSource(anyString(), org.mockito.ArgumentMatchers.anyLong());
+        verify(scheduler, never())
+            .registerSource(anyString(), org.mockito.ArgumentMatchers.anyLong(), any());
         verify(orchestrator, never()).startIngestion(any());
         assertThat(statuses.getAllStatuses()).isEmpty();
     }
@@ -131,7 +133,8 @@ class SourceDurabilityTest {
         registry.restore(source("my-docs"));
 
         assertThat(registry.isRegistered("my-docs")).isTrue();
-        verify(scheduler).registerSource("my-docs", 3_600_000L);
+        // No crawl of it that ran to its end is on record, so it is due at the first check.
+        verify(scheduler).registerSource("my-docs", 3_600_000L, null);
         assertThat(statuses.getStatus("my-docs")).isNotNull();
         verify(orchestrator, never()).startIngestion(any());
     }

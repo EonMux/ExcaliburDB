@@ -76,9 +76,7 @@ class IndexOrchestratorTest {
     @Test
     @DisplayName("SegmentReindexScheduler should have correct default configuration")
     void testReindexSchedulerDefaults() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
-            sourceId -> true);
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(sourceId -> true);
 
         assertEquals(60_000L, scheduler.getCheckIntervalMs());
         assertEquals(3_600_000L, scheduler.getDefaultReindexIntervalMs());
@@ -87,8 +85,6 @@ class IndexOrchestratorTest {
         assertEquals(0L, scheduler.getTotalReindexesTriggered());
         assertEquals(0L, scheduler.getTotalReindexesCompleted());
         assertEquals(0L, scheduler.getTotalReindexesFailed());
-
-        catalog.close();
     }
 
     @Test
@@ -112,9 +108,7 @@ class IndexOrchestratorTest {
     @Test
     @DisplayName("SegmentReindexScheduler should start and stop successfully")
     void testReindexSchedulerStartStop() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
-            sourceId -> true);
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(sourceId -> true);
 
         assertFalse(scheduler.isRunning());
         assertTrue(scheduler.start());
@@ -123,8 +117,6 @@ class IndexOrchestratorTest {
 
         scheduler.stop(STOP_WAIT);
         assertFalse(scheduler.isRunning());
-
-        catalog.close();
     }
 
     @Test
@@ -153,9 +145,7 @@ class IndexOrchestratorTest {
     @Test
     @DisplayName("SegmentReindexScheduler should support source registration")
     void testReindexSchedulerSourceRegistration() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
-            sourceId -> true);
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(sourceId -> true);
 
         assertEquals(0, scheduler.getRegisteredSourceCount());
 
@@ -167,8 +157,6 @@ class IndexOrchestratorTest {
 
         scheduler.unregisterSource("docs");
         assertEquals(1, scheduler.getRegisteredSourceCount());
-
-        catalog.close();
     }
 
     @Test
@@ -263,9 +251,7 @@ class IndexOrchestratorTest {
     @Test
     @DisplayName("SegmentReindexScheduler should support source management")
     void testReindexSchedulerSourceManagement() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
-            sourceId -> true);
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(sourceId -> true);
 
         assertEquals(0, scheduler.getRegisteredSourceCount());
 
@@ -277,17 +263,13 @@ class IndexOrchestratorTest {
 
         scheduler.unregisterSource("wiki");
         assertEquals(1, scheduler.getRegisteredSourceCount());
-
-        catalog.close();
     }
 
     @Test
     @DisplayName("SegmentReindexScheduler should support manual reindex triggering")
     void testReindexSchedulerManualTrigger() {
-        SegmentCatalog catalog = new SegmentCatalog();
         java.util.concurrent.atomic.AtomicBoolean triggered = new java.util.concurrent.atomic.AtomicBoolean(false);
-        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
-            sourceId -> { triggered.set(true); return true; });
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(sourceId -> { triggered.set(true); return true; });
 
         scheduler.registerSource("docs");
 
@@ -298,16 +280,12 @@ class IndexOrchestratorTest {
 
         // Unknown source should return false
         assertFalse(scheduler.triggerReindexNow("absent"));
-
-        catalog.close();
     }
 
     @Test
     @DisplayName("SegmentReindexScheduler should track reindex completion and failure")
     void testReindexSchedulerCompletionAndFailure() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
-            sourceId -> true);
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(sourceId -> true);
 
         scheduler.registerSource("docs");
 
@@ -316,79 +294,58 @@ class IndexOrchestratorTest {
 
         scheduler.markReindexFailed("docs", "Test error");
         assertEquals(1L, scheduler.getTotalReindexesFailed());
-
-        catalog.close();
     }
 
     @Test
     @DisplayName("SegmentReindexScheduler should support configuration changes")
     void testReindexSchedulerConfiguration() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
-            sourceId -> true);
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(sourceId -> true);
 
         scheduler.setCheckIntervalMs(30_000L);
         assertEquals(30_000L, scheduler.getCheckIntervalMs());
 
         scheduler.setDefaultReindexIntervalMs(1_800_000L);
         assertEquals(1_800_000L, scheduler.getDefaultReindexIntervalMs());
-
-        catalog.close();
     }
 
     @Test
     @DisplayName("SegmentReindexScheduler should validate configuration")
     void testReindexSchedulerValidation() {
-        SegmentCatalog catalog = new SegmentCatalog();
-
         // Invalid check interval
         assertThrows(IllegalArgumentException.class, () ->
-            new SegmentReindexScheduler(catalog, sourceId -> true, 1000, 3_600_000L));
+            new SegmentReindexScheduler(sourceId -> true, 1000, 3_600_000L));
 
         // Invalid reindex interval - too low
         assertThrows(IllegalArgumentException.class, () ->
-            new SegmentReindexScheduler(catalog, sourceId -> true, 60_000L, 1000));
+            new SegmentReindexScheduler(sourceId -> true, 60_000L, 1000));
 
         // Invalid reindex interval - too high
         assertThrows(IllegalArgumentException.class, () ->
-            new SegmentReindexScheduler(catalog, sourceId -> true, 60_000L, 25 * 60 * 60 * 1000L));
-
-        catalog.close();
+            new SegmentReindexScheduler(sourceId -> true, 60_000L, 25 * 60 * 60 * 1000L));
     }
 
     @Test
     @DisplayName("SegmentReindexScheduler should reject null parameters")
     void testReindexSchedulerNullParameters() {
         assertThrows(NullPointerException.class, () ->
-            new SegmentReindexScheduler(null, sourceId -> true));
-
-        SegmentCatalog catalog = new SegmentCatalog();
-        assertThrows(NullPointerException.class, () ->
-            new SegmentReindexScheduler(catalog, null));
-        catalog.close();
+            new SegmentReindexScheduler(null));
     }
 
     @Test
     @DisplayName("SegmentReindexScheduler should have correct toString")
     void testReindexSchedulerToString() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
-            sourceId -> true);
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(sourceId -> true);
 
         String str = scheduler.toString();
         assertNotNull(str);
         assertTrue(str.contains("SegmentReindexScheduler"));
         assertTrue(str.contains("running=false"));
-
-        catalog.close();
     }
 
     @Test
     @DisplayName("SegmentReindexScheduler should get next reindex time")
     void testReindexSchedulerNextReindexTime() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
-            sourceId -> true);
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(sourceId -> true);
 
         scheduler.registerSource("docs", 3_600_000L); // 1 hour
 
@@ -397,8 +354,6 @@ class IndexOrchestratorTest {
 
         // Unknown source should return null
         assertNull(scheduler.getNextReindexTime("absent"));
-
-        catalog.close();
     }
 
     // ==================== IndexOrchestrator Tests ====================
@@ -676,14 +631,12 @@ class IndexOrchestratorTest {
     @Test
     @DisplayName("SegmentReindexScheduler should allow multiple reindexes when flag is properly managed")
     void testReindexSchedulerMultipleReindexCyclesWithFlagManagement() throws Exception {
-        SegmentCatalog catalog = new SegmentCatalog();
-
         // Track reindex invocations
         java.util.concurrent.atomic.AtomicInteger reindexCount = new java.util.concurrent.atomic.AtomicInteger(0);
         java.util.List<Long> reindexTimes = new java.util.concurrent.CopyOnWriteArrayList<>();
         final SegmentReindexScheduler[] schedulerHolder = new SegmentReindexScheduler[1];
 
-        schedulerHolder[0] = new SegmentReindexScheduler(catalog, sourceId -> {
+        schedulerHolder[0] = new SegmentReindexScheduler(sourceId -> {
             reindexCount.incrementAndGet();
             reindexTimes.add(System.currentTimeMillis());
             // Simulate reindex completion - this is what IndexOrchestrator.onReindexNeeded does
@@ -709,7 +662,6 @@ class IndexOrchestratorTest {
         Thread.sleep(100);
 
         scheduler.stop(STOP_WAIT);
-        catalog.close();
 
         // Verify multiple reindexes occurred (should have at least 2)
         int count = reindexCount.get();
@@ -721,13 +673,11 @@ class IndexOrchestratorTest {
     @Test
     @DisplayName("SegmentReindexScheduler should block reindexes without flag management")
     void testReindexSchedulerBlocksReindexesWithoutFlagManagement() throws Exception {
-        SegmentCatalog catalog = new SegmentCatalog();
-
         // Track reindex invocations
         java.util.concurrent.atomic.AtomicInteger reindexCount = new java.util.concurrent.atomic.AtomicInteger(0);
 
         // This listener does NOT call markReindexComplete - simulating the bug
-        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog, sourceId -> {
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(sourceId -> {
             reindexCount.incrementAndGet();
             // BUG: Not calling markReindexComplete - flag stays true forever
             return true;
@@ -745,7 +695,6 @@ class IndexOrchestratorTest {
         Thread.sleep(80);
 
         scheduler.stop(STOP_WAIT);
-        catalog.close();
 
         // Without proper flag management, only 1 reindex should occur
         int count = reindexCount.get();

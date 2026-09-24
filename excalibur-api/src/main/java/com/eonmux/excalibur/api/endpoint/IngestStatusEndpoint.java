@@ -296,6 +296,17 @@ public class IngestStatusEndpoint implements HttpHandler {
         private volatile long lastUpdatedMs;
 
         /**
+         * When a crawl of this source - its first crawl or a re-crawl - last ran to its end, or 0
+         * while none has.
+         *
+         * <p>Not {@link #lastUpdatedMs}: a run stopped, broken or cut short also updates the
+         * status on its way out. This is what the re-crawl schedule of a source restored at
+         * startup counts its interval from, so it has to move only for a crawl whose listing was
+         * whole and whose documents were all dealt with.</p>
+         */
+        private volatile long lastCompletedMs;
+
+        /**
          * Told each time this status settles - reaches a state that ends a run - so that what
          * the run ended with can be written down; null when nothing keeps a history.
          */
@@ -324,6 +335,27 @@ public class IngestStatusEndpoint implements HttpHandler {
         public long documentsFailed() { return documentsFailed; }
         public String lastError() { return lastError; }
         public long lastUpdatedMs() { return lastUpdatedMs; }
+
+        /**
+         * When a crawl of this source last ran to its end.
+         *
+         * @return Epoch milliseconds, or 0 when no crawl of it on record has
+         */
+        public long lastCompletedMs() { return lastCompletedMs; }
+
+        /**
+         * Records that a re-crawl of this source ran to its end.
+         *
+         * <p>Called by the re-crawl itself, which reports nothing else here about how it went -
+         * it has its own readback. A first crawl needs no call: reaching {@code idle} at full
+         * progress, which is how the ingestion pipeline ends a run it finished, records it.</p>
+         */
+        public void recordCrawlCompleted() {
+            long now = System.currentTimeMillis();
+            this.lastCompletedMs = now;
+            this.lastUpdatedMs = now;
+            reportIfSettled();
+        }
 
         /**
          * Whether this status describes a run that has ended rather than one under way.
@@ -361,7 +393,7 @@ public class IngestStatusEndpoint implements HttpHandler {
         SourceStatusFile.Entry snapshot() {
             return new SourceStatusFile.Entry(sourceId, state, progress, entriesIngested,
                 entriesPending, entriesSkipped, entriesDisallowed, documentsFailed, lastUpdatedMs,
-                lastError);
+                lastCompletedMs, lastError);
         }
 
         /**
@@ -385,6 +417,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             status.documentsFailed = entry.failed();
             status.lastError = entry.lastError();
             status.lastUpdatedMs = entry.lastUpdatedMs();
+            status.lastCompletedMs = entry.lastCompletedMs();
             if (!status.isSettled()) {
                 status.state = "idle";
                 status.lastError = INTERRUPTED_BY_RESTART;
@@ -403,7 +436,8 @@ public class IngestStatusEndpoint implements HttpHandler {
          * error from the run before it. Nothing else does: {@code last_error} carries no run
          * identity, so an error left over from a run that has since been retried successfully
          * reads as a failure of the run that just finished. An update to {@code idle} is the
-         * end of a run, and keeps what that run reported.</p>
+         * end of a run, and keeps what that run reported; one at full progress is the end of a
+         * run that finished, and records when the source was last crawled to its end.</p>
          *
          * @param state Current state
          * @param progress Progress in range [0.0, 1.0]
@@ -418,7 +452,11 @@ public class IngestStatusEndpoint implements HttpHandler {
             this.progress = clampProgress(progress);
             this.entriesIngested = Math.max(0, entriesIngested);
             this.entriesPending = Math.max(0, entriesPending);
-            this.lastUpdatedMs = System.currentTimeMillis();
+            long now = System.currentTimeMillis();
+            if ("idle".equals(state) && this.progress >= 1.0) {
+                this.lastCompletedMs = now;
+            }
+            this.lastUpdatedMs = now;
             reportIfSettled();
         }
 
@@ -535,6 +573,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             this.entriesDisallowed = 0;
             this.documentsFailed = 0;
             this.lastError = null;
+            this.lastCompletedMs = 0;
             this.lastUpdatedMs = System.currentTimeMillis();
             reportIfSettled();
         }

@@ -63,8 +63,10 @@ import java.util.Objects;
  * them - a site's robots.txt. A re-crawl applies both tests exactly as the first crawl did, so a
  * run that newly skipped three hundred photographs, or found a page newly disallowed, has to be
  * able to say so - and {@code entries_skipped} and {@code entries_disallowed} on
- * {@code GET /v1/ingest/status} are where the node says it. Nothing else on that status is
- * touched, because a reindex has its own readback for how far it got and how it ended.</p>
+ * {@code GET /v1/ingest/status} are where the node says it. And, for a run that completed, that
+ * a crawl of the source ran to its end, which is what a restarted node counts the source's
+ * re-crawl interval from. Nothing else on that status is touched, because a reindex has its own
+ * readback for how far it got and how it ended.</p>
  *
  * <p>A run that was stopped, or broke, once it had begun on its documents reports the two as far
  * as it got: what it passed over is what the source is now known to hold, and the figure the run
@@ -303,6 +305,26 @@ public final class ReindexRun {
     }
 
     /**
+     * Records on the source's ingestion status that a crawl of it ran to its end.
+     *
+     * <p>For a run that completed - with its failures counted or without - and never for one
+     * that was stopped or failed. A restarted node counts the source's re-crawl interval from
+     * this time, so a run whose listing was never read whole must not move it: the source would
+     * then wait out a full interval after a crawl that did not finish.</p>
+     *
+     * @param sourceId The source that was reindexed
+     */
+    private void reportCompleted(String sourceId) {
+        if (ingestionStatusRegistry == null) {
+            return;
+        }
+        IngestStatusEndpoint.IngestionStatus status = ingestionStatusRegistry.getStatus(sourceId);
+        if (status != null) {
+            status.recordCrawlCompleted();
+        }
+    }
+
+    /**
      * Whether this run stopped because someone asked it to, rather than because it broke.
      *
      * <p>The run's own signal and the exception the reindexer ends a stopped run with are the
@@ -493,6 +515,7 @@ public final class ReindexRun {
                 threadName, result.getErrorCount(), sourceId, result.getDocumentsIndexed(),
                 result.getTombstonedSegmentIds().size(), result.getNewSegmentId(),
                 errorDetail(result.getBasicResult().getErrors()));
+            reportCompleted(sourceId);
             statusRegistry.completeReindexWithErrors(sourceId,
                 countedPartialFailure(result.getBasicResult()));
             return true;
@@ -501,6 +524,7 @@ public final class ReindexRun {
                 + "{} docs indexed, {} old segments tombstoned, new segment {}",
             threadName, sourceId, result.getDocumentsIndexed(),
             result.getTombstonedSegmentIds().size(), result.getNewSegmentId());
+        reportCompleted(sourceId);
         statusRegistry.completeReindex(sourceId);
         return true;
     }
@@ -557,6 +581,7 @@ public final class ReindexRun {
                 threadName, result.getErrorCount(), sourceId, result.getDocumentsIndexed(),
                 result.getDocumentsSkipped(), result.getChunksCreated(),
                 errorDetail(result.getErrors()));
+            reportCompleted(sourceId);
             statusRegistry.completeReindexWithErrors(sourceId,
                 countedPartialFailure(result));
             return true;
@@ -565,6 +590,7 @@ public final class ReindexRun {
                 + "indexed, {} skipped, {} chunks created",
             threadName, sourceId, result.getDocumentsIndexed(),
             result.getDocumentsSkipped(), result.getChunksCreated());
+        reportCompleted(sourceId);
         statusRegistry.completeReindex(sourceId);
         return true;
     }
