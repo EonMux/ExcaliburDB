@@ -1,4 +1,4 @@
-package com.eonmux.excalibur.core.report;
+package com.eonmux.excalibur.coverage;
 
 import java.io.*;
 import java.nio.file.*;
@@ -40,6 +40,21 @@ public final class CoverageGapAnalyzer {
     /** Where a module leaves the report this reads, relative to the module directory. */
     private static final String REPORT_PATH = "build/reports/jacoco/test/jacocoTestReport.xml";
 
+    /** Why a {@link LineGap} is reported: no instruction on its lines ever ran. */
+    static final String UNEXECUTED = "not executed";
+
+    /** The most unexecuted ranges the text summary prints for one class. */
+    private static final int MAX_RANGES_PRINTED = 10;
+
+    private static final Pattern SOURCE_FILE_ATTRIBUTE =
+        Pattern.compile("sourcefilename=\"([^\"]+)\"");
+
+    private static final Pattern SOURCE_FILE_ELEMENT = Pattern.compile(
+        "<sourcefile\\s+name=\"([^\"]+)\"[^>]*>(.*?)</sourcefile>", Pattern.DOTALL);
+
+    private static final Pattern LINE_ELEMENT = Pattern.compile(
+        "<line\\s+nr=\"(\\d+)\"\\s+mi=\"(\\d+)\"\\s+ci=\"(\\d+)\"[^>]*/>");
+
     private CoverageGapAnalyzer() {
         // Utility class - no instantiation
     }
@@ -59,8 +74,8 @@ public final class CoverageGapAnalyzer {
      * Analyzes coverage gaps across the modules named.
      *
      * <p>The caller's list wins where there is one, because the build knows which subprojects its
-     * gates ran; discovery is the answer for a hand invocation. Neither can go stale the way the
-     * compiled-in list this replaced did - it named four modules of twenty-one.</p>
+     * gates ran; discovery is the answer for a hand invocation. Neither can go stale the way a
+     * list compiled into the analyzer would as modules are added.</p>
      *
      * @param projectRoot the root directory of the project
      * @param modules the module directory names to analyze
@@ -83,7 +98,7 @@ public final class CoverageGapAnalyzer {
                     module,
                     List.of(new ClassGap(
                         module, "(no tests)", 0.0, 0.0, 0.0,
-                        List.of(), List.of()
+                        List.of(), null, List.of()
                     )),
                     List.of(),
                     List.of(),
@@ -109,6 +124,7 @@ public final class CoverageGapAnalyzer {
         List<PackageInfo> packages = parsePackages(content);
 
         for (PackageInfo pkg : packages) {
+            Map<String, List<LineGap>> unexecutedBySourceFile = new HashMap<>();
             double pkgCoverage = calculatePercentage(
                 pkg.instructionCovered, pkg.instructionMissed
             );
@@ -148,7 +164,10 @@ public final class CoverageGapAnalyzer {
 
                 // Track classes below threshold
                 if (classCoverage < COVERAGE_THRESHOLD * 100) {
-                    List<LineGap> uncoveredLines = findUncoveredLines(cls);
+                    List<LineGap> uncoveredLines = cls.sourceFile() == null
+                        ? List.of()
+                        : unexecutedBySourceFile.computeIfAbsent(cls.sourceFile(),
+                            file -> unexecutedRanges(pkg.sourceLines().getOrDefault(file, List.of())));
                     List<MethodGap> lowCoverageMethods = cls.methods.stream()
                         .filter(m -> {
                             double methodCov = calculatePercentage(
@@ -173,6 +192,7 @@ public final class CoverageGapAnalyzer {
                         uncoveredMethods.stream()
                             .filter(m -> m.className().equals(cls.name.replace('/', '.')))
                             .collect(Collectors.toList()),
+                        cls.sourceFile(),
                         uncoveredLines
                     ));
                 }
@@ -231,6 +251,7 @@ public final class CoverageGapAnalyzer {
             String pkgContent = pkgMatcher.group(2);
 
             List<ClassInfo> classes = parseClasses(pkgContent);
+            Map<String, List<SourceLine>> sourceLines = parseSourceFiles(pkgContent);
 
             // Get package-level counters
             Coverage pkgInstruction = extractCounter(pkgContent, "INSTRUCTION");
@@ -240,6 +261,7 @@ public final class CoverageGapAnalyzer {
             packages.add(new PackageInfo(
                 pkgName,
                 classes,
+                sourceLines,
                 pkgInstruction.covered(),
                 pkgInstruction.missed(),
                 pkgBranch.covered(),
@@ -259,14 +281,15 @@ public final class CoverageGapAnalyzer {
         List<ClassInfo> classes = new ArrayList<>();
 
         Pattern classPattern = Pattern.compile(
-            "<class\\s+name=\"([^\"]+)\"[^>]*>(.*?)</class>",
+            "<class\\s+name=\"([^\"]+)\"([^>]*)>(.*?)</class>",
             Pattern.DOTALL
         );
         Matcher classMatcher = classPattern.matcher(packageContent);
 
         while (classMatcher.find()) {
             String className = classMatcher.group(1);
-            String classContent = classMatcher.group(2);
+            Matcher sourceFile = SOURCE_FILE_ATTRIBUTE.matcher(classMatcher.group(2));
+            String classContent = classMatcher.group(3);
 
             List<MethodInfo> methods = parseMethods(classContent);
 
@@ -276,6 +299,7 @@ public final class CoverageGapAnalyzer {
 
             classes.add(new ClassInfo(
                 className,
+                sourceFile.find() ? sourceFile.group(1) : null,
                 methods,
                 clsInstruction.covered(),
                 clsInstruction.missed(),
@@ -327,19 +351,63 @@ public final class CoverageGapAnalyzer {
     }
 
     /**
-     * Finds uncovered line ranges in a class.
+     * Parses the per-line data of every source file in a package.
+     *
+     * <p>JaCoCo records line coverage per source file rather than per class, in
+     * {@code <sourcefile>} elements that follow the package's classes.</p>
+     *
+     * @return The lines of each source file, keyed by file name, in the order the report lists
+     *         them
      */
-    private static List<LineGap> findUncoveredLines(ClassInfo cls) {
-        // This is a simplified version - full implementation would parse
-        // sourcefile elements for detailed line information
-        List<LineGap> gaps = new ArrayList<>();
-
-        // Estimate based on missed line count
-        if (cls.lineMissed > 0 && cls.lineCovered == 0) {
-            gaps.add(new LineGap(1, (int) cls.lineMissed, "No coverage"));
+    private static Map<String, List<SourceLine>> parseSourceFiles(String packageContent) {
+        Map<String, List<SourceLine>> byFile = new HashMap<>();
+        Matcher fileMatcher = SOURCE_FILE_ELEMENT.matcher(packageContent);
+        while (fileMatcher.find()) {
+            List<SourceLine> lines = new ArrayList<>();
+            Matcher lineMatcher = LINE_ELEMENT.matcher(fileMatcher.group(2));
+            while (lineMatcher.find()) {
+                lines.add(new SourceLine(
+                    Integer.parseInt(lineMatcher.group(1)),
+                    Long.parseLong(lineMatcher.group(2)),
+                    Long.parseLong(lineMatcher.group(3))));
+            }
+            byFile.put(fileMatcher.group(1), lines);
         }
+        return byFile;
+    }
 
-        return gaps;
+    /**
+     * Groups a source file's lines into the ranges no test executed.
+     *
+     * <p>A line is unexecuted when it carries instructions and none of them ran. JaCoCo lists
+     * only lines that carry instructions, so blank lines, comments and declarations never
+     * interrupt a range; a range ends at the next line that did execute.</p>
+     *
+     * @param lines The file's lines as the report lists them
+     * @return The unexecuted ranges in line order
+     */
+    static List<LineGap> unexecutedRanges(List<SourceLine> lines) {
+        List<SourceLine> ordered = lines.stream()
+            .sorted(Comparator.comparingInt(SourceLine::number))
+            .toList();
+        List<LineGap> gaps = new ArrayList<>();
+        int start = -1;
+        int end = -1;
+        for (SourceLine line : ordered) {
+            if (line.coveredInstructions() == 0 && line.missedInstructions() > 0) {
+                if (start < 0) {
+                    start = line.number();
+                }
+                end = line.number();
+            } else if (line.coveredInstructions() > 0 && start >= 0) {
+                gaps.add(new LineGap(start, end, UNEXECUTED));
+                start = -1;
+            }
+        }
+        if (start >= 0) {
+            gaps.add(new LineGap(start, end, UNEXECUTED));
+        }
+        return List.copyOf(gaps);
     }
 
     /**
@@ -422,6 +490,11 @@ public final class CoverageGapAnalyzer {
                                 method.methodName(), method.lineNumber(), method.missedInstructions()));
                         }
                     }
+
+                    if (!cls.uncoveredLines().isEmpty()) {
+                        sb.append(String.format("      Unexecuted lines in %s: %s%n",
+                            cls.sourceFile(), describeRanges(cls.uncoveredLines())));
+                    }
                 }
             }
 
@@ -460,6 +533,23 @@ public final class CoverageGapAnalyzer {
         return sb.toString();
     }
 
+    /**
+     * Renders line ranges as {@code 12-15, 40}, naming how many more there are past the cap.
+     *
+     * @param gaps The ranges, in line order
+     * @return The rendered list
+     */
+    static String describeRanges(List<LineGap> gaps) {
+        String shown = gaps.stream()
+            .limit(MAX_RANGES_PRINTED)
+            .map(gap -> gap.startLine() == gap.endLine()
+                ? Integer.toString(gap.startLine())
+                : gap.startLine() + "-" + gap.endLine())
+            .collect(Collectors.joining(", "));
+        int hidden = gaps.size() - MAX_RANGES_PRINTED;
+        return hidden > 0 ? shown + " and " + hidden + " more" : shown;
+    }
+
     // Record types for parsed data
 
     private record Coverage(long covered, long missed) {}
@@ -467,6 +557,7 @@ public final class CoverageGapAnalyzer {
     private record PackageInfo(
         String name,
         List<ClassInfo> classes,
+        Map<String, List<SourceLine>> sourceLines,
         long instructionCovered,
         long instructionMissed,
         long branchCovered,
@@ -477,6 +568,7 @@ public final class CoverageGapAnalyzer {
 
     private record ClassInfo(
         String name,
+        String sourceFile,
         List<MethodInfo> methods,
         long instructionCovered,
         long instructionMissed,
@@ -485,6 +577,15 @@ public final class CoverageGapAnalyzer {
         long lineCovered,
         long lineMissed
     ) {}
+
+    /**
+     * One line of a source file as JaCoCo reports it.
+     *
+     * @param number The line number
+     * @param missedInstructions Instructions on the line that no test executed
+     * @param coveredInstructions Instructions on the line that a test executed
+     */
+    record SourceLine(int number, long missedInstructions, long coveredInstructions) {}
 
     private record MethodInfo(
         String name,
@@ -537,7 +638,11 @@ public final class CoverageGapAnalyzer {
      * @param branchCoverage the branch coverage percentage
      * @param lineCoverage the line coverage percentage
      * @param uncoveredMethods list of methods with zero coverage
-     * @param uncoveredLines list of line ranges without coverage
+     * @param sourceFile the source file the class was compiled from, or null when the report
+     *                   does not name one
+     * @param uncoveredLines the ranges of {@code sourceFile} that no test executed. JaCoCo
+     *                       records lines per source file, so a nested class and the class
+     *                       enclosing it report the same ranges
      */
     public record ClassGap(
         String packageName,
@@ -546,6 +651,7 @@ public final class CoverageGapAnalyzer {
         double branchCoverage,
         double lineCoverage,
         List<MethodGap> uncoveredMethods,
+        String sourceFile,
         List<LineGap> uncoveredLines
     ) {}
 

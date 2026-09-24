@@ -2690,6 +2690,7 @@ key plus `excalibur.graph.extraction-enabled=true`.
 | `excalibur-test-bootstrap` | Initializes `java.lang.foreign` before the first test in every module |
 | `excalibur-integration` | Integration tests |
 | `excalibur-bench` | JMH benchmarks |
+| `excalibur-coverage` | The coverage summary and gap report behind `./gradlew coverage` and `coverageGaps` |
 
 ### Query Pipeline
 
@@ -3019,6 +3020,7 @@ excaliburdb/
 ├── excalibur-backup/       # Offline snapshot, verify and restore command
 ├── excalibur-core/         # Primitives: memory, hash, checksums
 ├── excalibur-config/       # Configuration loading
+├── excalibur-coverage/     # Coverage summary and gap report (build tooling)
 ├── excalibur-filter/       # Cuckoo filters, LSH
 ├── excalibur-fsck/         # Offline integrity check and repair command
 ├── excalibur-graph/        # CSR adjacency, bitemporal, provenance, erasure

@@ -3383,10 +3383,10 @@ watches only `file:` and `http:` URLs, and a `jar:` URL is not one.
 You can embed ExcaliburDB directly in a JVM application.
 
 **Nothing is on Maven Central.** `./gradlew publishToMavenLocal` installs all sixteen library
-modules into `~/.m2`, so a coordinate dependency resolves there. The other five are not libraries:
+modules into `~/.m2`, so a coordinate dependency resolves there. The other six are not libraries:
 `excalibur-bench` is a benchmark harness, `excalibur-integration` and `excalibur-test-bootstrap`
-are test modules, and `excalibur-fsck` and `excalibur-backup` are commands rather than something
-to depend on.
+are test modules, `excalibur-fsck` and `excalibur-backup` are commands rather than something
+to depend on, and `excalibur-coverage` is the build's own coverage reporting.
 
 ```bash
 ./gradlew publishToMavenLocal

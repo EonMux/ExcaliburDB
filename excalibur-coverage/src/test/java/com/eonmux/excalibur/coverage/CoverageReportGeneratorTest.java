@@ -1,4 +1,4 @@
-package com.eonmux.excalibur.core.report;
+package com.eonmux.excalibur.coverage;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;

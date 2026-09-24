@@ -1,9 +1,9 @@
-package com.eonmux.excalibur.core.report;
+package com.eonmux.excalibur.coverage;
 
-import com.eonmux.excalibur.core.report.CoverageGapAnalyzer.ClassGap;
-import com.eonmux.excalibur.core.report.CoverageGapAnalyzer.MethodGap;
-import com.eonmux.excalibur.core.report.CoverageGapAnalyzer.ModuleGapAnalysis;
-import com.eonmux.excalibur.core.report.CoverageGapAnalyzer.PackageGap;
+import com.eonmux.excalibur.coverage.CoverageGapAnalyzer.ClassGap;
+import com.eonmux.excalibur.coverage.CoverageGapAnalyzer.MethodGap;
+import com.eonmux.excalibur.coverage.CoverageGapAnalyzer.ModuleGapAnalysis;
+import com.eonmux.excalibur.coverage.CoverageGapAnalyzer.PackageGap;
 
 import java.io.*;
 import java.nio.file.*;
@@ -55,9 +55,8 @@ public final class CoverageReportGenerator {
      *
      * <p>The build passes its own list, which is authoritative: it is the set of subprojects the
      * coverage gates actually ran. Discovery is for a hand invocation, where there is no build to
-     * ask. Both beat a list compiled into this file, which is what this used to carry - it named
-     * four of the twenty-one modules, so the summary described a fifth of the repository while
-     * reporting itself complete.</p>
+     * ask. Both beat a list compiled into this file, which goes stale as modules are added and
+     * then describes part of the repository while reporting itself complete.</p>
      *
      * @param projectRoot the root directory of the project
      * @param outputPath the path where the HTML report will be written
@@ -897,6 +896,15 @@ public final class CoverageReportGenerator {
                                 </ul>
                             </li>
                         """);
+                    }
+
+                    if (!cls.uncoveredLines().isEmpty()) {
+                        section.append(String.format("""
+                            <li style="flex-direction: column; align-items: flex-start;">
+                                <span style="color: #888; font-size: 0.8rem;">Unexecuted lines in %s:</span>
+                                <span style="color: #666;">%s</span>
+                            </li>
+                        """, cls.sourceFile(), CoverageGapAnalyzer.describeRanges(cls.uncoveredLines())));
                     }
                 }
                 section.append("""

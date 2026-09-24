@@ -1,4 +1,4 @@
-package com.eonmux.excalibur.core.report;
+package com.eonmux.excalibur.coverage;
 
 /**
  * Validates code coverage metrics against defined thresholds.

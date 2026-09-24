@@ -1,4 +1,4 @@
-package com.eonmux.excalibur.core.report;
+package com.eonmux.excalibur.coverage;
 
 import static org.assertj.core.api.Assertions.*;
 
@@ -6,8 +6,8 @@ import org.junit.jupiter.api.*;
 import org.junit.jupiter.params.*;
 import org.junit.jupiter.params.provider.*;
 
-import com.eonmux.excalibur.core.report.CoverageValidator.CoverageLevel;
-import com.eonmux.excalibur.core.report.CoverageValidator.ValidationResult;
+import com.eonmux.excalibur.coverage.CoverageValidator.CoverageLevel;
+import com.eonmux.excalibur.coverage.CoverageValidator.ValidationResult;
 
 /**
  * Tests for {@link CoverageValidator}.

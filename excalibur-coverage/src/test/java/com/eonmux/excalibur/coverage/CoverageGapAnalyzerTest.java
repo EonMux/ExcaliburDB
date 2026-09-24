@@ -1,4 +1,4 @@
-package com.eonmux.excalibur.core.report;
+package com.eonmux.excalibur.coverage;
 
 import static org.assertj.core.api.Assertions.*;
 
@@ -9,10 +9,12 @@ import java.util.*;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.*;
 
-import com.eonmux.excalibur.core.report.CoverageGapAnalyzer.ClassGap;
-import com.eonmux.excalibur.core.report.CoverageGapAnalyzer.MethodGap;
-import com.eonmux.excalibur.core.report.CoverageGapAnalyzer.ModuleGapAnalysis;
-import com.eonmux.excalibur.core.report.CoverageGapAnalyzer.PackageGap;
+import com.eonmux.excalibur.coverage.CoverageGapAnalyzer.ClassGap;
+import com.eonmux.excalibur.coverage.CoverageGapAnalyzer.LineGap;
+import com.eonmux.excalibur.coverage.CoverageGapAnalyzer.MethodGap;
+import com.eonmux.excalibur.coverage.CoverageGapAnalyzer.ModuleGapAnalysis;
+import com.eonmux.excalibur.coverage.CoverageGapAnalyzer.PackageGap;
+import com.eonmux.excalibur.coverage.CoverageGapAnalyzer.SourceLine;
 
 /**
  * Tests for {@link CoverageGapAnalyzer}.
@@ -52,6 +54,17 @@ class CoverageGapAnalyzerTest {
                     <counter type="METHOD" missed="1" covered="2"/>
                     <counter type="CLASS" missed="0" covered="1"/>
                 </class>
+                <sourcefile name="ClassA.java">
+                    <line nr="40" mi="2" ci="0" mb="0" cb="0"/>
+                    <line nr="10" mi="0" ci="3" mb="0" cb="0"/>
+                    <line nr="20" mi="0" ci="5" mb="0" cb="0"/>
+                    <line nr="30" mi="4" ci="0" mb="0" cb="0"/>
+                    <line nr="31" mi="4" ci="0" mb="0" cb="0"/>
+                    <line nr="33" mi="3" ci="0" mb="0" cb="0"/>
+                    <line nr="35" mi="1" ci="2" mb="1" cb="1"/>
+                    <counter type="INSTRUCTION" missed="15" covered="30"/>
+                    <counter type="LINE" missed="4" covered="8"/>
+                </sourcefile>
                 <counter type="INSTRUCTION" missed="15" covered="30"/>
                 <counter type="BRANCH" missed="2" covered="4"/>
                 <counter type="LINE" missed="4" covered="8"/>
@@ -175,7 +188,65 @@ class CoverageGapAnalyzerTest {
             .contains("Classes Below 80% Threshold")
             .contains("Methods With Zero Coverage")
             .contains("uncoveredMethod")
+            .contains("Unexecuted lines in ClassA.java: 30-33, 40")
             .contains("SUMMARY");
+    }
+
+    @Test
+    void analyzeModule_shouldReportTheSourceFileRangesNoTestExecuted() throws IOException {
+        ModuleGapAnalysis analysis = CoverageGapAnalyzer.analyzeModule(jacocoReportPath, "test-module");
+
+        ClassGap classA = analysis.classesBelowThreshold().getFirst();
+
+        assertThat(classA.sourceFile()).isEqualTo("ClassA.java");
+        // 30, 31 and 33 run together: 32 carries no instructions, so it is not in the report.
+        // 35 executed in part, which ends the range; 40 opens a new one.
+        assertThat(classA.uncoveredLines()).containsExactly(
+            new LineGap(30, 33, CoverageGapAnalyzer.UNEXECUTED),
+            new LineGap(40, 40, CoverageGapAnalyzer.UNEXECUTED));
+    }
+
+    @Test
+    void analyzeModule_shouldReportNoRangesForAClassWithoutASourceFile() throws IOException {
+        String xml = SAMPLE_JACOCO_XML.replace(" sourcefilename=\"ClassA.java\"", "");
+        Path report = tempDir.resolve("noSourceFile.xml");
+        Files.writeString(report, xml);
+
+        ClassGap classA = CoverageGapAnalyzer.analyzeModule(report, "test-module")
+            .classesBelowThreshold().getFirst();
+
+        assertThat(classA.sourceFile()).isNull();
+        assertThat(classA.uncoveredLines()).isEmpty();
+    }
+
+    @Test
+    void unexecutedRanges_shouldBeEmptyWhenEveryLineRan() {
+        assertThat(CoverageGapAnalyzer.unexecutedRanges(List.of())).isEmpty();
+        assertThat(CoverageGapAnalyzer.unexecutedRanges(List.of(
+            new SourceLine(1, 0, 4),
+            new SourceLine(2, 1, 1)))).isEmpty();
+    }
+
+    @Test
+    void unexecutedRanges_shouldCloseARangeRunningToTheEndOfTheFile() {
+        assertThat(CoverageGapAnalyzer.unexecutedRanges(List.of(
+            new SourceLine(7, 0, 2),
+            new SourceLine(9, 3, 0),
+            new SourceLine(12, 1, 0))))
+            .containsExactly(new LineGap(9, 12, CoverageGapAnalyzer.UNEXECUTED));
+    }
+
+    @Test
+    void describeRanges_shouldNameSingleLinesAndCountWhatItLeavesOut() {
+        List<LineGap> twelve = new ArrayList<>();
+        for (int i = 0; i < 12; i++) {
+            twelve.add(new LineGap(i * 10, i * 10 + (i % 2), CoverageGapAnalyzer.UNEXECUTED));
+        }
+
+        assertThat(CoverageGapAnalyzer.describeRanges(twelve.subList(0, 2))).isEqualTo("0, 10-11");
+        assertThat(CoverageGapAnalyzer.describeRanges(twelve))
+            .startsWith("0, 10-11, 20, 30-31")
+            .endsWith("90-91 and 2 more");
     }
 
     @Test
@@ -187,6 +258,7 @@ class CoverageGapAnalyzerTest {
             40.0,  // branch
             60.0,  // line
             List.of(),
+            "TestClass.java",
             List.of()
         );
 
@@ -231,7 +303,7 @@ class CoverageGapAnalyzerTest {
     void moduleGapAnalysis_shouldAggregateAllGapTypes() {
         ModuleGapAnalysis analysis = new ModuleGapAnalysis(
             "test-module",
-            List.of(new ClassGap("pkg", "cls", 50.0, 40.0, 30.0, List.of(), List.of())),
+            List.of(new ClassGap("pkg", "cls", 50.0, 40.0, 30.0, List.of(), "cls.java", List.of())),
             List.of(new MethodGap("pkg.cls", "method", 10, 50)),
             List.of(new PackageGap("pkg", 60.0, 1)),
             70.0
