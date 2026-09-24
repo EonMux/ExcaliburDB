@@ -819,29 +819,41 @@ class IngestEndpointTest {
         }
 
         @Test
-        @DisplayName("undoes a registration that raced a supplied batch and won")
-        void undoesARegistrationThatRacedASuppliedBatch(@TempDir Path root) throws IOException {
-            // The pre-check sees nothing; the batch records its claim; the post-check sees it.
-            // Without the second read the crawl would stay registered and delete the documents
-            // on its first pass, which is the loss both halves of this guard exist to prevent.
+        @DisplayName("refuses a registration that raced a supplied batch, before it starts")
+        void refusesARegistrationThatRacedASuppliedBatch(@TempDir Path root) throws IOException {
+            // The pre-check sees nothing; the batch records its claim; the read made once the
+            // registry holds its claim sees it. Without that second read the crawl would stay
+            // registered and delete the documents on its first pass, which is the loss both
+            // halves of this guard exist to prevent.
             InlineSourceIds supplied = new InlineSourceIds(256);
+            IngestionOrchestrator orchestrator = mock(IngestionOrchestrator.class);
+            List<NamespaceId> admitted = new ArrayList<>();
             // The batch claims the id while this registration is inside register(), which is
             // exactly the window the pre-check cannot see.
             registry = new InMemorySourceRegistry() {
                 @Override
                 public void register(Source source,
-                        com.eonmux.excalibur.ingest.source.SourceDescriptor descriptor) {
+                        com.eonmux.excalibur.ingest.source.SourceDescriptor descriptor,
+                        Admission admission) throws IOException {
                     supplied.remember(source.getSourceId());
-                    super.register(source, descriptor);
+                    super.register(source, descriptor, admission);
                 }
             };
+            registry.setIngestionOrchestrator(orchestrator);
 
-            Response response = register(root, "notes", supplied);
+            Response response = post(ApiSecurityConfig.builder().allowIngestRoot(root).build(),
+                supplied, "{\"source_type\": \"filesystem\", \"config\": {"
+                    + "\"source_id\": \"notes\", \"root_path\": \"" + root + "\"}}", "acme",
+                admitted::add);
 
             assertThat(response.status()).isEqualTo(409);
+            assertThat(response.body()).contains("\"code\": \"source_kind_conflict\"");
             assertThat(registry.isRegistered("notes"))
                 .as("a registration that is refused must not be left crawling")
                 .isFalse();
+            org.mockito.Mockito.verify(orchestrator, org.mockito.Mockito.never())
+                .startIngestion(org.mockito.ArgumentMatchers.any());
+            assertThat(admitted).as("nor leave a namespace behind").isEmpty();
         }
 
         @Test
@@ -964,6 +976,97 @@ class IngestEndpointTest {
             }
         }
 
+        @Test
+        @DisplayName("a duplicate registration admits no namespace")
+        void aDuplicateAdmitsNothing(@TempDir Path root) throws IOException {
+            assertThat(register(root, "docs").status()).isEqualTo(200);
+            List<NamespaceId> admitted = new ArrayList<>();
+
+            Response response = post(ApiSecurityConfig.builder().allowIngestRoot(root).build(),
+                null, body(root, "docs"), "acme", admitted::add);
+
+            assertThat(response.status()).isEqualTo(409);
+            assertThat(response.body()).contains("\"code\": \"source_exists\"");
+            assertThat(admitted).as("a request that fails leaves no tenant behind").isEmpty();
+        }
+
+        @Test
+        @DisplayName("a full registry admits no namespace")
+        void aFullRegistryAdmitsNothing(@TempDir Path root) throws IOException {
+            InMemorySourceRegistry full = new InMemorySourceRegistry(1);
+            ApiSecurityConfig security = ApiSecurityConfig.builder().allowIngestRoot(root).build();
+            assertThat(send("POST", full, security, null, body(root, "first"), null).status())
+                .isEqualTo(200);
+            List<NamespaceId> admitted = new ArrayList<>();
+
+            Response response = send("POST", full, security, null, body(root, "second"), "acme",
+                admitted::add);
+
+            assertThat(response.status()).isEqualTo(429);
+            assertThat(admitted).isEmpty();
+            full.close();
+        }
+
+        @Test
+        @DisplayName("a source supplied directly admits no namespace")
+        void aSuppliedSourceAdmitsNothing(@TempDir Path root) throws IOException {
+            InlineSourceIds supplied = new InlineSourceIds(8);
+            supplied.remember("docs");
+            List<NamespaceId> admitted = new ArrayList<>();
+
+            Response response = post(ApiSecurityConfig.builder().allowIngestRoot(root).build(),
+                supplied, body(root, "docs"), "acme", admitted::add);
+
+            assertThat(response.status()).isEqualTo(409);
+            assertThat(response.body()).contains("\"code\": \"source_kind_conflict\"");
+            assertThat(admitted).isEmpty();
+        }
+
+        @Test
+        @DisplayName("a namespace that cannot be created registers nothing and frees the id")
+        void anUncreatableNamespaceFreesTheId(@TempDir Path root) throws IOException {
+            ApiSecurityConfig security = ApiSecurityConfig.builder().allowIngestRoot(root).build();
+
+            Response failed = post(security, null, body(root, "docs"), "acme", namespace -> {
+                throw new IOException("disk full");
+            });
+
+            assertThat(failed.status()).isEqualTo(500);
+            assertThat(registry.getAllSourceIds()).isEmpty();
+            assertThat(post(security, null, body(root, "docs"), "acme", NamespaceAdmission.ANY)
+                .status()).as("the failed attempt kept no claim on the id").isEqualTo(200);
+        }
+
+        @Test
+        @DisplayName("against a node's real namespaces, a failed registration leaves no directory")
+        void aFailedRegistrationLeavesNoDirectory(@TempDir Path root, @TempDir Path graphs)
+                throws IOException {
+            try (GraphTenants tenants = new GraphTenants(graphs,
+                    new com.eonmux.excalibur.config.Config(new java.util.HashMap<>(
+                        Map.of("excalibur.graph.ram-buffer-mb", "4.0"))),
+                    com.eonmux.excalibur.tenancy.MappingBudget.detect(), 4)) {
+                ApiSecurityConfig security =
+                    ApiSecurityConfig.builder().allowIngestRoot(root).build();
+                assertThat(register(root, "docs").status()).isEqualTo(200);
+
+                Response duplicate = post(security, null, body(root, "docs"), "acme",
+                    tenants::admit);
+                Response mismatch = send("PUT", registry, security, null, body(root, "docs"),
+                    "beta", tenants::admit);
+
+                assertThat(duplicate.status()).isEqualTo(409);
+                assertThat(mismatch.status()).isEqualTo(409);
+                assertThat(mismatch.body()).contains("source_namespace_mismatch");
+                assertThat(graphs.resolve("acme")).doesNotExist();
+                assertThat(graphs.resolve("beta")).doesNotExist();
+                assertThat(tenants.exists(NamespaceId.of("acme"))).isFalse();
+
+                assertThat(post(security, null, body(root, "other"), "acme", tenants::admit)
+                    .status()).as("a registration that succeeds creates it").isEqualTo(200);
+                assertThat(tenants.exists(NamespaceId.of("acme"))).isTrue();
+            }
+        }
+
         /** A filesystem registration for {@code root} under {@code sourceId}. */
         private String body(Path root, String sourceId) {
             return "{\"source_type\": \"filesystem\", \"config\": {"
@@ -1021,6 +1124,67 @@ class IngestEndpointTest {
             assertThat(response.status()).isEqualTo(409);
             assertThat(response.body()).contains("namespace")
                 .contains("\"code\": \"source_namespace_mismatch\"");
+            assertThat(registry.get("docs")).isSameAs(original);
+        }
+
+        @Test
+        @DisplayName("another namespace admits no namespace")
+        void anotherNamespaceAdmitsNothing(@TempDir Path root) throws IOException {
+            assertThat(register(root, "docs").status()).isEqualTo(200);
+            List<NamespaceId> admitted = new ArrayList<>();
+
+            Response response = send("PUT", registry,
+                ApiSecurityConfig.builder().allowIngestRoot(root).build(), null,
+                body(root, "docs"), "acme", admitted::add);
+
+            assertThat(response.status()).isEqualTo(409);
+            assertThat(admitted).as("a request that fails leaves no tenant behind").isEmpty();
+        }
+
+        @Test
+        @DisplayName("an unknown id admits no namespace")
+        void unknownAdmitsNothing(@TempDir Path root) throws IOException {
+            List<NamespaceId> admitted = new ArrayList<>();
+
+            Response response = send("PUT", registry,
+                ApiSecurityConfig.builder().allowIngestRoot(root).build(), null,
+                body(root, "docs"), "acme", admitted::add);
+
+            assertThat(response.status()).isEqualTo(404);
+            assertThat(admitted).isEmpty();
+        }
+
+        @Test
+        @DisplayName("a replacement that goes through admits its namespace")
+        void aReplacementAdmitsItsNamespace(@TempDir Path root) throws IOException {
+            ApiSecurityConfig security = ApiSecurityConfig.builder().allowIngestRoot(root).build();
+            assertThat(send("POST", registry, security, null, body(root, "docs"), "acme")
+                .status()).isEqualTo(200);
+            List<NamespaceId> admitted = new ArrayList<>();
+
+            Response response = send("PUT", registry, security, null, body(root, "docs"),
+                "acme", admitted::add);
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(admitted).containsExactly(NamespaceId.of("acme"));
+        }
+
+        @Test
+        @DisplayName("a refused namespace replaces nothing, and says why")
+        void aRefusedNamespaceReplacesNothing(@TempDir Path root) throws IOException {
+            ApiSecurityConfig security = ApiSecurityConfig.builder().allowIngestRoot(root).build();
+            assertThat(send("POST", registry, security, null, body(root, "docs"), "acme")
+                .status()).isEqualTo(200);
+            Source original = registry.get("docs");
+
+            Response response = send("PUT", registry, security, null, body(root, "docs"),
+                "acme", namespace -> {
+                    throw new NamespaceRefusedException(namespace,
+                        NamespaceRefusedException.Reason.NOT_CREATED, "dropped meanwhile");
+                });
+
+            assertThat(response.status()).isEqualTo(404);
+            assertThat(response.body()).contains("namespace_not_found");
             assertThat(registry.get("docs")).isSameAs(original);
         }
 

@@ -1688,6 +1688,10 @@ the switch off too, so provisioning can create a tenant ahead of its first docum
 `shared` not counted: creating another past it — explicitly or by naming it — is refused with
 `429 namespace_limit_reached` and leaves nothing on disk, and dropping one makes room. Creating a
 namespace makes its directory and opens nothing, so it costs no open slot until something uses it.
+A request that fails creates nothing: a namespace is created only once the request is known to go
+through, so a registration refused as a duplicate, into a full registry or as a replacement naming
+another namespace, a build refused because one is running or the node is shutting down, and a
+body refused as malformed all leave the node's namespaces as they were.
 
 **What a namespace is not.** Namespaces partition the knowledge graph and nothing else. A node
 holds one corpus: every document, vector and lexical entry is searchable through `/v1/query` and

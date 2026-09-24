@@ -26,6 +26,8 @@ public class SourceRegistrationException extends IllegalStateException {
         IN_FLIGHT(409, ErrorCode.SOURCE_BUSY),
         /** A replacement names a different namespace from the one the source was registered in. */
         NAMESPACE_MISMATCH(409, ErrorCode.SOURCE_NAMESPACE_MISMATCH),
+        /** Documents were supplied directly under the id, and a crawl would remove them. */
+        KIND_CONFLICT(409, ErrorCode.SOURCE_KIND_CONFLICT),
         /** The node is shutting down and starts nothing new against its sources. */
         SHUTTING_DOWN(503, ErrorCode.SHUTTING_DOWN);
 

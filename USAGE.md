@@ -510,7 +510,9 @@ that does not exist creates it, unless `excalibur.graph.require-explicit-namespa
 only `PUT /v1/graph/namespaces/{namespace}` creates one, and every other route answers a name
 nobody created with `404 namespace_not_found`, so a typo cannot become a tenant. Either way the
 node holds at most `excalibur.graph.max-namespaces` of them besides `shared`, and refuses another
-with `429 namespace_limit_reached`.
+with `429 namespace_limit_reached`. A request that fails creates no namespace: one is created only
+once the request is known to succeed, so a duplicate registration, a replacement naming another
+namespace, a build refused during shutdown or a malformed body leaves no tenant behind.
 `PUT /v1/ingest` reads it too, and refuses with `409 source_namespace_mismatch` a replacement that
 names a namespace other than the one the source was registered in. A node holds one
 corpus, so every other `/v1` route answers `400` when a request names a namespace rather than

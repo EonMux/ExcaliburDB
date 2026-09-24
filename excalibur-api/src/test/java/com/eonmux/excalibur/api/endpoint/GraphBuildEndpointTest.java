@@ -334,6 +334,19 @@ class GraphBuildEndpointTest {
         }
 
         @Test
+        @DisplayName("a build asked for during shutdown is 503, and creates no namespace")
+        void shuttingDownCreatesNothing() throws IOException {
+            runner.close();
+
+            Response refused = call(build, "POST", "fresh");
+
+            assertThat(refused.status()).isEqualTo(503);
+            assertThat(Json.stringAt(refused.json(), "code")).isEqualTo("shutting_down");
+            assertThat(root.resolve("fresh"))
+                .as("a request that fails leaves no tenant behind").doesNotExist();
+        }
+
+        @Test
         @DisplayName("a namespace the node will not create is refused before a build is claimed")
         void aRefusedNamespaceClaimsNothing() throws IOException {
             tenants.close();

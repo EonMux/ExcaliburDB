@@ -20,6 +20,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
@@ -173,6 +174,17 @@ public final class GraphBuildRunner implements AutoCloseable {
     private final Object lock = new Object();
 
     /**
+     * Whether builds are still accepted: false from the moment a drain begins. Guarded by
+     * {@link #lock}.
+     *
+     * <p>Read before the namespace is admitted, and the build handed to the executor under the
+     * same lock, so a build refused because the node is shutting down has admitted - and
+     * possibly created - nothing. Relying on the executor's own refusal instead would find out
+     * only after the admission.</p>
+     */
+    private boolean accepting = true;
+
+    /**
      * Whether the build in progress has been asked to stop.
      *
      * <p>Read by the build itself at its own boundaries. Not an interrupt: a build publishes by
@@ -279,8 +291,9 @@ public final class GraphBuildRunner implements AutoCloseable {
     /**
      * Starts a build of one namespace, unless the node is already building something.
      *
-     * <p>The namespace is admitted once the slot is known to be free and before it is claimed,
-     * so a refused namespace claims nothing and a build that is in the way creates nothing.</p>
+     * <p>The namespace is admitted once the slot is known to be free and the node is known to be
+     * accepting builds, and before the slot is claimed: a refused namespace claims nothing, and a
+     * build that is in the way, or a shutdown, creates nothing.</p>
      *
      * @param namespace Whose graph to build
      * @return What was started, or what is in the way
@@ -294,6 +307,10 @@ public final class GraphBuildRunner implements AutoCloseable {
         long startedAtMs = System.currentTimeMillis();
         Snapshot started = new Snapshot(STATE_RUNNING, namespace, startedAtMs, 0L, null, null);
         synchronized (lock) {
+            if (!accepting) {
+                throw new RejectedExecutionException(
+                    "the node is shutting down and starts no graph build");
+            }
             if (inFlight != null) {
                 return new Claim(null, inFlight);
             }
@@ -304,16 +321,17 @@ public final class GraphBuildRunner implements AutoCloseable {
             }
             inFlight = started;
             remembered.put(namespace, started);
-        }
-        cancelRequested.set(false);
-        try {
-            executor.submit(() -> run(started));
-        } catch (RuntimeException e) {
-            // A rejected task would otherwise leave the slot claimed and every later build
-            // answered 409 for the life of the process.
-            finish(new Snapshot(STATE_FAILED, namespace, startedAtMs, System.currentTimeMillis(),
-                null, "the build could not be scheduled: " + e.getMessage()));
-            throw e;
+            cancelRequested.set(false);
+            try {
+                executor.submit(() -> run(started));
+            } catch (RuntimeException e) {
+                // A rejected task would otherwise leave the slot claimed and every later build
+                // answered 409 for the life of the process.
+                finish(new Snapshot(STATE_FAILED, namespace, startedAtMs,
+                    System.currentTimeMillis(), null,
+                    "the build could not be scheduled: " + e.getMessage()));
+                throw e;
+            }
         }
         LOGGER.info("graph build of namespace {} started", namespace);
         return new Claim(started, null);
@@ -529,6 +547,9 @@ public final class GraphBuildRunner implements AutoCloseable {
      */
     public boolean drain(Duration wait) {
         Objects.requireNonNull(wait, "wait must not be null");
+        synchronized (lock) {
+            accepting = false;
+        }
         cancelRequested.set(true);
         executor.shutdown();
         try {
