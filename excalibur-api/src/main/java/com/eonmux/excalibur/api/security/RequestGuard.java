@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.security;
 
 import com.eonmux.excalibur.api.protocol.ErrorCode;
+import com.eonmux.excalibur.api.protocol.RequestState;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 
 import com.sun.net.httpserver.HttpExchange;
@@ -59,8 +60,8 @@ public final class RequestGuard {
     private static final String BEARER_PREFIX = "bearer ";
 
     /**
-     * The exchange attribute holding the calling client's address, as {@link #allow} resolved
-     * it.
+     * The {@link RequestState} key holding the calling client's address, as {@link #allow}
+     * resolved it.
      *
      * <p>Resolved once, by the same rule the rate limiter keys on - the peer, or the origin a
      * trusted proxy forwarded for - so that whatever records who made a request names the
@@ -68,7 +69,7 @@ public final class RequestGuard {
      * Unlike the rate-limit key it is the whole address: an IPv6 client is metered by its /64,
      * and an audit record naming only the network would not name the client.</p>
      */
-    public static final String CLIENT_ADDRESS_ATTRIBUTE = "excalibur.client_address";
+    public static final String CLIENT_ADDRESS_KEY = "excalibur.client_address";
 
     private final ApiSecurityConfig config;
     private final ClientRateLimiter rateLimiter;
@@ -150,7 +151,7 @@ public final class RequestGuard {
     public boolean allow(HttpExchange exchange, Access access) throws IOException {
         byte[] origin = originOf(exchange, config.trustedProxies());
         String clientKey = ClientAddressKey.ofBytes(origin);
-        exchange.setAttribute(CLIENT_ADDRESS_ATTRIBUTE, addressText(origin));
+        RequestState.put(exchange, CLIENT_ADDRESS_KEY, addressText(origin));
         ClientRateLimiter.Decision decision = rateLimiter.check(clientKey, access.isMutating());
         if (!decision.allowed()) {
             LOGGER.warn("Rate limit exceeded for {} on {}", clientKey, exchange.getRequestURI().getPath());
@@ -228,7 +229,7 @@ public final class RequestGuard {
     /**
      * The calling client's address, as the guard resolved it for this exchange.
      *
-     * <p>Read from {@link #CLIENT_ADDRESS_ATTRIBUTE} when the exchange has passed through
+     * <p>Read from {@link #CLIENT_ADDRESS_KEY} when the exchange has passed through
      * {@link #allow}, and otherwise the peer address, which is what the guard would have
      * resolved on a node with no trusted proxy.</p>
      *
@@ -236,7 +237,7 @@ public final class RequestGuard {
      * @return The address as text, or {@code unknown} when the exchange carries none
      */
     public static String clientAddress(HttpExchange exchange) {
-        Object resolved = exchange.getAttribute(CLIENT_ADDRESS_ATTRIBUTE);
+        Object resolved = RequestState.get(exchange, CLIENT_ADDRESS_KEY);
         if (resolved instanceof String address) {
             return address;
         }

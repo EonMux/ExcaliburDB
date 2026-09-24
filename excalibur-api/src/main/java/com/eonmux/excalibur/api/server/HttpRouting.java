@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.protocol.ErrorCode;
+import com.eonmux.excalibur.api.protocol.RequestState;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.api.security.RequestGuard;
 import com.eonmux.excalibur.tenancy.NamespaceId;
@@ -142,6 +143,9 @@ final class HttpRouting {
     /**
      * Wraps a handler with logging and error handling.
      *
+     * <p>The outermost handler of every context, so it is also what releases the exchange's
+     * {@link RequestState} once the exchange is closed.</p>
+     *
      * @param handler The original handler
      * @return A wrapped handler with logging
      */
@@ -168,6 +172,7 @@ final class HttpRouting {
                 }
             } finally {
                 exchange.close();
+                RequestState.clear(exchange);
             }
         };
     }

@@ -5,6 +5,7 @@ import ch.qos.logback.classic.LoggerContext;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.eonmux.excalibur.api.StubExchange;
+import com.eonmux.excalibur.api.protocol.RequestState;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.security.RequestGuard;
@@ -160,7 +161,7 @@ class AuditLogTest {
 
         AuditLog.target(exchange, "source_id", "docs");
 
-        assertThat(exchange.getAttribute("excalibur.audit.targets")).isNull();
+        assertThat(RequestState.get(exchange, "excalibur.audit.targets")).isNull();
     }
 
     @Test

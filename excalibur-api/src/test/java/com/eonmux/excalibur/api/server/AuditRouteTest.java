@@ -146,6 +146,31 @@ class AuditRouteTest {
     }
 
     @Test
+    @DisplayName("each request on a route is recorded under its own id and its own targets")
+    void requestsOnOneRouteShareNothing() throws IOException {
+        // The JDK keeps an exchange's attributes on its route, shared by every request to it;
+        // what one request settled there must not be what the next is recorded under.
+        Answer first = call("DELETE", "/v1/ingest", "{\"source_id\": \"docs\"}", TOKEN, "a-1");
+        recorded(1);
+        Answer second = call("DELETE", "/v1/ingest", "{\"source_id\": \"notes\"}", TOKEN,
+            "b-2");
+        recorded(2);
+        Answer third = call("DELETE", "/v1/ingest", "{}", TOKEN, null);
+
+        assertThat(first.requestId()).isEqualTo("a-1");
+        assertThat(second.requestId()).isEqualTo("b-2");
+        assertThat(third.requestId()).isNotNull().isNotIn("a-1", "b-2");
+        List<Map<String, Object>> recorded = recorded(3);
+        assertThat(recorded).hasSize(3);
+        assertThat(recorded.get(0)).containsEntry("request_id", "a-1")
+            .containsEntry("audit_targets", Map.of("source_id", "docs"));
+        assertThat(recorded.get(1)).containsEntry("request_id", "b-2")
+            .containsEntry("audit_targets", Map.of("source_id", "notes"));
+        assertThat(recorded.get(2)).containsEntry("request_id", third.requestId())
+            .containsEntry("audit_targets", Map.of());
+    }
+
+    @Test
     @DisplayName("an attempt without a token is recorded as unauthenticated")
     void refusedAttemptsAreAudited() throws IOException {
         Answer refused = call("POST", "/v1/drain", null, null, null);

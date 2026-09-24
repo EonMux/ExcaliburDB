@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.audit;
 
+import com.eonmux.excalibur.api.protocol.RequestState;
 import com.eonmux.excalibur.api.security.RequestGuard;
 
 import com.sun.net.httpserver.HttpExchange;
@@ -55,7 +56,8 @@ import java.util.regex.Pattern;
  * name into it would defeat the erasure it records.</p>
  *
  * <h2>Thread Safety</h2>
- * <p>Stateless. Each exchange's targets live on the exchange.</p>
+ * <p>Stateless. Each request's id and targets are kept for it in {@link RequestState}, never in
+ * the exchange's attributes, which the JDK shares across every request on a route.</p>
  *
  * @author ExcaliburDB
  */
@@ -67,10 +69,10 @@ public final class AuditLog {
     /** The header a request id is read from and returned in. */
     public static final String REQUEST_ID_HEADER = "X-Request-Id";
 
-    /** The exchange attribute holding the request id once one has been settled. */
-    public static final String REQUEST_ID_ATTRIBUTE = "excalibur.request_id";
+    /** The {@link RequestState} key holding the request id once one has been settled. */
+    public static final String REQUEST_ID_KEY = "excalibur.request_id";
 
-    private static final String TARGETS_ATTRIBUTE = "excalibur.audit.targets";
+    private static final String TARGETS_KEY = "excalibur.audit.targets";
 
     /**
      * What a caller-supplied request id may look like.
@@ -126,12 +128,12 @@ public final class AuditLog {
      * @param value    Its value; null is ignored
      */
     public static void target(HttpExchange exchange, String name, Object value) {
-        if (value == null || !(exchange.getAttribute(TARGETS_ATTRIBUTE) instanceof Map<?, ?>)) {
+        if (value == null
+                || !(RequestState.get(exchange, TARGETS_KEY) instanceof Map<?, ?> held)) {
             return;
         }
         @SuppressWarnings("unchecked")
-        Map<String, Object> targets = (Map<String, Object>) exchange.getAttribute(
-            TARGETS_ATTRIBUTE);
+        Map<String, Object> targets = (Map<String, Object>) held;
         targets.put(name, value);
     }
 
@@ -146,7 +148,7 @@ public final class AuditLog {
      * @return The id
      */
     public static String requestId(HttpExchange exchange) {
-        Object settled = exchange.getAttribute(REQUEST_ID_ATTRIBUTE);
+        Object settled = RequestState.get(exchange, REQUEST_ID_KEY);
         if (settled instanceof String id) {
             return id;
         }
@@ -154,8 +156,8 @@ public final class AuditLog {
         String id = supplied != null && USABLE_REQUEST_ID.matcher(supplied).matches()
             ? supplied
             : UUID.randomUUID().toString();
-        exchange.setAttribute(REQUEST_ID_ATTRIBUTE, id);
-        exchange.setAttribute(TARGETS_ATTRIBUTE, Collections.synchronizedMap(
+        RequestState.put(exchange, REQUEST_ID_KEY, id);
+        RequestState.put(exchange, TARGETS_KEY, Collections.synchronizedMap(
             new LinkedHashMap<String, Object>()));
         exchange.getResponseHeaders().set(REQUEST_ID_HEADER, id);
         return id;
@@ -211,7 +213,7 @@ public final class AuditLog {
     }
 
     private static Map<String, Object> targetsOf(HttpExchange exchange) {
-        if (exchange.getAttribute(TARGETS_ATTRIBUTE) instanceof Map<?, ?> targets) {
+        if (RequestState.get(exchange, TARGETS_KEY) instanceof Map<?, ?> targets) {
             synchronized (targets) {
                 Map<String, Object> copy = new LinkedHashMap<>();
                 targets.forEach((name, value) -> copy.put(String.valueOf(name), value));
