@@ -28,6 +28,7 @@ import com.eonmux.excalibur.retrieval.pipeline.EntityLinker;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
 import com.eonmux.excalibur.retrieval.pipeline.RelationResolver;
 import com.eonmux.excalibur.retrieval.pipeline.LexicalEntityLinker;
+import com.eonmux.excalibur.retrieval.pipeline.WalkLimits;
 import com.eonmux.excalibur.retrieval.serialize.BpeTokenCounter;
 import com.eonmux.excalibur.retrieval.serialize.SerializationBudget;
 import com.eonmux.excalibur.retrieval.serialize.TripleSubgraphSerializer;
@@ -305,7 +306,8 @@ public final class GraphRagFactory {
                 settings.getTopK(),
                 embedderFor(models, entityVectors),
                 relationResolverFor(relationNames),
-                entityNames);
+                entityNames,
+                WalkLimits.of(settings));
 
             LOGGER.info("Graph-RAG pipeline opened from {}: {} entity names, {} relation names",
                 directory, entityNames.size(), relationNames.size());

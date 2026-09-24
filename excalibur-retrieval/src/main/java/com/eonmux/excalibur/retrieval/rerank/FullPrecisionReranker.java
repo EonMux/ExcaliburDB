@@ -3,6 +3,7 @@ package com.eonmux.excalibur.retrieval.rerank;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.eonmux.excalibur.core.util.QueryBudget;
 import com.eonmux.excalibur.retrieval.rank.RankedList;
 import com.eonmux.excalibur.retrieval.rank.Ranker;
 import com.eonmux.excalibur.retrieval.rank.RetrievalQuery;
@@ -129,6 +130,19 @@ public final class FullPrecisionReranker implements Ranker {
 
     @Override
     public RankedList rank(RetrievalQuery query, int limit) {
+        return rank(query, limit, QueryBudget.unbounded());
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>The budget is passed to the ranker underneath, which may wait on a model. The rerank
+     * itself waits on nothing, but is skipped once the query's deadline has passed: the coarse
+     * order is then returned as it stands and the budget marked timed out, so an answer already
+     * late is not made later by reading vectors.</p>
+     */
+    @Override
+    public RankedList rank(RetrievalQuery query, int limit, QueryBudget budget) {
         if (query == null) {
             throw new IllegalArgumentException("query must not be null");
         }
@@ -138,9 +152,14 @@ public final class FullPrecisionReranker implements Ranker {
         float[] queryVector = query.requireEmbedding(name);
 
         int overFetch = overFetch(limit);
-        RankedList coarse = delegate.rank(query, overFetch);
+        RankedList coarse = delegate.rank(query, overFetch, budget);
         if (coarse.isEmpty()) {
             return RankedList.empty(name);
+        }
+        budget.throwIfCancelled();
+        if (budget.isExpired()) {
+            budget.markTimedOut();
+            return RankedList.of(name, coarse.documents(), limit);
         }
 
         List<ScoredDocument> measured = new ArrayList<>(coarse.size());

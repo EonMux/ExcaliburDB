@@ -2,6 +2,7 @@ package com.eonmux.excalibur.retrieval;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -9,6 +10,7 @@ import java.util.concurrent.Future;
 
 import com.eonmux.excalibur.core.trace.QueryTrace;
 import com.eonmux.excalibur.core.trace.Stage;
+import com.eonmux.excalibur.core.util.QueryBudget;
 import com.eonmux.excalibur.retrieval.fusion.FusedDocument;
 import com.eonmux.excalibur.retrieval.fusion.FusionStrategy;
 import com.eonmux.excalibur.retrieval.fusion.ReciprocalRankFusion;
@@ -121,6 +123,26 @@ public final class HybridRetriever {
      * @return fused documents, best first, at most {@code limit}
      */
     public List<FusedDocument> retrieve(RetrievalQuery query, int limit, QueryTrace trace) {
+        return retrieve(query, limit, trace, QueryBudget.unbounded());
+    }
+
+    /**
+     * Runs every signal within what is left of a query's time, and fuses the results.
+     *
+     * <p>The budget is handed to each signal, which is what bounds a model call inside one; a
+     * signal that runs out of time contributes the ranking it had and marks the budget timed
+     * out. A cancelled query ends here rather than being counted as signals that failed.</p>
+     *
+     * @param trace  receives the time spent ranking; never null
+     * @param budget the query's deadline and cancellation; never null
+     * @return fused documents, best first, at most {@code limit}
+     * @throws java.util.concurrent.CancellationException if the query was cancelled
+     */
+    public List<FusedDocument> retrieve(RetrievalQuery query, int limit, QueryTrace trace,
+                                        QueryBudget budget) {
+        if (budget == null) {
+            throw new IllegalArgumentException("budget must not be null");
+        }
         if (query == null) {
             throw new IllegalArgumentException("query must not be null");
         }
@@ -131,16 +153,18 @@ public final class HybridRetriever {
             return List.of();
         }
         return trace.time(Stage.RANK, () -> {
-            List<RankedList> lists = runSignals(query, overFetch(limit));
+            List<RankedList> lists = runSignals(query, overFetch(limit), budget);
             return fusion.fuse(lists, limit);
         });
     }
 
-    private List<RankedList> runSignals(RetrievalQuery query, int perSignalLimit) {
+    private List<RankedList> runSignals(RetrievalQuery query, int perSignalLimit,
+                                        QueryBudget budget) {
+        budget.throwIfCancelled();
         List<Future<RankedList>> futures = new ArrayList<>(rankers.size());
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             for (Ranker ranker : rankers) {
-                futures.add(executor.submit(() -> ranker.rank(query, perSignalLimit)));
+                futures.add(executor.submit(() -> ranker.rank(query, perSignalLimit, budget)));
             }
         }
 
@@ -157,12 +181,16 @@ public final class HybridRetriever {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("interrupted while running retrieval signals", e);
             } catch (ExecutionException e) {
+                if (e.getCause() instanceof CancellationException cancelled) {
+                    throw cancelled;
+                }
                 LOGGER.warn("retrieval signal {} failed and will contribute nothing",
                     ranker.name(), e.getCause());
                 failed.add(ranker.name());
             }
         }
 
+        budget.throwIfCancelled();
         if (lists.isEmpty()) {
             throw new IllegalStateException(
                 "every retrieval signal failed: " + failed

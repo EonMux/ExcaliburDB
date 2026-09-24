@@ -17,10 +17,11 @@ import com.eonmux.excalibur.retrieval.fusion.FusedDocument;
  * reconstruct the retrieval it could not observe - which is how a calibrator comes to fit a
  * pipeline nobody runs.
  *
- * <p>Sealed with three cases because a question can fail to reach abstention in two ways that are
- * not abstention's to fix, and a fit must not treat either as a refusal it could have prevented:
- * an unbound pronoun is a question the planner could not read, and an unresolvable mention is a
- * name the graph does not hold. No threshold changes either outcome.
+ * <p>Sealed with four cases because a question can fail to reach abstention in three ways that
+ * are not abstention's to fix, and a fit must not treat any as a refusal it could have prevented:
+ * an unbound pronoun is a question the planner could not read, an unresolvable mention is a name
+ * the graph does not hold, and a deadline that passed before the walk is a question that was
+ * never looked into. No threshold changes any of them.
  */
 public sealed interface Evidence {
 
@@ -38,13 +39,14 @@ public sealed interface Evidence {
      * @param ranked   every entity retrieval ranked, best first; may be empty
      * @param subgraph the evidence the traversal assembled
      * @param plan     the plan this was retrieved for
+     * @param walk     what the walk's limits left out of the subgraph
      */
     record Gathered(List<FusedDocument> fused, List<FusedDocument> ranked, Subgraph subgraph,
-                    QueryPlan plan) implements Evidence {
+                    QueryPlan plan, WalkTruncation walk) implements Evidence {
 
         public Gathered {
-            if (subgraph == null || plan == null) {
-                throw new IllegalArgumentException("subgraph and plan are required");
+            if (subgraph == null || plan == null || walk == null) {
+                throw new IllegalArgumentException("subgraph, plan and walk are required");
             }
             fused = List.copyOf(fused);
             ranked = List.copyOf(ranked);
@@ -65,6 +67,21 @@ public sealed interface Evidence {
     record Unresolved(QueryPlan plan) implements Evidence {
 
         public Unresolved {
+            if (plan == null) {
+                throw new IllegalArgumentException("plan is required");
+            }
+        }
+    }
+
+    /**
+     * The query's deadline passed before the graph was walked, so there is no evidence at all.
+     *
+     * <p>A deadline that passes later leaves {@link Gathered} evidence that is partial rather than
+     * none; this is only the case where nothing had been looked at.</p>
+     */
+    record TimedOut(QueryPlan plan) implements Evidence {
+
+        public TimedOut {
             if (plan == null) {
                 throw new IllegalArgumentException("plan is required");
             }

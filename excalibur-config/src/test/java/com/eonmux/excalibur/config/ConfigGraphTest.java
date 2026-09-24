@@ -48,6 +48,8 @@ class ConfigGraphTest {
                 .as("the honest default is no correction, because none has been measured")
                 .isEqualTo(GraphConfig.DEFAULT_CONFIDENCE_TEMPERATURE);
             assertThat(settings.getRamBufferMb()).isEqualTo(GraphConfig.DEFAULT_RAM_BUFFER_MB);
+            assertThat(settings.getMaxFrontier()).isEqualTo(GraphConfig.DEFAULT_MAX_FRONTIER);
+            assertThat(settings.getMaxWalkFacts()).isEqualTo(GraphConfig.DEFAULT_MAX_WALK_FACTS);
         }
 
         @Test
@@ -99,6 +101,18 @@ class ConfigGraphTest {
             assertThat(settings.getMaxAmbiguousCandidates()).isEqualTo(3);
             assertThat(settings.getConfidenceTemperature()).isEqualTo(2.5);
             assertThat(settings.getRamBufferMb()).isEqualTo(64.0);
+        }
+
+        @Test
+        @DisplayName("the walk caps are read")
+        void walkCapsAreRead() {
+            GraphConfig settings = graph(Map.of(
+                "excalibur.graph.max-frontier", "25",
+                "excalibur.graph.max-walk-facts", "300"));
+
+            assertThat(settings.getMaxFrontier()).isEqualTo(25);
+            assertThat(settings.getMaxWalkFacts()).isEqualTo(300);
+            assertThat(settings.toString()).contains("maxFrontier=25", "maxWalkFacts=300");
         }
 
         @Test
@@ -198,6 +212,20 @@ class ConfigGraphTest {
                 graph(Map.of("excalibur.graph.max-ambiguous-candidates", "0")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("max-ambiguous-candidates");
+            assertThatThrownBy(() -> graph(Map.of("excalibur.graph.max-frontier", "0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max-frontier");
+            assertThatThrownBy(() -> graph(Map.of("excalibur.graph.max-walk-facts", "-5")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max-walk-facts");
+        }
+
+        @Test
+        @DisplayName("a walk cap that is not a number is refused, naming the key")
+        void unparseableWalkCap() {
+            assertThatThrownBy(() -> graph(Map.of("excalibur.graph.max-frontier", "lots")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max-frontier");
         }
 
         @Test

@@ -7,10 +7,13 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.TimeoutException;
 import java.util.function.LongFunction;
 
 import com.eonmux.excalibur.core.trace.QueryTrace;
 import com.eonmux.excalibur.core.trace.Stage;
+import com.eonmux.excalibur.core.util.QueryBudget;
 import com.eonmux.excalibur.graph.store.EdgeStore;
 import com.eonmux.excalibur.graph.store.MappedEdgeStore;
 import com.eonmux.excalibur.graph.subgraph.Subgraph;
@@ -54,6 +57,12 @@ import org.slf4j.LoggerFactory;
  * The conversation the caller sends is what that word arrives in: a name linked to several
  * entities resolves to the ones the conversation names, and the rest are kept out of the walk and
  * the ranking both.
+ *
+ * <p>A query can carry a {@link QueryBudget}. Its deadline bounds every stage that can wait - the
+ * walk, the question's embedding, the model rerank - and a stage that runs out of time hands on
+ * what it had, so the answer is the best one the time allowed, flagged
+ * {@link GraphRagResult#timedOut}. Cancelling it ends the query wherever it is, with a
+ * {@link CancellationException}.
  */
 public final class GraphRagPipeline {
 
@@ -155,10 +164,36 @@ public final class GraphRagPipeline {
                             AbstentionPolicy abstention, SerializationBudget budget, int topK,
                             QueryEmbedder embedder, RelationResolver relations,
                             LongFunction<String> entityNames) {
+        this(classifier, linker, edgeStore, retriever, serializer, abstention, budget, topK,
+            embedder, relations, entityNames, WalkLimits.defaults());
+    }
+
+    /**
+     * Creates a pipeline whose walks are bounded as configured.
+     *
+     * @param classifier  Turns the question into a plan
+     * @param linker      Resolves mentions to entities
+     * @param edgeStore   The graph to traverse
+     * @param retriever   The retrieval signals and their fusion
+     * @param serializer  Renders the subgraph into the model's context
+     * @param abstention  Decides whether the evidence is worth answering from
+     * @param budget      How much context an answer may carry
+     * @param topK        How many documents each signal contributes
+     * @param embedder    Embeds the question, or null when this node has no embedding endpoint
+     * @param relations   Resolves the plan's relation hints, or null to traverse every relation
+     * @param entityNames Names entities, or null to call each by its id
+     * @param limits      How wide one walk may grow
+     */
+    public GraphRagPipeline(QueryClassifier classifier, EntityLinker linker, EdgeStore edgeStore,
+                            HybridRetriever retriever, SubgraphSerializer serializer,
+                            AbstentionPolicy abstention, SerializationBudget budget, int topK,
+                            QueryEmbedder embedder, RelationResolver relations,
+                            LongFunction<String> entityNames, WalkLimits limits) {
         this.embedder = embedder;
         this.entityNames = entityNames != null ? entityNames : id -> "E" + id;
         if (classifier == null || linker == null || edgeStore == null || retriever == null
-                || serializer == null || abstention == null || budget == null) {
+                || serializer == null || abstention == null || budget == null
+                || limits == null) {
             throw new IllegalArgumentException("every pipeline component is required");
         }
         if (topK < 1) {
@@ -167,7 +202,7 @@ public final class GraphRagPipeline {
         this.classifier = classifier;
         this.linker = linker;
         this.edgeStore = edgeStore;
-        this.walker = new GraphWalker(edgeStore, relations);
+        this.walker = new GraphWalker(edgeStore, relations, limits);
         this.retriever = retriever;
         this.serializer = serializer;
         this.abstention = abstention;
@@ -245,12 +280,37 @@ public final class GraphRagPipeline {
     public GraphRagResult answer(String question, ConversationContext context,
                                  TemporalFilter asOf, TraversalDirection direction,
                                  QueryTrace trace) {
-        return switch (gather(question, context, asOf, direction, trace)) {
+        return answer(question, context, asOf, direction, trace, QueryBudget.unbounded());
+    }
+
+    /**
+     * Runs the whole pipeline within a query's deadline, and until it is cancelled.
+     *
+     * <p>A deadline that passes part-way leaves an answer judged on what had been gathered, with
+     * {@link GraphRagResult#timedOut} set; one that passes before the graph is walked leaves
+     * nothing to judge, and the question is declined with
+     * {@link RetrievalOutcome.Reason#TIMED_OUT}.</p>
+     *
+     * @param question  the user's question
+     * @param context   what has been mentioned so far, for coreference and disambiguation
+     * @param asOf      the valid-time instant to answer at, or null to use the question's own
+     * @param direction which way along an edge the traversal may step
+     * @param trace     receives per-stage latency
+     * @param budget    the query's deadline and cancellation
+     * @throws IllegalStateException if asked to walk in a direction this pipeline does not
+     *                               {@link #supports support}
+     * @throws CancellationException if the query was cancelled
+     */
+    public GraphRagResult answer(String question, ConversationContext context,
+                                 TemporalFilter asOf, TraversalDirection direction,
+                                 QueryTrace trace, QueryBudget budget) {
+        return switch (gather(question, context, asOf, direction, trace, budget)) {
             case Evidence.NeedsUser needsUser -> GraphRagResult.askUser(needsUser.ask(), trace);
             case Evidence.Unresolved unresolved -> GraphRagResult.declined(
                 RetrievalOutcome.NoResults.of(RetrievalOutcome.Reason.UNRESOLVED_REFERENCE),
                 unresolved.plan(), trace);
-            case Evidence.Gathered gathered -> judge(gathered, trace);
+            case Evidence.TimedOut timedOut -> GraphRagResult.timedOut(timedOut.plan(), trace);
+            case Evidence.Gathered gathered -> judge(gathered, budget.timedOut(), trace);
         };
     }
 
@@ -292,11 +352,33 @@ public final class GraphRagPipeline {
      */
     public Evidence gather(String question, ConversationContext context, TemporalFilter asOf,
                            TraversalDirection direction, QueryTrace trace) {
+        return gather(question, context, asOf, direction, trace, QueryBudget.unbounded());
+    }
+
+    /**
+     * As {@link #gather(String, ConversationContext, TemporalFilter, TraversalDirection,
+     * QueryTrace)}, within a query's deadline and until it is cancelled.
+     *
+     * @param question  the user's question
+     * @param context   what has been mentioned so far, for coreference and disambiguation
+     * @param asOf      the valid-time instant to answer at, or null to use the question's own
+     * @param direction which way along an edge the traversal may step
+     * @param trace     receives per-stage latency
+     * @param budget    the query's deadline and cancellation
+     * @return the evidence, possibly partial when the budget is marked timed out, or the reason
+     *         the question never reached retrieval
+     * @throws IllegalStateException if asked to walk in a direction this pipeline does not
+     *                               {@link #supports support}
+     * @throws CancellationException if the query was cancelled
+     */
+    public Evidence gather(String question, ConversationContext context, TemporalFilter asOf,
+                           TraversalDirection direction, QueryTrace trace, QueryBudget budget) {
         if (question == null || question.isBlank()) {
             throw new IllegalArgumentException("question must not be blank");
         }
-        if (context == null || trace == null || direction == null) {
-            throw new IllegalArgumentException("context, direction and trace must not be null");
+        if (context == null || trace == null || direction == null || budget == null) {
+            throw new IllegalArgumentException(
+                "context, direction, trace and budget must not be null");
         }
         if (!supports(direction)) {
             throw new IllegalStateException("a " + direction.wireName() + " traversal needs the "
@@ -310,16 +392,23 @@ public final class GraphRagPipeline {
         }
         QueryPlan plan = at(((PlanningOutcome.Planned) planning).plan(), asOf);
 
-        Linked linked = trace.time(Stage.LINK, () -> linkAll(plan, namedBy(context)));
+        Linked linked = trace.time(Stage.LINK, () -> linkAll(plan, namedBy(context), budget));
         if (linked.seeds().length == 0) {
             return new Evidence.Unresolved(plan);
         }
+        budget.throwIfCancelled();
+        if (budget.isExpired()) {
+            budget.markTimedOut();
+            return new Evidence.TimedOut(plan);
+        }
 
-        Subgraph subgraph =
-            trace.time(Stage.TRAVERSE, () -> walker.walk(plan, linked.seeds(), direction));
+        GraphWalker.Walk walk =
+            trace.time(Stage.TRAVERSE, () -> walker.walk(plan, linked.seeds(), direction, budget));
         List<FusedDocument> ranked = without(retriever.retrieve(
-            queryFor(retrievalTextFor(question, plan)), topK, trace), linked.ruledOut());
-        return new Evidence.Gathered(readings(ranked, linked.readings()), ranked, subgraph, plan);
+            queryFor(retrievalTextFor(question, plan), budget), topK, trace, budget),
+            linked.ruledOut());
+        return new Evidence.Gathered(readings(ranked, linked.readings()), ranked, walk.subgraph(),
+            plan, walk.truncation());
     }
 
     /**
@@ -391,30 +480,32 @@ public final class GraphRagPipeline {
     }
 
     /** Applies the abstention policy to gathered evidence, and serialises what survives it. */
-    private GraphRagResult judge(Evidence.Gathered gathered, QueryTrace trace) {
+    private GraphRagResult judge(Evidence.Gathered gathered, boolean timedOut,
+                                 QueryTrace trace) {
         RetrievalOutcome outcome = abstention.decide(gathered.fused(), gathered.subgraph());
         return switch (outcome) {
-            case RetrievalOutcome.Ambiguous ambiguous ->
-                GraphRagResult.ambiguous(labelled(ambiguous), gathered.plan(), trace);
+            case RetrievalOutcome.Ambiguous ambiguous -> GraphRagResult.ambiguous(
+                labelled(ambiguous), gathered.plan(), gathered.walk(), timedOut, trace);
             // Serialising evidence the system does not believe in only gives the model material to
             // be confidently wrong with.
-            case RetrievalOutcome.NoResults refused ->
-                GraphRagResult.declined(refused, gathered.plan(), trace);
-            case RetrievalOutcome.Results results ->
-                answered(results, gathered.ranked(), gathered.plan(), trace);
+            case RetrievalOutcome.NoResults refused -> GraphRagResult.declined(
+                refused, gathered.plan(), gathered.walk(), timedOut, trace);
+            case RetrievalOutcome.Results results -> answered(results, gathered, timedOut, trace);
         };
     }
 
     /** Serialises the evidence abstention accepted, led by the aggregate when there is one. */
-    private GraphRagResult answered(RetrievalOutcome.Results results, List<FusedDocument> fused,
-                                    QueryPlan plan, QueryTrace trace) {
+    private GraphRagResult answered(RetrievalOutcome.Results results, Evidence.Gathered gathered,
+                                    boolean timedOut, QueryTrace trace) {
+        QueryPlan plan = gathered.plan();
         Aggregation aggregation = aggregationOf(plan, results.subgraph());
-        SeedRelevance relevance = relevanceOf(fused);
+        SeedRelevance relevance = relevanceOf(gathered.ranked());
         SerializedSubgraph serialized = trace.time(Stage.SERIALIZE,
             () -> serialize(results.subgraph(), relevance, aggregation, plan));
 
         LOGGER.debug("answered in {}", trace);
-        return GraphRagResult.answered(results, serialized, plan, aggregation, trace);
+        return GraphRagResult.answered(results, serialized, plan, aggregation, gathered.walk(),
+            timedOut, trace);
     }
 
     /**
@@ -528,15 +619,17 @@ public final class GraphRagPipeline {
      * are ruled out - kept out of the walk, so their facts do not reach the model, and out of the
      * ranking, so abstention does not find the same ambiguity a second time.
      *
-     * @param plan  the plan whose mentions to resolve
-     * @param named the names the conversation mentions, normalised
+     * @param plan   the plan whose mentions to resolve
+     * @param named  the names the conversation mentions, normalised
+     * @param budget the query's cancellation, checked between mentions
      * @return the seeds, and the entities the conversation ruled out
      */
-    private Linked linkAll(QueryPlan plan, Set<String> named) {
+    private Linked linkAll(QueryPlan plan, Set<String> named, QueryBudget budget) {
         List<Long> seeds = new ArrayList<>();
         Set<Long> ruledOut = new HashSet<>();
         List<long[]> readings = new ArrayList<>();
         for (String mention : plan.mentions()) {
+            budget.throwIfCancelled();
             long[] candidates = linker.link(mention);
             List<Long> chosen = new ArrayList<>();
             if (candidates.length > 1) {
@@ -603,18 +696,36 @@ public final class GraphRagPipeline {
      * briefly unavailable should answer by term overlap rather than not answer - so the failure
      * degrades the query to text and the ranking chain drops its exact rerank accordingly.</p>
      *
-     * @param text The text to retrieve on
+     * <p>The same for an embedding the query's deadline does not leave time for: the call is
+     * waited for only as long as the budget allows, then interrupted, and the budget is marked
+     * timed out.</p>
+     *
+     * @param text   The text to retrieve on
+     * @param budget The query's deadline and cancellation
      * @return The query, with an embedding when one could be produced
+     * @throws CancellationException if the query was cancelled
      */
-    private RetrievalQuery queryFor(String text) {
+    private RetrievalQuery queryFor(String text, QueryBudget budget) {
         if (embedder == null) {
             return RetrievalQuery.ofText(text);
         }
+        budget.throwIfCancelled();
+        if (budget.isExpired()) {
+            budget.markTimedOut();
+            return RetrievalQuery.ofText(text);
+        }
         try {
-            float[] embedding = embedder.embed(text);
+            float[] embedding = budget.call(() -> embedder.embed(text));
             return embedding == null
                 ? RetrievalQuery.ofText(text)
                 : RetrievalQuery.of(text, embedding);
+        } catch (TimeoutException e) {
+            budget.markTimedOut();
+            LOGGER.debug("the question's embedding missed the query's deadline; "
+                + "retrieving on text alone");
+            return RetrievalQuery.ofText(text);
+        } catch (CancellationException e) {
+            throw e;
         } catch (RuntimeException e) {
             LOGGER.warn("could not embed the question; retrieving on text alone: {}", e.toString());
             return RetrievalQuery.ofText(text);

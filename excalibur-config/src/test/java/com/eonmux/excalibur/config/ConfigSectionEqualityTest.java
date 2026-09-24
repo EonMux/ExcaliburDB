@@ -259,6 +259,8 @@ class ConfigSectionEqualityTest {
             v("contextTokenBudget", "excalibur.graph.context-token-budget", "4000"),
             v("topK", "excalibur.graph.top-k", "25"),
             v("rerankOverFetch", "excalibur.graph.rerank-over-fetch", "8"),
+            v("maxFrontier", "excalibur.graph.max-frontier", "50"),
+            v("maxWalkFacts", "excalibur.graph.max-walk-facts", "500"),
             v("ramBufferMb", "excalibur.graph.ram-buffer-mb", "32.0"),
             v("extractionEnabled", "excalibur.graph.extraction-enabled", "true"),
             v("extractorVersion", "excalibur.graph.extractor-version", "2"),

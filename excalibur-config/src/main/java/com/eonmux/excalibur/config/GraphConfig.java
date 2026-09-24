@@ -74,6 +74,26 @@ public final class GraphConfig {
     /** Candidates the full-precision reranker reads per result it returns. */
     public static final int DEFAULT_RERANK_OVER_FETCH = 4;
 
+    /**
+     * Most new entities one hop of a graph walk admits.
+     *
+     * <p>A hub - an entity with thousands of neighbours - would otherwise hand every one of them
+     * to the next hop and to the facts collected, so the cost of a question would be set by the
+     * widest entity it touches. A thousand is far more than the context budget can ever carry
+     * the facts of, and small enough that a two-hop walk from a hub stays in the millisecond
+     * range.
+     */
+    public static final int DEFAULT_MAX_FRONTIER = 1000;
+
+    /**
+     * Most facts one walk collects before ranking and serialisation.
+     *
+     * <p>Every collected fact is judged by abstention and ranked for the context budget, which
+     * holds a few dozen at the default; ten thousand leaves the ranking a wide choice while
+     * keeping one question's working set bounded whatever the graph's shape.
+     */
+    public static final int DEFAULT_MAX_WALK_FACTS = 10_000;
+
     /** Lucene RAM buffer, in megabytes, for the read-only indexes. */
     public static final double DEFAULT_RAM_BUFFER_MB = 16.0;
 
@@ -135,6 +155,8 @@ public final class GraphConfig {
     private final int contextTokenBudget;
     private final int topK;
     private final int rerankOverFetch;
+    private final int maxFrontier;
+    private final int maxWalkFacts;
     private final double ramBufferMb;
     private final boolean extractionEnabled;
     private final int extractorVersion;
@@ -213,6 +235,10 @@ public final class GraphConfig {
             props, "excalibur.graph.top-k", DEFAULT_TOP_K, 1);
         this.rerankOverFetch = ConfigBounds.atLeast(
             props, "excalibur.graph.rerank-over-fetch", DEFAULT_RERANK_OVER_FETCH, 1);
+        this.maxFrontier = ConfigBounds.atLeast(
+            props, "excalibur.graph.max-frontier", DEFAULT_MAX_FRONTIER, 1);
+        this.maxWalkFacts = ConfigBounds.atLeast(
+            props, "excalibur.graph.max-walk-facts", DEFAULT_MAX_WALK_FACTS, 1);
         double buffer = PropertyParser.parseDouble(
             props, "excalibur.graph.ram-buffer-mb", DEFAULT_RAM_BUFFER_MB);
         if (buffer <= 0) {
@@ -316,6 +342,32 @@ public final class GraphConfig {
         return rerankOverFetch;
     }
 
+    /**
+     * Most new entities one hop of a graph walk admits.
+     *
+     * <p>When a hop reaches more, the ones reached along the strongest edges are kept - by
+     * extraction confidence, then by the later valid-time start, then by the lower entity id - and
+     * the answer reports how many were left out.</p>
+     *
+     * @return the cap, at least 1
+     */
+    public int getMaxFrontier() {
+        return maxFrontier;
+    }
+
+    /**
+     * Most facts one graph walk collects.
+     *
+     * <p>When the walk passes more, the ones kept are those touching the entities the question
+     * named first, then the more confident, then the later valid-time start, and the answer
+     * reports how many were left out.</p>
+     *
+     * @return the cap, at least 1
+     */
+    public int getMaxWalkFacts() {
+        return maxWalkFacts;
+    }
+
     /** @return documents each retrieval signal contributes before fusion */
     public int getTopK() {
         return topK;
@@ -412,7 +464,9 @@ public final class GraphConfig {
             + ", maxAmbiguousCandidates=" + maxAmbiguousCandidates
             + ", contextTokenBudget=" + contextTokenBudget
             + ", topK=" + topK
-            + ", rerankOverFetch=" + rerankOverFetch + "}";
+            + ", rerankOverFetch=" + rerankOverFetch
+            + ", maxFrontier=" + maxFrontier
+            + ", maxWalkFacts=" + maxWalkFacts + "}";
     }
 
     @Override
@@ -432,6 +486,8 @@ public final class GraphConfig {
             && contextTokenBudget == other.contextTokenBudget
             && topK == other.topK
             && rerankOverFetch == other.rerankOverFetch
+            && maxFrontier == other.maxFrontier
+            && maxWalkFacts == other.maxWalkFacts
             && Double.compare(ramBufferMb, other.ramBufferMb) == 0
             && extractionEnabled == other.extractionEnabled
             && extractorVersion == other.extractorVersion
@@ -449,7 +505,8 @@ public final class GraphConfig {
     public int hashCode() {
         return Objects.hash(path, minScore, minSeparation, minMeanConfidence,
             confidenceTemperature,
-            maxAmbiguousCandidates, contextTokenBudget, topK, rerankOverFetch, ramBufferMb,
+            maxAmbiguousCandidates, contextTokenBudget, topK, rerankOverFetch, maxFrontier,
+            maxWalkFacts, ramBufferMb,
             extractionEnabled, extractorVersion, entityVectorsEnabled, maxOpenNamespaces,
             erasureTombstoneRatio, erasureMaxLatencySeconds, singleValuedRelations,
             hotNamespaces, coldNamespaces);

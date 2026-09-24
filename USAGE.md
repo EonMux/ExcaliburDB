@@ -422,13 +422,13 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `GET` | `/v1/version` | bearer | Which build and JVM this process is running |
 | `POST` | `/v1/drain` | bearer | Report unready, so a load balancer stops choosing this node |
 | `DELETE` | `/v1/drain` | bearer | Report ready again |
-| `GET` | `/v1/query/status` | bearer | Queries in flight, with the ids `DELETE /v1/query/{id}` takes |
+| `GET` | `/v1/query/status` | bearer | Queries in flight, corpus and graph, with the ids `DELETE /v1/query/{id}` takes |
 | `POST` | `/v1/query` | bearer | Search the corpus: BM25, vector, or the two fused, depending on what the node holds |
 | `GET` | `/v1/documents` | bearer | Read one chunk's text, by `document_id` |
 | `POST` | `/v1/documents/fetch` | bearer | Read the text of a page of chunks |
 | `GET` | `/v1/documents/list` | bearer | Which documents this node holds, with their chunk ids. `404` on a node that keeps no document registry |
 | `POST` | `/v1/documents` | bearer | Index documents supplied in the request. `503` on a node with no ingestion pipeline |
-| `DELETE` | `/v1/query/{query_id}` | bearer | Cancel an in-progress query |
+| `DELETE` | `/v1/query/{query_id}` | bearer | Cancel an in-progress query, from `/v1/query` or `/v1/graph/query` |
 | `POST` | `/v1/ingest` | bearer | Register an ingestion source |
 | `GET` | `/v1/ingest` | bearer | Read back what every source was registered as |
 | `DELETE` | `/v1/ingest` | bearer | Stop crawling a source, keeping its documents |
@@ -441,7 +441,7 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `POST` | `/v1/compact` | bearer | Reclaim the space tombstoned entries still hold, now rather than on the next sweep |
 | `DELETE` | `/v1/compact` | bearer | Ask the compaction in progress to stop |
 | `GET` | `/v1/compact/status` | bearer | What the last compaction examined, reclaimed and failed on |
-| `POST` | `/v1/graph/query` | bearer | Answer a question from the graph |
+| `POST` | `/v1/graph/query` | bearer | Answer a question from the graph, within `timeout_ms` |
 | `POST` | `/v1/graph/build` | bearer | Start publishing the facts ingestion has staged as the served graph. `202`; the build runs behind the response. `409` while one is already running |
 | `DELETE` | `/v1/graph/build` | bearer | Stop the build in progress. It publishes nothing; the namespace keeps the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | What the build is doing, and what the last one published |
@@ -2201,6 +2201,12 @@ is written only once it can no longer be withdrawn. When this route answers `"ca
 `404`, the query was not withdrawn and answers as it would have. A query that misses its deadline
 is never reported cancelled, and is not "already cancelled" to this route.
 
+A graph question from `POST /v1/graph/query` is cancelled the same way, by the `query_id` its
+response carries or `/v1/query/status` lists. The walk stops where it is and a model call in flight
+— the question's embedding or the LLM rerank — is interrupted; the question then answers `200` with
+`"status": "cancelled"`, `"cancelled": true` and no context, by the same rule: once this route has
+answered `"cancelled": true`, the question is not answered.
+
 ---
 
 ## Monitoring & Operations
@@ -2374,10 +2380,14 @@ curl -H "Authorization: Bearer $EXCALIBUR_API_AUTH_TOKEN" \
   "cancelled": 3,
   "queries": [
     {"query_id": "1f0c...", "correlation_id": "9c41e07a",
-     "started_at_ms": 1736899200000, "duration_ms": 91400, "cancelled": false}
+     "started_at_ms": 1736899200000, "duration_ms": 91400, "cancelled": false,
+     "kind": "corpus"}
   ]
 }
 ```
+
+`kind` is `corpus` for a `POST /v1/query` search and `graph` for a `POST /v1/graph/query`
+question. Both are listed, counted and cancelled alike.
 
 Longest-running first, so the query that will not finish is the first line. Its `query_id` is what
 `DELETE /v1/query/{query_id}` takes, which makes this the way to learn the id of a query you did not
