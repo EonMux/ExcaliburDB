@@ -468,6 +468,23 @@ class McpParityToolsTest {
             }
         }
 
+        /**
+         * The route stops the namespace's automatic build as well as one build_graph started,
+         * and defers the next automatic attempt. A model told it stops only its own build would
+         * not reach for it to stop the node's, and one not told about the deferral would read
+         * 'deferred' as a fault and call build_graph to clear it.
+         */
+        @Test
+        @DisplayName("cancel_graph_build and graph_build_status describe stopping an automatic build")
+        void describesStoppingAnAutomaticBuild() {
+            assertThat(Json.stringAt(tool(McpTools.CANCEL_GRAPH_BUILD), "description"))
+                .contains("automatic").contains("'explicit'").contains("'automatic'")
+                .contains("'deferred'");
+            assertThat(Json.stringAt(tool(McpTools.GRAPH_BUILD_STATUS), "description"))
+                .contains("'deferred'").contains("next_attempt_at_ms")
+                .contains(McpTools.CANCEL_GRAPH_BUILD);
+        }
+
         @Test
         @DisplayName("stopping tools say they keep what was already done")
         void cancelsDescribeWhatTheyKeep() {

@@ -349,13 +349,18 @@ public final class McpTools {
             + "is 0 nothing was extracted, which usually means ingestion has not finished or the "
             + "server has extraction disabled. 'withheld_facts' counts staged facts left out "
             + "because an erasure is still owed for them; they are never published, and that is "
-            + "not an error. A cancelled build published nothing and the "
-            + "namespace is still serving the graph it had. 'freshness.behind_staging' says "
-            + "whether ingested changes are not yet in the graph search_graph reads, and "
-            + "'automatic.state' what the server is doing about it: 'pending' until it rebuilds "
-            + "by itself, 'running', 'current', or 'paused', 'backing_off' or 'disabled' when "
-            + "it will not without " + BUILD_GRAPH + ". 'automatic.last_result' is how the last "
-            + "automatic build ended: 'completed', 'unchanged', 'failed', 'cancelled', or "
+            + "not an error. These describe the last build " + BUILD_GRAPH + " started; a "
+            + "cancelled build published nothing and the namespace is still serving the graph "
+            + "it had. 'freshness.behind_staging' says whether ingested changes are not yet in "
+            + "the graph search_graph reads, and 'automatic.state' what the server is doing "
+            + "about it by itself: 'current'; 'pending' until it rebuilds; 'running'; "
+            + "'backing_off' after a failed build, or erasures overtaking several in a row, and "
+            + "'deferred' after " + CANCEL_GRAPH_BUILD + " stopped an automatic build - each "
+            + "rebuilds by itself at 'automatic.next_attempt_at_ms'; 'withheld' until an "
+            + "interrupted erasure has been applied; or 'paused' or 'disabled' when it will not "
+            + "without " + BUILD_GRAPH + ". 'automatic.last_result' "
+            + "is how the last automatic build ended: 'completed', 'unchanged', 'failed', "
+            + "'cancelled' when " + CANCEL_GRAPH_BUILD + " or a shutdown stopped it, or "
             + "'superseded' when an erasure arrived while it ran - nothing failed, and the server "
             + "builds again without the erased facts, so there is no need to call "
             + BUILD_GRAPH + ".",
@@ -860,9 +865,16 @@ public final class McpTools {
             ToolSchema.object()));
 
         tools.add(ToolSchema.tool(CANCEL_GRAPH_BUILD,
-            "Stop the graph build started by " + BUILD_GRAPH + ". A stopped build publishes "
-            + "nothing: the namespace keeps serving the graph it had, and the staged facts are "
-            + "kept for the next build. Poll " + GRAPH_BUILD_STATUS + " until its state is "
+            "Stop the namespace's graph build in progress, whether " + BUILD_GRAPH + " started "
+            + "it or the server did by itself to keep the graph current. A stopped build "
+            + "publishes nothing: the namespace keeps serving the graph it had, and the staged "
+            + "facts are kept for the next build. 'explicit' and 'automatic' in the reply say "
+            + "which build was asked to stop, and 'cancelled' false means none was running. A "
+            + "stopped automatic build is not restarted at once: " + GRAPH_BUILD_STATUS
+            + " reports 'automatic.state' 'deferred' until 'automatic.next_attempt_at_ms', when "
+            + "the server builds the staged changes by itself; " + BUILD_GRAPH + " builds them "
+            + "sooner. Poll " + GRAPH_BUILD_STATUS + " until 'state', for a build "
+            + BUILD_GRAPH + " started, or 'automatic.last_result', for the server's own, reads "
             + "'cancelled'.",
             ToolSchema.object(
                 ToolSchema.optional("namespace", "string",
