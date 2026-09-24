@@ -365,7 +365,7 @@ public final class ExcaliburApplication {
             cfg = new Config(configPath, System.getenv(), new java.util.HashMap<>());
             // ConfigLoader does this on the path it owns; this path bypasses it, and the
             // environment can carry the same typo a file can.
-            ConfigLoader.reportUnrecognisedKeys(configPath, cfg.getEffectiveProperties());
+            ConfigLoader.reportUnrecognisedVariables(System.getenv());
         } catch (IOException e) {
             // Present and unreadable is never the absence the default path is allowed: whoever
             // put a file there meant this node to run on it, and it cannot.

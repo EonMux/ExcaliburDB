@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.*;
@@ -344,6 +345,53 @@ class ConfigLoaderTest {
             // rather than one of the spellings that were tried on the way past it.
             assertThat(com.eonmux.excalibur.config.EnvOverrides.toPropertyKey("EXCALIBUR_LLM_NO_SUCH_KEY"))
                 .isEqualTo("excalibur.llm.no-such-key");
+        }
+
+        @Test
+        @DisplayName("a variable that sets no key in a parsed section is reported as a typo")
+        void aMistypedVariableIsReported() {
+            assertThat(com.eonmux.excalibur.config.EnvOverrides.unrecognisedVariables(Map.of(
+                "EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS", "512",
+                "EXCALIBUR_INGEST_CHUNK_TARGET_TOKENS", "512")))
+                .containsExactly("EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS");
+        }
+
+        @Test
+        @DisplayName("the variables read directly, rather than as a key's override, are not typos")
+        void directlyReadVariablesAreNotReported() {
+            // Each of these is read by name - by the server, logback, the MCP client or the
+            // container's health check - and names no key. Warning that one is being ignored
+            // would tell an operator to delete a line that is in force.
+            Map<String, String> environment = new HashMap<>();
+            for (String name : List.of("EXCALIBUR_PORT", "EXCALIBUR_DATA_DIR",
+                    "EXCALIBUR_LOG_LEVEL", "EXCALIBUR_URL", "EXCALIBUR_NAMESPACE",
+                    "EXCALIBUR_MCP_TIMEOUT_SECONDS", "EXCALIBUR_HEALTHCHECK_TIMEOUT",
+                    "EXCALIBUR_HEALTHCHECK_CLIENT_CERT", "EXCALIBUR_HEALTHCHECK_CLIENT_KEY",
+                    "EXCALIBUR_API_AUTH_TOKEN")) {
+                environment.put(name, "x");
+            }
+
+            assertThat(com.eonmux.excalibur.config.EnvOverrides.unrecognisedVariables(environment))
+                .isEmpty();
+        }
+
+        @Test
+        @DisplayName("an empty variable is not also reported as a typo")
+        void anEmptyVariableIsNotAlsoATypo() {
+            assertThat(com.eonmux.excalibur.config.EnvOverrides.unrecognisedVariables(
+                Map.of("EXCALIBUR_LLM_NO_SUCH_KEY", " "))).isEmpty();
+        }
+
+        @Test
+        @DisplayName("every key's variable spelling reads back as that key")
+        void everyKeyRoundTripsThroughItsVariable() {
+            // The suggestion a typo warning offers is spelled as a variable, so it has to be one
+            // that reaches the key it names.
+            for (String key : ConfigKeys.known()) {
+                String variable = com.eonmux.excalibur.config.EnvOverrides.toVariableName(key);
+                assertThat(com.eonmux.excalibur.config.EnvOverrides.toPropertyKey(variable))
+                    .as(variable).isEqualTo(key);
+            }
         }
 
         @Test

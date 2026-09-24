@@ -1,6 +1,8 @@
 package com.eonmux.excalibur.config;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.SortedMap;
@@ -102,6 +104,45 @@ final class EnvOverrides {
             }
         });
         return prefixed;
+    }
+
+    /**
+     * The variables that would set a key no section reads, in name order.
+     *
+     * <p>Judged the way {@link ConfigKeys} judges a key in a file: only a variable that lands
+     * under a section this module parses can be called a typo. That is also what leaves alone
+     * the variables read directly rather than as the override of a key -
+     * <code>EXCALIBUR_PORT</code>, <code>EXCALIBUR_DATA_DIR</code>,
+     * <code>EXCALIBUR_LOG_LEVEL</code>, the MCP client's <code>EXCALIBUR_URL</code>,
+     * <code>EXCALIBUR_NAMESPACE</code> and <code>EXCALIBUR_MCP_TIMEOUT_SECONDS</code>, and the
+     * container health check's <code>EXCALIBUR_HEALTHCHECK_*</code> - none of which spells a key
+     * under such a section. An empty variable is not listed: it overrides nothing, and
+     * {@link #apply} has already said so.</p>
+     *
+     * @param environment Environment variables, keyed by variable name
+     * @return The names of the variables that set nothing
+     */
+    static List<String> unrecognisedVariables(Map<String, String> environment) {
+        List<String> unrecognised = new ArrayList<>();
+        prefixed(environment).forEach((name, value) -> {
+            String key = toPropertyKey(name);
+            if (value != null && !value.isBlank()
+                    && ConfigKeys.isOwned(key) && !ConfigKeys.isKnown(key)) {
+                unrecognised.add(name);
+            }
+        });
+        return unrecognised;
+    }
+
+    /**
+     * Spells a property key as the environment variable that overrides it.
+     *
+     * @param key A property key, <code>excalibur.</code> and all
+     * @return The variable, such as <code>EXCALIBUR_QUERY_CACHE_MAX_ENTRIES</code>
+     */
+    static String toVariableName(String key) {
+        return ENV_PREFIX + key.substring("excalibur.".length())
+            .replace('.', '_').replace('-', '_').toUpperCase(Locale.ROOT);
     }
 
     /**

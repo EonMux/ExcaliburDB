@@ -120,11 +120,34 @@ public final class ConfigLoader {
         // so every construction path resolves overrides identically.
         Config config = new Config(configPath, envOverrides, properties);
 
-        // Over the effective map rather than the file: the same typo is as easy to make in a
-        // deployment manifest as in a properties file, and a key that arrived as
-        // EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS is exactly as silently ignored.
-        reportUnrecognisedKeys(configPath, config.getEffectiveProperties());
+        // The file and the environment separately, so each warning names what the operator
+        // typed: the same typo is as easy to make in a deployment manifest as in a properties
+        // file, and a key that arrived as EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS is exactly as
+        // silently ignored - but it is fixed in the manifest, under its variable's name.
+        reportUnrecognisedKeys(configPath, properties);
+        reportUnrecognisedVariables(envOverrides);
         return config;
+    }
+
+    /**
+     * Warns about an <code>EXCALIBUR_*</code> variable that would set a key no setting answers to.
+     *
+     * <p>The environment's half of {@link #reportUnrecognisedKeys}, for every path that applies
+     * one: the server's, whether or not it found a file, and an embedded node's. The warning names
+     * the variable and, where one is close, the variable that was probably meant.</p>
+     *
+     * @param environment Environment variables, keyed by variable name; null is no environment
+     */
+    public static void reportUnrecognisedVariables(Map<String, String> environment) {
+        if (environment == null) {
+            return;
+        }
+        for (String variable : EnvOverrides.unrecognisedVariables(environment)) {
+            String nearest = ConfigKeys.nearest(EnvOverrides.toPropertyKey(variable));
+            LOGGER.warn("No setting is named by the environment variable {}; it is being ignored{}",
+                variable,
+                nearest == null ? "" : ". Did you mean " + EnvOverrides.toVariableName(nearest) + "?");
+        }
     }
 
     /**
@@ -135,7 +158,7 @@ public final class ConfigLoader {
      * not take. A deployment can run for a year on a queue limit it believes it changed.</p>
      *
      * @param configPath Where the properties came from, for the message
-     * @param properties The effective settings, file and environment overlaid
+     * @param properties The settings read from there
      */
     public static void reportUnrecognisedKeys(String configPath, Map<String, String> properties) {
         for (String key : properties.keySet()) {

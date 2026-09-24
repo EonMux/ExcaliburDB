@@ -760,6 +760,13 @@ spell them this way:
 variable of the same name as the token it presents to the node — see
 [Pointing a model at it](#pointing-a-model-at-it).
 
+The MCP server (`EXCALIBUR_URL`, `EXCALIBUR_NAMESPACE`, `EXCALIBUR_MCP_TIMEOUT_SECONDS`) and the
+container health check (`EXCALIBUR_HEALTHCHECK_*`) read variables of their own under the same
+prefix, and the node ignores them. Any other `EXCALIBUR_` variable is the override of the key it
+spells, and one that spells a key the node does not read in one of its sections -
+`EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS` - is logged at startup as a warning with the nearest setting
+it does read.
+
 ### Configuration Options
 
 | Property | Default | Description |

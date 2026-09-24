@@ -320,8 +320,16 @@ stripped from a value.
 Three variables are read directly rather than as overrides of a key: `EXCALIBUR_PORT` (the listen
 port, taking precedence over `excalibur.api.port`), `EXCALIBUR_DATA_DIR` (the data directory,
 default `./data`; there is no property for it) and `EXCALIBUR_LOG_LEVEL` (the root log level,
-default `INFO`). Every other `EXCALIBUR_` variable is the override of the key it names — including
-`EXCALIBUR_API_AUTH_TOKEN`, which is `excalibur.api.auth-token` like any other.
+default `INFO`). Two other processes read variables of their own under the same prefix, and the
+node ignores them: the MCP server's `EXCALIBUR_URL`, `EXCALIBUR_NAMESPACE` and
+`EXCALIBUR_MCP_TIMEOUT_SECONDS` (it also reads `EXCALIBUR_API_AUTH_TOKEN`, as the token it
+presents), and the container health check's `EXCALIBUR_HEALTHCHECK_TIMEOUT`,
+`EXCALIBUR_HEALTHCHECK_CLIENT_CERT` and `EXCALIBUR_HEALTHCHECK_CLIENT_KEY`. Every other
+`EXCALIBUR_` variable is the override of the key it names — including `EXCALIBUR_API_AUTH_TOKEN`,
+which is `excalibur.api.auth-token` like any other. One that spells a key the node does not read
+in one of its sections, such as `EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS`, is logged at startup as a
+warning with the nearest setting it does read; the variables above are never reported that way.
+The server and an embedded node given an environment check it alike.
 
 A variable that is set but empty, or only whitespace, overrides nothing. It is ignored with a
 warning naming it, and the file's value — or the default, if the file does not set the key —
