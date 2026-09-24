@@ -20,7 +20,7 @@ import java.util.Map;
  *   <li>Values are used in HNSW graph operations</li>
  * </ul>
  */
-class Feature28VerificationTest {
+class HnswEfParametersTest {
 
     @Test
     @DisplayName("Default efConstruction should be 128")

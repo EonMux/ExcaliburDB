@@ -165,7 +165,7 @@ class LiveIndexingIntegrationTest {
      */
     @Test
     @DisplayName("Live indexing - all four requirements verified")
-    void feature85_LiveIndexing_AllRequirementsVerified() throws Exception {
+    void liveIndexingMeetsEveryRequirement() throws Exception {
         // Create HNSW graph
         HnswConfig config = HnswConfig.create(dimension);
         Path graphPath = tempDir.resolve("live-indexing.graph");

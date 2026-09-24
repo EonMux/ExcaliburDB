@@ -31,7 +31,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * @author ExcaliburDB
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
-class Feature22VerificationTest {
+class LshVerificationTest {
 
     private static final int DIMENSIONS = 128;
     private static final int NUM_VECTORS = 1000;

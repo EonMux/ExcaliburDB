@@ -24,7 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Verification tests for the memory-mapped LSH hash table.
  */
-class Feature23VerificationTest {
+class MappedLshHashTableTest {
 
     private static final int DIMENSIONS = 128;
     private static final int NUM_BITS = 16;
@@ -36,7 +36,7 @@ class Feature23VerificationTest {
 
     @BeforeEach
     void setUp() throws IOException {
-        tempDir = Files.createTempDirectory("lsh_feature23_test");
+        tempDir = Files.createTempDirectory("mapped_lsh_table_test");
         tableFile = tempDir.resolve("test_table.dat");
     }
 
