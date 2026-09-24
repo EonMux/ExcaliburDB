@@ -72,7 +72,9 @@ import java.util.function.Consumer;
  * failed, a document was over the per-document limits, or its chunks could not all be embedded
  * and written. That is an error, and {@code last_error} says the same in words. All three count
  * documents, whatever their prefix; this one is named as {@code POST /v1/documents} names the
- * count it answers with.</p>
+ * count it answers with. {@code last_error} is also set by a crawl whose listing had gaps - pages
+ * it could not read for links - even with nothing failed, and names those pages: what lies only
+ * behind them is not indexed.</p>
  *
  * <h2>States</h2>
  * <ul>

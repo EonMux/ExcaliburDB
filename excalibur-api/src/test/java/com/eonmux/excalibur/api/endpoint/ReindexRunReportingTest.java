@@ -2,6 +2,7 @@ package com.eonmux.excalibur.api.endpoint;
 
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.pipeline.ReindexCancelledException;
+import com.eonmux.excalibur.ingest.source.ListingGaps;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
 import com.eonmux.excalibur.ingest.source.SourceResolver;
@@ -295,6 +296,120 @@ class ReindexRunReportingTest {
             assertThat(status().documentsFailed()).isEqualTo(2);
             assertThat(status().documentsUnchecked()).isEqualTo(2);
             assertThat(status().uncheckedSample()).containsExactly("a.txt", "b.txt");
+        }
+    }
+
+    @Nested
+    @DisplayName("a run whose listing had gaps")
+    class IncompleteListing {
+
+        private ListingGaps hubUnread() {
+            ListingGaps.Recorder recorder = new ListingGaps.Recorder();
+            recorder.record("https://example.com/hub", "links not read: HTTP 503");
+            return recorder.snapshot();
+        }
+
+        @Test
+        @DisplayName("is not reported clean, though nothing failed")
+        void aListingWithGapsIsNotClean() throws Exception {
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(
+                new DocumentReindexer.ReindexResult.Builder(SOURCE_ID)
+                    .documentsUnchanged(10)
+                    .listingIncomplete(hubUnread(), 3)
+                    .build());
+
+            assertThat(run().execute(SOURCE_ID)).isTrue();
+
+            assertThat(status().state()).isEqualTo("idle");
+            assertThat(status().documentsFailed()).isZero();
+            assertThat(status().documentsKeptUnlisted()).isEqualTo(3);
+            assertThat(status().lastError())
+                .contains("the listing was incomplete, so 3 documents it did not list were "
+                    + "kept rather than removed")
+                .contains("https://example.com/hub (links not read: HTTP 503)");
+        }
+
+        @Test
+        @DisplayName("says so beside the documents it failed on")
+        void gapsAreReportedBesideFailures() throws Exception {
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(
+                new DocumentReindexer.ReindexResult.Builder(SOURCE_ID)
+                    .documentsUnchanged(10)
+                    .addUnchecked("https://example.com/hub")
+                    .listingIncomplete(hubUnread(), 2)
+                    .build());
+
+            run().execute(SOURCE_ID);
+
+            assertThat(status().lastError()).contains("1 errors").contains("listing was incomplete");
+        }
+
+        @Test
+        @DisplayName("says so when it failed outright too")
+        void gapsAreReportedOnAFailedRun() throws Exception {
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(
+                new DocumentReindexer.ReindexResult.Builder(SOURCE_ID)
+                    .addUnchecked("https://example.com/")
+                    .listingIncomplete(hubUnread(), 40)
+                    .build());
+
+            run().execute(SOURCE_ID);
+
+            assertThat(status().state()).isEqualTo(ReindexEndpoint.ReindexStatus.STATE_FAILED);
+            assertThat(status().documentsKeptUnlisted()).isEqualTo(40);
+            assertThat(status().lastError()).contains("40 documents it did not list were kept");
+        }
+
+        @Test
+        @DisplayName("is reported the moment the run knows it, so a stopped run keeps it")
+        void keptDocumentsSurviveACancellation() throws Exception {
+            when(reindexer.reindexAll(eq(source), any(), any())).thenAnswer(invocation -> {
+                DocumentReindexer.ReindexProgress progress = invocation.getArgument(1);
+                progress.listingIncomplete(hubUnread(), 5);
+                progress.documentsDone(0, 5);
+                throw new ReindexCancelledException("stopped after 0 of 5");
+            });
+
+            run().execute(SOURCE_ID);
+
+            assertThat(status().cancelled()).isTrue();
+            assertThat(status().documentsKeptUnlisted()).isEqualTo(5);
+        }
+
+        @Test
+        @DisplayName("a rolling run says so too")
+        void aRollingRunReportsGaps() throws Exception {
+            java.nio.file.Path volume = java.nio.file.Path.of("volume");
+            com.eonmux.excalibur.shard.allocator.VolumeManager volumes =
+                mock(com.eonmux.excalibur.shard.allocator.VolumeManager.class);
+            when(volumes.getVolumeWithMostSpace()).thenReturn(volume);
+            when(reindexer.hasRollingReplacement()).thenReturn(true);
+            DocumentReindexer.ReindexResult basic =
+                new DocumentReindexer.ReindexResult.Builder(SOURCE_ID)
+                    .documentsUnchanged(10)
+                    .listingIncomplete(hubUnread(), 3)
+                    .build();
+            when(reindexer.reindexWithRollingReplacement(eq(source), eq(volume), any(), any()))
+                .thenReturn(new DocumentReindexer.RollingReindexResult(basic, -1, List.of()));
+
+            new ReindexRun(reindexer, sourceResolver, volumes,
+                mock(com.eonmux.excalibur.store.SegmentCatalog.class), statusRegistry,
+                ingestionStatus).execute(SOURCE_ID);
+
+            assertThat(status().state()).isEqualTo("idle");
+            assertThat(status().documentsKeptUnlisted()).isEqualTo(3);
+            assertThat(status().lastError()).contains("listing was incomplete");
+        }
+
+        @Test
+        @DisplayName("a complete listing leaves nothing kept and nothing said")
+        void aCompleteListingSaysNothing() throws Exception {
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(result(3));
+
+            run().execute(SOURCE_ID);
+
+            assertThat(status().documentsKeptUnlisted()).isZero();
+            assertThat(status().lastError()).isNull();
         }
     }
 

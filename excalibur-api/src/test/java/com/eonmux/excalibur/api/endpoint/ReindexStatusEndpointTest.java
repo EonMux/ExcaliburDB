@@ -95,11 +95,25 @@ class ReindexStatusEndpointTest {
         }
 
         @Test
+        @DisplayName("reports the documents a listing with gaps kept")
+        void reportsKeptUnlistedDocuments() throws IOException {
+            registry.startReindex("docs");
+            registry.recordKeptUnlisted("docs", 7);
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+
+            endpoint.handle(get("?source_id=docs", body));
+
+            assertThat(body.toString(StandardCharsets.UTF_8))
+                .contains("\"documents_kept_unlisted\": 7");
+        }
+
+        @Test
         @DisplayName("a new run starts with nothing failed and nothing unchecked")
         void aNewRunClearsTheFailures() throws IOException {
             registry.startReindex("docs");
             registry.recordFailures("docs", 3);
             registry.recordUnchecked("docs", 1, List.of("a.txt"));
+            registry.recordKeptUnlisted("docs", 4);
             registry.startReindex("docs");
             ByteArrayOutputStream body = new ByteArrayOutputStream();
 
@@ -109,6 +123,7 @@ class ReindexStatusEndpointTest {
             assertThat(json).contains("\"documents_failed\": 0");
             assertThat(json).contains("\"documents_unchecked\": 0");
             assertThat(json).contains("\"unchecked_sample\": []");
+            assertThat(json).contains("\"documents_kept_unlisted\": 0");
         }
 
         @Test

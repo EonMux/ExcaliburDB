@@ -2369,6 +2369,13 @@ The status outlives a restart. Each source's last finished run is kept in
 never reported as still running: it comes back `idle`, with `last_error` saying the run in
 progress when the node stopped did not finish.
 
+A crawl whose listing had gaps — pages it could not read for links, see
+[How a re-crawl finds what changed](#how-a-re-crawl-finds-what-changed) — also finishes `idle`
+with `last_error` set, even when every document it listed was indexed: `"The listing is
+incomplete, so documents may be missing: 1 place(s) could not be read: https://docs.example.com/
+(links not read: HTTP 503)"`. What lies only behind those pages is not in the index until a crawl
+reads them.
+
 | Count | What it counts |
 |-------|----------------|
 | `entries_ingested` | Chunks written and published by this run |
@@ -2513,6 +2520,26 @@ not as unchecked, and its indexed version kept all the same. A `404` or `410` is
 is gone, and the re-crawl removes it as it does a page no longer listed. Each failure's reason is in the
 node's log.
 
+Removal is inferred by subtraction — an indexed page the re-crawl does not list is taken to be
+gone — so it is only made over a listing that saw the whole source. A page the link walk could not
+read for links — the server answered `5xx`, `408`, `429`, `401`, `403` or `407`, the request timed
+out, or the page was larger than `max_response_bytes` — does not fail the crawl, and neither is it
+read as a page that links to nothing. It is a gap in the listing: every page the listing does hold
+is re-indexed, checked or removed as above, but no indexed page it missed is removed. Those are
+kept as indexed and counted in `documents_kept_unlisted` on
+[`/v1/reindex/status`](#reindex-status-example), and `last_error` says the listing was incomplete
+and names the first ten pages that could not be read, with what each answered. The next re-crawl
+whose listing is complete removes whatever has really gone. A page that is `404` or `410`, answers
+any other `4xx`, redirects somewhere the source does not follow, or is not HTML did answer: it links
+to nothing, and what only it led to is removed. Without this rule one `503` from a hub page would
+remove every page below it, and one from the base URL — itself a listed page — the whole source. A
+first crawl removes nothing, but a first crawl with gaps says so in its `last_error` on
+[`/v1/ingest/status`](#ingest-status-example) too, since the pages behind them are missing from
+the index. A filesystem source has the same rule for a file whose attributes or real location it
+cannot read — a link into a directory the node may not search, say: the file is left out of the
+listing as a gap, not as a deletion. A directory it cannot list still fails the crawl, as it always
+has.
+
 The validators live in the registry file, not in memory, so this holds across a restart — the
 first re-crawl after one is exactly when a node would otherwise transfer the whole site again. A
 filesystem source has nothing to ask with and reads each file, and an unchanged one is recognised
@@ -2553,6 +2580,7 @@ curl 'http://localhost:8080/v1/reindex/status?source_id=my-docs'
   "documents_failed": 1,
   "documents_unchecked": 1,
   "unchecked_sample": ["https://docs.example.com/guide/install"],
+  "documents_kept_unlisted": 0,
   "started_at_ms": 1730000000000,
   "finished_at_ms": 0,
   "last_error": null
@@ -2568,7 +2596,7 @@ curl http://localhost:8080/v1/reindex/status
   "sources": [
     {"source_id": "my-docs", "state": "idle", "cancelled": false, "progress": 1.0000,
      "documents_processed": 100, "documents_total": 100, "documents_failed": 0,
-     "documents_unchecked": 0, "unchecked_sample": [],
+     "documents_unchecked": 0, "unchecked_sample": [], "documents_kept_unlisted": 0,
      "started_at_ms": 1730000000000, "finished_at_ms": 1730000042000,
      "last_error": null}
   ]
@@ -2589,7 +2617,12 @@ for failed documents, how many it affected. A document the source confirmed unch
 a re-crawl of a source that has barely moved, with one page timing out, is not a failed run. A run
 that indexed or confirmed some documents and failed on others did finish, and reads `idle` at `progress: 1.0` with
 `last_error` counting the failures and the documents indexed (`"Reindex completed with 3 errors;
-400 documents indexed; ..."`), so a clean run is the one with `last_error: null`. Either way
+400 documents indexed; ..."`), so a clean run is the one with `last_error: null`. A run whose
+listing had gaps is never clean either, even with nothing failed: `last_error` reads
+`"Reindex completed; 400 documents indexed; the listing was incomplete, so 12 documents it did not
+list were kept rather than removed: 1 place(s) could not be read: https://docs.example.com/guide/
+(links not read: HTTP 503)"`. Those places are pages of the source, as `unchecked_sample` names
+documents, with a status or a kind of failure — never an error message. Either way
 `last_error` points at the node's log for the reasons themselves — those carry filesystem paths
 and embedding endpoint URLs, and this route answers any caller holding a read token. A failed run
 is not reported as `idle`, because a failed run reported as idle-with-a-note
@@ -2611,6 +2644,7 @@ and `progress` is their ratio.
 | `documents_failed` | Documents the run could not index or could not check: a fetch or read that failed, a document over the per-document limits, chunks that could not all be embedded and written, and the unchecked documents below. Counted as the run goes, so a stopped or failed run reports what it had failed on by then. Each failed document keeps whatever version was indexed before |
 | `documents_unchecked` | The part of `documents_failed` the re-crawl could not ask its source about — a timeout, a `5xx`, `408`, `429`, `401` or `407`, a `304` to a request that carried no condition. See [How a re-crawl finds what changed](#how-a-re-crawl-finds-what-changed) |
 | `unchecked_sample` | The first ten unchecked documents, by document id — the id a query result names, never an error message. Enough to tell one host that is down from scattered timeouts; the count above is always whole |
+| `documents_kept_unlisted` | Indexed documents the re-crawl did not list and kept rather than removed, because its listing had gaps — pages it could not read for links, named in `last_error`. Not part of `documents_failed`: nothing was asked of them. See [How a re-crawl finds what changed](#how-a-re-crawl-finds-what-changed) |
 
 ### Compaction Example
 
