@@ -43,6 +43,13 @@ import java.util.stream.Stream;
  * {@code charset} was replaced, a server labels the page with another encoding - is changed, and
  * is read again with the decoding its source now declares.</p>
  *
+ * <h2>Documents that could not be checked</h2>
+ * <p>A source that cannot answer for a document - it timed out, a server failed, a server
+ * answered {@code 304 Not Modified} to a request that asked nothing - says nothing about whether
+ * it changed. Such a document is kept as it is indexed and reported unchecked in the
+ * {@link ChangeSet}, so the run counts it as a fetch that failed rather than passing it as
+ * current.</p>
+ *
  * <h2>Deleted Document Detection</h2>
  * <p>After processing all crawled documents, any document in the registry that was not
  * seen during the crawl is considered deleted. That inference is only sound over a complete
@@ -241,8 +248,9 @@ public class ChangeDetector {
      * apart. A {@link DocumentNotFoundException} means the crawl listed a document that is no
      * longer there, so it is reported as unseen and the deleted-document pass tombstones it. Any
      * other failure is transient - the host is down, the request timed out - and treating it as
-     * unseen would tombstone a document that still exists, so the previous version is kept and
-     * the failure is logged rather than silently recorded as "unchanged".</p>
+     * unseen would tombstone a document that still exists, so the previous version is kept, the
+     * failure is logged, and the document is reported unchecked rather than silently recorded as
+     * unchanged.</p>
      *
      * <p>A {@link FetchDisallowedException} is not a failure but an answer: the publisher now
      * forbids fetching the document - a robots.txt that disallows it, or the URL it redirects
@@ -275,6 +283,7 @@ public class ChangeDetector {
         } catch (SourceException e) {
             LOGGER.warn("Could not determine whether document {} of source {} changed: {}. "
                 + "Keeping the indexed version.", documentId, sourceId, e.getMessage());
+            builder.addUnchecked(documentId);
             return true;
         }
     }

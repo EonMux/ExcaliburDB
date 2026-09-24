@@ -27,10 +27,12 @@ import java.util.Objects;
  * this class, and it is a judgement rather than a transcription.</p>
  *
  * <h2>What counts as a failure</h2>
- * <p>A run is failed only when it indexed nothing. Anything else is a completed run, because
- * failing on any error at all reported a run that reindexed four hundred documents and could not
- * read one of them as a failed reindex - which is the opposite of what an operator would do about
- * it. A completed run that did lose documents still says so in {@code last_error}, with how many,
+ * <p>A run is failed only when it indexed nothing and confirmed nothing current. Anything else
+ * is a completed run, because failing on any error at all reported a run that reindexed four
+ * hundred documents and could not read one of them as a failed reindex - which is the opposite
+ * of what an operator would do about it. A document its source confirmed unchanged counts as
+ * work done: a re-crawl of a source that has barely moved indexes little or nothing, and one
+ * timeout among four hundred confirmed pages is not a failed run either. A completed run that did lose documents still says so in {@code last_error}, with how many,
  * because a readback that answered null for it could not be told from a clean run. Both the
  * rolling and the standard branch apply that same rule, deliberately: which of them ran is a
  * property of how the node is deployed, not something a caller asked for, and the two must not
@@ -49,9 +51,10 @@ import java.util.Objects;
  * writes closes the channel for all of them for the life of the process.</p>
  *
  * <h2>Progress is counted, not assumed</h2>
- * <p>What the status reports is what the reindexer says it has finished, document by document.
- * The three constants this class used to publish instead described a run that nobody had
- * measured, and in units - chunks, in the total - that nothing else on the route used.</p>
+ * <p>What the status reports is what the reindexer says it has finished, document by document,
+ * and what it has failed on so far. The three constants this class used to publish instead
+ * described a run that nobody had measured, and in units - chunks, in the total - that nothing
+ * else on the route used.</p>
  *
  * <h2>What the source's ingestion status is told</h2>
  * <p>Two numbers: how many of the documents the crawl listed were passed over because they are
@@ -61,6 +64,7 @@ import java.util.Objects;
  * able to say so - and {@code entries_skipped} and {@code entries_disallowed} on
  * {@code GET /v1/ingest/status} are where the node says it. Nothing else on that status is
  * touched, because a reindex has its own readback for how far it got and how it ended.</p>
+
  *
  * <h2>Thread Safety</h2>
  * <p>Thread-safe. Every field is final and the mutual exclusion that matters - one reindex per
@@ -185,11 +189,12 @@ public final class ReindexRun {
             // the reindexer publishes is the size of the run.
             statusRegistry.updateProgress(sourceId, STATE_CRAWLING, 0.0, 0, 0);
 
+            RunReport report = new RunReport(sourceId);
             boolean useRollingReplacement = volumeManager != null && segmentCatalog != null
                 && reindexer.hasRollingReplacement();
             return useRollingReplacement
-                ? runRolling(threadName, sourceId, source, stop)
-                : runStandard(threadName, sourceId, source, stop);
+                ? runRolling(threadName, sourceId, source, report, stop)
+                : runStandard(threadName, sourceId, source, report, stop);
 
         } catch (Exception e) {
             if (wasCancelled(stop, e)) {
@@ -325,19 +330,38 @@ public final class ReindexRun {
     }
 
     /**
-     * Builds the listener that turns the reindexer's counts into the status a caller polls.
+     * The listener that turns the reindexer's counts into the status a caller polls.
      *
      * <p>The phase is settled once, from what this node can do, rather than guessed per
      * document: a node with no embedding endpoint never enters an embedding phase, and
      * reporting one would be reporting work it does not perform.</p>
-     *
-     * @param sourceId The source being reindexed
-     * @return The listener to hand the reindexer
+
      */
-    private DocumentReindexer.ReindexProgress progressFor(String sourceId) {
-        String state = reindexer.embedsChunks() ? STATE_EMBEDDING : STATE_INDEXING;
-        return (processed, total) -> statusRegistry.updateProgress(sourceId, state,
-            fractionDone(processed, total), processed, total);
+    private final class RunReport implements DocumentReindexer.ReindexProgress {
+
+        private final String sourceId;
+        private final String state;
+
+        RunReport(String sourceId) {
+            this.sourceId = sourceId;
+            this.state = reindexer.embedsChunks() ? STATE_EMBEDDING : STATE_INDEXING;
+        }
+
+        @Override
+        public void documentsDone(long processed, long total) {
+            statusRegistry.updateProgress(sourceId, state, fractionDone(processed, total),
+                processed, total);
+        }
+
+        @Override
+        public void documentsCounted(long documentsFailed, long documentsNotText) {
+            statusRegistry.recordFailures(sourceId, documentsFailed);
+        }
+
+        @Override
+        public void documentsUnchecked(long documentsUnchecked, List<String> sample) {
+            statusRegistry.recordUnchecked(sourceId, documentsUnchecked, sample);
+        }
     }
 
     /**
@@ -361,11 +385,12 @@ public final class ReindexRun {
      * @param threadName The worker thread, which is how a run is followed through the log
      * @param sourceId   The source being reindexed
      * @param source     The resolved source
+     * @param report     Told what the run does as it does it
      * @param stop       Asks the run to stop
      * @throws SourceException if the source cannot be read
      */
     private boolean runRolling(String threadName, String sourceId, Source source,
-                               StopSignal stop)
+                               RunReport report, StopSignal stop)
             throws SourceException {
         LOGGER.info("[reindex-{}] Using rolling replacement for zero-downtime reindex of "
             + "source: {}", threadName, sourceId);
@@ -382,8 +407,7 @@ public final class ReindexRun {
             threadName, volumePath, sourceId);
 
         DocumentReindexer.RollingReindexResult result =
-            reindexer.reindexWithRollingReplacement(source, volumePath, progressFor(sourceId),
-                stop);
+            reindexer.reindexWithRollingReplacement(source, volumePath, report, stop);
 
         reportDisallowed(sourceId, source);
         return reportRolling(threadName, sourceId, result);
@@ -404,7 +428,8 @@ public final class ReindexRun {
     private boolean reportRolling(String threadName, String sourceId,
                                   DocumentReindexer.RollingReindexResult result) {
         reportSkipped(sourceId, result.getBasicResult().getDocumentsNotText());
-        if (result.hasErrors() && result.getDocumentsIndexed() == 0) {
+        reportFailures(sourceId, result.getBasicResult());
+        if (failedOutright(result.getBasicResult())) {
             LOGGER.error("[reindex-{}] Reindex failed completely with {} errors for "
                     + "source {}: {}", threadName, result.getErrorCount(), sourceId,
                 errorDetail(result.getBasicResult().getErrors()));
@@ -435,17 +460,18 @@ public final class ReindexRun {
      * @param threadName The worker thread, for the log
      * @param sourceId   The source being reindexed
      * @param source     The resolved source
+     * @param report     Told what the run does as it does it
      * @param stop       Asks the run to stop
      * @throws SourceException if the source cannot be read
      */
     private boolean runStandard(String threadName, String sourceId, Source source,
-                                StopSignal stop)
+                                RunReport report, StopSignal stop)
             throws SourceException {
         LOGGER.info("[reindex-{}] Using standard reindex (rolling replacement not configured) "
             + "for source: {}", threadName, sourceId);
 
         DocumentReindexer.ReindexResult result =
-            reindexer.reindexAll(source, progressFor(sourceId), stop);
+            reindexer.reindexAll(source, report, stop);
 
         reportDisallowed(sourceId, source);
         return reportStandard(threadName, sourceId, result);
@@ -454,9 +480,10 @@ public final class ReindexRun {
     /**
      * Records the verdict on an in-place run.
      *
-     * <p>Applies the same rule the rolling branch does - failed only when nothing was indexed,
-     * finished with its failures counted when only some were - and reports the counts an operator compares against the previous run to see whether the
-     * corpus actually changed.</p>
+     * <p>Applies the same rule the rolling branch does - failed only when nothing was indexed
+     * and nothing confirmed current, finished with its failures counted otherwise - and reports
+     * the counts an operator compares against the previous run to see whether the corpus
+     * actually changed.</p>
      *
      * @param threadName The worker thread, for the log
      * @param sourceId   The source that was reindexed
@@ -465,7 +492,8 @@ public final class ReindexRun {
     private boolean reportStandard(String threadName, String sourceId,
                                    DocumentReindexer.ReindexResult result) {
         reportSkipped(sourceId, result.getDocumentsNotText());
-        if (result.hasErrors() && result.getDocumentsIndexed() == 0) {
+        reportFailures(sourceId, result);
+        if (failedOutright(result)) {
             LOGGER.error("[reindex-{}] Reindex failed completely with {} errors for "
                     + "source {}: {}", threadName, result.getErrorCount(), sourceId,
                 errorDetail(result.getErrors()));
@@ -488,6 +516,33 @@ public final class ReindexRun {
             result.getDocumentsSkipped(), result.getChunksCreated());
         statusRegistry.completeReindex(sourceId);
         return true;
+    }
+
+    /**
+     * Whether a run that ended produced nothing: it failed, and neither indexed a document nor
+     * confirmed one current.
+     *
+     * @param result What the run produced
+     * @return true for a failed run
+     */
+    private static boolean failedOutright(DocumentReindexer.ReindexResult result) {
+        return result.hasErrors() && result.getDocumentsIndexed() == 0
+            && result.getDocumentsUnchanged() == 0;
+    }
+
+    /**
+     * Records the run's whole count of the documents it failed on and could not check.
+     *
+     * <p>The listener has reported them as they came; the result is the final word, and the
+     * only word from a reindexer that reports nothing as it goes.</p>
+     *
+     * @param sourceId The source that was reindexed
+     * @param result   What the run produced
+     */
+    private void reportFailures(String sourceId, DocumentReindexer.ReindexResult result) {
+        statusRegistry.recordFailures(sourceId, result.getDocumentsFailed());
+        statusRegistry.recordUnchecked(sourceId, result.getDocumentsUnchecked(),
+            result.getUncheckedSample());
     }
 
     /**

@@ -44,14 +44,30 @@ class ReindexProgressTest {
             new UpsertHandler(registry, writer), registry, writer);
     }
 
-    /** Every (processed, total) pair a run published, in order. */
+    /** Everything a run published, in order. */
     private static final class Reported implements DocumentReindexer.ReindexProgress {
 
         private final List<long[]> pairs = new ArrayList<>();
 
+        /** Each (failed, not text) pair, as {@code failed/notText}. */
+        private final List<String> counted = new ArrayList<>();
+
+        /** Each report of unchecked documents, as {@code count:sample}. */
+        private final List<String> unchecked = new ArrayList<>();
+
         @Override
         public void documentsDone(long documentsProcessed, long documentsTotal) {
             pairs.add(new long[] {documentsProcessed, documentsTotal});
+        }
+
+        @Override
+        public void documentsCounted(long documentsFailed, long documentsNotText) {
+            counted.add(documentsFailed + "/" + documentsNotText);
+        }
+
+        @Override
+        public void documentsUnchecked(long documentsUnchecked, List<String> sample) {
+            unchecked.add(documentsUnchecked + ":" + sample);
         }
 
         List<String> asText() {
@@ -97,6 +113,75 @@ class ReindexProgressTest {
         assertThat(reported.asText())
             .as("a run that stops advancing because one document failed reads as hung")
             .containsExactly("0/2", "1/2", "2/2");
+    }
+
+    @Test
+    @DisplayName("what the run fails on is counted as it goes, not only at the end")
+    void failuresAreCountedAsTheRunGoes() throws SourceException {
+        StubSource source = new StubSource();
+        source.add("doc-a", "A readable document. ".repeat(60));
+        source.add("doc-b", "An unreadable document. ".repeat(60));
+        source.failOn("doc-b");
+        Reported reported = new Reported();
+
+        DocumentReindexer.ReindexResult result = reindexer.reindexAll(source, reported);
+
+        assertThat(reported.counted)
+            .as("once before the first document, then once after each")
+            .containsExactly("0/0", "0/0", "1/0");
+        assertThat(result.getDocumentsFailed()).isEqualTo(1);
+        assertThat(result.getDocumentsUnchecked()).isZero();
+        assertThat(reported.unchecked).containsExactly("0:[]");
+    }
+
+    @Test
+    @DisplayName("a document its source could not be asked about is a failure, and stays indexed")
+    void anUncheckedDocumentIsAFailure() throws SourceException {
+        StubSource source = new StubSource();
+        source.add("doc-a", "A document that stays the same. ".repeat(60));
+        source.add("doc-b", "A document whose host goes down. ".repeat(60));
+        reindexer.reindexAll(source);
+        source.failOn("doc-b");
+        Reported reported = new Reported();
+
+        DocumentReindexer.ReindexResult result = reindexer.reindexAll(source, reported);
+
+        assertThat(result.getDocumentsUnchecked()).isEqualTo(1);
+        assertThat(result.getUncheckedSample()).containsExactly("doc-b");
+        assertThat(result.getDocumentsFailed())
+            .as("a check that could not be made is a fetch that failed")
+            .isEqualTo(1);
+        assertThat(result.getDocumentsUnchanged())
+            .as("doc-a was checked and found current; doc-b was not checked at all")
+            .isEqualTo(1);
+        assertThat(result.getErrors())
+            .extracting(DocumentReindexer.ReindexResult.OperationError::getComponent)
+            .containsExactly("check");
+        assertThat(reported.unchecked).containsExactly("1:[doc-b]");
+        assertThat(reported.counted).containsExactly("1/0");
+        assertThat(registry.get(SOURCE, "doc-b"))
+            .as("not knowing whether it changed is no reason to drop what is indexed")
+            .isNotNull();
+    }
+
+    @Test
+    @DisplayName("the documents named as unchecked are a bounded sample of them")
+    void theUncheckedSampleIsBounded() {
+        DocumentReindexer.ReindexResult.Builder builder =
+            DocumentReindexer.ReindexResult.builder(SOURCE);
+        int count = DocumentReindexer.ReindexResult.UNCHECKED_SAMPLE_SIZE + 5;
+        for (int i = 0; i < count; i++) {
+            builder.addUnchecked("doc-" + i);
+        }
+
+        DocumentReindexer.ReindexResult result = builder.build();
+
+        assertThat(result.getDocumentsUnchecked()).isEqualTo(count);
+        assertThat(result.getDocumentsFailed()).isEqualTo(count);
+        assertThat(result.getErrorCount()).isEqualTo(count);
+        assertThat(result.getUncheckedSample())
+            .hasSize(DocumentReindexer.ReindexResult.UNCHECKED_SAMPLE_SIZE)
+            .startsWith("doc-0", "doc-1");
     }
 
     @Test

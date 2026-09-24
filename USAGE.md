@@ -1423,6 +1423,12 @@ A filesystem source reads each file and compares its length and content hash. A 
 copied or restored with its bytes intact is not rewritten, whatever its modification time says;
 the new time is recorded in the registry instead.
 
+A document the re-crawl cannot ask about is neither changed nor current: the request timed out,
+the server answered `5xx`, or it answered `304` to a request that carried no validators, which
+names no version at all. Its indexed version stays, it is counted in `documents_failed` and
+`documents_unchecked` on the reindex status below, with the first ten named in
+`unchecked_sample`, and the next re-crawl asks again. The reason for each is in the node's log.
+
 ### Re-index status
 
 `POST /v1/reindex` answers 202 and works in the background, so this is how the run's verdict
@@ -1442,6 +1448,9 @@ curl "http://localhost:8080/v1/reindex/status?source_id=project-docs"
   "progress": 0.6200,
   "documents_processed": 62,
   "documents_total": 100,
+  "documents_failed": 1,
+  "documents_unchecked": 1,
+  "unchecked_sample": ["https://docs.example.com/guide/install"],
   "started_at_ms": 1730000000000,
   "finished_at_ms": 0,
   "last_error": null
@@ -1455,13 +1464,15 @@ curl http://localhost:8080/v1/reindex/status
 ```
 
 ```json
-{"sources": [{"source_id": "project-docs", "state": "idle", "cancelled": false, "progress": 1.0000, "documents_processed": 100, "documents_total": 100, "started_at_ms": 1730000000000, "finished_at_ms": 1730000042000, "last_error": null}]}
+{"sources": [{"source_id": "project-docs", "state": "idle", "cancelled": false, "progress": 1.0000, "documents_processed": 100, "documents_total": 100, "documents_failed": 0, "documents_unchecked": 0, "unchecked_sample": [], "started_at_ms": 1730000000000, "finished_at_ms": 1730000042000, "last_error": null}]}
 ```
 
 `state` is one of `crawling`, `embedding`, `indexing` while a run is in flight, `idle` at
 `progress: 1.0` once it finished, `cancelled` when someone stopped it, or `failed` with
-`last_error` set when it broke — which means it indexed nothing. A run that indexed some documents
-and failed on others finished, so it reads `idle`, with `last_error` counting what failed and what
+`last_error` set when it broke — which means it failed on documents and neither indexed any nor
+confirmed any current. A document the source confirmed unchanged counts as work done, so a
+re-crawl of a source that has barely moved, with one page timing out, has not failed. A run that
+indexed or confirmed some documents and failed on others finished, so it reads `idle`, with `last_error` counting what failed and what
 was indexed (`"Reindex completed with 3 errors; 400 documents indexed; see the node's log for the
 reason"`); a clean run is `idle` with `last_error: null`. `cancelled` and `failed` are different answers and the
 `cancelled` boolean says which without parsing `state`: a stopped run is the outcome you asked
@@ -1479,6 +1490,14 @@ corpus was rewritten. Deregistering a source with `DELETE /v1/ingest` clears its
 counts chunks. Both counters are the run's own — `documents_total` is the number of documents
 the change detection found to be new or changed, and `documents_processed` goes up by one as
 each of them is written. `progress` is their ratio and nothing else.
+
+`documents_failed` is how many documents the run could not index or could not check: a fetch or
+read that failed, a document over the per-document limits, one whose chunks could not all be
+embedded and written, and the unchecked ones. It rises as the run goes, so a cancelled or failed
+run says what it had failed on by then, and each of those documents keeps the version indexed
+before. `documents_unchecked` is the part of it whose source could not be asked whether they had
+changed, and `unchecked_sample` names the first ten by document id — the id a query result carries,
+not an error message. The count is always whole.
 
 **Error — `404 Not Found`**
 

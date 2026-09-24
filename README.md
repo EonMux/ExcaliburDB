@@ -2361,9 +2361,15 @@ transferred and nothing about it is re-chunked, re-embedded or re-written. Any o
 read in full and compared by content; a changed page is then fetched again and replaced. A server
 that ignores the conditions costs a full fetch per page and nothing worse. A `304` to a request
 that carried no condition — a page the server never gave validators for, or whose stored tag
-cannot travel in a header — names no version at all, so it fails that document's fetch rather
-than keeping it unchecked. The link walk still reads every HTML page it follows links from,
-because a page's links cannot be read from a `304`.
+cannot travel in a header — names no version at all, so it is a failed fetch, not a page found
+current. The link walk still reads every HTML page it follows links from, because a page's links
+cannot be read from a `304`.
+
+A document the re-crawl cannot ask about — the request timed out, the server answered `5xx`, or
+the `304` above — has not been shown to be either changed or current. It keeps its indexed
+version, is counted in the run's `documents_failed` and `documents_unchecked` on
+[`/v1/reindex/status`](#reindex-status-example) with the first ten named in `unchecked_sample`,
+and is asked again by the next re-crawl. Each failure's reason is in the node's log.
 
 The validators live in the registry file, not in memory, so this holds across a restart — the
 first re-crawl after one is exactly when a node would otherwise transfer the whole site again. A
@@ -2402,6 +2408,9 @@ curl 'http://localhost:8080/v1/reindex/status?source_id=my-docs'
   "progress": 0.6200,
   "documents_processed": 62,
   "documents_total": 100,
+  "documents_failed": 1,
+  "documents_unchecked": 1,
+  "unchecked_sample": ["https://docs.example.com/guide/install"],
   "started_at_ms": 1730000000000,
   "finished_at_ms": 0,
   "last_error": null
@@ -2416,7 +2425,8 @@ curl http://localhost:8080/v1/reindex/status
 {
   "sources": [
     {"source_id": "my-docs", "state": "idle", "cancelled": false, "progress": 1.0000,
-     "documents_processed": 100, "documents_total": 100,
+     "documents_processed": 100, "documents_total": 100, "documents_failed": 0,
+     "documents_unchecked": 0, "unchecked_sample": [],
      "started_at_ms": 1730000000000, "finished_at_ms": 1730000042000,
      "last_error": null}
   ]
@@ -2429,14 +2439,16 @@ and `failed`, which the ingest status has no equivalent of. A run stopped throug
 parsing `state`: a stop that was asked for is not a crash, and reporting it as one sends an
 operator looking for a fault that is not there. `finished_at_ms` is when the run ended, `0`
 while one is still going, so how long it took and how stale its result is are both readable.
-A run is `failed` only when it indexed nothing; it leaves the old segments serving, and
-`last_error` says what kind of failure it was and how many documents it affected. A run that
-indexed some documents and failed on others did finish, and reads `idle` at `progress: 1.0` with
+A run is `failed` only when it failed on documents and neither indexed any nor confirmed any
+current; it leaves the old segments serving, and `last_error` says what kind of failure it was and
+how many documents it affected. A document the source confirmed unchanged counts as work done, so
+a re-crawl of a source that has barely moved, with one page timing out, is not a failed run. A run
+that indexed or confirmed some documents and failed on others did finish, and reads `idle` at `progress: 1.0` with
 `last_error` counting the failures and the documents indexed (`"Reindex completed with 3 errors;
 400 documents indexed; ..."`), so a clean run is the one with `last_error: null`. Either way
 `last_error` points at the node's log for the reasons themselves — those carry filesystem paths
-and embedding endpoint URLs, and this route answers any caller holding a read token. A run that
-indexed nothing is not reported as `idle`, because a failed run reported as idle-with-a-note
+and embedding endpoint URLs, and this route answers any caller holding a read token. A failed run
+is not reported as `idle`, because a failed run reported as idle-with-a-note
 reads as a run that finished.
 
 A source that has never been reindexed is a 404 rather than an invented idle run: "nothing has
@@ -2449,6 +2461,12 @@ chunks, and giving the two the same name for different units would be worse than
 different names. They are the run's own counts: `documents_total` is how many documents the
 change detection found new or changed, `documents_processed` rises by one as each is written,
 and `progress` is their ratio.
+
+| Count | What it counts |
+|-------|----------------|
+| `documents_failed` | Documents the run could not index or could not check: a fetch or read that failed, a document over the per-document limits, chunks that could not all be embedded and written, and the unchecked documents below. Counted as the run goes, so a stopped or failed run reports what it had failed on by then. Each failed document keeps whatever version was indexed before |
+| `documents_unchecked` | The part of `documents_failed` the re-crawl could not ask its source about — a timeout, a `5xx`, a `304` to a request that carried no condition. See [How a re-crawl finds what changed](#how-a-re-crawl-finds-what-changed) |
+| `unchecked_sample` | The first ten unchecked documents, by document id — the id a query result names, never an error message. Enough to tell one host that is down from scattered timeouts; the count above is always whole |
 
 ### Compaction Example
 

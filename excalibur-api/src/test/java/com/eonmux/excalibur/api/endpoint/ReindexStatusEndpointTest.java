@@ -12,6 +12,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -74,6 +75,40 @@ class ReindexStatusEndpointTest {
             assertThat(json).contains("\"documents_processed\": 3");
             assertThat(json).contains("\"documents_total\": 10");
             assertThat(json).contains("\"last_error\": null");
+        }
+
+        @Test
+        @DisplayName("reports what a run failed on, and which documents it could not check")
+        void reportsFailedAndUncheckedDocuments() throws IOException {
+            registry.startReindex("docs");
+            registry.recordFailures("docs", 3);
+            registry.recordUnchecked("docs", 2, List.of("a.txt", "say \"hi\".txt"));
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+
+            endpoint.handle(get("?source_id=docs", body));
+
+            String json = body.toString(StandardCharsets.UTF_8);
+            assertThat(json).contains("\"documents_failed\": 3");
+            assertThat(json).contains("\"documents_unchecked\": 2");
+            assertThat(json).contains(
+                "\"unchecked_sample\": [\"a.txt\", \"say \\\"hi\\\".txt\"]");
+        }
+
+        @Test
+        @DisplayName("a new run starts with nothing failed and nothing unchecked")
+        void aNewRunClearsTheFailures() throws IOException {
+            registry.startReindex("docs");
+            registry.recordFailures("docs", 3);
+            registry.recordUnchecked("docs", 1, List.of("a.txt"));
+            registry.startReindex("docs");
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+
+            endpoint.handle(get("?source_id=docs", body));
+
+            String json = body.toString(StandardCharsets.UTF_8);
+            assertThat(json).contains("\"documents_failed\": 0");
+            assertThat(json).contains("\"documents_unchecked\": 0");
+            assertThat(json).contains("\"unchecked_sample\": []");
         }
 
         @Test

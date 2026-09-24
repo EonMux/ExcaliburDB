@@ -689,6 +689,43 @@ class ChangeDetectionTest {
         assertEquals(List.of("chunk1"), recorded.getChunkIds());
     }
 
+    @Test
+    void testDocumentThatCannotBeCheckedIsReportedUnchecked() throws SourceException {
+        byte[] content = "same content".getBytes(StandardCharsets.UTF_8);
+        for (String id : List.of("down", "fine")) {
+            registry.register(DocumentMetadata.builder()
+                .sourceId("test-source")
+                .documentId(id)
+                .contentHash(DocumentRegistry.computeContentHash(content))
+                .contentLength(content.length)
+                .lastModifiedMillis(1000L)
+                .addChunkId(id + "#0")
+                .build());
+        }
+        Source source = new MockSource("test-source", List.of("down", "fine", "added"),
+            docId -> new FetchedDocument(docId, content, "text/plain", 1000L)) {
+            @Override
+            public FetchedDocument fetch(String documentId) {
+                if (documentId.equals("down")) {
+                    throw new UncheckedSourceFailure();
+                }
+                return super.fetch(documentId);
+            }
+        };
+
+        ChangeSet changes = detector.detectChanges(new Rethrowing(source));
+
+        assertEquals(List.of("down"), changes.getUncheckedDocuments(),
+            "a document its source could not be asked about is neither changed nor gone");
+        assertEquals(1, changes.getUncheckedCount());
+        assertEquals(0, changes.getChangedCount());
+        assertEquals(0, changes.getDeletedCount(), "its indexed version is kept");
+        assertEquals(1, changes.getNewCount());
+        assertEquals(1, changes.getUnchangedCount(),
+            "only the document the source answered for is confirmed current");
+        assertTrue(changes.hasChanges());
+    }
+
     // ==================== Helper Methods ====================
 
     private DocumentMetadata createMetadata(String sourceId, String documentId) {
@@ -707,6 +744,49 @@ class ChangeDetectionTest {
     }
 
     // ==================== Mock Source ====================
+
+    /** Marks a fetch the {@link Rethrowing} wrapper turns into a {@link SourceException}. */
+    private static final class UncheckedSourceFailure extends RuntimeException {
+    }
+
+    /** A source whose marked fetches fail as a source does: a timeout, a 5xx. */
+    private static final class Rethrowing implements Source {
+        private final Source delegate;
+
+        Rethrowing(Source delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public String getSourceId() {
+            return delegate.getSourceId();
+        }
+
+        @Override
+        public String getSourceType() {
+            return delegate.getSourceType();
+        }
+
+        @Override
+        public Stream<String> crawl() throws SourceException {
+            return delegate.crawl();
+        }
+
+        @Override
+        public FetchedDocument fetch(String documentId) throws SourceException {
+            try {
+                return delegate.fetch(documentId);
+            } catch (UncheckedSourceFailure e) {
+                throw new SourceException("HTTP error 503 fetching: " + documentId,
+                    getSourceId(), true);
+            }
+        }
+
+        @Override
+        public void close() throws java.io.IOException {
+            delegate.close();
+        }
+    }
 
     private static class MockSource implements Source {
         private final String sourceId;

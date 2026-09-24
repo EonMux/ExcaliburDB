@@ -189,6 +189,40 @@ public class DocumentReindexer {
          * @param documentsTotal     How many it will finish with, new and changed together
          */
         void documentsDone(long documentsProcessed, long documentsTotal);
+
+        /**
+         * Reports what the run has counted against its documents so far.
+         *
+         * <p>Called once before the first document, when the documents that could not be
+         * checked are known, and once after each document with {@link #documentsDone}. So a run
+         * that is stopped, or breaks, partway has already said what it failed on and passed over
+         * up to then, and a caller does not have to wait for a result the run never
+         * returns.</p>
+         *
+         * <p>Must not throw, and must not block, for the reason {@link #documentsDone}
+         * gives.</p>
+         *
+         * @param documentsFailed  Documents the run could not check, fetch, read or write
+         * @param documentsNotText Documents it passed over because they are not text
+         */
+        default void documentsCounted(long documentsFailed, long documentsNotText) {
+        }
+
+        /**
+         * Reports the documents the run's source could not say had changed or not.
+         *
+         * <p>Called once, before the first document. Each is kept as it is indexed and counted
+         * among the failures {@link #documentsCounted} reports.</p>
+         *
+         * <p>Must not throw, and must not block, for the reason {@link #documentsDone}
+         * gives.</p>
+         *
+         * @param documentsUnchecked How many there were
+         * @param sample             The first of them, at most
+         *                           {@link ReindexResult#UNCHECKED_SAMPLE_SIZE}, in crawl order
+         */
+        default void documentsUnchecked(long documentsUnchecked, List<String> sample) {
+        }
     }
 
     /**
@@ -872,6 +906,17 @@ public class DocumentReindexer {
      * Result of re-indexing all documents from a source.
      */
     public static final class ReindexResult {
+
+        /**
+         * How many of the documents that could not be checked a result names.
+         *
+         * <p>Enough to tell one host that is down from a scatter of timeouts, and to try one
+         * of them by hand; bounded because a source that is down entirely fails every document
+         * it lists. The count is always whole, and each failure is in the log with its
+         * reason.</p>
+         */
+        public static final int UNCHECKED_SAMPLE_SIZE = 10;
+
         private final String sourceId;
         private final int documentsIndexed;
         private final int documentsTombstoned;
@@ -880,6 +925,10 @@ public class DocumentReindexer {
         private final int chunksFailed;
         private final int documentsSkipped;
         private final int documentsNotText;
+        private final int documentsFailed;
+        private final int documentsUnchecked;
+        private final List<String> uncheckedSample;
+        private final int documentsUnchanged;
         private final long elapsedMillis;
         private final List<OperationError> errors;
 
@@ -888,6 +937,10 @@ public class DocumentReindexer {
             this.documentsIndexed = builder.documentsIndexed;
             this.documentsSkipped = builder.documentsSkipped;
             this.documentsNotText = builder.documentsNotText;
+            this.documentsFailed = builder.documentsFailed;
+            this.documentsUnchecked = builder.documentsUnchecked;
+            this.uncheckedSample = List.copyOf(builder.uncheckedSample);
+            this.documentsUnchanged = builder.documentsUnchanged;
             this.documentsTombstoned = builder.documentsTombstoned;
             this.chunksCreated = builder.chunksCreated;
             this.chunksTombstoned = builder.chunksTombstoned;
@@ -945,6 +998,55 @@ public class DocumentReindexer {
             return documentsNotText;
         }
 
+        /**
+         * Documents the run could not index or could not check.
+         *
+         * <p>Each is one document, however many chunks it has: one whose fetch or read failed,
+         * one over the per-document limits, one whose chunks could not all be embedded and
+         * written, and one whose source could not say whether it had changed. Every such
+         * document is also among {@link #getErrors()}, which may hold more - a removal that
+         * could not tombstone a chunk is an error of the run and not a document it failed
+         * on.</p>
+         *
+         * @return How many documents failed
+         */
+        public int getDocumentsFailed() {
+            return documentsFailed;
+        }
+
+        /**
+         * Documents whose source could not say whether they had changed.
+         *
+         * <p>A subset of {@link #getDocumentsFailed()}. Their indexed versions were kept.</p>
+         *
+         * @return How many documents could not be checked
+         */
+        public int getDocumentsUnchecked() {
+            return documentsUnchecked;
+        }
+
+        /**
+         * The first documents that could not be checked, by id.
+         *
+         * @return At most {@link #UNCHECKED_SAMPLE_SIZE} ids, in crawl order
+         */
+        public List<String> getUncheckedSample() {
+            return uncheckedSample;
+        }
+
+        /**
+         * Registered documents the source confirmed are still current.
+         *
+         * <p>Neither indexed nor failed, and still documents the run accounted for: a re-crawl
+         * of a source that has not moved finds every document here, and that is a run that
+         * worked.</p>
+         *
+         * @return How many documents were confirmed unchanged
+         */
+        public int getDocumentsUnchanged() {
+            return documentsUnchanged;
+        }
+
         public long getElapsedMillis() {
             return elapsedMillis;
         }
@@ -967,10 +1069,12 @@ public class DocumentReindexer {
 
         @Override
         public String toString() {
-            return String.format("ReindexResult[source=%s, indexed=%d, skipped=%d, tombstoned=%d, " +
-                "chunksCreated=%d, chunksTombstoned=%d, chunksFailed=%d, errors=%d, elapsed=%dms]",
-                sourceId, documentsIndexed, documentsSkipped, documentsTombstoned, chunksCreated,
-                chunksTombstoned, chunksFailed, errors.size(), elapsedMillis);
+            return String.format("ReindexResult[source=%s, indexed=%d, skipped=%d, failed=%d, " +
+                "unchecked=%d, unchanged=%d, tombstoned=%d, chunksCreated=%d, chunksTombstoned=%d, " +
+                "chunksFailed=%d, errors=%d, elapsed=%dms]",
+                sourceId, documentsIndexed, documentsSkipped, documentsFailed, documentsUnchecked,
+                documentsUnchanged, documentsTombstoned, chunksCreated, chunksTombstoned,
+                chunksFailed, errors.size(), elapsedMillis);
         }
 
         public static Builder builder(String sourceId) {
@@ -987,6 +1091,10 @@ public class DocumentReindexer {
             private int chunksCreated = 0;
             private int chunksTombstoned = 0;
             private int chunksFailed = 0;
+            private int documentsFailed = 0;
+            private int documentsUnchecked = 0;
+            private final List<String> uncheckedSample = new ArrayList<>();
+            private int documentsUnchanged = 0;
             private final List<OperationError> errors = new ArrayList<>();
 
             public Builder(String sourceId) {
@@ -1019,6 +1127,54 @@ public class DocumentReindexer {
             }
 
             /**
+             * Sets how many registered documents the source confirmed are current.
+             *
+             * @param count The count
+             * @return This builder
+             */
+            public Builder documentsUnchanged(int count) {
+                this.documentsUnchanged = count;
+                return this;
+            }
+
+            /**
+             * How many documents have failed so far; see
+             * {@link ReindexResult#getDocumentsFailed()}.
+             *
+             * @return The count
+             */
+            public int getDocumentsFailed() {
+                return documentsFailed;
+            }
+
+            /**
+             * How many documents have been passed over as not text so far.
+             *
+             * @return The count
+             */
+            public int getDocumentsNotText() {
+                return documentsNotText;
+            }
+
+            /**
+             * How many documents could not be checked.
+             *
+             * @return The count
+             */
+            public int getDocumentsUnchecked() {
+                return documentsUnchecked;
+            }
+
+            /**
+             * The first documents that could not be checked.
+             *
+             * @return An unmodifiable copy, at most {@link #UNCHECKED_SAMPLE_SIZE} ids
+             */
+            public List<String> getUncheckedSample() {
+                return List.copyOf(uncheckedSample);
+            }
+
+            /**
              * Folds one document's outcome into the result.
              *
              * <p>{@code documentsIndexed} counts documents that actually produced data. A
@@ -1043,12 +1199,52 @@ public class DocumentReindexer {
                         documentsNotText++;
                     }
                 } else if (docResult.hasError()) {
-                    errors.add(new OperationError("document", docResult.getDocumentId(),
-                        docResult.getError()));
+                    addDocumentFailure("document", docResult.getDocumentId(), docResult.getError());
                 }
                 return this;
             }
 
+            /**
+             * Records a document the run could not index: its fetch, its read or its write
+             * failed.
+             *
+             * @param component Where it failed, for the log
+             * @param id        The document
+             * @param message   Why, for the log
+             * @return This builder
+             */
+            public Builder addDocumentFailure(String component, String id, String message) {
+                documentsFailed++;
+                return addError(component, id, message);
+            }
+
+            /**
+             * Records a registered document its source could not say had changed or not.
+             *
+             * <p>A failure like any fetch that failed, and one that leaves the indexed version
+             * where it was. Only the first {@link #UNCHECKED_SAMPLE_SIZE} are named.</p>
+             *
+             * @param id The document
+             * @return This builder
+             */
+            public Builder addUnchecked(String id) {
+                documentsUnchecked++;
+                if (uncheckedSample.size() < UNCHECKED_SAMPLE_SIZE) {
+                    uncheckedSample.add(id);
+                }
+                return addDocumentFailure("check", id, "Could not check whether document " + id
+                    + " changed; its indexed version is kept");
+            }
+
+            /**
+             * Records an error of the run that is not a document it failed on, such as a chunk
+             * a removal could not tombstone.
+             *
+             * @param component Where it failed, for the log
+             * @param id        What failed
+             * @param message   Why, for the log
+             * @return This builder
+             */
             public Builder addError(String component, String id, String message) {
                 errors.add(new OperationError(component, id, message));
                 return this;
