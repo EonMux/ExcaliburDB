@@ -267,6 +267,14 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
         NamespaceRegistry.Lease<GraphTenant> borrowed;
         try {
             borrowed = tenants.borrow(namespace);
+        } catch (NamespaceRefusedException e) {
+            // Dropped since its source was registered, on a node that does not recreate
+            // namespaces on demand or has no room for another. Nothing is staged in a namespace
+            // that does not exist, so a withdrawal owes nothing there either.
+            tenantFailures.incrementAndGet();
+            LOGGER.warn("Namespace {} was refused, so {} is not staged there: {}", namespace,
+                documentKey, e.getMessage());
+            return;
         } catch (RuntimeException e) {
             // Opening a tenant can fail - a directory that will not create, a staging log that
             // will not open - and one namespace failing must not stop the next document, in this

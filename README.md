@@ -769,6 +769,8 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.graph.entity-vectors-enabled` | true | Embed each entity's text at build time, so retrieval can rerank against real vectors |
 | `excalibur.graph.single-valued-relations` | *(empty)* | Comma-separated relations that hold one value at a time, per subject. At build time a new value closes the previous one on the day it began — its stated start, else the day it was stated (document date, else staging day), with staging order breaking ties. A restatement of the current value closes nothing, and one document's same-day values stay ambiguous |
 | `excalibur.graph.max-open-namespaces` | 16 | Graphs held open at once before the least recently used is evicted. At least 1 |
+| `excalibur.graph.max-namespaces` | 10000 | Tenant namespaces held on disk before creating another is refused with `429 namespace_limit_reached`. The shared namespace is not counted, and dropping one makes room. At least 1 |
+| `excalibur.graph.require-explicit-namespaces` | false | Refuse a request that names a namespace nobody created, with `404 namespace_not_found`, rather than creating it. A namespace is then created only by `PUT /v1/graph/namespaces/{namespace}`, so a typo in a header cannot become a tenant |
 | `excalibur.graph.hot-namespaces` | *(empty)* | Comma-separated namespaces never evicted, alongside the shared index. Each one spends a slot permanently |
 | `excalibur.graph.cold-namespaces` | *(empty)* | Comma-separated namespaces evicted before any other, whatever their recency — for a bulk import or an idle tenant. Naming one in both lists refuses to start |
 | `excalibur.graph.erasure-tombstone-ratio` | 0.2 | Tombstoned fraction of the store at which a compaction becomes worthwhile. Above 0, at most 1 |
@@ -1271,7 +1273,8 @@ separate so a burst of writes cannot starve ordinary reads.
 | `DELETE` | `/v1/graph/build` | bearer | mutate | Stop the build in progress. It publishes nothing, and the namespace keeps serving the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | read | What the build is doing, and what the last one published |
 | `POST` | `/v1/graph/erasure` | bearer | mutate | Record an obligation to erase, and compact when it is due |
-| `GET` | `/v1/graph/namespaces` | bearer | read | Every namespace on disk, and what each one holds and owes |
+| `GET` | `/v1/graph/namespaces` | bearer | read | The namespaces on disk, a page at a time, and what each one holds and owes |
+| `PUT` | `/v1/graph/namespaces/{namespace}` | bearer | mutate | Create a namespace. `201` when created, `200` when it already existed |
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | mutate | Remove a namespace entirely. Irreversible, and `409` for `shared` |
 
 A method a registered path does not serve answers 405, on every path, unauthenticated and charged
@@ -1425,6 +1428,19 @@ uses one namespace called `shared`, which is the single-tenant arrangement — m
 something a node should acquire by accident. Each namespace gets its own directory under the graph
 root: its own store, its own staged facts, its own erasure obligations.
 
+By default, naming a namespace that does not exist creates it — on `POST /v1/ingest`,
+`POST /v1/graph/build`, and a source- or extractor-scoped `POST /v1/graph/erasure`; a read or an
+entity erasure never creates one. That is convenient, and it is also how a typo in the header
+becomes a tenant whose documents nobody finds. `excalibur.graph.require-explicit-namespaces=true`
+closes it: a namespace then exists only once `PUT /v1/graph/namespaces/{namespace}` has created it,
+and every route that would have created one answers a name nobody created with
+`404 namespace_not_found`, before anything is registered, built or recorded. The route works with
+the switch off too, so provisioning can create a tenant ahead of its first document. Either way,
+`excalibur.graph.max-namespaces` (10000 by default) bounds how many tenant namespaces a node holds,
+`shared` not counted: creating another past it — explicitly or by naming it — is refused with
+`429 namespace_limit_reached` and leaves nothing on disk, and dropping one makes room. Creating a
+namespace makes its directory and opens nothing, so it costs no open slot until something uses it.
+
 A served namespace is around twenty-seven memory mappings - thirteen of them the edge store's
 columns, the rest the two dictionaries, the entity vectors and the two Lucene indexes, whose share
 moves as segments merge. The served indexes are opened read-only, so on a 64-bit JVM, where Lucene
@@ -1507,11 +1523,16 @@ lexical retrieval path. Staging borrows the tenant for the length of one documen
 namespace that has been evicted costs a reopen rather than a write to a closed file, and
 `excalibur.graph.max-open-namespaces` still bounds how many graphs are open at once.
 
-A namespace can also be listed and removed. `GET /v1/graph/namespaces` reports every namespace on
+A namespace can also be listed and removed. `GET /v1/graph/namespaces` reports the namespaces on
 disk, not only the ones currently resident, with whether each is open, whether it has ever built a
 graph, how many facts it has staged and how many erasure obligations it still owes; no graph is
 opened to produce it, so an inventory does not evict the working set in order to describe it, and a
-count the node could not read is reported as `null` rather than as zero. `DELETE
+count the node could not read is reported as `null` rather than as zero. It is paged: `limit`
+(default 100, at most 1000 — a larger one is `400`, not trimmed) bounds the page, and `cursor`
+continues after the previous page's `next_cursor`, which is `null` on the last one. Namespaces are
+listed in identifier order and a page starts strictly after its cursor, so a namespace dropped
+between two pages does not end the walk. `count` is the page's length, `total` the whole
+inventory, `shared` included, and `open` how many graphs the node holds open. `DELETE
 /v1/graph/namespaces/{namespace}` removes one entirely — its store, its staged facts and its
 erasure log — and answers with an exact account of what was destroyed, because nothing restores it.
 `shared` cannot be dropped: it is where every unnamespaced request lands and the node holds it open

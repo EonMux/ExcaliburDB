@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphExtraction;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.bootstrap.NamespaceRefusedException;
 import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -13,6 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.RejectedExecutionException;
@@ -40,7 +42,12 @@ import java.util.concurrent.RejectedExecutionException;
  * }</pre>
  *
  * <p>No body. The namespace header names whose graph to build, and its absence means the shared
- * namespace, as it does on every other graph route.</p>
+ * namespace, as it does on every other graph route. A namespace that does not exist yet is
+ * admitted as every route admits one: created, unless
+ * {@code excalibur.graph.require-explicit-namespaces} is on ({@code 404 namespace_not_found}) or
+ * the node holds {@code excalibur.graph.max-namespaces} already ({@code 429
+ * namespace_limit_reached}). Asked before the build is claimed, so a refusal is this response
+ * rather than a build that fails behind it.</p>
  *
  * <h2>Response (accepted)</h2>
  * <pre>{@code
@@ -114,6 +121,14 @@ public class GraphBuildEndpoint implements HttpHandler {
         GraphBuildRunner.Claim claim;
         try {
             claim = runner.start(namespace);
+        } catch (NamespaceRefusedException e) {
+            ResponseBody.sendError(exchange, e.reason().statusCode(), e.reason().code(),
+                e.getMessage());
+            return;
+        } catch (UncheckedIOException e) {
+            LOGGER.error("could not create namespace {} to build it", namespace, e);
+            ResponseBody.sendError(exchange, 500, "Internal Server Error");
+            return;
         } catch (RejectedExecutionException e) {
             // The node is shutting down. Retryable at another node or after a restart, which is
             // what 503 says and 500 does not.

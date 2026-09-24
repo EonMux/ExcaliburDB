@@ -19,8 +19,10 @@ import com.eonmux.excalibur.api.endpoint.GraphBuildEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphBuildRunner;
 import com.eonmux.excalibur.api.endpoint.GraphBuildStatusEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphErasureEndpoint;
+import com.eonmux.excalibur.api.endpoint.GraphNamespaceCreateEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespaceDeleteEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespacesEndpoint;
+import com.eonmux.excalibur.api.endpoint.NamespaceAdmission;
 import com.eonmux.excalibur.api.endpoint.GraphQueryEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphStatsReader;
 import com.eonmux.excalibur.api.endpoint.HealthEndpoint;
@@ -419,7 +421,9 @@ final class EndpointRegistrar {
             in.ingestionOrchestrator(),
             new IngestTargetValidator(in.security()),
             suppliedSources,
-            minCrawlDelayMillis()
+            minCrawlDelayMillis(),
+            // A node without graphs has no namespaces to bound, so the header is taken as is.
+            in.graphTenants() != null ? in.graphTenants()::admit : NamespaceAdmission.ANY
         );
         LOGGER.info("IngestEndpoint configured with status registry (orchestrator: {})",
             in.ingestionOrchestrator() != null ? "enabled"
@@ -1081,13 +1085,18 @@ final class EndpointRegistrar {
                         guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                             "Method Not Allowed - Use GET to list namespaces"))),
                     createMethodRouter(
-                        // A mutation, and the most destructive one this node offers: it removes
-                        // a tenant's graph, its staged facts and the log of what it still owed.
-                        Map.of("DELETE", guard.protect(RequestGuard.Access.MUTATE,
-                            new GraphNamespaceDeleteEndpoint(in.graphTenants()))),
+                        Map.of(
+                            // Both mutations. Creating writes a directory and counts against
+                            // the node's cap; dropping is the most destructive thing this node
+                            // offers: a tenant's graph, its staged facts and the log of what it
+                            // still owed.
+                            "PUT", guard.protect(RequestGuard.Access.MUTATE,
+                                new GraphNamespaceCreateEndpoint(in.graphTenants())),
+                            "DELETE", guard.protect(RequestGuard.Access.MUTATE,
+                                new GraphNamespaceDeleteEndpoint(in.graphTenants()))),
                         guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
-                            "Method Not Allowed - Use DELETE "
-                                + "/v1/graph/namespaces/{namespace} to drop one"))),
+                            "Method Not Allowed - Use PUT /v1/graph/namespaces/{namespace} to "
+                                + "create one or DELETE to drop it"))),
                     notFound)));
         } else if (in.graphPipeline() != null) {
             target.createContext("/v1/graph/query", wrapHandler(exactPath("/v1/graph/query",

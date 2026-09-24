@@ -14,6 +14,7 @@ import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.security.IngestTargetRejectedException;
 import com.eonmux.excalibur.api.security.IngestTargetValidator;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.bootstrap.NamespaceRefusedException;
 import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -77,6 +78,12 @@ import java.util.*;
  * {@code 400} rather than quietly given the shared namespace: a caller who asked for one tenant
  * and was given another has had its documents cross a tenancy boundary, and nothing later in the
  * pipeline could tell.</p>
+ * <p>A namespace that does not exist yet is admitted before the source is registered: created,
+ * or refused with {@code 404 namespace_not_found} when
+ * {@code excalibur.graph.require-explicit-namespaces} is on and {@code 429
+ * namespace_limit_reached} when the node holds {@code excalibur.graph.max-namespaces} already.
+ * Refused at registration rather than when the crawl publishes, because by then the caller has
+ * been told its source is registered and its documents would be staged nowhere.</p>
  *
  * <h2>Target Allow-Lists</h2>
  * <p>Both source types point the server at something a caller names, so both are
@@ -115,6 +122,9 @@ public class IngestEndpoint implements HttpHandler {
      * supplied documents. A crawl registered over one of them deletes what was supplied.
      */
     private final InlineSourceIds inlineSourceIds;
+
+    /** Whether the namespace a registration names may be used, asked before registering. */
+    private final NamespaceAdmission namespaceAdmission;
 
     /**
      * Creates a new IngestEndpoint with a source registry.
@@ -245,7 +255,37 @@ public class IngestEndpoint implements HttpHandler {
                           IngestTargetValidator targetValidator,
                           InlineSourceIds inlineSourceIds,
                           long minCrawlDelayMillis) {
+        this(sourceRegistry, statusRegistry, orchestrator, targetValidator, inlineSourceIds,
+            minCrawlDelayMillis, NamespaceAdmission.ANY);
+    }
+
+    /**
+     * Creates a new IngestEndpoint that admits the namespace a registration names.
+     *
+     * @param sourceRegistry      The registry for managing sources
+     * @param statusRegistry      The registry for tracking ingestion status (may be null)
+     * @param orchestrator        The ingestion orchestrator for background processing (may be null)
+     * @param targetValidator     The allow-list policy for ingest targets
+     * @param inlineSourceIds     The ids documents have been supplied directly under, whose crawl
+     *                            registration this endpoint refuses, or null on a node that takes
+     *                            no supplied documents
+     * @param minCrawlDelayMillis The shortest gap a registered crawl may leave between requests
+     *                            to its host, from {@code excalibur.ingest.crawl-delay-ms}
+     * @param namespaceAdmission  Whether a namespace may be registered into, creating it when the
+     *                            node creates namespaces on demand
+     * @throws NullPointerException if sourceRegistry, targetValidator or namespaceAdmission is
+     *                              null
+     */
+    public IngestEndpoint(SourceRegistry sourceRegistry,
+                          IngestStatusEndpoint.IngestionStatusRegistry statusRegistry,
+                          IngestionOrchestrator orchestrator,
+                          IngestTargetValidator targetValidator,
+                          InlineSourceIds inlineSourceIds,
+                          long minCrawlDelayMillis,
+                          NamespaceAdmission namespaceAdmission) {
         Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
+        this.namespaceAdmission =
+            Objects.requireNonNull(namespaceAdmission, "NamespaceAdmission cannot be null");
         this.inlineSourceIds = inlineSourceIds;
         this.sourceFactory = new SourceFactory(
             Objects.requireNonNull(targetValidator, "IngestTargetValidator cannot be null"),
@@ -345,6 +385,20 @@ public class IngestEndpoint implements HttpHandler {
                         + "supplied directly; a crawl registered under its id would remove them "
                         + "on its first pass. Use a different source_id.");
                     return;
+                }
+
+                // Last before the claim, because admitting may create the namespace: a request
+                // refused for anything above leaves no directory behind it.
+                try {
+                    namespaceAdmission.admit(request.namespace());
+                } catch (NamespaceRefusedException e) {
+                    closeQuietly(source);
+                    ResponseBody.sendError(exchange, e.reason().statusCode(), e.reason().code(),
+                        e.getMessage());
+                    return;
+                } catch (IOException | RuntimeException e) {
+                    closeQuietly(source);
+                    throw e;
                 }
 
                 // Registration is a single atomic claim on the source ID: checking

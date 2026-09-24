@@ -59,14 +59,25 @@ class GraphNamespaceEndpointsTest {
     private GraphTenants tenants;
     private GraphNamespacesEndpoint list;
     private GraphNamespaceDeleteEndpoint delete;
+    private GraphNamespaceCreateEndpoint put;
 
     @BeforeEach
     void setUp(@TempDir Path root) throws IOException {
         this.root = root;
-        Config config = new Config(new HashMap<>(Map.of("excalibur.graph.ram-buffer-mb", "4.0")));
-        tenants = new GraphTenants(root, config, MappingBudget.detect(), 4);
+        open(Map.of());
+    }
+
+    /** Reopens the registry over the same root with extra configuration. */
+    private void open(Map<String, String> extra) throws IOException {
+        if (tenants != null) {
+            tenants.close();
+        }
+        Map<String, String> props = new HashMap<>(Map.of("excalibur.graph.ram-buffer-mb", "4.0"));
+        props.putAll(extra);
+        tenants = new GraphTenants(root, new Config(props), MappingBudget.detect(), 4);
         list = new GraphNamespacesEndpoint(tenants);
         delete = new GraphNamespaceDeleteEndpoint(tenants);
+        put = new GraphNamespaceCreateEndpoint(tenants);
     }
 
     @AfterEach
@@ -142,6 +153,10 @@ class GraphNamespaceEndpointsTest {
             assertThat(response.status()).isEqualTo(200);
             assertThat(namespacesOf(response)).hasSize(3);
             assertThat(Json.at(response.json(), "count")).isEqualTo(3L);
+            assertThat(Json.at(response.json(), "total")).isEqualTo(3L);
+            assertThat(Json.at(response.json(), "next_cursor"))
+                .as("everything fits on one page, so there is nothing to continue from")
+                .isNull();
             assertThat(Json.at(entryFor(response, "acme"), "open"))
                 .as("an evicted namespace exists exactly as much as a resident one")
                 .isEqualTo(Boolean.FALSE);
@@ -189,6 +204,119 @@ class GraphNamespaceEndpointsTest {
         @DisplayName("only GET lists")
         void onlyGetLists() throws IOException {
             assertThat(call(list, "POST", "/v1/graph/namespaces").status()).isEqualTo(405);
+        }
+
+        @Test
+        @DisplayName("a limit pages the inventory, and next_cursor walks it to the end")
+        void pagesWalkTheInventory() throws IOException {
+            for (String name : List.of("acme", "beta", "gamma")) {
+                tenants.create(NamespaceId.of(name));
+            }
+
+            Response first = call(list, "GET", "/v1/graph/namespaces?limit=2");
+            assertThat(first.status()).isEqualTo(200);
+            assertThat(namespacesOf(first)).extracting(each -> Json.stringAt(each, "namespace"))
+                .containsExactly("acme", "beta");
+            assertThat(Json.at(first.json(), "count")).isEqualTo(2L);
+            assertThat(Json.at(first.json(), "total")).isEqualTo(4L);
+            assertThat(Json.stringAt(first.json(), "next_cursor")).isEqualTo("beta");
+
+            Response second = call(list, "GET", "/v1/graph/namespaces?limit=2&cursor=beta");
+            assertThat(namespacesOf(second)).extracting(each -> Json.stringAt(each, "namespace"))
+                .containsExactly("gamma", "shared");
+            assertThat(Json.at(second.json(), "next_cursor")).isNull();
+        }
+
+        @Test
+        @DisplayName("a limit or cursor it cannot use is a 400, not a guess")
+        void badPagingIsRefused() throws IOException {
+            for (String query : List.of("limit=0", "limit=1001", "limit=ten", "cursor=..%2Fetc",
+                "cursor=UPPER")) {
+                Response response = call(list, "GET", "/v1/graph/namespaces?" + query);
+
+                assertThat(response.status()).as(query).isEqualTo(400);
+                assertThat(Json.stringAt(response.json(), "code")).isEqualTo("invalid_request");
+            }
+            assertThat(call(list, "GET", "/v1/graph/namespaces?limit=1000").status())
+                .isEqualTo(200);
+        }
+    }
+
+    @Nested
+    @DisplayName("PUT /v1/graph/namespaces/{namespace}")
+    class Creating {
+
+        @Test
+        @DisplayName("creating one answers 201, and again answers 200 with nothing created")
+        void createIsIdempotent() throws IOException {
+            Response created = call(put, "PUT", "/v1/graph/namespaces/acme");
+
+            assertThat(created.status()).isEqualTo(201);
+            assertThat(Json.stringAt(created.json(), "namespace")).isEqualTo("acme");
+            assertThat(Json.at(created.json(), "created")).isEqualTo(Boolean.TRUE);
+            assertThat(root.resolve("acme")).isDirectory();
+            assertThat(entryFor(call(list, "GET", "/v1/graph/namespaces"), "acme")).isNotNull();
+
+            Response again = call(put, "PUT", "/v1/graph/namespaces/acme/");
+            assertThat(again.status()).isEqualTo(200);
+            assertThat(Json.at(again.json(), "created")).isEqualTo(Boolean.FALSE);
+        }
+
+        @Test
+        @DisplayName("the shared namespace always exists, so creating it creates nothing")
+        void theSharedNamespaceExists() throws IOException {
+            Response response = call(put, "PUT", "/v1/graph/namespaces/shared");
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(Json.at(response.json(), "created")).isEqualTo(Boolean.FALSE);
+        }
+
+        @Test
+        @DisplayName("a name that is not a namespace is refused before it reaches the disk")
+        void anUnusableNameIsRefused() throws IOException {
+            for (String hostile : List.of("/v1/graph/namespaces/..",
+                "/v1/graph/namespaces/%2e%2e%2foutside", "/v1/graph/namespaces/UPPER",
+                "/v1/graph/namespaces/a/b", "/v1/graph/namespaces//")) {
+                Response response = call(put, "PUT", hostile);
+
+                assertThat(response.status()).as(hostile).isEqualTo(400);
+                assertThat(Json.stringAt(response.json(), "code")).isEqualTo("invalid_namespace");
+            }
+            assertThat(root.resolveSibling("outside")).doesNotExist();
+        }
+
+        @Test
+        @DisplayName("past the cap, creating is refused with its own code")
+        void theCapIsAnswered() throws IOException {
+            open(Map.of("excalibur.graph.max-namespaces", "1"));
+            assertThat(call(put, "PUT", "/v1/graph/namespaces/first").status()).isEqualTo(201);
+
+            Response refused = call(put, "PUT", "/v1/graph/namespaces/second");
+
+            assertThat(refused.status()).isEqualTo(429);
+            assertThat(Json.stringAt(refused.json(), "code"))
+                .isEqualTo("namespace_limit_reached");
+            assertThat(root.resolve("second")).doesNotExist();
+            assertThat(call(put, "PUT", "/v1/graph/namespaces/first").status())
+                .as("an existing namespace is not a new one")
+                .isEqualTo(200);
+        }
+
+        @Test
+        @DisplayName("creating is the one way in when explicit creation is required")
+        void explicitCreationIsTheWayIn() throws IOException {
+            open(Map.of("excalibur.graph.require-explicit-namespaces", "true"));
+
+            assertThat(call(put, "PUT", "/v1/graph/namespaces/acme").status()).isEqualTo(201);
+            create("acme");
+        }
+
+        @Test
+        @DisplayName("only PUT creates, and only with a namespace named")
+        void theRouteIsNarrow() throws IOException {
+            assertThat(call(put, "GET", "/v1/graph/namespaces/acme").status()).isEqualTo(405);
+            assertThat(call(put, "PUT", "/v1/graph/namespaces").status()).isEqualTo(405);
+            assertThat(root.resolve("acme")).doesNotExist();
         }
     }
 

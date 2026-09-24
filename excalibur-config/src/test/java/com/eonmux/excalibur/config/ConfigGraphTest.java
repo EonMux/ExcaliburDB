@@ -51,6 +51,17 @@ class ConfigGraphTest {
         }
 
         @Test
+        @DisplayName("namespaces are capped, and may still be created by naming them")
+        void namespaceCreationDefaults() {
+            // Implicit creation stays on by default, so a node upgraded into this release keeps
+            // answering the requests it answered before; the cap is what bounds it.
+            GraphConfig settings = graph(Map.of());
+
+            assertThat(settings.getMaxNamespaces()).isEqualTo(GraphConfig.DEFAULT_MAX_NAMESPACES);
+            assertThat(settings.isRequireExplicitNamespaces()).isFalse();
+        }
+
+        @Test
         @DisplayName("the score gates default to values that mean something on the unit relevance scale")
         void scoreGatesDefaultOnTheUnitScale() {
             // Retrieval reports relevance in [0, 1]: a share of the attainable BM25 score, or a
@@ -99,6 +110,17 @@ class ConfigGraphTest {
             assertThat(settings.getMaxAmbiguousCandidates()).isEqualTo(3);
             assertThat(settings.getConfidenceTemperature()).isEqualTo(2.5);
             assertThat(settings.getRamBufferMb()).isEqualTo(64.0);
+        }
+
+        @Test
+        @DisplayName("the namespace cap and the explicit-creation switch are read")
+        void namespaceCreationKeys() {
+            GraphConfig settings = graph(Map.of(
+                "excalibur.graph.max-namespaces", "3",
+                "excalibur.graph.require-explicit-namespaces", "true"));
+
+            assertThat(settings.getMaxNamespaces()).isEqualTo(3);
+            assertThat(settings.isRequireExplicitNamespaces()).isTrue();
         }
 
         @Test
@@ -213,6 +235,15 @@ class ConfigGraphTest {
         }
 
         @Test
+        @DisplayName("a namespace cap below one is refused")
+        void namespaceCapBelowOne() {
+            // Zero would refuse every tenant while the node reported a healthy configuration.
+            assertThatThrownBy(() -> graph(Map.of("excalibur.graph.max-namespaces", "0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max-namespaces");
+        }
+
+        @Test
         @DisplayName("a non-positive RAM buffer is refused")
         void nonPositiveRamBuffer() {
             assertThatThrownBy(() -> graph(Map.of("excalibur.graph.ram-buffer-mb", "0")))
@@ -242,17 +273,19 @@ class ConfigGraphTest {
             // Equality is what tells a caller two configurations are the same configuration.
             // A field left out of it says "identical" about sections that would run differently.
             Map<String, String> base = Map.of("excalibur.graph.top-k", "7");
-            Map<String, String> keys = Map.of(
-                "excalibur.graph.path", "/srv/graph",
-                "excalibur.graph.extraction-enabled", "true",
-                "excalibur.graph.extractor-version", "3",
-                "excalibur.graph.entity-vectors-enabled", "false",
-                "excalibur.graph.single-valued-relations", "employed-by",
-                "excalibur.graph.hot-namespaces", "vip",
-                "excalibur.graph.cold-namespaces", "bulk-import",
-                "excalibur.graph.max-open-namespaces", "32",
-                "excalibur.graph.erasure-tombstone-ratio", "0.4",
-                "excalibur.graph.erasure-max-latency-seconds", "600");
+            Map<String, String> keys = Map.ofEntries(
+                Map.entry("excalibur.graph.path", "/srv/graph"),
+                Map.entry("excalibur.graph.extraction-enabled", "true"),
+                Map.entry("excalibur.graph.extractor-version", "3"),
+                Map.entry("excalibur.graph.entity-vectors-enabled", "false"),
+                Map.entry("excalibur.graph.single-valued-relations", "employed-by"),
+                Map.entry("excalibur.graph.hot-namespaces", "vip"),
+                Map.entry("excalibur.graph.cold-namespaces", "bulk-import"),
+                Map.entry("excalibur.graph.max-open-namespaces", "32"),
+                Map.entry("excalibur.graph.max-namespaces", "12"),
+                Map.entry("excalibur.graph.require-explicit-namespaces", "true"),
+                Map.entry("excalibur.graph.erasure-tombstone-ratio", "0.4"),
+                Map.entry("excalibur.graph.erasure-max-latency-seconds", "600"));
 
             keys.forEach((key, value) -> {
                 Map<String, String> changed = new HashMap<>(base);

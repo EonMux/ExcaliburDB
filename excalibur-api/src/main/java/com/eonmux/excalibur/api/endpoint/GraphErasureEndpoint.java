@@ -6,6 +6,7 @@ import com.eonmux.excalibur.api.bootstrap.GraphErasureService;
 import com.eonmux.excalibur.api.bootstrap.GraphRagFactory;
 import com.eonmux.excalibur.api.bootstrap.GraphTenant;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.bootstrap.NamespaceRefusedException;
 import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.RequestBody;
@@ -158,6 +159,11 @@ public class GraphErasureEndpoint implements HttpHandler {
             accept(exchange, namespace, requested, compactNow, borrowed.get());
         } catch (GraphErasureService.UnknownEntityException e) {
             sendNotFound(exchange, requested);
+        } catch (NamespaceRefusedException e) {
+            // A source or extractor scope creates the namespace it is recorded in, so it is
+            // refused for the same reasons as any other creation, before anything is recorded.
+            ResponseBody.sendError(exchange, e.reason().statusCode(), e.reason().code(),
+                e.getMessage());
         } catch (IOException | RuntimeException e) {
             // RuntimeException is not defensive padding: a namespace that cannot be opened
             // arrives here as an UncheckedIOException from the registry, and catching only

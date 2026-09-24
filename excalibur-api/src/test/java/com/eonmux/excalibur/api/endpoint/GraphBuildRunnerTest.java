@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.endpoint;
 
 import com.eonmux.excalibur.api.bootstrap.GraphBuildService;
+import com.eonmux.excalibur.api.bootstrap.NamespaceRefusedException;
 
 import com.eonmux.excalibur.graph.build.BuildCancelledException;
 import com.eonmux.excalibur.tenancy.NamespaceId;
@@ -12,6 +13,9 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -38,6 +42,54 @@ class GraphBuildRunnerTest {
 
     private static final NamespaceId ACME = NamespaceId.of("acme");
     private static final NamespaceId OTHER = NamespaceId.of("other");
+
+    @Nested
+    @DisplayName("admitting the namespace")
+    class Admitting {
+
+        @Test
+        @DisplayName("a refused namespace claims nothing, and a build in the way admits nothing")
+        void admissionComesBetweenTheSlotAndTheClaim() throws Exception {
+            List<NamespaceId> admitted = new ArrayList<>();
+            Gate gate = new Gate();
+            try (GraphBuildRunner runner = new GraphBuildRunner(gate, Optional::empty,
+                     namespace -> {
+                         if (namespace.equals(OTHER)) {
+                             throw new NamespaceRefusedException(namespace,
+                                 NamespaceRefusedException.Reason.NOT_CREATED,
+                                 "no such namespace");
+                         }
+                         admitted.add(namespace);
+                     })) {
+
+                assertThatThrownBy(() -> runner.start(OTHER))
+                    .isInstanceOf(NamespaceRefusedException.class);
+                assertThat(runner.snapshot(OTHER).state()).isEqualTo(GraphBuildRunner.STATE_IDLE);
+
+                assertThat(runner.start(ACME).accepted()).isTrue();
+                gate.awaitEntry();
+                assertThat(runner.start(NamespaceId.of("third")).accepted()).isFalse();
+                assertThat(admitted)
+                    .as("the build in the way was found before anything was admitted")
+                    .containsExactly(ACME);
+                gate.release();
+            }
+        }
+
+        @Test
+        @DisplayName("a namespace that cannot be created is reported to the caller, unclaimed")
+        void aFailedCreationIsReported() {
+            try (GraphBuildRunner runner = new GraphBuildRunner(new Gate(), Optional::empty,
+                     namespace -> {
+                         throw new IOException("mkdir failed");
+                     })) {
+
+                assertThatThrownBy(() -> runner.start(ACME))
+                    .isInstanceOf(UncheckedIOException.class);
+                assertThat(runner.counts().running()).isFalse();
+            }
+        }
+    }
 
     private static final GraphBuildService.BuildOutcome PUBLISHED =
         new GraphBuildService.BuildOutcome(true, 12, 5, 2, 5, 0, 12);

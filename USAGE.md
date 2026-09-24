@@ -427,13 +427,14 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `DELETE` | `/v1/graph/build` | bearer | Stop the build in progress. It publishes nothing; the namespace keeps the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | What the build is doing, and what the last one published |
 | `POST` | `/v1/graph/erasure` | bearer | Record an obligation to erase, and compact when it is due. `404` for an entity, by name or `entity_id`, that nothing in the namespace holds, and nothing is recorded |
-| `GET` | `/v1/graph/namespaces` | bearer | Every namespace on disk: whether it is open, whether it has built a graph, what it has staged and what it still owes |
+| `GET` | `/v1/graph/namespaces` | bearer | The namespaces on disk, a page at a time (`limit`, default 100, at most 1000; `cursor`): whether each is open, whether it has built a graph, what it has staged and what it still owes |
+| `PUT` | `/v1/graph/namespaces/{namespace}` | bearer | Create a namespace. `201` when created, `200` when it already existed; `429 namespace_limit_reached` past `excalibur.graph.max-namespaces` |
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | Remove a namespace entirely - its graph, its staged facts and its erasure log. Irreversible; `409` for `shared` |
 
 All request/response bodies are JSON. Request size limit: **1 MB**, and a body over it is refused with `413` by every endpoint that reads one - split the payload rather than retrying it. The `GET` routes read no body, and neither do `POST` and `DELETE /v1/drain`,
 `DELETE /v1/query/{query_id}`, `DELETE /v1/compact`,
-`DELETE /v1/graph/namespaces/{namespace}`, `DELETE /v1/graph/build` or `POST /v1/graph/build`,
-so none of them ever produces a `413`.
+`PUT` and `DELETE /v1/graph/namespaces/{namespace}`, `DELETE /v1/graph/build` or
+`POST /v1/graph/build`, so none of them ever produces a `413`.
 
 A method a registered path does not serve is answered `405` on every path, and it is answered
 before authentication: the `405` is a routing answer, decided by the path and the method alone, so
@@ -450,7 +451,8 @@ rather than `401`, and a wrong method on a mutating route costs a read, not a mu
 collection and its members are separate paths with separate methods: `/v1/query` serves `POST`
 and `/v1/query/{query_id}` serves `DELETE`, so `DELETE /v1/query` with no id is a `405` naming
 `POST`; `/v1/graph/namespaces` serves `GET` and `/v1/graph/namespaces/{namespace}` serves
-`DELETE`, so a `DELETE` of the collection or a `GET` of one namespace is a `405` as well. A
+`PUT` and `DELETE`, so a `DELETE` of the collection or a `GET` of one namespace is a `405` as
+well. A
 path that is not registered at all — including anything deeper than one segment beneath a
 collection — is `404`. `HEAD` is not served on any route and is answered `405` like any other
 method a path does not take.
@@ -473,7 +475,12 @@ optional value.
 
 `X-Excalibur-Namespace` names the graph namespace a request belongs to. It is read by the
 `/v1/graph/*` routes and by `POST /v1/ingest`, which binds the registered source to that namespace
-for the life of the registration — every document it crawls is staged there. A node holds one
+for the life of the registration — every document it crawls is staged there. Naming a namespace
+that does not exist creates it, unless `excalibur.graph.require-explicit-namespaces` is on: then
+only `PUT /v1/graph/namespaces/{namespace}` creates one, and every other route answers a name
+nobody created with `404 namespace_not_found`, so a typo cannot become a tenant. Either way the
+node holds at most `excalibur.graph.max-namespaces` of them besides `shared`, and refuses another
+with `429 namespace_limit_reached`. A node holds one
 corpus, so every other `/v1` route answers `400` when a request names a namespace rather than
 quietly serving the shared index — set the header to `shared` or leave it off. The probes and node-level routes (`/health`, `/health/ready`, `/metrics`,
 `/v1/version`, `/v1/drain`) ignore it. See
@@ -2569,7 +2576,7 @@ across namespaces, never a row per namespace — which namespace owes what is
 - `budget` sets two shares against each limit. `graphMappings` and `graphDescriptors` are what eviction can give back; `processMappings` and `processDescriptors` are the whole process — segments, vector graphs, the chunk index and the JVM itself — which is what the kernel limit is measured against. Graph eviction starts when the whole process crosses `mappingHighWater`. A process figure is `null` where the platform cannot be asked, and `descriptorLimit` is `0` where no descriptor limit is enforced.
 - `builds` counts builds since startup by how they ended. A cancelled build is one somebody asked to stop, not a failure.
 - `erasure` is the graph's erasure backlog across every namespace on disk, resident or not. Compare `oldestAgeMs` against `excalibur.graph.erasure-max-latency-seconds`; `overdueNamespaces` is how many have already missed it. `unreadableNamespaces` are namespaces whose log could not be read, and so are in none of the other figures. `oldestAgeMs` is `null` when nothing is owed. The block is absent when the graph root cannot be listed, which is not the same as owing nothing.
-- `ingest` is present only where ingestion stages facts into the graph (a chat model is configured). `unresolvedDocuments`, `extractionFailures` and `tenantFailures` count documents the graph did not take: no registered source named their namespace, the extractor failed on them, or their namespace would not open. A published one among them is searchable and its facts are missing, and it is not offered to the graph again unless it changes; nothing else shows that. A replaced or removed one whose namespace would not open still owes the withdrawal of what was staged from it: that is handed to the namespace when it next opens, which the erasure sweep keeps trying, and only a restart before then loses it — the log says so at `ERROR`, naming the document.
+- `ingest` is present only where ingestion stages facts into the graph (a chat model is configured). `unresolvedDocuments`, `extractionFailures` and `tenantFailures` count documents the graph did not take: no registered source named their namespace, the extractor failed on them, or their namespace would not open — or no longer exists and the node would not recreate it, having been dropped on a node that requires explicit creation or has reached `excalibur.graph.max-namespaces`. A published one among them is searchable and its facts are missing, and it is not offered to the graph again unless it changes; nothing else shows that. A replaced or removed one whose namespace would not open still owes the withdrawal of what was staged from it: that is handed to the namespace when it next opens, which the erasure sweep keeps trying, and only a restart before then loses it — the log says so at `ERROR`, naming the document.
 - `sinkRefusals` counts reports the graph sink threw on instead of counting under one of those reasons. It should stay `0`: the sink is required to absorb its own failures, and one that throws has left a published document's facts missing, or a removed document's staged facts neither withdrawn nor owed. The log names each document.
 - `withdrawalFailures` counts the times a replaced or removed document's staged facts could not be withdrawn when it was reported. None of them is dropped. Each is recorded in the namespace's `graph-staging/withdrawals.log` and retried until it is made: when the namespace next opens, on the erasure sweep over the namespaces that are resident, before every build, and whenever the document is reported again. Nothing newer is staged for that document until then, because the retry withdraws by document and would take a newer version's facts with the old ones. A build tries the withdrawal first and, if it is still refused, publishes what the document used to say, so a figure that keeps climbing means the staging logs are refusing to be rewritten; the log names each document.
 

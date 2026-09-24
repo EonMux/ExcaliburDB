@@ -194,6 +194,13 @@ excalibur.graph.entity-vectors-enabled=true
 # number of them, so the least recently used graph is evicted to make room rather than the node
 # running out at whatever unrelated allocation comes next.
 excalibur.graph.max-open-namespaces=16
+# Tenant namespaces held on disk before creating another is refused. The shared namespace is not
+# counted; dropping a namespace makes room.
+excalibur.graph.max-namespaces=10000
+# Refuse a request naming a namespace nobody created, rather than creating it. On, a namespace
+# exists only once PUT /v1/graph/namespaces/{namespace} has created it, so a typo in the
+# X-Excalibur-Namespace header is a 404 instead of a new tenant. Off by default for compatibility.
+excalibur.graph.require-explicit-namespaces=false
 # Namespaces that override recency. A hot one is never evicted and spends a slot permanently; a
 # cold one is evicted before any other, which is what a bulk import or an idle tenant wants.
 # Naming the same namespace in both refuses to start, as does naming the shared one: it is
