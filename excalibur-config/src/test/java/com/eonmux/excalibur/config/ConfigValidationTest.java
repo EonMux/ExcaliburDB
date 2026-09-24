@@ -67,7 +67,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("visibility.epoch-tick-ms must be >= 10");
+                .hasMessageContaining("excalibur.visibility.epoch-tick-ms must be >= 10");
         }
 
         @Test
@@ -78,7 +78,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("visibility.epoch-tick-ms must be <= 10000");
+                .hasMessageContaining("excalibur.visibility.epoch-tick-ms must be <= 10000");
         }
 
         @Test
@@ -103,7 +103,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("visibility.query-timeout-ms must be >= 1000");
+                .hasMessageContaining("excalibur.visibility.query-timeout-ms must be >= 1000");
         }
 
         @Test
@@ -114,7 +114,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("visibility.query-timeout-ms must be <= 300000");
+                .hasMessageContaining("excalibur.visibility.query-timeout-ms must be <= 300000");
         }
     }
 
@@ -132,7 +132,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("ingest.document-atomicity-timeout-ms must be >= 1000");
+                .hasMessageContaining("excalibur.ingest.document-atomicity-timeout-ms must be >= 1000");
         }
 
         @Test
@@ -143,7 +143,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("ingest.document-atomicity-timeout-ms must be <= 30000");
+                .hasMessageContaining("excalibur.ingest.document-atomicity-timeout-ms must be <= 30000");
         }
 
         @Test
@@ -154,7 +154,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("ingest.reindex-interval-ms must be >= 60000");
+                .hasMessageContaining("excalibur.ingest.reindex-interval-ms must be >= 60000");
         }
 
         @Test
@@ -165,7 +165,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("ingest.reindex-interval-ms must be <= 86400000");
+                .hasMessageContaining("excalibur.ingest.reindex-interval-ms must be <= 86400000");
         }
 
         @Test
@@ -195,7 +195,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("health.readiness-threshold must be >= 0.0");
+                .hasMessageContaining("excalibur.health.readiness-threshold must be >= 0.0");
         }
 
         @Test
@@ -206,7 +206,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("health.readiness-threshold must be <= 1.0");
+                .hasMessageContaining("excalibur.health.readiness-threshold must be <= 1.0");
         }
 
         @Test
@@ -215,12 +215,12 @@ class ConfigValidationTest {
             baseProps.put("excalibur.health.min-free-disk-ratio", "-0.1");
             assertThatThrownBy(() -> ConfigValidation.validate(new Config(baseProps)))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("health.min-free-disk-ratio must be >= 0.0");
+                .hasMessageContaining("excalibur.health.min-free-disk-ratio must be >= 0.0");
 
             baseProps.put("excalibur.health.min-free-disk-ratio", "1.1");
             assertThatThrownBy(() -> ConfigValidation.validate(new Config(baseProps)))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("health.min-free-disk-ratio must be <= 1.0");
+                .hasMessageContaining("excalibur.health.min-free-disk-ratio must be <= 1.0");
         }
 
         @Test
@@ -231,7 +231,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("health.healthy-threshold must be >= 0.0");
+                .hasMessageContaining("excalibur.health.healthy-threshold must be >= 0.0");
         }
 
         @Test
@@ -242,7 +242,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("health.healthy-threshold must be <= 1.0");
+                .hasMessageContaining("excalibur.health.healthy-threshold must be <= 1.0");
         }
 
         @Test
@@ -253,7 +253,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("health.max-latency-ms must be >= 100");
+                .hasMessageContaining("excalibur.health.max-latency-ms must be >= 100");
         }
 
         @Test
@@ -264,7 +264,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("health.max-latency-ms must be <= 60000");
+                .hasMessageContaining("excalibur.health.max-latency-ms must be <= 60000");
         }
     }
 
@@ -280,7 +280,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("query.top-k-default must be >= 1");
+                .hasMessageContaining("excalibur.query.top-k-default must be >= 1");
         }
 
         @Test
@@ -291,7 +291,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("query.top-k-default must be <= 10000");
+                .hasMessageContaining("excalibur.query.top-k-default must be <= 10000");
         }
 
         @Test
@@ -302,7 +302,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("query.threshold must be >= 0.0");
+                .hasMessageContaining("excalibur.query.threshold must be >= 0.0");
         }
 
         @Test
@@ -313,7 +313,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("query.threshold must be <= 1.0");
+                .hasMessageContaining("excalibur.query.threshold must be <= 1.0");
         }
 
         @Test
@@ -324,7 +324,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("query.vector-dimensions must be >= 128");
+                .hasMessageContaining("excalibur.query.vector-dimensions must be >= 128");
         }
 
         @Test
@@ -335,7 +335,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("query.vector-dimensions must be <= 4096");
+                .hasMessageContaining("excalibur.query.vector-dimensions must be <= 4096");
         }
 
         @Test
@@ -346,7 +346,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("query.llm-timeout-ms must be >= 5000");
+                .hasMessageContaining("excalibur.query.llm-timeout-ms must be >= 5000");
         }
 
         @Test
@@ -357,7 +357,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("query.llm-timeout-ms must be <= 300000");
+                .hasMessageContaining("excalibur.query.llm-timeout-ms must be <= 300000");
         }
     }
 
@@ -373,7 +373,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.base-url must be a valid URL");
+                .hasMessageContaining("excalibur.llm.base-url must be a valid URL");
         }
 
         @Test
@@ -404,7 +404,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.embeddings-dimensions must be >= 128");
+                .hasMessageContaining("excalibur.llm.embeddings-dimensions must be >= 128");
         }
 
         @Test
@@ -415,7 +415,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.embeddings-dimensions must be <= 4096");
+                .hasMessageContaining("excalibur.llm.embeddings-dimensions must be <= 4096");
         }
 
         @Test
@@ -426,7 +426,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.retry-base-delay-ms must be >= 10");
+                .hasMessageContaining("excalibur.llm.retry-base-delay-ms must be >= 10");
         }
 
         @Test
@@ -437,7 +437,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.retry-base-delay-ms must be <= 30000");
+                .hasMessageContaining("excalibur.llm.retry-base-delay-ms must be <= 30000");
         }
 
         @Test
@@ -448,7 +448,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.relevancy-threshold must be <= 1.0");
+                .hasMessageContaining("excalibur.llm.relevancy-threshold must be <= 1.0");
         }
 
         @Test
@@ -459,7 +459,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.relevancy-threshold must be >= 0.0");
+                .hasMessageContaining("excalibur.llm.relevancy-threshold must be >= 0.0");
         }
 
         @Test
@@ -470,7 +470,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.max-retries must be <= 10");
+                .hasMessageContaining("excalibur.llm.max-retries must be <= 10");
         }
 
         @Test
@@ -481,7 +481,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.failure-threshold must be >= 1");
+                .hasMessageContaining("excalibur.llm.failure-threshold must be >= 1");
         }
 
         @Test
@@ -492,7 +492,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.cooldown-period-ms must be >= 1000");
+                .hasMessageContaining("excalibur.llm.cooldown-period-ms must be >= 1000");
         }
 
         @Test
@@ -503,7 +503,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.max-prompts-per-query must be <= 100");
+                .hasMessageContaining("excalibur.llm.max-prompts-per-query must be <= 100");
         }
 
         @Test
@@ -514,7 +514,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.max-batch-tokens must be >= 100");
+                .hasMessageContaining("excalibur.llm.max-batch-tokens must be >= 100");
         }
 
         @Test
@@ -525,7 +525,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.timeout-ms must be >= 1000");
+                .hasMessageContaining("excalibur.llm.timeout-ms must be >= 1000");
         }
 
         @Test
@@ -536,7 +536,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.base-url must be a valid URL");
+                .hasMessageContaining("excalibur.llm.base-url must be a valid URL");
         }
 
         @Test
@@ -547,7 +547,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.base-url must be a valid URL");
+                .hasMessageContaining("excalibur.llm.base-url must be a valid URL");
         }
     }
 
@@ -564,7 +564,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.api-key would be sent in cleartext")
+                .hasMessageContaining("excalibur.llm.api-key would be sent in cleartext")
                 .hasMessageContaining("llm-gateway.internal");
         }
 
@@ -657,7 +657,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("llm.chat-base-url must be a valid URL");
+                .hasMessageContaining("excalibur.llm.chat-base-url must be a valid URL");
         }
     }
 
@@ -673,7 +673,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("shard.segment-load-factor must be >= 0.5");
+                .hasMessageContaining("excalibur.shard.segment-load-factor must be >= 0.5");
         }
 
         @Test
@@ -684,7 +684,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("shard.segment-load-factor must be <= 0.9");
+                .hasMessageContaining("excalibur.shard.segment-load-factor must be <= 0.9");
         }
 
         @Test
@@ -695,7 +695,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("shard.default-ef-construction must be >= 16");
+                .hasMessageContaining("excalibur.shard.default-ef-construction must be >= 16");
         }
 
         @Test
@@ -706,7 +706,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("shard.default-ef-construction must be <= 1024");
+                .hasMessageContaining("excalibur.shard.default-ef-construction must be <= 1024");
         }
 
         @Test
@@ -717,7 +717,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("shard.default-ef-search must be >= 8");
+                .hasMessageContaining("excalibur.shard.default-ef-search must be >= 8");
         }
 
         @Test
@@ -728,7 +728,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("shard.default-ef-search must be <= 1024");
+                .hasMessageContaining("excalibur.shard.default-ef-search must be <= 1024");
         }
 
         @Test
@@ -739,7 +739,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("shard.hnsw-integration-queue-depth-limit must be >= 10000");
+                .hasMessageContaining("excalibur.shard.hnsw-integration-queue-depth-limit must be >= 10000");
         }
 
         @Test
@@ -750,7 +750,7 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("shard.hnsw-integration-queue-depth-limit must be <= 1000000");
+                .hasMessageContaining("excalibur.shard.hnsw-integration-queue-depth-limit must be <= 1000000");
         }
     }
 
@@ -771,8 +771,8 @@ class ConfigValidationTest {
 
             assertThatThrownBy(() -> ConfigValidation.validate(new Config(props)))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("query.vector-dimensions")
-                .hasMessageContaining("llm.embeddings-dimensions")
+                .hasMessageContaining("excalibur.query.vector-dimensions")
+                .hasMessageContaining("excalibur.llm.embeddings-dimensions")
                 .hasMessageContaining("reindex");
         }
 

@@ -727,7 +727,7 @@ The file is `key=value` lines split at the first `=`, with `#` or `;` starting a
 are no trailing comments — everything after the `=` is the value, so
 `excalibur.api.max-top-k=1000  # ceiling` is refused at startup as not a number — and one pair of
 surrounding quotes is stripped. A value outside its key's range, or one that cannot be parsed, fails
-startup naming the key; a key the node does not recognise is logged as a warning with the nearest
+startup naming the full property key; a key the node does not recognise is logged as a warning with the nearest
 key it does. Booleans accept `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off`, case-insensitive,
 except `excalibur.api.allow-plaintext` and `excalibur.api.tls-enabled`, which accept only `true` or
 `false`.

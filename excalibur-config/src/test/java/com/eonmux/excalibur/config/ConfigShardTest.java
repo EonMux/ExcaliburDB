@@ -262,6 +262,25 @@ class ConfigShardTest {
             Config config = new Config(props);
             assertEquals(1, config.shard().getHnswQueueLimit());
         }
+
+        @Test
+        @DisplayName("each refusal names the property key the operator has to edit")
+        void refusalsNameTheFullKey() {
+            // The Java field behind a setting - loadFactor, efSearch - is not something an
+            // operator can find in a properties file or a deployment manifest.
+            Map<String, String> outOfRange = Map.of(
+                "excalibur.shard.segment-load-factor", "0",
+                "excalibur.shard.default-ef-construction", "0",
+                "excalibur.shard.default-ef-search", "0",
+                "excalibur.shard.compaction-delay-ms", "-1",
+                "excalibur.shard.hnsw-integration-queue-depth-limit", "0");
+            outOfRange.forEach((key, value) -> {
+                IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                    () -> new Config(Map.of(key, value)));
+                assertTrue(refusal.getMessage().startsWith(key + " "),
+                    () -> "expected the message to name " + key + ": " + refusal.getMessage());
+            });
+        }
     }
 
     // ==================== Immutability Tests ====================
