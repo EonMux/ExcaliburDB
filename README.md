@@ -2126,7 +2126,9 @@ curl -X POST http://localhost:8080/v1/ingest \
 `excalibur.ingest.allowed-roots`, which is empty until configured — a 403 here is the allow-list,
 not the path. The other supported `source_type` is `http`, whose `base_url` is checked against
 `excalibur.ingest.allowed-hosts` and refused if it resolves to any non-public address (see
-[Securing the API](#securing-the-api) for the ranges).
+[Securing the API](#securing-the-api) for the ranges). A crawl stays on that host and under that URL's
+path: only URLs whose path begins with the path of `base_url` are fetched, redirect hops included,
+so `https://example.com/docs/` crawls `/docs/` and nothing beside it.
 
 Beyond `source_id` and the target, every field in `config` is optional and left to the source's
 own default when absent. Each is bounded, and a value outside its bound is a 400 naming the field

@@ -371,8 +371,9 @@ public final class McpTools {
                     + "Omit for the server's default, which does not follow them.", null),
                 ToolSchema.optional("include_hidden", "boolean",
                     "Whether to index hidden files - those whose name starts with a dot, or "
-                    + "that the operating system marks hidden. Omit for the server's default, "
-                    + "which skips them.", null),
+                    + "that the operating system marks hidden - and descend into hidden "
+                    + "directories below the root. Omit for the server's default, which skips "
+                    + "both.", null),
                 ToolSchema.optional("max_file_bytes", "integer",
                     "Largest single file to index, in bytes, from 1 to 104857600 (100 MiB), "
                     + "the largest document the server indexes. A larger file is skipped rather "
@@ -424,9 +425,9 @@ public final class McpTools {
 
         tools.add(ToolSchema.tool(CRAWL_WEBSITE,
             "Register a website as a source and start crawling and indexing it. The crawl stays "
-            + "on the starting URL's host - redirects are followed with the same host policy "
-            + "re-applied at every hop - and the host must be one the server allows, or the "
-            + "request is refused. The site's robots.txt is obeyed unless respect_robots_txt is "
+            + "on the starting URL's host and under its path - redirects are followed with the "
+            + "same policy re-applied at every hop - and the host must be one the server "
+            + "allows, or the request is refused.The site's robots.txt is obeyed unless respect_robots_txt is "
             + "false, and a robots.txt the site cannot serve (a 5xx or no answer) fails the "
             + "crawl with the reason in last_error. Returns as soon as the source is "
             + "registered; the crawl continues in the background, so poll " + INGESTION_STATUS
@@ -441,7 +442,9 @@ public final class McpTools {
                     + " to stop crawling it."),
                 ToolSchema.required("base_url", "string",
                     "The http or https URL the crawl starts from. Its host is the only host "
-                    + "the crawl will fetch from."),
+                    + "the crawl will fetch from, and only URLs whose path begins with its path "
+                    + "are fetched: end it with '/' to confine the crawl to one directory, or "
+                    + "give the site root to crawl the whole host."),
                 ToolSchema.optional("max_depth", "integer",
                     "How many link hops to follow from the starting URL. Omit for the "
                     + "server's default.", null),

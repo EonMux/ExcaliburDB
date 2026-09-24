@@ -746,9 +746,16 @@ The walk is sequential and makes two requests per page — one to read its links
 and every one of them, redirect hops included, waits out the gap above. A crawl left unpaced asks
 a host for pages as fast as it will answer them, up to the ten million `max_documents` allows.
 
-The crawl stays on the base URL's host regardless of any of these — redirects are followed by the
-crawler itself, with the host policy re-applied at every hop — and hosts resolving to loopback,
-private, link-local or multicast addresses are refused whatever the allow-list says.
+The crawl stays on the base URL's host **and under its path** regardless of any of these. A URL is
+crawled only if its path begins with the path of `base_url`, compared as plain text before the
+path patterns above are applied: `https://example.com/docs` admits `/docs`, `/docs/guide` and
+`/docs-archive/old`, and never `/blog` or `/`. End `base_url` with `/` to confine the crawl to one
+directory, and give the site root to crawl the whole host. A `base_url` naming a page
+(`/docs/index.html`) reaches only URLs whose path begins with that page's. Redirects are followed
+by the crawler itself, with the host, path and pattern rules re-applied at every hop, so a
+redirect out of the base path fails that document rather than fetching it. `robots.txt` is the
+one request outside the base path, read at the root of each origin. Hosts resolving to any
+non-public address are refused whatever the allow-list says.
 
 #### robots.txt
 
