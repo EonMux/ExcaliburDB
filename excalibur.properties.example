@@ -209,6 +209,27 @@ excalibur.graph.erasure-tombstone-ratio=0.2
 # a node that then goes quiet is still discharged on time.
 excalibur.graph.erasure-max-latency-seconds=3600
 
+# Automatic builds. Ingestion stages every change - a new document's facts, and the withdrawal of
+# a replaced or removed one's - but /v1/graph/query answers from the graph the last build
+# published. Every interval the node rebuilds each namespace whose graph is behind its staging,
+# once staging has been quiet for the debounce (so a crawl is one build, not one per document) or
+# once its oldest unpublished change has waited the maximum delay (so ingestion that never pauses
+# cannot hold the graph back). Off, a graph changes only when POST /v1/graph/build asks.
+# Automatic builds pause while extraction is asked for without an API key or could not be wired:
+# a build then would publish withdrawals with nothing to replace them.
+excalibur.graph.auto-build-enabled=true
+excalibur.graph.auto-build-interval-seconds=30
+excalibur.graph.auto-build-debounce-seconds=60
+excalibur.graph.auto-build-max-delay-seconds=900
+# Most automatic builds at once across the node; each saturates the disk and the embedding
+# endpoint. A namespace is never built twice at once, and one an explicit build is running for is
+# left to it.
+excalibur.graph.auto-build-max-concurrent=1
+# After a failed automatic build a namespace waits this long, doubling with each further failure
+# up to the maximum.
+excalibur.graph.auto-build-failure-backoff-seconds=60
+excalibur.graph.auto-build-max-failure-backoff-seconds=3600
+
 # Ingest Target Allow-Lists
 # Empty means DISABLED, not unrestricted. Filesystem ingest may only read inside these
 # absolute directories; a requested root_path is canonicalised first and must resolve

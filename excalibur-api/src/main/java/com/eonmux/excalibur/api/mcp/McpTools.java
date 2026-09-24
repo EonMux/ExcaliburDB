@@ -180,8 +180,9 @@ public final class McpTools {
                     null))));
 
         tools.add(ToolSchema.tool(BUILD_GRAPH,
-            "Turn the facts ingestion has extracted into the graph that search_graph reads. Run it "
-            + "once after ingesting documents and again after ingesting more; until it has run, "
+            "Turn the facts ingestion has extracted into the graph that search_graph reads. The "
+            + "server does this by itself once ingestion has been quiet for a while (a minute by "
+            + "default); call this to publish what was ingested now. Until a build has run, "
             + "search_graph reports that no graph is being served. This call only starts the "
             + "build and returns immediately - on a real corpus the build takes minutes - so "
             + "poll " + GRAPH_BUILD_STATUS + " until its state is no longer 'running' to learn "
@@ -199,7 +200,11 @@ public final class McpTools {
             + "many edges, entities and relations were published, and 'staged_facts': when that "
             + "is 0 nothing was extracted, which usually means ingestion has not finished or the "
             + "server has extraction disabled. A cancelled build published nothing and the "
-            + "namespace is still serving the graph it had.",
+            + "namespace is still serving the graph it had. 'freshness.behind_staging' says "
+            + "whether ingested changes are not yet in the graph search_graph reads, and "
+            + "'automatic.state' what the server is doing about it: 'pending' until it rebuilds "
+            + "by itself, 'running', 'current', or 'paused', 'backing_off' or 'disabled' when "
+            + "it will not without " + BUILD_GRAPH + ".",
             ToolSchema.object(
                 ToolSchema.optional("namespace", "string",
                     "Namespace whose build to report on. Omit for the configured default, or "

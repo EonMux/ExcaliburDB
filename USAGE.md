@@ -425,9 +425,9 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `POST` | `/v1/graph/query` | bearer | Answer a question from the graph |
 | `POST` | `/v1/graph/build` | bearer | Start publishing the facts ingestion has staged as the served graph. `202`; the build runs behind the response. `409` while one is already running |
 | `DELETE` | `/v1/graph/build` | bearer | Stop the build in progress. It publishes nothing; the namespace keeps the graph it had |
-| `GET` | `/v1/graph/build/status` | bearer | What the build is doing, and what the last one published |
+| `GET` | `/v1/graph/build/status` | bearer | What the build is doing, what the last one published, whether the served graph is behind what is staged, and what the node's automatic build is doing about it |
 | `POST` | `/v1/graph/erasure` | bearer | Record an obligation to erase, and compact when it is due. `404` for an entity, by name or `entity_id`, that nothing in the namespace holds, and nothing is recorded |
-| `GET` | `/v1/graph/namespaces` | bearer | Every namespace on disk: whether it is open, whether it has built a graph, what it has staged and what it still owes |
+| `GET` | `/v1/graph/namespaces` | bearer | Every namespace on disk: whether it is open, whether it has built a graph, what it has staged, whether its graph is behind that, and what it still owes |
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | Remove a namespace entirely - its graph, its staged facts and its erasure log. Irreversible; `409` for `shared` |
 
 All request/response bodies are JSON. Request size limit: **1 MB**, and a body over it is refused with `413` by every endpoint that reads one - split the payload rather than retrying it. The `GET` routes read no body, and neither do `POST` and `DELETE /v1/drain`,
@@ -1050,8 +1050,11 @@ chunk — and only with its latest version.
 Graph facts go with it too. Every fact and snippet staged from a document carries the same source
 id whatever version it came from, so a replacement withdraws everything staged from the document —
 exactly as `/v1/erasure` does, labels excepted — before it stages what the new version says. The
-graph being served keeps what it was built from until the next `POST /v1/graph/build`, which no
-longer holds the earlier version's facts. A withdrawal rewrites the namespace's staging logs, so
+graph being served keeps what it was built from until the next build, which no longer holds the
+earlier version's facts. Nobody has to ask for it: the node rebuilds a namespace whose graph is
+behind its staging by itself, once staging has been quiet for
+`excalibur.graph.auto-build-debounce-seconds` (see [Keeping the graph current](README.md#keeping-the-graph-current));
+`POST /v1/graph/build` publishes it at once. A withdrawal rewrites the namespace's staging logs, so
 it is paid per replaced or removed document that had facts staged; one that fails is logged, counted in
 `graph.ingest.withdrawalFailures` on `/v1/stats` and retried until it is made, and the new
 version's facts are not staged, since the retry withdraws by document and would take them with the
@@ -1137,7 +1140,8 @@ staged in its place; and one its source no longer lists has everything staged fr
 All three go to the namespace the source was registered in, through the same reporting a crawl and
 `POST /v1/documents` use, so a re-crawl and a re-post of one document reach the graph in the order
 they were published. A node with no chat model extracts nothing, and a removal still withdraws.
-The graph being served changes at the next `POST /v1/graph/build`.
+The graph being served changes at the next build — the node's automatic one, or
+`POST /v1/graph/build`.
 
 A document is removed under the same per-document lock a publication or an erasure takes, and only
 if its registry entry is still the one the reindex read when it listed the source. One posted again
