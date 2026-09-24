@@ -4202,7 +4202,6 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 - `AutomaticGraphBuildIntegrationTest` - Over HTTP, a document ingested, replaced and removed reaches the served graph through the node's automatic build with no build asked for, and with automatic builds disabled the graph waits for one
 - `ReindexGraphIntegrationTest` - A reindex replaces a changed document's staged facts and withdraws a removed one's, so the graph stops answering with what the source no longer says
 - `ChunkAttributionNodeTest` - A vector hit names the chunk it embeds, fuses with the BM25 hit on that chunk and reads its text; a reposted or erased document leaves no vector rankable, and a directory an older build attributed by document is re-keyed to chunks
-- `FailureReportGeneratorTest` - The `util` helper that groups test failures into a categorised report
 
 ```bash
 ./gradlew :excalibur-integration:test
