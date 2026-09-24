@@ -24,14 +24,19 @@ import java.util.stream.Stream;
  * registry recorded for the indexed version (see {@link Source#fetchIfChanged}). A source that
  * confirms the version is current - an HTTP origin answering {@code 304 Not Modified} - settles
  * it without transferring the body, and the document is unchanged. Every other answer carries
- * the document, and the detector compares what came back:
+ * the document, and the detector compares what came back by content (see
+ * {@link DocumentMetadata#isChanged}):
  * <ol>
- *   <li><strong>Last Modified Timestamp:</strong> If the source provides lastModified,
- *       compare with the stored timestamp. Newer = changed.</li>
  *   <li><strong>Content Length:</strong> If lengths differ, document is changed.</li>
- *   <li><strong>Content Hash:</strong> If both old and new hashes are available and differ,
- *       document is changed.</li>
+ *   <li><strong>Content Hash:</strong> If both old and new hashes are available, they
+ *       decide.</li>
+ *   <li><strong>Last Modified Timestamp:</strong> Only for an entry that recorded no hash: a
+ *       newer timestamp is then taken as a change.</li>
  * </ol>
+ *
+ * <p>A document that came back with its bytes intact is unchanged even when its timestamp or its
+ * entity tag moved - a touched file, a redeployed page - and nothing of it is re-chunked or
+ * re-embedded. What it came back with is recorded instead; see {@link #refreshValidators}.</p>
  *
  * <h2>Deleted Document Detection</h2>
  * <p>After processing all crawled documents, any document in the registry that was not
@@ -177,7 +182,9 @@ public class ChangeDetector {
      * document registered before tags were kept - or whose tag the server rotated over the same
      * bytes, as a redeployment does, would be sent in full on every re-crawl for as long as its
      * content did not change: each fetch asks with the stale tag, the server cannot match it,
-     * and the tag the answer carried is thrown away.</p>
+     * and the tag the answer carried is thrown away. The same goes for a file touched with its
+     * bytes intact: its new modification time is recorded, so the entry goes on describing the
+     * file as it now stands.</p>
      *
      * <p>Each validator is replaced only when the answer carried one. An answer without a tag
      * is not evidence against the recorded one - the server can only ever answer 304 to a tag

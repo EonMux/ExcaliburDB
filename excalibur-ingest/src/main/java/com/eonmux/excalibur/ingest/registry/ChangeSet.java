@@ -13,7 +13,7 @@ import java.util.Objects;
  * <ul>
  *   <li><strong>New documents:</strong> Documents that exist in the crawl but not in the registry</li>
  *   <li><strong>Changed documents:</strong> Documents that exist in both but have different content
- *       (detected via lastModified, contentHash, or contentLength)</li>
+ *       (see {@link DocumentMetadata#isChanged})</li>
  *   <li><strong>Deleted documents:</strong> Documents that exist in the registry but not in the crawl</li>
  * </ul>
  *

@@ -1400,7 +1400,9 @@ holds with a conditional GET — the `ETag` and `Last-Modified` it reported last
 without its body being transferred. Any other answer is compared by content hash, and a page that
 changed is fetched and replaced. The two validators are kept in `<data dir>/document-registry`, so
 the first re-crawl after a restart asks the same questions rather than transferring the whole site.
-A filesystem source reads each file and compares modification time, length and content hash.
+A filesystem source reads each file and compares its length and content hash. A file touched,
+copied or restored with its bytes intact is not rewritten, whatever its modification time says;
+the new time is recorded in the registry instead.
 
 ### Re-index status
 

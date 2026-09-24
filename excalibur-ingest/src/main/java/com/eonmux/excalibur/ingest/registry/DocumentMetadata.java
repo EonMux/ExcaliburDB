@@ -24,12 +24,13 @@ import java.util.Objects;
  * </ul>
  *
  * <h2>Change Detection</h2>
- * <p>A document is considered changed if any of these conditions are true:
- * <ul>
- *   <li>Last modified timestamp is newer than the stored timestamp</li>
- *   <li>Content hash differs (for sources that support hashing)</li>
- *   <li>Content length differs</li>
- * </ul>
+ * <p>A document is compared by its content: it has changed when its length differs, or when
+ * both versions carry a content hash and the hashes differ. The timestamp decides only for an
+ * entry that recorded no hash, where a newer one is all there is to go on. A file that was
+ * touched, copied or restored with its bytes intact is therefore unchanged whatever its
+ * modification time now says - re-chunking and re-embedding it would pay for the same chunks
+ * twice - and the time it came back with is recorded in its place, so the entry describes the
+ * document as the source now reports it.</p>
  *
  * <p>The timestamp and the entity tag have a second use: they are what a re-crawl sends back to
  * the source as {@link #validators()}, so a source that can ask its origin conditionally learns
@@ -147,24 +148,27 @@ public final class DocumentMetadata {
         return contentHash != 0;
     }
 
+    /**
+     * Whether what the source now holds differs from the version this entry describes.
+     *
+     * <p>See the class documentation: by content where both sides were hashed, and by timestamp
+     * only where this entry recorded no hash to compare.</p>
+     *
+     * @param fetched What the source handed back, or null when it handed back nothing
+     * @return true if the document has to be indexed again
+     */
     public boolean isChanged(FetchedDocumentInfo fetched) {
         if (fetched == null) {
             return true;
-        }
-        if (fetched.getLastModifiedMillis() > 0 && lastModifiedMillis > 0) {
-            if (fetched.getLastModifiedMillis() > lastModifiedMillis) {
-                return true;
-            }
         }
         if (fetched.getContentLength() != contentLength) {
             return true;
         }
         if (fetched.getContentHash() != 0 && contentHash != 0) {
-            if (fetched.getContentHash() != contentHash) {
-                return true;
-            }
+            return fetched.getContentHash() != contentHash;
         }
-        return false;
+        return fetched.getLastModifiedMillis() > 0 && lastModifiedMillis > 0
+            && fetched.getLastModifiedMillis() > lastModifiedMillis;
     }
 
     public static Builder builder() {

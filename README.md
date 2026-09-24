@@ -2364,7 +2364,11 @@ because a page's links cannot be read from a `304`.
 The validators live in the registry file, not in memory, so this holds across a restart — the
 first re-crawl after one is exactly when a node would otherwise transfer the whole site again. A
 filesystem source has nothing to ask with and reads each file, and an unchanged one is recognised
-by its modification time, length and content hash.
+by its length and content hash. A newer modification time over the same bytes — a file touched,
+copied or restored — is not a change: nothing of it is re-chunked or re-embedded, and the new time
+is recorded in the registry in place of the old one. The same holds for a page a server sends in
+full with a new `ETag` or `Last-Modified` over the same body, as a redeployment does: it is kept
+as indexed, and the validators it came with are what the next re-crawl asks with.
 
 ### Reindex Status Example
 

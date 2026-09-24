@@ -40,8 +40,8 @@ import java.util.stream.Collectors;
  * <h2>Change Detection</h2>
  * <p>When re-crawling, the registry is used to determine:
  * <ul>
- *   <li><strong>Changed documents:</strong> Documents where lastModified, contentHash,
- *       or contentLength differ from the stored metadata</li>
+ *   <li><strong>Changed documents:</strong> Documents whose content differs from the stored
+ *       metadata - by length, or by hash; see {@link DocumentMetadata#isChanged}</li>
  *   <li><strong>Deleted documents:</strong> Documents present in the registry but
  *       not returned by the current crawl</li>
  *   <li><strong>New documents:</strong> Documents returned by the crawl but not

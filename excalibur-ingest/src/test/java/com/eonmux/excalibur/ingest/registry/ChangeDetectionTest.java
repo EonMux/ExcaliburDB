@@ -589,10 +589,10 @@ class ChangeDetectionTest {
             new DocumentMetadata.FetchedDocumentInfo(1000L, 1000L, 100);
         assertFalse(metadata.isChanged(sameInfo));
 
-        // Different timestamp - changed
+        // Newer timestamp over the same bytes - a touched file - not changed
         DocumentMetadata.FetchedDocumentInfo newerTimestamp = 
             new DocumentMetadata.FetchedDocumentInfo(2000L, 1000L, 100);
-        assertTrue(metadata.isChanged(newerTimestamp));
+        assertFalse(metadata.isChanged(newerTimestamp));
 
         // Different length - changed
         DocumentMetadata.FetchedDocumentInfo differentLength = 
@@ -606,6 +606,45 @@ class ChangeDetectionTest {
 
         // Null fetched info - changed
         assertTrue(metadata.isChanged(null));
+    }
+
+    @Test
+    void testMetadataWithoutHashFallsBackToTimestamp() {
+        DocumentMetadata unhashed = DocumentMetadata.builder()
+            .sourceId("source1")
+            .documentId("doc1")
+            .contentLength(100)
+            .lastModifiedMillis(1000L)
+            .build();
+
+        assertTrue(unhashed.isChanged(new DocumentMetadata.FetchedDocumentInfo(2000L, 1000L, 100)),
+            "with no hash recorded, a newer timestamp is all there is to go on");
+        assertFalse(unhashed.isChanged(new DocumentMetadata.FetchedDocumentInfo(1000L, 1000L, 100)));
+    }
+
+    @Test
+    void testTouchedDocumentIsUnchangedAndItsTimestampRecorded() throws SourceException {
+        byte[] content = "same content".getBytes(StandardCharsets.UTF_8);
+        registry.register(DocumentMetadata.builder()
+            .sourceId("test-source")
+            .documentId("doc1")
+            .contentHash(DocumentRegistry.computeContentHash(content))
+            .contentLength(content.length)
+            .lastModifiedMillis(1000L)
+            .addChunkId("chunk1")
+            .build());
+
+        // Touched: a newer modification time over the bytes that were indexed.
+        Source source = new MockSource("test-source", List.of("doc1"),
+            docId -> new FetchedDocument(docId, content, "text/plain", 5000L));
+
+        ChangeSet changes = detector.detectChanges(source);
+
+        assertFalse(changes.hasChanges(), "identical bytes are not re-chunked or re-embedded");
+        DocumentMetadata recorded = registry.get("test-source", "doc1");
+        assertEquals(5000L, recorded.getLastModifiedMillis(),
+            "the time it came back with is recorded, so the entry describes the file as it is");
+        assertEquals(List.of("chunk1"), recorded.getChunkIds());
     }
 
     // ==================== Helper Methods ====================
