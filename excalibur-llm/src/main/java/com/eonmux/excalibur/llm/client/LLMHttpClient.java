@@ -700,10 +700,18 @@ public class LLMHttpClient {
      *   <li>PARSE_ERROR - truly unparseable responses</li>
      * </ul>
      *
+     * <p>A call its own thread was interrupted out of is none of these: the caller abandoned it -
+     * a query's deadline passed, or the query was cancelled - whatever state the endpoint is in.
+     * A half-open probe abandoned this way is reissued after the cooldown like any other probe
+     * that never reports back.</p>
+     *
      * @param e The exception to evaluate
      * @return true if this should count as a failure for circuit breaker
      */
     private boolean shouldCountAsFailure(LLMException e) {
+        if (e.getCause() instanceof InterruptedException) {
+            return false;
+        }
         return switch (e.getErrorType()) {
             case NETWORK, HTTP_ERROR, RATE_LIMITED, AUTH_ERROR, PARSE_ERROR, INVALID_REQUEST -> true;
             case CIRCUIT_OPEN -> false; // Circuit already open, don't double-count
