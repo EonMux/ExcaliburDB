@@ -1089,7 +1089,7 @@ Two routes retrieve, and they are separate pipelines rather than two entry point
 
 ```
 user query
-   -> query expansion (chat model, and only when the corpus is not embedded)
+   -> query expansion (chat model; on an embedded corpus only with expand-hybrid-queries)
    -> BM25 over ingested chunks (the engine's own inverted index)
    -> vector retrieval                           [when the corpus is embedded]
    -> reciprocal rank fusion                     [when both signals ran]
@@ -3525,7 +3525,7 @@ whether it is in use and, if not, which setting would change that.
 | `excalibur-planner` | Deterministic query classification and lexical coreference |
 | `excalibur-tenancy` | Per-namespace graph directories, mapping budget, eviction |
 | `excalibur-filter` | Cuckoo filters, LSH indexes |
-| `excalibur-query` | Query pipeline with multi-stage filtering |
+| `excalibur-query` | The vector query pipeline: epoch snapshot, LSH candidates, HNSW search, rerank and relevancy scoring |
 | `excalibur-ingest` | Document ingestion, chunking, source adapters |
 | `excalibur-shard` | Index orchestration, volume management, visibility tracking |
 | `excalibur-llm` | LLM client with circuit breaker and retry logic |
@@ -3537,13 +3537,17 @@ whether it is in use and, if not, which setting would change that.
 | `excalibur-test` | Test utilities and fixtures |
 | `excalibur-test-bootstrap` | Initializes `java.lang.foreign` before the first test in every module |
 | `excalibur-integration` | Integration tests |
-| `excalibur-bench` | JMH benchmarks |
+| `excalibur-bench` | JMH benchmarks, the retrieval evaluation harness and `GraphCalibrationHarness` |
 | `excalibur-coverage` | The coverage summary and gap report behind `./gradlew coverage` and `coverageGaps` |
 
 ### Query Pipeline
 
-Queries execute through a pipeline of five stages, numbered here as the code and its log lines
-(`Stage 1: ...`, `Stage 3: ...`) number them:
+The vector half of `POST /v1/query` executes through a pipeline of five stages in
+`excalibur-query`, numbered here as the code and its log lines (`Stage 1: ...`, `Stage 3: ...`)
+number them. The lexical and hybrid route — BM25 (`LexicalQueryService`), reciprocal rank fusion
+(`HybridFusion`) and relevancy scoring of the fused list (`RelevancyScoring`), all in
+`excalibur-api` — is not part of it; `QueryEndpoint` chooses the route by what the node holds, and
+[Retrieval](#retrieval) describes it.
 
 - **Stage 0 — Epoch Snapshot** - Capture visibility epoch, resolve queryable segments
 - **Stage 1 — LSH Candidates** - Name each segment's entries that share the query's hash buckets, for stage 2 to measure beside its graph search. Excludes no segment and confines no search
@@ -3551,7 +3555,10 @@ Queries execute through a pipeline of five stages, numbered here as the code and
 - **Stage 3 — Full Vector Rerank** - Exact distance computation on candidates
 - **Stage 4 — LLM Relevancy Scoring** - Optional semantic relevancy scoring
 
-Each stage checks for cancellation and timeout, allowing queries to return partial results if time-constrained.
+Every stage checks for cancellation, which withdraws the question and returns nothing. The timeout
+is enforced around the whole run: when it expires, the results of the last stage to complete are
+returned as a partial answer. Stage 2, which dispatches searches of its own across segments, is
+also handed the deadline, so its work finishes inside it rather than running on after it.
 
 Every segment stage 0 admits is searched, in no order that depends on the query. Stage 0 admits by
 segment state alone: it holds back a segment with no graph to search, and one still taking entries
@@ -3938,7 +3945,7 @@ excaliburdb/
 ├── excalibur-llm/          # LLM client
 ├── excalibur-metrics/      # JMX metrics
 ├── excalibur-planner/      # Query classification and coreference
-├── excalibur-query/        # Query execution
+├── excalibur-query/        # Vector query pipeline
 ├── excalibur-retrieval/    # Ranking, fusion, rerank, serialisation, abstention
 ├── excalibur-shard/        # Index orchestration
 ├── excalibur-store/        # Storage engine
@@ -3946,7 +3953,7 @@ excaliburdb/
 ├── excalibur-test/         # Test utilities
 ├── excalibur-test-bootstrap/  # Foreign-memory warm-up for every test JVM
 ├── excalibur-vector/       # HNSW, distance, quantization
-└── excalibur-bench/        # JMH benchmarks
+└── excalibur-bench/        # JMH benchmarks, retrieval evaluation, graph calibration
 ```
 
 ### Running Benchmarks
