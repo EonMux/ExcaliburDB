@@ -116,6 +116,7 @@ class ExcaliburEmbeddedTest {
 
                 assertThat(answer.route()).isEqualTo(SearchRoute.LEXICAL);
                 assertThat(answer.timedOut()).isFalse();
+                assertThat(answer.degraded()).as("BM25 is all this node plans").isFalse();
                 assertThat(answer.hits()).isNotEmpty();
                 SearchHit best = answer.hits().getFirst();
                 assertThat(best.chunkId()).isEqualTo(TIERING_CHUNK);
@@ -362,6 +363,7 @@ class ExcaliburEmbeddedTest {
                     3, Duration.ofSeconds(10));
 
                 assertThat(answer.route()).isEqualTo(SearchRoute.HYBRID);
+                assertThat(answer.degraded()).isFalse();
                 assertThat(answer.hits().getFirst().chunkId()).isEqualTo(TIERING_CHUNK);
                 assertThat(answer.hits().getFirst().signals()).contains("vector", "bm25");
             }
@@ -408,6 +410,7 @@ class ExcaliburEmbeddedTest {
                 SearchAnswer answer = db.query("which policy moves cold segments to cheaper disks", 3);
 
                 assertThat(answer.route()).isEqualTo(SearchRoute.VECTOR);
+                assertThat(answer.degraded()).isFalse();
                 assertThat(answer.hits()).extracting(SearchHit::chunkId).contains(TIERING_CHUNK);
                 assertThat(answer.hits()).allSatisfy(hit ->
                     assertThat(hit.signals()).containsExactly("vector"));
@@ -424,6 +427,7 @@ class ExcaliburEmbeddedTest {
                 SearchAnswer answer = db.query("cold segments cheaper disks", 3);
 
                 assertThat(answer.route()).isEqualTo(SearchRoute.LEXICAL);
+                assertThat(answer.degraded()).as("the vector half failed").isTrue();
                 assertThat(answer.hits().getFirst().chunkId()).isEqualTo(TIERING_CHUNK);
             }
         }
@@ -439,6 +443,7 @@ class ExcaliburEmbeddedTest {
                 SearchAnswer answer = db.query("cold segments cheaper disks", 3);
 
                 assertThat(answer.route()).isEqualTo(SearchRoute.LEXICAL);
+                assertThat(answer.degraded()).as("the vector search failed").isTrue();
                 assertThat(answer.hits()).extracting(SearchHit::chunkId).contains(TIERING_CHUNK);
             }
         }

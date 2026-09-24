@@ -47,9 +47,9 @@ import java.util.function.Function;
  * cancellation by query id and relevancy scoring by the chat model. So do the request's
  * presentation and reporting fields: a hit always carries its chunk's whole text, with no
  * snippet window; the similarity floor is the node's {@code excalibur.query.threshold} for every
- * search rather than one a request sets; and the answer reports its route and whether it timed
- * out, not the coverage, {@code result_total} or {@code degraded} the route reports. An embedder
- * that wants any of those runs the server.</p>
+ * search rather than one a request sets; and the answer reports its route, whether it timed out
+ * and whether it was degraded, not the per-segment coverage or {@code result_total} the route
+ * reports. An embedder that wants any of those runs the server.</p>
  */
 final class EmbeddedRetrieval {
 
@@ -193,10 +193,11 @@ final class EmbeddedRetrieval {
         try {
             LexicalQueryService.Ranking ranking = signal.await(remainingMillis(deadlineNanos));
             if (ranking != null) {
-                return new SearchAnswer(SearchRoute.LEXICAL, lexicalHits(ranking.hits()), false);
+                return new SearchAnswer(SearchRoute.LEXICAL, lexicalHits(ranking.hits()), false,
+                    ranking.expansionFellBack());
             }
             if (remainingMillis(deadlineNanos) == 0) {
-                return new SearchAnswer(SearchRoute.LEXICAL, List.of(), true);
+                return new SearchAnswer(SearchRoute.LEXICAL, List.of(), true, false);
             }
             throw new IllegalStateException("The BM25 search failed; see the log for why");
         } finally {
@@ -241,10 +242,11 @@ final class EmbeddedRetrieval {
                 List<HybridFusion.Result> fused =
                     HybridFusion.fuse(response.results(), ranking.hits(), topK, lexical.rrfK());
                 return new SearchAnswer(SearchRoute.HYBRID, fusedHits(fused),
-                    response.timedOut());
+                    response.timedOut(), response.isDegraded() || ranking.expansionFellBack());
             }
+            // A BM25 half that was started and did not answer leaves a hybrid search vector-only.
             return new SearchAnswer(SearchRoute.VECTOR, vectorHits(response.results(), topK),
-                response.timedOut());
+                response.timedOut(), response.isDegraded() || signal != null);
         } catch (TimeoutException e) {
             token.cancel("Query timeout");
             LOGGER.warn("Vector search ran out of the search's budget");
@@ -316,7 +318,7 @@ final class EmbeddedRetrieval {
                 : timedOut ? signal.ready() : signal.await(remainingMillis(deadlineNanos));
             if (ranking != null) {
                 return new SearchAnswer(SearchRoute.LEXICAL, lexicalHits(ranking.hits()),
-                    timedOut);
+                    timedOut, true);
             }
         } finally {
             if (startedHere) {
@@ -324,7 +326,7 @@ final class EmbeddedRetrieval {
             }
         }
         if (timedOut) {
-            return new SearchAnswer(SearchRoute.VECTOR, List.of(), true);
+            return new SearchAnswer(SearchRoute.VECTOR, List.of(), true, true);
         }
         throw new IllegalStateException("The search failed and no other signal could answer: "
             + (failure == null ? "unknown cause" : failure.getMessage()), failure);

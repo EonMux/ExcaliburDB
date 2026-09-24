@@ -11,8 +11,15 @@ import java.util.Objects;
  * @param hits     The chunks, best first
  * @param timedOut Whether the search ran out of its budget, so a short list is not a claim that
  *                 nothing else matched
+ * @param degraded Whether the answer came from less than this node set out to use: a signal
+ *                 that failed and left the other to answer, a vector search that did not reach
+ *                 every segment, or a query expansion that fell back to the query as typed.
+ *                 Measured against {@link ExcaliburEmbedded#route()}, so a node that has only
+ *                 BM25 answering from BM25 is not degraded - unlike the route's
+ *                 {@code coverage.degraded}, which is measured against a fully configured node
  */
-public record SearchAnswer(SearchRoute route, List<SearchHit> hits, boolean timedOut) {
+public record SearchAnswer(SearchRoute route, List<SearchHit> hits, boolean timedOut,
+                           boolean degraded) {
 
     /**
      * @throws NullPointerException if route or hits is null

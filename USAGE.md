@@ -4104,7 +4104,11 @@ What each call does:
   lists the route refuses: empty, more than 1000 ids, or an id that is null, blank or longer than
   256 characters. Each `SearchHit` carries the chunk id, its score,
   the signals that found it and the chunk's text; `timedOut()` on the answer says the budget ran
-  out and the hits are what was found before it did.
+  out and the hits are what was found before it did, and `degraded()` says the answer came from
+  less than the node set out to use - a signal that failed and left the other to answer, a vector
+  search that did not reach every segment, or a query expansion that fell back to the query as
+  typed. It is measured against the node's own `route()`, so a BM25-only node answering from BM25
+  is not degraded, where the route's `coverage.degraded` would be.
 - **`fetch(chunkId)`** reads a chunk's text back. **`documents()`** and **`documents(sourceId)`**
   list what the node holds, with each document's chunk ids, length and indexing time, as
   `GET /v1/documents/list` does.
@@ -4134,9 +4138,8 @@ query result cache, pagination and explanations. A search's own settings are few
 route's too. Every hit carries its chunk's whole text - there is no `include_text` to turn it
 off, no `snippet` window and no clipping to `excalibur.api.max-result-text-chars`. The similarity
 floor is the node's `excalibur.query.threshold`, set with `property(...)`, for every search, not
-one a call sets. And a `SearchAnswer` reports its route and `timedOut()`, not the `coverage`,
-`result_total` or `degraded` the route reports; an answer whose `route()` differs from the node's
-is how a signal that failed shows. The knowledge graph is not built in-process:
+one a call sets. And a `SearchAnswer` reports its route, `timedOut()` and `degraded()`, not the
+per-segment `coverage` or the `result_total` the route reports. The knowledge graph is not built in-process:
 `open()` refuses `excalibur.graph.extraction-enabled=true`, and a directory's graph is built and
 queried by serving it. Erasing a document in-process therefore withdraws nothing from a graph a
 served node built over the same directory; erase through the HTTP API where a graph is in use.
