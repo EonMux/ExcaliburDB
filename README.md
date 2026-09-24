@@ -3065,20 +3065,22 @@ In the source scope, `N` names one ingested document, not a registered source: i
 (seed 0) of the UTF-8 bytes of the document's key, `<source_id>:<document_id>` — `my-docs:guide.md`
 for the document whose chunks come back from `/v1/query` as `my-docs:guide.md:chunk:N`. It is
 stamped on every fact and snippet extracted from that document, and a caller reads it back off the
-answers: each fact in a graph answer's `context` ends with its provenance, `{document#N conf=0.9
-ext=v1}`, and that `N` is the one to send. To withdraw a document from the corpus and the graph at
+answers: each fact in a graph answer's `context` ends with its provenance, `{document#N conf=90
+ext=v1}` - the confidence there is a percentage, the one byte the store keeps - and that `N` is
+the one to send. To withdraw a document from the corpus and the graph at
 once, use `POST /v1/erasure` with its `source_id` and `document_id` instead — it removes the chunks
 and submits this graph obligation for you, so nobody has to compute the hash.
 
-An entity id is internal, and a graph answer does not carry one: its `answer` and `context` name
-entities by label. The node hands an id out in exactly two places, both where a name alone is not
-enough to say which entity is meant — a `needs_input` candidate for a name several entities share
-(`Ada #12`), and the `409` below. So `entity_name` is how "erase everything about this person" is
-ordinarily asked. It is matched exactly, ignoring case and surrounding space, against the served
-entity dictionary and the staged labels it is built from - never against the `labels` index, whose
-whole value at query time is that "Lovelace" finds "Ada Lovelace" and whose whole danger here is
-the same thing. A name no entity has is a `404`; a name two entities share is a `409` listing their
-ids in `candidates`, so the caller repeats the request with the `entity_id` of the one they meant.
+A name is what a caller ordinarily has, so `entity_name` is how "erase everything about this
+person" is usually asked. It is matched exactly, ignoring case and surrounding space, against the
+served entity dictionary and the staged labels it is built from - never against the `labels`
+index, whose whole value at query time is that "Lovelace" finds "Ada Lovelace" and whose whole
+danger here is the same thing. A name no entity has is a `404`; a name two entities share is a
+`409` listing their ids in `candidates`, so the caller repeats the request with the `entity_id` of
+the one they meant. Ids appear wherever a name alone may not say which entity is meant: a graph
+answer's `context` writes each entity as its label followed by its id, `Ada Lovelace (id=12)`, so
+the model can tell apart two entities that share a label; `GET /v1/graph/entities` lists ids
+beside labels; and a `needs_input` candidate for a shared name reads `Ada #12`.
 
 An `entity_id` has to name an entity: one the namespace's staged labels hold, or one the graph it
 serves names. Anything else is a `404` - `{"error": "no entity in this namespace has id 42", "code": "entity_not_found"}` - and
