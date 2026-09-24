@@ -67,6 +67,7 @@ import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.shard.allocator.VolumeManager;
 import com.eonmux.excalibur.shard.worker.SegmentReindexScheduler;
 import com.eonmux.excalibur.config.Config;
+import com.eonmux.excalibur.config.VisibilityConfig;
 import com.eonmux.excalibur.llm.client.CircuitBreaker;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
 import com.eonmux.excalibur.store.SegmentCatalog;
@@ -1014,6 +1015,18 @@ final class EndpointRegistrar {
     }
 
     /**
+     * How long a graph question may run when it names no {@code timeout_ms}: the same default
+     * {@code POST /v1/query} applies, since both bound one caller's wait for one answer.
+     *
+     * @return The default timeout, in milliseconds
+     */
+    private long graphQueryTimeoutMs() {
+        return in.config() != null
+            ? in.config().visibility().getQueryTimeoutMs()
+            : VisibilityConfig.DEFAULT_QUERY_TIMEOUT_MS;
+    }
+
+    /**
      * Registers the graph routes, only when a graph store is configured.
      *
      * <p>The query is a read, not a mutation: it walks the graph and returns context, and
@@ -1024,7 +1037,8 @@ final class EndpointRegistrar {
         if (in.graphTenants() != null) {
             target.createContext("/v1/graph/query", wrapHandler(exactPath("/v1/graph/query",
                 onlyMethod("POST", guard.protect(RequestGuard.Access.READ,
-                    new GraphQueryEndpoint(in.graphTenants()))), notFound)));
+                    new GraphQueryEndpoint(in.graphTenants(),
+                        in.queryRegistry(), graphQueryTimeoutMs(), in.security().maxQueryTimeoutMs()))), notFound)));
             // Both mutations: they rewrite the served graph. The build answers 202 and runs
             // behind the response, so the DELETE beside it is how one started at the wrong
             // moment is ended - a mutation too, since an anonymous caller able to stop every
@@ -1069,7 +1083,8 @@ final class EndpointRegistrar {
         } else if (in.graphPipeline() != null) {
             target.createContext("/v1/graph/query", wrapHandler(exactPath("/v1/graph/query",
                 onlyMethod("POST", guard.protect(RequestGuard.Access.READ,
-                    new GraphQueryEndpoint(in.graphPipeline()))), notFound)));
+                    new GraphQueryEndpoint(in.graphPipeline(),
+                        in.queryRegistry(), graphQueryTimeoutMs(), in.security().maxQueryTimeoutMs()))), notFound)));
         }
     }
 }

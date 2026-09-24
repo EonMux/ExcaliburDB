@@ -34,11 +34,16 @@ import java.util.Objects;
  *       "correlation_id": "9c41e07a",
  *       "started_at_ms": 1736899200000,
  *       "duration_ms": 91400,
- *       "cancelled": false
+ *       "cancelled": false,
+ *       "kind": "corpus"
  *     }
  *   ]
  * }
  * }</pre>
+ *
+ * <p>{@code kind} is {@code corpus} for {@code POST /v1/query} and {@code graph} for
+ * {@code POST /v1/graph/query}. Both are cancelled the same way, by {@code DELETE
+ * /v1/query/{query_id}}.</p>
  *
  * <p>Longest-running first. An operator reading this is looking for the query that will not
  * finish, and it is the first line rather than somewhere in a hash order.</p>
@@ -126,6 +131,7 @@ public final class QueryStatusEndpoint implements HttpHandler {
             .append("\", \"started_at_ms\": ").append(query.startTimeMs())
             .append(", \"duration_ms\": ").append(query.durationMs())
             .append(", \"cancelled\": ").append(query.cancelled())
-            .append('}');
+            .append(", \"kind\": \"").append(query.kind().wireName())
+            .append("\"}");
     }
 }
