@@ -8,6 +8,8 @@ import com.eonmux.excalibur.fsck.check.FileInspector;
 import com.eonmux.excalibur.fsck.check.InFlightJournalCheck;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
+import com.eonmux.excalibur.ingest.registry.ErasureReceiptFile;
+
 import com.eonmux.excalibur.ingest.registry.EndLine;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
 import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
@@ -29,6 +31,7 @@ import java.util.Map;
 import java.util.zip.CRC32C;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * The verdicts on the ingest side's checksummed files: proven when the checksum holds, damage
@@ -87,6 +90,8 @@ class IngestChecksumCheckTest {
     @DisplayName("the last version without a checksum is whole but unproven")
     void anOlderVersionIsLegacyUnprotected(CountMarkedFormat format, @TempDir Path dataDir)
             throws IOException {
+        assumeTrue(format.firstChecksummedVersion() > format.oldestVersion(),
+            "a format born with its checksum has no version without one");
         Path file = dataDir.resolve(fileName(format));
         int version = format.firstChecksummedVersion() - 1;
         Files.writeString(file, format.headerMarker() + "|" + version + "\n" + record(format)
@@ -178,6 +183,7 @@ class IngestChecksumCheckTest {
             case DOCUMENT_REGISTRY -> "document-registry";
             case SOURCE_CATALOG -> SourceCatalog.FILE;
             case SOURCE_STATUS -> SourceStatusFile.FILE;
+            case ERASURE_RECEIPTS -> ErasureReceiptFile.FILE;
         };
     }
 
@@ -186,6 +192,7 @@ class IngestChecksumCheckTest {
             case DOCUMENT_REGISTRY -> "docs|a.txt|1000|4242|128|2000|docs:a.txt:chunk:0";
             case SOURCE_CATALOG -> "filesystem|a|shared|root_path=/a";
             case SOURCE_STATUS -> "a|idle|1.0|3|0|1|0|1000";
+            case ERASURE_RECEIPTS -> "r-1|1000|docs|document|1|0|0|0|0|0|shared=1+1";
         };
     }
 
@@ -209,6 +216,12 @@ class IngestChecksumCheckTest {
                 SourceStatusFile.open(dataDir).write(List.of(
                     new SourceStatusFile.Entry("a", "idle", 1.0, 3, 0, 1, 0, 1000L, null)));
                 yield dataDir.resolve(SourceStatusFile.FILE);
+            }
+            case ERASURE_RECEIPTS -> {
+                ErasureReceiptFile.open(dataDir).record(new ErasureReceiptFile.Receipt("r-1",
+                    1000L, "docs", "document", 1, 0, 0, 0, false, false,
+                    List.of(new ErasureReceiptFile.GraphRequests("shared", List.of(1L)))));
+                yield dataDir.resolve(ErasureReceiptFile.FILE);
             }
         };
     }

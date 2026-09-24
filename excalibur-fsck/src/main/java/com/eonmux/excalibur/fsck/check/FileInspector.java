@@ -147,6 +147,8 @@ public final class FileInspector {
                 file, relative, CountMarkedFormat.SOURCE_CATALOG);
             case SOURCE_STATUS -> CountMarkedTextCheck.check(
                 file, relative, CountMarkedFormat.SOURCE_STATUS);
+            case ERASURE_RECEIPTS -> CountMarkedTextCheck.check(
+                file, relative, CountMarkedFormat.ERASURE_RECEIPTS);
             case IN_FLIGHT_JOURNAL -> InFlightJournalCheck.check(file, relative);
             case LEXICAL_STORE_PART, LEXICAL_KEY_LOOKUP -> unverifiable(file, relative,
                 "lexical store sidecar",

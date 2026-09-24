@@ -376,6 +376,12 @@ public final class RepairPlanner {
                 + "this file from the segment's names on its next open whether or not it is "
                 + "moved; moving it aside only means "
                 + "the damaged copy is no longer read first and rejected"
+            : kind == FileKind.ERASURE_RECEIPTS
+            ? "Every byte is preserved under the quarantine directory. The node would read "
+                + "these receipts as empty on its next start whether or not they are moved, so "
+                + "the erasures they described answer GET /v1/erasure/{request_id} as unknown; "
+                + "the erasure obligations themselves are in each namespace's erasure log and "
+                + "are untouched either way"
             : kind.discardedOnOpen()
             ? "Every byte is preserved under the quarantine directory. The node would read "
                 + "this history as empty on its next start whether or not it is moved, and "

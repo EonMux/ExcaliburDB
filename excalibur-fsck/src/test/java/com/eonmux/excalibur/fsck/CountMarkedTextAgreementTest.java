@@ -6,6 +6,8 @@ import com.eonmux.excalibur.fsck.check.CountMarkedTextCheck;
 import com.eonmux.excalibur.fsck.check.FileCheck;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
+import com.eonmux.excalibur.ingest.registry.ErasureReceiptFile;
+
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
 import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
 import com.eonmux.excalibur.ingest.source.SourceDescriptor;
@@ -216,6 +218,7 @@ class CountMarkedTextAgreementTest {
                 }
             }
             case SOURCE_STATUS -> SourceStatusFile.open(dataDir).loaded().isEmpty();
+            case ERASURE_RECEIPTS -> ErasureReceiptFile.open(dataDir).size() == 0;
         };
     }
 
@@ -245,6 +248,15 @@ class CountMarkedTextAgreementTest {
                     new SourceStatusFile.Entry("a", "idle", 1.0, 3, 0, 1, 0, 1000L, null),
                     new SourceStatusFile.Entry("b", "idle", 1.0, 5, 0, 0, 2, 2000L, "boom")));
                 return dataDir.resolve(SourceStatusFile.FILE);
+            }
+            case ERASURE_RECEIPTS -> {
+                ErasureReceiptFile receipts = ErasureReceiptFile.open(dataDir);
+                receipts.record(new ErasureReceiptFile.Receipt("r-1", 1000L, "docs", "document",
+                    1, 0, 0, 0, false, true, List.of()));
+                receipts.record(new ErasureReceiptFile.Receipt("r-2", 2000L, "docs", "source",
+                    2, 0, 1, 0, true, false,
+                    List.of(new ErasureReceiptFile.GraphRequests("shared", List.of(4L, 5L)))));
+                return dataDir.resolve(ErasureReceiptFile.FILE);
             }
             default -> throw new IllegalArgumentException("No writer for " + format);
         }

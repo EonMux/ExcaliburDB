@@ -47,9 +47,35 @@ class SourceStatusCheckTest {
     }
 
     @Test
-    void onlyTheStatusHistoryIsDiscardedByTheNodeOnOpen() {
+    void onlyTheReportsAreDiscardedByTheNodeOnOpen() {
         assertThat(Arrays.stream(FileKind.values()).filter(FileKind::discardedOnOpen))
-            .containsExactly(FileKind.SOURCE_STATUS);
+            .containsExactlyInAnyOrder(FileKind.SOURCE_STATUS, FileKind.ERASURE_RECEIPTS);
+    }
+
+    @Test
+    void erasureReceiptsAreClassifiedAndADamagedSetIsQuarantinedNotCountedAsDamage(
+            @TempDir Path dataDir) throws IOException {
+        assertThat(FileClassifier.classify("erasure-receipts"))
+            .isEqualTo(FileKind.ERASURE_RECEIPTS);
+        assertThat(FileClassifier.classify("erasure-receipts.tmp"))
+            .isEqualTo(FileKind.STAGING_LEFTOVER);
+        Files.writeString(dataDir.resolve("erasure-receipts"),
+            "\\#erasure-receipts|1\nr|1|docs|document|1|0|0|0|0|0|\n\\#end|1|00000000\n");
+
+        DataDirectoryScan scan = new DataDirectoryScanner(dataDir).scan();
+        FileCheck check = scan.files().stream()
+            .filter(file -> file.relative().equals("erasure-receipts"))
+            .findFirst()
+            .orElseThrow();
+
+        assertThat(check.status()).isEqualTo(CheckStatus.CORRUPT);
+        assertThat(check.format()).isEqualTo("erasure receipts");
+        assertThat(scan.hasDamage()).isFalse();
+        assertThat(RepairPlanner.plan(scan).actions()).anySatisfy(action -> {
+            assertThat(action.relative()).isEqualTo("erasure-receipts");
+            assertThat(action.kind()).isEqualTo(RepairKind.QUARANTINE_CORRUPT_FILE);
+            assertThat(action.rationale()).contains("erasure log");
+        });
     }
 
     @Test
