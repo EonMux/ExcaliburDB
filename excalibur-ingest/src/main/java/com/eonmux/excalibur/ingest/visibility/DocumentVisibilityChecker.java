@@ -8,7 +8,8 @@ import java.util.Set;
  *
  * <p>This interface abstracts the document visibility checking mechanism,
  * allowing the query pipeline to work with different visibility tracking
- * implementations (DocumentVisibilityRegistry, DocumentVisibilityTracker, etc.).</p>
+ * implementations. A node uses {@link DocumentVisibilityTracker}, through
+ * {@link DocumentVisibilityTrackerAdapter}.</p>
  *
  * <h2>Document Atomicity Contract</h2>
  * <p>Implementations must ensure that:</p>

@@ -210,8 +210,10 @@ final class SourceReindexPass {
         Removals removals = new Removals();
         ReindexCancelledException cancelled = null;
         try {
-            // Only removals are safe to apply before the replacement content exists; see
-            // UpsertHandler.processDeletions.
+            // Only removals are safe to apply before the replacement content exists: a changed
+            // document removed now and then failing to re-embed would be lost in both forms.
+            // Changed documents retire their surplus chunks after publishing instead; see
+            // UpsertHandler.tombstoneObsoleteChunks.
             removeDeleted(sourceId, changeSet, stop, removals, resultBuilder);
 
             for (String newDocId : changeSet.getNewDocuments()) {

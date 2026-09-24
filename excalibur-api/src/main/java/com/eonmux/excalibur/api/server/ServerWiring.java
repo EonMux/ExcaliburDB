@@ -17,6 +17,8 @@ import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
+import com.eonmux.excalibur.ingest.registry.ErasureReceiptFile;
+
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
 import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
 import com.eonmux.excalibur.ingest.source.SourceResolver;
@@ -142,6 +144,7 @@ final class ServerWiring {
 
     /** What this node has ingested, or null on a node that keeps no record of it. */
     private volatile DocumentRegistry documentRegistry;
+    private volatile ErasureReceiptFile erasureReceipts;
 
     /** The expander the lexical half widens queries with, or null on a node with none. */
     private volatile com.eonmux.excalibur.retrieval.expand.QueryExpander queryExpander;
@@ -319,6 +322,11 @@ final class ServerWiring {
     /** @param service The service behind {@code POST /v1/erasure}, or null to omit the route */
     void withDocumentErasure(DocumentErasureService service) {
         this.documentErasure = service;
+    }
+
+    /** @param receipts Where document erasures leave their receipts, or null for none */
+    void withErasureReceipts(ErasureReceiptFile receipts) {
+        this.erasureReceipts = receipts;
     }
 
     /** @param registry What this node holds, or null to omit {@code GET /v1/documents/list} */
@@ -525,6 +533,29 @@ final class ServerWiring {
             chunkIndex,
             ingestSourceRegistry, sourceCatalog, ingestionStatusRegistry, ingestionOrchestrator,
             reindexStatusRegistry, documentReindexer, resolver, reindexCoordinator,
-            documentErasure, graphTenants, graphIngestSink, graphPipeline, documentRegistry);
+            documentErasure, graphTenants, graphIngestSink, graphPipeline, documentRegistry,
+            erasureReceipts);
+    }
+
+    /**
+     * The collaborators a caller in the same process searches, supplies and erases through.
+     *
+     * <p>Read at the same point {@link #endpointInputs()} is, and for the same reason: after
+     * every attachment, so the pipeline is the one ingestion wrapped and not the one it was
+     * handed.</p>
+     *
+     * @return The node's services, as the routes would have used them
+     * @throws IllegalStateException if the node was assembled without ingestion, a document
+     *                               registry or an erasure service, which an in-process caller
+     *                               has no other way to reach
+     */
+    InProcessServices inProcessServices() {
+        if (ingestionOrchestrator == null || documentRegistry == null || documentErasure == null) {
+            throw new IllegalStateException("An in-process node needs its ingestion pipeline, its "
+                + "document registry and its erasure service attached before it starts");
+        }
+        return new InProcessServices(config, storageEngine, queryPipeline, embeddingClient,
+            lexicalQueryService, ingestionOrchestrator, documentRegistry, documentErasure,
+            sourceCatalog);
     }
 }

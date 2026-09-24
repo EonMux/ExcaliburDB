@@ -306,9 +306,9 @@ class JmxMBeanIntegrationTest {
         ObjectName throughputName = new ObjectName("com.eonmux.excalibur:type=IngestionThroughput");
 
         // Record some ingestion entries
-        Metrics.recordIngestEntry();
-        Metrics.recordIngestEntry();
-        Metrics.recordIngestEntry();
+        Metrics.recordIngestEntries(1);
+        Metrics.recordIngestEntries(1);
+        Metrics.recordIngestEntries(1);
 
         // Read entriesIngested via JMX
         Object entriesIngested = mbeanServer.getAttribute(throughputName, "entriesIngested");

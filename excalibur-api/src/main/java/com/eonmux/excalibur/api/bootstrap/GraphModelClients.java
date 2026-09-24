@@ -15,8 +15,8 @@ import java.util.Objects;
  * a build writes.
  *
  * <h2>Why one per node, not one per graph</h2>
- * <p>A circuit breaker describes an endpoint, and every graph on a node calls the same endpoint
- * with the same key: {@code excalibur.llm.*} is node configuration, not namespace configuration.
+ * <p>A circuit breaker describes an endpoint, and every graph on a node calls the same endpoints
+ * with the same keys: {@code excalibur.llm.*} is node configuration, not namespace configuration.
  * A client per opened graph gave that one endpoint a breaker per namespace, which is wrong in
  * three ways at once. A provider outage had to fail {@code failure-threshold} calls in every
  * namespace before the node stopped making them. Reopening a graph - after every build, every
@@ -33,8 +33,8 @@ import java.util.Objects;
  * vectors with nothing but a log line to say why.</p>
  *
  * <h2>Why the build and the question embed through different clients</h2>
- * <p>Both read the same {@code excalibur.llm.*} settings - one base URL, one key, one embedding
- * model - so one client would be defensible if a breaker only described the endpoint. It also
+ * <p>Both read the same embedding endpoint - one base URL, one key, one embedding model - so one
+ * client would be defensible if a breaker only described the endpoint. It also
  * decides what stops, and the two stop different things at very different cost. A question
  * embedding is one short text per query, and an open breaker costs that query its exact vector
  * rerank and nothing after it. A build embedding is a bulk batch of entity documents, and an open
@@ -48,7 +48,7 @@ import java.util.Objects;
  *
  * <h2>Created when first needed</h2>
  * <p>Each client comes into existence when it is first needed, not when the node starts: the
- * rerank client with the first graph opened on a node that has a key, the
+ * rerank client with the first graph opened on a node whose chat endpoint is in use, the
  * question-embedding client with the first graph built with entity vectors, and the build's with
  * the first build that embeds an entity. Until then the node has no such client, and
  * {@link #rerankBreaker()}, {@link #queryEmbeddingBreaker()} and {@link #buildEmbeddingBreaker()}
@@ -62,39 +62,47 @@ import java.util.Objects;
  */
 public final class GraphModelClients {
 
-    /** How to reach the model, or null on a node with no API key. */
-    private final LLMClientConfig clientConfig;
+    /** How to reach the chat model, or null on a node whose chat endpoint is not in use. */
+    private final LLMClientConfig chatConfig;
+
+    /** How to reach the embedding model, or null on a node that embeds nothing. */
+    private final LLMClientConfig embeddingConfig;
 
     private final Object creation = new Object();
     private volatile LLMHttpClient rerankClient;
     private volatile EmbeddingClient queryEmbeddingClient;
     private volatile EmbeddingClient buildEmbeddingClient;
 
-    private GraphModelClients(LLMClientConfig clientConfig) {
-        this.clientConfig = clientConfig;
+    private GraphModelClients(LLMClientConfig chatConfig, LLMClientConfig embeddingConfig) {
+        this.chatConfig = chatConfig;
+        this.embeddingConfig = embeddingConfig;
     }
 
     /**
      * The clients a node with this configuration shares between its graphs.
      *
+     * <p>Each role is decided the way the rest of the node decides it - by
+     * {@link RetrievalCapabilities} - so a graph never reranks through a chat endpoint that
+     * ingestion considers off, or embeds entities on a node whose corpus has no vectors.</p>
+     *
      * @param config Configuration, read for the LLM settings
-     * @return The shared clients; ones that will never create anything on a node without a key
+     * @return The shared clients; for a role that is not in use, ones that never create anything
      */
     public static GraphModelClients forConfig(Config config) {
         Objects.requireNonNull(config, "config cannot be null");
-        String apiKey = config.llm().getApiKey();
-        return new GraphModelClients(apiKey == null || apiKey.isBlank()
-            ? null
-            : LLMClientConfig.fromConfig(config.llm()));
+        RetrievalCapabilities capabilities = RetrievalCapabilities.from(config.llm());
+        return new GraphModelClients(
+            capabilities.chatModel() ? LLMClientConfig.forChat(config.llm()) : null,
+            capabilities.embedCorpus() ? LLMClientConfig.forEmbeddings(config.llm()) : null);
     }
 
     /**
      * The chat client graph retrieval reranks through, created on first call.
      *
-     * @return The client, or null on a node with no API key
+     * @return The client, or null on a node whose chat endpoint is not in use
      */
     LLMHttpClient rerankClient() {
-        if (clientConfig == null) {
+        if (chatConfig == null) {
             return null;
         }
         LLMHttpClient client = rerankClient;
@@ -102,7 +110,7 @@ public final class GraphModelClients {
             synchronized (creation) {
                 client = rerankClient;
                 if (client == null) {
-                    client = new LLMHttpClient(clientConfig);
+                    client = new LLMHttpClient(chatConfig);
                     rerankClient = client;
                 }
             }
@@ -113,10 +121,10 @@ public final class GraphModelClients {
     /**
      * The embedding client graph retrieval embeds a question through, created on first call.
      *
-     * @return The client, or null on a node with no API key
+     * @return The client, or null on a node that embeds nothing
      */
     EmbeddingClient queryEmbeddingClient() {
-        if (clientConfig == null) {
+        if (embeddingConfig == null) {
             return null;
         }
         EmbeddingClient client = queryEmbeddingClient;
@@ -124,7 +132,7 @@ public final class GraphModelClients {
             synchronized (creation) {
                 client = queryEmbeddingClient;
                 if (client == null) {
-                    client = new EmbeddingClient(clientConfig);
+                    client = new EmbeddingClient(embeddingConfig);
                     queryEmbeddingClient = client;
                 }
             }
@@ -135,10 +143,10 @@ public final class GraphModelClients {
     /**
      * The embedding client graph builds embed entity documents through, created on first call.
      *
-     * @return The client, or null on a node with no API key
+     * @return The client, or null on a node that embeds nothing
      */
     EmbeddingClient buildEmbeddingClient() {
-        if (clientConfig == null) {
+        if (embeddingConfig == null) {
             return null;
         }
         EmbeddingClient client = buildEmbeddingClient;
@@ -146,7 +154,7 @@ public final class GraphModelClients {
             synchronized (creation) {
                 client = buildEmbeddingClient;
                 if (client == null) {
-                    client = new EmbeddingClient(clientConfig);
+                    client = new EmbeddingClient(embeddingConfig);
                     buildEmbeddingClient = client;
                 }
             }
@@ -161,10 +169,10 @@ public final class GraphModelClients {
      * a tenant can hold an embedder from the moment it opens without that bringing a client -
      * and a breaker to report - into existence before any build has embedded anything.</p>
      *
-     * @return The embedder, or null on a node with no API key
+     * @return The embedder, or null on a node that embeds nothing
      */
     GraphDirectoryBuilder.EntityEmbedder entityEmbedder() {
-        if (clientConfig == null) {
+        if (embeddingConfig == null) {
             return null;
         }
         return texts -> buildEmbeddingClient().embedBatch(texts);
@@ -191,7 +199,7 @@ public final class GraphModelClients {
      * vector rerank, ranking by BM25 (and the model rerank, if that breaker is closed).</p>
      *
      * @return The breaker, or null where no graph on this node has entity vectors to rerank
-     *         against, or the node has no API key
+     *         against, or the node embeds nothing
      */
     public CircuitBreaker queryEmbeddingBreaker() {
         EmbeddingClient client = queryEmbeddingClient;
@@ -206,7 +214,7 @@ public final class GraphModelClients {
      * vector rerank until a later build embeds them.</p>
      *
      * @return The breaker, or null where no build on this node has embedded an entity, or the
-     *         node has no API key
+     *         node embeds nothing
      */
     public CircuitBreaker buildEmbeddingBreaker() {
         EmbeddingClient client = buildEmbeddingClient;
@@ -215,14 +223,15 @@ public final class GraphModelClients {
 
     @Override
     public String toString() {
-        return "GraphModelClients[" + (clientConfig == null ? "no model" : "rerank="
-            + (rerankClient == null ? "unused" : rerankClient.getCircuitBreaker().getState())
+        return "GraphModelClients[rerank="
+            + (chatConfig == null ? "no model" : rerankClient == null
+                ? "unused" : rerankClient.getCircuitBreaker().getState())
             + ", queryEmbedding="
-            + (queryEmbeddingClient == null
+            + (embeddingConfig == null ? "no model" : queryEmbeddingClient == null
                 ? "unused" : queryEmbeddingClient.getCircuitBreaker().getState())
             + ", buildEmbedding="
-            + (buildEmbeddingClient == null
-                ? "unused" : buildEmbeddingClient.getCircuitBreaker().getState()))
+            + (embeddingConfig == null ? "no model" : buildEmbeddingClient == null
+                ? "unused" : buildEmbeddingClient.getCircuitBreaker().getState())
             + "]";
     }
 }

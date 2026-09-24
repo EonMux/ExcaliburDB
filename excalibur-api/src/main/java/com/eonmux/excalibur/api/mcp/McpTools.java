@@ -8,6 +8,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.regex.Pattern;
 
+import com.eonmux.excalibur.graph.browse.EdgeDirection;
 import com.eonmux.excalibur.retrieval.pipeline.TraversalDirection;
 import com.eonmux.excalibur.tenancy.NamespaceId;
 
@@ -58,6 +59,12 @@ import com.eonmux.excalibur.tenancy.NamespaceId;
  * name or entity id, which means choosing among people who share a name - a judgement a model
  * would make on the evidence of the graph it is erasing from. Erasing a document already
  * withdraws every fact extracted from it, which is the erasure a model is asked for.</p>
+ *
+ * <p>Nor is retracting an asserted fact. {@link #ASSERT_GRAPH_FACTS} is here because stating a
+ * fact is additive and, until a build, invisible; {@code DELETE /v1/graph/facts} is not, because
+ * a retraction is recorded as a graph erasure - irreversible once compacted - and matching by
+ * subject, relation and object retracts every asserted statement of that triple, including ones a
+ * person made. It stays with the erasure routes.</p>
  *
  * <p>{@link #DEREGISTER_SOURCE} and the {@code cancel_*} tools destroy nothing. Deregistering
  * keeps every document the source contributed, and a cancelled run keeps what it had already
@@ -160,6 +167,14 @@ public final class McpTools {
      * that could name another path segment is let through.
      */
     private static final Pattern QUERY_ID = Pattern.compile("[A-Za-z0-9-]{1,64}");
+    /** Find entities in the served graph by name, and learn their ids. */
+    public static final String FIND_GRAPH_ENTITIES = "find_graph_entities";
+
+    /** List the facts the served graph holds about one entity. */
+    public static final String GRAPH_ENTITY_EDGES = "graph_entity_edges";
+
+    /** State facts for the graph to hold after its next build. */
+    public static final String ASSERT_GRAPH_FACTS = "assert_graph_facts";
 
     private final ExcaliburClient client;
 
@@ -258,8 +273,9 @@ public final class McpTools {
                     null))));
 
         tools.add(ToolSchema.tool(BUILD_GRAPH,
-            "Turn the facts ingestion has extracted into the graph that search_graph reads. Run it "
-            + "once after ingesting documents and again after ingesting more; until it has run, "
+            "Turn the facts ingestion has extracted into the graph that search_graph reads. The "
+            + "server does this by itself once ingestion has been quiet for a while (a minute by "
+            + "default); call this to publish what was ingested now. Until a build has run, "
             + "search_graph reports that no graph is being served. This call only starts the "
             + "build and returns immediately - on a real corpus the build takes minutes - so "
             + "poll " + GRAPH_BUILD_STATUS + " until its state is no longer 'running' to learn "
@@ -277,7 +293,11 @@ public final class McpTools {
             + "many edges, entities and relations were published, and 'staged_facts': when that "
             + "is 0 nothing was extracted, which usually means ingestion has not finished or the "
             + "server has extraction disabled. A cancelled build published nothing and the "
-            + "namespace is still serving the graph it had.",
+            + "namespace is still serving the graph it had. 'freshness.behind_staging' says "
+            + "whether ingested changes are not yet in the graph search_graph reads, and "
+            + "'automatic.state' what the server is doing about it: 'pending' until it rebuilds "
+            + "by itself, 'running', 'current', or 'paused', 'backing_off' or 'disabled' when "
+            + "it will not without " + BUILD_GRAPH + ".",
             ToolSchema.object(
                 ToolSchema.optional("namespace", "string",
                     "Namespace whose build to report on. Omit for the configured default, or "
@@ -468,6 +488,104 @@ public final class McpTools {
             ToolSchema.object(
                 ToolSchema.required("source_id", "string",
                     "The source to stop crawling, as it was registered."))));
+
+        tools.add(ToolSchema.tool(FIND_GRAPH_ENTITIES,
+            "Find entities in the graph " + SEARCH_GRAPH + " reads, by exact name or by the start "
+            + "of a name, ignoring case; with neither, list every entity in name order. Each "
+            + "result carries the entity's 'id', its 'name', and how many facts it is the "
+            + "subject ('out_degree') and object ('in_degree') of. Use it to learn what "
+            + "extraction produced, to check how a name was spelt, or to get the id "
+            + GRAPH_ENTITY_EDGES + " needs; two entities can share a name ignoring case, and "
+            + "they are different entities. Results come a page at a time: when 'next_cursor' "
+            + "is not null, call again with it as 'cursor' and the same other arguments for the "
+            + "next page. Reads only the graph being served, so it needs " + BUILD_GRAPH
+            + " to have run; a 503 means none is being served in that namespace.",
+            ToolSchema.object(
+                ToolSchema.optional("name", "string",
+                    "The whole name to match, ignoring case and surrounding space. Give this "
+                    + "or 'prefix', not both.", null),
+                ToolSchema.optional("prefix", "string",
+                    "Match names starting with this, ignoring case.", null),
+                ToolSchema.optionalInteger("limit",
+                    "Most entities per page, up to 500. Omit for the server's default of 50.",
+                    1),
+                ToolSchema.optional("cursor", "string",
+                    "The 'next_cursor' of the previous page, passed back unchanged. Omit for "
+                    + "the first page.", null),
+                ToolSchema.optional("namespace", "string",
+                    "Namespace to read. Omit for the configured default, or the shared one.",
+                    null))));
+
+        tools.add(ToolSchema.tool(GRAPH_ENTITY_EDGES,
+            "List the facts the served graph holds about one entity, named by the 'id' "
+            + FIND_GRAPH_ENTITIES + " returned: outgoing ones (the entity is the subject) first, "
+            + "then incoming ones. Each fact carries its subject and object with their ids, its "
+            + "relation, the interval it held over ('valid_from' null for an unknown start, "
+            + "'valid_to' null while it still holds), a confidence between 0 and 1, and its "
+            + "provenance: 'DOCUMENT' for a fact extracted from an ingested document, "
+            + "'USER_ASSERTED' for one stated through " + ASSERT_GRAPH_FACTS + ", which also "
+            + "carries its 'fact_id'. Unlike " + SEARCH_GRAPH + " this answers no question and "
+            + "ranks nothing: it is the record, all of it, a page at a time - follow "
+            + "'next_cursor' as " + FIND_GRAPH_ENTITIES + " does. An id the graph does not "
+            + "hold is a 404.",
+            ToolSchema.object(
+                ToolSchema.required("entity_id", "integer",
+                    "The entity's id, from " + FIND_GRAPH_ENTITIES + " or from an earlier "
+                    + "listing of edges."),
+                ToolSchema.optional("relation", "string",
+                    "Only facts with this relation, spelt as extraction spells one: lower case, "
+                    + "words joined by underscores ('worked with' is read as 'worked_with'). "
+                    + "Omit for every relation.", null),
+                ToolSchema.optionalChoice("direction",
+                    "'out' for the facts the entity is the subject of, 'in' for those it is the "
+                    + "object of, 'both' for either. Omit for both.", edgeDirectionNames()),
+                ToolSchema.optional("as_of", "string",
+                    "Only facts that held at this point in valid time: an ISO-8601 date "
+                    + "('2019-03-01') or instant ('2019-03-01T14:00:00Z'). Omit, or send 'all', "
+                    + "for every fact whenever it held, including ones since superseded.", null),
+                ToolSchema.optionalInteger("limit",
+                    "Most facts per page, up to 500. Omit for the server's default of 50.", 1),
+                ToolSchema.optional("cursor", "string",
+                    "The 'next_cursor' of the previous page, passed back unchanged. Omit for "
+                    + "the first page.", null),
+                ToolSchema.optional("namespace", "string",
+                    "Namespace to read. Omit for the configured default, or the shared one.",
+                    null))));
+
+        tools.add(ToolSchema.tool(ASSERT_GRAPH_FACTS,
+            "State facts for the graph to hold, as subject, relation and object, when you know "
+            + "something the ingested documents do not say or say wrongly. Each fact is staged "
+            + "with 'USER_ASSERTED' provenance and given a 'fact_id' of its own, which the reply "
+            + "lists. Staged is not served: the facts reach " + SEARCH_GRAPH + ", "
+            + FIND_GRAPH_ENTITIES + " and " + GRAPH_ENTITY_EDGES + " only once the graph is "
+            + "next built, so call " + BUILD_GRAPH + " afterwards when they are needed now. "
+            + "Name entities exactly as the graph already names them - check with "
+            + FIND_GRAPH_ENTITIES + " - or the fact attaches to a new entity with the other "
+            + "spelling. There is no tool to retract a fact; a person does that over the HTTP "
+            + "API, so assert only what you are sure of. Any malformed fact refuses the whole "
+            + "call, and nothing is staged.",
+            ToolSchema.object(
+                ToolSchema.requiredObjectArray("facts",
+                    "The facts to stage; 1 to 64 per call.",
+                    ToolSchema.required("subject", "string",
+                        "The entity the fact is about, at most 200 characters."),
+                    ToolSchema.required("relation", "string",
+                        "How the subject relates to the object, e.g. 'founded' or 'worked with'; "
+                        + "stored lower case with spaces as underscores. At most 200 "
+                        + "characters."),
+                    ToolSchema.required("object", "string",
+                        "The entity or value on the other side, at most 200 characters."),
+                    ToolSchema.optional("valid_from", "string",
+                        "The first day the fact held, as an ISO-8601 date. Omit when not "
+                        + "known.", null),
+                    ToolSchema.optional("valid_to", "string",
+                        "The first day it no longer held, as an ISO-8601 date. Omit while it "
+                        + "still holds.", null),
+                    ToolSchema.optional("confidence", "number",
+                        "How sure the statement is, from 0 to 1. Omit for 1.", null)),
+                ToolSchema.optional("namespace", "string",
+                    "Namespace to stage into. Omit for the configured default, or the shared "
+                    + "one.", null))));
 
         addReadingTools(tools);
         addStoppingTools(tools);
@@ -680,6 +798,9 @@ public final class McpTools {
                 case CANCEL_GRAPH_BUILD -> answer(client.delete("/v1/graph/build", scope(args)));
                 case ERASE_DOCUMENTS -> eraseDocuments(args);
                 case DELETE_NAMESPACE -> deleteNamespace(args);
+                case FIND_GRAPH_ENTITIES -> findGraphEntities(args);
+                case GRAPH_ENTITY_EDGES -> graphEntityEdges(args);
+                case ASSERT_GRAPH_FACTS -> assertGraphFacts(args);
                 default -> ToolResult.error("No such tool: " + name);
             };
         } catch (IllegalArgumentException e) {
@@ -1012,6 +1133,77 @@ public final class McpTools {
         Map<String, Object> body = Json.object();
         body.put("source_id", ToolArguments.requiredString(args, "source_id"));
         return answer(client.delete("/v1/ingest", Json.write(body), null));
+    }
+
+    private ToolResult findGraphEntities(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        String name = ToolArguments.optionalString(args, "name");
+        String prefix = ToolArguments.optionalString(args, "prefix");
+        if (name != null && prefix != null) {
+            return ToolResult.error("Give 'name' or 'prefix', not both.");
+        }
+        Map<String, String> query = new LinkedHashMap<>();
+        query.put("name", name);
+        query.put("prefix", prefix);
+        putPage(args, query);
+        return answer(client.get("/v1/graph/entities", query, scope(args)));
+    }
+
+    private ToolResult graphEntityEdges(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        Long entityId = ToolArguments.wholeLong(args, "entity_id");
+        if (entityId == null) {
+            return ToolResult.error("Argument 'entity_id' is required.");
+        }
+        if (entityId < 0) {
+            return ToolResult.error("Argument 'entity_id' must not be negative, got: "
+                + entityId);
+        }
+        Map<String, String> query = new LinkedHashMap<>();
+        query.put("relation", ToolArguments.optionalString(args, "relation"));
+        // Checked here as search_graph checks its direction, so a misspelt one is refused naming
+        // the three it could have been.
+        String direction = ToolArguments.optionalString(args, "direction");
+        query.put("direction", direction == null ? null : EdgeDirection.parse(direction).wireName());
+        query.put("as_of", ToolArguments.optionalString(args, "as_of"));
+        putPage(args, query);
+        return answer(client.get("/v1/graph/entities/" + entityId + "/edges", query,
+            scope(args)));
+    }
+
+    private ToolResult assertGraphFacts(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        // Forwarded as written, as add_documents forwards its documents: the node cleans and
+        // bounds each fact exactly as it does an extracted one, and answers the first it refuses
+        // naming the fact and the field.
+        List<Object> facts = ToolArguments.optionalList(args, "facts");
+        if (facts == null || facts.isEmpty()) {
+            return ToolResult.error("'facts' is required and must carry at least one fact.");
+        }
+        Map<String, Object> body = Json.object();
+        body.put("facts", facts);
+        return answer(client.post("/v1/graph/facts", Json.write(body), scope(args)));
+    }
+
+    /** The directions graph_entity_edges accepts, as a request spells them. */
+    private static List<String> edgeDirectionNames() {
+        List<String> names = new ArrayList<>();
+        for (EdgeDirection direction : EdgeDirection.values()) {
+            names.add(direction.wireName());
+        }
+        return names;
+    }
+
+    /**
+     * Copies the paging arguments into a listing's query, absent staying absent.
+     *
+     * @param args  The call's arguments
+     * @param query The query being built
+     */
+    private static void putPage(Map<String, Object> args, Map<String, String> query) {
+        Integer limit = ToolArguments.wholeNumber(args, "limit");
+        query.put("limit", limit == null ? null : limit.toString());
+        query.put("cursor", ToolArguments.optionalString(args, "cursor"));
     }
 
     /**

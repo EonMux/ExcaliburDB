@@ -12,6 +12,7 @@ import com.eonmux.excalibur.fsck.check.FileKind;
 import com.eonmux.excalibur.fsck.check.GraphStagingCheck;
 import com.eonmux.excalibur.fsck.check.GraphStoreCheck;
 import com.eonmux.excalibur.fsck.check.LexicalStoreCheck;
+import com.eonmux.excalibur.graph.staging.FactIdFloor;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.retrieval.lexical.native_.DocumentErasureLog;
 import com.eonmux.excalibur.retrieval.lexical.native_.LexicalSidecars;
@@ -301,6 +302,10 @@ public final class RepairPlanner {
                 "this is the text entities are ranked by and embedded from, so the next build "
                     + "would rank every entity with none, and an erasure aimed at the prose in it "
                     + "would find nothing to erase while the moved copy still held it";
+            case FactIdFloor.FILE_NAME ->
+                "the node would number fact ids from the highest asserted fact still staged and "
+                    + "the clock, so once the newest assertions have been erased and the clock "
+                    + "set back it could hand out an id a client still holds";
             case GraphStagingCheck.WITHDRAWAL_LOG ->
                 "it records the staged facts of replaced and removed documents that are still "
                     + "to be withdrawn, so those facts would stay in the graph with nothing left "
@@ -376,6 +381,12 @@ public final class RepairPlanner {
                 + "this file from the segment's names on its next open whether or not it is "
                 + "moved; moving it aside only means "
                 + "the damaged copy is no longer read first and rejected"
+            : kind == FileKind.ERASURE_RECEIPTS
+            ? "Every byte is preserved under the quarantine directory. The node would read "
+                + "these receipts as empty on its next start whether or not they are moved, so "
+                + "the erasures they described answer GET /v1/erasure/{request_id} as unknown; "
+                + "the erasure obligations themselves are in each namespace's erasure log and "
+                + "are untouched either way"
             : kind.discardedOnOpen()
             ? "Every byte is preserved under the quarantine directory. The node would read "
                 + "this history as empty on its next start whether or not it is moved, and "
@@ -446,14 +457,20 @@ public final class RepairPlanner {
         switch (finding.kind()) {
             case "catalog-names-missing-segment" ->
                 dropRecord(scan, finding, actions);
-            case "index-without-segment" ->
-                quarantineByRelative(scan, finding.subject(), actions,
-                    RepairKind.QUARANTINE_ORPHANED_INDEX,
-                    "It belongs to a segment that is not in this directory, so nothing will "
-                        + "open it and nothing will rebuild it in place. Every byte is "
-                        + "preserved under the quarantine directory - which matters most for "
-                        + "a write-ahead log, whose unintegrated records are the only copy "
-                        + "of themselves left");
+            case "index-without-segment" -> {
+                // Not a file that could not be read: its own verdict puts it to an operator,
+                // and an orphan in a newer build's format is most likely a directory a newer
+                // build has been running on, where moving files aside is not this build's call.
+                if (!isUnreadable(scan, finding.subject())) {
+                    quarantineByRelative(scan, finding.subject(), actions,
+                        RepairKind.QUARANTINE_ORPHANED_INDEX,
+                        "It belongs to a segment that is not in this directory, so nothing will "
+                            + "open it and nothing will rebuild it in place. Every byte is "
+                            + "preserved under the quarantine directory - which matters most for "
+                            + "a write-ahead log, whose unintegrated records are the only copy "
+                            + "of themselves left");
+                }
+            }
             case "staging-leftover" -> {
                 // A graph staging rewrite is left for the node, which deletes it on open: it
                 // may hold what an erasure removed, and quarantine would keep every byte.
@@ -466,7 +483,8 @@ public final class RepairPlanner {
                 }
             }
             case "routing-names-missing-segment", "lexical-segment-missing",
-                 "lexical-column-missing" ->
+                 "lexical-column-missing",
+                 com.eonmux.excalibur.fsck.check.DataDirectoryScanner.INTERRUPTED_RESTORE ->
                 operator.add(finding.subject() + ": " + finding.detail());
             case CrossFileChecks.PENDING_MAPPING -> {
                 // Named rather than left to the default, because this is the one finding
@@ -477,6 +495,22 @@ public final class RepairPlanner {
                 // A warning with no action: reported by the survey, nothing to decide.
             }
         }
+    }
+
+    /**
+     * Reports whether the survey could not read a file far enough to judge it.
+     *
+     * @param scan     The survey
+     * @param relative The file's path relative to the data directory
+     * @return true if the file's verdict is {@link CheckStatus#UNREADABLE}
+     */
+    private static boolean isUnreadable(DataDirectoryScan scan, String relative) {
+        for (FileCheck file : scan.files()) {
+            if (file.relative().equals(relative)) {
+                return file.status() == CheckStatus.UNREADABLE;
+            }
+        }
+        return false;
     }
 
     /**

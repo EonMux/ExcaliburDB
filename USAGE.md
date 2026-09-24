@@ -10,7 +10,8 @@ scoring on top.
 # 1. Build the fat JAR
 ./gradlew :excalibur-api:shadowJar
 
-# 2. Set your LLM API key (required for embeddings/scoring)
+# 2. Set your LLM API key for the hosted default endpoint (optional: without a model the node
+#    answers from BM25; a local Ollama/vLLM/TGI server needs no key - see "Keyless local models")
 export EXCALIBUR_LLM_API_KEY=sk-your-openai-key
 
 # 2b. Allow-list the directory you want indexed. Empty means DISABLED, not unrestricted,
@@ -77,7 +78,8 @@ curl http://localhost:8080/v1/stats
   (`-Xmx2g` appears in the build only for the test JVM.) Size it deliberately: Lucene's inverted
   index works on the heap while the vector and graph columns are memory-mapped outside it, so both
   budgets are real and they compete for the same machine.
-- An **LLM API key** if you want embeddings or relevancy scoring (OpenAI-compatible)
+- An **OpenAI-compatible model endpoint** if you want embeddings or relevancy scoring: a hosted
+  one with its API key, or a local Ollama, vLLM or TGI server, which needs none
 
 ## Installation
 
@@ -225,8 +227,8 @@ uid `10001`, with the jar owned by `root` and read-only to the process. Nothing 
 | Secrets | None are in the image. Pass `EXCALIBUR_LLM_API_KEY` at run time, or mount a properties file and point `--config` at it — arguments after the image name reach the application |
 | Heap | `-XX:MaxRAMPercentage=60.0`, so the same image is right under any `docker run -m`. Not 75%: segments live in mapped arenas outside the heap, and a heap that crowds out the page cache turns every search into a disk read |
 | Heap dumps | Written on an out-of-memory exit to `/var/lib/excalibur-diagnostics`, not the data directory. Mount a volume there to keep one past `docker rm` |
-| Operator tools | `excalibur-fsck` and `excalibur-backup` are on the `PATH`. Run them with the node stopped, against the same volume; a repair needs `/var/lib/excalibur-quarantine` mounted, and a snapshot `/var/lib/excalibur-backups` — see below |
-| Health | `HEALTHCHECK` polls `/health/ready` with a 90s start period, which covers segment recovery on a large data directory |
+| Operator tools | `excalibur-fsck` and `excalibur-backup` are on the `PATH`. Run them with the node stopped, against the same volume; a repair needs `/var/lib/excalibur-quarantine` mounted, and a snapshot or restore `/var/lib/excalibur-backups` — see below. A repair, snapshot or restore against a volume a node is running on is refused (exit `4` from `excalibur-fsck`, `7` from `excalibur-backup`) |
+| Health | `HEALTHCHECK` runs `/opt/excalibur/bin/excalibur-healthcheck` every 15s, with a 90s start period that covers segment recovery on a large data directory. It probes liveness, `/health`, at the URL the node recorded as `health-url=` in `/var/lib/excalibur/.excalibur-lock` once its listener was bound — so the scheme, port and bind address are always the node's own. Liveness, because a health check drives restarts, and a drained or recovering node is alive. With `tls-client-auth=need`, give it a client certificate through `EXCALIBUR_HEALTHCHECK_CLIENT_CERT` and `EXCALIBUR_HEALTHCHECK_CLIENT_KEY` |
 | Stop | The JVM is pid 1, so `SIGTERM` reaches the shutdown hook. The hook publishes the chunk index's buffer, which is the tail of an ingestion run, and closes the storage engine. It does all of this within `excalibur.api.shutdown-timeout-seconds` (30 by default). Give it that plus 10: `--stop-timeout 40`, or `terminationGracePeriodSeconds: 40`, and more if you raise the setting |
 
 Bind-mounting a host directory instead of a named volume means `chown 10001:10001` on it first;
@@ -256,8 +258,20 @@ docker run --rm -v excalibur-data:/var/lib/excalibur \
   --entrypoint excalibur-backup excalibur \
   snapshot --data-dir /var/lib/excalibur --out /var/lib/excalibur-backups/$(date +%F)
 
+# Restore an image over the volume. /var/lib/excalibur is a mount point, which cannot be
+# renamed, so restore works inside it; --force because the volume holds a data directory.
+docker run --rm -v excalibur-data:/var/lib/excalibur \
+  -v excalibur-backups:/var/lib/excalibur-backups \
+  --entrypoint excalibur-backup excalibur \
+  restore --snapshot /var/lib/excalibur-backups/2026-09-14 --target /var/lib/excalibur --force
+
 docker start excalibur
 ```
+
+Each of these takes the data directory's lock, so run against a volume whose node is still up, a
+repair exits `4`, and a snapshot or a restore `7`, each naming the node's pid; nothing is written.
+The containers inherit the image's `HEALTHCHECK`, which has no node to ask in them; add
+`--no-healthcheck` to a long snapshot or restore if its health status matters to you.
 
 The data and the quarantine are two mounts, which no rename can cross, so `excalibur-fsck` copies
 each file it sets aside, forces the copy to disk and compares it byte for byte before removing the
@@ -345,6 +359,8 @@ Property keys convert to env vars by uppercasing and replacing `.` / `-` with `_
 |---|---|
 | `excalibur.llm.api-key` | `EXCALIBUR_LLM_API_KEY` |
 | `excalibur.llm.base-url` | `EXCALIBUR_LLM_BASE_URL` |
+| `excalibur.llm.embedding-base-url` | `EXCALIBUR_LLM_EMBEDDING_BASE_URL` |
+| `excalibur.llm.chat-api-key` | `EXCALIBUR_LLM_CHAT_API_KEY` |
 | `excalibur.query.top-k-default` | `EXCALIBUR_QUERY_TOP_K_DEFAULT` |
 
 Only variables starting with `EXCALIBUR_` are processed — other env vars (`HOME`, `PATH`, etc.) are ignored.
@@ -354,7 +370,8 @@ Only variables starting with `EXCALIBUR_` are processed — other env vars (`HOM
 The most important knobs:
 
 ```properties
-# LLM (required for embeddings; optional for scoring)
+# LLM. The hosted default needs a key (better supplied as EXCALIBUR_LLM_API_KEY); any other
+# OpenAI-compatible server is called without one.
 excalibur.llm.api-key=sk-...
 # Either spelling works: the clients append /v1/embeddings themselves and a trailing
 # /v1 is stripped rather than duplicated.
@@ -365,6 +382,8 @@ excalibur.llm.embeddings-dimensions=1536
 # Set false to skip the corpus embedding pass and keep the chat model: retrieval becomes
 # BM25 over the chunk index with the query expanded by the chat model.
 excalibur.llm.embeddings-enabled=true
+# Set false to keep the embedding pass and make no chat calls at all.
+excalibur.llm.chat-enabled=true
 
 # Query
 excalibur.query.top-k-default=100
@@ -403,14 +422,15 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `GET` | `/v1/version` | bearer | Which build and JVM this process is running |
 | `POST` | `/v1/drain` | bearer | Report unready, so a load balancer stops choosing this node |
 | `DELETE` | `/v1/drain` | bearer | Report ready again |
-| `GET` | `/v1/query/status` | bearer | Queries in flight, with the ids `DELETE /v1/query/{id}` takes |
+| `GET` | `/v1/query/status` | bearer | Queries in flight, corpus and graph, with the ids `DELETE /v1/query/{id}` takes |
 | `POST` | `/v1/query` | bearer | Search the corpus: BM25, vector, or the two fused, depending on what the node holds |
 | `GET` | `/v1/documents` | bearer | Read one chunk's text, by `document_id` |
 | `POST` | `/v1/documents/fetch` | bearer | Read the text of a page of chunks |
-| `GET` | `/v1/documents/list` | bearer | Which documents this node holds, with their chunk ids. `404` on a node that keeps no document registry |
+| `GET` | `/v1/documents/list` | bearer | Which documents this node holds, with their chunk ids; with `document_id`, one document's chunks in order. `404` on a node that keeps no document registry |
 | `POST` | `/v1/documents` | bearer | Index documents supplied in the request. `503` on a node with no ingestion pipeline |
-| `DELETE` | `/v1/query/{query_id}` | bearer | Cancel an in-progress query |
+| `DELETE` | `/v1/query/{query_id}` | bearer | Cancel an in-progress query, from `/v1/query` or `/v1/graph/query` |
 | `POST` | `/v1/ingest` | bearer | Register an ingestion source |
+| `PUT` | `/v1/ingest` | bearer | Replace a registered source's configuration, keeping its history and documents |
 | `GET` | `/v1/ingest` | bearer | Read back what every source was registered as |
 | `DELETE` | `/v1/ingest` | bearer | Stop crawling a source, keeping its documents |
 | `DELETE` | `/v1/ingest/run` | bearer | Stop the ingestion run in flight, keeping the source registered |
@@ -419,22 +439,29 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `DELETE` | `/v1/reindex` | bearer | Ask a running re-index to stop |
 | `GET` | `/v1/reindex/status` | bearer | Per-source re-index status |
 | `POST` | `/v1/erasure` | bearer | Remove named documents from the corpus, and withdraw what was extracted from them into the graph |
+| `GET` | `/v1/erasure/{request_id}` | bearer | Where one document erasure stands, from its receipt |
 | `POST` | `/v1/compact` | bearer | Reclaim the space tombstoned entries still hold, now rather than on the next sweep |
 | `DELETE` | `/v1/compact` | bearer | Ask the compaction in progress to stop |
 | `GET` | `/v1/compact/status` | bearer | What the last compaction examined, reclaimed and failed on |
-| `POST` | `/v1/graph/query` | bearer | Answer a question from the graph |
+| `POST` | `/v1/graph/query` | bearer | Answer a question from the graph, within `timeout_ms` |
+| `GET` | `/v1/graph/entities` | bearer | List the served graph's entities, by exact `name` or name `prefix`, a page at a time. `503` while no graph is served |
+| `GET` | `/v1/graph/entities/{entity_id}` | bearer | One entity: its name, its degree, and each relation's count in each direction. `404` for an id the served graph does not hold |
+| `GET` | `/v1/graph/entities/{entity_id}/edges` | bearer | An entity's edges, filtered by `relation`, `direction` and `as_of`, each with its interval, confidence and provenance |
+| `POST` | `/v1/graph/facts` | bearer | Stage facts a caller states, as `USER_ASSERTED`, returning their fact ids. `201`; served once the graph is next built |
+| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | Retract an asserted fact - by id, or every one stating a `subject`, `relation` and `object` given as query parameters. `202`; served until a compaction applies it, which `compact=true` runs now |
 | `POST` | `/v1/graph/build` | bearer | Start publishing the facts ingestion has staged as the served graph. `202`; the build runs behind the response. `409` while one is already running |
 | `DELETE` | `/v1/graph/build` | bearer | Stop the build in progress. It publishes nothing; the namespace keeps the graph it had |
-| `GET` | `/v1/graph/build/status` | bearer | What the build is doing, and what the last one published |
+| `GET` | `/v1/graph/build/status` | bearer | What the build is doing, what the last one published, whether the served graph is behind what is staged, and what the node's automatic build is doing about it |
 | `POST` | `/v1/graph/erasure` | bearer | Record an obligation to erase, and compact when it is due. `404` for an entity, by name or `entity_id`, that nothing in the namespace holds, and nothing is recorded |
-| `GET` | `/v1/graph/namespaces` | bearer | The namespaces on disk, a page at a time (`limit`, default 100, at most 1000; `cursor`): whether each is open, whether it has built a graph, what it has staged and what it still owes |
+| `GET` | `/v1/graph/erasure/{request_id}` | bearer | Where one graph erasure obligation stands, in the namespace the header names |
+| `GET` | `/v1/graph/namespaces` | bearer | The namespaces on disk, a page at a time (`limit`, default 100, at most 1000; `cursor`): whether each is open, whether it has built a graph, what it has staged, whether its graph is behind that, and what it still owes |
 | `PUT` | `/v1/graph/namespaces/{namespace}` | bearer | Create a namespace. `201` when created, `200` when it already existed; `429 namespace_limit_reached` past `excalibur.graph.max-namespaces` |
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | Remove a namespace entirely - its graph, its staged facts and its erasure log. Irreversible; `409` for `shared` |
 
 All request/response bodies are JSON. Request size limit: **1 MB**, and a body over it is refused with `413` by every endpoint that reads one - split the payload rather than retrying it. The `GET` routes read no body, and neither do `POST` and `DELETE /v1/drain`,
 `DELETE /v1/query/{query_id}`, `DELETE /v1/compact`,
-`PUT` and `DELETE /v1/graph/namespaces/{namespace}`, `DELETE /v1/graph/build` or
-`POST /v1/graph/build`, so none of them ever produces a `413`.
+`PUT` and `DELETE /v1/graph/namespaces/{namespace}`, `DELETE /v1/graph/build`,
+`POST /v1/graph/build` or `DELETE /v1/graph/facts`, so none of them ever produces a `413`.
 
 A method a registered path does not serve is answered `405` on every path, and it is answered
 before authentication: the `405` is a routing answer, decided by the path and the method alone, so
@@ -445,20 +472,23 @@ naming the methods the path does serve, and `"code": "method_not_allowed"`. That
 single-method routes as much as for the ones that answer two or three methods: `GET /health`,
 `GET /health/ready`, `GET /v1/stats`, `GET /metrics`, `GET /v1/version`, `GET /v1/query/status`,
 `DELETE /v1/ingest/run`, `GET /v1/ingest/status`, `GET /v1/documents/list`,
-`GET /v1/reindex/status`, `POST /v1/erasure`, `GET /v1/compact/status`, `POST /v1/graph/query`,
-`GET /v1/graph/build/status` and `POST /v1/graph/erasure` each answer any other method with `405`
-rather than `401`, and a wrong method on a mutating route costs a read, not a mutation. A
-collection and its members are separate paths with separate methods: `/v1/query` serves `POST`
-and `/v1/query/{query_id}` serves `DELETE`, so `DELETE /v1/query` with no id is a `405` naming
-`POST`; `/v1/graph/namespaces` serves `GET` and `/v1/graph/namespaces/{namespace}` serves
-`PUT` and `DELETE`, so a `DELETE` of the collection or a `GET` of one namespace is a `405` as
-well. A
-path that is not registered at all — including anything deeper than one segment beneath a
-collection — is `404`. `HEAD` is not served on any route and is answered `405` like any other
-method a path does not take.
+`GET /v1/reindex/status`, `POST /v1/erasure`, `GET /v1/erasure/{request_id}`,
+`GET /v1/compact/status`, `POST /v1/graph/query`, `GET /v1/graph/entities` and every path beneath
+it, `GET /v1/graph/build/status`, `POST /v1/graph/erasure` and `GET /v1/graph/erasure/{request_id}`
+each answer any other method with `405` rather than `401`, and a wrong method on a mutating route
+costs a read, not a mutation. A collection and its members are separate paths with separate
+methods: `/v1/query` serves `POST` and `/v1/query/{query_id}` serves `DELETE`, so `DELETE /v1/query`
+with no id is a `405` naming `POST`; `/v1/erasure` and `/v1/graph/erasure` serve `POST` and their
+members `GET`; `/v1/graph/facts` serves `POST` and `/v1/graph/facts/{fact_id}` serves `DELETE`;
+`/v1/graph/namespaces` serves `GET` and `/v1/graph/namespaces/{namespace}` serves `PUT` and
+`DELETE`, so a `DELETE` of the collection or a `GET` of one namespace is a `405` as well. A path
+that is not registered at all — including anything deeper than one segment beneath a collection —
+is `404`. `HEAD` is not served on any route and is answered `405` like any other method a path does
+not take.
 
-Three routes that change what is registered — `POST /v1/ingest`, `DELETE /v1/ingest` and
-`POST /v1/erasure` — answer `503` when the change could not be recorded in the source catalog.
+Four routes that change what is registered — `POST /v1/ingest`, `PUT /v1/ingest`,
+`DELETE /v1/ingest` and `POST /v1/erasure` — answer `503` when the change could not be recorded
+in the source catalog.
 The registration itself is refused in that case rather than applied in memory alone: a source
 this node is crawling and has no record of is one that silently stops being crawled at the next
 restart.
@@ -480,7 +510,9 @@ that does not exist creates it, unless `excalibur.graph.require-explicit-namespa
 only `PUT /v1/graph/namespaces/{namespace}` creates one, and every other route answers a name
 nobody created with `404 namespace_not_found`, so a typo cannot become a tenant. Either way the
 node holds at most `excalibur.graph.max-namespaces` of them besides `shared`, and refuses another
-with `429 namespace_limit_reached`. A node holds one
+with `429 namespace_limit_reached`.
+`PUT /v1/ingest` reads it too, and refuses with `409 source_namespace_mismatch` a replacement that
+names a namespace other than the one the source was registered in. A node holds one
 corpus, so every other `/v1` route answers `400` when a request names a namespace rather than
 quietly serving the shared index — set the header to `shared` or leave it off. The probes and node-level routes (`/health`, `/health/ready`, `/metrics`,
 `/v1/version`, `/v1/drain`) ignore it. See
@@ -489,7 +521,11 @@ quietly serving the shared index — set the header to `shared` or leave it off.
 The `/v1/graph/*` routes are documented in the README, under
 [Graph Examples](README.md#graph-examples) for the request and response shapes. They are named
 here so the surface is complete in one table; the shapes are kept in one place rather than two so
-they cannot disagree.
+they cannot disagree. [Reading the graph by entity](README.md#reading-the-graph-by-entity) covers
+the entity listings, their cursors and filters, and
+[Stating facts](README.md#stating-facts) covers asserting and retracting facts: what a fact id is,
+why a stated fact is not served until the next build, and why a retracted one is served until a
+compaction applies the retraction.
 
 ### Error codes
 
@@ -928,6 +964,48 @@ in a source's configuration is secret today, but a read-back that echoes whateve
 becomes a way out for the first setting that is — a header, a cookie, a signed URL — and that
 change would be made in the registration code, not here.
 
+### Replace a source's configuration
+
+Changes what a registered source crawls — a narrower root, a new filter, a gentler crawl delay —
+without deregistering it. The body is the one `POST /v1/ingest` takes, validated the same way:
+the same required fields, the same bounds, the same allow-lists.
+
+```bash
+curl -X PUT http://localhost:8080/v1/ingest \
+  -H "Content-Type: application/json" \
+  -d '{"source_type": "filesystem", "config": {"source_id": "project-docs",
+       "root_path": "/data/docs/handbook", "included_extensions": [".md"]}}'
+```
+
+**Response — `200 OK`**
+
+```json
+{"source_id": "project-docs", "source_type": "filesystem", "status": "updated"}
+```
+
+The source keeps its id, its namespace, its `/v1/ingest/status` history, its place in the
+re-crawl schedule and every document it already indexed. The new configuration is recorded in the
+source catalog before the running source is swapped, so `GET /v1/ingest` and every later restart
+show it; a catalog that cannot be written leaves the old configuration in force. No crawl is
+started: the next scheduled re-crawl uses the new configuration, or `POST /v1/reindex` runs one
+now. The whole configuration is replaced, not merged — a setting left out of the body goes back
+to its default. `source_type` may change too; the next crawl then removes whatever the old
+configuration indexed that the new one does not find.
+
+**Error — `404 Not Found`** — no source is running under that id. A catalog record the node could
+not start at boot (`registered: false` on `GET /v1/ingest`) is not running either; register it
+again with `POST`.
+
+**Error — `409 Conflict`** — a crawl or re-index of the source is running, and would carry on with
+the configuration it started with; send the replacement again once it has finished, or stop it —
+a crawl with `DELETE /v1/ingest/run`, a re-index with `DELETE /v1/reindex`. Also `409` when `X-Excalibur-Namespace` names a namespace other than
+the one the source was registered in: its documents' facts are already staged there, and moving a
+source is a deregistration and a new registration.
+
+**Error — `400 Bad Request`**, **`403 Forbidden`**, **`413 Payload Too Large`** — as for
+`POST /v1/ingest`. **`503 Service Unavailable`** — the catalog could not be written, or the node is
+shutting down; nothing was changed.
+
 ### Check progress
 
 **Request — all sources**
@@ -1053,8 +1131,8 @@ A reindex of the source reports on `GET /v1/reindex/status` instead and leaves t
 crawled, so the documents that exist are counted into `entries_pending` and none were indexed, and
 `last_error` says where the reason is — the startup log, under `Failed to configure ingestion
 pipeline`. It is deliberately not reported as `idle` at `progress: 1.0`, which would make a node
-that indexes nothing at all look exactly like a successful run. A missing API key is not this
-state: that node has a pipeline and indexes lexically.
+that indexes nothing at all look exactly like a successful run. A node with no model in use is not
+this state: that node has a pipeline and indexes lexically.
 
 ### Supply documents directly
 
@@ -1087,8 +1165,9 @@ searchable — not that indexing was scheduled. That is the difference from `POS
 answers as soon as the source is registered and leaves the crawl to run behind the response,
 because a crawl is of unknown size and duration.
 
-On a node with `excalibur.graph.extraction-enabled=true` and an LLM API key (without one,
-extraction is inactive and `/v1/graph/build` reports `"extraction": "missing_api_key"`), the facts
+On a node with `excalibur.graph.extraction-enabled=true` and a chat endpoint in use (without one,
+extraction is inactive and `/v1/graph/build` reports `"extraction": "missing_api_key"`, or
+`"chat_disabled"` when `excalibur.llm.chat-enabled=false`), the facts
 extracted from supplied
 documents are staged into the `shared` namespace's graph, ready for the next
 `POST /v1/graph/build` there. That is fixed rather than chosen per request: this route refuses the
@@ -1123,8 +1202,11 @@ chunk — and only with its latest version.
 Graph facts go with it too. Every fact and snippet staged from a document carries the same source
 id whatever version it came from, so a replacement withdraws everything staged from the document —
 exactly as `/v1/erasure` does, labels excepted — before it stages what the new version says. The
-graph being served keeps what it was built from until the next `POST /v1/graph/build`, which no
-longer holds the earlier version's facts. A withdrawal rewrites the namespace's staging logs, so
+graph being served keeps what it was built from until the next build, which no longer holds the
+earlier version's facts. Nobody has to ask for it: the node rebuilds a namespace whose graph is
+behind its staging by itself, once staging has been quiet for
+`excalibur.graph.auto-build-debounce-seconds` (see [Keeping the graph current](README.md#keeping-the-graph-current));
+`POST /v1/graph/build` publishes it at once. A withdrawal rewrites the namespace's staging logs, so
 it is paid per replaced or removed document that had facts staged; one that fails is logged, counted in
 `graph.ingest.withdrawalFailures` on `/v1/stats` and retried until it is made, and the new
 version's facts are not staged, since the retry withdraws by document and would take them with the
@@ -1210,7 +1292,8 @@ staged in its place; and one its source no longer lists has everything staged fr
 All three go to the namespace the source was registered in, through the same reporting a crawl and
 `POST /v1/documents` use, so a re-crawl and a re-post of one document reach the graph in the order
 they were published. A node with no chat model extracts nothing, and a removal still withdraws.
-The graph being served changes at the next `POST /v1/graph/build`.
+The graph being served changes at the next build — the node's automatic one, or
+`POST /v1/graph/build`.
 
 A document is removed under the same per-document lock a publication or an erasure takes, and only
 if its registry entry is still the one the reindex read when it listed the source. One posted again
@@ -1597,6 +1680,69 @@ graph obligation — is a bare `500` with the detail in the log.
 registered. Not the same as a document that does not exist, which is a `200` with
 `documents_not_found`.
 
+### Where an erasure stands
+
+Every `POST /v1/erasure` answer begins with a `request_id`. That id reads the erasure back — after
+the response, after the graph half is compacted, after a restart:
+
+```bash
+curl http://localhost:8080/v1/erasure/0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11
+```
+
+```json
+{
+  "request_id": "0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11",
+  "state": "pending",
+  "requested_at_ms": 1757808123456,
+  "discharged_at_ms": null,
+  "source_id": "project-docs",
+  "scope": "document",
+  "documents_erased": 1,
+  "documents_incomplete": 0,
+  "documents_not_found": 0,
+  "documents_remaining": 0,
+  "source_deregistered": false,
+  "remaining": {"graph_requests_pending": 1, "lexical_reclamation_pending": false, "documents_incomplete": 0},
+  "graph": [{"namespace": "shared", "requests": 1, "pending": 1, "discharged": 0, "namespace_dropped": false}]
+}
+```
+
+`state` is the first of these that holds:
+
+| State | Meaning |
+|---|---|
+| `incomplete` | A document the request named is still held — the request answered `500`. Repeat it |
+| `pending` | A graph obligation it queued has not been discharged yet |
+| `applied` | Out of storage, the index and the graph, but the lexical index still keeps the removed chunks' bytes on disk until a compaction reclaims them |
+| `discharged` | Nothing the request removed remains anywhere the node keeps it. `discharged_at_ms` says when |
+
+`remaining` counts what is still owed; `graph` lists each namespace the request queued graph
+obligations in. A namespace dropped since (`DELETE /v1/graph/namespaces/{namespace}`) took
+everything in it along, so its requests count as discharged and it reports
+`namespace_dropped: true`. The lexical half is judged by time: the erasure counts as reclaimed once
+the index holds no outstanding erasure recorded at or before it. An `applied` state can therefore
+outlast its own reclamation while an older erasure still waits for a compaction, but it never
+reports a reclamation that has not happened.
+
+What answers is a receipt in `<data dir>/erasure-receipts`: the id, the time, the source, the scope,
+the counts and the graph request ids — never a document id, a name, or any content, so asking
+where an erasure stands can never bring back what it removed. The 1024 most recent receipts are
+kept; an older id is `404`, as is an id the node never issued. A receipt that could not be written
+does not undo the erasure: the answer still reports it, with `request_id: null`, and the failure is
+in the log.
+
+**Error — `400 Bad Request`** — the id is not one this node could have issued. **`405`** — any
+method but `GET`. **`503 Service Unavailable`** — the node keeps no receipts (an embedded server
+wired without them).
+
+The graph route has its own readback, `GET /v1/graph/erasure/{request_id}`, for obligations recorded
+with `POST /v1/graph/erasure`. It reads the namespace `X-Excalibur-Namespace` names — request ids
+are per namespace — and answers `pending` or `discharged`, with `requested_at_ms`,
+`discharged_at_ms`, the scope by id, and `remaining` while pending. The most recent 1024 completed
+requests of each namespace keep that detail; an older one still answers `discharged`, with its
+scope and timestamps null and `detail_retained: false`. An id the namespace never issued, or a
+namespace that does not exist, is `404`.
+
 ---
 
 ## Querying
@@ -1640,7 +1786,7 @@ curl -X POST http://localhost:8080/v1/query \
 
 The HTTP API intentionally does **not** accept pre-computed vectors. A vector is only meaningful in the embedding space of a specific model — if a client embeds with a different model than ingestion used, similarity scores become meaningless but still look plausible. Embedding is a server invariant, so the server owns both sides of it.
 
-If you need custom embeddings (e.g., a local model, a different provider), change the server config — `excalibur.llm.base-url`, `excalibur.llm.embedding-model`, and `excalibur.llm.api-key` work with any OpenAI-compatible embedding API (OpenAI, Ollama, vLLM, TGI, etc.).
+If you need custom embeddings (e.g., a local model, a different provider), change the server config — `excalibur.llm.embedding-base-url` (or `excalibur.llm.base-url` for both roles), `excalibur.llm.embedding-model`, and, only for a server that asks for one, `excalibur.llm.embedding-api-key` / `excalibur.llm.api-key` work with any OpenAI-compatible embedding API (OpenAI, Ollama, vLLM, TGI, etc.). See [Keyless local models](README.md#keyless-local-models).
 
 ### Response — `200 OK`
 
@@ -1836,8 +1982,8 @@ not threshold them against a number tuned on the vector path. That is why `thres
 as ignored rather than applied. With `llm_scored: true` a score is instead the model's 0–1
 judgement, and `llm_threshold` is what filtered it.
 
-Two ways to reach this path. With no API key it is plain BM25 — the startup log says so. With a
-key and `excalibur.llm.embeddings-enabled=false` the chat model is kept and spent on expanding the
+Two ways to reach this path. With no model in use it is plain BM25 — the startup log says so. With
+a chat endpoint and `excalibur.llm.embeddings-enabled=false` the chat model is kept and spent on expanding the
 query instead of on embedding every document, which is the deployment this path was built for: a
 few dozen generated tokens per query against billions of embedded tokens per corpus.
 
@@ -1933,7 +2079,7 @@ meaning of a question when there are no vectors, and here there are — so the l
 matches the words as typed, which makes it weaker than the same node would run with no embedding
 model at all. Whether that trade pays depends on the corpus, so
 `excalibur.query.expand-hybrid-queries=true` expands the lexical half as well, at one extra chat
-call per query. It requires `excalibur.llm.api-key`. The retrieval harness in `excalibur-bench`
+call per query. It requires a chat endpoint in use. The retrieval harness in `excalibur-bench`
 measures the two side by side on your corpus; see
 [Evaluating it](README.md#evaluating-it).
 
@@ -2020,10 +2166,10 @@ which is the largest unit anything in the index was embedded as.
 **`503 Service Unavailable` — no retrieval path configured**
 
 ```json
-{"error": "Server is not configured for text queries: this node has neither an embedding client nor a lexical index, so there is no index to search. Set excalibur.llm.api-key (or EXCALIBUR_LLM_API_KEY) so the server can embed queries with the same model that ingestion uses, or see the startup log for why the chunk lexical index was not opened.", "code": "not_configured"}
+{"error": "Server is not configured for text queries: this node has neither an embedding client nor a lexical index, so there is no index to search. Configure an embedding endpoint (excalibur.llm.embedding-base-url or excalibur.llm.base-url, with excalibur.llm.api-key for the hosted default) so the server can embed queries with the same model that ingestion uses, or see the startup log for why the chunk lexical index was not opened.", "code": "not_configured"}
 ```
 
-A missing embedding key alone does not produce this: without one the node answers from BM25
+A missing embedding endpoint alone does not produce this: without one the node answers from BM25
 instead — see **Degraded retrieval** above. Reaching 503 means the chunk lexical
 index failed to open as well. The body names the configuration key and nothing else — no paths,
 no exception text — so it stays safe to return to an unauthenticated caller while still being
@@ -2206,7 +2352,46 @@ limit it asked for would otherwise skip the documents it never received.
 **Error — `404 Not Found`** — the node keeps no document registry, so it has no record to read
 back. An empty listing would be indistinguishable from an empty corpus.
 
+### Read one document whole
+
+`document_id`, with the `source_id` it belongs to, turns the listing into a read of that one
+document: its fields and its chunks in the order it was chunked.
+
+```bash
+curl -G http://localhost:8080/v1/documents/list \
+  -H "Authorization: Bearer $EXCALIBUR_API_AUTH_TOKEN" \
+  --data-urlencode "source_id=notes" \
+  --data-urlencode "document_id=handbook.md" \
+  --data-urlencode "include_text=true"
+```
+
+```json
+{"source_id": "notes", "document_id": "handbook.md", "chunk_count": 2,
+ "content_length": 8241, "content_hash": "771002914",
+ "last_modified_ms": 1757807000000, "indexed_at_ms": 1757808123999,
+ "chunks": [
+   {"position": 0, "chunk_id": "notes:handbook.md:chunk:0", "text": "# Handbook ...", "text_truncated": false},
+   {"position": 1, "chunk_id": "notes:handbook.md:chunk:1", "text": "## Leave ...", "text_truncated": false}],
+ "returned": 2, "next_cursor": null}
+```
+
+`limit` counts chunks. Without `include_text` a page carries ids only, defaults to 100 and is
+capped at 1000. With it, each chunk also carries its text — clipped at
+`excalibur.api.max-result-text-chars` with `text_truncated` saying so, and `null` for a chunk the
+node no longer holds — and a page is capped at `excalibur.api.max-top-k`, the bound on one
+`POST /v1/documents/fetch`, because it is the same read.
+
+Page with `next_cursor` as above. The cursor carries the document's content hash: a document
+re-ingested between two pages has different chunks, and continuing it by position would splice two
+versions, so the old cursor is refused with **`409 Conflict`** and the read starts again.
+
+**Error — `400 Bad Request`** — `document_id` without `source_id` (a document id is unique only
+within its source), `include_text` that is neither `true` nor `false` or given without
+`document_id`, a limit over the cap, or a cursor issued for the listing rather than for a document.
+**`404 Not Found`** — the source holds no such document.
+
 ### Cancel a query
+
 
 **Request**
 
@@ -2256,6 +2441,12 @@ and lexical routes alike, and even when the search had already finished, because
 is written only once it can no longer be withdrawn. When this route answers `"cancelled": false` or
 `404`, the query was not withdrawn and answers as it would have. A query that misses its deadline
 is never reported cancelled, and is not "already cancelled" to this route.
+
+A graph question from `POST /v1/graph/query` is cancelled the same way, by the `query_id` its
+response carries or `/v1/query/status` lists. The walk stops where it is and a model call in flight
+— the question's embedding or the LLM rerank — is interrupted; the question then answers `200` with
+`"status": "cancelled"`, `"cancelled": true` and no context, by the same rule: once this route has
+answered `"cancelled": true`, the question is not answered.
 
 ---
 
@@ -2430,10 +2621,14 @@ curl -H "Authorization: Bearer $EXCALIBUR_API_AUTH_TOKEN" \
   "cancelled": 3,
   "queries": [
     {"query_id": "1f0c...", "correlation_id": "9c41e07a",
-     "started_at_ms": 1736899200000, "duration_ms": 91400, "cancelled": false}
+     "started_at_ms": 1736899200000, "duration_ms": 91400, "cancelled": false,
+     "kind": "corpus"}
   ]
 }
 ```
+
+`kind` is `corpus` for a `POST /v1/query` search and `graph` for a `POST /v1/graph/query`
+question. Both are listed, counted and cancelled alike.
 
 Longest-running first, so the query that will not finish is the first line. Its `query_id` is what
 `DELETE /v1/query/{query_id}` takes, which makes this the way to learn the id of a query you did not
@@ -2539,7 +2734,7 @@ shows up anywhere else:
   take the vector rerank away from every query, nor a burst of failed questions strip the vectors
   from a build. The three graph breakers are one each for the node, not one per namespace - every
   namespace's graph calls the same endpoint through the same client - and each appears once it is
-  first needed: `graphRerank` with the first graph on a node that has an API key,
+  first needed: `graphRerank` with the first graph on a node whose chat endpoint is in use,
   `graphQueryEmbedding` with the first graph built with entity vectors, and `graphBuildEmbedding`
   with the first build that embeds an entity (never, with `excalibur.graph.entity-vectors-enabled`
   off). All seven leave the node
@@ -2727,7 +2922,73 @@ curl http://localhost:8080/v1/compact/status
 
 Only the most recent run is kept; the next one replaces it.
 
+### Audit log
+
+Every request that changes what the node holds or how it behaves leaves exactly one event on the
+`excalibur.audit` logger — whether it succeeded, was refused, was unauthenticated or was rate
+limited, because the guard runs inside the audit and not before it. Reads are not audited.
+
+```json
+{"timestamp": "2026-09-23T22:17:29.114-0300", "logger": "excalibur.audit", "level": "INFO",
+ "message": "audit erasure.documents accepted status=202 request_id=op-42 client=203.0.113.7 targets={...}",
+ "audit_action": "erasure.documents", "audit_outcome": "accepted", "http_status": 202,
+ "request_id": "op-42", "client_address": "203.0.113.7",
+ "http_method": "POST", "http_path": "/v1/erasure",
+ "audit_targets": {"source_id": "project-docs", "scope": "document", "documents_named": 1,
+                   "request_id": "0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11"}}
+```
+
+| Action | Route |
+|---|---|
+| `source.register`, `source.update`, `source.deregister` | `POST`, `PUT`, `DELETE /v1/ingest` |
+| `ingest.cancel` | `DELETE /v1/ingest/run` |
+| `documents.supply` | `POST /v1/documents` |
+| `reindex.start`, `reindex.cancel` | `POST`, `DELETE /v1/reindex` |
+| `erasure.documents` | `POST /v1/erasure` |
+| `erasure.graph` | `POST /v1/graph/erasure` |
+| `compaction.start`, `compaction.cancel` | `POST`, `DELETE /v1/compact` |
+| `graph.build.start`, `graph.build.cancel` | `POST`, `DELETE /v1/graph/build` |
+| `graph.facts.assert`, `graph.facts.retract` | `POST /v1/graph/facts`, `DELETE /v1/graph/facts/{fact_id}` |
+| `graph.namespace.delete` | `DELETE /v1/graph/namespaces/{namespace}` |
+| `query.cancel` | `DELETE /v1/query/{query_id}` |
+| `node.drain`, `node.undrain` | `POST`, `DELETE /v1/drain` |
+
+`audit_outcome` is `success`, `accepted` (a `202`: recorded, finishing in the background),
+`rejected` (other `4xx`), `unauthenticated` (`401`), `rate_limited` (`429`), `failed` (`5xx`) or
+`error` (the handler threw before answering). `request_id` is the caller's `X-Request-Id` when it
+is 1–128 characters of `[A-Za-z0-9._:-]`, otherwise one the node generates; either way it comes
+back in the `X-Request-Id` response header, so a caller can quote it. `client_address` is resolved
+as rate limiting resolves it: the peer, or the `X-Forwarded-For` hop `excalibur.api.trusted-proxies`
+vouches for. The event's timestamp is when the request finished.
+
+`audit_targets` names identifiers and counts, never content. A graph erasure asked by name records
+`"entity_by": "name"` and the `request_id` it was given, not the name; a document erasure records
+its source and `documents_named`, not which documents. An audit trail is kept longer and read more
+widely than the data it describes, and copying an erased name into it would undo the erasure it
+records.
+
+The logger is pinned at `INFO` in the shipped `logback.xml`, so `EXCALIBUR_LOG_LEVEL=WARN` quiets
+the node without silencing its audit trail, and its events go to the same JSON stream as the rest.
+To keep them apart — a separate file, a separate retention, a separate shipper — copy the shipped
+`logback.xml`, give the logger its own appender with `additivity="false"`, and start the node with
+`-Dlogback.configurationFile` pointing at the copy:
+
+```xml
+<appender name="AUDIT_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>/var/log/excalibur/audit.json</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+        <fileNamePattern>/var/log/excalibur/audit.%d{yyyy-MM-dd}.json</fileNamePattern>
+        <maxHistory>365</maxHistory>
+    </rollingPolicy>
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
+</appender>
+<logger name="excalibur.audit" level="INFO" additivity="false">
+    <appender-ref ref="AUDIT_FILE"/>
+</logger>
+```
+
 ### Metrics
+
 
 `GET /metrics` serves the Prometheus text exposition format. A scrape config needs the bearer
 token, which every scraper supports:
@@ -2882,8 +3143,10 @@ the copy verifies faithfully without it:
   the seal a clean close writes. A node mapping names each node's chunk at version 3 and its
   document at versions 1 and 2; one at a version this build does not read fails the image.
 - Everything else goes to `excalibur-fsck`'s checkers, read-only, where the file lies — the same
-  dispatch `excalibur-fsck` surveys a live directory with. Write-ahead logs have every record
-  replayed against its checksum; `routing.dir` is checked against the CRC32C that ends it; the
+  dispatch `excalibur-fsck` surveys a live directory with. Write-ahead logs have their header's
+  CRC and format version checked and every record replayed against its checksum — a log with no
+  header, which an older build wrote, is healthy and unproven, and one a newer build wrote fails
+  the image; `routing.dir` is checked against the CRC32C that ends it; the
   lexical store is checked as one structure — its manifest against the CRC32C on its last line,
   every column of every segment the manifest names, each named segment's key table against
   `seg-N.keysum` and its tombstones against their CRC32C, and every line of `erasure.log`
@@ -2919,10 +3182,9 @@ the copy verifies faithfully without it:
 The report counts the structures proven and lists every one that was not, with why, rather than
 leaving them out, which would read as though nothing went unverified.
 
-Restoring verifies the image first, builds the tree beside the target, and renames it on in one
-move. It verifies to the same depth `verify` does by default — every length and CRC32C — and
-`restore --deep` adds the SHA-256 comparison and the format checkers, which is worth the time
-whenever the image has not already been through `verify --deep`:
+Restoring verifies the image first, to the same depth `verify` does by default — every length and
+CRC32C — and `restore --deep` adds the SHA-256 comparison and the format checkers, which is worth
+the time whenever the image has not already been through `verify --deep`:
 
 ```bash
 $B restore --snapshot /backups/excalibur-2026-09-14 --target /var/lib/excalibur/data --deep
@@ -2930,25 +3192,44 @@ $B restore --snapshot /backups/excalibur-2026-09-14 --target /var/lib/excalibur/
 
 An image that does not verify is refused and the target is left exactly as it was — exit 3, and
 nothing written. A target that already holds something needs `--force`, because a restore
-replaces a data directory wholesale rather than merging into one. Afterwards, start the node
-against it: it rediscovers the segments from the catalog, replays each write log, and serves the
-same answers the node it was taken from served. No import step and no reindex.
+replaces a data directory wholesale rather than merging into one; a lock file a stopped node left
+does not count. A target a node, a repair or another restore holds is refused with exit 7.
+Afterwards, start the node against it: it rediscovers the segments from the catalog, replays each
+write log, and serves the same answers the node it was taken from served. No import step and no
+reindex.
+
+The target is replaced in place — never renamed — so it can be a mount point such as a container
+volume, and only the target itself has to be writable. Under the target's lock, the image is
+copied into `.excalibur-restore-staging-*` inside the target and forced to disk; then the
+target's previous entries are moved into `.excalibur-restore-replaced-*` and the staged ones into
+place, one rename each, and both scratch directories are deleted. Each phase is recorded in a
+journal, `.excalibur-restore`, before it starts:
+
+| If it stops... | ...the target holds | and then |
+|---|---|---|
+| while the image is copied | its previous contents, untouched | the next restore discards the partial copy |
+| on a rename that fails | its previous contents, put back on the spot | the error says so; nothing else to do |
+| on a crash while entries move | a mixture, with the journal | the node refuses to start on it and `excalibur-fsck` reports it; run the same restore again, which completes it — or, if it was unwinding, undoes it — before anything else |
+
+At no point are the previous contents deleted before every entry of the image is in place.
 
 **Take the image with the node stopped.** The state is spread over many files, written two
 different ways: the catalog, the manifests and the registries are replaced by an atomic rename,
 while the segments, their write logs and the HNSW graphs are written in place through their
-mappings. Nothing orders one file against another, and nothing locks the directory. A copy taken
-while the node is writing can catch a catalog naming a segment the copy does not yet hold, or a
-mapping caught half-flushed. A clean `SIGTERM` shutdown is the only moment at which every file
-describes the same instant.
+mappings. Nothing orders one file against another. A copy taken while the node is writing can
+catch a catalog naming a segment the copy does not yet hold, or a mapping caught half-flushed. A
+clean `SIGTERM` shutdown is the only moment at which every file describes the same instant.
 
-The tool enforces this as far as it can: it fingerprints the directory before and after the copy
-and refuses an image whose source moved underneath it, with exit 5. That check is one-sided — it
-can prove a node *was* running, never that one was not — so `--allow-live` downgrades the refusal
-to a warning and stamps the image `LIVE_UNSAFE` rather than claiming a consistency it cannot
-establish. There is no online-backup mode. Stopping the background workers while the write path
-kept accepting writes would produce something that looked like a consistent image and was not,
-which is worse than having none.
+The tool enforces this two ways. A running node holds an exclusive operating-system lock on its
+data directory, the file `.excalibur-lock`, and the snapshot takes the same lock for the length of
+the copy: a directory a node holds is refused with exit 7, naming the node's pid, and a node
+started during the copy fails to start. It also fingerprints the directory before and after the
+copy and refuses an image whose source moved underneath it, with exit 5 — which catches a writer
+that does not take the lock, such as an older build. `--allow-live` downgrades both refusals to a
+warning and stamps the image `LIVE_UNSAFE` rather than claiming a consistency it cannot
+establish. The lock file is never copied into an image. There is no online-backup mode. Stopping
+the background workers while the write path kept accepting writes would produce something that
+looked like a consistent image and was not, which is worse than having none.
 
 If a hot copy is the only option, take it knowing what it is worth. Every write-log append is
 fsynced before it is acknowledged, so the acknowledged writes are on disk; what an inconsistent
@@ -3075,6 +3356,14 @@ The `erasure.interrupted` marker beside them says the graph is withheld until th
 owes are applied. The node writes it empty and reads only whether it is there, so an empty one is
 `INTACT`, and one holding bytes is `UNCHECKED`.
 
+`asserted.last-id` beside them is not a log but one checksummed value: the highest fact id the
+namespace has handed out to `POST /v1/graph/facts`. It is recorded before any id in it is
+returned, so ids stay unique after the newest asserted facts have been retracted or erased and the
+clock set back. A record that matches its checksum is `INTACT` and names that id; any other is
+`CORRUPT` and left for an operator, since the node refuses to assert facts in that namespace until
+it is restored from a backup or removed. A leftover `asserted.last-id.writing` is an unfinished
+rewrite the node deletes on open.
+
 A namespace's built graph, `<namespace>/graph/`, is checked as one structure, by the same checks the
 node runs before it serves one:
 
@@ -3127,6 +3416,10 @@ Three files are judged by what the node does with them rather than by name alone
   lookup tables under `corruptRebuiltOnOpen` rather than as damage, and moved aside by the repair
   plan — what is lost either way is the history, never indexed data. As with a lookup table, one
   the operating system will not read is `UNREADABLE` and fails the run.
+- **`erasure-receipts`, what each recent document erasure did**, is checked and excused the same
+  way: its format is the same count-marked, checksummed layout, and the node discards a set it
+  cannot read. What is lost is the readback, `GET /v1/erasure/{request_id}` answering `404` for the
+  erasures it described — never the erasures, which were carried out when they were requested.
 - **`segment_<N>.hnsw.compact.docmap`, a compaction's staged mapping**, means one of two things.
   Beside `segment_<N>.hnsw.compact`, the compaction never swapped its graph in: both are staging
   leftovers the node would discard, and the repair moves the mapping aside before the graph —
@@ -3153,7 +3446,9 @@ the tool writes, stating each write before it makes it, and **no repair ever del
   place, through the engine's own catalog code — rather than cut out.
 - A write-ahead log ending in a torn record, an append that never completed, has that record's
   opcode cleared in place: the one-byte write the log itself makes when an append fails its fsync,
-  after which the log reads as ending before it.
+  after which the log reads as ending before it. A log whose header was torn as it was created,
+  with nothing written behind it, has the header's first byte cleared the same way; the node writes
+  a fresh header when it next opens the log, as it would have without the repair.
 
 The quarantine is a timestamped directory beside the data directory unless
 `--quarantine-dir=<path>` names another; the default needs the data directory's parent to be
@@ -3174,14 +3469,21 @@ quarantine and the original directory removed. What it refuses to attempt matter
 | A damaged `catalog.dat` | Segment files are rediscovered on start-up, but lifecycle state, integrated offsets, source ids and epochs live only there. A node that starts without them looks like a first start |
 | A damaged `routing.dir`, or a slot pointing at a missing segment | Which hash slot belongs to which segment after a split is not derivable from file names. That is why the directory is written down |
 | A write-ahead log damaged in the middle | The records behind the damage were fsynced and acknowledged. Trimming past them would destroy committed writes, and so would moving the file aside — nothing rebuilds a log the way a reindex rebuilds an index |
+| A write-ahead log whose header is damaged, with records behind it | The version the header names cannot be believed, and the records behind it were acknowledged. It is damage, not a newer build's log — whose header's checksum would match — so restore the segment from a backup or a replica |
 | A damaged `segment_<N>.hnsw.compact.docmap` with no `.hnsw.compact` beside it | The graph already holds the compacted numbering, and without this mapping it would be served through the pre-compaction one — wrong documents rather than an error. Restore the graph and both mappings together, or reindex the segment |
 | A damaged lexical store `manifest` | A store without its manifest opens as a new, empty index and deletes every segment the empty manifest does not name. Restore the manifest from a backup, or remove the whole `chunk-index` directory and reindex |
 | A damaged built graph with a `graph.previous` or `graph.retired` beside it | With the graph moved away the node would restore that copy and serve it, and a copy an erasure compaction replaced still holds what the erasure removed. Start the node once, which deletes the copy beside a served graph, or delete the copy, then repair again — or `POST /v1/graph/build`, which replaces the damaged graph without either. The move is checked again as it is made |
 | A damaged built graph beside a damaged label interner | The graph's dictionary may be all that still names the ids past the interner's damage. Moved away, the node would cut those ids off and hand them to new labels, serving one entity under another's name. Restore the namespace's `graph-staging` directory and graph from a backup. The move is checked again as it is made |
 | A damaged graph staging log | Nothing rebuilds one, and the node opens a missing one as empty. Moved aside, a label interner hands its ids out again under the published graph, so entities are served under other entities' names; `triples.log` empties the next graph build; `entity_text.log` leaves entities nothing to be ranked or embedded by; `erasure.log` and `withdrawals.log` forget what is still owed. Restore the namespace's `graph-staging` directory from a backup, all its logs together, since they refer to one another by id |
-| Anything `UNREADABLE` | A device or permission problem, or a header naming a format version a newer build wrote. Either way nothing is known about the contents, and a newer build's file is not damaged |
+| Anything `UNREADABLE` | A device or permission problem, or a header naming a format version a newer build wrote. Either way nothing is known about the contents, and a newer build's file is not damaged. A newer build's write-ahead log is never trimmed, and is not moved aside even when its segment is gone |
 
-Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself failed — which says nothing about the directory and must not be read as `0`.
+Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself failed — which says nothing about the directory and must not be read as `0` — and `4` `--repair` was refused because a node or another tool holds the directory.
+
+`--repair` takes the data directory's lock before reading anything, so it can never write under a
+live node, and a node cannot start while it runs. A check without `--repair` writes nothing and
+proceeds against a held directory, warning that the files may change under it. A data directory
+holding `.excalibur-restore` — a restore that was interrupted — is reported as damage for the
+operator: re-run the same `excalibur-backup restore`, which finishes or undoes it.
 
 ---
 
@@ -3189,11 +3491,11 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `Server is not configured for text queries: this node has neither an embedding client nor a lexical index` | Not a missing API key on its own — without one the node still answers from BM25. Both retrieval paths are gone, so the chunk lexical index also failed to open | Search the startup log for `Chunk lexical index unavailable` and fix what it names (usually the data directory); set `EXCALIBUR_LLM_API_KEY` as well if you want vector retrieval |
+| `Server is not configured for text queries: this node has neither an embedding client nor a lexical index` | Not a missing model on its own — without one the node still answers from BM25. Both retrieval paths are gone, so the chunk lexical index also failed to open | Search the startup log for `Chunk lexical index unavailable` and fix what it names (usually the data directory); configure an embedding endpoint as well if you want vector retrieval |
 | Results look like noise / no relevant matches | The `excalibur.llm.embedding-model` config changed between ingestion and query runs | Reingest with the current model — old vectors are incompatible once the embedding model changes |
 | `Field 'query' is required and must be non-empty` | Request body is missing the `query` field | Send the query text in the `query` field; the HTTP API does not accept raw vectors — see [Why no client-side vectors?](#why-no-client-side-vectors) |
 | `hnsw.queueDepth` keeps growing | Integration worker falling behind | Check logs for errors; slow down ingestion; increase hardware |
-| All LLM calls failing | A circuit breaker tripped. Embeddings, relevancy scoring, query expansion, relation extraction, the graph rerank, the graph question embedding and the graph build's entity embedding each have their own, so check which on `breakers` in `/v1/stats`: relevancy scoring stopping while ingestion continues is `llmRelevancy`, the reverse is `embedding`, queries losing their expansions is `queryExpansion`, a graph that stopped growing is `graphExtraction`, graph answers no longer reranked by the model is `graphRerank` (or `graphQueryEmbedding` for the vector rerank), and a build that published entities without vectors is `graphBuildEmbedding` | Wait for the cooldown (default 60s), after which one probe is admitted. Confirm API key/endpoint. Queries still work without LLM scoring. |
+| All LLM calls failing | A circuit breaker tripped. Embeddings, relevancy scoring, query expansion, relation extraction, the graph rerank, the graph question embedding and the graph build's entity embedding each have their own, so check which on `breakers` in `/v1/stats`: relevancy scoring stopping while ingestion continues is `llmRelevancy`, the reverse is `embedding`, queries losing their expansions is `queryExpansion`, a graph that stopped growing is `graphExtraction`, graph answers no longer reranked by the model is `graphRerank` (or `graphQueryEmbedding` for the vector rerank), and a build that published entities without vectors is `graphBuildEmbedding` | Wait for the cooldown (default 60s), after which one probe is admitted. Confirm API key/endpoint: a 401 or 403 is logged once per client at ERROR, saying whether a key was sent and which of `excalibur.llm.chat-api-key` / `excalibur.llm.embedding-api-key` / `excalibur.llm.api-key` to set. Queries still work without LLM scoring. |
 | Queries return nothing on a fresh node, but `coverage` reads `1.0000` | Not a cold-start indicator. `/health` coverage counts the segments a query reads, and an empty segment is read as readily as a full one, so it reads `1.0000` and `/health` reports `ready` and `healthy` | Look at `/v1/stats` instead: `entries.total` and `segments.active` are `0` until something is indexed |
 | A node answers `200` to everything but its results are getting worse | A circuit breaker has opened: the embedding one drops retrieval to lexical-only, the relevancy one bypasses stage 4's relevancy scoring, the query-expansion one searches every query as typed, and on the graph route the rerank one keeps the BM25 order and the question-embedding one skips the vector rerank; the graph build-embedding one publishes a build's entities without vectors | `breakers` on `/v1/stats`, or `excalibur_circuit_breaker_state` on `/metrics`. Alert on `> 0` for any `breaker` label |
 | `hnsw.queueDepth` grows without bound while `coverage` stays `1.0000` and `/health` stays healthy | The index orchestrator is dead | `workers.indexOrchestratorRunning` on `/v1/stats`, `indexerRunning` on `/health`, and `/health/ready` answers `503` with `indexer` in `failed` |
@@ -3349,6 +3651,30 @@ and rewritten at version 3 before anything is next appended to it or settled fro
 build refuses a version 3 log, so the lexical store it would open does not; going back from a node
 that has recorded or settled an erasure under this build needs an image taken before the upgrade.
 
+**`segment_<N>.wal` — no step required; rollback needs an image.** A segment's write-ahead log is
+version 2, which begins with a 16-byte header: the magic `EXWL`, the format version and a CRC-32
+over both. Every record already carried its own checksum; what the header adds is a way to tell a
+log a newer build wrote from a damaged one. A log whose sound header names a version this build
+does not read is refused and left untouched — not replayed, not truncated — and the node does not
+start, naming the file and the versions it reads; `excalibur-fsck` reports it `UNREADABLE` and puts
+it to an operator. A log whose header fails its CRC is damage: the start is refused as for a log
+damaged in the middle, and `excalibur-fsck` reports it `CORRUPT`.
+
+A log an older build wrote has no header and is version 1. It is replayed and appended to exactly
+as before, and `excalibur-fsck` reports it *legacy, unprotected* — its records are still checked,
+but nothing in the file names their format. It is not rewritten in place: a header would have to
+go where its first record is, which would move every record and invalidate the integrated offset
+the catalog and the graph keep against it. It is replaced instead by a version 2 log when a
+compaction or a split next gives its segment a fresh one. A version 1 log with no record in it —
+every segment an older build compacted and nothing has been written to since — is given its
+header as soon as the node opens it, since nothing has to move.
+
+An older build reads the header as a damaged record. A log with records behind its header is
+refused as damaged in the middle and that build does not start — it neither replays nor
+overwrites anything — so a node that has written to a segment under this build cannot go back
+without restoring an image taken before the upgrade. A log that holds only its header is read by
+an older build as ending at offset 0, and its first append writes over the header; nothing is lost.
+
 **`<data dir>/routing.dir` — no step required; rollback depends on splits.** The routing directory
 is version 2, which ends with a CRC32C of every byte before it. Every slot value is a plausible
 segment number, so a damaged slot used to read as a valid directory and route part of the
@@ -3391,6 +3717,11 @@ carry no checksum, are read as before, and are rewritten at version 3 when the n
 older build does not read version 3: it logs the file as unreadable and starts with no history, so
 rolling back loses the record of each source's last run, never indexed data, unless a
 pre-upgrade image is restored.
+
+**`<data dir>/erasure-receipts` — no step required.** A build older than the file never wrote it;
+the first `POST /v1/erasure` after the upgrade creates it, and erasures made before then have no
+receipt, so their `GET /v1/erasure/{request_id}` is `404`. An older build ignores the file, and a
+backup keeps it as authoritative.
 
 **`<namespace>/graph/` — no step required, but a rollback needs one.** A built graph now carries a
 checksum for every file: `edgestore.meta` is version 2, recording each column's length and CRC32C
@@ -3456,13 +3787,17 @@ watches only `file:` and `http:` URLs, and a `jar:` URL is not one.
 
 ## Programmatic Usage (JVM Embedded)
 
-You can embed ExcaliburDB directly in a JVM application.
+You can run an ExcaliburDB node inside a JVM application and call it directly instead of over
+HTTP. `ExcaliburEmbedded`, in `excalibur-api`, opens a data directory through the same assembly
+the server's bootstrap uses, so an embedded node and a served one over the same directory are the
+same node: the same configuration keys and defaults, the same persisted document registry, the
+same erasure, and the query route `POST /v1/query` would take.
 
 **Nothing is on Maven Central.** `./gradlew publishToMavenLocal` installs all sixteen library
-modules into `~/.m2`, so a coordinate dependency resolves there. The other five are not libraries:
+modules into `~/.m2`, so a coordinate dependency resolves there. The other six are not libraries:
 `excalibur-bench` is a benchmark harness, `excalibur-integration` and `excalibur-test-bootstrap`
-are test modules, and `excalibur-fsck` and `excalibur-backup` are commands rather than something
-to depend on.
+are test modules, `excalibur-fsck` and `excalibur-backup` are commands rather than something
+to depend on, and `excalibur-coverage` is the build's own coverage reporting.
 
 ```bash
 ./gradlew publishToMavenLocal
@@ -3479,242 +3814,169 @@ includeBuild("/path/to/ExcaliburDB")
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("com.eonmux:excalibur-core:1.0.0-SNAPSHOT")    // ForeignMemoryBootstrap
-    implementation("com.eonmux:excalibur-store:1.0.0-SNAPSHOT")   // StorageEngine, HnswInitializer
-    implementation("com.eonmux:excalibur-vector:1.0.0-SNAPSHOT")  // distance functions, HNSW config
-    implementation("com.eonmux:excalibur-shard:1.0.0-SNAPSHOT")   // IndexOrchestrator
-    implementation("com.eonmux:excalibur-llm:1.0.0-SNAPSHOT")     // EmbeddingClient
-    implementation("com.eonmux:excalibur-ingest:1.0.0-SNAPSHOT")  // IngestionOrchestrator
-    implementation("com.eonmux:excalibur-query:1.0.0-SNAPSHOT")   // QueryPipeline
+    implementation("com.eonmux:excalibur-api:1.0.0-SNAPSHOT")   // ExcaliburEmbedded
 }
 ```
 
-Each is named directly because the example below uses a class from each. Some of them would
-arrive anyway, since a few modules expose theirs as `api` (`excalibur-vector` hands on
-`excalibur-core`, for one). Most declare their dependencies as `implementation`, which a consumer
-sees at run time and not at compile time, so relying on what happens to be exposed would break
-when a module's internals change. These seven are also enough: `excalibur-integration`'s
-`embeddedExampleTest` compiles and runs the example against exactly this list, through the same
-variants these POMs give a consumer, and nothing else.
+One coordinate is enough. Every type the facade's methods take or return is either a JDK type or
+one of its own in `com.eonmux.excalibur.api.embedded`, so nothing else has to be on the compile
+classpath, and the modules underneath arrive at run time as `excalibur-api`'s own dependencies.
+`excalibur-integration`'s `embeddedExampleTest` compiles and runs the example below against
+exactly this coordinate, through the same variants its POM gives a consumer, and nothing else.
+`excalibur-api` also brings Logback at run time, the binding the server logs through; an
+application with a binding of its own excludes it.
 
-Gradle substitutes each coordinate with the project in the included build. The consuming project
+Gradle substitutes the coordinate with the project in the included build. The consuming project
 must also compile and run on Java 21 with `--enable-preview`, for the reason in
 [Requirements](#requirements).
 
 ### Ingesting and querying in-process
 
-The example opens a data directory, ingests three documents and queries them, assembled in the
-order the server's own bootstrap uses. It is not a sketch: it is the body of
-`EmbeddedUsageExampleTest.ingestAndQuery` in `excalibur-integration`, which compiles it against the
-current API and runs it on every build, against an in-process stand-in for the embeddings
-endpoint. A test beside it compares the block below with that method, token for token, so neither
-can change without the other.
+The example opens a data directory, supplies three documents and queries them; then, as a second
+run of the application would, opens the same directory again, finds the documents still there,
+replaces one, erases another and queries what is left. It is not a sketch: the two methods are
+`EmbeddedUsageExampleTest.ingestAndQuery` and `reopenAndErase` in `excalibur-integration`, which
+compiles them against the current API and runs them on every build, against an in-process
+stand-in for the embeddings endpoint. A test beside it compares the block below with those
+methods, token for token, so neither can change without the other.
 
 ```java
-import com.eonmux.excalibur.core.memory.ForeignMemoryBootstrap;
-import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
-import com.eonmux.excalibur.ingest.processor.TextChunker;
-import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
-import com.eonmux.excalibur.ingest.source.InlineSource;
-import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
-import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
-import com.eonmux.excalibur.llm.client.LLMClientConfig;
-import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
-import com.eonmux.excalibur.query.QueryRequest;
-import com.eonmux.excalibur.query.QueryResponse;
-import com.eonmux.excalibur.query.QueryResultItem;
-import com.eonmux.excalibur.query.executor.CancellationToken;
-import com.eonmux.excalibur.query.pipeline.QueryPipeline;
-import com.eonmux.excalibur.shard.IndexOrchestrator;
-import com.eonmux.excalibur.store.HnswInitializer;
-import com.eonmux.excalibur.store.Segment;
-import com.eonmux.excalibur.store.StorageEngine;
-import com.eonmux.excalibur.vector.distance.CosineSimilarity;
-import com.eonmux.excalibur.vector.distance.DistanceFunction;
-import com.eonmux.excalibur.vector.hnsw.HnswConfigFactory;
+import com.eonmux.excalibur.api.embedded.EmbeddedDocument;
+import com.eonmux.excalibur.api.embedded.ErasureOutcome;
+import com.eonmux.excalibur.api.embedded.ExcaliburEmbedded;
+import com.eonmux.excalibur.api.embedded.SearchAnswer;
+import com.eonmux.excalibur.api.embedded.SearchHit;
+import com.eonmux.excalibur.api.embedded.StoredDocument;
 
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.util.List;
 
-static List<QueryResultItem> ingestAndQuery(Path dataDir, String embeddingEndpoint)
+static List<SearchHit> ingestAndQuery(Path dataDir, String embeddingEndpoint)
         throws Exception {
-    // First statement, before anything can start a thread.
-    ForeignMemoryBootstrap.ensureInitialized();
+    // The same keys excalibur.properties takes, set in code. A local Ollama, vLLM or TGI
+    // server needs no key; a hosted endpoint also takes excalibur.llm.api-key, and a model
+    // other than the default takes excalibur.llm.embedding-model and its dimensions.
+    try (ExcaliburEmbedded db = ExcaliburEmbedded.builder(dataDir)
+            .property("excalibur.llm.embedding-base-url", embeddingEndpoint)
+            .property("excalibur.llm.chat-enabled", "false")
+            .open()) {
+        // Chunked, embedded and indexed before supply returns; results name the chunk
+        // that matched, "<sourceId>:<documentId>:chunk:<n>".
+        db.supply("handbook", List.of(
+            EmbeddedDocument.of("tiering.txt",
+                "Cold segments are moved to cheaper disks by the tiering policy."),
+            EmbeddedDocument.of("hnsw.txt",
+                "The HNSW graph links every vector to its nearest neighbours."),
+            EmbeddedDocument.of("backup.txt",
+                "Backups copy the write log and the catalog to object storage.")));
 
-    // The embedding width and the distance metric are properties of the corpus: ingestion and
-    // queries must use the same model, width and metric for the lifetime of dataDir.
-    int dimension = 1536;
-    DistanceFunction metric = CosineSimilarity.getInstance();
-    EmbeddingClient embeddingClient = new EmbeddingClient(LLMClientConfig.builder()
-        .baseUrl(embeddingEndpoint)                  // e.g. "https://api.openai.com"
-        .apiKey(System.getenv().getOrDefault("OPENAI_API_KEY", ""))
-        .embeddingModel("text-embedding-3-small")
-        .embeddingDimension(dimension)
-        .build());
-
-    try (StorageEngine storage = new StorageEngine(dataDir)) {
-        // Installed before start(), so every segment start() opens or creates has a graph.
-        storage.setHnswInitializer(new HnswInitializer(HnswConfigFactory.defaults(), metric,
-            dimension, HnswInitializer.DEFAULT_MAX_NODES, storage.arena()));
-        storage.start();
-
-        try (IndexOrchestrator indexing = new IndexOrchestrator(storage.getCatalog(), storage)) {
-            // One visibility clock for storage, ingestion and queries.
-            storage.setVisibilityTracker(indexing.getVisibilityTracker());
-            indexing.syncSegmentsFromStorage();
-            indexing.start();
-            storage.startLifecycleManager();
-
-            DocumentVisibilityTracker documents = new DocumentVisibilityTracker(
-                new DocumentRegistry(), indexing.getVisibilityTracker());
-            IngestionOrchestrator ingestion = new IngestionOrchestrator(
-                new TextChunker(), embeddingClient, storage, indexing,
-                sourceId -> new IngestionOrchestrator.IngestionStatus() {
-                    @Override
-                    public void update(String state, double progress, long ingested,
-                                       long pending) {
-                    }
-
-                    @Override
-                    public void setSkipped(long skipped) {
-                    }
-
-                    @Override
-                    public void setDisallowed(long disallowed) {
-                    }
-
-                    @Override
-                    public void setError(String error) {
-                        System.err.println(sourceId + ": " + error);
-                    }
-                },
-                documents);
-
-            QueryPipeline pipeline = new QueryPipeline(
-                storage,
-                indexing.getVisibilityTracker(),
-                new DocumentVisibilityTrackerAdapter(documents),
-                segmentId -> {
-                    Segment segment = storage.getSegment(segmentId);
-                    return segment != null ? segment.getHnswGraph() : null;
-                },
-                metric);
-
-            try {
-                // Ingest: chunk, embed, write, publish. Returns once the documents are
-                // published; results name the chunk that matched,
-                // "<sourceId>:<documentId>:chunk:<n>".
-                ingestion.ingestNow(InlineSource.of("handbook", List.of(
-                    text("tiering.txt",
-                        "Cold segments are moved to cheaper disks by the tiering policy."),
-                    text("hnsw.txt",
-                        "The HNSW graph links every vector to its nearest neighbours."),
-                    text("backup.txt",
-                        "Backups copy the write log and the catalog to object storage."))));
-
-                // Query: embed the question with the SAME client, then search.
-                String queryText = "which policy moves cold segments to cheaper disks";
-                QueryRequest request = QueryRequest.builder()
-                    .queryText(queryText)
-                    .queryVector(embeddingClient.embed(queryText))
-                    .topK(3)
-                    .timeoutMs(5000)
-                    .includePartialSegments(true)
-                    .enableLlmScoring(false)
-                    .build();
-                QueryResponse response = pipeline.executeSync(request, new CancellationToken());
-
-                response.results().forEach(item ->
-                    System.out.println(item.documentIdStr() + " -> " + item.score()));
-                return response.results();
-            } finally {
-                // Stop taking work before the storage underneath it closes.
-                pipeline.shutdown(Duration.ofSeconds(30));
-                ingestion.shutdown(Duration.ofSeconds(30));
-            }
-        }
+        // Embedded by the node with the model the corpus was embedded with, and fused
+        // with BM25 over the same chunks.
+        SearchAnswer answer = db.query("which policy moves cold segments to cheaper disks", 3);
+        answer.hits().forEach(hit ->
+            System.out.println(hit.chunkId() + " -> " + hit.score() + ": " + hit.text()));
+        return answer.hits();
     }
 }
 
-static InlineSource.Document text(String documentId, String content) {
-    return new InlineSource.Document(documentId, content.getBytes(StandardCharsets.UTF_8),
-        "text/plain", 0L);
+static SearchAnswer reopenAndErase(Path dataDir, String embeddingEndpoint) throws Exception {
+    try (ExcaliburEmbedded db = ExcaliburEmbedded.builder(dataDir)
+            .property("excalibur.llm.embedding-base-url", embeddingEndpoint)
+            .property("excalibur.llm.chat-enabled", "false")
+            .open()) {
+        // What the last node supplied is still here: documents and their chunks.
+        for (StoredDocument document : db.documents("handbook")) {
+            System.out.println(document.documentId() + " " + document.chunkIds());
+        }
+
+        // Supplying a document id again replaces it; a query sees one version or the other.
+        db.supply("handbook", List.of(EmbeddedDocument.of("tiering.txt",
+            "Warm segments stay on fast disks until the tiering policy demotes them.")));
+
+        // Gone from storage, from the lexical index and from the vectors.
+        ErasureOutcome erased = db.erase("handbook", List.of("backup.txt"));
+        System.out.println("erased " + erased.erasedDocumentIds());
+
+        return db.query("when are warm segments demoted from fast disks", 3);
+    }
 }
 ```
 
-What each piece is for:
+What each call does:
 
-- **`StorageEngine`** owns the data directory. The `HnswInitializer` must be installed before
-  `start()`, or the segments it opens carry no vector index and vector search finds nothing in
-  them. `storage.arena()` is the engine's own arena, so the graphs live and die with it.
-- **`IndexOrchestrator`** owns the visibility clock and the worker that integrates each written
-  vector into its segment's HNSW graph. Handing its clock to the engine, to the document tracker
-  and to the pipeline is what makes a published document visible to all three at once.
-- **`IngestionOrchestrator.ingestNow`** chunks, embeds, writes and publishes the documents of one
-  source, and returns once they are published — the in-process equivalent of `POST /v1/documents`.
-  The status callback is where a crawl's progress and errors would be reported; a crawl of a
-  filesystem or a website goes through the same orchestrator with a different `Source`.
-- **`QueryPipeline`** is built over the same engine and clock, and the document tracker's adapter,
-  which hides a document until all of its chunks are published. This 5-argument constructor is
-  the plain pipeline; the wider constructors add what the server adds on top — LLM relevancy
-  scoring and its coverage threshold, the epoch isolation validator and product-quantisation settings — and `withLlmScorer` adds the
-  scorer to a pipeline already built.
+- **`builder(dataDir)…open()`** opens the directory, creating it if it is missing, and starts the
+  node's background workers. Configuration is layered as the server layers it: the built-in
+  defaults, then a file given to `configFile(path)`, then `property`/`properties`, then the
+  `EXCALIBUR_*` variables handed to `environment(map)`. The process environment is **not** read
+  unless you pass it (`environment(System.getenv())`), so a library inside your application is not
+  reconfigured by whatever the shell exported. Every value goes through the server's validation,
+  and an invalid one fails `open()` with the message the server would log; an unknown key is
+  logged as a warning, as on a node.
+- **`supply(sourceId, documents)`** is `POST /v1/documents` in-process: each document is chunked,
+  embedded and indexed, and the call returns once the documents are searchable. A document id
+  supplied again replaces the previous version, the new one published before the old one's
+  surplus is removed, so a query sees one or the other and never neither. The `SupplyOutcome`
+  counts what was ingested and what failed. `EmbeddedDocument` is checked the way the HTTP route
+  checks a posted document: an id, and content that is text (`text/plain` unless a content type
+  is given). A source id a crawl was registered under in this directory is refused, because its
+  documents belong to that crawl.
+- **`query(text, topK)`** takes the route `POST /v1/query` takes on the same node, and
+  `SearchAnswer.route()` says which: `HYBRID` (the vector and BM25 signals fused by reciprocal
+  rank) on a node with an embedding endpoint and a chunk index and
+  `excalibur.query.hybrid-retrieval` on; `VECTOR` with it off; `LEXICAL` on a node that does not
+  embed (the embedding endpoint disabled, or left at the hosted default with no key), or when the
+  endpoint fails or runs out of time mid-query. A node with
+  neither signal refuses every query with `IllegalStateException`; `route()` on the node answers
+  that before any query is made. The limits are the server's: `excalibur.api.max-query-chars`,
+  `max-top-k` and `max-query-timeout-ms`, and `query(text, topK, timeout)` sets a budget below the
+  default. Each `SearchHit` carries the chunk id, its score, the signals that found it and the
+  chunk's text; `timedOut()` on the answer says the budget ran out and the hits are what was
+  found before it did.
+- **`fetch(chunkId)`** reads a chunk's text back. **`documents()`** and **`documents(sourceId)`**
+  list what the node holds, with each document's chunk ids, length and indexing time, as
+  `GET /v1/documents/list` does.
+- **`erase(sourceId, documentIds)`** is `POST /v1/erasure` for named documents: nothing named is
+  searchable once it returns, and the `ErasureOutcome` separates what was erased from what was
+  not found. The space is reclaimed by the compaction policy, as on a node.
+- **`close()`** runs the server's shutdown sequence, bounded by
+  `excalibur.api.shutdown-timeout-seconds`: ingestion and queries drained, background work
+  stopped, the chunk index and the document registry persisted, the storage engine closed. It is
+  idempotent, and every other method refuses once it has begun. Everything supplied before it is
+  there the next time the directory is opened, embedded or served.
 
-The pipeline operates on vectors, so the caller embeds the question — with the **same**
-`EmbeddingClient`, model and width the corpus was ingested with; the HTTP API does this step
-itself. Results come back closest first. Read `documentIdStr()`, not `documentId()`: the string is
-the identifier ingestion assigned to the chunk that matched — `<sourceId>:<documentId>:chunk:<n>`,
-so `handbook:tiering.txt:chunk:0` here — and the one the HTTP API returns; the chunk's text is
-stored under it. `documentId()` is the numeric handle, which for a string-keyed result is the HNSW
-node id and matches nothing a caller can look up. A result whose graph node has no chunk identity
-carries an empty `documentIdStr()`; set `requireNamedResults(true)` on the
-`QueryRequest`, as the HTTP API does, to have such results dropped before the page is cut.
+All of these may be called from any number of threads at once. Supplying two batches under one
+source id at the same time is refused by the second, as the HTTP route refuses it.
 
-Shut down in the reverse of the order things were started: the pipeline and the ingestion
-orchestrator first, so nothing is still taking work, then the index orchestrator and the storage
-engine, which the `try`-with-resources blocks close.
-
-Every wait is the caller's to choose. `pipeline.shutdown(wait)` and `ingestion.shutdown(wait)`
-wait no longer than they are handed and answer whether everything ended; neither interrupts work
-still running, because an interrupt inside a read or a write closes the file channels every other
-reader shares. The two `close()` calls wait, the way `ExecutorService.close` does, until the
-background workers have stopped. An embedder with a deadline of its own bounds those too:
-`indexing.shutdown(wait)` and `storage.stopBackgroundWork(wait)` answer whether the segment
-workers, and the storage engine's own splits and lifecycle checks, have ended, and
-`indexing.close(wait)` releases the orchestrator waiting no longer than that. Close the engine
-only on a `true`: a worker still running when the engine closes is writing into a mapping whose
-memory is about to be released, which ends the process rather than failing it.
+What an embedded node leaves out, because it lives around the HTTP surface rather than in the
+node: crawl registration and re-indexing on request, relevancy scoring by the chat model, the
+query result cache, pagination and explanations. The knowledge graph is not built in-process:
+`open()` refuses `excalibur.graph.extraction-enabled=true`, and a directory's graph is built and
+queried by serving it. Erasing a document in-process therefore withdraws nothing from a graph a
+served node built over the same directory; erase through the HTTP API where a graph is in use.
 
 ### Remember when embedding
 
-- **Call `ForeignMemoryBootstrap.ensureInitialized()` as the first statement of your startup,
-  before anything spawns a thread.** Two threads reaching `java.lang.foreign` for the first time
-  at the same instant deadlock the JVM inside the JDK's own class-initialization monitors, and a
-  thread waiting on one of those cannot be interrupted, so nothing times out and the process
-  hangs rather than fails. The call is idempotent and costs about 34ms once. The server does this
-  in `ExcaliburApplication.main`; an embedder has no such entry point, so it has to do it itself.
-  Two threads is all it takes - storage, query, retrieval, graph and shard components hand work
-  to virtual threads, so one sequential caller that starts a worker is already a race.
+- **One node per data directory.** An embedded node claims its directory with the same lock a
+  server takes (`.excalibur-lock`), so a server, another embedded node - in this process or
+  another - or an `excalibur-fsck --repair` or `excalibur-backup restore` on it is refused with a
+  `DataDirectoryLockedException` naming the holder. `close()` gives the claim back once the node
+  has shut down cleanly, so the directory can be opened again in the same process; a shutdown that
+  left work running keeps it claimed until the process exits.
+- **Call `ExcaliburEmbedded.prepare()` first if your application starts threads that might reach
+  `java.lang.foreign` before the node is opened.** Two threads reaching it for the first time at
+  the same instant deadlock the JVM inside the JDK's own class-initialization monitors, and a
+  thread waiting on one of those cannot be interrupted, so nothing times out and the process hangs
+  rather than fails. `open()` makes the same call before the node starts any thread, so an
+  application whose first use of the library is opening a node needs nothing else. The call is
+  idempotent and costs about 34ms once.
 - Always pass `--enable-preview --enable-native-access=ALL-UNNAMED
   --add-modules=jdk.incubator.vector` JVM flags. Without the last one the SIMD distance
   kernels fall back to scalar arithmetic silently.
+- The embedding model, its width and the distance metric are properties of the corpus: open a
+  directory with the model its documents were embedded with, every time. A different model's
+  vectors are not comparable with the stored ones, so a model change means re-supplying the
+  documents, or re-indexing the directory through a served node.
 - HNSW graphs cap at `Integer.MAX_VALUE` nodes per segment.
-- The routing directory's width is a power of two, and it doubles only when a segment as deep as
-  the directory splits (extendible hashing); every other split re-points slots the segment
-  already owns. `getSegmentCount()` returns that width, and `getSegments().size()` the number of
-  distinct segments behind it. The directory lives on the heap at about 60 bytes a slot and stays
-  within a small multiple of the segment count: 300 MB of 1536-dimensional chunks fills 510
-  segments behind a 512-slot directory. `withMaxRoutingWidth(int)` (default 2^20 slots; `excalibur.shard.max-routing-width` on a node) bounds
-  the case keys that do not hash evenly would otherwise make unbounded: a split that would double
-  past it is refused with `RoutingDirectoryFullException` and counted in
-  `getStatistics().getRefusedSplits()`.
-- An entry larger than an empty segment's 1 MiB data region is refused with
-  `IllegalArgumentException`, since no split can make room for it. A write or delete that reaches
-  a segment in the middle of a split waits for the split to publish or be abandoned, then routes
-  again.
-- `StorageEngine` is thread-safe; multiple concurrent queries and ingests are supported.
 
 ---
 

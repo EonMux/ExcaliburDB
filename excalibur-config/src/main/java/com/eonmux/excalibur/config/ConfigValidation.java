@@ -205,19 +205,53 @@ public final class ConfigValidation {
             throw new IllegalStateException(
                 "llm.base-url must be a valid URL (http:// or https://), got: " + baseUrl);
         }
+        validateRoleEndpoint(llm.chatEndpoint());
+        validateRoleEndpoint(llm.embeddingEndpoint());
+    }
 
-        // The API key is attached as a Bearer header to every embedding and scoring
-        // request. Plain http:// exists for a local model server, which needs no
-        // credential; combined with a key and a remote host it puts that key on the
-        // wire in cleartext.
-        String apiKey = llm.getApiKey();
+    /**
+     * Validates one role's resolved endpoint: its own base URL where it has one, and the
+     * transport its key would travel over.
+     *
+     * <p>Checked on the resolved pair rather than on the shared keys alone, because the pair is
+     * what is sent: a shared key inherited by a role pointed at a plain-http host leaves the
+     * machine exactly as a role key would.</p>
+     *
+     * @param endpoint The resolved endpoint
+     * @throws IllegalStateException if invalid
+     */
+    private static void validateRoleEndpoint(LlmEndpoint endpoint) {
+        String baseUrl = endpoint.baseUrl();
+        String role = endpoint.role().label();
+        if (!isValidUrl(baseUrl)) {
+            throw new IllegalStateException(settingName(endpoint.role().baseUrlKey())
+                + " must be a valid URL (http:// or https://), got: " + baseUrl);
+        }
+
+        // The API key is attached as a Bearer header to every request in the role.
+        // Plain http:// exists for a local model server, which needs no credential;
+        // combined with a key and a remote host it puts that key on the wire in cleartext.
+        // A role that is switched off sends nothing, so it is not refused for what it would
+        // have sent.
         String host = hostOf(baseUrl);
-        if (apiKey != null && !apiKey.isEmpty()
+        if (endpoint.enabled() && endpoint.hasApiKey()
                 && baseUrl.startsWith(HTTP_PREFIX) && !isLoopbackHost(host)) {
             throw new IllegalStateException(
-                "llm.api-key would be sent in cleartext: llm.base-url uses http:// with the "
-                    + "non-loopback host '" + host + "'. Use https://, or leave llm.api-key empty.");
+                "llm.api-key would be sent in cleartext: the " + role + " endpoint uses http:// "
+                    + "with the non-loopback host '" + host + "'. Use https://, or leave the key "
+                    + "empty for this endpoint - set it per role with llm.chat-api-key or "
+                    + "llm.embedding-api-key rather than the shared llm.api-key.");
         }
+    }
+
+    /**
+     * The short spelling of a property this class names in its messages.
+     *
+     * @param key The full property key
+     * @return The key without the {@code excalibur.} prefix
+     */
+    private static String settingName(String key) {
+        return key.substring("excalibur.".length());
     }
 
     /**

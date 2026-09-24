@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.audit.AuditLog;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphErasureService;
@@ -146,6 +147,8 @@ public class GraphErasureEndpoint implements HttpHandler {
                 "{\"error\": \"" + JsonText.escape(e.getMessage()) + "\"}");
             return;
         }
+        AuditLog.target(exchange, "namespace", namespace.value());
+        audit(exchange, requested);
 
         try {
             Optional<NamespaceRegistry.Lease<GraphTenant>> borrowed = leaseFor(namespace, requested);
@@ -221,11 +224,13 @@ public class GraphErasureEndpoint implements HttpHandler {
                 if (scope == null) {
                     return;
                 }
+                audit(exchange, new Requested(scope, null));
             }
             GraphErasureService erasureService = lease.resource().erasureService();
             // Refuses an entity id nothing in the namespace holds, recording nothing; the
             // handler answers that 404.
             long id = erasureService.submit(scope);
+            AuditLog.target(exchange, "request_id", id);
 
             // Past here the obligation is durable, so the request has been accepted whatever
             // happens next, and a failure below is reported in the answer rather than raised as
@@ -269,6 +274,38 @@ public class GraphErasureEndpoint implements HttpHandler {
                     + "\"namespace\": \"" + JsonText.escape(namespace.value()) + "\", "
                     + "\"detail\": \"" + JsonText.escape(outcome.reason()) + "\""
                     + "}");
+        }
+    }
+
+    /**
+     * Names what a request is about in the audit event, never by the name it gave.
+     *
+     * <p>An entity named by {@code entity_name} is recorded only as having been named, and by its
+     * id once resolved: the audit trail outlives the erasure, and a name written into it would be
+     * the one copy of the erased person's name the node kept.
+     *
+     * @param exchange  The request being audited
+     * @param requested What the body asked for
+     */
+    private static void audit(HttpExchange exchange, Requested requested) {
+        switch (requested.scope()) {
+            case null -> {
+                AuditLog.target(exchange, "scope", "entity");
+                AuditLog.target(exchange, "entity_by", "name");
+            }
+            case ErasureScope.Entity entity -> {
+                AuditLog.target(exchange, "scope", "entity");
+                AuditLog.target(exchange, "entity_id", entity.entityId());
+            }
+            case ErasureScope.Source source -> {
+                AuditLog.target(exchange, "scope", "source");
+                AuditLog.target(exchange, "source_type", source.sourceType().name());
+                AuditLog.target(exchange, "source_id", source.sourceId());
+            }
+            case ErasureScope.ExtractorVersion version -> {
+                AuditLog.target(exchange, "scope", "extractor");
+                AuditLog.target(exchange, "version", version.version());
+            }
         }
     }
 
@@ -473,9 +510,24 @@ public class GraphErasureEndpoint implements HttpHandler {
             return SourceType.valueOf(value.trim().toUpperCase(Locale.ROOT));
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException(
-                "unknown source_type '" + value + "'; expected one of UNKNOWN, KNOWLEDGE_BASE, "
-                    + "DOCUMENT, CONVERSATION, USER_ASSERTED, INFERRED");
+                "unknown source_type '" + value + "'; expected one of " + sourceTypeNames());
         }
+    }
+
+    /**
+     * The source types a request may name, as it spells them.
+     *
+     * @return The names, comma-separated, in code order
+     */
+    private static String sourceTypeNames() {
+        StringBuilder names = new StringBuilder();
+        for (SourceType type : SourceType.values()) {
+            if (!names.isEmpty()) {
+                names.append(", ");
+            }
+            names.append(type.name());
+        }
+        return names.toString();
     }
 
     /**

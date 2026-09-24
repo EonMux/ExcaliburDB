@@ -201,6 +201,34 @@ class GraphNamespaceEndpointsTest {
         }
 
         @Test
+        @DisplayName("each entry says whether its graph is behind what it has staged")
+        void eachEntrySaysWhetherItIsBehind() throws IOException {
+            create("acme");
+            assertThat(tenants.invalidate(NamespaceId.of("acme"))).isTrue();
+            create("beta");
+
+            Response response = call(list, "GET", "/v1/graph/namespaces");
+
+            for (String staged : List.of("acme", "beta")) {
+                Object entry = entryFor(response, staged);
+                assertThat(Json.at(entry, "behind_staging")).as(staged).isEqualTo(Boolean.TRUE);
+                assertThat((Long) Json.at(entry, "staged_changes_since_ms")).as(staged)
+                    .isPositive();
+            }
+            Object shared = entryFor(response, "shared");
+            assertThat(Json.at(shared, "behind_staging")).isEqualTo(Boolean.FALSE);
+            assertThat(Json.at(shared, "staged_changes_since_ms")).isNull();
+
+            try (NamespaceRegistry.Lease<GraphTenant> lease =
+                     tenants.borrow(NamespaceId.of("beta"))) {
+                lease.resource().buildService().build();
+            }
+            Object built = entryFor(call(list, "GET", "/v1/graph/namespaces"), "beta");
+            assertThat(Json.at(built, "behind_staging")).isEqualTo(Boolean.FALSE);
+            assertThat(Json.at(built, "staged_changes_since_ms")).isNull();
+        }
+
+        @Test
         @DisplayName("only GET lists")
         void onlyGetLists() throws IOException {
             assertThat(call(list, "POST", "/v1/graph/namespaces").status()).isEqualTo(405);

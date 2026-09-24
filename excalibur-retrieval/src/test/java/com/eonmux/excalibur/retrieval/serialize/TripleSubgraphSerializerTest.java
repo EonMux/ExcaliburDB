@@ -21,7 +21,7 @@ class TripleSubgraphSerializerTest {
                                      int depth, int confidence) {
         return new SubgraphEdge(subject, relation, object, index,
             Integer.MIN_VALUE, TemporalFilter.OPEN,
-            new Provenance(SourceType.KNOWLEDGE_BASE, index, confidence, 1), depth);
+            new Provenance(SourceType.USER_ASSERTED, index, confidence, 1), depth);
     }
 
     private SerializationBudget budget(int maxTokens) {
@@ -77,14 +77,14 @@ class TripleSubgraphSerializerTest {
         Subgraph subgraph = new Subgraph.Builder()
             .seed(1)
             .edge(new SubgraphEdge(1, 5, 2, 0, Integer.MIN_VALUE, TemporalFilter.OPEN,
-                new Provenance(SourceType.CONVERSATION, 77L, 40, 3), 1))
+                new Provenance(SourceType.USER_ASSERTED, 77L, 40, 3), 1))
             .build();
 
         SerializedSubgraph result = serializer.serialize(
             subgraph, budget(1000), SeedRelevance.uniform());
 
         assertThat(result.text())
-            .contains("conversation").contains("77").contains("conf=40").contains("ext=v3");
+            .contains("user_asserted").contains("77").contains("conf=40").contains("ext=v3");
     }
 
     @Test

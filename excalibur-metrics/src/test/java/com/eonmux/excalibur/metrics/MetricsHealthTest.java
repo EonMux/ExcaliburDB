@@ -5,7 +5,6 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -13,8 +12,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>The health score is "higher is better" and the healthy flag is derived from it. An
  * inverted flag is worse than no flag at all: it reports a system as healthy at the exact
- * moment it stops serving within its latency budget. These tests pin the direction so the
- * comparison cannot be flipped again without a failure.</p>
+ * moment it has lost the corpus it serves. These tests pin the direction so the comparison
+ * cannot be flipped without a failure.</p>
  *
  * @author ExcaliburDB
  */
@@ -24,21 +23,17 @@ class MetricsHealthTest {
     private static final double READY_THRESHOLD = 0.5;
 
     @Test
-    @DisplayName("Latency far above the threshold makes the system unhealthy, not healthy")
-    void latencyAboveThresholdIsUnhealthy() {
-        Metrics.updateHealth(900, 1000);
-        assertTrue(Metrics.getHealthScore() < READY_THRESHOLD,
-            "score should drop below the ready threshold at 90% of the latency budget");
+    @DisplayName("A score below the threshold makes the system unhealthy, not healthy")
+    void lowScoreIsUnhealthy() {
+        Metrics.setHealthScore(0.1);
         assertFalse(Metrics.isHealthy(),
             "isHealthy must be false when the score is below the ready threshold");
     }
 
     @Test
-    @DisplayName("Latency well inside the threshold keeps the system healthy")
-    void latencyInsideThresholdIsHealthy() {
-        Metrics.updateHealth(100, 1000);
-        assertTrue(Metrics.getHealthScore() >= READY_THRESHOLD,
-            "score should stay at or above the ready threshold at 10% of the latency budget");
+    @DisplayName("A score well above the threshold keeps the system healthy")
+    void highScoreIsHealthy() {
+        Metrics.setHealthScore(0.9);
         assertTrue(Metrics.isHealthy(),
             "isHealthy must be true when the score is at or above the ready threshold");
     }
@@ -46,24 +41,36 @@ class MetricsHealthTest {
     @Test
     @DisplayName("The healthy flag follows the score back up on recovery")
     void healthyFlagRecovers() {
-        Metrics.updateHealth(2000, 1000);
+        Metrics.setHealthScore(0.0);
         assertFalse(Metrics.isHealthy(), "precondition: degraded");
 
-        Metrics.updateHealth(10, 1000);
+        Metrics.setHealthScore(0.95);
         assertTrue(Metrics.isHealthy(),
             "the flag must be re-evaluated on every update, not only on a drop");
     }
 
     @Test
-    @DisplayName("isHealthy() and the score agree across the whole latency range")
+    @DisplayName("isHealthy() and the score agree across the whole score range")
     void flagAndScoreNeverDisagree() {
-        for (long latencyMs = 0; latencyMs <= 2000; latencyMs += 50) {
-            Metrics.updateHealth(latencyMs, 1000);
+        for (int step = 0; step <= 20; step++) {
+            double score = step / 20.0;
+            Metrics.setHealthScore(score);
             assertEquals(Metrics.getHealthScore() >= READY_THRESHOLD, Metrics.isHealthy(),
-                "flag and score disagree at latency " + latencyMs + "ms");
+                "flag and score disagree at score " + score);
             assertEquals(Metrics.isHealthy(), readyAttribute(),
-                "the ready attribute disagrees with isHealthy at latency " + latencyMs + "ms");
+                "the ready attribute disagrees with isHealthy at score " + score);
         }
+    }
+
+    @Test
+    @DisplayName("An unmeasured health state is not healthy")
+    void unmeasuredStateIsNotHealthy() {
+        HealthState fresh = new HealthState();
+
+        assertEquals(0.0, fresh.score(), 0.0,
+            "the score is coverage, and nothing has been measured to be visible yet");
+        assertFalse(fresh.isHealthy());
+        assertEquals(0.0, fresh.coverage(), 0.0);
     }
 
     @Test
@@ -83,30 +90,6 @@ class MetricsHealthTest {
 
         assertEquals(Metrics.isHealthy(), Metrics.getSystemHealthMBean().getAttribute("isHealthy"),
             "the MBean attribute must report the same flag");
-    }
-
-    @Test
-    @DisplayName("Health score stays inside [0.0, 1.0] whatever the latency")
-    void scoreStaysInDomain() {
-        Metrics.updateHealth(0, 1000);
-        assertEquals(1.0, Metrics.getHealthScore(), 1e-9, "zero latency is perfect health");
-
-        Metrics.updateHealth(10_000, 1000);
-        assertEquals(0.0, Metrics.getHealthScore(), 1e-9,
-            "ten times over budget clamps at zero rather than going negative");
-    }
-
-    @Test
-    @DisplayName("A non-positive threshold is rejected instead of producing NaN")
-    void nonPositiveThresholdIsRejected() {
-        double before = Metrics.getHealthScore();
-
-        assertThrows(IllegalArgumentException.class, () -> Metrics.updateHealth(0, 0));
-        assertThrows(IllegalArgumentException.class, () -> Metrics.updateHealth(5, -1));
-
-        assertEquals(before, Metrics.getHealthScore(), 0.0,
-            "a rejected update must not disturb the published score");
-        assertFalse(Double.isNaN(Metrics.getHealthScore()), "score must never become NaN");
     }
 
     @Test

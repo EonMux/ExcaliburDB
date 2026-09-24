@@ -99,6 +99,31 @@ final class HttpRouting {
         };
     }
 
+    /**
+     * Serves a context's own path and every path beneath it, for a handler that parses the rest.
+     *
+     * <p>For {@code /v1/graph/entities}, whose routes are an entity and its edges, two and three
+     * segments deep. Only the paths are handed on: the method table wrapped in {@code delegate}
+     * still answers a method none of them serves, so a 405 is decided before the guard here as
+     * it is everywhere else. A longer prefix that merely starts the same way is 404.</p>
+     *
+     * @param context  The path this context is registered under
+     * @param delegate What serves the path and everything beneath it
+     * @param notFound What answers every other path reaching this context
+     * @return A handler that answers 404 for paths outside the context
+     */
+    static HttpHandler pathAndBelow(String context, HttpHandler delegate,
+                                    HttpHandler notFound) {
+        return exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if (isExactly(context, path) || path.startsWith(context + "/")) {
+                delegate.handle(exchange);
+            } else {
+                notFound.handle(exchange);
+            }
+        };
+    }
+
     /** Whether a path names exactly one non-empty segment beneath a context. */
     private static boolean isMember(String context, String path) {
         String prefix = context + "/";

@@ -239,9 +239,11 @@ public class QueryEndpoint implements HttpHandler {
      */
     static final String UNCONFIGURED_QUERY_REASON =
         "Server is not configured for text queries: this node has neither an embedding client "
-        + "nor a lexical index, so there is no index to search. Set excalibur.llm.api-key (or "
-        + "EXCALIBUR_LLM_API_KEY) so the server can embed queries with the same model that "
-        + "ingestion uses, or see the startup log for why the chunk lexical index was not opened.";
+        + "nor a lexical index, so there is no index to search. Configure an embedding endpoint "
+        + "(excalibur.llm.embedding-base-url or excalibur.llm.base-url, with "
+        + "excalibur.llm.api-key for the hosted default) so the server can embed queries with the "
+        + "same model that ingestion uses, or see the startup log for why the chunk lexical index "
+        + "was not opened.";
 
     /**
      * Answers a repeated question without searching again, or null where none is configured.

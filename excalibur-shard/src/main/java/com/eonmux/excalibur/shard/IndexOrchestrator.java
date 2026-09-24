@@ -873,11 +873,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     }
 
     /**
-     * Default backpressure timeout in milliseconds.
-     */
-    public static final long DEFAULT_BACKPRESSURE_TIMEOUT_MS = 30_000;
-
-    /**
      * Blocks until backpressure is released or timeout expires.
      *
      * <p>This method should be called by the ingestion pipeline before adding
@@ -932,18 +927,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
                 timeoutMs, workers.hnsw().getCurrentQueueDepth());
         }
         return released;
-    }
-
-    /**
-     * Blocks until backpressure is released using the default timeout.
-     *
-     * <p>Uses a 30-second default timeout. For custom timeouts, use
-     * {@link #awaitBackpressureRelease(long)}.</p>
-     *
-     * @return true if backpressure was released, false on timeout
-     */
-    public boolean awaitBackpressureRelease() {
-        return awaitBackpressureRelease(DEFAULT_BACKPRESSURE_TIMEOUT_MS);
     }
 
     /**

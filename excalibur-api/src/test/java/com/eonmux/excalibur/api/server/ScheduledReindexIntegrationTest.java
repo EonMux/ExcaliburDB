@@ -6,7 +6,6 @@ import com.eonmux.excalibur.ingest.source.SourceResolver;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.shard.ReindexOperationHandler;
-import com.eonmux.excalibur.shard.worker.SegmentReindexScheduler;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
 import org.junit.jupiter.api.AfterEach;
@@ -24,8 +23,9 @@ import static org.mockito.Mockito.*;
  * Integration tests for scheduled reindex functionality.
  *
  * <p>Tests verify that when {@link ExcaliburDBServer#withReindexer(DocumentReindexer, SourceResolver)}
- * is called, the {@link ReindexOperationHandler} is properly wired to the scheduler so that
- * scheduled reindexes actually execute the {@link DocumentReindexer}.</p>
+ * is called, the {@link ReindexOperationHandler} the scheduler dispatches to is installed and
+ * runs the {@link DocumentReindexer}. The scheduler's own dispatch to that handler is covered by
+ * the shard module's tests.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
@@ -144,13 +144,9 @@ class ScheduledReindexIntegrationTest {
             // Configure reindexer
             server.withReindexer(mockReindexer, mockResolver);
 
-            // Get the reindex scheduler and register a source with numeric ID
-            SegmentReindexScheduler scheduler = indexOrchestrator.getReindexScheduler();
-            String sourceId = "1";
-            scheduler.registerSource(sourceId);
-
             // Trigger reindex directly
-            boolean triggered = scheduler.triggerReindexNow(sourceId);
+            boolean triggered = indexOrchestrator.getReindexOperationHandler()
+                .executeReindex("1");
 
             // Verify reindex was triggered and reindexer was called
             assertThat(triggered).isTrue();
@@ -170,13 +166,9 @@ class ScheduledReindexIntegrationTest {
             // Configure reindexer
             server.withReindexer(mockReindexer, mockResolver);
 
-            // Get the reindex scheduler and register a source with numeric ID
-            SegmentReindexScheduler scheduler = indexOrchestrator.getReindexScheduler();
-            String sourceId = "999";
-            scheduler.registerSource(sourceId);
-
             // Trigger reindex - should fail because source not found
-            boolean triggered = scheduler.triggerReindexNow(sourceId);
+            boolean triggered = indexOrchestrator.getReindexOperationHandler()
+                .executeReindex("999");
 
             // Verify reindex was not triggered (returns false)
             assertThat(triggered).isFalse();
@@ -199,13 +191,9 @@ class ScheduledReindexIntegrationTest {
             // Configure reindexer
             server.withReindexer(mockReindexer, mockResolver);
 
-            // Get the reindex scheduler and register a source with numeric ID
-            SegmentReindexScheduler scheduler = indexOrchestrator.getReindexScheduler();
-            String sourceId = "2";
-            scheduler.registerSource(sourceId);
-
             // Trigger reindex - should fail because of exception
-            boolean triggered = scheduler.triggerReindexNow(sourceId);
+            boolean triggered = indexOrchestrator.getReindexOperationHandler()
+                .executeReindex("2");
 
             // Verify reindex was attempted but returned false due to exception
             assertThat(triggered).isFalse();
@@ -229,13 +217,9 @@ class ScheduledReindexIntegrationTest {
             // Configure reindexer
             server.withReindexer(mockReindexer, mockResolver);
 
-            // Get the reindex scheduler and register a source with numeric ID
-            SegmentReindexScheduler scheduler = indexOrchestrator.getReindexScheduler();
-            String sourceId = "3";
-            scheduler.registerSource(sourceId);
-
             // Trigger reindex - should return false because result has errors
-            boolean triggered = scheduler.triggerReindexNow(sourceId);
+            boolean triggered = indexOrchestrator.getReindexOperationHandler()
+                .executeReindex("3");
 
             // Verify reindex was triggered but returned false due to errors
             assertThat(triggered).isFalse();

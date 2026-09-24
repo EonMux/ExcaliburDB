@@ -17,7 +17,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *
  * <h2>Domain Correctness Verification</h2>
  * <ul>
- *   <li>Deleted and changed documents have every chunk tombstoned in storage</li>
+ *   <li>Deleted documents have every chunk tombstoned in storage</li>
+ *   <li>Changed documents lose only the chunks their new version did not overwrite</li>
  *   <li>Deleted document metadata is removed from the registry</li>
  *   <li>Storage failures are collected as errors rather than thrown</li>
  * </ul>
@@ -46,55 +47,28 @@ class UpsertHandlerDeletionTest {
             DocumentMetadata metadata = createAndRegisterDocument(DOCUMENT_ID, "chunk-1", "chunk-2");
 
             UpsertHandler handler = new UpsertHandler(registry, storageAdapter);
-            ChangeSet changeSet = ChangeSet.builder(SOURCE_ID)
-                .addDeleted(metadata)
-                .build();
 
-            UpsertHandler.UpsertResult result = handler.processChanges(changeSet);
+            UpsertHandler.UpsertResult result = handler.removeDocument(metadata);
 
             assertThat(result.getDocumentsDeleted()).isEqualTo(1);
             assertThat(result.getChunksTombstoned()).isEqualTo(2);
+            assertThat(result.isSuccess()).isTrue();
             assertThat(storageAdapter.deletedKeys).containsExactlyInAnyOrder("chunk-1", "chunk-2");
             assertThat(registry.get(SOURCE_ID, DOCUMENT_ID)).isNull();
         }
 
         @Test
-        @DisplayName("should tombstone the old chunks of a changed document")
-        void shouldTombstoneChangedDocumentChunks() {
-            DocumentMetadata oldMetadata =
-                createAndRegisterDocument(DOCUMENT_ID, "old-chunk-1", "old-chunk-2");
+        @DisplayName("should remove the registry entry without storage in dry-run mode")
+        void shouldRemoveRegistryEntryWithoutStorage() {
+            DocumentMetadata metadata = createAndRegisterDocument(DOCUMENT_ID, "chunk-1");
 
-            UpsertHandler handler = new UpsertHandler(registry, storageAdapter);
+            UpsertHandler handler = new UpsertHandler(registry, null);
 
-            DocumentMetadata.FetchedDocumentInfo fetchedInfo = new DocumentMetadata.FetchedDocumentInfo(
-                System.currentTimeMillis(), 999L, 5000L);
+            UpsertHandler.UpsertResult result = handler.removeDocument(metadata);
 
-            ChangeSet changeSet = ChangeSet.builder(SOURCE_ID)
-                .addChanged(DOCUMENT_ID, oldMetadata, fetchedInfo)
-                .build();
-
-            UpsertHandler.UpsertResult result = handler.processChanges(changeSet);
-
-            assertThat(result.getDocumentsChanged()).isEqualTo(1);
-            assertThat(result.getChunksTombstoned()).isEqualTo(2);
-            assertThat(storageAdapter.deletedKeys)
-                .containsExactlyInAnyOrder("old-chunk-1", "old-chunk-2");
-        }
-
-        @Test
-        @DisplayName("should keep changed-document metadata for the ingestion pipeline to update")
-        void shouldKeepChangedDocumentMetadata() {
-            DocumentMetadata oldMetadata = createAndRegisterDocument(DOCUMENT_ID, "chunk-1");
-
-            UpsertHandler handler = new UpsertHandler(registry, storageAdapter);
-            DocumentMetadata.FetchedDocumentInfo fetchedInfo = new DocumentMetadata.FetchedDocumentInfo(
-                System.currentTimeMillis(), 999L, 5000L);
-
-            handler.processChanges(ChangeSet.builder(SOURCE_ID)
-                .addChanged(DOCUMENT_ID, oldMetadata, fetchedInfo)
-                .build());
-
-            assertThat(registry.get(SOURCE_ID, DOCUMENT_ID)).isNotNull();
+            assertThat(result.getDocumentsDeleted()).isEqualTo(1);
+            assertThat(result.getChunksTombstoned()).isZero();
+            assertThat(registry.get(SOURCE_ID, DOCUMENT_ID)).isNull();
         }
 
         @Test
@@ -147,6 +121,49 @@ class UpsertHandlerDeletionTest {
             assertThat(tombstoned).isZero();
             assertThat(storageAdapter.deletedKeys).isEmpty();
         }
+
+        @Test
+        @DisplayName("should leave the changed document's registry entry for the pipeline to update")
+        void shouldKeepChangedDocumentMetadata() {
+            DocumentMetadata oldMetadata =
+                createAndRegisterDocument(DOCUMENT_ID, "doc:chunk:0", "doc:chunk:1");
+            UpsertHandler handler = new UpsertHandler(registry, storageAdapter);
+
+            handler.tombstoneObsoleteChunks(oldMetadata.getChunkIds(), List.of("doc:chunk:0"));
+
+            assertThat(registry.get(SOURCE_ID, DOCUMENT_ID)).isEqualTo(oldMetadata);
+        }
+
+        @Test
+        @DisplayName("should count only the obsolete chunks storage actually removed")
+        void shouldCountOnlyRemovedChunks() {
+            TestStorageAdapter partial = new TestStorageAdapter() {
+                @Override
+                public boolean delete(byte[] key) {
+                    String id = new String(key, StandardCharsets.UTF_8);
+                    if (id.endsWith(":2")) {
+                        throw new RuntimeException("Storage error");
+                    }
+                    return super.delete(key);
+                }
+            };
+            UpsertHandler handler = new UpsertHandler(registry, partial);
+
+            int tombstoned = handler.tombstoneObsoleteChunks(
+                List.of("doc:chunk:0", "doc:chunk:1", "doc:chunk:2"),
+                List.of("doc:chunk:0"));
+
+            assertThat(tombstoned).isEqualTo(1);
+            assertThat(partial.deletedKeys).containsExactly("doc:chunk:1");
+        }
+
+        @Test
+        @DisplayName("should tombstone nothing without a storage adapter")
+        void shouldTombstoneNothingWithoutStorage() {
+            UpsertHandler handler = new UpsertHandler(registry, null);
+
+            assertThat(handler.tombstoneObsoleteChunks(List.of("a", "b"), List.of())).isZero();
+        }
     }
 
     @Nested
@@ -167,23 +184,33 @@ class UpsertHandlerDeletionTest {
             };
 
             UpsertHandler handler = new UpsertHandler(registry, failingStorage);
-            ChangeSet changeSet = ChangeSet.builder(SOURCE_ID)
-                .addDeleted(metadata)
-                .build();
 
-            UpsertHandler.UpsertResult result = handler.processChanges(changeSet);
+            UpsertHandler.UpsertResult result = handler.removeDocument(metadata);
 
             assertThat(result.hasErrors()).isTrue();
+            assertThat(result.isSuccess()).isFalse();
             assertThat(result.getErrors()).hasSize(1);
             assertThat(result.getErrors().get(0).getComponent()).isEqualTo("storage");
+            assertThat(result.getErrors().get(0).getChunkId()).isEqualTo(chunkId);
         }
 
         @Test
-        @DisplayName("should throw on null change set")
-        void shouldThrowOnNullChangeSet() {
+        @DisplayName("should throw on null metadata")
+        void shouldThrowOnNullMetadata() {
             UpsertHandler handler = new UpsertHandler(registry, storageAdapter);
 
-            assertThatThrownBy(() -> handler.processChanges(null))
+            assertThatThrownBy(() -> handler.removeDocument(null))
+                .isInstanceOf(NullPointerException.class);
+        }
+
+        @Test
+        @DisplayName("should throw on null chunk id lists")
+        void shouldThrowOnNullChunkIdLists() {
+            UpsertHandler handler = new UpsertHandler(registry, storageAdapter);
+
+            assertThatThrownBy(() -> handler.tombstoneObsoleteChunks(null, List.of()))
+                .isInstanceOf(NullPointerException.class);
+            assertThatThrownBy(() -> handler.tombstoneObsoleteChunks(List.of(), null))
                 .isInstanceOf(NullPointerException.class);
         }
     }

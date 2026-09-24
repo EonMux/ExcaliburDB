@@ -60,7 +60,7 @@ class GraphQueryEndpointTest {
     void setUp(@TempDir Path root) throws IOException {
         EdgeStoreWriter writer = new EdgeStoreWriter();
         writer.add(ADA, COLLABORATED_WITH, BABBAGE, Integer.MIN_VALUE, TemporalFilter.OPEN,
-            new Provenance(SourceType.KNOWLEDGE_BASE, 1, 96, 7));
+            new Provenance(SourceType.USER_ASSERTED, 1, 96, 7));
         writer.build(root.resolve("graph"), 8);
         edgeStore = MappedEdgeStore.open(root.resolve("graph"));
 
@@ -309,7 +309,7 @@ class GraphQueryEndpointTest {
         Response response = call("POST",
             "{\"query\": \"Who did Ada Lovelace collaborate with?\"}");
 
-        assertThat(response.body()).contains("knowledge_base").contains("conf=96");
+        assertThat(response.body()).contains("user_asserted").contains("conf=96");
     }
 
     @Test
@@ -569,7 +569,7 @@ class GraphQueryEndpointTest {
 
         @BeforeEach
         void build(@TempDir Path root) throws IOException {
-            Provenance curated = new Provenance(SourceType.KNOWLEDGE_BASE, 1, 96, 7);
+            Provenance curated = new Provenance(SourceType.USER_ASSERTED, 1, 96, 7);
             EdgeStoreWriter writer = new EdgeStoreWriter().supersessionPolicy(
                 com.eonmux.excalibur.graph.temporal.SupersessionPolicy.forRelations(LIVED_IN));
             writer.add(ADA, COLLABORATED_WITH, BABBAGE, Integer.MIN_VALUE, TemporalFilter.OPEN,

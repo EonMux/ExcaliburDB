@@ -279,27 +279,4 @@ class QueryRequestTest {
             assertThat(str).contains("timeout=5000ms");
         }
     }
-
-    @Nested
-    @DisplayName("toQueryOptions conversion")
-    class ToQueryOptionsConversion {
-
-        @Test
-        @DisplayName("converts to QueryOptions with equivalent settings")
-        void convertsToQueryOptions() {
-            QueryRequest request = QueryRequest.builder()
-                .queryVector(createVector(10))
-                .topK(25)
-                .threshold(0.6f)
-                .includePartialSegments(false)
-                .timeoutMs(10000)
-                .build();
-
-            QueryOptions options = request.toQueryOptions();
-
-            assertThat(options.topK()).isEqualTo(25);
-            assertThat(options.threshold()).isEqualTo(0.6f);
-            assertThat(options.includePartialSegments()).isFalse();
-        }
-    }
 }

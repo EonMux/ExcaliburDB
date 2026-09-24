@@ -80,6 +80,16 @@ public enum FileKind {
      */
     SOURCE_STATUS,
 
+    /**
+     * {@code erasure-receipts}: what each recent document erasure did, for its caller to ask
+     * about later.
+     *
+     * <p>A report like the status history: the node reads one it cannot trust as holding no
+     * receipts, and the obligations the receipts pointed at are in the erasure logs, which
+     * losing it does not touch. See {@link #discardedOnOpen()}.</p>
+     */
+    ERASURE_RECEIPTS,
+
     /** A log inside a tenant's {@code graph-staging} directory. */
     GRAPH_STAGING_LOG,
 
@@ -91,6 +101,14 @@ public enum FileKind {
      * whole content and there is nothing in it that could differ from what was written.</p>
      */
     GRAPH_ERASURE_MARKER,
+
+    /**
+     * {@code graph-staging/unpublished.changes}: the marker that says a tenant's staging holds
+     * changes its served graph does not have yet, which the node's automatic build publishes.
+     *
+     * <p>Empty by construction, for the reason {@link #GRAPH_ERASURE_MARKER} is.</p>
+     */
+    GRAPH_UNPUBLISHED_MARKER,
 
     /**
      * A file of a tenant's built graph, {@code <namespace>/graph/}, or of a directory a publish,
@@ -139,6 +157,17 @@ public enum FileKind {
      * is reported as such rather than as a file this tool failed to check.</p>
      */
     DIAGNOSTIC_DUMP,
+
+    /**
+     * {@code .excalibur-lock}: the lock that gives one process at a time the directory.
+     *
+     * <p>Coordination, not state: it holds the current or last holder's pid and, for a node,
+     * where it listens, and nothing in the engine reads it back. It is not data, not even
+     * unverified data - and a scan leaves it out of the report altogether, as it does a
+     * restore's journal and scratch, so that every run does not list the same file that
+     * describes a process rather than the store.</p>
+     */
+    NODE_LOCK,
 
     /** Nothing here recognises this file. */
     UNRECOGNISED;
@@ -196,10 +225,14 @@ public enum FileKind {
      * build does not read - is logged and treated as empty, each source reports from its next
      * run, and the file is rewritten when the first run ends. What is lost is the history, never data.</p>
      *
+     * <p>The erasure receipts are the same kind of record: one the node will not take is logged
+     * and read as holding no receipts, so the erasures it described answer as unknown, and it is
+     * rewritten at the next erasure. The obligations themselves live in the erasure logs.</p>
+     *
      * @return true for a kind the node discards, rather than refuses to start on, when damaged
      */
     public boolean discardedOnOpen() {
-        return this == SOURCE_STATUS;
+        return this == SOURCE_STATUS || this == ERASURE_RECEIPTS;
     }
 
     /**

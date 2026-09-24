@@ -275,8 +275,6 @@ class IndexOrchestratorTest {
         scheduler.registerSource("wiki"); // Using default interval
         assertEquals(2, scheduler.getRegisteredSourceCount());
 
-        scheduler.updateReindexInterval("docs", 3_600_000L);
-
         scheduler.unregisterSource("wiki");
         assertEquals(1, scheduler.getRegisteredSourceCount());
 

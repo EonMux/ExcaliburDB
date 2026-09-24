@@ -570,6 +570,27 @@ class GraphStoreCheckTest {
     }
 
     @Test
+    @DisplayName("the unpublished-changes marker is recognised, and its presence is its content")
+    void unpublishedMarker(@TempDir Path tempDir) throws IOException {
+        Path dataDir = builtNamespace(tempDir);
+        Path marker = dataDir.resolve(NAMESPACE).resolve("graph-staging")
+            .resolve(GraphStagingStore.UNPUBLISHED_MARKER);
+        Files.deleteIfExists(marker);
+        Files.createFile(marker);
+        String relative = NAMESPACE + "/graph-staging/" + GraphStagingStore.UNPUBLISHED_MARKER;
+
+        FileCheck empty = verdictOn(scan(dataDir), relative);
+        assertThat(FileClassifier.classify(relative))
+            .isEqualTo(FileKind.GRAPH_UNPUBLISHED_MARKER);
+        assertThat(empty.status()).isEqualTo(CheckStatus.INTACT);
+        assertThat(empty.detail()).contains("behind");
+
+        Files.writeString(marker, "unexpected");
+        FileCheck written = verdictOn(scan(dataDir), relative);
+        assertThat(written.status()).isEqualTo(CheckStatus.UNCHECKED);
+    }
+
+    @Test
     @DisplayName("names outside a graph directory are not taken for one")
     void classification() {
         assertThat(GraphStoreCheck.isGraphPart("shared/graph/edges_fwd.csr")).isTrue();

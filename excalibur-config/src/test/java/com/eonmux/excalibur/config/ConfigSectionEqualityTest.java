@@ -196,6 +196,11 @@ class ConfigSectionEqualityTest {
         return new SectionUnderTest(LlmConfig.class, LlmConfig::new, Map.of(), List.of(
             v("baseUrl", "excalibur.llm.base-url", "https://models.example.test/v1"),
             v("apiKey", "excalibur.llm.api-key", "sk-not-a-real-key"),
+            v("chatBaseUrl", "excalibur.llm.chat-base-url", "https://chat.example.test/v1"),
+            v("chatApiKey", "excalibur.llm.chat-api-key", "sk-not-a-real-chat-key"),
+            v("chatEnabled", "excalibur.llm.chat-enabled", "false"),
+            v("embeddingBaseUrl", "excalibur.llm.embedding-base-url", "http://localhost:11434"),
+            v("embeddingApiKey", "excalibur.llm.embedding-api-key", "sk-not-a-real-embed-key"),
             v("chatModel", "excalibur.llm.chat-model", "gpt-4o"),
             v("embeddingModel", "excalibur.llm.embedding-model", "text-embedding-3-large"),
             v("embeddingsDimensions", "excalibur.llm.embeddings-dimensions", "3072"),
@@ -254,6 +259,8 @@ class ConfigSectionEqualityTest {
             v("contextTokenBudget", "excalibur.graph.context-token-budget", "4000"),
             v("topK", "excalibur.graph.top-k", "25"),
             v("rerankOverFetch", "excalibur.graph.rerank-over-fetch", "8"),
+            v("maxFrontier", "excalibur.graph.max-frontier", "50"),
+            v("maxWalkFacts", "excalibur.graph.max-walk-facts", "500"),
             v("ramBufferMb", "excalibur.graph.ram-buffer-mb", "32.0"),
             v("extractionEnabled", "excalibur.graph.extraction-enabled", "true"),
             v("extractorVersion", "excalibur.graph.extractor-version", "2"),
@@ -265,7 +272,16 @@ class ConfigSectionEqualityTest {
             v("hotNamespaces", "excalibur.graph.hot-namespaces", "alpha,beta"),
             v("coldNamespaces", "excalibur.graph.cold-namespaces", "gamma"),
             v("erasureTombstoneRatio", "excalibur.graph.erasure-tombstone-ratio", "0.5"),
-            v("erasureMaxLatencySeconds", "excalibur.graph.erasure-max-latency-seconds", "7200")));
+            v("erasureMaxLatencySeconds", "excalibur.graph.erasure-max-latency-seconds", "7200"),
+            v("autoBuildEnabled", "excalibur.graph.auto-build-enabled", "false"),
+            v("autoBuildIntervalSeconds", "excalibur.graph.auto-build-interval-seconds", "7"),
+            v("autoBuildDebounceSeconds", "excalibur.graph.auto-build-debounce-seconds", "9"),
+            v("autoBuildMaxDelaySeconds", "excalibur.graph.auto-build-max-delay-seconds", "1800"),
+            v("autoBuildMaxConcurrent", "excalibur.graph.auto-build-max-concurrent", "2"),
+            v("autoBuildFailureBackoffSeconds",
+                "excalibur.graph.auto-build-failure-backoff-seconds", "30"),
+            v("autoBuildMaxFailureBackoffSeconds",
+                "excalibur.graph.auto-build-max-failure-backoff-seconds", "7200")));
     }
 
     /**

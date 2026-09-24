@@ -2,6 +2,7 @@ package com.eonmux.excalibur.graph.store;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.function.BooleanSupplier;
 
 import com.eonmux.excalibur.core.memory.MappedFootprint;
 import com.eonmux.excalibur.graph.format.EdgeColumn;
@@ -170,6 +171,100 @@ public final class MappedEdgeStore implements EdgeStore, MappedFootprint {
         return toLongArray(visited);
     }
 
+    /**
+     * As {@link #expand(long[], int, int[], TemporalFilter)}, with at most {@code maxFrontier}
+     * entities admitted by each hop and a signal that stops the walk early.
+     *
+     * <p>A hub - an entity with thousands of neighbours - would otherwise hand every one of them to
+     * the next hop, and the walk's cost would grow with the widest entity it touches rather than
+     * with the question. So when a hop reaches more new entities than the cap, the ones kept are
+     * those reached along the strongest edge, and the choice is deterministic: the edge's
+     * extraction confidence first, then the later valid-time start (an undated edge is the
+     * oldest), then the lower entity id. The same question on the same graph walks the same
+     * entities every time, which is what lets a truncated answer be reproduced and explained.</p>
+     *
+     * <p>The seeds are always admitted: they are the entities the question named, not ones the
+     * walk found. {@code stop} is read before each hop and as each frontier entity is expanded; a
+     * hop it interrupts is discarded whole, so the walk keeps exactly the hops it finished rather
+     * than an arbitrary part of one.</p>
+     *
+     * @param seeds        entities to start from
+     * @param hops         maximum hops to take; {@code 0} returns the seeds alone
+     * @param relWhitelist selectors to follow, or {@code null} for every relation both ways
+     * @param asOf         valid-time window applied as edges are considered
+     * @param maxFrontier  most new entities one hop may admit, at least 1
+     * @param stop         true once the walk should stop where it is
+     * @return what the walk reached and what it left out
+     * @throws IllegalArgumentException as {@link #expand(long[], int, int[], TemporalFilter)} does,
+     *                                  or if {@code maxFrontier} is below 1 or {@code stop} is null
+     */
+    public Expansion expand(long[] seeds, int hops, int[] relWhitelist, TemporalFilter asOf,
+                            int maxFrontier, BooleanSupplier stop) {
+        if (seeds == null) {
+            throw new IllegalArgumentException("seeds must not be null");
+        }
+        if (hops < 0) {
+            throw new IllegalArgumentException("hops must not be negative, got " + hops);
+        }
+        if (asOf == null) {
+            throw new IllegalArgumentException(
+                "asOf must not be null; use TemporalFilter.ALL to ignore valid time");
+        }
+        if (maxFrontier < 1) {
+            throw new IllegalArgumentException("maxFrontier must be at least 1, got " + maxFrontier);
+        }
+        if (stop == null) {
+            throw new IllegalArgumentException("stop must not be null");
+        }
+
+        RoaringBitmap visited = new RoaringBitmap();
+        for (long seed : seeds) {
+            visited.add(checkEntity(seed));
+        }
+        long dropped = 0;
+        boolean stopped = false;
+        RoaringBitmap frontier = visited.clone();
+        for (int hop = 0; hop < hops && !frontier.isEmpty(); hop++) {
+            if (stop.getAsBoolean()) {
+                stopped = true;
+                break;
+            }
+            RoaringBitmap next = expander.expandFrontier(frontier, relWhitelist, asOf, stop);
+            if (next == null) {
+                stopped = true;
+                break;
+            }
+            next.andNot(visited);
+            int reached = next.getCardinality();
+            if (reached > maxFrontier) {
+                next = expander.strongest(frontier, next, relWhitelist, asOf, maxFrontier, stop);
+                if (next == null) {
+                    stopped = true;
+                    break;
+                }
+                dropped += reached - maxFrontier;
+            }
+            visited.or(next);
+            frontier = next;
+        }
+        return new Expansion(toLongArray(visited), dropped, stopped);
+    }
+
+    /**
+     * What a bounded expansion reached, and what it left out.
+     *
+     * @param reached         reachable entity ids including the seeds, ascending
+     * @param entitiesDropped entities a hop reached and did not admit because of its cap
+     * @param stopped         whether the stop signal ended the walk before its last hop
+     */
+    public record Expansion(long[] reached, long entitiesDropped, boolean stopped) {
+
+        /** Whether a cap left anything out. */
+        public boolean truncated() {
+            return entitiesDropped > 0;
+        }
+    }
+
     @Override
     public long count(long subject, int relation) {
         int id = checkEntity(subject);
@@ -292,6 +387,114 @@ public final class MappedEdgeStore implements EdgeStore, MappedFootprint {
         void visit(int subject, int relation, int object, long forwardEdgeIndex);
     }
 
+    // ---------------------------------------------------------------- incident runs
+
+    /**
+     * Where an entity's edges lie in one index, optionally narrowed to one relation.
+     *
+     * <p>The forward index holds the edges an entity is the subject of, sorted by relation and
+     * then object; the reverse index the edges it is the object of, sorted by relation and then
+     * subject. Either run is therefore ordered by {@code (relation, neighbour)}, and edges that
+     * agree on both keep the order they were staged in. That order is what lets a reader page
+     * through a run by key, and resume after a rebuild at the same place: relation and entity ids
+     * are never renumbered.</p>
+     *
+     * @param entity   The entity
+     * @param reverse  The reverse index rather than the forward one
+     * @param relation The relation id to narrow to, or a negative value for every relation
+     * @return {@code {start, end}}, positions in that index, end exclusive
+     * @throws IllegalArgumentException if {@code entity} is not a valid id for this store
+     */
+    public long[] runOf(long entity, boolean reverse, int relation) {
+        int id = checkEntity(entity);
+        EdgeColumn offsets = reverse ? EdgeColumn.OFFSETS_REV : EdgeColumn.OFFSETS_FWD;
+        long start = columns.getLong(offsets, id);
+        long end = columns.getLong(offsets, id + 1L);
+        if (relation >= 0) {
+            EdgeColumn rel = reverse ? EdgeColumn.REL_REV : EdgeColumn.REL_FWD;
+            long from = lowerBound(rel, start, end, relation);
+            end = upperBound(rel, from, end, relation);
+            start = from;
+        }
+        return new long[] {start, end};
+    }
+
+    /**
+     * How many edges an entity has in one direction, over all of valid time.
+     *
+     * @param entity  The entity
+     * @param reverse Count the edges it is the object of rather than the subject of
+     * @return The count, from the offset array alone
+     * @throws IllegalArgumentException if {@code entity} is not a valid id for this store
+     */
+    public long degree(long entity, boolean reverse) {
+        long[] run = runOf(entity, reverse, -1);
+        return run[1] - run[0];
+    }
+
+    /**
+     * The relation of the edge at a position of one index.
+     *
+     * @param reverse  Which index
+     * @param position A position within it
+     * @return The relation id
+     */
+    public int relationAt(boolean reverse, long position) {
+        return columns.getInt(reverse ? EdgeColumn.REL_REV : EdgeColumn.REL_FWD, position);
+    }
+
+    /**
+     * The other endpoint of the edge at a position of one index: its object in the forward
+     * index, its subject in the reverse one.
+     *
+     * @param reverse  Which index
+     * @param position A position within it
+     * @return The neighbouring entity id
+     */
+    public int neighborAt(boolean reverse, long position) {
+        return columns.getInt(reverse ? EdgeColumn.EDGES_REV : EdgeColumn.EDGES_FWD, position);
+    }
+
+    /**
+     * The forward index of the edge at a position of one index, which is what the validity and
+     * provenance columns are addressed by.
+     *
+     * @param reverse  Which index
+     * @param position A position within it
+     * @return The edge's position in the forward index
+     */
+    public long forwardIndexAt(boolean reverse, long position) {
+        return reverse ? columns.getLong(EdgeColumn.PERM_REV, position) : position;
+    }
+
+    /**
+     * The first position of a run whose {@code (relation, neighbour)} is at or after the given
+     * pair.
+     *
+     * @param reverse  Which index
+     * @param start    Where the run starts
+     * @param end      Where it ends, exclusive
+     * @param relation The relation id of the pair
+     * @param neighbor The neighbouring entity id of the pair
+     * @return A position in {@code [start, end]}
+     */
+    public long seek(boolean reverse, long start, long end, int relation, int neighbor) {
+        long lo = start;
+        long hi = end;
+        while (lo < hi) {
+            long mid = (lo + hi) >>> 1;
+            int midRelation = relationAt(reverse, mid);
+            boolean before = midRelation < relation
+                || (midRelation == relation && neighborAt(reverse, mid) < neighbor);
+            if (before) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
     // ---------------------------------------------------------------- internals
 
     /**
@@ -323,6 +526,79 @@ public final class MappedEdgeStore implements EdgeStore, MappedFootprint {
                     relation, false, asOf, sink);
             }
         }
+    }
+
+    /**
+     * Raises each candidate's strength to that of the strongest admitted edge from
+     * {@code entity} reaching it.
+     *
+     * <p>The ranking behind {@link #expand(long[], int, int[], TemporalFilter, int,
+     * BooleanSupplier)}'s cap: the same edges {@link #collectNeighbors} admits, each scored by
+     * {@link #strength}, recorded at the candidate's position in {@code candidates}.</p>
+     *
+     * @param entity     the frontier entity whose edges to read
+     * @param selectors  selectors to follow, or null for every relation both ways
+     * @param asOf       valid-time window
+     * @param candidates the entities being ranked
+     * @param best       each candidate's strongest edge so far, indexed by rank in candidates
+     */
+    void strengthenNeighbors(int entity, int[] selectors, TemporalFilter asOf,
+                             RoaringBitmap candidates, long[] best) {
+        if (selectors == null) {
+            strengthenRun(entity, EdgeColumn.OFFSETS_FWD, EdgeColumn.EDGES_FWD, -1, false, asOf,
+                candidates, best);
+            strengthenRun(entity, EdgeColumn.OFFSETS_REV, EdgeColumn.EDGES_REV, -1, true, asOf,
+                candidates, best);
+            return;
+        }
+        for (int selector : selectors) {
+            boolean reverse = RelationSelector.isReverse(selector);
+            int relation = RelationSelector.relationOf(selector);
+            if (reverse) {
+                strengthenRun(entity, EdgeColumn.OFFSETS_REV, EdgeColumn.EDGES_REV, relation, true,
+                    asOf, candidates, best);
+            } else {
+                strengthenRun(entity, EdgeColumn.OFFSETS_FWD, EdgeColumn.EDGES_FWD, relation,
+                    false, asOf, candidates, best);
+            }
+        }
+    }
+
+    private void strengthenRun(int entity, EdgeColumn offsets, EdgeColumn adjacency, int relation,
+                               boolean reverse, TemporalFilter asOf, RoaringBitmap candidates,
+                               long[] best) {
+        long start = columns.getLong(offsets, entity);
+        long end = columns.getLong(offsets, entity + 1L);
+        if (relation >= 0 && start < end) {
+            EdgeColumn relColumn = reverse ? EdgeColumn.REL_REV : EdgeColumn.REL_FWD;
+            start = lowerBound(relColumn, start, end, relation);
+            end = upperBound(relColumn, start, end, relation);
+        }
+        boolean unbounded = asOf.isUnbounded();
+        for (long position = start; position < end; position++) {
+            int target = columns.getInt(adjacency, position);
+            if (!candidates.contains(target)) {
+                continue;
+            }
+            long forwardIndex = reverse ? columns.getLong(EdgeColumn.PERM_REV, position) : position;
+            int validFrom = columns.getInt(EdgeColumn.VALID_FROM, forwardIndex);
+            if (!unbounded
+                    && !asOf.admits(validFrom, columns.getInt(EdgeColumn.VALID_TO, forwardIndex))) {
+                continue;
+            }
+            int slot = candidates.rank(target) - 1;
+            best[slot] = Math.max(best[slot], strength(forwardIndex, validFrom));
+        }
+    }
+
+    /**
+     * How strongly one edge ties its ends together, for choosing which neighbours a capped hop
+     * keeps: extraction confidence in the high bits, the valid-time start below it, so a more
+     * confident edge always wins and a later one breaks the tie. Never negative.
+     */
+    private long strength(long forwardIndex, int validFrom) {
+        long confidence = columns.getByte(EdgeColumn.EXTRACTION_CONFIDENCE, forwardIndex) & 0xFF;
+        return (confidence << 32) | ((long) validFrom - Integer.MIN_VALUE);
     }
 
     /**

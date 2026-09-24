@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.store;
 
 import com.eonmux.excalibur.store.format.LogEntry;
+import com.eonmux.excalibur.store.format.WriteLogHeader;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -37,6 +38,9 @@ class WriteLogMidLogCorruptionTest {
 
     private static final int RECORD_COUNT = 100;
 
+    /** Where the first record lies in the file: the damage is written at file offsets. */
+    private static final long RECORDS_START = WriteLogHeader.SIZE;
+
     @TempDir
     Path directory;
 
@@ -61,7 +65,7 @@ class WriteLogMidLogCorruptionTest {
 
     /** Flips a payload byte, leaving the opcode and the lengths intact, as bit rot would. */
     private void corruptPayloadOf(Path logFile, int recordIndex) throws IOException {
-        long target = (long) recordIndex * RECORD_SIZE + LogEntry.KEY_BYTES_OFFSET;
+        long target = RECORDS_START + (long) recordIndex * RECORD_SIZE + LogEntry.KEY_BYTES_OFFSET;
         try (FileChannel channel = FileChannel.open(logFile, StandardOpenOption.READ,
                 StandardOpenOption.WRITE)) {
             ByteBuffer one = ByteBuffer.allocate(1);
@@ -81,7 +85,7 @@ class WriteLogMidLogCorruptionTest {
         assertThatThrownBy(() -> new WriteLog(logFile))
             .as("the 49 acknowledged records after the damage must not be discarded in silence")
             .isInstanceOf(CorruptLogException.class)
-            .hasMessageContaining("2550");
+            .hasMessageContaining("offset " + (RECORDS_START + 50L * RECORD_SIZE) + ":");
     }
 
     @Test
@@ -107,7 +111,7 @@ class WriteLogMidLogCorruptionTest {
             // The header of the last record survives and its payload does not, which is what
             // a write interrupted part-way through leaves behind.
             channel.write(ByteBuffer.allocate(RECORD_SIZE - LogEntry.HEADER_SIZE),
-                lastRecord + LogEntry.HEADER_SIZE);
+                RECORDS_START + lastRecord + LogEntry.HEADER_SIZE);
         }
 
         try (WriteLog reopened = new WriteLog(logFile)) {

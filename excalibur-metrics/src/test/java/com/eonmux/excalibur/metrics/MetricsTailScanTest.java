@@ -23,7 +23,6 @@ class MetricsTailScanTest {
     void vectorEntriesFoundAccumulates() throws Exception {
         long scannedBefore = Metrics.getTotalTailScanned();
         long foundBefore = Metrics.getTotalVectorEntriesFound();
-        long scansBefore = Metrics.getTotalTailScanCount();
 
         Metrics.recordTailScanMetrics(100, 30);
         Metrics.recordTailScanMetrics(50, 20);
@@ -32,8 +31,6 @@ class MetricsTailScanTest {
             "entries scanned must accumulate");
         assertEquals(foundBefore + 50, Metrics.getTotalVectorEntriesFound(),
             "entries with a vector must accumulate, not be discarded");
-        assertEquals(scansBefore + 2, Metrics.getTotalTailScanCount(),
-            "each call is one scan");
 
         Object published = Metrics.getHnswQueueDepthMBean().getAttribute("totalVectorEntriesFound");
         assertEquals(Metrics.getTotalVectorEntriesFound(), published,

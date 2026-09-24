@@ -72,7 +72,7 @@ public final class ReindexerFactory {
                 + "does not embed its corpus, and its chunks are stored and ranked lexically.");
             return null;
         }
-        return new LLMHttpClient(LLMClientConfig.fromConfig(llm));
+        return new LLMHttpClient(LLMClientConfig.forEmbeddings(llm));
     }
 
     /**
@@ -115,9 +115,7 @@ public final class ReindexerFactory {
 
         DocumentBatchPublisher batchPublisher = new DocumentBatchPublisher(
             indexOrchestrator.getVisibilityTracker(),
-            registry,
-            () -> { /* write log sync is performed by the storage engine */ },
-            null
+            registry
         );
 
         boolean rollingReplacement = volumeManager != null && storageEngine.getCatalog() != null;

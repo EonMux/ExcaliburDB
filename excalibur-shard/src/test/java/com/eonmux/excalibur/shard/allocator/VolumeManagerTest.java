@@ -285,42 +285,6 @@ class VolumeManagerTest {
         }
     }
 
-    // ==================== Reassignment Tests ====================
-
-    @Nested
-    @DisplayName("reassignSegment()")
-    class ReassignTests {
-
-        @Test
-        @DisplayName("should reassign segment to new volume")
-        void shouldReassignSegment() throws IOException {
-            manager.registerVolume(vol1);
-            manager.registerVolume(vol2);
-
-            // Initial assignment
-            Path initial = manager.assignSegmentToVolume(1L);
-
-            // Reassign
-            Path reassigned = manager.reassignSegment(1L);
-
-            // After reassignment, the segment should still be assigned
-            assertThat(reassigned).isNotNull();
-        }
-
-        @Test
-        @DisplayName("should update volume-to-segment mapping on reassign")
-        void shouldUpdateMappingOnReassign() throws IOException {
-            manager.registerVolume(vol1);
-            manager.registerVolume(vol2);
-
-            manager.assignSegmentToVolume(1L);
-            manager.reassignSegment(1L);
-
-            // Total segment count should remain 1
-            assertThat(manager.getTotalSegmentCount()).isEqualTo(1);
-        }
-    }
-
     // ==================== Statistics Tests ====================
 
     @Nested

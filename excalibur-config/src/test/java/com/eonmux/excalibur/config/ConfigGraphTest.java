@@ -48,6 +48,8 @@ class ConfigGraphTest {
                 .as("the honest default is no correction, because none has been measured")
                 .isEqualTo(GraphConfig.DEFAULT_CONFIDENCE_TEMPERATURE);
             assertThat(settings.getRamBufferMb()).isEqualTo(GraphConfig.DEFAULT_RAM_BUFFER_MB);
+            assertThat(settings.getMaxFrontier()).isEqualTo(GraphConfig.DEFAULT_MAX_FRONTIER);
+            assertThat(settings.getMaxWalkFacts()).isEqualTo(GraphConfig.DEFAULT_MAX_WALK_FACTS);
         }
 
         @Test
@@ -121,6 +123,18 @@ class ConfigGraphTest {
 
             assertThat(settings.getMaxNamespaces()).isEqualTo(3);
             assertThat(settings.isRequireExplicitNamespaces()).isTrue();
+        }
+
+        @Test
+        @DisplayName("the walk caps are read")
+        void walkCapsAreRead() {
+            GraphConfig settings = graph(Map.of(
+                "excalibur.graph.max-frontier", "25",
+                "excalibur.graph.max-walk-facts", "300"));
+
+            assertThat(settings.getMaxFrontier()).isEqualTo(25);
+            assertThat(settings.getMaxWalkFacts()).isEqualTo(300);
+            assertThat(settings.toString()).contains("maxFrontier=25", "maxWalkFacts=300");
         }
 
         @Test
@@ -220,6 +234,20 @@ class ConfigGraphTest {
                 graph(Map.of("excalibur.graph.max-ambiguous-candidates", "0")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("max-ambiguous-candidates");
+            assertThatThrownBy(() -> graph(Map.of("excalibur.graph.max-frontier", "0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max-frontier");
+            assertThatThrownBy(() -> graph(Map.of("excalibur.graph.max-walk-facts", "-5")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max-walk-facts");
+        }
+
+        @Test
+        @DisplayName("a walk cap that is not a number is refused, naming the key")
+        void unparseableWalkCap() {
+            assertThatThrownBy(() -> graph(Map.of("excalibur.graph.max-frontier", "lots")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max-frontier");
         }
 
         @Test
@@ -249,6 +277,86 @@ class ConfigGraphTest {
             assertThatThrownBy(() -> graph(Map.of("excalibur.graph.ram-buffer-mb", "0")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("ram-buffer-mb");
+        }
+    }
+
+    @Nested
+    @DisplayName("Automatic build")
+    class AutomaticBuild {
+
+        @Test
+        @DisplayName("on by default, debounced, one namespace at a time, backing off on failure")
+        void defaults() {
+            GraphConfig graph = graph(Map.of());
+
+            assertThat(graph.isAutoBuildEnabled()).isTrue();
+            assertThat(graph.getAutoBuildIntervalSeconds())
+                .isEqualTo(GraphConfig.DEFAULT_AUTO_BUILD_INTERVAL_SECONDS);
+            assertThat(graph.getAutoBuildDebounceSeconds())
+                .isEqualTo(GraphConfig.DEFAULT_AUTO_BUILD_DEBOUNCE_SECONDS);
+            assertThat(graph.getAutoBuildMaxDelaySeconds())
+                .isEqualTo(GraphConfig.DEFAULT_AUTO_BUILD_MAX_DELAY_SECONDS);
+            assertThat(graph.getAutoBuildMaxConcurrent()).isOne();
+            assertThat(graph.getAutoBuildFailureBackoffSeconds())
+                .isEqualTo(GraphConfig.DEFAULT_AUTO_BUILD_FAILURE_BACKOFF_SECONDS);
+            assertThat(graph.getAutoBuildMaxFailureBackoffSeconds())
+                .isEqualTo(GraphConfig.DEFAULT_AUTO_BUILD_MAX_FAILURE_BACKOFF_SECONDS);
+        }
+
+        @Test
+        @DisplayName("every setting is read")
+        void explicitValues() {
+            GraphConfig graph = graph(Map.of(
+                "excalibur.graph.auto-build-enabled", "false",
+                "excalibur.graph.auto-build-interval-seconds", "5",
+                "excalibur.graph.auto-build-debounce-seconds", "0",
+                "excalibur.graph.auto-build-max-delay-seconds", "120",
+                "excalibur.graph.auto-build-max-concurrent", "3",
+                "excalibur.graph.auto-build-failure-backoff-seconds", "10",
+                "excalibur.graph.auto-build-max-failure-backoff-seconds", "600"));
+
+            assertThat(graph.isAutoBuildEnabled()).isFalse();
+            assertThat(graph.getAutoBuildIntervalSeconds()).isEqualTo(5);
+            assertThat(graph.getAutoBuildDebounceSeconds()).isZero();
+            assertThat(graph.getAutoBuildMaxDelaySeconds()).isEqualTo(120);
+            assertThat(graph.getAutoBuildMaxConcurrent()).isEqualTo(3);
+            assertThat(graph.getAutoBuildFailureBackoffSeconds()).isEqualTo(10);
+            assertThat(graph.getAutoBuildMaxFailureBackoffSeconds()).isEqualTo(600);
+        }
+
+        @Test
+        @DisplayName("values that cannot schedule anything are refused")
+        void refusals() {
+            assertThatThrownBy(() -> graph(Map.of(
+                "excalibur.graph.auto-build-interval-seconds", "0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("auto-build-interval-seconds");
+            assertThatThrownBy(() -> graph(Map.of(
+                "excalibur.graph.auto-build-debounce-seconds", "-1")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("auto-build-debounce-seconds");
+            assertThatThrownBy(() -> graph(Map.of(
+                "excalibur.graph.auto-build-max-delay-seconds", "0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("auto-build-max-delay-seconds");
+            assertThatThrownBy(() -> graph(Map.of(
+                "excalibur.graph.auto-build-max-concurrent", "0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("auto-build-max-concurrent");
+            assertThatThrownBy(() -> graph(Map.of(
+                "excalibur.graph.auto-build-failure-backoff-seconds", "0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("auto-build-failure-backoff-seconds");
+        }
+
+        @Test
+        @DisplayName("a backoff ceiling below its first step is refused")
+        void ceilingBelowFirstStep() {
+            assertThatThrownBy(() -> graph(Map.of(
+                "excalibur.graph.auto-build-failure-backoff-seconds", "60",
+                "excalibur.graph.auto-build-max-failure-backoff-seconds", "30")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("auto-build-max-failure-backoff-seconds");
         }
     }
 
@@ -285,7 +393,12 @@ class ConfigGraphTest {
                 Map.entry("excalibur.graph.max-namespaces", "12"),
                 Map.entry("excalibur.graph.require-explicit-namespaces", "true"),
                 Map.entry("excalibur.graph.erasure-tombstone-ratio", "0.4"),
-                Map.entry("excalibur.graph.erasure-max-latency-seconds", "600"));
+                Map.entry("excalibur.graph.erasure-max-latency-seconds", "600"),
+                Map.entry("excalibur.graph.auto-build-enabled", "false"),
+                Map.entry("excalibur.graph.auto-build-interval-seconds", "5"),
+                Map.entry("excalibur.graph.auto-build-debounce-seconds", "5"),
+                Map.entry("excalibur.graph.auto-build-max-delay-seconds", "60"),
+                Map.entry("excalibur.graph.auto-build-max-concurrent", "2"));
 
             keys.forEach((key, value) -> {
                 Map<String, String> changed = new HashMap<>(base);

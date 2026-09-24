@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.audit.AuditLog;
 import com.eonmux.excalibur.api.protocol.RequestBody;
 
 import com.sun.net.httpserver.HttpExchange;
@@ -286,6 +287,7 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
                 // Parse request body
                 String requestBody = readRequestBody(exchange);
                 ReindexRequest request = parseRequest(requestBody);
+                AuditLog.target(exchange, "source_id", request.sourceId);
 
                 // Set source ID in MDC for per-source logging
                 StructuredLoggingHelper.setSourceId(request.sourceId);
@@ -519,6 +521,7 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         String sourceId;
         try {
             sourceId = parseRequest(readRequestBody(exchange)).sourceId;
+            AuditLog.target(exchange, "source_id", sourceId);
         } catch (RequestBody.TooLargeException e) {
             sendError(exchange, 413, e.getMessage());
             return;

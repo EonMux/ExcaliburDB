@@ -102,6 +102,13 @@ public sealed interface RetrievalOutcome
         LOW_PROVENANCE_CONFIDENCE,
 
         /** A mention in the question could not be resolved to any entity. */
-        UNRESOLVED_REFERENCE
+        UNRESOLVED_REFERENCE,
+
+        /**
+         * The query's deadline passed before the graph could be walked, so there was no
+         * evidence to judge. Not a statement about the graph: the same question with more time
+         * may well be answered.
+         */
+        TIMED_OUT
     }
 }

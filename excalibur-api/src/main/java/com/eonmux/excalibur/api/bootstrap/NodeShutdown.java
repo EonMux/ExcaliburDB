@@ -112,14 +112,19 @@ public record NodeShutdown(ExcaliburDBServer server,
      *
      * <p>Every step runs even when an earlier one failed, because a step that throws must not
      * leave the arena open with the process still holding mappings.</p>
+     *
+     * @return true if every step completed, so nothing the node started is still running and
+     *         nothing it opened is still open
      */
-    public void run() {
+    public boolean run() {
         SweepState sweep = new SweepState(lexicalErasureSweep != null);
         BackgroundWork background = new BackgroundWork();
         ShutdownSequence sequence =
             sequence(sweep, background, ShutdownBudget.startingNow(shutdownTimeout));
         int failedSteps = sequence.stepNames().size() - sequence.run().size();
-        reportOutcome(failedSteps, storageEngine.getCatalog().closeFailure());
+        Throwable catalogFailure = storageEngine.getCatalog().closeFailure();
+        reportOutcome(failedSteps, catalogFailure);
+        return failedSteps == 0 && catalogFailure == null;
     }
 
     /**

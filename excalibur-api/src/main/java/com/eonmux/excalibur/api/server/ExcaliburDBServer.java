@@ -16,7 +16,9 @@ import com.eonmux.excalibur.ingest.lsh.LshIngestionService;
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
+import com.eonmux.excalibur.ingest.registry.ErasureReceiptFile;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
+
 import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
 import com.eonmux.excalibur.ingest.source.SourceResolver;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
@@ -299,6 +301,18 @@ public class ExcaliburDBServer {
     public void withDocumentErasure(DocumentErasureService service) {
         requireNotStarted("erasure");
         wiring.withDocumentErasure(service);
+    }
+
+    /**
+     * Keeps a receipt for every document erasure, and serves {@code GET /v1/erasure/{request_id}}
+     * from them.
+     *
+     * @param receipts Where the receipts are recorded
+     * @throws IllegalStateException if the server is already running
+     */
+    public void withErasureReceipts(ErasureReceiptFile receipts) {
+        requireNotStarted("erasure receipts");
+        wiring.withErasureReceipts(receipts);
     }
 
     /**
@@ -618,6 +632,39 @@ public class ExcaliburDBServer {
     }
 
     /**
+     * Starts the node without binding a listener, for a caller in the same process.
+     *
+     * <p>Everything {@link #start()} starts except the socket: the index orchestrator, whose
+     * epoch tick is what makes a published document visible, starts here too. The node then
+     * counts as running, so {@link #stop(ShutdownBudget)} drains the query pipeline, ingestion
+     * and the orchestrator exactly as it does for a served node - there is simply no listener or
+     * request pool for it to stop first. The security policy is not consulted: it governs a
+     * listener, and there is none.</p>
+     *
+     * @return What the routes would have been built from
+     * @throws IllegalStateException if the node is already running, or was assembled without
+     *                               what an in-process caller needs
+     */
+    public synchronized InProcessServices startInProcess() {
+        if (running.get()) {
+            throw new IllegalStateException("Server is already running");
+        }
+        InProcessServices services = wiring.inProcessServices();
+
+        IndexOrchestrator indexOrchestrator = wiring.indexOrchestrator();
+        try {
+            indexOrchestrator.start();
+        } catch (RuntimeException e) {
+            stopOrchestratorAfterFailedStart(indexOrchestrator, e);
+            throw e;
+        }
+        running.set(true);
+        LOGGER.info("ExcaliburDB {} on {} started in-process, with no listener",
+            BuildInfo.version(), BuildInfo.jvm());
+        return services;
+    }
+
+    /**
      * Takes down an orchestrator a failed {@link #start()} brought up, and records whether it
      * went.
      *
@@ -845,6 +892,63 @@ public class ExcaliburDBServer {
             return null;
         }
         return urlOf(current instanceof HttpsServer, current.getAddress());
+    }
+
+    /**
+     * Where a probe on this host reaches the liveness route.
+     *
+     * <p>From the bound socket, like {@link #baseUrl()}, so it carries the scheme, the port and
+     * the interface the listener really has. The one difference is a wildcard bind: the wildcard
+     * is what the node listens on but not an address anything can connect to, so the loopback
+     * address of the same family - on every interface the wildcard covers - stands in for it.
+     * {@code /health} and not {@code /health/ready}: a process supervisor asks whether the
+     * process is alive, and a drained or still-recovering node is alive; restarting it would
+     * only lose the recovery it is part-way through.</p>
+     *
+     * @return The liveness URL, or null if the server is not started
+     */
+    public String livenessProbeUrl() {
+        HttpServer current = server;
+        if (current == null) {
+            return null;
+        }
+        return probeUrlOf(current instanceof HttpsServer, current.getAddress());
+    }
+
+    /**
+     * Spells the liveness URL a local probe uses for a listening address.
+     *
+     * @param tls     Whether the listener serves TLS
+     * @param address The bound address
+     * @return The {@code /health} URL, on loopback when the address is a wildcard
+     */
+    static String probeUrlOf(boolean tls, InetSocketAddress address) {
+        InetAddress host = address.getAddress();
+        InetSocketAddress reachable = host.isAnyLocalAddress()
+            ? new InetSocketAddress(loopbackLike(host), address.getPort())
+            : address;
+        return urlOf(tls, reachable) + "/health";
+    }
+
+    /**
+     * Returns the loopback address of the same family as a wildcard.
+     *
+     * @param wildcard {@code 0.0.0.0} or {@code ::}
+     * @return {@code 127.0.0.1} or {@code ::1}
+     */
+    private static InetAddress loopbackLike(InetAddress wildcard) {
+        byte[] loopback = new byte[wildcard.getAddress().length];
+        if (wildcard instanceof Inet6Address) {
+            loopback[loopback.length - 1] = 1;
+        } else {
+            loopback[0] = 127;
+            loopback[loopback.length - 1] = 1;
+        }
+        try {
+            return InetAddress.getByAddress(loopback);
+        } catch (java.net.UnknownHostException e) {
+            throw new IllegalStateException("A 4- or 16-byte address was refused", e);
+        }
     }
 
     /**

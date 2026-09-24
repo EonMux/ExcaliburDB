@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.core.util.QueryBudget;
 import com.eonmux.excalibur.query.executor.CancellationToken;
 import com.eonmux.excalibur.query.executor.QueryRegistry;
 
@@ -52,9 +53,24 @@ final class QueryWithdrawal {
      * @return The open window
      */
     static QueryWithdrawal open(QueryRegistry registry, String queryId, String correlationId) {
+        return open(registry, queryId, correlationId, QueryRegistry.Kind.CORPUS);
+    }
+
+    /**
+     * Makes a query of the given kind withdrawable.
+     *
+     * @param registry      Where the cancel route looks a query up, or null on a node that keeps
+     *                      none, where nothing can withdraw a query
+     * @param queryId       The identifier the query is registered under
+     * @param correlationId Correlation ID for the registration
+     * @param kind          Which kind of search the status route lists it as
+     * @return The open window
+     */
+    static QueryWithdrawal open(QueryRegistry registry, String queryId, String correlationId,
+                                QueryRegistry.Kind kind) {
         QueryWithdrawal withdrawal = new QueryWithdrawal(registry, queryId);
         if (registry != null) {
-            registry.register(queryId, withdrawal.token, correlationId);
+            registry.register(queryId, withdrawal.token, correlationId, kind);
         }
         return withdrawal;
     }
@@ -76,6 +92,17 @@ final class QueryWithdrawal {
      * @return This window
      */
     QueryWithdrawal stops(CancellationToken work) {
+        token.addListener(() -> work.cancel(WITHDRAWN));
+        return this;
+    }
+
+    /**
+     * Makes a withdrawal end a query that runs within a budget.
+     *
+     * @param work The budget the query's stages check and wait within
+     * @return This window
+     */
+    QueryWithdrawal stops(QueryBudget work) {
         token.addListener(() -> work.cancel(WITHDRAWN));
         return this;
     }

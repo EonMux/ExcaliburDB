@@ -150,6 +150,19 @@ class IngestionWiringTest {
     }
 
     @Test
+    @DisplayName("a node on a keyless local server attaches both roles without a key")
+    void keylessLocalServerAttaches(@TempDir Path dataDir) throws IOException {
+        Config config = config(Map.of("excalibur.llm.base-url", "http://127.0.0.1:9"));
+        ExcaliburDBServer server = attach(config, dataDir);
+
+        assertThat(RetrievalCapabilities.from(config).embedCorpus())
+            .as("Ollama, vLLM and TGI need no key, so the endpoint is used")
+            .isTrue();
+        assertThat(server.getIngestionOrchestrator()).isNotNull();
+        assertThat(attachment.chunkIndex()).isNotNull();
+    }
+
+    @Test
     @DisplayName("a node that declines the embedding pass still ingests and expands")
     void expandingNodeIngestsLexically(@TempDir Path dataDir) throws IOException {
         ExcaliburDBServer server = attach(config(Map.of(

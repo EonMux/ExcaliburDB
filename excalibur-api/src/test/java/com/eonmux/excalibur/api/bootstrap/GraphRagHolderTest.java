@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import com.eonmux.excalibur.graph.browse.GraphCatalog;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
 
 import org.junit.jupiter.api.DisplayName;
@@ -21,6 +22,7 @@ class GraphRagHolderTest {
     /** A stack whose only interest is whether it was closed. */
     private static GraphRagFactory.GraphRag stack(AtomicBoolean closed) {
         return new GraphRagFactory.GraphRag(mock(GraphRagPipeline.class), mention -> new long[0],
+            mock(GraphCatalog.class),
             List.of(() -> closed.set(true)), DIRECTORY);
     }
 

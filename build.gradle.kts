@@ -62,7 +62,8 @@ subprojects {
     // Absent by intent: excalibur-bench is a JMH harness whose entry points are benchmark runs,
     // excalibur-integration and excalibur-test-bootstrap exist only for the test classpath, and
     // excalibur-fsck and excalibur-backup are commands run against a stopped data directory
-    // rather than libraries anything would compile against.
+    // rather than libraries anything would compile against, and excalibur-coverage is the
+    // build's own coverage reporting, run by the tasks at the end of this file.
     val publishedModules = mapOf(
         "excalibur-config" to "Configuration loading and validation",
         "excalibur-metrics" to "Metrics registry and instrumentation",
@@ -79,7 +80,7 @@ subprojects {
         "excalibur-query" to "Query pipeline: planning, execution and result aggregation",
         "excalibur-llm" to "OpenAI-compatible client for embeddings and relevancy scoring",
         "excalibur-ingest" to "Ingestion pipeline: chunking, indexing and erasure",
-        "excalibur-api" to "HTTP API surface and server bootstrap"
+        "excalibur-api" to "HTTP API surface, server bootstrap and the in-process embedded node"
     )
 
     publishedModules[project.name]?.let { moduleDescription ->
@@ -435,10 +436,9 @@ tasks.register<JavaExec>("generateCoverageSummary") {
 
     dependsOn("jacocoAggregateReport")
 
-    classpath = files("excalibur-core/build/classes/java/main")
-    classpath = classpath.plus(files("excalibur-core/build/resources/main"))
+    classpath = project(":excalibur-coverage").the<SourceSetContainer>()["main"].runtimeClasspath
 
-    mainClass.set("com.eonmux.excalibur.core.report.CoverageReportGenerator")
+    mainClass.set("com.eonmux.excalibur.coverage.CoverageReportGenerator")
 
     // The module list comes from the build, for the same reason the aggregate report's does: a
     // list compiled into the generator named four modules of twenty-one, so `./gradlew coverage`
@@ -450,9 +450,6 @@ tasks.register<JavaExec>("generateCoverageSummary") {
                 .get().asFile.absolutePath
         ) + subprojects.map { it.name }.sorted()
     )
-
-    // Run after core module is compiled
-    dependsOn(":excalibur-core:classes")
 }
 
 // Every module's tag-excluded gates, in one command.
@@ -523,17 +520,13 @@ tasks.register<JavaExec>("coverageGaps") {
         dependsOn(":${project.name}:jacocoTestReport")
     }
 
-    classpath = files("excalibur-core/build/classes/java/main")
-    classpath = classpath.plus(files("excalibur-core/build/resources/main"))
+    classpath = project(":excalibur-coverage").the<SourceSetContainer>()["main"].runtimeClasspath
 
-    mainClass.set("com.eonmux.excalibur.core.report.CoverageGapAnalyzer")
+    mainClass.set("com.eonmux.excalibur.coverage.CoverageGapAnalyzer")
 
     // Named rather than discovered, so a module whose tests have not run is reported as a gap
     // instead of quietly missing from the analysis.
     args(listOf(rootProject.projectDir.absolutePath) + subprojects.map { it.name }.sorted())
-
-    // Run after core module is compiled
-    dependsOn(":excalibur-core:classes")
 
     doFirst {
         println("\n" + "=".repeat(70))

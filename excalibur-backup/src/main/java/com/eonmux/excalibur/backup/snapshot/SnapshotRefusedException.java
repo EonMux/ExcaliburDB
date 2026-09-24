@@ -33,7 +33,18 @@ public final class SnapshotRefusedException extends IOException {
         SOURCE_CHANGED_UNDERNEATH,
 
         /** A file was copied and the copy did not read back as the original. */
-        COPY_DID_NOT_MATCH
+        COPY_DID_NOT_MATCH,
+
+        /**
+         * Another process holds the data directory's lock: a node is running on it, or a
+         * repair or a restore is.
+         *
+         * <p>Found before anything is copied, which the fingerprint cannot do - it only notices
+         * a writer that happened to write during the copy. Stop the holder and take the snapshot
+         * again, or pass {@code --allow-live} to copy the directory under it and record the
+         * image as live.</p>
+         */
+        SOURCE_IN_USE
     }
 
     /** Why this one was refused. */

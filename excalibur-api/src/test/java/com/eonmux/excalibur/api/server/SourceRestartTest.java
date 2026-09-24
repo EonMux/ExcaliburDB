@@ -108,6 +108,39 @@ class SourceRestartTest {
             .isEqualTo(before);
     }
 
+    @Test
+    @DisplayName("a replaced configuration keeps the source's history and is what the restart restores")
+    void aReplacedConfigurationSurvivesTheRestart() throws Exception {
+        java.nio.file.Files.writeString(allowedRoot.resolve("a.md"), "# a");
+        Path narrower = java.nio.file.Files.createDirectory(allowedRoot.resolve("narrower"));
+        server = startNode();
+        post(server.getPort(), "/v1/ingest", """
+            {"source_type": "filesystem", \
+            "config": {"source_id": "project-docs", "root_path": "%s"}}""".formatted(allowedRoot.toString().replace("\\", "\\\\")));
+        String before = awaitStatus(server.getPort(), "\"state\": \"unconfigured\"");
+
+        int replaced = send(server.getPort(), "/v1/ingest", "PUT", """
+            {"source_type": "filesystem", \
+            "config": {"source_id": "project-docs", "root_path": "%s"}}""".formatted(narrower.toString().replace("\\", "\\\\")))
+            .getFirst();
+
+        assertThat(replaced).isEqualTo(200);
+        assertThat(get(server.getPort(), "/v1/ingest/status?source_id=project-docs"))
+            .as("a replacement starts no crawl and clears no history")
+            .isEqualTo(before);
+        assertThat(get(server.getPort(), "/v1/ingest")).contains(narrower.toString());
+
+        server.stop(0);
+        server = startNode();
+
+        assertThat(server.getIngestSourceRegistry().isRegistered("project-docs")).isTrue();
+        assertThat(get(server.getPort(), "/v1/ingest")).contains(narrower.toString());
+        assertThat(SourceCatalog.open(dataDirectory).all())
+            .singleElement()
+            .satisfies(descriptor -> assertThat(descriptor.config())
+                .containsEntry("root_path", narrower.toString()));
+    }
+
     /** Polls a source's status until it contains {@code expected}, and returns it. */
     private static String awaitStatus(int port, String expected) throws Exception {
         long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(20);

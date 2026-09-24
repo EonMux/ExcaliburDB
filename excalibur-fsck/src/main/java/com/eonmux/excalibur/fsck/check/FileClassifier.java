@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.fsck.check;
 
+import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.retrieval.lexical.native_.LexicalSidecars;
 
 import java.nio.file.Path;
@@ -26,6 +27,11 @@ public final class FileClassifier {
      * @return What the file is
      */
     public static FileKind classify(String relative) {
+        // At the top of the directory only: the lock is taken there and nowhere else, and the
+        // same name deeper down is not this build's.
+        if (relative.equals(com.eonmux.excalibur.core.datadir.DataDirectoryLock.FILE_NAME)) {
+            return FileKind.NODE_LOCK;
+        }
         String name = nameOf(relative);
         // First, and wherever it sits: a heap dump is the JVM's, not any format's, so the
         // directory it landed in says nothing about what it is.
@@ -56,6 +62,9 @@ public final class FileClassifier {
             }
             if (GraphStagingCheck.ERASURE_INTERRUPTED_MARKER.equals(name)) {
                 return FileKind.GRAPH_ERASURE_MARKER;
+            }
+            if (GraphStagingStore.UNPUBLISHED_MARKER.equals(name)) {
+                return FileKind.GRAPH_UNPUBLISHED_MARKER;
             }
         }
         FileKind byName = byFileName(name);
@@ -102,6 +111,7 @@ public final class FileClassifier {
             case "document-registry.in-flight" -> FileKind.IN_FLIGHT_JOURNAL;
             case "source-catalog" -> FileKind.SOURCE_CATALOG;
             case "source-status" -> FileKind.SOURCE_STATUS;
+            case "erasure-receipts" -> FileKind.ERASURE_RECEIPTS;
             default -> null;
         };
     }

@@ -26,7 +26,7 @@ class ScopedStagedErasureTest {
         assertThat(erasure.erasesFact(1, 0, 2, 0, 0, FROM_DOC_7)).isTrue();
         assertThat(erasure.erasesFact(1, 0, 2, 0, 0, FROM_DOC_8)).isFalse();
         assertThat(erasure.erasesFact(1, 0, 2, 0, 0,
-            new Provenance(SourceType.CONVERSATION, 7L, 90, 2)))
+            new Provenance(SourceType.USER_ASSERTED, 7L, 90, 2)))
             .as("the same number from another kind of source is another source")
             .isFalse();
         assertThat(erasure.erasesSnippet(1, FROM_DOC_7)).isTrue();

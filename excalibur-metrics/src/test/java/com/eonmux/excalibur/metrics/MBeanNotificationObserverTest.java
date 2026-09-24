@@ -659,8 +659,8 @@ class MBeanNotificationObserverTest {
     }
 
     @Test
-    @DisplayName("Metrics recordQueueDepth emits notification")
-    void testMetricsRecordQueueDepthEmitsNotification() {
+    @DisplayName("Metrics recordHnswDepth notifies IngestionQueue listeners, the bean it aliases")
+    void testMetricsRecordHnswDepthNotifiesIngestionQueue() {
         DefaultNotificationObserver obs = new DefaultNotificationObserver();
         ObjectNotificationInfo info = new ObjectNotificationInfo(
             MBeanNotificationBroadcaster.NotificationTypes.INGESTION_QUEUE,
@@ -671,7 +671,7 @@ class MBeanNotificationObserverTest {
 
         Metrics.getIngestionQueueMBean().addNotificationListener(info, obs, false);
 
-        Metrics.recordQueueDepth(500L);
+        Metrics.recordHnswDepth(500L);
 
         assertTrue(obs.hasNotifications());
         Notification[] notifications = obs.getNotifications();

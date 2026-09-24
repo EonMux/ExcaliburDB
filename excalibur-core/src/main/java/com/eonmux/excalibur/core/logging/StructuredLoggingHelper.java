@@ -92,50 +92,10 @@ public final class StructuredLoggingHelper {
     }
 
     /**
-     * Gets the current correlation ID from MDC.
-     *
-     * @return The correlation ID, or null if not set
-     */
-    public static String getCorrelationId() {
-        return MDC.get(CORRELATION_ID);
-    }
-
-    /**
      * Clears the correlation ID from MDC.
      */
     public static void clearCorrelationId() {
         MDC.remove(CORRELATION_ID);
-    }
-
-    // ==================== Query ID ====================
-
-    /**
-     * Sets the query ID in MDC.
-     *
-     * @param queryId The query ID to set (may be null to clear)
-     */
-    public static void setQueryId(String queryId) {
-        if (queryId != null && !queryId.isEmpty()) {
-            MDC.put(QUERY_ID, queryId);
-        } else {
-            MDC.remove(QUERY_ID);
-        }
-    }
-
-    /**
-     * Gets the current query ID from MDC.
-     *
-     * @return The query ID, or null if not set
-     */
-    public static String getQueryId() {
-        return MDC.get(QUERY_ID);
-    }
-
-    /**
-     * Clears the query ID from MDC.
-     */
-    public static void clearQueryId() {
-        MDC.remove(QUERY_ID);
     }
 
     // ==================== Source ID ====================
@@ -151,22 +111,6 @@ public final class StructuredLoggingHelper {
         } else {
             MDC.remove(SOURCE_ID);
         }
-    }
-
-    /**
-     * Gets the current source ID from MDC.
-     *
-     * @return The source ID, or null if not set
-     */
-    public static String getSourceId() {
-        return MDC.get(SOURCE_ID);
-    }
-
-    /**
-     * Clears the source ID from MDC.
-     */
-    public static void clearSourceId() {
-        MDC.remove(SOURCE_ID);
     }
 
     // ==================== Document ID ====================
@@ -185,59 +129,10 @@ public final class StructuredLoggingHelper {
     }
 
     /**
-     * Gets the current document ID from MDC.
-     *
-     * @return The document ID, or null if not set
-     */
-    public static String getDocumentId() {
-        return MDC.get(DOCUMENT_ID);
-    }
-
-    /**
      * Clears the document ID from MDC.
      */
     public static void clearDocumentId() {
         MDC.remove(DOCUMENT_ID);
-    }
-
-    // ==================== Segment ID ====================
-
-    /**
-     * Sets the segment ID in MDC.
-     *
-     * @param segmentId The segment ID to set (may be null to clear)
-     */
-    public static void setSegmentId(String segmentId) {
-        if (segmentId != null && !segmentId.isEmpty()) {
-            MDC.put(SEGMENT_ID, segmentId);
-        } else {
-            MDC.remove(SEGMENT_ID);
-        }
-    }
-
-    /**
-     * Sets the segment ID in MDC using a long value.
-     *
-     * @param segmentId The segment ID to set
-     */
-    public static void setSegmentId(long segmentId) {
-        MDC.put(SEGMENT_ID, String.valueOf(segmentId));
-    }
-
-    /**
-     * Gets the current segment ID from MDC.
-     *
-     * @return The segment ID, or null if not set
-     */
-    public static String getSegmentId() {
-        return MDC.get(SEGMENT_ID);
-    }
-
-    /**
-     * Clears the segment ID from MDC.
-     */
-    public static void clearSegmentId() {
-        MDC.remove(SEGMENT_ID);
     }
 
     // ==================== Stage ====================
@@ -253,53 +148,6 @@ public final class StructuredLoggingHelper {
         } else {
             MDC.remove(STAGE);
         }
-    }
-
-    /**
-     * Gets the current stage from MDC.
-     *
-     * @return The stage, or null if not set
-     */
-    public static String getStage() {
-        return MDC.get(STAGE);
-    }
-
-    /**
-     * Clears the stage from MDC.
-     */
-    public static void clearStage() {
-        MDC.remove(STAGE);
-    }
-
-    // ==================== Thread Name ====================
-
-    /**
-     * Sets a custom thread name in MDC for logging purposes.
-     *
-     * @param threadName The thread name to set (may be null to clear)
-     */
-    public static void setThreadName(String threadName) {
-        if (threadName != null && !threadName.isEmpty()) {
-            MDC.put(THREAD_NAME, threadName);
-        } else {
-            MDC.remove(THREAD_NAME);
-        }
-    }
-
-    /**
-     * Gets the custom thread name from MDC.
-     *
-     * @return The thread name, or null if not set
-     */
-    public static String getThreadName() {
-        return MDC.get(THREAD_NAME);
-    }
-
-    /**
-     * Clears the custom thread name from MDC.
-     */
-    public static void clearThreadName() {
-        MDC.remove(THREAD_NAME);
     }
 
     // ==================== Clear All ====================

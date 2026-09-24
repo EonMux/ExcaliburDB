@@ -192,15 +192,6 @@ class SegmentCandidateTest {
     class LshMethods {
 
         @Test
-        @DisplayName("hasLshIndex returns false when no LSH index")
-        void hasLshIndexReturnsFalseWhenNoLshIndex() {
-            SegmentCandidate candidate = new SegmentCandidate(
-                1L, mockSegment(), mockGraph(), LifecycleState.ACTIVE);
-
-            assertThat(candidate.hasLshIndex()).isFalse();
-        }
-
-        @Test
         @DisplayName("hasLshCandidates returns false when no candidates")
         void hasLshCandidatesReturnsFalseWhenNoCandidates() {
             SegmentCandidate candidate = new SegmentCandidate(

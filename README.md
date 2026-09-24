@@ -86,7 +86,9 @@ export EXCALIBUR_LLM_API_KEY=sk-...
 ```
 
 `excalibur.properties` is gitignored precisely because it is the file a key ends up in;
-`excalibur.properties.example` is the tracked template. A node started without a key still runs, and
+`excalibur.properties.example` is the tracked template. A local model server needs no key at all:
+point `excalibur.llm.base-url` at Ollama, vLLM or TGI instead — see
+[Keyless local models](#keyless-local-models). A node started with neither still runs, and
 still indexes: documents are chunked, stored and term-indexed, `/v1/ingest/status` reports each
 source as `idle` once done, and `POST /v1/query` answers from BM25. Only dense retrieval is missing,
 which is one signal of several rather than the precondition for having an index at all.
@@ -177,7 +179,8 @@ is why it is off by default:
 excalibur.graph.extraction-enabled=true
 ```
 
-Ingest, wait for `idle`, then publish what was staged and ask:
+Ingest and wait for `idle`. The node publishes what was staged by itself, a minute after
+ingestion goes quiet; to publish it now instead, ask for the build, then ask the graph:
 
 ```bash
 curl -X POST http://localhost:8080/v1/graph/build
@@ -329,15 +332,42 @@ docker run --rm -v excalibur-data:/var/lib/excalibur \
   snapshot --data-dir /var/lib/excalibur --out /var/lib/excalibur-backups/2026-09-22
 ```
 
-CI runs all three against a node the image started and stopped.
+A restore is the same shape the other way. `/var/lib/excalibur` is a mount point in a root-owned
+`/var/lib`, so it can be neither renamed nor replaced; `restore` works inside it instead, and
+`--force` is needed when the volume already holds a data directory:
+
+```bash
+docker run --rm -v excalibur-data:/var/lib/excalibur \
+  -v excalibur-backups:/var/lib/excalibur-backups \
+  --entrypoint excalibur-backup excalibur \
+  restore --snapshot /var/lib/excalibur-backups/2026-09-22 --target /var/lib/excalibur --force
+```
+
+All four take the data directory's lock, so none of them can run against a volume a node is
+running on: a repair exits `4` and a snapshot or restore `7`, naming the node's pid, and nothing
+is written. A check without `--repair` goes ahead with a warning. CI runs all four against a node
+the image started and stopped, and runs the repair once more with the node up to see it refused.
 
 Nothing is baked in. The API binds `127.0.0.1` by default and binding anything else requires a
 bearer token and either TLS or an explicit `EXCALIBUR_API_ALLOW_PLAINTEXT=true` where something in
 front of the process terminates it — so the container ships with none of those set, because a
 default that listened on every interface unauthenticated is the one mistake that policy exists to
-prevent. `HEALTHCHECK` points at `/health/ready`, not `/health`: readiness answers 200 or 503 on
-whether this node can serve a query, where liveness answers 200 while it is still opening
-segments.
+prevent.
+
+`HEALTHCHECK` probes liveness, `/health`, not readiness. A container health check is what a
+supervisor restarts or replaces a container on, and a node that is drained, or still recovering
+its segments, is alive — restarting it would throw away the recovery it is part-way through.
+Readiness, `/health/ready`, is for whatever routes traffic. The probe finds the node where the
+node actually is: once its listener is bound, the node writes its liveness URL into the data
+directory's lock file (`health-url=` in `/var/lib/excalibur/.excalibur-lock`) — `https` when TLS
+is on, the port it took however that was configured, the interface it bound, loopback for a
+wildcard — and `/opt/excalibur/bin/excalibur-healthcheck` reads it from there and asks it with
+`curl`. So no setting is repeated in the image, and none can disagree with the node's. The
+certificate is not verified: the probe talks to the node's own socket, sends no credential and
+reads only a status code. A node that requires client certificates (`tls-client-auth=need`)
+needs the probe given one, with `EXCALIBUR_HEALTHCHECK_CLIENT_CERT` and
+`EXCALIBUR_HEALTHCHECK_CLIENT_KEY`. A tool container started with `--entrypoint` inherits the
+check as well; pass it `--no-healthcheck`, or ignore its health.
 
 ### Stopping the node
 
@@ -419,7 +449,12 @@ version field altered — is `UNREADABLE`: the node refuses to open it, so it fa
 is put to an operator rather than moved aside, since nothing shows its bytes are damaged. An HNSW
 node mapping, for instance, is read at versions 1 to 3 — its entries name each node's document at
 versions 1 and 2 and its chunk at version 3 — and a version 4 mapping is reported unreadable, not
-checked as if it were version 3.
+checked as if it were version 3. A write-ahead log is judged the same way: one whose header names a
+version this build does not read is `UNREADABLE`, and is never trimmed or moved aside — not even
+when its segment is gone; one whose header is damaged is `CORRUPT` and put to an operator, since
+records behind it were acknowledged; and one with no header at all, which a build before the
+header wrote, has its records weighed against their checksums as always and is reported
+`LEGACY_UNPROTECTED`, because nothing in the file says which format they are in.
 
 Two files are judged by what the node does with them rather than by their name alone. A lexical
 segment's lookup table, `chunk-index/seg-N.keymap`, is a derived file the node rebuilds by itself
@@ -434,7 +469,9 @@ restart, so losing it loses that history, though never any of the corpus. But no
 serves depends on it, and the node reads one it will not take — cut short, without its header, or
 at a version it does not read, or altered so its checksum no longer matches — as no history and
 reports each source from its next run, so such a file is reported `CORRUPT` and not counted as
-damage. Every other derived file — a graph, a
+damage. The erasure receipts, `erasure-receipts`, are excused the same way: the node discards a
+set it cannot read, and what is lost is the readback of earlier erasures, never the erasures.
+Every other derived file — a graph, a
 mapping, a codebook, an LSH table — is rebuilt only by a reindex or a retrain, and its damage fails
 the run. A `segment_<N>.hnsw.compact.docmap` is
 the mapping an HNSW compaction stages: beside its `segment_<N>.hnsw.compact` the compaction never
@@ -470,7 +507,10 @@ begin it — is `CORRUPT`. The verdict on
 `erasure.log` also counts the outstanding entity erasures that name an id nothing in the namespace
 holds, which the node discharges when it next opens the namespace. The `erasure.interrupted`
 marker beside them is recognised as well; the node writes it empty and reads only whether it is
-there, so an empty one is `INTACT`.
+there, so an empty one is `INTACT`. So is `asserted.last-id`, the checksummed record of the highest
+fact id handed out (see [Stating facts](#stating-facts)): `INTACT` when it matches its checksum,
+otherwise `CORRUPT`, since the node asserts no fact in that namespace until it is restored or
+removed.
 
 A namespace's built graph, `<namespace>/graph/`, is checked as one structure, by the checks the node
 runs before it serves one: the descriptor, every column against the length and CRC32C the descriptor
@@ -534,8 +574,17 @@ read, check or repair alike. Symbolic links and `..` are followed as the filesys
 so a path that only reads as outside is refused too. A data directory at a filesystem root has
 nothing beside it, so there the quarantine has to be named.
 
+`--repair` takes the data directory's lock before it reads anything, so it cannot run under a
+live node, and a node cannot start underneath it: a directory another process holds is refused
+with exit code `4`, naming the holder, and nothing is checked or repaired. A check without
+`--repair` writes nothing, so it goes ahead against a held directory, with a warning that what it
+reads may be changing. The lock file is reported `NOT_DATA`. A restore that was interrupted —
+its journal, `.excalibur-restore`, still in the directory — is reported as damage and put to the
+operator: running the same `excalibur-backup restore` again finishes it.
+
 Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself
-failed, so nothing is known about the directory — which is not the same claim as `0`.
+failed, so nothing is known about the directory — which is not the same claim as `0` — and `4`
+`--repair` was refused because another process holds the directory.
 
 ### Snapshots — `excalibur-backup`
 
@@ -559,7 +608,7 @@ already there when it was copied verifies faithfully:
 | segments, `catalog.dat` | the storage engine, on a scratch copy | every entry's checksum, and the header and record CRCs |
 | HNSW graphs and their node mappings, quantiser codebooks, LSH tables | the vector and filter modules, on a scratch copy | the seal a clean close writes. A mapping names each node's chunk at version 3 and its document at versions 1 and 2; one at a version the node does not read fails the image |
 | a compaction's staged pair (`segment_<N>.hnsw.compact`, `.hnsw.compact.docmap`) | `excalibur-fsck`, read-only | nothing, while both are there: the compaction never swapped, the node discards the pair on open, and a torn pair does not fail the image. A staged mapping alone is the only mapping the swapped graph matches, and is verified against its seal like any mapping |
-| write-ahead logs | `excalibur-fsck`'s checkers, read-only | every record replayed against its checksum |
+| write-ahead logs | `excalibur-fsck`'s checkers, read-only | the header's CRC and the format version it names, then every record replayed against its checksum. A log with no header, which an older build wrote, has its records checked and is reported unproven; a newer build's fails the image |
 | graph staging logs | `excalibur-fsck`, read-only | every record of the label, triple, entity text, erasure and withdrawal logs against its CRC, walked by the graph module's own replay without opening the log. One ending in a write cut short is healthy and unproven: the node trims it on open. Damage the node refuses fails the image |
 | a tenant's built graph (`<namespace>/graph/`) | `excalibur-fsck`, read-only, as one structure | the edge store's descriptor against its CRC32C, every column against the length and CRC32C the descriptor records, both dictionaries against their trailers, the entity vectors against the CRC32Cs in their header, and every file of both Lucene indexes against its footer. Damage fails the image. A graph an older build wrote is reported unproven; a newer build's fails the image. Scratch and a copy the node deletes on open are reported unchecked |
 | the lexical store | `excalibur-fsck`, read-only, as one structure | the manifest against the CRC32C on its end line; every column of every segment it names; each named segment's key table against the checksums in `seg-N.keysum` and its tombstones against their trailing CRC32C; and every line of `erasure.log` against its own CRC32C. A manifest an older build wrote carries only a record count, and a key table, tombstone file or erasure log it wrote carries nothing: each is held to its structure and not proven |
@@ -575,16 +624,37 @@ about which checker a file belongs to. The report counts how many structures wer
 a checksum or seal and lists every one that was not, with the reason: a format that carries
 nothing to prove it by is reported as checked and unproven rather than left out, which would read
 as though nothing went unverified. `restore` verifies before it writes anything, to the same default depth and to
-the deeper one with `restore --deep`, then builds the new tree beside the target and renames it on
-in one move; an image that does not verify is refused with the target untouched, and a target that
-already holds something needs `--force`.
+the deeper one with `restore --deep`; an image that does not verify is refused with the target
+untouched, and a target that already holds something needs `--force`.
 
-**The node must be stopped.** Nothing in this engine orders one file against another and nothing
-locks the directory, so a clean shutdown is the only moment at which every file describes the
-same instant. The directory is fingerprinted before and after the copy and a snapshot whose
-source moved underneath it is refused. That check is one-sided — it can prove a node *was*
-running, never that one was not — so `--allow-live` downgrades the refusal to a warning and
-records the image as `LIVE_UNSAFE` rather than claiming a consistency it cannot establish. There
+A restore works inside its target and never renames the target itself, so the target can be a
+mount point — a container volume, say — and only the target needs to be writable. It takes the
+target's lock, copies the image into a staging directory inside the target and forces it to disk,
+then moves the target's previous entries into a second scratch directory and the staged entries
+into place, one rename each. That is a sequence, not one atomic step, so each phase is journaled
+(`.excalibur-restore` in the target) before it begins, and what it guarantees is this:
+
+- The previous contents are never deleted until every entry of the image is in place; until then
+  they are in the target or, whole, in the scratch directory.
+- A rename that fails is unwound on the spot, and the target is left as it was.
+- A crash leaves the journal. A node refuses to start on a directory holding one, so a mixture of
+  old and new entries is never served, and `excalibur-fsck` reports it as damage. The next
+  `restore` into that directory first finishes the interrupted one — forward to its image once the
+  image was fully staged, back to the previous contents when it was unwinding — and says which.
+  Re-running the same restore is therefore the recovery.
+
+**The node must be stopped.** Nothing in this engine orders one file against another, so a clean
+shutdown is the only moment at which every file describes the same instant. A node holds an
+exclusive operating-system lock on its data directory (`.excalibur-lock`, taken with
+`FileChannel.tryLock` before anything is read) for as long as it runs, and a second node on the
+same directory fails at startup, naming the directory and the holder's pid. A snapshot takes the
+same lock for the length of the copy, so a directory a node holds is refused with exit `7`, and a
+node cannot start underneath the copy. The directory is also fingerprinted before and after the
+copy and a snapshot whose source moved underneath it is refused with exit `5`, which still catches
+a writer that does not take the lock — an older build, or a filesystem whose locks do not reach
+across hosts. `--allow-live` downgrades both refusals to a warning and records the image as
+`LIVE_UNSAFE` rather than claiming a consistency it cannot establish. The lock file itself records
+only who last held the directory; it is never copied, restored, or reported as data. There
 is no online-backup mode, and a half-barrier that stopped the background workers while the write
 path kept accepting writes would be worse than none: it would look like a consistent image and
 not be one.
@@ -617,7 +687,9 @@ Exit codes: `0` done, `2` bad command line — including an `--out` inside `--da
 `--target` inside `--snapshot`, and a path the platform cannot name — `3` the image did not verify
 and nothing was restored, `4` the restore target or the snapshot's `--out` is not empty, `5` the data directory
 moved while being copied, `6` a file could not be read or written — or a copy did not read back as
-what was written — and `70` something this build did not anticipate, reported rather than hidden.
+what was written — `7` another process holds the data directory or the restore target, and
+nothing was written, and `70` something this build did not anticipate, reported rather than
+hidden.
 
 ## Configuration
 
@@ -670,7 +742,7 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.api.port` | 8080 | Port to listen on; `EXCALIBUR_PORT` overrides it |
 | `excalibur.api.shutdown-timeout-seconds` | 30 | How long a stop may take, from the signal to the last file closed. Every drain shares this one deadline. The last 10 seconds are kept for publishing buffered chunks, forcing staged graph facts and persisting the registry. Work still running when the drains' share runs out is reported and left for the next start to recover. Set the supervisor's stop timeout to at least this plus 10 (see [Stopping the node](#stopping-the-node)). 15 to 3600; any other value stops startup |
 | `excalibur.visibility.epoch-tick-ms` | 100 | Visibility epoch tick interval (ms). 10 to 10000 |
-| `excalibur.visibility.query-timeout-ms` | 30000 | Query timeout (ms) for a request that names none. Must not exceed `excalibur.api.max-query-timeout-ms`, or the node refuses to start: every such request would be refused. 1000 to 300000 |
+| `excalibur.visibility.query-timeout-ms` | 30000 | Query timeout (ms) for a `/v1/query` or `/v1/graph/query` request that names none. Must not exceed `excalibur.api.max-query-timeout-ms`, or the node refuses to start: every such request would be refused. 1000 to 300000 |
 | `excalibur.query.top-k-default` | 100 | Default number of results. Must not exceed `excalibur.api.max-top-k`, or the node refuses to start, for the same reason. 1 to 10000 |
 | `excalibur.query.threshold` | 0.0 | Score floor for requests that omit `threshold`; a request's own `threshold` overrides it. 0 disables filtering. 0.0 to 1.0 |
 | `excalibur.query.vector-dimensions` | 1536 | Vector dimensionality. 128 to 4096, and must equal `excalibur.llm.embeddings-dimensions` |
@@ -716,12 +788,17 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.ingest.chunk-overlap-tokens` | 64 | Tokens a chunk repeats from the one before it, so an answer that straddles a boundary is not split across two chunks holding half of it each. Must be less than the target, or chunking would never advance; the node refuses the pair at startup rather than failing on the first document |
 | `excalibur.ingest.bm25-k1` | 1.2 | Where a repeated term stops earning more score. 0 reduces term frequency to a yes-or-no. Under `lexical-engine=native` this is **recorded in the index** and an index built under one value refuses to open under another — not because the bytes depend on it, but because changing it changes every score the corpus can produce, and with it every ranking and every threshold a deployment has calibrated. Changing it means reingesting. Under `lexical-engine=lucene` it is applied at query time and nothing is recorded, so a change takes effect on the next query. At least 0 |
 | `excalibur.ingest.bm25-b` | 0.75 | How much a match is discounted for the length of the chunk it was found in. 1 normalises fully by length, 0 not at all. Recorded, or not, on the same terms as `bm25-k1`. 0 to 1 |
-| `excalibur.llm.api-key` | _(none)_ | Key for the OpenAI-compatible endpoint. Supply as `EXCALIBUR_LLM_API_KEY`, not in this file. Without it the corpus is still chunked, stored and term-indexed; only the vector signal is missing |
-| `excalibur.llm.base-url` | https://api.openai.com/v1 | API root. The clients append `/v1/embeddings` and `/v1/chat/completions` themselves; a trailing `/v1` is stripped, so `https://api.openai.com` and `https://api.openai.com/v1` mean the same thing |
+| `excalibur.llm.api-key` | _(none)_ | Key both endpoints fall back to. Supply as `EXCALIBUR_LLM_API_KEY`, not in this file. Only the hosted default endpoint needs one: a role left on `https://api.openai.com/v1` with no key is off (the corpus is still chunked, stored and term-indexed; the startup log says what is missing). A keyless server — Ollama, vLLM, TGI — is used without one, and a server that does want one answers 401, which is logged naming these keys |
+| `excalibur.llm.base-url` | https://api.openai.com/v1 | API root both endpoints fall back to. The clients append `/v1/embeddings` and `/v1/chat/completions` themselves; a trailing `/v1` is stripped, so `https://api.openai.com` and `https://api.openai.com/v1` mean the same thing |
+| `excalibur.llm.chat-base-url` | _(`excalibur.llm.base-url`)_ | API root for chat calls — relevancy scoring, query expansion, relation extraction, the graph rerank. Unset or blank falls back to `excalibur.llm.base-url` |
+| `excalibur.llm.chat-api-key` | _(`excalibur.llm.api-key`)_ | Key for chat calls (`EXCALIBUR_LLM_CHAT_API_KEY`). Unset or blank falls back to `excalibur.llm.api-key` |
+| `excalibur.llm.chat-enabled` | true | Whether chat calls are made at all. `false` keeps the embedding pass and drops scoring, expansion, extraction and the graph rerank |
+| `excalibur.llm.embedding-base-url` | _(`excalibur.llm.base-url`)_ | API root for embedding calls — the corpus, each query, graph entities. Unset or blank falls back to `excalibur.llm.base-url` |
+| `excalibur.llm.embedding-api-key` | _(`excalibur.llm.api-key`)_ | Key for embedding calls (`EXCALIBUR_LLM_EMBEDDING_API_KEY`). Unset or blank falls back to `excalibur.llm.api-key` |
 | `excalibur.llm.chat-model` | gpt-4o-mini | Chat model for relevancy scoring |
 | `excalibur.llm.embedding-model` | text-embedding-3-small | Embedding model name |
 | `excalibur.llm.embeddings-dimensions` | 1536 | Embedding vector dimensions. 128 to 4096, and must equal `excalibur.query.vector-dimensions` |
-| `excalibur.llm.embeddings-enabled` | true | Whether the key is spent on embedding the corpus. Set `false` to keep the chat model and skip the embedding pass: retrieval is then BM25 over the chunk index with the chat model expanding the query. Inert without a key |
+| `excalibur.llm.embeddings-enabled` | true | Whether embedding calls are made at all. Set `false` to keep the chat model and skip the embedding pass: retrieval is then BM25 over the chunk index with the chat model expanding the query |
 | `excalibur.llm.relevancy-threshold` | 0.3 | Minimum relevancy score (0.0-1.0) |
 | `excalibur.llm.timeout-ms` | 60000 | LLM request timeout (ms). 1000 to 300000 |
 | `excalibur.llm.max-retries` | 3 | Maximum retry attempts. 0 to 10 |
@@ -756,7 +833,7 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.api.rate-limit-max-clients` | 10000 | Clients tracked before eviction. 1 to 2147483647 |
 | `excalibur.api.trusted-proxies` | _(empty)_ | Addresses and CIDR ranges whose `X-Forwarded-For` is believed, so callers behind a proxy are rate-limited individually instead of sharing the proxy's budget. Empty means only the peer address is ever metered |
 | `excalibur.api.max-top-k` | 1000 | Largest `top_k` a query may request. At most 2147483647, like every count limit under `excalibur.api.*`; a larger value is refused at startup |
-| `excalibur.api.max-query-timeout-ms` | 60000 | Largest query timeout a request may ask for. At least 1 |
+| `excalibur.api.max-query-timeout-ms` | 60000 | Largest `timeout_ms` a `/v1/query` or `/v1/graph/query` request may ask for. At least 1 |
 | `excalibur.api.max-query-chars` | 8192 | Longest `query` text a request may send. It is embedded, and on the lexical path expanded, so its size is an outbound call the caller picks. 1 to 2147483647 |
 | `excalibur.api.max-oversampling-factor` | 16 | Largest `oversampling_factor` a request may ask for. It multiplies `top_k` into the HNSW beam width, so it is what decides how much of a segment a search walks. 1 to 2147483647 |
 | `excalibur.api.max-result-text-chars` | 4096 | Longest text returned for one chunk, by `include_text` on a query or by `/v1/documents`. Past it the text is clipped and `text_truncated` says so. 1 to 2147483647 |
@@ -775,8 +852,17 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.graph.cold-namespaces` | *(empty)* | Comma-separated namespaces evicted before any other, whatever their recency — for a bulk import or an idle tenant. Naming one in both lists refuses to start |
 | `excalibur.graph.erasure-tombstone-ratio` | 0.2 | Tombstoned fraction of the store at which a compaction becomes worthwhile. Above 0, at most 1 |
 | `excalibur.graph.erasure-max-latency-seconds` | 3600 | Longest an erasure obligation waits before a compaction runs regardless. Checked every tenth of it by a sweep over **every namespace on disk**, so the bound holds on an idle node and on an evicted tenant nobody is querying. The sweep reads each non-resident namespace's erasure log — a small append-only file, not a served store — and reopens only the tenants whose oldest obligation has passed the bound, at most four per pass, oldest first; a longer backlog is logged at WARN, because the node is then not meeting its deadline. At least 1 |
+| `excalibur.graph.auto-build-enabled` | true | Rebuild each namespace whose served graph is behind its staging without being asked. Off, a graph changes only when `POST /v1/graph/build` asks. See [Keeping the graph current](#keeping-the-graph-current) |
+| `excalibur.graph.auto-build-interval-seconds` | 30 | How often every namespace on disk is checked for changes its graph does not have. At least 1 |
+| `excalibur.graph.auto-build-debounce-seconds` | 60 | How long a namespace's staging must be quiet before it is rebuilt, so a crawl is published by one build rather than one per document. At least 0 |
+| `excalibur.graph.auto-build-max-delay-seconds` | 900 | Longest an unpublished change waits however busy staging stays: past it the namespace is rebuilt without waiting for quiet. At least 1 |
+| `excalibur.graph.auto-build-max-concurrent` | 1 | Most automatic builds at once across the node. At least 1 |
+| `excalibur.graph.auto-build-failure-backoff-seconds` | 60 | Wait after a failed automatic build before the namespace is tried again, doubling with each further failure. At least 1 |
+| `excalibur.graph.auto-build-max-failure-backoff-seconds` | 3600 | Longest that wait grows to. At least `excalibur.graph.auto-build-failure-backoff-seconds` |
 | `excalibur.graph.top-k` | 10 | Documents each retrieval signal contributes before fusion. At least 1 |
 | `excalibur.graph.rerank-over-fetch` | 4 | Candidates the full-precision reranker reads per result it returns. Reranking can only reorder what it is given, so this is what lets an entity that term overlap ranked poorly be rescued by its vector. At least 1 |
+| `excalibur.graph.max-frontier` | 1000 | Most new entities one hop of a graph walk admits. When a hop reaches more, it keeps those reached along the strongest edge — highest extraction confidence, then latest valid-time start, then lowest entity id — so a hub cannot make one question read the graph, and a capped answer is the same every time. The entities the question named are always admitted. At least 1 |
+| `excalibur.graph.max-walk-facts` | 10000 | Most facts one graph walk collects. When it passes more, it keeps those touching the named entities first, then the most confident, then the latest start. At least 1 |
 | `excalibur.graph.context-token-budget` | 2000 | Tokens of serialised subgraph an answer may carry. At least 1 |
 | `excalibur.graph.min-score` | 0.05 | Smallest relevance the entity the question named must reach to be answered, on the unit scale: its share of the question's BM25 weight, counting only words the graph holds, or its vector similarity. 0.0 to 1.0 |
 | `excalibur.graph.min-separation` | 0.01 | Smallest gap, as a fraction of the best, between the two best entities sharing the name the question used before the result is ambiguous. 0.0 to 1.0 |
@@ -826,6 +912,59 @@ traversal assembled — not the top-ranked candidate, which on this route is the
 is *about* rather than its answer. So what is measured is whether the evidence needed to answer
 survived into the context, which is what abstention decides about. Whether a model then used that
 context correctly is a different question and this does not answer it.
+
+### Keyless local models
+
+A node calls models in two roles, each resolved on its own: the **embedding** endpoint (the corpus,
+each query, graph entities) and the **chat** endpoint (relevancy scoring, query expansion, relation
+extraction, the graph rerank). Each role reads its own base URL and key and falls back to the
+shared pair, so a file that sets only `excalibur.llm.base-url` and `excalibur.llm.api-key` keeps
+meaning what it always did:
+
+| Role | Base URL, in precedence order | Key, in precedence order | Switch |
+|------|-------------------------------|--------------------------|--------|
+| Embedding | `excalibur.llm.embedding-base-url`, `excalibur.llm.base-url` | `excalibur.llm.embedding-api-key`, `excalibur.llm.api-key` | `excalibur.llm.embeddings-enabled` |
+| Chat | `excalibur.llm.chat-base-url`, `excalibur.llm.base-url` | `excalibur.llm.chat-api-key`, `excalibur.llm.api-key` | `excalibur.llm.chat-enabled` |
+
+The environment overrides each the usual way (`EXCALIBUR_LLM_EMBEDDING_BASE_URL`,
+`EXCALIBUR_LLM_CHAT_API_KEY`, ...), and a blank value counts as unset. Models, timeouts, retries
+and breaker settings stay shared: the models are already per role (`chat-model`,
+`embedding-model`), and each role gets its own client and breaker from the same limits.
+
+A role is used when its switch is on and it either has a key or names a server other than the
+hosted default. A key decides only whether `https://api.openai.com/v1` can be called, since that is
+the one endpoint that always wants one; Ollama, vLLM and TGI are called with no key at all. A server
+that does want a key answers 401, and the node says so — once at ERROR per client, naming whether a
+key was sent and which settings supply one — and counts it against the role's circuit breaker, so
+the breaker shows up open under `breakers` on `/v1/stats` rather than the role quietly doing nothing.
+At startup the log has one line per role: in use at which URL, or off and why, with the setting that
+changes it. A role left on the hosted default with no key is a WARN, because nobody chose it; one
+switched off by its flag is INFO.
+
+Everything local, no key (Ollama serving both roles):
+
+```properties
+excalibur.llm.base-url=http://localhost:11434
+excalibur.llm.chat-model=llama3.2
+excalibur.llm.embedding-model=nomic-embed-text
+excalibur.llm.embeddings-dimensions=768
+excalibur.query.vector-dimensions=768
+```
+
+Embeddings from a local vLLM or TGI server, chat from a hosted model — the key is set only for the
+role that needs it, so it is never sent to the local box:
+
+```properties
+excalibur.llm.embedding-base-url=http://gpu-box:8080
+excalibur.llm.embedding-model=BAAI/bge-base-en-v1.5
+excalibur.llm.embeddings-dimensions=768
+excalibur.query.vector-dimensions=768
+# EXCALIBUR_LLM_CHAT_API_KEY=sk-... in the environment; chat stays on the hosted default
+```
+
+A key over plain `http://` to a host other than loopback is refused at startup, per role, because it
+would travel in cleartext — which is why the example above scopes the key to chat rather than using
+the shared `excalibur.llm.api-key`.
 
 ### System properties
 
@@ -987,6 +1126,24 @@ A document whose chunks would not all come out of storage or out of the index is
 to finish it. That is a failure rather than a partial success: the caller asked for content to be
 gone and some of it is not.
 
+Every `POST /v1/erasure` answer carries a `request_id`, and `GET /v1/erasure/{request_id}` says
+where that erasure stands, after the response and after a restart. The answer is `incomplete` while
+a document the request named is still held (repeat the request), `pending` while a graph erasure
+it queued has not been discharged, `applied` while the lexical index still keeps the removed
+content's bytes awaiting a compaction, and `discharged` once nothing the request removed remains
+anywhere the node keeps it, with `discharged_at_ms`. `remaining` counts what is still owed and
+`graph` lists each namespace's queued requests. What backs it is `<data dir>/erasure-receipts`: the
+source, the scope, the per-document counts and the graph request ids of the 1024 most recent
+erasures — never a document id, a name or any content. An older request is `404`; a receipt that
+could not be written leaves the erasure itself done and answers `request_id: null`.
+
+`GET /v1/graph/erasure/{request_id}` answers the same question for a graph obligation, in the
+namespace `X-Excalibur-Namespace` names: `pending` until a compaction has rewritten what it covers
+out of the store and the staged facts, then `discharged` with `discharged_at_ms`. It reads the
+namespace's own erasure log, so it survives a restart. The completion of the most recent 1024
+requests per namespace is kept in full; an older one still answers `discharged`, with no scope,
+no timestamps and `detail_retained: false`. A request id the namespace never issued is `404`.
+
 What no erasure can reach is the source itself. A document removed here and still served by the
 directory or website it was crawled from comes back on the next re-crawl. That half of an obligation
 belongs to whoever owns the source.
@@ -1098,7 +1255,7 @@ and not the query. A query longer than `excalibur.api.max-query-chars` is refuse
 query shorter than that is expanded, so one endpoint runs one retrieval strategy.
 
 Expansion belongs to the lexical path: it rewrites the terms BM25 is searched with. The deployment
-it is for by default has a chat model and no embedding pass — `excalibur.llm.api-key` set,
+it is for by default has a chat model and no embedding pass — a chat endpoint in use,
 `excalibur.llm.embeddings-enabled=false` — and spends the model on each query instead of on the
 whole corpus.
 
@@ -1147,10 +1304,11 @@ retrieval:
 | Graph | `/v1/graph/query` answers 503; `/v1/query` is unaffected, having never read the graph |
 | Expansion returns nothing usable | The original query is executed directly |
 
-Two of those rows are configurations rather than failures. Without `excalibur.llm.api-key` a node has
-neither a chat model nor an embedding endpoint, so the first two apply together and retrieval is
-plain BM25. With a key and `excalibur.llm.embeddings-enabled=false` only the second applies: the
-chat model expands the query and BM25 answers it.
+Two of those rows are configurations rather than failures. On the shipped defaults — the hosted
+endpoint and no `excalibur.llm.api-key` — a node has neither a chat model nor an embedding
+endpoint, so the first two apply together and retrieval is plain BM25. With a chat model and
+`excalibur.llm.embeddings-enabled=false` only the embedding row applies: the chat model expands
+the query and BM25 answers it.
 
 A response says which signals answered it. `retrieval` is `"hybrid"`, `"vector"` or `"lexical"`,
 and a `coverage.degraded` flag distinguishes "this is all there was" from "this is all we looked
@@ -1249,14 +1407,15 @@ separate so a burst of writes cannot starve ordinary reads.
 | `GET` | `/v1/version` | bearer | read | Which build and JVM this process is running |
 | `POST` | `/v1/drain` | bearer | mutate | Report unready so a load balancer stops choosing this node, while it keeps serving. A mutation: an anonymous caller able to drain a node is a one-request outage |
 | `DELETE` | `/v1/drain` | bearer | mutate | Report ready again |
-| `GET` | `/v1/query/status` | bearer | read | Queries in flight, longest-running first, with the ids `DELETE /v1/query/{query_id}` takes |
+| `GET` | `/v1/query/status` | bearer | read | Queries in flight — `/v1/query` and `/v1/graph/query`, told apart by `kind` — longest-running first, with the ids `DELETE /v1/query/{query_id}` takes |
 | `POST` | `/v1/query` | bearer | read | Search the corpus: BM25, vector, or the two fused |
 | `DELETE` | `/v1/query/{query_id}` | bearer | mutate | Cancel an in-progress query |
 | `GET` | `/v1/documents` | bearer | read | Read one chunk's text, named by `document_id` |
 | `POST` | `/v1/documents/fetch` | bearer | read | Read the text of a page of chunks in one request |
-| `GET` | `/v1/documents/list` | bearer | read | Which documents this node holds, with their chunk ids — paged by `limit` and `cursor`, narrowed by `source_id` |
+| `GET` | `/v1/documents/list` | bearer | read | Which documents this node holds, with their chunk ids — paged by `limit` and `cursor`, narrowed by `source_id`. With `document_id` and its `source_id`, one document's chunks in order, with their text when `include_text=true` |
 | `POST` | `/v1/documents` | bearer | mutate | Index documents supplied in the request, for a caller that holds the content rather than a target to crawl |
 | `POST` | `/v1/ingest` | bearer | mutate | Register an ingestion source and start indexing it |
+| `PUT` | `/v1/ingest` | bearer | mutate | Replace a registered source's configuration, keeping its id, status history, schedule and indexed documents. 404 for an unknown source, 409 while it is being crawled or reindexed |
 | `GET` | `/v1/ingest` | bearer | read | Read back what each source was registered as, or one named source |
 | `DELETE` | `/v1/ingest` | bearer | mutate | Stop crawling a source. Its indexed documents are kept |
 | `DELETE` | `/v1/ingest/run` | bearer | mutate | Stop the ingestion run in flight and leave the source registered |
@@ -1264,7 +1423,8 @@ separate so a burst of writes cannot starve ordinary reads.
 | `POST` | `/v1/reindex` | bearer | mutate | Re-index a registered source. A node with no embedding endpoint re-chunks and re-indexes lexically |
 | `DELETE` | `/v1/reindex` | bearer | mutate | Ask a running re-index to stop, so a hung one does not hold its source's claim for the life of the process |
 | `GET` | `/v1/reindex/status` | bearer | read | Re-index state per source, or all sources. The readback for the 202 `/v1/reindex` returns |
-| `POST` | `/v1/erasure` | bearer | mutate | Remove named documents from the corpus: storage, the lexical index, and the registry — and withdraw what was extracted from them into the graph of the namespace they were staged into. 200 when both halves are done, 202 while the graph half is queued, 500 when some content could not be removed |
+| `POST` | `/v1/erasure` | bearer | mutate | Remove named documents from the corpus: storage, the lexical index, and the registry — and withdraw what was extracted from them into the graph of the namespace they were staged into. 200 when both halves are done, 202 while the graph half is queued, 500 when some content could not be removed. Answers with a `request_id` |
+| `GET` | `/v1/erasure/{request_id}` | bearer | read | Where one document erasure stands: `incomplete`, `pending`, `applied` or `discharged`, with timestamps and what remains |
 | `POST` | `/v1/compact` | bearer | mutate | Reclaim the space tombstoned entries still hold, without waiting for the next background sweep. Answers 202 and works behind the response |
 | `DELETE` | `/v1/compact` | bearer | mutate | Ask the compaction in progress to stop. 200 either way, saying whether there was one |
 | `GET` | `/v1/compact/status` | bearer | read | What the last compaction examined, reclaimed and failed on. The readback for the 202 `/v1/compact` returns |
@@ -1273,6 +1433,12 @@ separate so a burst of writes cannot starve ordinary reads.
 | `DELETE` | `/v1/graph/build` | bearer | mutate | Stop the build in progress. It publishes nothing, and the namespace keeps serving the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | read | What the build is doing, and what the last one published |
 | `POST` | `/v1/graph/erasure` | bearer | mutate | Record an obligation to erase, and compact when it is due |
+| `GET` | `/v1/graph/erasure/{request_id}` | bearer | read | Where one graph erasure obligation stands: `pending` or `discharged`, with timestamps, in the namespace `X-Excalibur-Namespace` names |
+| `GET` | `/v1/graph/entities` | bearer | read | Entities in the served graph by exact `name` or `prefix`, or all of them, in name order — paged by `limit` and `cursor` |
+| `GET` | `/v1/graph/entities/{id}` | bearer | read | One entity, its edges counted by relation and direction. `404` for an id the served graph does not hold |
+| `GET` | `/v1/graph/entities/{id}/edges` | bearer | read | An entity's edges with their intervals and provenance, narrowed by `relation`, `direction` (`out`, `in`, `both`) and `as_of` — paged by `limit` and `cursor` |
+| `POST` | `/v1/graph/facts` | bearer | mutate | Stage facts a caller states, each under a fact id of its own. `201`; they are served after the next build |
+| `DELETE` | `/v1/graph/facts/{fact_id}` | bearer | mutate | Retract an asserted fact, or every one stating `?subject=&relation=&object=`, as a source-scoped erasure. `202`; `compact=true` applies it now |
 | `GET` | `/v1/graph/namespaces` | bearer | read | The namespaces on disk, a page at a time, and what each one holds and owes |
 | `PUT` | `/v1/graph/namespaces/{namespace}` | bearer | mutate | Create a namespace. `201` when created, `200` when it already existed |
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | mutate | Remove a namespace entirely. Irreversible, and `409` for `shared` |
@@ -1301,14 +1467,53 @@ Document erasure is exposed as an MCP tool, `erase_documents`, but only behind a
 repeats the source it erases — see [The tools](#the-tools). Graph erasure is not: it removes facts
 by entity or by extractor version rather than by anything a model ingested, so a model has no way
 to know what a call would take with it, and the cost of making one wrongly is not bounded by
-retrying.
+retrying. Retracting an asserted fact, `DELETE /v1/graph/facts`, is recorded as a graph erasure and
+stays out with it.
 
 ### The graph store
 
 The node builds its own graph from what it ingests. Ingestion extracts facts from each published
-document and stages them; `POST /v1/graph/build` turns everything staged into the store and starts
-serving it, without a restart. A node that has ingested but never built answers `/v1/graph/query`
-with 503 and says so, rather than 404 — the capability is there, the data is not yet.
+document and stages them; a build turns everything staged into the store and starts serving it,
+without a restart. The node runs one by itself once a namespace's graph falls behind its staging
+(see [Keeping the graph current](#keeping-the-graph-current)), and `POST /v1/graph/build` runs one
+now. A node that has ingested but never built answers `/v1/graph/query` with 503 and says so,
+rather than 404 — the capability is there, the data is not yet.
+
+#### Keeping the graph current
+
+Ingestion stages every change: a new document's facts, and — when a crawl replaces or removes a
+document — the withdrawal of the facts its earlier version contributed. `/v1/graph/query` answers
+from the graph the last build published, so until a build runs it still answers with what a
+replaced document used to say. Staging records each change no published graph has, durably, in a
+`unpublished.changes` marker beside the staging logs, and every
+`excalibur.graph.auto-build-interval-seconds` the node rebuilds each namespace that is behind:
+
+- once its staging has been quiet for `excalibur.graph.auto-build-debounce-seconds`, so a crawl is
+  published by one build, or once its oldest unpublished change has waited
+  `excalibur.graph.auto-build-max-delay-seconds`, so ingestion that never pauses cannot hold the
+  graph back — oldest first;
+- never twice at once for one namespace, never one an explicit build is running for, and at most
+  `excalibur.graph.auto-build-max-concurrent` across the node. The build takes the namespace's
+  replacement lock, as explicit builds and erasure compactions do, and checks again under it
+  whether the graph is still behind, so a namespace an explicit build caught up is left alone;
+- not while extraction is asked for but has no API key or could not be wired: a replaced
+  document's old facts are withdrawn whether or not its new ones could be extracted, and a build
+  would publish a graph that lost them with nothing in their place. The status says it is paused;
+- not while the graph is withheld for an interrupted erasure, which the erasure sweep applies first.
+
+A failed automatic build is retried after `excalibur.graph.auto-build-failure-backoff-seconds`,
+doubling with each further failure up to `excalibur.graph.auto-build-max-failure-backoff-seconds`.
+An erasure compaction is not a change to publish: it rewrites staging and the served graph alike.
+A build that finds every staged fact withdrawn — its documents all removed — stops serving the
+graph they built rather than going on answering from it. A node upgraded from one that kept no
+marker notices staged facts written after its graph was built, from the files' times, when the
+namespace opens.
+
+`GET /v1/graph/build/status` reports, beside the last explicit build, a `freshness` block —
+whether the graph is behind its staging and since when — and an `automatic` block with what the
+node is doing about it; `GET /v1/graph/namespaces` carries `behind_staging` for every namespace.
+Automatic builds replace a waiting ingest with a debounce and a build: with the defaults a changed
+document reaches the graph a minute or so after its crawl goes quiet, plus the build.
 
 Each namespace keeps its own store, under the root `excalibur.graph.path` names — the data
 directory by default. A node that never sees the `X-Excalibur-Namespace` header uses exactly one,
@@ -1662,7 +1867,38 @@ allow-listed and every address it resolves to is rejected if it is loopback, lin
 any-local or multicast, which is what keeps ingestion away from cloud metadata endpoints and
 internal services.
 
+### Audit log
+
+Every request that changes what the node holds or how it behaves writes one structured event to
+the `excalibur.audit` logger, whatever its outcome — including a refused one, so an unauthenticated
+or rate-limited attempt is on the record too. The actions are `source.register`, `source.update`,
+`source.deregister`, `ingest.cancel`, `documents.supply`, `reindex.start`, `reindex.cancel`,
+`erasure.documents`, `erasure.graph`, `compaction.start`, `compaction.cancel`,
+`graph.build.start`, `graph.build.cancel`, `graph.facts.assert`, `graph.facts.retract`,
+`graph.namespace.delete`, `query.cancel`, `node.drain` and `node.undrain`. Reads are not audited.
+
+Each event is a JSON line with the usual `timestamp` and these top-level fields:
+
+| Field | Meaning |
+|-------|---------|
+| `audit_action` | One of the actions above |
+| `audit_outcome` | `success`, `accepted` (a 202), `rejected` (4xx), `unauthenticated` (401), `rate_limited` (429), `failed` (5xx) or `error` |
+| `http_status`, `http_method`, `http_path` | The request and the status it was answered with |
+| `request_id` | The caller's `X-Request-Id` when it is 1–128 characters of `[A-Za-z0-9._:-]`, otherwise one the node generates. Returned in the same response header |
+| `client_address` | The caller, resolved as rate limiting resolves it, so `excalibur.api.trusted-proxies` applies |
+| `audit_targets` | What the action applied to: source ids, source types, namespaces, erasure scope and request ids, counts |
+
+No event carries content an erasure removes: a graph erasure by name records `entity_by: name`
+and never the name, and a document erasure records how many documents it named, never which.
+
+The logger is pinned at `INFO`, so lowering `EXCALIBUR_LOG_LEVEL` does not silence it, and it writes
+to the same JSON stream as everything else. To keep audit events apart, start the node with
+`-Dlogback.configurationFile` pointing at a copy of the shipped `logback.xml` that routes the
+logger to its own appender with additivity off — the shipped file carries a commented example of
+exactly that.
+
 ### Query Example
+
 
 Send raw query text. On a node with an embedding model the server embeds it using the same model that ingestion uses, guaranteeing the query lives in the same embedding space as the indexed vectors; a node without one answers from its BM25 index:
 
@@ -2266,10 +2502,11 @@ curl -X POST http://localhost:8080/v1/graph/build
 
 `extraction` says whether ingestion on this node extracts the facts a build publishes, and is on
 every answer from both routes: `active`, `disabled` when `excalibur.graph.extraction-enabled` is
-off, `missing_api_key` when it is on but no LLM API key is configured, or `unavailable` when both
-are set but the ingestion pipeline could not be set up — its failure is in the startup log. The
-last two also carry a `warning`, because nobody chose them and the build they answer publishes
-nothing ingestion staged since startup. The status route carries the same fields.
+off, `missing_api_key` when it is on but the chat endpoint is the hosted default with no key,
+`chat_disabled` when it is on but `excalibur.llm.chat-enabled` is false, or `unavailable` when a
+chat model is configured but the ingestion pipeline could not be set up — its failure is in the
+startup log. The last three also carry a `warning`, because nobody chose them and the build they
+answer publishes nothing ingestion staged since startup. The status route carries the same fields.
 
 `202`, not `200`. On a real corpus the build takes minutes — it replays every staged fact, embeds
 every entity and writes two Lucene indexes — so it runs behind the response and the request does
@@ -2291,13 +2528,28 @@ curl http://localhost:8080/v1/graph/build/status
   "relations": 87,
   "entities_with_text": 5210,
   "entities_with_vectors": 5210,
-  "staged_facts": 19004
+  "staged_facts": 19004,
+  "retired": false,
+  "freshness": {"behind_staging": false, "withheld": false},
+  "automatic": {"enabled": true, "state": "current", "debounce_seconds": 60,
+                "max_delay_seconds": 900, "last_started_at_ms": 1736899500000,
+                "last_finished_at_ms": 1736899560000, "last_result": "completed",
+                "consecutive_failures": 0}
 }
 ```
 
 `state` is `idle`, `running`, `completed`, `cancelled` or `failed`. One build runs at a time across
 the node — it saturates the same disk and the same embedding endpoint either way — so a second
 `POST` while one is in flight is refused with `409` naming the namespace that holds it.
+
+The top-level fields describe the last build asked for. `freshness` says whether the served graph
+is behind what the namespace has staged — `behind_staging`, with `staged_changes_since_ms` and
+`last_staged_change_ms` when it is — and `automatic` what the node is doing about it: `state` is
+`current`, `pending` (waiting for the debounce or the maximum delay), `running`, `backing_off`
+(after a failure, until `next_attempt_at_ms`), `paused` (with `paused_reason`, while extraction is
+`missing_api_key` or `unavailable`), `withheld` or `disabled`; `last_result` is `completed`,
+`unchanged` (an explicit build got there first), `failed` (with `last_error`) or `cancelled`. See
+[Keeping the graph current](#keeping-the-graph-current).
 
 A node that has staged nothing keeps serving the graph it already had — replacing it with an empty
 one would turn every question into a refusal. Its status says so and why, from `extraction`:
@@ -2346,26 +2598,52 @@ curl -X POST http://localhost:8080/v1/graph/query \
   "truncated": true,
   "format": "triples-v1",
   "plan": "lookup",
+  "walk": {"truncated": false, "entities_dropped": 0, "facts_dropped": 0},
+  "query_id": "5b0f1c2e-8d4a-4f7e-9a61-0c3d2e1f4b6a",
+  "timed_out": false,
+  "cancelled": false,
   "timings_ms": {"plan": 0.412, "link": 4.211, "traverse": 12.008,
                  "rank": 26.894, "serialize": 1.077, "total": 44.602}
 }
 ```
 
-Three statuses, and a client has to tell them apart:
+A client has to tell the statuses apart:
 
 | Status | Meaning |
 |--------|---------|
 | `answered` | Context to put in a prompt, with a calibrated confidence |
 | `needs_input` | The question did not say which entity it meant. Carries `reason` — one of `unbound_pronoun`, `ambiguous_pronoun`, `no_entity_mention` or `ambiguous_entity` (a name several entities share, which the evidence could not tell apart) — plus `question` and `candidates`; send the chosen one back in `context_entities` with the same query. Entities that share a name are offered as the name followed by ` #` and the entity id (`Ada #12`), so the one sent back names exactly one of them. Returned as 200 — the request was well-formed and the system did what it should |
-| `declined` | The evidence does not support an answer. `reason` is one of `no_match`, `below_confidence_threshold`, `low_provenance_confidence` or `unresolved_reference`. Deliberately not an empty `answered`, which a client would render as "nothing found" |
+| `declined` | The evidence does not support an answer. `reason` is one of `no_match`, `below_confidence_threshold`, `low_provenance_confidence`, `unresolved_reference` or `timed_out` (the deadline passed before the graph was walked, so there was nothing to judge). Deliberately not an empty `answered`, which a client would render as "nothing found" |
+| `cancelled` | `DELETE /v1/query/{query_id}` withdrew the question while it ran. No context, whatever it had reached; `cancelled` is `true` |
 
 `tokens`, `facts_included`, `facts_dropped`, `truncated` and `format` come with the serialised
 context, so they are absent on an `answered` response that carries none — read `context` and treat
 the five as optional rather than assuming a shape. `format` names the serializer that produced the
 context, so an A/B test can attribute an outcome to it. `timings_ms` carries only the stages that actually ran, drawn from a fixed set — `plan`, `link`,
-`traverse`, `rank`, `serialize` — plus `total`. It comes back on all three
-statuses, because a refusal that took two seconds is as much a performance question as an answer
+`traverse`, `rank`, `serialize` — plus `total`. It comes back on every
+status, because a refusal that took two seconds is as much a performance question as an answer
 that did.
+
+`timeout_ms` bounds the question, validated exactly as `/v1/query` validates it: positive, at most
+`excalibur.api.max-query-timeout-ms`, and `excalibur.visibility.query-timeout-ms` when absent. The
+deadline reaches every stage that can wait — the walk, the question's embedding and the LLM rerank —
+and a model call is waited for only until it passes, not for the client's own timeout times its
+retries; the call is then interrupted and not counted against the circuit breaker. What had been
+gathered by then is judged as usual and answered with `"timed_out": true`, so an `answered` or
+`declined` response with it set may be missing what more time would have found. A deadline that
+passes before the walk leaves nothing to judge, and is `declined` with reason `timed_out`.
+
+Every question is registered while it runs: `GET /v1/query/status` lists it with `"kind": "graph"`,
+and `DELETE /v1/query/{query_id}` withdraws it — the walk stops and any model call in flight is
+interrupted — after which it answers `"status": "cancelled"`. Every response carries its
+`query_id`.
+
+`walk` comes back whenever the graph was walked. `truncated` is true when
+`excalibur.graph.max-frontier` or `excalibur.graph.max-walk-facts` left something out, and
+`entities_dropped` and `facts_dropped` say how much: facts and entities the walk never collected,
+unlike `facts_dropped` beside `context`, which counts facts it found that the token budget could not
+carry. A truncated answer is still a real answer, from the strongest part of the neighbourhood; a
+caller that needs the rest can ask a narrower question.
 
 `context_entities` is the conversation the question is asked in, which is what a pronoun in it
 binds to. The node keeps no session, so the client sends it with every question. Two spellings:
@@ -2474,6 +2752,23 @@ deadline that has to be able to say the data is gone. The scopes are
 `{"scope":"source","source_type":"DOCUMENT","source_id":N}` and
 `{"scope":"extractor","version":N}`.
 
+`request_id` is how the obligation is followed afterwards, with the same `X-Excalibur-Namespace`
+it was recorded under:
+
+```bash
+curl http://localhost:8080/v1/graph/erasure/7
+```
+
+```json
+{"request_id": 7, "state": "discharged", "scope": "entity", "entity_id": 42,
+ "requested_at_ms": 1756649000000, "discharged_at_ms": 1756649900000,
+ "detail_retained": true, "namespace": "shared", "remaining": null}
+```
+
+`pending` carries a `remaining` sentence saying what is still owed; `discharged` means the edges
+the scope selects are gone from the served graph and from the staged facts. An entity erased by
+name reports its `entity_id`, never the name.
+
 In the source scope, `N` names one ingested document, not a registered source: it is the XxHash64
 (seed 0) of the UTF-8 bytes of the document's key, `<source_id>:<document_id>` — `my-docs:guide.md`
 for the document whose chunks come back from `/v1/query` as `my-docs:guide.md:chunk:N`. It is
@@ -2536,6 +2831,122 @@ accumulated from every source that mentioned them; those two artifacts are inste
 the staging the erasure has already cleaned, which is why the staging erasure runs first. A node
 with no embedding endpoint can rebuild the text and not the vectors, and says so in
 `requests_withheld` rather than publishing a graph whose vectors were silently dropped.
+
+### Reading the graph by entity
+
+`/v1/graph/query` answers a question. It does not say what extraction produced, what the graph
+holds about one entity, or which id an entity has — and an id is what `"scope": "entity"` erasure
+and the edge listing below take. `GET /v1/graph/entities` reads the served graph by entity instead,
+through the same lease the query takes, so it lists exactly what a question could be answered
+from:
+
+```bash
+curl 'http://localhost:8080/v1/graph/entities?name=ada%20lovelace'
+curl 'http://localhost:8080/v1/graph/entities?prefix=ada&limit=20'
+curl 'http://localhost:8080/v1/graph/entities/12'
+curl 'http://localhost:8080/v1/graph/entities/12/edges?direction=out&relation=worked_with&as_of=1840-01-01'
+```
+
+```json
+{
+  "namespace": "shared",
+  "entity_id": 12,
+  "direction": "out",
+  "edges": [
+    {"direction": "out",
+     "subject": {"id": 12, "name": "Ada Lovelace"},
+     "relation": "worked_with", "relation_id": 3,
+     "object": {"id": 40, "name": "Charles Babbage"},
+     "valid_from": null, "valid_to": null, "confidence": 1.00,
+     "provenance": {"source_type": "USER_ASSERTED", "source_id": 1788439912004211,
+                    "extractor_version": 0},
+     "fact_id": 1788439912004211}
+  ],
+  "next_cursor": null
+}
+```
+
+`name` matches the whole name and `prefix` its start, both ignoring case and surrounding space;
+with neither the listing is every entity in name order, and both at once is a 400. Two spellings
+of a name are two entities, and so are names that differ only in case, so a `name` lookup can
+return several. An entity an erasure removed is not listed. `/{id}` adds each relation's count in
+each direction. `/{id}/edges` lists outgoing edges before incoming ones, each by relation and then
+by the other endpoint; `relation` is cleaned as extraction cleans one (`Worked With` reads as
+`worked_with`), `direction` is `out`, `in` or `both` (the default), and `as_of` is spelled as the
+query spells it — a date, an instant, or `all` — but defaults to all of valid time, because a
+listing is a record of what is held rather than an answer about today. Each edge carries its
+interval (`null` for an unknown start or an open end), its confidence as a fraction, and its
+provenance, whose `source_type` and `source_id` are a source-scoped erasure request as they stand;
+an asserted fact also carries its `fact_id`.
+
+Every listing takes `limit` (default 50, at most 500) and `cursor`, and answers with `next_cursor`,
+null on the last page. A cursor names the last item returned — entity name and id, or relation and
+other endpoint — rather than a position, so one carried across a rebuild resumes after that item
+instead of skipping or repeating what the rebuild moved. It is opaque; one this listing did not
+issue is a 400. An id the served graph does not hold is a 404. A namespace with no graph being
+served — never built, damaged, or withheld until an interrupted erasure is applied — is a 503 with
+the query's own message, and a namespace that does not exist gets the same 503 and is not created.
+
+### Stating facts
+
+Extraction is not the only way in. `POST /v1/graph/facts` stages facts a caller states:
+
+```bash
+curl -X POST http://localhost:8080/v1/graph/facts \
+  -H 'Content-Type: application/json' \
+  -d '{"facts": [{"subject": "Ada Lovelace", "relation": "worked with",
+                  "object": "Charles Babbage", "valid_from": "1833-06-05", "confidence": 0.95}]}'
+```
+
+```json
+{
+  "namespace": "shared",
+  "staged": 1,
+  "facts": [{"fact_id": 1788439912004211, "subject": "Ada Lovelace", "relation": "worked_with",
+             "object": "Charles Babbage", "valid_from": "1833-06-05", "valid_to": null,
+             "confidence": 0.95}],
+  "served": false,
+  "detail": "staged; served once the graph is next built (POST /v1/graph/build)"
+}
+```
+
+A body is one fact, or up to 64 under `facts` — the most one extraction call stages. Labels are
+cleaned and bounded exactly as extracted ones are: surrounding space removed, the relation
+lower-cased with spaces turned to underscores, each at most 200 characters, and never the
+`(erased N)` placeholder an erasure leaves in place of a name. `valid_from` and `valid_to` are ISO
+dates, absent or null for no known start or no end; `confidence` is a fraction, 1 when absent. Any
+malformed fact is a 400 naming it, and nothing in the request is staged.
+
+**Staged is not served.** A fact reaches `/v1/graph/query` and `/v1/graph/entities` once the
+namespace's graph is next built, exactly as an extracted fact does — the edge store is rebuilt
+rather than appended to. The answer is 201 with `"served": false` and says so.
+
+Each fact is staged with `USER_ASSERTED` provenance whose source id is the fact id the answer
+returns. Fact ids rise, and are never handed out again — not after a retraction, not after an
+erasure of either entity, and not after a restart, even one with the clock set back. A fact id is
+the time it was asserted in microseconds, or one more than the last, whichever is larger.
+
+Retracting one is a source-scoped erasure of it, recorded through the same service
+`POST /v1/graph/erasure` uses:
+
+```bash
+curl -X DELETE 'http://localhost:8080/v1/graph/facts/1788439912004211?compact=true'
+curl -X DELETE 'http://localhost:8080/v1/graph/facts?subject=Ada%20Lovelace&relation=worked_with&object=Charles%20Babbage'
+```
+
+By subject, relation and object it retracts every asserted fact stating that triple, matched on
+exact labels; a fact extraction found is never touched by this route — erase its document for
+that. Nothing staged to retract is a 404 and records nothing, as is a namespace that does not
+exist, which is not created. Otherwise the answer is 202 with the `fact_ids` retracted, their
+`request_ids`, and the compaction outcome. As with any erasure, accepting is not removing: until a
+compaction runs the fact is still served, and a build still publishes it. `compact=true` runs one
+now. An entity-scoped erasure covers asserted facts as it covers extracted ones.
+
+The provenance source types are `UNKNOWN`, `DOCUMENT` and `USER_ASSERTED`, and those are what
+`"scope": "source"` accepts. Three more were defined and never produced — a knowledge-base import, a
+conversation and an inference, codes 1, 3 and 5 — and are retired: the codes stay reserved and are
+never reissued, an edge stored under one reads as `UNKNOWN`, and an erasure request recorded
+against one is replayed as owing nothing, since nothing was ever stored under it.
 
 ## Pointing a model at it
 
@@ -2604,6 +3015,9 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `erase_documents` | **`source_id`**, `document_ids`, `scope`, `compact`, **`confirm`** | Permanently erases the named documents, or with `scope` `source` everything the source holds, from the corpus and the graph. `confirm` must repeat `source_id` |
 | `delete_namespace` | **`namespace`**, **`confirm`** | Permanently removes a namespace's graph, staged facts and erasure log. `confirm` must repeat `namespace` |
 | `search_graph` | **`query`**, `context_entities`, `as_of`, `direction`, `namespace` | Asks the graph a question, optionally `as_of` a date, an instant or `all` of history, in one `direction`, and in a conversation: `context_entities` names what was mentioned, each with an optional grammatical shape and turn so a pronoun binds the right one |
+| `find_graph_entities` | `name`, `prefix`, `limit`, `cursor`, `namespace` | Finds entities in the served graph by exact name or prefix, ignoring case, with their ids and degrees — `GET /v1/graph/entities` |
+| `graph_entity_edges` | **`entity_id`**, `relation`, `direction`, `as_of`, `limit`, `cursor`, `namespace` | Lists one entity's facts with their intervals and provenance — `GET /v1/graph/entities/{id}/edges` |
+| `assert_graph_facts` | **`facts`** (each **`subject`**, **`relation`**, **`object`**, `valid_from`, `valid_to`, `confidence`), `namespace` | Stages facts the model states, served after the next `build_graph` — `POST /v1/graph/facts` |
 
 Arguments in bold are required; every other one is optional and, when left out, is not sent, so
 the node's configured default applies rather than one the adapter chose.
@@ -2611,7 +3025,9 @@ the node's configured default applies rather than one the adapter chose.
 Together they are the whole loop, so a model can prepare a corpus as well as query one. The order
 matters: `build_graph` has to run after ingestion finishes - it answers as soon as the build
 starts, so `graph_build_status` is how a model waits for one - and `search_graph` reports that no
-graph is being served until it has.
+graph is being served until it has. The same holds for `assert_graph_facts`: what it states is
+served after the next `build_graph`, and `find_graph_entities` and `graph_entity_edges` read only
+the graph being served.
 
 The two ways in are not alternatives either. `ingest_documents` points the node at a directory,
 which has to be inside an allow-listed root - the right policy for a node that goes and reads
@@ -2710,11 +3126,14 @@ Only one thing is required: filesystem ingestion needs the directory listed in
 `excalibur.ingest.allowed-roots`, and HTTP ingestion needs the host listed in
 `excalibur.ingest.allowed-hosts`. Without a matching entry the registration is refused.
 
-`excalibur.llm.api-key` is optional. Without it the corpus is chunked, stored and term-indexed and
-`/v1/query` answers from BM25 with query-side expansion; with it the corpus is also embedded and
-`/v1/query` fuses vector search with that same BM25 index, reporting `"retrieval": "hybrid"`. Set
-`excalibur.query.hybrid-retrieval=false` for vector-only ranking. Fact extraction needs the same
-key plus `excalibur.graph.extraction-enabled=true`.
+A model is optional. With none — the shipped defaults name the hosted endpoint and no
+`excalibur.llm.api-key` — the corpus is chunked, stored and term-indexed and `/v1/query` answers
+from BM25. With an embedding endpoint in use (a key for the hosted one, or any keyless server:
+Ollama, vLLM, TGI) the corpus is also embedded and `/v1/query` fuses vector search with that same
+BM25 index, reporting `"retrieval": "hybrid"`. Set `excalibur.query.hybrid-retrieval=false` for
+vector-only ranking. Fact extraction needs a chat endpoint in use plus
+`excalibur.graph.extraction-enabled=true`. The startup log has one line per endpoint saying
+whether it is in use and, if not, which setting would change that.
 
 ## Architecture
 
@@ -2734,7 +3153,7 @@ key plus `excalibur.graph.extraction-enabled=true`.
 | `excalibur-ingest` | Document ingestion, chunking, source adapters |
 | `excalibur-shard` | Index orchestration, volume management, visibility tracking |
 | `excalibur-llm` | LLM client with circuit breaker and retry logic |
-| `excalibur-api` | HTTP server, API endpoints and the MCP server |
+| `excalibur-api` | HTTP server, API endpoints, the MCP server and the in-process embedded node (`ExcaliburEmbedded`, see [USAGE.md](USAGE.md#programmatic-usage-jvm-embedded)) |
 | `excalibur-fsck` | Offline integrity check and repair for a data directory |
 | `excalibur-backup` | Verified snapshot, verify and restore for a data directory |
 | `excalibur-metrics` | JMX metrics and observability |
@@ -2743,6 +3162,7 @@ key plus `excalibur.graph.extraction-enabled=true`.
 | `excalibur-test-bootstrap` | Initializes `java.lang.foreign` before the first test in every module |
 | `excalibur-integration` | Integration tests |
 | `excalibur-bench` | JMH benchmarks |
+| `excalibur-coverage` | The coverage summary and gap report behind `./gradlew coverage` and `coverageGaps` |
 
 ### Query Pipeline
 
@@ -2896,6 +3316,16 @@ reported as unverifiable rather than as sound, and a file gains protection the f
 compaction or a split rewrites it. `excalibur-fsck` finds a damaged slot in an older file anyway,
 by comparing each slot against the record it names — the record keeps its own copy of the key
 hash, under the record's own checksum.
+
+A segment's write-ahead log, `segment_<N>.wal`, begins with a 16-byte header — the magic `EXWL`, a
+format version and a CRC-32 over both — so a node can tell a log a newer build wrote from a
+damaged one. A log whose header is sound and names a version this build does not read is refused
+and left exactly as it was: not replayed, not truncated, not given a header of this build's, and
+the node does not start on it. A damaged header is refused as damage, the same way a log damaged
+in the middle is. A log an older build wrote has no header; it is replayed and appended to exactly
+as before, and keeps its format until a compaction or a split gives its segment a fresh log, since
+writing a header into it would move every record and every offset recorded against them. One with
+no record in it is given a header as soon as it is opened.
 
 The same standard covers the index files beside the segments: the HNSW graph, its
 node-to-chunk map, the PQ codebook and the LSH tables each carry a CRC32C over their payload
@@ -3053,6 +3483,14 @@ still read — version 1, written before a crawl counted the pages `robots.txt` 
 each source's `entries_disallowed` as 0 — and the next run to end rewrites the file at version
 3.
 
+`<data dir>/erasure-receipts` is what `GET /v1/erasure/{request_id}` answers from: one line per
+document erasure — its id, when it was made, the source and scope, the per-document counts and the
+graph erasure requests it queued — for the 1024 most recent, the oldest dropped as a newer one is
+written. It holds no document id and no content. It is written like `source-status` — a
+`\#erasure-receipts|1` header, a `\#end|<count>|<crc>` marker, an atomic rename — and like it, one
+the node cannot read is logged and ignored rather than failing the start: the erasures it described
+were carried out when they were requested, and only the readback of them is lost.
+
 ### Visibility and Consistency
 
 The system uses epoch-based visibility tracking to ensure:
@@ -3068,10 +3506,11 @@ The system uses epoch-based visibility tracking to ensure:
 
 ```
 excaliburdb/
-├── excalibur-api/          # HTTP server and endpoints
+├── excalibur-api/          # HTTP server, endpoints and the embedded node
 ├── excalibur-backup/       # Offline snapshot, verify and restore command
 ├── excalibur-core/         # Primitives: memory, hash, checksums
 ├── excalibur-config/       # Configuration loading
+├── excalibur-coverage/     # Coverage summary and gap report (build tooling)
 ├── excalibur-filter/       # Cuckoo filters, LSH
 ├── excalibur-fsck/         # Offline integrity check and repair command
 ├── excalibur-graph/        # CSR adjacency, bitemporal, provenance, erasure
@@ -3303,11 +3742,11 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 ```
 
 The embedded example in [USAGE.md](USAGE.md#programmatic-usage-jvm-embedded) runs in a source set
-of its own, `embeddedExample`. Its only dependencies are the seven coordinates USAGE.md lists, so
-it proves that list is enough. `check` runs it:
+of its own, `embeddedExample`. Its only dependency is the one coordinate USAGE.md lists,
+`excalibur-api`, so it proves that coordinate is enough. `check` runs it:
 
-- `EmbeddedUsageExampleTest` - The example compiles against those seven alone, ingests through a stand-in embeddings endpoint, and answers
-- `EmbeddedUsageDocumentationTest` - The code block in USAGE.md matches that test's method and helper token for token, and its imports are exactly the ones the example uses
+- `EmbeddedUsageExampleTest` - The example compiles against `excalibur-api` alone, supplies documents through `ExcaliburEmbedded` with a stand-in embeddings endpoint and answers; after the node is closed and the directory reopened the documents are still there, and a replacement and an erasure both take effect and outlive the next restart
+- `EmbeddedUsageDocumentationTest` - The code block in USAGE.md matches that test's two example methods token for token, and its imports are exactly the ones the example uses
 
 ```bash
 ./gradlew :excalibur-integration:embeddedExampleTest
@@ -3353,12 +3792,17 @@ question, answered on a machine whose clock you trust.
 
 **Image.** Builds the container image from the repository's `Dockerfile`, as `docker build .`
 does, starts it with the bind address, plaintext opt-in and token the image needs to come up,
-waits for `/health/ready`, and stops it the way a scheduler would. An image that builds and never
-reports ready fails here. Then it runs the two container commands [In a
+waits for `/health/ready` and for Docker to report the container `healthy` from its own
+`HEALTHCHECK`, checks that an `excalibur-fsck --repair` run against the live volume is refused
+with exit `4`, and stops the node the way a scheduler would. An image that builds and never
+reports ready or healthy fails here. Then it runs the container commands [In a
 container](#in-a-container) documents against the stopped node's volume: an `excalibur-fsck
 --repair` into a mounted quarantine volume, after planting a staged file for it to set aside — it
 must arrive in the quarantine and be gone from the data directory, which must then check clean —
-and an `excalibur-backup snapshot` into a backup volume, verified `--deep` from a second container.
+an `excalibur-backup snapshot` into a backup volume, verified `--deep` from a second container,
+and an `excalibur-backup restore` of that image both over the node's own volume with `--force`
+and into a fresh volume, each of which must then check clean and start a node that reports
+healthy.
 
 ## FAQ
 
@@ -3489,7 +3933,7 @@ Server is not configured for text queries: this node has neither an embedding cl
 nor a lexical index, so there is no index to search...
 ```
 
-A missing API key alone does not cause this. Without an embedding endpoint the node still chunks,
+A missing model alone does not cause this. Without an embedding endpoint the node still chunks,
 stores and lexically indexes what it ingests, and `/v1/query` answers from BM25 with
 `"retrieval": "lexical"` and `"degraded": true`. The 503 means both paths are gone: no embedding
 client *and* no chunk lexical index, which is a failure to open the index rather than a missing
@@ -3500,8 +3944,9 @@ the check runs before the body is even read, so a malformed body will not shadow
 No, and this is deliberate. A vector only means something in one model's embedding space. If a
 client embedded with a different model than ingestion used, similarity scores would still look
 plausible and be meaningless. Owning both sides of the embedding is what makes that impossible.
-Point `excalibur.llm.base-url` at any OpenAI-compatible endpoint — Ollama, vLLM, TGI — if you want
-a different model.
+Point `excalibur.llm.embedding-base-url` (or `excalibur.llm.base-url`, for both roles) at any
+OpenAI-compatible endpoint — Ollama, vLLM, TGI — if you want a different model; no key is needed
+for one that does not ask for it.
 
 **Which embedding model should I use, and do I need one?**
 You need one for vector retrieval, not to run the server. The server embeds both the documents it
@@ -3511,12 +3956,14 @@ OpenAI-compatible `/v1/embeddings` endpoint — hosted or local.
 
 For a corpus of identifiers, DOIs, error codes and titles, embedding it may be the wrong trade
 outright: those are exactly what BM25 answers well and a dense vector blurs. Set
-`excalibur.llm.embeddings-enabled=false` with the key still configured and the chat model is spent
+`excalibur.llm.embeddings-enabled=false` with the chat endpoint still configured and the chat model is spent
 on expanding each query rather than on embedding every document — a few dozen generated tokens per
 query instead of billions of embedded tokens per corpus.
 
 The default, `text-embedding-3-small` at 1536 dimensions, is a reasonable starting point and needs
-no configuration beyond an API key. Four things about this codebase narrow the choice:
+no configuration beyond an API key. A local model needs no key at all: set
+`excalibur.llm.embedding-base-url=http://localhost:11434` (Ollama) and the model name and widths
+below, and the node embeds through it — see [Keyless local models](#keyless-local-models). Four things about this codebase narrow the choice:
 
 - **Chunks are ~512 tokens by default** (`excalibur.ingest.chunk-target-tokens`, with
   `excalibur.ingest.chunk-overlap-tokens` at 64), so at the default a long-context embedding model
@@ -3594,8 +4041,9 @@ chat-model call per ingested document — the most expensive thing ingestion can
 **`/v1/graph/query` answers 503.**
 
 ```
-No graph is being served for this namespace; POST /v1/graph/build to build one
-from the facts ingestion has staged
+No graph is being served for this namespace. One is built automatically once facts
+are staged, unless excalibur.graph.auto-build-enabled is off; POST /v1/graph/build
+builds one now
 ```
 
 Nothing has been built yet, or the namespace in the `X-Excalibur-Namespace` header has never been
@@ -3607,14 +4055,27 @@ staged to build from.
 **`/v1/graph/build` returned `"published": false`.**
 Nothing was staged, so the graph you were already serving was left alone. Replacing it with an
 empty one would turn every subsequent question into a refusal. The status's `message` says why
-nothing was staged, and `extraction` is the first thing to read.
+nothing was staged, and `extraction` is the first thing to read. The exception is
+`"retired": true`: every fact the graph was built from has been withdrawn — its documents removed
+from their sources — so the namespace stops serving it, and `/v1/graph/query` answers 503.
+
+**`/v1/graph/query` still answers with what a replaced document used to say.**
+The served graph is what the last build published. Read `freshness` and `automatic` on
+`GET /v1/graph/build/status` with the namespace's header: `behind_staging: true` with `pending`
+means the node rebuilds once staging has been quiet for
+`excalibur.graph.auto-build-debounce-seconds`; `paused` means extraction is not active and nothing
+is built automatically until it is; `backing_off` means the last automatic build failed, and
+`last_error` says why; `disabled` means `excalibur.graph.auto-build-enabled=false`.
+`POST /v1/graph/build` publishes it now in every case.
 
 **I set `excalibur.graph.extraction-enabled=true` and nothing is ever staged.**
-Extraction is a chat-model call, so it also needs `excalibur.llm.api-key` (or
-`EXCALIBUR_LLM_API_KEY`). With the flag and no key the node starts, ingests and searches normally,
-and extracts nothing — so it says so everywhere you would look: a WARN at startup naming both
-settings, and `"extraction": "missing_api_key"` with a `warning` on the answer to
-`POST /v1/graph/build` and on `GET /v1/graph/build/status`. Set the key, restart, and re-ingest:
+Extraction is a chat-model call, so it also needs a chat endpoint in use: `excalibur.llm.api-key`
+(or `EXCALIBUR_LLM_API_KEY`) for the hosted default, or `excalibur.llm.chat-base-url` pointed at a
+keyless server. With the flag and no usable chat endpoint the node starts, ingests and searches
+normally, and extracts nothing — so it says so everywhere you would look: a WARN at startup naming
+the settings, and `"extraction": "missing_api_key"` (or `"chat_disabled"` when
+`excalibur.llm.chat-enabled=false`) with a `warning` on the answer to `POST /v1/graph/build` and
+on `GET /v1/graph/build/status`. Fix the setting, restart, and re-ingest:
 documents ingested while extraction was inactive were never offered to the extractor, and a build
 cannot recover facts nobody extracted. With both set and `"extraction": "unavailable"`, the key is
 not the problem: the ingestion pipeline failed to set up at startup, and the WARN logged then says

@@ -251,7 +251,10 @@ public final class DataDirectoryFixture {
      * Digests every regular file under a tree, keyed by its path relative to the root.
      *
      * <p>What "byte-identical" is asserted with: a restored directory that produces the same
-     * map as the source produced holds the same content under the same names.</p>
+     * map as the source produced holds the same content under the same names. The data
+     * directory's lock file is left out, as every tool here leaves it out: it records the last
+     * process that held the directory - the snapshot on one side, the restore on the other - and
+     * is not data either side holds.</p>
      *
      * @param root The tree
      * @return Relative path to lowercase hex SHA-256, in sorted path order
@@ -263,7 +266,10 @@ public final class DataDirectoryFixture {
             var files = walk.filter(Files::isRegularFile)
                 .sorted(Comparator.comparing(Path::toString)).toList();
             for (Path file : files) {
-                digests.put(root.relativize(file).toString().replace('\\', '/'), digest(file));
+                String relative = root.relativize(file).toString().replace('\\', '/');
+                if (!relative.equals(com.eonmux.excalibur.core.datadir.DataDirectoryLock.FILE_NAME)) {
+                    digests.put(relative, digest(file));
+                }
             }
         }
         return digests;

@@ -13,8 +13,9 @@ import java.util.Objects;
 /**
  * Checks the line-oriented registries that end with a record count.
  *
- * <p>{@code document-registry}, {@code source-catalog} and {@code source-status} are UTF-8 text
- * with a versioned first line and a closing {@code \#end|<count>|<crc>} line: the count, which
+ * <p>{@code document-registry}, {@code source-catalog}, {@code source-status} and
+ * {@code erasure-receipts} are UTF-8 text with a versioned first line and a closing
+ * {@code \#end|<count>|<crc>} line: the count, which
  * is what distinguishes a whole file from one whose tail a failed write took with it, and the
  * CRC32C of every byte before the closing line, which is what distinguishes a record altered in
  * place from the one that was written. A file whose count and checksum both hold is intact. The

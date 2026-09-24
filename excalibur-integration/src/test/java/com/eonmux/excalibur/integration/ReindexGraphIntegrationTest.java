@@ -112,6 +112,8 @@ class ReindexGraphIntegrationTest {
         props.put("excalibur.graph.entity-vectors-enabled", "false");
         props.put("excalibur.graph.extraction-enabled", "true");
         props.put("excalibur.graph.ram-buffer-mb", "4.0");
+        // Every build here is asked for, so what each one publishes is the test's to say.
+        props.put("excalibur.graph.auto-build-enabled", "false");
         props.put(ApiSecurityConfig.KEY_ALLOWED_ROOTS, documents.toString());
         props.put(ApiSecurityConfig.KEY_AUTH_TOKEN, TOKEN);
         Config config = new Config(props);

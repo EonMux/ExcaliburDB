@@ -1,26 +1,18 @@
 package com.eonmux.excalibur.api;
 
-import com.eonmux.excalibur.api.bootstrap.CoreComponents;
-import com.eonmux.excalibur.api.bootstrap.GraphRagFactory;
-import com.eonmux.excalibur.api.bootstrap.IngestionWiring;
-import com.eonmux.excalibur.api.bootstrap.NodeShutdown;
-import com.eonmux.excalibur.api.bootstrap.QueryPipelineFactory;
-import com.eonmux.excalibur.api.bootstrap.ReindexerFactory;
+import com.eonmux.excalibur.api.bootstrap.NodeAssembly;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.server.ExcaliburDBServer;
 import com.eonmux.excalibur.api.server.ListenPort;
 import com.eonmux.excalibur.api.server.ShutdownBudget;
-import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
-import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
-import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
-import com.eonmux.excalibur.shard.allocator.VolumeManager;
 import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.config.ConfigLoader;
 import com.eonmux.excalibur.config.ConfigValidation;
 import com.eonmux.excalibur.config.ShardConfig;
+import com.eonmux.excalibur.core.datadir.DataDirectoryLock;
 import com.eonmux.excalibur.core.memory.ForeignMemoryBootstrap;
 import com.eonmux.excalibur.metrics.Metrics;
 import com.eonmux.excalibur.metrics.MetricsRegistry;
@@ -31,7 +23,6 @@ import org.slf4j.LoggerFactory;
 import org.slf4j.bridge.SLF4JBridgeHandler;
 
 import java.io.IOException;
-import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -99,33 +90,9 @@ public final class ExcaliburApplication {
      */
     private final Duration shutdownTimeout;
 
-    private final Arena arena;
-    private final StorageEngine storageEngine;
-    private final IndexOrchestrator indexOrchestrator;
-
-    /**
-     * The chunk index, once the ingestion pipeline has opened one.
-     *
-     * <p>Held so shutdown can close it. Closing publishes whatever is still buffered, which is the
-     * difference between a clean stop and one that leaves the tail of a run in storage and out of
-     * every query.</p>
-     */
-    private volatile com.eonmux.excalibur.ingest.lexical.ChunkIndex chunkIndex;
-
-    /**
-     * Enforces the chunk index's erasure deadline.
-     *
-     * <p>Held so shutdown can stop it before the index it compacts is closed underneath it.</p>
-     */
-    private volatile com.eonmux.excalibur.api.bootstrap.LexicalErasureSweep lexicalErasureSweep;
-
-    /** Every namespace's graph: what it has staged, what it serves, and what it owes. */
-    private final com.eonmux.excalibur.api.bootstrap.GraphTenants graphTenants;
-    private final VolumeManager volumeManager;
-    private final QueryPipeline queryPipeline;
-    private final ExcaliburDBServer server;
+    /** The node this process serves: storage, pipelines, graphs and the unstarted server. */
+    private final NodeAssembly node;
     private final int port;
-    private final HnswConfigFactory hnswConfigFactory;
 
     /**
      * Security policy for the HTTP surface, resolved once from the properties file and
@@ -133,29 +100,7 @@ public final class ExcaliburApplication {
      */
     private final ApiSecurityConfig apiSecurity;
 
-    /**
-     * Document visibility tracker for atomic document-level visibility.
-     * Tracks when documents become fully visible to queries, ensuring no partial
-     * documents appear in query results.
-     */
-    private final DocumentVisibilityTracker documentVisibilityTracker;
-
-    /**
-     * Adapter that exposes DocumentVisibilityTracker as DocumentVisibilityChecker.
-     * Passed to the query pipeline for document atomicity filtering.
-     */
-    private final DocumentVisibilityChecker documentVisibilityChecker;
-
-    /**
-     * Metrics registry for JMX MBean management.
-     * All JMX MBeans are registered through this registry for observability.
-     */
-    private final MetricsRegistry metricsRegistry;
-
     private volatile boolean shutdownRequested = false;
-
-    /** Where segments, indexes and the lexical index live. */
-    private Path dataDirectory;
 
     /**
      * Main entry point.
@@ -341,25 +286,19 @@ public final class ExcaliburApplication {
         // Load configuration
         this.config = loadConfiguration(configSource);
 
-        // Initialize metrics registry and register JMX MBeans
-        // This enables observability for query latency, queue depth, coverage, etc.
-        this.metricsRegistry = new MetricsRegistry();
+        // Register the JMX MBeans: query latency, queue depth, coverage, epoch, throughput.
         try {
-            Metrics.registerAll(metricsRegistry);
+            Metrics.registerAll(new MetricsRegistry());
             LOGGER.info("JMX MBeans registered successfully");
         } catch (Exception e) {
             LOGGER.warn("Failed to register JMX MBeans: {}. Metrics will not be available via JMX.", e.getMessage());
         }
-        // Initialize health score and coverage to sensible defaults
-        Metrics.setHealthScore(0.5);
+        // Nothing has been measured as visible yet. The health score is the coverage (the epoch
+        // tick and the health endpoint both publish it), so it starts where coverage does and
+        // the node reads unhealthy until a measurement says otherwise.
         Metrics.setEstimatedCoverage(0.0);
+        Metrics.setHealthScore(0.0);
         Metrics.recordEpoch(0);
-
-        // Initialize HNSW config factory from ShardConfig settings
-        // This ensures property file values (efConstruction, efSearch) are used for HNSW graphs
-        this.hnswConfigFactory = HnswConfigFactory.fromShardConfig(config.shard());
-        LOGGER.info("HNSW config factory initialized: efConstruction={}, efSearch={}",
-            hnswConfigFactory.getEfConstruction(), hnswConfigFactory.getEfSearch());
 
         // Determine server port from config or use default
         this.port = determinePort();
@@ -379,45 +318,14 @@ public final class ExcaliburApplication {
 
         // Initialize data directory
         Path dataDir = initializeDataDirectory();
-        this.dataDirectory = dataDir;
 
-        // Build the storage stack: arena, storage engine with its HNSW initializer
-        // installed before start(), volume manager and index orchestrator.
-        CoreComponents core = CoreComponents.create(config, dataDir, hnswConfigFactory);
-        this.arena = core.arena();
-        this.storageEngine = core.storageEngine();
-        this.volumeManager = core.volumeManager();
-        this.indexOrchestrator = core.indexOrchestrator();
-
-        // Document visibility, on the node's own epoch clock. Built here rather than earlier
-        // because it needs the index orchestrator's visibility tracker: publishing a document
-        // on the same counter the query pipeline captures from is what lets the atomicity
-        // filter bound by the query's snapshot instead of only checking completeness.
-        // Persisted, because the registry is what says which documents this node holds and under
-        // which chunk ids. Lost on restart, every document reads as new to change detection - so a
-        // re-crawl reingests the whole corpus and tombstones none of the old chunks - and
-        // POST /v1/erasure can no longer name the chunks of anything ingested before the restart.
-        this.documentVisibilityTracker = new DocumentVisibilityTracker(
-            com.eonmux.excalibur.api.bootstrap.DocumentRegistryFactory.open(dataDir),
-            indexOrchestrator.getVisibilityTracker());
-        this.documentVisibilityChecker =
-            new DocumentVisibilityTrackerAdapter(documentVisibilityTracker);
-        LOGGER.info("Document visibility tracker initialized on the node epoch clock");
-
-        this.queryPipeline = QueryPipelineFactory.create(config, storageEngine, indexOrchestrator,
-            documentVisibilityChecker);
-
-        // The build side of the graph, per namespace. A node that never sees the namespace
-        // header runs with exactly one, called shared, which is the single-tenant arrangement.
-        this.graphTenants = openGraphTenants(dataDir);
-
-        // Create HTTP server
-        this.server = createServer();
-
-        // Configure the document reindexer. This runs after the server field is
-        // assigned: it wires the reindexer into the server, and doing it earlier
-        // dereferences a field that is still null.
-        configureReindexer();
+        // The node itself, assembled the one way both the server and the embedded facade use.
+        // It claims the directory before reading anything in it. The claim is never released:
+        // the operating system releases it when the process exits, and releasing it any earlier -
+        // after a shutdown that left a drain running, say - would let a second node in while this
+        // one could still be writing.
+        this.node = NodeAssembly.open(config, dataDir, apiSecurity, port,
+            NodeAssembly.SERVER_LOCK_HOLDER);
 
         LOGGER.info("ExcaliburApplication initialized successfully");
     }
@@ -517,172 +425,6 @@ public final class ExcaliburApplication {
 
 
     /**
-     * Configures the document reindexer for actual reindex operations.
-     *
-     * <p>Wiring order matters: this must run after {@code server} is assigned, because
-     * it hands the reindexer to the server. Running it from the middle of the
-     * constructor dereferences a field that is still null, and swallowing the
-     * resulting NullPointerException leaves reindexing permanently disabled with only
-     * a warning to show for it.</p>
-     *
-     * <h3>Domain Correctness</h3>
-     * <ul>
-     *   <li>Chunks are written through the storage engine's hash routing, so a
-     *       reindexed chunk stays reachable by key</li>
-     *   <li>Superseded chunks are tombstoned through the same routed delete</li>
-     *   <li>The lexical index is kept in step: reindexed chunks are indexed and retired
-     *       ones erased, so BM25 cannot answer with a document the corpus no longer has</li>
-     *   <li>Rolling replacement is enabled when a volume manager and a segment catalog
-     *       are available</li>
-     * </ul>
-     *
-     * @throws IllegalStateException if the reindexer cannot be constructed
-     */
-    private void configureReindexer() {
-        LOGGER.info("Configuring document reindexer...");
-
-        DocumentReindexer reindexer = ReindexerFactory.create(
-            config,
-            storageEngine,
-            volumeManager,
-            indexOrchestrator,
-            documentVisibilityTracker.getRegistry(),
-            chunkIndex
-        );
-
-        server.withReindexer(reindexer);
-        LOGGER.info("Document reindexer configured successfully");
-    }
-
-    /**
-     * Creates the HTTP server.
-     *
-     * <p>This method also wires the ingestion pipeline, enabling the /v1/ingest endpoint to
-     * trigger full document processing.</p>
-     *
-     * @return Initialized HTTP server
-     */
-    private ExcaliburDBServer createServer() {
-        LOGGER.info("Creating HTTP server on port {}...", port);
-
-        ExcaliburDBServer srv = new ExcaliburDBServer(
-            port,
-            ExcaliburDBServer.DEFAULT_BACKLOG,
-            indexOrchestrator,
-            storageEngine,
-            volumeManager,
-            config,
-            queryPipeline
-        );
-
-        // One resolution of the security policy for the whole process
-        srv.withSecurity(apiSecurity);
-
-        // Registrations are written down before the endpoints read them back, so a node that is
-        // restarted keeps crawling what it was asked to crawl. Fatal if the file exists and cannot
-        // be read: starting with an empty registry would silently cancel every source on it.
-        srv.withSourceCatalog(com.eonmux.excalibur.ingest.registry.SourceCatalog.open(dataDirectory));
-
-        // And how each of them was last crawled, so /v1/ingest/status after a restart reports
-        // that crawl rather than zeros. Never fatal: a history that cannot be read is logged and
-        // each source reports from its next run.
-        srv.withSourceStatus(
-            com.eonmux.excalibur.ingest.registry.SourceStatusFile.open(dataDirectory));
-
-        // This enables /v1/ingest to trigger full document processing: chunking, embedding, storage
-        attachIngestionPipeline(srv);
-
-        // Erasure, wired after the pipeline because it removes what the pipeline wrote and needs
-        // the chunk index the pipeline opened.
-        registerDocumentErasure(srv);
-
-        // The same registry the erasure service resolves documents through, read-only. It is
-        // the only thing that knows which documents this node holds, and every id an erasure
-        // request needs had to come from somewhere.
-        srv.withDocumentRegistry(documentVisibilityTracker.getRegistry());
-
-        // Both graph routes, whether or not a graph exists yet: a node that has ingested and not
-        // built needs the build route, and one that builds later must start answering without a
-        // restart.
-        srv.withGraphSupport(graphTenants);
-        LOGGER.info("Graph-RAG endpoints registered: /v1/graph/query, /v1/graph/build, "
-            + "/v1/graph/build/status, /v1/graph/erasure, /v1/graph/namespaces "
-            + "({} namespace(s) open)",
-            graphTenants.openCount());
-
-        LOGGER.info("HTTP server created");
-        return srv;
-    }
-
-    /**
-     * Attaches the ingestion half of the node and keeps hold of what it opened.
-     *
-     * <p>The chunk index and its erasure sweep are recorded on the application rather than left
-     * with the wiring because they outlive the attachment by the whole life of the process, and
-     * shutdown is the only thing that closes them. They are read again a few lines later, by the
-     * erasure service, which is why this runs before that one.</p>
-     *
-     * @param srv The server being built
-     */
-    private void attachIngestionPipeline(ExcaliburDBServer srv) {
-        IngestionWiring.Attachment ingestion = new IngestionWiring(config, dataDirectory,
-            storageEngine, indexOrchestrator, documentVisibilityTracker,
-            graphTenants).attachTo(srv);
-        this.chunkIndex = ingestion.chunkIndex();
-        this.lexicalErasureSweep = ingestion.lexicalErasureSweep();
-    }
-
-    /**
-     * Registers {@code POST /v1/erasure}, whether or not this node has a lexical index.
-     *
-     * <p>A node with no chunk index still has content in storage that someone can ask to have
-     * removed, so the route exists either way and the index is simply one more place the service
-     * reaches into when there is one. Removing a document is three removals rather than one: the
-     * text in storage, the terms in the lexical index, and the vectors - and without the last a
-     * vector query still ranks the erased document, with no text, because the payload comes from
-     * storage and storage no longer has it, but with its name and a distance, which is the fact
-     * the request asked to remove.</p>
-     *
-     * @param srv The server being built
-     */
-    private void registerDocumentErasure(ExcaliburDBServer srv) {
-        srv.withDocumentErasure(new com.eonmux.excalibur.ingest.erasure.DocumentErasureService(
-            documentVisibilityTracker.getRegistry(),
-            com.eonmux.excalibur.api.bootstrap.StorageChunkWriter.tombstoneAdapter(storageEngine),
-            this.chunkIndex,
-            com.eonmux.excalibur.ingest.lexical.StoredChunkText.of(storageEngine),
-            documentVisibilityTracker,
-            com.eonmux.excalibur.ingest.erasure.SegmentVectorEraser.of(storageEngine)));
-    }
-
-    /**
-     * Opens every namespace's graph, bounded by what this process may map.
-     *
-     * <p>Rooted at {@code excalibur.graph.path}, or the data directory when that is unset, with
-     * one subdirectory per namespace and the shared namespace being the one a node that never
-     * sees the header uses. The mapping budget is
-     * detected once and governs how many graphs stay open at a time: a served namespace costs
-     * dozens of mappings and a pair of descriptors, and a node with a graph per tenant will
-     * otherwise exhaust the process's supply of either at whatever unrelated allocation happens
-     * to come next.</p>
-     *
-     * @param dataDir The data directory
-     * @return The tenant registry
-     */
-    private com.eonmux.excalibur.api.bootstrap.GraphTenants openGraphTenants(Path dataDir) {
-        Path root = GraphRagFactory.tenantRootFor(config, dataDir);
-        try {
-            return new com.eonmux.excalibur.api.bootstrap.GraphTenants(
-                root, config,
-                com.eonmux.excalibur.tenancy.MappingBudget.detect(),
-                config.graph().getMaxOpenNamespaces());
-        } catch (IOException e) {
-            throw new IllegalStateException("Graph tenants under " + root
-                + " could not be opened: " + e.getMessage(), e);
-        }
-    }
-
-    /**
      * Runs the application.
      *
      * <p>This method starts all components and registers a shutdown hook
@@ -695,6 +437,7 @@ public final class ExcaliburApplication {
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "shutdown-hook"));
 
         // Start the HTTP server
+        ExcaliburDBServer server = node.server();
         server.start();
 
         LOGGER.info("========================================");
@@ -703,6 +446,7 @@ public final class ExcaliburApplication {
         // refuses the http URL, a node bound to one interface is not on localhost, and port 0
         // binds an ephemeral port the configuration never names.
         String baseUrl = server.baseUrl();
+        advertiseEndpoint(server);
         LOGGER.info("Listening on: {}", baseUrl);
         LOGGER.info("Health endpoint: {}/health", baseUrl);
         LOGGER.info("Stats endpoint: {}/v1/stats", baseUrl);
@@ -736,9 +480,7 @@ public final class ExcaliburApplication {
         // Ordering is a correctness property, not tidiness, and it is written down in
         // NodeShutdown next to the sequence that runs it: this method's job is only to make
         // sure it runs once, because run() is watching shutdownRequested to stop its own loop.
-        new NodeShutdown(server, indexOrchestrator, lexicalErasureSweep, chunkIndex,
-            documentVisibilityTracker, graphTenants, storageEngine, arena,
-            shutdownTimeout).run();
+        node.shutdown(shutdownTimeout).run();
     }
 
     /**
@@ -756,7 +498,7 @@ public final class ExcaliburApplication {
      * @return The storage engine
      */
     public StorageEngine getStorageEngine() {
-        return storageEngine;
+        return node.storageEngine();
     }
 
     /**
@@ -765,7 +507,7 @@ public final class ExcaliburApplication {
      * @return The index orchestrator
      */
     public IndexOrchestrator getIndexOrchestrator() {
-        return indexOrchestrator;
+        return node.indexOrchestrator();
     }
 
     /**
@@ -774,7 +516,7 @@ public final class ExcaliburApplication {
      * @return The HTTP server
      */
     public ExcaliburDBServer getServer() {
-        return server;
+        return node.server();
     }
 
     /**
@@ -799,7 +541,7 @@ public final class ExcaliburApplication {
      * @return The HNSW configuration factory
      */
     public HnswConfigFactory getHnswConfigFactory() {
-        return hnswConfigFactory;
+        return node.hnswConfigFactory();
     }
 
     /**
@@ -818,7 +560,7 @@ public final class ExcaliburApplication {
      * @return The document visibility tracker
      */
     public DocumentVisibilityTracker getDocumentVisibilityTracker() {
-        return documentVisibilityTracker;
+        return node.documentVisibilityTracker();
     }
 
     /**
@@ -830,25 +572,24 @@ public final class ExcaliburApplication {
      * @return The document visibility checker
      */
     public DocumentVisibilityChecker getDocumentVisibilityChecker() {
-        return documentVisibilityChecker;
+        return node.documentVisibilityChecker();
     }
 
     /**
-     * Gets the metrics registry for JMX MBean management.
+     * Records in the data directory's lock file where this node is listening.
      *
-     * <p>The metrics registry provides access to all registered JMX MBeans
-     * for observability and monitoring:</p>
-     * <ul>
-     *   <li>Query latency (p50, p90, p95, p99)</li>
-     *   <li>System health score</li>
-     *   <li>Ingestion queue depth</li>
-     *   <li>Visibility epoch</li>
-     *   <li>HNSW queue depth</li>
-     * </ul>
+     * <p>Read by the container's health check. A failure is logged rather than fatal: the node
+     * serves either way, and the health check reporting it unhealthy is what surfaces it.</p>
      *
-     * @return The metrics registry
+     * @param server The started server
      */
-    public MetricsRegistry getMetricsRegistry() {
-        return metricsRegistry;
+    private void advertiseEndpoint(ExcaliburDBServer server) {
+        try {
+            node.advertise(server.baseUrl(), server.livenessProbeUrl());
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("Could not record the listening address in {}: {}. A health check "
+                + "that reads it will report this node unhealthy.",
+                node.dataDirectory().resolve(DataDirectoryLock.FILE_NAME), e.toString());
+        }
     }
 }

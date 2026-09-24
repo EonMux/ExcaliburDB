@@ -69,13 +69,6 @@ class VisibilityEpochClockTest {
         }
 
         @Test
-        @DisplayName("the reindex registry is always on the node clock")
-        void registryIsOnTheNodeClock() {
-            // Its epochs come from DocumentBatchPublisher, which reads the node tracker.
-            assertThat(new DocumentVisibilityRegistry().sharesNodeEpochClock()).isTrue();
-        }
-
-        @Test
         @DisplayName("an implementation that says nothing is assumed not to share")
         void defaultIsConservative() {
             DocumentVisibilityChecker minimal = new DocumentVisibilityChecker() {

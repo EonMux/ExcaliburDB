@@ -50,9 +50,9 @@ import java.util.Optional;
  * <p>{@code excalibur-fsck}'s, through {@link FileInspector}, for everything else: the
  * write-ahead logs, whose records are replayed and their checksums compared; the routing
  * directory, whose trailing checksum is compared with every byte before it; the document
- * registry, the source catalog and the source status history, which are checked against the
- * header version, the record count and the checksum their readers require; the in-flight
- * ingest journal, whose every line carries its own checksum; the graph staging logs; the
+ * registry, the source catalog, the source status history and the erasure receipts, which are
+ * checked against the header version, the record count and the checksum their readers
+ * require; the in-flight ingest journal, whose every line carries its own checksum; the graph staging logs; the
  * native lexical store, which is checked as a whole by {@link #withLexicalStore} because its
  * manifest - verified against the checksum on its end line - the segments it names, the key
  * table and tombstones beside each, and its erasure log are one structure; and each tenant's

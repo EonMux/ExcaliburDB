@@ -162,6 +162,8 @@ public final class FsckOptionsParser {
               1  damage, or an inconsistency between files, was found
               2  the command line was wrong, or the directory is not there
               3  the check could not be performed
+              4  --repair was refused because a running node or another tool holds the
+                 directory; nothing was checked or changed
 
             A corrupt chunk-index/seg-N.keymap is reported and does not exit 1: the node
             rebuilds it from the segment's names the next time it opens the segment. A

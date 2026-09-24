@@ -34,7 +34,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * because those carry the same id and a withdrawal after them would take them too. Entity labels
  * stay: a label is a name other documents' facts may share. The served graph keeps what it was
  * built with until the next build, which replays staging and so no longer holds the earlier
- * version.</p>
+ * version. Nobody has to ask for that build: the withdrawal and the new facts are changes the
+ * staging store records as unpublished, and the node's automatic build publishes them once
+ * staging has been quiet for {@code excalibur.graph.auto-build-debounce-seconds}.</p>
  *
  * <p>A document removed outright is withdrawn the same way, with nothing staged after it.</p>
  *

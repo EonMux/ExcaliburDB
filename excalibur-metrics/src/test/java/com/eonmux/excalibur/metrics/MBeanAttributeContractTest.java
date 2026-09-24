@@ -56,7 +56,7 @@ class MBeanAttributeContractTest {
         Metrics.recordEpoch(9L);
         Metrics.recordHnswDepth(1234L);
         Metrics.recordTailScanMetrics(10, 4);
-        Metrics.recordIngestEntry();
+        Metrics.recordIngestEntries(1);
 
         for (DynamicMBean mbean : allMBeans()) {
             for (MBeanAttributeInfo info : mbean.getMBeanInfo().getAttributes()) {

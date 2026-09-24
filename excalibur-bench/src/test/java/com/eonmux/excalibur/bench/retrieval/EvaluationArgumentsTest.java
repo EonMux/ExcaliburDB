@@ -94,12 +94,12 @@ class EvaluationArgumentsTest {
             Map.of(EvaluationArguments.API_KEY_VARIABLE, "sk-test")).apiKey())
             .isEqualTo("sk-test");
         assertThat(EvaluationArguments.parse(args, Map.of()).apiKey())
-            .as("a local endpoint takes any key, and a node takes none as no model at all")
-            .isNotBlank();
+            .as("a local endpoint needs no key, and a node calls it without one")
+            .isEmpty();
         assertThat(EvaluationArguments.parse(args,
             Map.of(EvaluationArguments.API_KEY_VARIABLE, "  ")).apiKey())
             .as("a blank variable is a mis-set one, not a key")
-            .isNotBlank();
+            .isEmpty();
     }
 
     @Test

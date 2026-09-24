@@ -137,6 +137,13 @@ excalibur.graph.context-token-budget=2000
 # what it is given, so this is what lets an entity that term overlap ranked poorly be rescued by
 # its vector. Each extra candidate is one more full-precision vector read.
 excalibur.graph.rerank-over-fetch=4
+# How wide one graph walk may grow. max-frontier is the most new entities one hop admits: past it,
+# the ones reached along the strongest edges are kept (extraction confidence, then the later
+# valid-time start, then the lower entity id), so a hub with thousands of neighbours costs what
+# a thousand do. max-walk-facts is the most facts one walk collects, those touching the entities
+# the question named kept first. An answer a cap cut short says so in its "walk" object.
+excalibur.graph.max-frontier=1000
+excalibur.graph.max-walk-facts=10000
 # Abstention thresholds. Below these the endpoint declines rather than answering from evidence
 # it does not trust -- an empty "answered" reads to a client as "nothing found", which is a
 # different statement from "found something and did not believe it".
@@ -215,6 +222,27 @@ excalibur.graph.erasure-tombstone-ratio=0.2
 # Checked every tenth of this by a sweep over the open namespaces, so an obligation submitted to
 # a node that then goes quiet is still discharged on time.
 excalibur.graph.erasure-max-latency-seconds=3600
+
+# Automatic builds. Ingestion stages every change - a new document's facts, and the withdrawal of
+# a replaced or removed one's - but /v1/graph/query answers from the graph the last build
+# published. Every interval the node rebuilds each namespace whose graph is behind its staging,
+# once staging has been quiet for the debounce (so a crawl is one build, not one per document) or
+# once its oldest unpublished change has waited the maximum delay (so ingestion that never pauses
+# cannot hold the graph back). Off, a graph changes only when POST /v1/graph/build asks.
+# Automatic builds pause while extraction is asked for without an API key or could not be wired:
+# a build then would publish withdrawals with nothing to replace them.
+excalibur.graph.auto-build-enabled=true
+excalibur.graph.auto-build-interval-seconds=30
+excalibur.graph.auto-build-debounce-seconds=60
+excalibur.graph.auto-build-max-delay-seconds=900
+# Most automatic builds at once across the node; each saturates the disk and the embedding
+# endpoint. A namespace is never built twice at once, and one an explicit build is running for is
+# left to it.
+excalibur.graph.auto-build-max-concurrent=1
+# After a failed automatic build a namespace waits this long, doubling with each further failure
+# up to the maximum.
+excalibur.graph.auto-build-failure-backoff-seconds=60
+excalibur.graph.auto-build-max-failure-backoff-seconds=3600
 
 # Ingest Target Allow-Lists
 # Empty means DISABLED, not unrestricted. Filesystem ingest may only read inside these
@@ -340,15 +368,31 @@ excalibur.query.per-signal-over-fetch=3
 # /v1/chat/completions), so a trailing /v1 here is stripped rather than duplicated -- both
 # https://api.openai.com and https://api.openai.com/v1 work. Point it at any OpenAI-compatible
 # endpoint: Ollama (http://localhost:11434), vLLM, TGI, LiteLLM.
+# Only the hosted default needs a key. A role left on it with no key is off (the startup log says
+# so and how to fix it); any other server is called without one, and one that does want a key
+# answers 401, which is logged naming the setting to fix.
 excalibur.llm.base-url=https://api.openai.com/v1
 # Never set the api key here. Supply it as the EXCALIBUR_LLM_API_KEY environment variable,
 # so it cannot be committed or read out of the working directory.
 #excalibur.llm.api-key=
+# The chat and embedding endpoints can live on different servers. Each role's own base URL and
+# key win; left unset they fall back to the two settings above, so a file that names only those
+# means what it always did. Keys again belong in the environment:
+# EXCALIBUR_LLM_CHAT_API_KEY / EXCALIBUR_LLM_EMBEDDING_API_KEY.
+# Chat: relevancy scoring, query expansion, relation extraction, the graph rerank.
+#excalibur.llm.chat-base-url=
+#excalibur.llm.chat-api-key=
+# Whether chat calls are made at all. False keeps the embedding pass and drops every chat call.
+excalibur.llm.chat-enabled=true
+# Embedding: the corpus, each query, graph entities. A local embedding server beside a hosted chat
+# model, for instance -- set the key per role then, so it is never sent to the local box:
+#excalibur.llm.embedding-base-url=http://localhost:11434
+#excalibur.llm.embedding-api-key=
 excalibur.llm.chat-model=gpt-4o-mini
 excalibur.llm.embedding-model=text-embedding-3-small
 excalibur.llm.embeddings-dimensions=1536
-# Whether a configured key is spent on embedding the corpus. Turning it off keeps the chat model
-# and drops the embedding pass: documents are chunked, stored and term-indexed, and /v1/query
+# Whether embedding calls are made at all. Turning it off keeps the chat model and drops the
+# embedding pass: documents are chunked, stored and term-indexed, and /v1/query
 # answers from BM25 with the model spent on expanding the query. Worth it for a corpus of
 # identifiers, error codes or DOIs, where the literal token is the match.
 excalibur.llm.embeddings-enabled=true

@@ -30,23 +30,17 @@ dependencies {
 
 // The embedded example in USAGE.md, compiled and run from an embedder's position.
 //
-// USAGE.md tells an embedder that the seven coordinates it lists are the dependencies the
-// example needs. Inside `test` that claim is unverifiable: this module depends on every library
-// module and on the server, so the example would compile here whatever those seven expose. This
-// source set sees only the seven, through the same variants a consumer of the published POMs
-// resolves - each module's `api` dependencies at compile time, its `implementation` ones at run
-// time - so a type the example needs that none of them hands on fails this compile first.
+// USAGE.md tells an embedder that the one coordinate it lists is the dependency the example
+// needs. Inside `test` that claim is unverifiable: this module depends on every library module
+// directly, so the example would compile here whatever excalibur-api exposes. This source set
+// sees only excalibur-api, through the same variants a consumer of the published POM resolves -
+// its `api` dependencies at compile time, its `implementation` ones at run time - so a type the
+// example needs that excalibur-api does not hand on fails this compile first.
 val embeddedExample: SourceSet by sourceSets.creating
 
 dependencies {
     // Exactly the block USAGE.md shows; a change to one is a change to the other.
-    "embeddedExampleImplementation"(project(":excalibur-core"))
-    "embeddedExampleImplementation"(project(":excalibur-store"))
-    "embeddedExampleImplementation"(project(":excalibur-vector"))
-    "embeddedExampleImplementation"(project(":excalibur-shard"))
-    "embeddedExampleImplementation"(project(":excalibur-llm"))
-    "embeddedExampleImplementation"(project(":excalibur-ingest"))
-    "embeddedExampleImplementation"(project(":excalibur-query"))
+    "embeddedExampleImplementation"(project(":excalibur-api"))
 
     "embeddedExampleImplementation"("org.junit.jupiter:junit-jupiter:5.11.3")
     "embeddedExampleImplementation"("org.assertj:assertj-core:3.26.3")

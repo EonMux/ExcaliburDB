@@ -350,33 +350,6 @@ public final class QueryRequest {
         return requireNamedResults;
     }
 
-    // ==================== Conversion ====================
-
-    /**
-     * Converts this request to QueryOptions, timeout and all.
-     *
-     * <p>Not what the pipeline uses, and deliberately so. The timeout carried here is the
-     * request's whole budget, measured from before stage 0; a segment fan-out given that budget
-     * outlives the pipeline's own deadline, so the pipeline is abandoned first and every segment
-     * that did answer in time is discarded - a partial result turned into an empty one. The
-     * pipeline therefore builds its own options against what is left of the deadline, less the
-     * share the merge needs.</p>
-     *
-     * <p>For a caller running a single search outside the pipeline, where the request's budget
-     * is the only budget there is.</p>
-     *
-     * @return QueryOptions with equivalent settings
-     */
-    public QueryOptions toQueryOptions() {
-        return QueryOptions.builder()
-            .topK(topK)
-            .threshold(threshold)
-            .includePartialSegments(includePartialSegments)
-            .timeout(timeout())
-            .oversamplingFactor(oversamplingFactor)
-            .build();
-    }
-
     // ==================== Object Methods ====================
 
     @Override

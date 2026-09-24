@@ -7,10 +7,15 @@ import com.eonmux.excalibur.store.WriteLog;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.lang.foreign.Arena;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Objects;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -79,6 +84,44 @@ class StorageChunkWriterTest {
 
             assertThat(first).isNotNegative();
             assertThat(second).isGreaterThan(first);
+        }
+    }
+
+    @Nested
+    @DisplayName("Durability")
+    class Durability {
+
+        /**
+         * Atomic publication advances the visibility epoch without syncing anything, on the
+         * strength of this: the write has been appended to the segment's write-ahead log and
+         * forced to the device by the time the writer returns. The log advances its head only
+         * after its fsync has returned, so a head that already covers the record is the proof.
+         */
+        @Test
+        @DisplayName("returns only once the chunk's record is in the write-ahead log")
+        void writeIsLoggedBeforeReturning(@TempDir Path tempDir) throws Exception {
+            try (Arena arena = Arena.ofShared();
+                 StorageEngine engine = new StorageEngine(tempDir, arena)) {
+                engine.start();
+                StorageChunkWriter writer = new StorageChunkWriter(engine);
+
+                long offset = writer.writeChunkWithOffset("doc-1:chunk:0", "hello", EMBEDDING);
+
+                List<WriteLog> logged = engine.getSegments().values().stream()
+                    .map(Segment::writeLog)
+                    .filter(Objects::nonNull)
+                    .filter(log -> log.entriesAppended() > 0)
+                    .distinct()
+                    .toList();
+                assertThat(logged)
+                    .as("exactly one segment took the write, and it has a write log")
+                    .hasSize(1);
+                assertThat(logged.get(0).entriesAppended()).isEqualTo(1L);
+                assertThat(offset)
+                    .as("the offset reported is the log head just past the durable record")
+                    .isEqualTo(logged.get(0).writeOffset())
+                    .isPositive();
+            }
         }
     }
 

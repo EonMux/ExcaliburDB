@@ -403,32 +403,6 @@ public final class DocumentRegistry {
     }
 
     /**
-     * Removes all documents for a specific source.
-     *
-     * @param sourceId The source identifier
-     * @return The number of documents removed
-     * @throws NullPointerException if sourceId is null
-     */
-    public int removeBySource(String sourceId) {
-        Objects.requireNonNull(sourceId, "sourceId must not be null");
-        String prefix = sourceId + KEY_SEPARATOR;
-        
-        int removed = 0;
-        for (String key : documents.keySet()) {
-            if (key.startsWith(prefix)) {
-                documents.remove(key);
-                removed++;
-            }
-        }
-        
-        if (removed > 0) {
-            version.incrementAndGet();
-        }
-        
-        return removed;
-    }
-
-    /**
      * Returns all document IDs for a specific source.
      *
      * @param sourceId The source identifier

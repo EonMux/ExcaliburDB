@@ -1,6 +1,9 @@
 package com.eonmux.excalibur.store;
 
 import com.eonmux.excalibur.core.codec.ChunkPayloadCodec;
+import com.eonmux.excalibur.store.format.UnsupportedWriteLogFormatException;
+import com.eonmux.excalibur.store.format.WriteLogFormat;
+import com.eonmux.excalibur.store.format.WriteLogHeader;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -95,6 +98,33 @@ class EngineStartRecoveryTest {
         } finally {
             engine.close();
         }
+    }
+
+    @Test
+    @DisplayName("a write-ahead log a newer build wrote refuses the start and is left untouched")
+    void aNewerLogRefusesTheStart() throws IOException {
+        Path dataDir = Files.createDirectories(tempDir.resolve("newer-log"));
+        try (StorageEngine engine = new StorageEngine(dataDir)) {
+            engine.start();
+            engine.put(key("a"), chunk("alpha"));
+        }
+        Path log = largestFile(dataDir, ".wal");
+        try (RandomAccessFile raf = new RandomAccessFile(log.toFile(), "rw")) {
+            raf.write(WriteLogHeader.encode(WriteLogFormat.CURRENT.version() + 1));
+        }
+        byte[] before = Files.readAllBytes(log);
+
+        StorageEngine engine = new StorageEngine(dataDir);
+        try {
+            assertThatThrownBy(engine::start)
+                .hasRootCauseInstanceOf(UnsupportedWriteLogFormatException.class);
+            assertThat(engine.getSegments()).isEmpty();
+        } finally {
+            engine.close();
+        }
+        assertThat(Files.readAllBytes(log))
+            .as("not replayed, not truncated, not given a header of this build's")
+            .isEqualTo(before);
     }
 
     @Test

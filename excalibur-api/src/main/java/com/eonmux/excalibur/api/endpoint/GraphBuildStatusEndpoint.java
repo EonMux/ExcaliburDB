@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphBuildService;
 import com.eonmux.excalibur.api.bootstrap.GraphExtraction;
+import com.eonmux.excalibur.api.bootstrap.GraphFreshness;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
@@ -45,7 +46,21 @@ import java.util.Optional;
  *   "relations": 47,
  *   "entities_with_text": 3180,
  *   "entities_with_vectors": 3180,
- *   "staged_facts": 12840
+ *   "staged_facts": 12840,
+ *   "retired": false,
+ *   "freshness": {
+ *     "behind_staging": true,
+ *     "staged_changes_since_ms": 1736899500000,
+ *     "last_staged_change_ms": 1736899530000,
+ *     "withheld": false
+ *   },
+ *   "automatic": {
+ *     "enabled": true,
+ *     "state": "pending",
+ *     "debounce_seconds": 60,
+ *     "max_delay_seconds": 900,
+ *     "consecutive_failures": 0
+ *   }
  * }
  * }</pre>
  *
@@ -60,8 +75,35 @@ import java.util.Optional;
  * {@code message} saying why nothing was staged, read from {@code extraction} - the same field
  * {@code POST /v1/graph/build} answers with, present on every status: {@code active},
  * {@code disabled}, or - each with a {@code warning} - {@code missing_api_key} when extraction was
- * asked for and no LLM API key is configured, and {@code unavailable} when it has a key but the
- * ingestion pipeline could not be set up.</p>
+ * asked for and the chat endpoint is the hosted default with no key, {@code chat_disabled} when
+ * {@code excalibur.llm.chat-enabled} is false, and {@code unavailable} when a chat model is
+ * configured but the ingestion pipeline could not be set up.</p>
+ *
+ * <p>A build that finds every staged fact withdrawn - each document the graph was built from
+ * replaced by nothing or removed - reports {@code "retired": true}: the namespace stops serving
+ * the graph those facts built, since serving it would go on answering with documents that are
+ * gone.</p>
+ *
+ * <h2>Whether the graph is current</h2>
+ * <p>{@code freshness} says whether the served graph is behind what the namespace has staged:
+ * {@code behind_staging} is true from the first change ingestion stages after a build - a new
+ * document's facts, or a replaced or removed one's withdrawal - until a build publishes it.
+ * {@code staged_changes_since_ms} is when the oldest unpublished change was made and
+ * {@code last_staged_change_ms} the newest, each present when known. {@code withheld} is true
+ * while the graph is withheld until an interrupted erasure is applied. When freshness cannot be
+ * read, the block carries an {@code error} instead.</p>
+ *
+ * <p>{@code automatic} is what the node does about it by itself. {@code state} is
+ * {@code disabled} when {@code excalibur.graph.auto-build-enabled} is off; {@code paused}, with
+ * {@code paused_reason}, while extraction is {@code missing_api_key} or {@code unavailable};
+ * {@code current}; {@code pending} while the graph is behind and waits for staging to be quiet
+ * for {@code debounce_seconds} or for its oldest change to reach {@code max_delay_seconds};
+ * {@code running}; {@code backing_off} after a failed automatic build, until
+ * {@code next_attempt_at_ms}; and {@code withheld}. {@code last_started_at_ms},
+ * {@code last_finished_at_ms}, {@code last_result} ({@code completed}, {@code unchanged},
+ * {@code failed} or {@code cancelled}) and {@code last_error} describe the last automatic build
+ * of the namespace, and {@code consecutive_failures} how many in a row have failed. The
+ * top-level fields describe the last build asked for through {@code POST /v1/graph/build}.</p>
  *
  * <p>A cancelled build reports {@code "published": false} for a different reason: it stopped
  * before the rename that would have published it. There is no partial graph to describe,
@@ -77,15 +119,19 @@ import java.util.Optional;
 public final class GraphBuildStatusEndpoint implements HttpHandler {
 
     private final GraphBuildRunner runner;
+    private final GraphAutoBuilder autoBuilder;
 
     /**
-     * Creates the endpoint over a runner.
+     * Creates the endpoint over a runner and the automatic build beside it.
      *
-     * @param runner The runner holding the current and last build of each namespace
-     * @throws NullPointerException if runner is null
+     * @param runner      The runner holding the current and last build of each namespace
+     * @param autoBuilder The automatic build, which says whether each graph is behind its
+     *                    staging and what it last did about it
+     * @throws NullPointerException if either is null
      */
-    public GraphBuildStatusEndpoint(GraphBuildRunner runner) {
+    public GraphBuildStatusEndpoint(GraphBuildRunner runner, GraphAutoBuilder autoBuilder) {
         this.runner = Objects.requireNonNull(runner, "runner cannot be null");
+        this.autoBuilder = Objects.requireNonNull(autoBuilder, "autoBuilder cannot be null");
     }
 
     @Override
@@ -105,29 +151,86 @@ public final class GraphBuildStatusEndpoint implements HttpHandler {
             return;
         }
 
-        ResponseBody.sendJson(exchange, 200,
-            render(runner.snapshot(namespace), runner.extraction()));
+        StringBuilder json = new StringBuilder(720);
+        appendBuild(json, runner.snapshot(namespace), runner.extraction());
+        appendAutomatic(json, autoBuilder.status(namespace));
+        ResponseBody.sendJson(exchange, 200, json.append('}').toString());
     }
 
     /**
-     * Renders a snapshot as the response body.
+     * Appends whether the namespace's graph is behind its staging and what the automatic build
+     * is doing about it.
      *
+     * @param json   The body being built; left without its closing brace
+     * @param status What the automatic build has to say about the namespace
+     */
+    private static void appendAutomatic(StringBuilder json, GraphAutoBuilder.Status status) {
+        json.append(", \"freshness\": {");
+        GraphFreshness freshness = status.freshness();
+        if (freshness == null) {
+            json.append("\"error\": \"").append(JsonText.escape(status.freshnessError()))
+                .append('"');
+        } else {
+            json.append("\"behind_staging\": ").append(freshness.behind());
+            freshness.pendingSince().ifPresent(since ->
+                json.append(", \"staged_changes_since_ms\": ").append(since.toEpochMilli()));
+            freshness.lastChangedAt().ifPresent(last ->
+                json.append(", \"last_staged_change_ms\": ").append(last.toEpochMilli()));
+            json.append(", \"withheld\": ").append(freshness.withheld());
+        }
+        json.append('}');
+
+        GraphAutoBuilder.Memory memory = status.memory();
+        json.append(", \"automatic\": {\"enabled\": ").append(status.enabled())
+            .append(", \"state\": \"").append(status.state()).append('"');
+        status.pausedBy().ifPresent(paused -> json.append(", \"paused_reason\": \"")
+            .append(paused.wireName()).append('"'));
+        json.append(", \"debounce_seconds\": ")
+            .append(status.settings().debounce().toSeconds())
+            .append(", \"max_delay_seconds\": ")
+            .append(status.settings().maxDelay().toSeconds());
+        if (memory.lastStartedAtMs() > 0) {
+            json.append(", \"last_started_at_ms\": ").append(memory.lastStartedAtMs());
+        }
+        if (memory.lastFinishedAtMs() > 0) {
+            json.append(", \"last_finished_at_ms\": ").append(memory.lastFinishedAtMs());
+        }
+        if (memory.lastResult() != null) {
+            json.append(", \"last_result\": \"").append(memory.lastResult()).append('"');
+        }
+        if (memory.lastError() != null) {
+            json.append(", \"last_error\": \"").append(JsonText.escape(memory.lastError()))
+                .append('"');
+        }
+        json.append(", \"consecutive_failures\": ").append(memory.consecutiveFailures());
+        if (memory.retryAtMs() > 0) {
+            json.append(", \"next_attempt_at_ms\": ").append(memory.retryAtMs());
+        }
+        json.append('}');
+    }
+
+
+    /**
+     * Opens the response body with what the last explicit build did.
+     *
+     * @param json       The body being built; left without its closing brace
      * @param snapshot   What the runner has to say about the namespace
      * @param extraction Whether ingestion on this node extracts facts, if it says
-     * @return The JSON body
      */
-    private static String render(GraphBuildRunner.Snapshot snapshot,
-                                 Optional<GraphExtraction> extraction) {
-        StringBuilder json = new StringBuilder(320);
+    private static void appendBuild(StringBuilder json, GraphBuildRunner.Snapshot snapshot,
+                                    Optional<GraphExtraction> extraction) {
         json.append("{\"state\": \"").append(JsonText.escape(snapshot.state()))
             .append("\", \"namespace\": \"")
             .append(JsonText.escape(snapshot.namespace().value())).append('"');
         GraphBuildEndpoint.appendExtraction(json, extraction);
         if (GraphBuildRunner.STATE_IDLE.equals(snapshot.state())) {
-            return json.append('}').toString();
+            return;
         }
         GraphBuildService.BuildOutcome outcome = snapshot.outcome();
-        if (outcome != null && !outcome.published() && outcome.staged() == 0) {
+        if (outcome != null && outcome.retired()) {
+            json.append(", \"message\": \"Every staged fact has been withdrawn, so this "
+                + "namespace no longer serves the graph they built\"");
+        } else if (outcome != null && !outcome.published() && outcome.staged() == 0) {
             // The outcome a caller most needs explained: a completed build that changed nothing.
             json.append(", \"message\": \"").append(JsonText.escape(nothingStaged(extraction)))
                 .append('"');
@@ -144,7 +247,6 @@ public final class GraphBuildStatusEndpoint implements HttpHandler {
             json.append(", \"error\": \"").append(JsonText.escape(snapshot.error())).append('"');
         }
         appendCounts(json, snapshot.outcome());
-        return json.append('}').toString();
     }
 
     /**
@@ -177,6 +279,7 @@ public final class GraphBuildStatusEndpoint implements HttpHandler {
             .append(", \"relations\": ").append(outcome.relations())
             .append(", \"entities_with_text\": ").append(outcome.indexed())
             .append(", \"entities_with_vectors\": ").append(outcome.embedded())
-            .append(", \"staged_facts\": ").append(outcome.staged());
+            .append(", \"staged_facts\": ").append(outcome.staged())
+            .append(", \"retired\": ").append(outcome.retired());
     }
 }

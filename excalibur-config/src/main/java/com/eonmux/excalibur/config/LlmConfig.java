@@ -8,13 +8,25 @@ import java.util.Objects;
  *
  * <p>This class is IMMUTABLE and thread-safe.</p>
  *
+ * <h2>Two endpoints</h2>
+ * <p>Chat and embedding calls are resolved as separate {@link LlmEndpoint}s, each with its own
+ * base URL, key and enabled flag. A role's own base URL or key wins; left unset (or blank) it
+ * falls back to the shared {@code excalibur.llm.base-url} / {@code excalibur.llm.api-key}. A role
+ * is used when its flag is on and it either has a key or names a server other than the hosted
+ * default - see {@link LlmEndpoint} for why a key is not what decides it.</p>
+ *
  * <h2>Configuration Properties</h2>
  * <ul>
- *   <li><code>excalibur.llm.base-url</code> - Base URL for the LLM API (default: OpenAI)</li>
- *   <li><code>excalibur.llm.api-key</code> - API key for authentication (default: empty)</li>
+ *   <li><code>excalibur.llm.base-url</code> - Base URL both roles fall back to (default: OpenAI)</li>
+ *   <li><code>excalibur.llm.api-key</code> - API key both roles fall back to (default: empty)</li>
+ *   <li><code>excalibur.llm.chat-base-url</code> - Base URL for chat calls (default: the shared one)</li>
+ *   <li><code>excalibur.llm.chat-api-key</code> - API key for chat calls (default: the shared one)</li>
+ *   <li><code>excalibur.llm.chat-enabled</code> - Whether chat calls are made at all (default: true)</li>
+ *   <li><code>excalibur.llm.embedding-base-url</code> - Base URL for embedding calls (default: the shared one)</li>
+ *   <li><code>excalibur.llm.embedding-api-key</code> - API key for embedding calls (default: the shared one)</li>
  *   <li><code>excalibur.llm.chat-model</code> - Model for chat completions (default: gpt-4o-mini)</li>
  *   <li><code>excalibur.llm.embedding-model</code> - Model for embeddings (default: text-embedding-3-small)</li>
- *   <li><code>excalibur.llm.embeddings-enabled</code> - Whether the corpus and queries are embedded (default: true)</li>
+ *   <li><code>excalibur.llm.embeddings-enabled</code> - Whether embedding calls are made at all (default: true)</li>
  *   <li><code>excalibur.llm.embeddings-dimensions</code> - Embedding vector dimensions (default: 1536)</li>
  *   <li><code>excalibur.llm.timeout-ms</code> - HTTP request timeout (default: 60000)</li>
  *   <li><code>excalibur.llm.max-retries</code> - Maximum retry attempts (default: 3)</li>
@@ -43,11 +55,15 @@ public final class LlmConfig {
     // Default embeddings dimensions
     public static final int DEFAULT_EMBEDDINGS_DIMENSIONS = 1536;
 
-    // Whether a configured key is spent on embedding the corpus. On by default: a key is
-    // normally set because vector retrieval is wanted. Turning it off keeps the chat model
-    // and drops the embedding pass, which is the lexical-only deployment - BM25 over the
-    // chunks with the model spent on expanding the query instead.
+    // Whether a reachable embedding endpoint is spent on embedding the corpus. On by default:
+    // an endpoint is normally configured because vector retrieval is wanted. Turning it off
+    // keeps the chat model and drops the embedding pass, which is the lexical-only deployment -
+    // BM25 over the chunks with the model spent on expanding the query instead.
     public static final boolean DEFAULT_EMBEDDINGS_ENABLED = true;
+
+    // Whether a reachable chat endpoint is called. On by default for the same reason; off keeps
+    // the embedding pass and drops every chat call - scoring, expansion, extraction, rerank.
+    public static final boolean DEFAULT_CHAT_ENABLED = true;
 
     // Default timeout in milliseconds
     public static final int DEFAULT_TIMEOUT_MS = 60000;
@@ -96,6 +112,11 @@ public final class LlmConfig {
     // All fields final for immutability
     private final String baseUrl;
     private final String apiKey;
+    private final String chatBaseUrl;
+    private final String chatApiKey;
+    private final boolean chatEnabled;
+    private final String embeddingBaseUrl;
+    private final String embeddingApiKey;
     private final String chatModel;
     private final String embeddingModel;
     private final int embeddingsDimensions;
@@ -117,6 +138,11 @@ public final class LlmConfig {
     public LlmConfig(Map<String, String> props) {
         this.baseUrl = PropertyParser.parseString(props, "excalibur.llm.base-url", DEFAULT_BASE_URL);
         this.apiKey = PropertyParser.parseString(props, "excalibur.llm.api-key", DEFAULT_API_KEY);
+        this.chatBaseUrl = PropertyParser.parseString(props, "excalibur.llm.chat-base-url", "");
+        this.chatApiKey = PropertyParser.parseString(props, "excalibur.llm.chat-api-key", "");
+        this.chatEnabled = PropertyParser.parseBoolean(props, "excalibur.llm.chat-enabled", DEFAULT_CHAT_ENABLED);
+        this.embeddingBaseUrl = PropertyParser.parseString(props, "excalibur.llm.embedding-base-url", "");
+        this.embeddingApiKey = PropertyParser.parseString(props, "excalibur.llm.embedding-api-key", "");
         this.chatModel = PropertyParser.parseString(props, "excalibur.llm.chat-model", DEFAULT_CHAT_MODEL);
         this.embeddingModel = PropertyParser.parseString(props, "excalibur.llm.embedding-model", DEFAULT_EMBEDDING_MODEL);
         this.embeddingsDimensions = PropertyParser.parseInt(props, "excalibur.llm.embeddings-dimensions", DEFAULT_EMBEDDINGS_DIMENSIONS);
@@ -132,17 +158,62 @@ public final class LlmConfig {
     }
 
     /**
-     * Gets the base URL.
+     * Gets the shared base URL both endpoints fall back to.
+     *
+     * <p>What a client calls is {@link #chatEndpoint()} or {@link #embeddingEndpoint()}, never
+     * this directly: either role may have been pointed somewhere else.</p>
      */
     public String getBaseUrl() {
         return baseUrl;
     }
 
     /**
-     * Gets the API key.
+     * Gets the shared API key both endpoints fall back to.
      */
     public String getApiKey() {
         return apiKey;
+    }
+
+    /**
+     * The endpoint chat calls go to: relevancy scoring, query expansion, relation extraction
+     * and the graph rerank.
+     *
+     * @return The resolved chat endpoint
+     */
+    public LlmEndpoint chatEndpoint() {
+        return new LlmEndpoint(LlmEndpoint.Role.CHAT, orShared(chatBaseUrl, baseUrl),
+            orShared(chatApiKey, apiKey), chatEnabled);
+    }
+
+    /**
+     * The endpoint embedding calls go to: the corpus, each query and the graph's entities.
+     *
+     * @return The resolved embedding endpoint
+     */
+    public LlmEndpoint embeddingEndpoint() {
+        return new LlmEndpoint(LlmEndpoint.Role.EMBEDDING, orShared(embeddingBaseUrl, baseUrl),
+            orShared(embeddingApiKey, apiKey), embeddingsEnabled);
+    }
+
+    /**
+     * A role's own setting, or the shared one when the role's is unset or blank.
+     *
+     * @param own    The role's setting
+     * @param shared The shared setting
+     * @return The value the role uses
+     */
+    private static String orShared(String own, String shared) {
+        return own == null || own.isBlank() ? shared : own.trim();
+    }
+
+    /**
+     * Whether chat calls may be made. Only a switch: {@link #chatEndpoint()} decides whether
+     * they actually are.
+     *
+     * @return false if {@code excalibur.llm.chat-enabled} turned chat off
+     */
+    public boolean isChatEnabled() {
+        return chatEnabled;
     }
 
     /**
@@ -160,13 +231,13 @@ public final class LlmConfig {
     }
 
     /**
-     * Whether this node embeds its corpus and its queries.
+     * Whether embedding calls may be made. Only a switch: {@link #embeddingEndpoint()} decides
+     * whether they actually are.
      *
-     * <p>False leaves the key configured and the chat model reachable while producing no
-     * vectors, so retrieval is BM25 over the chunk index with the query expanded by the
-     * chat model. Meaningless without a key: nothing is embedded either way.</p>
+     * <p>False leaves the chat model reachable while producing no vectors, so retrieval is BM25
+     * over the chunk index with the query expanded by the chat model.</p>
      *
-     * @return true if documents and query text are embedded
+     * @return false if {@code excalibur.llm.embeddings-enabled} turned embedding off
      */
     public boolean isEmbeddingsEnabled() {
         return embeddingsEnabled;
@@ -244,7 +315,10 @@ public final class LlmConfig {
 
     @Override
     public String toString() {
-        return "Llm{baseUrl='" + baseUrl + "', apiKey='***', chatModel='" + chatModel +
+        return "Llm{baseUrl='" + baseUrl + "', apiKey='***', chatBaseUrl='" + chatBaseUrl +
+               "', chatApiKey='***', chatEnabled=" + chatEnabled +
+               ", embeddingBaseUrl='" + embeddingBaseUrl + "', embeddingApiKey='***'" +
+               ", embeddingsEnabled=" + embeddingsEnabled + ", chatModel='" + chatModel +
                "', embeddingModel='" + embeddingModel + "', embeddingsDimensions=" + embeddingsDimensions +
                ", timeoutMs=" + timeoutMs + ", maxRetries=" + maxRetries +
                ", failureThreshold=" + failureThreshold + ", cooldownPeriodMs=" + cooldownPeriodMs +
@@ -263,6 +337,7 @@ public final class LlmConfig {
         LlmConfig other = (LlmConfig) o;
         return embeddingsDimensions == other.embeddingsDimensions
             && embeddingsEnabled == other.embeddingsEnabled
+            && chatEnabled == other.chatEnabled
             && timeoutMs == other.timeoutMs
             && maxRetries == other.maxRetries
             && failureThreshold == other.failureThreshold
@@ -273,13 +348,18 @@ public final class LlmConfig {
             && retryBaseDelayMs == other.retryBaseDelayMs
             && Objects.equals(baseUrl, other.baseUrl)
             && Objects.equals(apiKey, other.apiKey)
+            && Objects.equals(chatBaseUrl, other.chatBaseUrl)
+            && Objects.equals(chatApiKey, other.chatApiKey)
+            && Objects.equals(embeddingBaseUrl, other.embeddingBaseUrl)
+            && Objects.equals(embeddingApiKey, other.embeddingApiKey)
             && Objects.equals(chatModel, other.chatModel)
             && Objects.equals(embeddingModel, other.embeddingModel);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(baseUrl, apiKey, chatModel, embeddingModel, embeddingsDimensions,
+        return Objects.hash(baseUrl, apiKey, chatBaseUrl, chatApiKey, chatEnabled,
+            embeddingBaseUrl, embeddingApiKey, chatModel, embeddingModel, embeddingsDimensions,
             embeddingsEnabled, timeoutMs, maxRetries, failureThreshold, cooldownPeriodMs,
             maxPromptsPerQuery, relevancyThreshold, maxBatchTokens, retryBaseDelayMs);
     }

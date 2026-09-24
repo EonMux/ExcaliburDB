@@ -18,8 +18,11 @@ import java.util.Set;
  * <h2>Upsert Logic</h2>
  * <p>On re-crawl, this handler processes:
  * <ul>
- *   <li><strong>Changed documents:</strong> Tombstone old chunks, re-chunk, re-embed, upsert new chunks</li>
- *   <li><strong>Deleted documents:</strong> Tombstone all chunks, remove the registry entry</li>
+ *   <li><strong>Changed documents:</strong> once the new version is published under the same
+ *       deterministic chunk ids, tombstone only the old chunks it did not overwrite
+ *       ({@link #tombstoneObsoleteChunks(List, Collection)})</li>
+ *   <li><strong>Deleted documents:</strong> Tombstone all chunks, remove the registry entry
+ *       ({@link #removeDocument(DocumentMetadata)})</li>
  *   <li><strong>New documents:</strong> Chunk, embed, and insert (delegated to ingestion pipeline)</li>
  * </ul>
  *
@@ -84,73 +87,15 @@ public class UpsertHandler {
     }
 
     /**
-     * Processes a ChangeSet, tombstoning old chunks for changed/deleted documents.
-     *
-     * <p>This method:
-     * <ol>
-     *   <li>Tombstones all chunks from changed documents</li>
-     *   <li>Tombstones all chunks from deleted documents</li>
-     *   <li>Removes deleted document metadata from the registry</li>
-     * </ol>
-     *
-     * <p>Changed document metadata is NOT removed from the registry - the ingestion
-     * pipeline will update it after re-indexing.</p>
-     *
-     * @param changeSet The change set to process
-     * @return Result containing counts of successful operations and any errors
-     * @throws NullPointerException if changeSet is null
-     */
-    public UpsertResult processChanges(ChangeSet changeSet) {
-        Objects.requireNonNull(changeSet, "changeSet must not be null");
-        
-        UpsertResult.Builder result = UpsertResult.builder();
-        
-        // Process changed documents - tombstone old chunks
-        for (ChangeSet.ChangedDocument changed : changeSet.getChangedDocuments()) {
-            processChangedDocument(changed, result);
-        }
-        
-        // Process deleted documents - tombstone all chunks and remove from registry
-        for (DocumentMetadata deleted : changeSet.getDeletedDocuments()) {
-            processDeletedDocument(deleted, result);
-        }
-        
-        return result.build();
-    }
-
-    /**
-     * Tombstones only the documents that disappeared from the source.
-     *
-     * <p>Re-indexing must not use {@link #processChanges(ChangeSet)}, because that also removes
-     * the previous version of every <em>changed</em> document before its replacement has been
-     * fetched and embedded. If the replacement then fails - the embedding endpoint is down, the
-     * circuit breaker is open, the fetch throws - the document is left absent in both its old and
-     * its new form, with nothing to restore it. Deletions have no such replacement, so they are
-     * safe to process up front; changed documents are handled by
-     * {@link #tombstoneObsoleteChunks(List, Collection)} after their new version is published.</p>
-     *
-     * @param changeSet The change set whose deletions should be processed
-     * @return Result containing counts of successful operations and any errors
-     * @throws NullPointerException if changeSet is null
-     */
-    public UpsertResult processDeletions(ChangeSet changeSet) {
-        Objects.requireNonNull(changeSet, "changeSet must not be null");
-
-        UpsertResult.Builder result = UpsertResult.builder();
-        for (DocumentMetadata deleted : changeSet.getDeletedDocuments()) {
-            processDeletedDocument(deleted, result);
-        }
-        return result.build();
-    }
-
-    /**
      * Tombstones one document that disappeared from its source and removes its registry entry.
      *
-     * <p>What {@link #processDeletions(ChangeSet)} does for each deleted document, for a caller
-     * that has to remove them one at a time: under each document's lock, having first checked
-     * that the entry it is removing is still the one change detection read. Removing a batch
-     * without that lock removes whatever a concurrent re-post has since written under the same
-     * deterministic chunk ids, along with its registry entry.</p>
+     * <p>Deletions are the only removal that is safe before any replacement content exists, so
+     * re-indexing applies them up front, one document at a time: under each document's lock,
+     * having first checked that the entry it is removing is still the one change detection read.
+     * Removing a batch without that lock removes whatever a concurrent re-post has since written
+     * under the same deterministic chunk ids, along with its registry entry. Changed documents are
+     * never removed ahead of their replacement; see
+     * {@link #tombstoneObsoleteChunks(List, Collection)}.</p>
      *
      * @param metadata The registry entry of the document to remove
      * @return Result containing counts of successful operations and any errors
@@ -201,24 +146,6 @@ public class UpsertHandler {
             }
         }
         return tombstoned;
-    }
-
-    /**
-     * Tombstones chunks for a single changed document.
-     *
-     * <p>The old chunks are tombstoned in storage. The metadata remains in the registry for
-     * update after re-indexing.</p>
-     *
-     * @param changed The changed document information
-     * @param resultBuilder The result builder to record operations
-     */
-    private void processChangedDocument(ChangeSet.ChangedDocument changed,
-                                         UpsertResult.Builder resultBuilder) {
-        String documentId = changed.getDocumentId();
-        DocumentMetadata oldMetadata = changed.getOldMetadata();
-        
-        tombstoneChunks(oldMetadata.getChunkIds(), resultBuilder);
-        resultBuilder.incrementDocumentsChanged();
     }
 
     /**
@@ -314,28 +241,17 @@ public class UpsertHandler {
     }
 
     /**
-     * Result of processing a ChangeSet.
+     * Result of removing a document.
      */
     public static final class UpsertResult {
-        private final int documentsChanged;
         private final int documentsDeleted;
         private final int chunksTombstoned;
         private final List<OperationError> errors;
 
         private UpsertResult(Builder builder) {
-            this.documentsChanged = builder.documentsChanged;
             this.documentsDeleted = builder.documentsDeleted;
             this.chunksTombstoned = builder.chunksTombstoned;
             this.errors = List.copyOf(builder.errors);
-        }
-
-        /**
-         * Returns the number of changed documents processed.
-         *
-         * @return Changed document count
-         */
-        public int getDocumentsChanged() {
-            return documentsChanged;
         }
 
         /**
@@ -380,13 +296,13 @@ public class UpsertHandler {
          * @return true if no errors and at least one operation performed
          */
         public boolean isSuccess() {
-            return errors.isEmpty() && (documentsChanged > 0 || documentsDeleted > 0 || chunksTombstoned > 0);
+            return errors.isEmpty() && (documentsDeleted > 0 || chunksTombstoned > 0);
         }
 
         @Override
         public String toString() {
-            return String.format("UpsertResult[changed=%d, deleted=%d, tombstoned=%d, errors=%d]",
-                documentsChanged, documentsDeleted, chunksTombstoned, errors.size());
+            return String.format("UpsertResult[deleted=%d, tombstoned=%d, errors=%d]",
+                documentsDeleted, chunksTombstoned, errors.size());
         }
 
         /**
@@ -402,15 +318,9 @@ public class UpsertHandler {
          * Builder for UpsertResult.
          */
         public static final class Builder {
-            private int documentsChanged = 0;
             private int documentsDeleted = 0;
             private int chunksTombstoned = 0;
             private final List<OperationError> errors = new ArrayList<>();
-
-            public Builder incrementDocumentsChanged() {
-                documentsChanged++;
-                return this;
-            }
 
             public Builder incrementDocumentsDeleted() {
                 documentsDeleted++;

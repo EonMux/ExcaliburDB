@@ -14,7 +14,6 @@ import java.util.HashSet;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.function.Consumer;
 import java.util.stream.Stream;
 
 /**
@@ -103,71 +102,6 @@ public class ChangeDetector {
         
         builder.totalCrawled(seenDocumentIds.size());
         return builder.build();
-    }
-
-    /**
-     * Detects changes incrementally, fetching documents in batches.
-     *
-     * @param source The source to crawl
-     * @param batchSize Number of documents to process per batch
-     * @param batchConsumer Consumer called for each batch
-     * @return Final ChangeSet containing deleted documents
-     * @throws SourceException if crawling fails
-     */
-    public ChangeSet detectChangesIncremental(Source source, int batchSize,
-                                              Consumer<ChangeSet> batchConsumer) throws SourceException {
-        Objects.requireNonNull(source, "source must not be null");
-        Objects.requireNonNull(batchConsumer, "batchConsumer must not be null");
-        
-        String sourceId = source.getSourceId();
-        Set<String> seenDocumentIds = new HashSet<>();
-        int totalRegistered = registry.size(sourceId);
-        int totalCrawled = 0;
-        
-        try (Stream<String> crawl = source.crawl()) {
-            ChangeSet.Builder batchBuilder = ChangeSet.builder(sourceId);
-            batchBuilder.totalRegistered(totalRegistered);
-            int batchCount = 0;
-            
-            for (String documentId : (Iterable<String>) crawl::iterator) {
-                if (processDocument(source, sourceId, documentId, batchBuilder)) {
-                    seenDocumentIds.add(documentId);
-                }
-                batchCount++;
-                totalCrawled++;
-                
-                if (batchCount >= batchSize) {
-                    batchBuilder.totalCrawled(batchCount);
-                    batchConsumer.accept(batchBuilder.build());
-                    
-                    batchBuilder = ChangeSet.builder(sourceId);
-                    batchBuilder.totalRegistered(totalRegistered);
-                    batchCount = 0;
-                }
-            }
-            
-            if (batchCount > 0) {
-                batchBuilder.totalCrawled(batchCount);
-                batchConsumer.accept(batchBuilder.build());
-            }
-        } catch (IncompleteCrawlException e) {
-            throw truncated(sourceId, e);
-        }
-
-        ChangeSet.Builder finalBuilder = ChangeSet.builder(sourceId);
-        finalBuilder.totalCrawled(totalCrawled);
-        finalBuilder.totalRegistered(totalRegistered);
-        
-        for (String registeredDocId : registry.getDocumentIds(sourceId)) {
-            if (!seenDocumentIds.contains(registeredDocId)) {
-                DocumentMetadata metadata = registry.get(sourceId, registeredDocId);
-                if (metadata != null) {
-                    finalBuilder.addDeleted(metadata);
-                }
-            }
-        }
-        
-        return finalBuilder.build();
     }
 
     /**

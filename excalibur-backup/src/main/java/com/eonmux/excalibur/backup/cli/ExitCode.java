@@ -45,6 +45,16 @@ public enum ExitCode {
     /** A file could not be read or written. Retryable, unlike everything above. */
     IO_ERROR(6),
 
+    /**
+     * Another process holds the directory the command was to read or write.
+     *
+     * <p>A node is running on it, or an {@code excalibur-fsck --repair} or another restore is.
+     * The lock that says so is the one every node takes on its data directory, and the message
+     * names the holder's pid. Stop the holder and run the command again; a snapshot can instead
+     * be taken live with {@code --allow-live}. Nothing was written.</p>
+     */
+    IN_USE(7),
+
     /** Something this build did not anticipate. A bug here, reported rather than hidden. */
     INTERNAL_ERROR(70);
 

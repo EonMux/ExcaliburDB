@@ -81,6 +81,10 @@ public enum ErrorCode {
     SOURCE_KIND_CONFLICT("source_kind_conflict"),
     /** 429: the node already holds as many sources as it is configured for. */
     SOURCE_LIMIT_REACHED("source_limit_reached"),
+    /** 409: a crawl or reindex of the source is running, so its registration cannot change. */
+    SOURCE_BUSY("source_busy"),
+    /** 409: a replacement names a different namespace from the source's own. */
+    SOURCE_NAMESPACE_MISMATCH("source_namespace_mismatch"),
     /** 403: the ingest target is outside the allow-lists. */
     TARGET_NOT_ALLOWED("target_not_allowed"),
     /** 503: a registration change could not be recorded in the source catalog. */

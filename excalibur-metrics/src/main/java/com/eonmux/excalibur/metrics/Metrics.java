@@ -191,13 +191,6 @@ public final class Metrics {
     }
 
     /**
-     * Records an ingestion entry.
-     */
-    public static void recordIngestEntry() {
-        recordIngestEntries(1);
-    }
-
-    /**
      * Records a batch of ingested entries.
      *
      * <p>One call per document rather than per chunk, so the ingest path pays for a single
@@ -264,18 +257,6 @@ public final class Metrics {
     }
 
     /**
-     * Gets the current ingestion rate (entries per second).
-     *
-     * <p>Domain: Returns a value in range [0, Long.MAX_VALUE]. Typical values
-     * for production systems: 100-10000 entries/second.</p>
-     *
-     * @return Current ingestion rate in entries per second
-     */
-    public static double getIngestionRate() {
-        return throughput.currentRate();
-    }
-
-    /**
      * Gets the peak ingestion rate (entries per second) since startup.
      *
      * @return Peak ingestion rate in entries per second
@@ -285,26 +266,16 @@ public final class Metrics {
     }
 
     /**
-     * Updates the ingestion rate calculation.
-     * Should be called periodically to track throughput over time.
-     *
-     * <p>Domain correctness: Rate is the number of entries ingested since the
-     * previous call divided by the time elapsed since that call, so it reflects
-     * current throughput rather than a lifetime average and drops to zero while
-     * ingestion is idle. Peak rate is the maximum of those interval rates.
-     * Values are non-negative.</p>
-     */
-    public static void updateIngestionRate() {
-        throughput.updateRate();
-    }
-
-    /**
      * Returns the ingestion rate for observers, re-sampling at most once per sample window.
      *
-     * <p>This is what the JMX attribute reads. Unlike {@link #updateIngestionRate()} it is safe to
-     * call from any number of observers at any frequency: reading the rate does not consume the
-     * interval it was measured over, so two reads in the same window agree, and one console's
-     * polling cannot zero the value another console is watching.</p>
+     * <p>This is what the JMX attribute and the metrics endpoint read. It is safe to call from any
+     * number of observers at any frequency: reading the rate does not consume the interval it was
+     * measured over, so two reads in the same window agree, and one console's polling cannot zero
+     * the value another console is watching.</p>
+     *
+     * <p>The rate is the number of entries ingested since the previous sample divided by the time
+     * elapsed since it, so it reflects current throughput rather than a lifetime average and drops
+     * to zero while ingestion is idle.</p>
      *
      * @return The current ingestion rate in entries per second
      */
@@ -351,99 +322,6 @@ public final class Metrics {
      */
     public static boolean isHealthy() {
         return health.isHealthy();
-    }
-
-    /**
-     * Updates health based on latency threshold.
-     *
-     * <p>The score is {@code 1.0 - latencyMs / thresholdMs} clamped to
-     * [0.0, 1.0], so a query at the latency budget scores 0.0 and an instant
-     * one scores 1.0. {@link #isHealthy()} follows it in both directions.</p>
-     *
-     * @param latencyMs Query latency in ms
-     * @param thresholdMs Latency threshold in ms, must be positive
-     * @throws IllegalArgumentException if thresholdMs is not positive
-     */
-    public static void updateHealth(long latencyMs, long thresholdMs) {
-        if (thresholdMs <= 0) {
-            throw new IllegalArgumentException("thresholdMs must be positive, got: " + thresholdMs);
-        }
-        double latencyRatio = (double) latencyMs / thresholdMs;
-        health.setScore(1.0 - latencyRatio);
-    }
-
-    // ============================================
-    // Ingestion Queue Depth
-    // ============================================
-    //
-    // One number under two names. Everything here reads the HNSW integration backlog, which
-    // is what ingestion backpressure is actually measured against; there is no separate
-    // ingestion queue to report. The IngestionQueue MBean is an alias of HnswQueueDepth and
-    // says so in its own description.
-
-    /**
-     * Gets the current ingestion queue depth.
-     * Delegates to HNSW queue depth for consistency with actual ingestion backpressure tracking.
-     */
-    public static long getQueueDepth() {
-        return getHnswQueueDepth();
-    }
-
-    /**
-     * Records the current queue depth.
-     * This method updates HNSW depth tracking and emits INGESTION_QUEUE notification
-     * to maintain consistency between IngestionQueueMBean and HnswQueueDepthMBean metrics.
-     *
-     * @param depth Current queue depth
-     */
-    public static void recordQueueDepth(long depth) {
-        // Update HNSW depth tracking (used by both MBeans)
-        queueDepth.setDepth(depth);
-        // Emit HNSW notification
-        hnswQueueDepthMBeanInstance.getBroadcaster().sendNotification(
-            MBeanNotificationBroadcaster.NotificationTypes.HNSW_QUEUE_DEPTH,
-            "HNSW queue depth: " + depth,
-            depth
-        );
-        // Emit the aliased notification too, so a listener on either name sees the change.
-        // The text names the queue it came from rather than the bean it arrived on.
-        ingestionQueueMBeanInstance.getBroadcaster().sendNotification(
-            MBeanNotificationBroadcaster.NotificationTypes.INGESTION_QUEUE,
-            "HNSW integration backlog: " + depth,
-            depth
-        );
-    }
-
-    /**
-     * Gets the queue depth percentage.
-     * Delegates to HNSW queue depth for consistency.
-     *
-     * @param limit Maximum queue depth limit
-     * @return Percentage of limit
-     */
-    public static double getQueueDepthPercent(long limit) {
-        return getHnswQueueDepthPercent(limit);
-    }
-
-    /**
-     * Checks if the queue is under control (&lt; 50% of limit).
-     */
-    public static boolean isUnderControl(long limit) {
-        return isHnswUnderControl(limit);
-    }
-
-    /**
-     * Checks if the queue is critical (&gt; 80% of limit).
-     */
-    public static boolean isCritical(long limit) {
-        return isHnswCritical(limit);
-    }
-
-    /**
-     * Checks if the queue is full (&gt; 100% of limit).
-     */
-    public static boolean isFull(long limit) {
-        return isHnswFull(limit);
     }
 
     // ============================================
@@ -552,15 +430,6 @@ public final class Metrics {
     }
 
     /**
-     * Gets the total number of tail scan operations performed.
-     *
-     * @return Total count of tail scan operations
-     */
-    public static long getTotalTailScanCount() {
-        return tailScan.totalCount();
-    }
-
-    /**
      * Gets the total number of scanned entries that carried a valid vector.
      *
      * <p>Together with {@link #getTotalTailScanned()} this gives the vector hit
@@ -611,16 +480,26 @@ public final class Metrics {
     }
 
     /**
-     * Records the current HNSW queue depth.
+     * Records the current HNSW integration backlog and notifies both beans that report it.
+     *
+     * <p>{@code IngestionQueue} is an alias of {@code HnswQueueDepth}: there is no separate
+     * ingestion queue, and the backlog measured here is what ingestion backpressure is applied
+     * against. Both beans read this one number, so both are told when it changes; a listener
+     * subscribed under either name sees every change.</p>
      *
      * @param depth Current queue depth
      */
     public static void recordHnswDepth(long depth) {
         queueDepth.setDepth(depth);
-        // Emit notification
         hnswQueueDepthMBeanInstance.getBroadcaster().sendNotification(
             MBeanNotificationBroadcaster.NotificationTypes.HNSW_QUEUE_DEPTH,
             "HNSW queue depth: " + depth,
+            depth
+        );
+        // The text names the queue the number comes from rather than the bean it arrives on.
+        ingestionQueueMBeanInstance.getBroadcaster().sendNotification(
+            MBeanNotificationBroadcaster.NotificationTypes.INGESTION_QUEUE,
+            "HNSW integration backlog: " + depth,
             depth
         );
     }

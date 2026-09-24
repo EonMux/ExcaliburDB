@@ -9,6 +9,7 @@ import com.eonmux.excalibur.graph.erasure.ErasureRequest;
 import com.eonmux.excalibur.graph.erasure.GraphErasureCoordinator;
 import com.eonmux.excalibur.graph.erasure.ServedArtifactEraser;
 import com.eonmux.excalibur.graph.file.GraphCorruptionException;
+import com.eonmux.excalibur.graph.format.EdgeStoreDescriptor;
 import com.eonmux.excalibur.graph.staging.GraphBuilder;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.graph.staging.ReferencedLabels;
@@ -23,12 +24,16 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -151,6 +156,8 @@ public final class GraphTenant implements AutoCloseable {
                 staging, stagingDirectory.resolve(StagedWithdrawals.LOG_FILE));
             opened.push(withdrawals);
             retryWithdrawals(id, withdrawals);
+
+            noticeStaleGraph(id, directory, staging);
 
             ErasureLog erasureLog = ErasureLog.open(stagingDirectory.resolve(ERASURE_LOG));
             opened.push(erasureLog);
@@ -389,6 +396,92 @@ public final class GraphTenant implements AutoCloseable {
     }
 
     /**
+     * Records a graph older than its staging as behind, when nothing on disk says so already.
+     *
+     * <p>Staging keeps {@link GraphStagingStore#UNPUBLISHED_MARKER} from the first change after a
+     * build to the next build. A namespace last written by a node that kept no such marker, or
+     * one whose marker a crash lost, can still hold staged facts written after its graph was:
+     * that is read from the files' times, and recorded so the automatic build publishes them.
+     * Only staging that holds facts counts, so a graph built elsewhere and served beside staging
+     * nothing has written to is never taken for a stale one. Never fails the open: a namespace
+     * that cannot be judged is logged and served as it is.</p>
+     *
+     * @param id        The namespace, for the log lines
+     * @param directory Where its graph is served from
+     * @param staging   Its staging, open
+     */
+    private static void noticeStaleGraph(NamespaceId id, Path directory,
+                                         GraphStagingStore staging) {
+        try {
+            if (!staging.unpublishedChanges().pending() && staging.stagedCount() > 0
+                    && stagingNewerThanGraph(directory)) {
+                staging.markUnpublished();
+                LOGGER.info("graph tenant {} holds facts staged after its graph was built; they "
+                    + "are published by the next build", id);
+            }
+        } catch (IOException | RuntimeException e) {
+            LOGGER.warn("graph tenant {} could not tell whether its graph is behind its "
+                + "staging: {}", id, e.toString());
+        }
+    }
+
+    /**
+     * Whether a namespace's staged facts or text were written after its graph was built.
+     *
+     * <p>Read from modification times: the edge store's descriptor is written by the build that
+     * publishes it, after the build has read staging, and the staging logs are written by every
+     * change to them.</p>
+     *
+     * @param graphDirectory The namespace's graph directory
+     * @return true if a staging log is newer than the graph; false when either is missing
+     */
+    static boolean stagingNewerThanGraph(Path graphDirectory) {
+        Path descriptor = graphDirectory.resolve(EdgeStoreDescriptor.FILE_NAME);
+        Path staging = stagingDirectoryOf(graphDirectory);
+        try {
+            FileTime built = Files.getLastModifiedTime(descriptor);
+            for (String log : List.of(GraphStagingStore.TRIPLE_LOG,
+                    GraphStagingStore.ENTITY_TEXT_LOG)) {
+                Path file = staging.resolve(log);
+                if (Files.exists(file) && Files.getLastModifiedTime(file).compareTo(built) > 0) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Whether a namespace's served graph is behind its staging, read from disk without opening
+     * it.
+     *
+     * <p>Behind when staging records unpublished changes, when facts are staged and no graph has
+     * been built, or when staged facts were written after the graph was. A stat of a few files
+     * and the length of the triple log; nothing is opened or mapped.</p>
+     *
+     * @param graphDirectory The namespace's graph directory
+     * @return The freshness
+     * @throws IOException if the triple log exists and cannot be measured
+     */
+    public static GraphFreshness freshnessOnDisk(Path graphDirectory) throws IOException {
+        Path staging = stagingDirectoryOf(graphDirectory);
+        boolean withheld = Files.exists(staging.resolve(ERASURE_INTERRUPTED_MARKER));
+        Optional<Instant> since = GraphStagingStore.unpublishedOnDisk(staging);
+        if (since.isPresent()) {
+            return GraphFreshness.behind(since, GraphStagingStore.lastChangedOnDisk(staging))
+                .withheld(withheld);
+        }
+        if (stagedFactsOnDisk(graphDirectory) > 0
+                && (!hasBuiltGraph(graphDirectory) || stagingNewerThanGraph(graphDirectory))) {
+            Optional<Instant> lastChanged = GraphStagingStore.lastChangedOnDisk(staging);
+            return GraphFreshness.behind(lastChanged, lastChanged).withheld(withheld);
+        }
+        return GraphFreshness.CURRENT.withheld(withheld);
+    }
+
+    /**
      * Where a namespace's staged facts and erasure obligations live.
      *
      * <p>Beside the graph directory rather than inside it, because a build replaces the graph
@@ -539,7 +632,7 @@ public final class GraphTenant implements AutoCloseable {
      * @return The dimension
      */
     private static int embeddingDimension(Config config) {
-        return com.eonmux.excalibur.llm.client.LLMClientConfig.fromConfig(config.llm())
+        return com.eonmux.excalibur.llm.client.LLMClientConfig.forEmbeddings(config.llm())
             .getEmbeddingDimension();
     }
 
@@ -635,6 +728,64 @@ public final class GraphTenant implements AutoCloseable {
         try (BuildCancellation.Scope ignored = BuildCancellation.scope(cancelRequested)) {
             return buildService.build();
         }
+    }
+
+    /**
+     * Builds this tenant's graph if it is behind its staging, and does nothing otherwise.
+     *
+     * <p>For the automatic build, which decided to build from a reading that may be stale by the
+     * time it runs: an explicit build may have published everything since. So the question is
+     * asked again under the replacement lock the build itself takes, where no other build or
+     * compaction can change the answer. A graph withheld until an interrupted erasure is applied
+     * is not built either: the erasure sweep applies what is owed first, and a build ahead of it
+     * would serve the facts the erasure is removing.</p>
+     *
+     * @param cancelRequested Read at the build's boundaries; true asks it to stop
+     * @return What was built, or empty when there was nothing to build
+     * @throws IOException if the graph cannot be built or reopened
+     * @throws com.eonmux.excalibur.graph.build.BuildCancelledException if the build was asked to
+     *                     stop and reached a boundary before publishing
+     * @throws NullPointerException if cancelRequested is null
+     */
+    public Optional<GraphBuildService.BuildOutcome> buildIfBehind(BooleanSupplier cancelRequested)
+            throws IOException {
+        Objects.requireNonNull(cancelRequested, "cancelRequested must not be null");
+        retryWithdrawals(id, withdrawals);
+        ReentrantLock lock = holder.replacementLock();
+        lock.lock();
+        try {
+            GraphFreshness freshness = freshness();
+            if (!freshness.behind() || freshness.withheld()) {
+                return Optional.empty();
+            }
+            try (BuildCancellation.Scope ignored = BuildCancellation.scope(cancelRequested)) {
+                return Optional.of(buildService.build());
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Whether this tenant's served graph is behind its staging.
+     *
+     * <p>Behind when staging records a change no build has published, or when facts are staged
+     * and no graph has been built from them - a namespace whose graph was discarded as damaged,
+     * say. Read from memory and a stat of the graph directory.</p>
+     *
+     * @return The freshness
+     */
+    public GraphFreshness freshness() {
+        boolean withheld = erasureService.servingWithheld();
+        GraphStagingStore.UnpublishedChanges changes = staging.unpublishedChanges();
+        if (changes.pending()) {
+            return GraphFreshness.behind(changes.pendingSince(), changes.lastChangedAt())
+                .withheld(withheld);
+        }
+        if (staging.stagedCount() > 0 && !hasBuiltGraph(directory)) {
+            return GraphFreshness.behind(Optional.empty(), Optional.empty()).withheld(withheld);
+        }
+        return GraphFreshness.CURRENT.withheld(withheld);
     }
 
     /**

@@ -17,7 +17,7 @@ import static org.assertj.core.api.Assertions.*;
  *   <li>Default tick interval is 100ms</li>
  *   <li>Start/stop lifecycle works correctly</li>
  *   <li>Epoch advances periodically when scheduler is running</li>
- *   <li>tickNow() provides immediate epoch advancement</li>
+ *   <li>Each tick records its count and timestamp</li>
  *   <li>No ticks after stop</li>
  *   <li>Custom intervals work correctly</li>
  * </ul>
@@ -135,16 +135,18 @@ class EpochTickSchedulerTest {
     }
 
     @Test
-    @DisplayName("tickNow should advance epoch immediately")
-    void tickNowShouldAdvanceImmediately() {
-        scheduler = new EpochTickScheduler(tracker);
+    @DisplayName("a tick records its count and timestamp")
+    void tickRecordsCountAndTimestamp() throws InterruptedException {
+        scheduler = new EpochTickScheduler(tracker, 10);
         long epochBefore = tracker.currentEpoch();
+        long startedAt = System.currentTimeMillis();
+        assertThat(scheduler.getTickCount()).isZero();
 
-        long newEpoch = scheduler.tickNow();
+        scheduler.start();
+        awaitTicks(1);
 
-        assertThat(newEpoch).isGreaterThan(epochBefore);
-        assertThat(scheduler.getTickCount()).isEqualTo(1L);
-        assertThat(scheduler.getLastTickTimestamp()).isGreaterThan(0L);
+        assertThat(tracker.currentEpoch()).isGreaterThan(epochBefore);
+        assertThat(scheduler.getLastTickTimestamp()).isGreaterThanOrEqualTo(startedAt);
     }
 
     @Test

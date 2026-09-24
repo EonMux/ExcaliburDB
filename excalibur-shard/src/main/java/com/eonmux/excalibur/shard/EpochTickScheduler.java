@@ -268,38 +268,11 @@ public class EpochTickScheduler implements AutoCloseable {
     }
 
     /**
-     * Requests an immediate epoch tick.
-     *
-     * <p>This can be used to advance the epoch immediately after
-     * a write log fsync, rather than waiting for the next scheduled tick.</p>
-     *
-     * @return The new epoch value
-     */
-    public long tickNow() {
-        long newEpoch = visibilityTracker.advanceEpoch();
-        tickCount.incrementAndGet();
-        lastTickTimestamp.set(System.currentTimeMillis());
-
-        // Record epoch in JMX metrics for observability
-        Metrics.recordEpoch(newEpoch);
-
-        // Calculate and record estimated coverage based on visible segment ratio
-        VisibilityTracker.VisibilityStats stats = visibilityTracker.getStats();
-        double coverage = stats.visibilityRatio();
-        Metrics.setEstimatedCoverage(coverage);
-        publishHealthScore(coverage);
-
-        LOGGER.trace("Immediate epoch tick: new epoch = {}, coverage = {}", newEpoch, coverage);
-        return newEpoch;
-    }
-
-    /**
      * Publishes the health score the {@code SystemHealth} MBean reports.
      *
-     * <p>The score had two writers: the bootstrap, which sets 0.5 once, and the HTTP health
-     * endpoint. So it only moved when somebody polled {@code /health} over HTTP, and a
-     * monitor watching this node through JMX alone - which is what those MBeans exist for -
-     * read 0.5 for ever, through a total loss of the corpus included. The tick is where a
+     * <p>The tick is the writer that keeps the score moving when nobody polls {@code /health}:
+     * a monitor watching this node through JMX alone, which is what those MBeans exist for,
+     * must see a loss of coverage without anyone calling the HTTP endpoint. The tick is where a
      * background signal belongs, and it is already where coverage is refreshed from.</p>
      *
      * <p>Coverage is the score, because it is the one health signal measured here on the

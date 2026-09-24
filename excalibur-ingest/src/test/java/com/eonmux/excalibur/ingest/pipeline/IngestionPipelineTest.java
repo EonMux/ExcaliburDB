@@ -583,6 +583,23 @@ class IngestionPipelineTest {
         }
 
         @Test
+        @DisplayName("what a run dropped is recorded before the run reports itself finished")
+        void droppedDocumentsAreReportedBeforeTheRunEnds() {
+            // A caller polling the status stops at the first idle, full-progress reading. An
+            // error recorded after that reading is one it never sees, and the run reads as clean.
+            FakeSource source = new FakeSource("docs", Map.of(
+                "a.txt", "!fail",
+                "b.txt", "real text here"));
+
+            RecordingStatus status = ingest(orchestrator(), source);
+
+            assertThat(status.states)
+                .as("the error, then the idle that ends the run")
+                .endsWith("error", "idle");
+            assertThat(status.error).contains("1 of 2");
+        }
+
+        @Test
         @DisplayName("a crawl that fails is reported as an error, not as a completed run")
         void crawlFailureIsReported() {
             FakeSource source = new FakeSource("docs", Map.of("a.txt", "text"));

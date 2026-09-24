@@ -5,7 +5,9 @@ import com.eonmux.excalibur.ingest.pipeline.DocumentBatchPublisher;
 import com.eonmux.excalibur.ingest.processor.TextChunk;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
-import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityRegistry;
+import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker;
+import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
+import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
 import com.eonmux.excalibur.query.IndexCoverage;
 import com.eonmux.excalibur.query.QueryRequest;
 import com.eonmux.excalibur.query.QueryResponse;
@@ -96,7 +98,8 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
     private WriteLog writeLog;
     private AtomicDocumentWriter documentWriter;
     private DocumentRegistry documentRegistry;
-    private DocumentVisibilityRegistry visibilityRegistry;
+    private DocumentVisibilityTracker documentVisibility;
+    private DocumentVisibilityChecker atomicityChecker;
     private DocumentBatchPublisher publisher;
 
     @BeforeEach
@@ -121,16 +124,11 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
         // Create ingestion infrastructure
         documentWriter = new AtomicDocumentWriter(writeLog);
         documentRegistry = new DocumentRegistry();
-        visibilityRegistry = new DocumentVisibilityRegistry();
-        publisher = new DocumentBatchPublisher(
-            visibilityTracker,
-            documentRegistry,
-            visibilityRegistry,
-            // com.eonmux.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
-            // durability barrier is already satisfied before the adapter runs.
-            () -> { },
-            new ReentrantLock()
-        );
+        // On the node clock, as production wires it, so the atomicity filter bounds queries
+        // by the epochs they capture rather than only checking completeness.
+        documentVisibility = new DocumentVisibilityTracker(documentRegistry, visibilityTracker);
+        atomicityChecker = new DocumentVisibilityTrackerAdapter(documentVisibility);
+        publisher = new DocumentBatchPublisher(visibilityTracker, documentRegistry);
     }
 
     @AfterEach
@@ -169,7 +167,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
-                visibilityRegistry,  // Document atomicity checker
+                atomicityChecker,  // Document atomicity checker
                 graphProvider,
                 distanceFunction
             );
@@ -226,13 +224,13 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                         // Sync write log and advance epoch
                         long newEpoch = visibilityTracker.advanceEpoch();
 
-                        // CRITICAL: Register document with visibility registry for document atomicity filtering
+                        // CRITICAL: Register document with visibility tracker for document atomicity filtering
                         // Without this, DocumentAtomicityFilter will filter out ALL results
                         Set<String> chunkIds = new HashSet<>();
                         for (int i = 0; i < chunksPerDocument; i++) {
                             chunkIds.add(documentId + ":" + i);
                         }
-                        visibilityRegistry.registerDocument(documentId, chunkIds, newEpoch);
+                        documentVisibility.registerDocument(documentId, chunkIds, newEpoch);
 
                         // Small delay to allow concurrent queries
                         if (d % 10 == 0) {
@@ -375,7 +373,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
-                visibilityRegistry,  // Document atomicity checker
+                atomicityChecker,  // Document atomicity checker
                 graphProvider,
                 distanceFunction
             );
@@ -415,14 +413,14 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
 
                     long newEpoch = visibilityTracker.advanceEpoch();
 
-                    // CRITICAL: Register document with visibility registry for document atomicity filtering
+                    // CRITICAL: Register document with visibility tracker for document atomicity filtering
                     // Without this, DocumentAtomicityFilter will filter out ALL results because the
                     // document is not registered as visible
                     Set<String> chunkIds = new HashSet<>();
                     for (int i = 0; i < chunksPerDocument; i++) {
                         chunkIds.add(documentId + ":" + i);
                     }
-                    visibilityRegistry.registerDocument(documentId, chunkIds, newEpoch);
+                    documentVisibility.registerDocument(documentId, chunkIds, newEpoch);
                 }
 
                 // Query at this checkpoint
@@ -505,7 +503,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
-                visibilityRegistry,  // Document atomicity checker
+                atomicityChecker,  // Document atomicity checker
                 graphProvider,
                 distanceFunction
             );
@@ -717,7 +715,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
-                visibilityRegistry,  // Document atomicity checker
+                atomicityChecker,  // Document atomicity checker
                 graphProvider,
                 distanceFunction
             );
@@ -774,7 +772,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                         graph.registerDocumentId(nodeId, documentId);
                         graph.setLastIntegratedOffset(writeLog.writeOffset());
 
-                        // Publish atomically - this registers document in visibilityRegistry
+                        // Publish atomically, then register the document for visibility tracking
                         DocumentMetadata metadata = DocumentMetadata.builder()
                             .sourceId("test-source")
                             .documentId(documentId)
@@ -789,14 +787,14 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                         // Sync write log and advance epoch
                         long publicationEpoch = visibilityTracker.advanceEpoch();
 
-                        // Register document with visibility registry for atomicity filtering
+                        // Register document with visibility tracker for atomicity filtering
                         Set<String> chunkIds = new HashSet<>();
                         for (int i = 0; i < chunksPerDocument; i++) {
                             chunkIds.add(documentId + ":" + i);
                         }
-                        visibilityRegistry.registerDocument(documentId, chunkIds, publicationEpoch);
+                        documentVisibility.registerDocument(documentId, chunkIds, publicationEpoch);
 
-                        // Mark document as published with its epoch - atomically with visibility registration
+                        // Mark document as published with its epoch - atomically with visibility tracking
                         publishedDocumentsWithEpoch.put(documentId, publicationEpoch);
 
                         Thread.sleep(10);
@@ -847,11 +845,11 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
 
                             if (publicationEpoch != null) {
                                 // Document was published - verify it's visible at the query epoch
-                                boolean isVisibleInRegistry = visibilityRegistry.isDocumentVisible(resultDocId, queryEpoch);
+                                boolean isVisibleToFilter = atomicityChecker.isDocumentVisible(resultDocId, queryEpoch);
 
                                 // If document was published at epoch <= queryEpoch, it MUST be visible
                                 // If document was published at epoch > queryEpoch, it's OK if not visible
-                                if (publicationEpoch <= queryEpoch && !isVisibleInRegistry) {
+                                if (publicationEpoch <= queryEpoch && !isVisibleToFilter) {
                                     // Document was published before/during query but not visible - VIOLATION
                                     atomicityViolations.incrementAndGet();
                                     violationDetails.add(String.format(
@@ -931,7 +929,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
-                visibilityRegistry,  // Document atomicity checker
+                atomicityChecker,  // Document atomicity checker
                 graphProvider,
                 distanceFunction
             );
@@ -988,12 +986,12 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
 
                 long newEpoch = visibilityTracker.advanceEpoch();
 
-                // CRITICAL: Register document with visibility registry for document atomicity filtering
+                // CRITICAL: Register document with visibility tracker for document atomicity filtering
                 Set<String> chunkIds = new HashSet<>();
                 for (int i = 0; i < chunksPerDocument; i++) {
                     chunkIds.add(documentId + ":" + i);
                 }
-                visibilityRegistry.registerDocument(documentId, chunkIds, newEpoch);
+                documentVisibility.registerDocument(documentId, chunkIds, newEpoch);
             }
 
             // Query to verify all documents are fully visible
@@ -1046,7 +1044,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
-                visibilityRegistry,  // Document atomicity checker
+                atomicityChecker,  // Document atomicity checker
                 graphProvider,
                 distanceFunction
             );
@@ -1157,14 +1155,14 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
 
         long newEpoch = visibilityTracker.advanceEpoch();
 
-        // CRITICAL: Register document with visibility registry for document atomicity filtering
+        // CRITICAL: Register document with visibility tracker for document atomicity filtering
         // Without this, DocumentAtomicityFilter will filter out ALL results because the
         // document is not registered as visible
         Set<String> chunkIds = new HashSet<>();
         for (int i = 0; i < chunkCount; i++) {
             chunkIds.add(documentId + ":" + i);
         }
-        visibilityRegistry.registerDocument(documentId, chunkIds, newEpoch);
+        documentVisibility.registerDocument(documentId, chunkIds, newEpoch);
     }
 
     // ==================== Test Infrastructure ====================

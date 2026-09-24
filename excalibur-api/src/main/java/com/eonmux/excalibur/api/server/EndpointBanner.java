@@ -58,12 +58,14 @@ final class EndpointBanner {
         lines.add(route("GET", "/v1/documents", "Read one chunk's text"));
         lines.add(route("POST", "/v1/documents/fetch", "Read the text of a page of chunks"));
         if (routes.documentListing()) {
-            lines.add(route("GET", "/v1/documents/list", "Which documents this node holds"));
+            lines.add(route("GET", "/v1/documents/list",
+                "Which documents this node holds, or one document's chunks"));
         }
         if (routes.ingestion()) {
             lines.add(route("POST", "/v1/documents", "Index documents sent in the request"));
         }
         lines.add(route("POST", "/v1/ingest", "Register an ingestion source"));
+        lines.add(route("PUT", "/v1/ingest", "Replace a registered source's configuration"));
         lines.add(route("GET", "/v1/ingest", "Read back what each source was registered as"));
         lines.add(route("DELETE", "/v1/ingest", "Stop crawling a source"));
         lines.add(route("DELETE", "/v1/ingest/run", "Stop the ingestion run, keep the source"));
@@ -79,6 +81,8 @@ final class EndpointBanner {
         lines.add(route("GET", "/v1/compact/status", "What the last compaction did"));
         if (routes.erasure()) {
             lines.add(route("POST", "/v1/erasure", "Remove named documents from the corpus"));
+            lines.add(route("GET", "/v1/erasure/{request_id}",
+                "Where one document erasure stands"));
         }
         if (routes.graphTenanted() || routes.graphQueryOnly()) {
             lines.add(route("POST", "/v1/graph/query", "Answer a question from the graph"));
@@ -88,6 +92,8 @@ final class EndpointBanner {
             lines.add(route("DELETE", "/v1/graph/build", "Stop the graph build in progress"));
             lines.add(route("GET", "/v1/graph/build/status", "What the last graph build did"));
             lines.add(route("POST", "/v1/graph/erasure", "Record an obligation to erase"));
+            lines.add(route("GET", "/v1/graph/erasure/{request_id}",
+                "Where one erasure obligation stands"));
             lines.add(route("GET", "/v1/graph/namespaces", "Every namespace on this node"));
             lines.add(route("DELETE", "/v1/graph/namespaces/{namespace}",
                 "Drop a namespace entirely"));

@@ -972,6 +972,144 @@ class IngestEndpointTest {
         }
     }
 
+    /**
+     * {@code PUT /v1/ingest}: the same body and the same validation as a registration, applied to
+     * a source that is already registered.
+     */
+    @Nested
+    @DisplayName("Replacing a registration")
+    class Replacing {
+
+        @Test
+        @DisplayName("replaces the configuration of a registered source and says so")
+        void replaces(@TempDir Path root, @TempDir Path dataDir) throws IOException {
+            SourceCatalog catalog = SourceCatalog.open(dataDir);
+            registry.setSourceCatalog(catalog);
+            assertThat(register(root, "docs").status()).isEqualTo(200);
+            Source original = registry.get("docs");
+
+            Response response = put(root, "{\"source_type\": \"filesystem\", \"config\": {"
+                + "\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"max_depth\": 2}}", null);
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(response.body()).contains("\"status\": \"updated\"")
+                .contains("\"source_id\": \"docs\"");
+            assertThat(registry.get("docs")).isNotSameAs(original);
+            assertThat(SourceCatalog.open(dataDir).all()).singleElement()
+                .satisfies(d -> assertThat(d.config()).containsEntry("max_depth", "2"));
+        }
+
+        @Test
+        @DisplayName("an id nothing is registered under is 404, and nothing is registered")
+        void unknownIs404(@TempDir Path root) throws IOException {
+            Response response = put(root, body(root, "docs"), null);
+
+            assertThat(response.status()).isEqualTo(404);
+            assertThat(registry.getAllSourceIds()).isEmpty();
+        }
+
+        @Test
+        @DisplayName("another namespace is 409 and changes nothing")
+        void anotherNamespaceIs409(@TempDir Path root) throws IOException {
+            assertThat(register(root, "docs").status()).isEqualTo(200);
+            Source original = registry.get("docs");
+
+            Response response = put(root, body(root, "docs"), "acme");
+
+            assertThat(response.status()).isEqualTo(409);
+            assertThat(response.body()).contains("namespace");
+            assertThat(registry.get("docs")).isSameAs(original);
+        }
+
+        @Test
+        @DisplayName("a running crawl is 409 and changes nothing")
+        void aRunningCrawlIs409(@TempDir Path root) throws IOException {
+            IngestionOrchestrator orchestrator = mock(IngestionOrchestrator.class);
+            registry.setIngestionOrchestrator(orchestrator);
+            assertThat(register(root, "docs").status()).isEqualTo(200);
+            Source original = registry.get("docs");
+            when(orchestrator.isIngestionActive("docs")).thenReturn(true);
+
+            Response response = put(root, body(root, "docs"), null);
+
+            assertThat(response.status()).isEqualTo(409);
+            assertThat(registry.get("docs")).isSameAs(original);
+        }
+
+        @Test
+        @DisplayName("is validated exactly as a registration is")
+        void validatesLikeARegistration(@TempDir Path root, @TempDir Path elsewhere)
+                throws IOException {
+            assertThat(register(root, "docs").status()).isEqualTo(200);
+            Source original = registry.get("docs");
+
+            assertThat(put(root, body(elsewhere, "docs"), null).status())
+                .as("a root outside the allow-list").isEqualTo(403);
+            assertThat(put(root, "{\"source_type\": \"filesystem\", \"config\": "
+                + "{\"source_id\": \"docs\"}}", null).status())
+                .as("a missing root").isEqualTo(400);
+            assertThat(put(root, "{\"source_type\": \"filesystem\", \"config\": {"
+                + "\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"user_agent\": \"x\"}}", null).status())
+                .as("a crawl-only setting on a walk").isEqualTo(400);
+            assertThat(put(root, body(root, "docs"), "Not A Namespace").status())
+                .as("an illegal namespace").isEqualTo(400);
+            assertThat(registry.get("docs")).isSameAs(original);
+        }
+
+        @Test
+        @DisplayName("a registry that cannot replace in one step answers 501")
+        void aRegistryWithoutReplacementIs501(@TempDir Path root) throws IOException {
+            AtomicReference<Source> offered = new AtomicReference<>();
+            SourceRegistry legacy = new SourceRegistry() {
+                @Override
+                public void register(Source source) {
+                    offered.set(source);
+                }
+
+                @Override
+                public boolean isRegistered(String sourceId) {
+                    return true;
+                }
+
+                @Override
+                public Source get(String sourceId) {
+                    return null;
+                }
+
+                @Override
+                public boolean remove(String sourceId) {
+                    return false;
+                }
+
+                @Override
+                public java.util.Set<String> getAllSourceIds() {
+                    return java.util.Set.of();
+                }
+            };
+
+            Response response = send("PUT", legacy,
+                ApiSecurityConfig.builder().allowIngestRoot(root).build(), null,
+                body(root, "docs"), null);
+
+            assertThat(response.status()).isEqualTo(501);
+            assertThat(offered.get()).as("nothing was registered in its place").isNull();
+        }
+
+        private Response put(Path root, String requestBody, String namespace)
+                throws IOException {
+            return send("PUT", registry, ApiSecurityConfig.builder().allowIngestRoot(root).build(),
+                null, requestBody, namespace);
+        }
+
+        private String body(Path root, String sourceId) {
+            return "{\"source_type\": \"filesystem\", \"config\": {"
+                + "\"source_id\": \"" + sourceId + "\", "
+                + "\"root_path\": \"" + root + "\"}}";
+        }
+    }
+
     /** One captured HTTP response. */
     private record Response(int status, String body) {}
 
@@ -1022,7 +1160,29 @@ class IngestEndpointTest {
     private Response post(ApiSecurityConfig security, InlineSourceIds supplied,
                           String requestBody, String namespace, NamespaceAdmission admission)
             throws IOException {
-        IngestEndpoint endpoint = new IngestEndpoint(registry, null, null,
+        return send("POST", registry, security, supplied, requestBody, namespace, admission);
+    }
+
+    /**
+     * Sends {@code requestBody} with {@code method} to an endpoint over {@code sources} enforcing
+     * {@code security}.
+     */
+    private static Response send(String method, SourceRegistry sources,
+                                 ApiSecurityConfig security, InlineSourceIds supplied,
+                                 String requestBody, String namespace) throws IOException {
+        return send(method, sources, security, supplied, requestBody, namespace,
+            NamespaceAdmission.ANY);
+    }
+
+    /**
+     * Sends {@code requestBody} with {@code method} to an endpoint over {@code sources} enforcing
+     * {@code security} that admits namespaces through {@code admission}.
+     */
+    private static Response send(String method, SourceRegistry sources,
+                                 ApiSecurityConfig security, InlineSourceIds supplied,
+                                 String requestBody, String namespace,
+                                 NamespaceAdmission admission) throws IOException {
+        IngestEndpoint endpoint = new IngestEndpoint(sources, null, null,
             new IngestTargetValidator(security), supplied, IngestConfig.DEFAULT_CRAWL_DELAY_MS,
             admission);
 
@@ -1032,7 +1192,7 @@ class IngestEndpointTest {
         if (namespace != null) {
             requestHeaders.set(GraphTenants.NAMESPACE_HEADER, namespace);
         }
-        when(exchange.getRequestMethod()).thenReturn("POST");
+        when(exchange.getRequestMethod()).thenReturn(method);
         when(exchange.getRequestURI()).thenReturn(URI.create("/v1/ingest"));
         when(exchange.getRequestHeaders()).thenReturn(requestHeaders);
         when(exchange.getResponseHeaders()).thenReturn(new Headers());

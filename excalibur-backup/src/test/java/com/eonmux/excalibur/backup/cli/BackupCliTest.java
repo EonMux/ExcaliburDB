@@ -347,6 +347,28 @@ class BackupCliTest {
     }
 
     @Test
+    @DisplayName("a snapshot of, or a restore into, a directory a node holds exits 7")
+    void aHeldDirectoryHasItsOwnCode() throws Exception {
+        Path dataDir = DataDirectoryFixture.syntheticDirectory(tempDir.resolve("data"));
+        Path snapshotDir = tempDir.resolve("snap");
+        assertThat(run("snapshot", "--data-dir", dataDir.toString(),
+            "--out", snapshotDir.toString()).code()).isEqualTo(ExitCode.OK.code());
+
+        try (var ignored = com.eonmux.excalibur.core.datadir.DataDirectoryLock
+                 .acquire(dataDir, "excalibur node")) {
+            Run snapshot = run("snapshot", "--data-dir", dataDir.toString(),
+                "--out", tempDir.resolve("again").toString());
+            assertThat(snapshot.code()).as(snapshot.err()).isEqualTo(ExitCode.IN_USE.code());
+            assertThat(snapshot.err()).contains("excalibur node").contains(dataDir.toString());
+
+            Run restore = run("restore", "--snapshot", snapshotDir.toString(),
+                "--target", dataDir.toString(), "--force");
+            assertThat(restore.code()).as(restore.err()).isEqualTo(ExitCode.IN_USE.code());
+            assertThat(restore.err()).contains("excalibur node");
+        }
+    }
+
+    @Test
     @DisplayName("an unanticipated failure exits 70 and says where it came from")
     void anUnanticipatedFailureHasItsOwnCode() {
         Run run = runWith((args, out, err) -> {

@@ -68,7 +68,7 @@ class GraphCitationsTest {
     @DisplayName("a fact from anything but a document of this corpus cites nothing")
     void otherProvenanceCitesNothing() {
         assertThat(GraphCitations.documentsCitedBy(List.of(
-            factFrom(SourceType.CONVERSATION, "ada.txt", 0),
+            factFrom(SourceType.USER_ASSERTED, "ada.txt", 0),
             factFrom("elsewhere.txt", 1),
             new SubgraphEdge(1, 2, 3, 2, Integer.MIN_VALUE, TemporalFilter.OPEN,
                 Provenance.UNKNOWN, 1)), corpus))

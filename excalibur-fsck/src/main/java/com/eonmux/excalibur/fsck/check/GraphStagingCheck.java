@@ -5,6 +5,7 @@ import com.eonmux.excalibur.graph.file.LogCorruptionException;
 import com.eonmux.excalibur.graph.file.LogHeader;
 import com.eonmux.excalibur.graph.file.LogInspection;
 import com.eonmux.excalibur.graph.staging.EntityTextLog;
+import com.eonmux.excalibur.graph.staging.FactIdFloor;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.graph.staging.LabelInterner;
 import com.eonmux.excalibur.graph.staging.ReferencedLabels;
@@ -80,6 +81,12 @@ import java.util.List;
  * node starts the log afresh. Any other file that short is not one the node wrote, and it refuses
  * to write after it, so it is {@link CheckStatus#CORRUPT}.</p>
  *
+ * <h2>The last fact id</h2>
+ * <p>{@link FactIdFloor#FILE_NAME} is not a log but one checksummed value: the highest fact id the
+ * namespace has handed out, read with {@link FactIdFloor#read}. It is {@link CheckStatus#INTACT}
+ * or {@link CheckStatus#CORRUPT}, and a damaged one is put to an operator like the logs: the node
+ * refuses to assert facts past it rather than risk handing out an id twice.</p>
+ *
  * <h2>The header first</h2>
  * <p>The version in the header is judged before the records are, against the range each log's
  * reader opens. A version outside it is a file the node refuses, whatever the records behind it
@@ -121,6 +128,12 @@ public final class GraphStagingCheck {
     /** Name the marker goes by in a report. */
     public static final String MARKER_FORMAT = "erasure interrupted marker";
 
+    /** Name {@link GraphStagingStore#UNPUBLISHED_MARKER} goes by in a report. */
+    public static final String UNPUBLISHED_MARKER_FORMAT = "unpublished changes marker";
+
+    /** Name the record of the last fact id goes by in a report. */
+    public static final String FACT_ID_FORMAT = "graph fact id floor";
+
     private GraphStagingCheck() {
         throw new AssertionError("Utility class");
     }
@@ -161,7 +174,8 @@ public final class GraphStagingCheck {
             || GraphStagingStore.TRIPLE_LOG.equals(fileName)
             || GraphStagingStore.ENTITY_TEXT_LOG.equals(fileName)
             || ERASURE_LOG.equals(fileName)
-            || WITHDRAWAL_LOG.equals(fileName);
+            || WITHDRAWAL_LOG.equals(fileName)
+            || FactIdFloor.FILE_NAME.equals(fileName);
     }
 
     /**
@@ -176,22 +190,52 @@ public final class GraphStagingCheck {
      * @return The verdict
      */
     public static FileCheck marker(Path file, String relative) {
+        return emptyMarker(file, relative, MARKER_FORMAT,
+            "the tenant's graph is withheld until the erasures it still owes have been applied "
+                + "to it, which the node does on its next open or compaction before it serves "
+                + "the graph, removing the marker once they are");
+    }
+
+    /**
+     * Checks the marker that says staging holds changes the served graph does not have.
+     *
+     * <p>Written empty and read only for whether it is there, like the interrupted-erasure
+     * marker, and judged the same way.</p>
+     *
+     * @param file     The marker
+     * @param relative Its path relative to the data directory
+     * @return The verdict
+     */
+    public static FileCheck unpublishedMarker(Path file, String relative) {
+        return emptyMarker(file, relative, UNPUBLISHED_MARKER_FORMAT,
+            "the tenant's served graph is behind its staged facts, which the node's automatic "
+                + "build or POST /v1/graph/build publishes, removing the marker once it has");
+    }
+
+    /**
+     * Judges a marker whose presence is its whole content.
+     *
+     * @param file     The marker
+     * @param relative Its path relative to the data directory
+     * @param format   What the marker is called in a report
+     * @param meaning  What its presence says
+     * @return The verdict
+     */
+    private static FileCheck emptyMarker(Path file, String relative, String format,
+                                         String meaning) {
         long size;
         try {
             size = Files.size(file);
         } catch (IOException e) {
-            return new FileCheck(file, relative, MARKER_FORMAT, null, CheckStatus.UNREADABLE,
+            return new FileCheck(file, relative, format, null, CheckStatus.UNREADABLE,
                 "the marker could not be sized: " + e, -1);
         }
-        String meaning = "the tenant's graph is withheld until the erasures it still owes have "
-            + "been applied to it, which the node does on its next open or compaction before it "
-            + "serves the graph, removing the marker once they are";
         if (size == 0) {
-            return new FileCheck(file, relative, MARKER_FORMAT, null, CheckStatus.INTACT,
+            return new FileCheck(file, relative, format, null, CheckStatus.INTACT,
                 "empty, as written: its presence is its whole content, and says " + meaning,
                 size);
         }
-        return new FileCheck(file, relative, MARKER_FORMAT, null, CheckStatus.UNCHECKED,
+        return new FileCheck(file, relative, format, null, CheckStatus.UNCHECKED,
             "holds " + size + " bytes, which the node never writes and never reads; its presence "
                 + "still says " + meaning, size);
     }
@@ -205,6 +249,9 @@ public final class GraphStagingCheck {
      */
     public static FileCheck check(Path file, String relative) {
         String name = file.getFileName().toString();
+        if (FactIdFloor.FILE_NAME.equals(name)) {
+            return factIdFloor(file, relative);
+        }
         if (ERASURE_LOG.equals(name)) {
             return replayed(file, relative, "graph erasure log", "erasure requests");
         }
@@ -226,6 +273,25 @@ public final class GraphStagingCheck {
         return inspected(file, relative, new LogFormat("graph label interner",
             LabelInterner.MAGIC, LabelInterner.VERSION, LabelInterner.VERSION), "labels",
             interner -> GraphStagingStore.inspectLabels(interner, holders));
+    }
+
+    /**
+     * Checks the record of the highest fact id a namespace has handed out.
+     *
+     * @param file     The record
+     * @param relative Its path relative to the data directory
+     * @return The verdict
+     */
+    private static FileCheck factIdFloor(Path file, String relative) {
+        long size = sizeOf(file);
+        try {
+            long last = FactIdFloor.read(file);
+            return new FileCheck(file, relative, FACT_ID_FORMAT, null, CheckStatus.INTACT,
+                "matched its checksum: the highest fact id handed out is " + last, size);
+        } catch (IOException e) {
+            return new FileCheck(file, relative, FACT_ID_FORMAT, null, CheckStatus.CORRUPT,
+                e.getMessage(), size, true);
+        }
     }
 
     /**

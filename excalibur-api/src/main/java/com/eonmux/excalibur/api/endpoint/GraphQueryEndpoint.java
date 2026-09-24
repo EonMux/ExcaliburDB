@@ -1,6 +1,8 @@
 package com.eonmux.excalibur.api.endpoint;
 
 import java.util.Locale;
+import java.util.UUID;
+import java.util.concurrent.CancellationException;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
@@ -9,16 +11,21 @@ import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.api.protocol.RequestBody;
+import com.eonmux.excalibur.api.security.ApiSecurityConfig;
+import com.eonmux.excalibur.config.VisibilityConfig;
 import com.eonmux.excalibur.core.trace.QueryTrace;
+import com.eonmux.excalibur.core.util.QueryBudget;
 import com.eonmux.excalibur.graph.temporal.TemporalFilter;
 import com.eonmux.excalibur.core.trace.Stage;
 import com.eonmux.excalibur.planner.ConversationContext;
 import com.eonmux.excalibur.planner.QueryPlan;
+import com.eonmux.excalibur.query.executor.QueryRegistry;
 import com.eonmux.excalibur.retrieval.pipeline.Aggregation;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagResult;
 import com.eonmux.excalibur.retrieval.pipeline.InputRequest;
 import com.eonmux.excalibur.retrieval.pipeline.TraversalDirection;
+import com.eonmux.excalibur.retrieval.pipeline.WalkTruncation;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,12 +75,42 @@ import java.util.Objects;
  * {@code direction}. {@code 422} says exactly that - understood, and not processable here as
  * asked.</p>
  *
+ * <h2>Deadline and cancellation</h2>
+ * <p>An optional {@code timeout_ms} bounds the question, validated as {@code POST /v1/query}
+ * validates it and defaulting to the same {@code excalibur.visibility.query-timeout-ms}, at most
+ * {@code excalibur.api.max-query-timeout-ms}. The deadline reaches every stage that can wait: the
+ * walk, the question's embedding and the model rerank, each of which is abandoned when it passes
+ * rather than allowed the model client's own timeout and retries. What was gathered by then is
+ * judged as usual and answered with {@code "timed_out": true}; a deadline that passes before the
+ * graph is walked leaves nothing to judge, and is {@code declined} with reason
+ * {@code timed_out}.</p>
+ *
+ * <p>Every question is registered for as long as it runs: it is listed by
+ * {@code GET /v1/query/status} with {@code "kind": "graph"}, and {@code DELETE
+ * /v1/query/{query_id}} withdraws it - stopping the walk and interrupting any model call in
+ * flight - after which it answers {@code "status": "cancelled"}. Every response carries the
+ * {@code query_id}.</p>
+ *
+ * <h2>Walk limits</h2>
+ * <p>An answer whose walk was cut short by {@code excalibur.graph.max-frontier} or
+ * {@code max-walk-facts} says so in a {@code walk} object: {@code truncated}, and how many
+ * entities and facts were left out.</p>
+ *
  * <p>Per-stage latency is returned with every response, including the ones that answered nothing —
  * a refusal that took two seconds is as much a performance question as an answer that did.
  */
 public class GraphQueryEndpoint implements HttpHandler {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(GraphQueryEndpoint.class);
+
+    /**
+     * What a namespace with no graph being served is told, whatever the reason: never built,
+     * damaged, or withheld until an interrupted erasure has been applied. Shared with the
+     * structured read routes, which must not tell those cases apart where the query does not.
+     */
+    static final String NO_GRAPH = "No graph is being served for this namespace. One is built "
+        + "automatically once facts are staged, unless excalibur.graph.auto-build-enabled is "
+        + "off; POST /v1/graph/build builds one now";
 
     /** The {@code as_of} value asking for the whole history rather than a snapshot. */
     private static final String ALL_HISTORY = "all";
@@ -87,13 +124,49 @@ public class GraphQueryEndpoint implements HttpHandler {
     /** The namespaces to answer from, when this node is multi-tenant; null otherwise. */
     private final com.eonmux.excalibur.api.bootstrap.GraphTenants tenants;
 
+    /** Where a running question is listed and withdrawn from; null where nothing can be. */
+    private final QueryRegistry queryRegistry;
+
+    /** How long a question may run when the request names no {@code timeout_ms}. */
+    private final long defaultTimeoutMs;
+
+    /** The longest {@code timeout_ms} a request may name. */
+    private final long maxTimeoutMs;
+
+    /**
+     * Creates the endpoint over one pipeline, with the default deadline and nowhere to withdraw
+     * a question from.
+     *
+     * @param pipeline The pipeline to answer from
+     */
     public GraphQueryEndpoint(GraphRagPipeline pipeline) {
-        this.pipeline = Objects.requireNonNull(pipeline, "pipeline cannot be null");
-        this.tenants = null;
+        this(pipeline, null, VisibilityConfig.DEFAULT_QUERY_TIMEOUT_MS,
+            ApiSecurityConfig.DEFAULT_MAX_QUERY_TIMEOUT_MS);
     }
 
     /**
-     * Creates the endpoint over every namespace's graph.
+     * Creates the endpoint over one pipeline.
+     *
+     * @param pipeline         The pipeline to answer from
+     * @param queryRegistry    Where running questions are listed and withdrawn from, or null
+     * @param defaultTimeoutMs How long a question may run when it names no {@code timeout_ms}
+     * @param maxTimeoutMs     The longest {@code timeout_ms} a request may name
+     * @throws IllegalArgumentException if a timeout is not positive, or the default exceeds the
+     *                                  maximum
+     */
+    public GraphQueryEndpoint(GraphRagPipeline pipeline, QueryRegistry queryRegistry,
+                              long defaultTimeoutMs, long maxTimeoutMs) {
+        this.pipeline = Objects.requireNonNull(pipeline, "pipeline cannot be null");
+        this.tenants = null;
+        this.queryRegistry = queryRegistry;
+        this.defaultTimeoutMs = defaultTimeoutMs;
+        this.maxTimeoutMs = maxTimeoutMs;
+        checkTimeouts(defaultTimeoutMs, maxTimeoutMs);
+    }
+
+    /**
+     * Creates the endpoint over every namespace's graph, with the default deadline and nowhere to
+     * withdraw a question from.
      *
      * <p>The namespace comes from a request header and defaults to the shared one, so a node that
      * never sees the header answers exactly as a single-tenant node would.</p>
@@ -101,8 +174,61 @@ public class GraphQueryEndpoint implements HttpHandler {
      * @param tenants The namespaces to answer from
      */
     public GraphQueryEndpoint(com.eonmux.excalibur.api.bootstrap.GraphTenants tenants) {
+        this(tenants, null, VisibilityConfig.DEFAULT_QUERY_TIMEOUT_MS,
+            ApiSecurityConfig.DEFAULT_MAX_QUERY_TIMEOUT_MS);
+    }
+
+    /**
+     * Creates the endpoint over every namespace's graph.
+     *
+     * @param tenants          The namespaces to answer from
+     * @param queryRegistry    Where running questions are listed and withdrawn from, or null
+     * @param defaultTimeoutMs How long a question may run when it names no {@code timeout_ms}
+     * @param maxTimeoutMs     The longest {@code timeout_ms} a request may name
+     * @throws IllegalArgumentException if a timeout is not positive, or the default exceeds the
+     *                                  maximum
+     */
+    public GraphQueryEndpoint(com.eonmux.excalibur.api.bootstrap.GraphTenants tenants,
+                              QueryRegistry queryRegistry, long defaultTimeoutMs,
+                              long maxTimeoutMs) {
         this.tenants = Objects.requireNonNull(tenants, "tenants cannot be null");
         this.pipeline = null;
+        this.queryRegistry = queryRegistry;
+        this.defaultTimeoutMs = defaultTimeoutMs;
+        this.maxTimeoutMs = maxTimeoutMs;
+        checkTimeouts(defaultTimeoutMs, maxTimeoutMs);
+    }
+
+    private static void checkTimeouts(long defaultTimeoutMs, long maxTimeoutMs) {
+        if (defaultTimeoutMs <= 0 || maxTimeoutMs <= 0) {
+            throw new IllegalArgumentException("timeouts must be positive, got a default of "
+                + defaultTimeoutMs + "ms and a maximum of " + maxTimeoutMs + "ms");
+        }
+        if (defaultTimeoutMs > maxTimeoutMs) {
+            throw new IllegalArgumentException("the default timeout (" + defaultTimeoutMs
+                + "ms) exceeds the maximum a request may ask for (" + maxTimeoutMs + "ms)");
+        }
+    }
+
+    /**
+     * One response, decided before it is written.
+     *
+     * @param status The HTTP status
+     * @param body   The JSON body
+     */
+    private record Reply(int status, String body) {
+    }
+
+    /**
+     * What identifies one running question, and bounds it.
+     *
+     * @param queryId       The id it is listed and withdrawn under
+     * @param correlationId The id its log lines carry
+     * @param budget        Its deadline and cancellation
+     * @param trace         Per-stage latency
+     */
+    private record Running(String queryId, String correlationId, QueryBudget budget,
+                           QueryTrace trace) {
     }
 
     @Override
@@ -126,11 +252,14 @@ public class GraphQueryEndpoint implements HttpHandler {
         ConversationContext context;
         String asOfText;
         TraversalDirection direction;
+        long timeoutMs;
         try {
             question = JsonText.string(body, "query");
             context = GraphConversation.from(body);
             asOfText = JsonText.string(body, "as_of");
             direction = directionFrom(JsonText.string(body, "direction"));
+            timeoutMs = timeoutFrom(JsonText.longValue(body, "timeout_ms", defaultTimeoutMs),
+                maxTimeoutMs);
         } catch (IllegalArgumentException e) {
             send(exchange, 400, "{\"error\":" + quoted(e.getMessage()) + "}");
             return;
@@ -153,27 +282,81 @@ public class GraphQueryEndpoint implements HttpHandler {
             return;
         }
 
-        if (tenants != null) {
-            answerFromTenant(exchange, question, context, asOf, direction);
-            return;
+        Running running = new Running(UUID.randomUUID().toString(),
+            UUID.randomUUID().toString().substring(0, 8), QueryBudget.ofMillis(timeoutMs),
+            new QueryTrace());
+        QueryWithdrawal withdrawal = QueryWithdrawal.open(queryRegistry, running.queryId(),
+            running.correlationId(), QueryRegistry.Kind.GRAPH).stops(running.budget());
+        Reply reply;
+        boolean withdrawn;
+        try {
+            reply = tenants != null
+                ? answerFromTenant(exchange, question, context, asOf, direction, running)
+                : answerFromPipeline(question, context, asOf, direction, running);
+        } finally {
+            // Decided only once the registration is gone, so a DELETE cannot arrive after it.
+            withdrawn = withdrawal.close();
         }
+        send(exchange, withdrawn ? 200 : reply.status(),
+            withdrawn ? renderCancelled(running) : reply.body());
+    }
 
+    /**
+     * Reads the deadline a request named.
+     *
+     * @param timeoutMs    The {@code timeout_ms} the request carried, or the default
+     * @param maxTimeoutMs The longest a request may name
+     * @return The timeout
+     * @throws IllegalArgumentException if it is not positive, or longer than the maximum
+     */
+    static long timeoutFrom(long timeoutMs, long maxTimeoutMs) {
+        if (timeoutMs <= 0) {
+            throw new IllegalArgumentException("Field 'timeout_ms' must be positive: " + timeoutMs);
+        }
+        if (timeoutMs > maxTimeoutMs) {
+            throw new IllegalArgumentException(
+                "Field 'timeout_ms' must be at most " + maxTimeoutMs + ": " + timeoutMs);
+        }
+        return timeoutMs;
+    }
+
+    /**
+     * Answers from the one pipeline this node serves.
+     *
+     * @return The response to write, unless the question is withdrawn before it is
+     */
+    private Reply answerFromPipeline(String question, ConversationContext context,
+                                     TemporalFilter asOf, TraversalDirection direction,
+                                     Running running) {
         if (!pipeline.supports(direction)) {
-            sendUnsupportedDirection(exchange, direction);
-            return;
+            return unsupportedDirection(direction);
         }
         try {
-            QueryTrace trace = new QueryTrace();
-            GraphRagResult result = pipeline.answer(question, context, asOf, direction, trace);
-            send(exchange, 200, render(result, trace, asOf));
+            GraphRagResult result = pipeline.answer(question, context, asOf, direction,
+                running.trace(), running.budget());
+            return new Reply(200, render(result, running, asOf));
         } catch (IllegalArgumentException e) {
-            send(exchange, 400, "{\"error\":" + quoted(e.getMessage()) + "}");
+            return new Reply(400, "{\"error\":" + quoted(e.getMessage()) + "}");
         } catch (RuntimeException e) {
-            // Logged with detail, answered without it: the message can name internal paths,
-            // host names and entity ids that a client has no business seeing.
-            LOGGER.error("graph query failed", e);
-            send(exchange, 500, "{\"error\":\"Internal Server Error\"}");
+            return failed(e, running, "graph query failed");
         }
+    }
+
+    /**
+     * The reply to a question the pipeline did not finish.
+     *
+     * <p>A cancellation is the caller's withdrawal, which the handler answers once the
+     * registration is closed; anything else is a fault, logged with detail and answered without
+     * it: the message can name internal paths, host names and entity ids that a client has no
+     * business seeing.</p>
+     */
+    private static Reply failed(RuntimeException e, Running running, String what) {
+        if (e instanceof CancellationException && running.budget().isCancelled()) {
+            LOGGER.debug("graph query {} withdrawn: {}", running.queryId(), e.getMessage());
+        } else {
+            LOGGER.error("{} (query {})", what, running.queryId(), e);
+        }
+        return new Reply(500, "{\"error\":\"Internal Server Error\"}");
     }
 
     /**
@@ -195,21 +378,20 @@ public class GraphQueryEndpoint implements HttpHandler {
      * @param context  The conversation the question is asked in
      * @param asOf      The valid-time instant to answer at, or null for the question's own
      * @param direction Which way along an edge the walk may step
-     * @throws IOException if the response cannot be written
+     * @param running   The question's identity, deadline and trace
+     * @return The response to write, unless the question is withdrawn before it is
      */
-    private void answerFromTenant(HttpExchange exchange, String question,
-                                  ConversationContext context, TemporalFilter asOf,
-                                  TraversalDirection direction)
-            throws IOException {
+    private Reply answerFromTenant(HttpExchange exchange, String question,
+                                   ConversationContext context, TemporalFilter asOf,
+                                   TraversalDirection direction, Running running) {
         com.eonmux.excalibur.tenancy.NamespaceId namespace;
         try {
             namespace = com.eonmux.excalibur.api.bootstrap.GraphTenants.namespaceOf(
                 exchange.getRequestHeaders().getFirst(
                     com.eonmux.excalibur.api.bootstrap.GraphTenants.NAMESPACE_HEADER));
         } catch (IllegalArgumentException e) {
-            send(exchange, 400,
+            return new Reply(400,
                 ResponseBody.errorJson(ErrorCode.INVALID_NAMESPACE, e.getMessage()));
-            return;
         }
 
         java.util.Optional<
@@ -218,16 +400,13 @@ public class GraphQueryEndpoint implements HttpHandler {
         try {
             borrowed = tenants.borrowIfPresent(namespace);
         } catch (RuntimeException e) {
-            LOGGER.error("graph query failed for namespace {}", namespace, e);
-            send(exchange, 500, "{\"error\":\"Internal Server Error\"}");
-            return;
+            return failed(e, running, "graph query failed for namespace " + namespace);
         }
         if (borrowed.isEmpty()) {
             // Deliberately the same answer an existing namespace with no built graph gets. Every
             // tenant on this node presents the same bearer token, so a reply that separated the
             // two would tell one tenant which namespaces the others have.
-            sendNoGraph(exchange);
-            return;
+            return noGraph();
         }
 
         try (com.eonmux.excalibur.tenancy.NamespaceRegistry.Lease<com.eonmux.excalibur.api.bootstrap.GraphTenant> lease
@@ -235,11 +414,9 @@ public class GraphQueryEndpoint implements HttpHandler {
             java.util.Optional<com.eonmux.excalibur.api.bootstrap.GraphRagHolder.Reading> reading =
                 lease.resource().holder().acquire();
             if (reading.isEmpty()) {
-                sendNoGraph(exchange);
-                return;
+                return noGraph();
             }
 
-            QueryTrace trace = new QueryTrace();
             GraphRagResult result = null;
             boolean supported;
             // Released before the response is written: the stack is needed to answer, not to
@@ -247,19 +424,18 @@ public class GraphQueryEndpoint implements HttpHandler {
             try (com.eonmux.excalibur.api.bootstrap.GraphRagHolder.Reading held = reading.get()) {
                 supported = held.pipeline().supports(direction);
                 if (supported) {
-                    result = held.pipeline().answer(question, context, asOf, direction, trace);
+                    result = held.pipeline().answer(question, context, asOf, direction,
+                        running.trace(), running.budget());
                 }
             }
             if (!supported) {
-                sendUnsupportedDirection(exchange, direction);
-                return;
+                return unsupportedDirection(direction);
             }
-            send(exchange, 200, render(result, trace, asOf));
+            return new Reply(200, render(result, running, asOf));
         } catch (IllegalArgumentException e) {
-            send(exchange, 400, "{\"error\":" + quoted(e.getMessage()) + "}");
+            return new Reply(400, "{\"error\":" + quoted(e.getMessage()) + "}");
         } catch (RuntimeException e) {
-            LOGGER.error("graph query failed for namespace {}", namespace, e);
-            send(exchange, 500, "{\"error\":\"Internal Server Error\"}");
+            return failed(e, running, "graph query failed for namespace " + namespace);
         }
     }
 
@@ -271,11 +447,10 @@ public class GraphQueryEndpoint implements HttpHandler {
      *
      * @param exchange  The exchange
      * @param direction The direction asked for
-     * @throws IOException if the response cannot be written
+     * @return The refusal
      */
-    private void sendUnsupportedDirection(HttpExchange exchange, TraversalDirection direction)
-            throws IOException {
-        send(exchange, 422, "{\"error\":" + quoted("'direction' \"" + direction.wireName()
+    private static Reply unsupportedDirection(TraversalDirection direction) {
+        return new Reply(422, "{\"error\":" + quoted("'direction' \"" + direction.wireName()
             + "\" needs the graph's relation vocabulary, and the graph pipeline on this node was "
             + "built without one; omit 'direction', or send \"both\"") + "}");
     }
@@ -283,13 +458,10 @@ public class GraphQueryEndpoint implements HttpHandler {
     /**
      * Says that this namespace has no graph to answer from, whatever the reason.
      *
-     * @param exchange The exchange
-     * @throws IOException if the response cannot be written
+     * @return The refusal
      */
-    private void sendNoGraph(HttpExchange exchange) throws IOException {
-        send(exchange, 503, ResponseBody.errorJson(ErrorCode.GRAPH_NOT_SERVED,
-            "No graph is being served for this namespace; POST "
-                + "/v1/graph/build to build one from the facts ingestion has staged"));
+    private static Reply noGraph() {
+        return new Reply(503, ResponseBody.errorJson(ErrorCode.GRAPH_NOT_SERVED, NO_GRAPH));
     }
 
     /**
@@ -399,7 +571,7 @@ public class GraphQueryEndpoint implements HttpHandler {
             .append(",\"as_of_source\":").append(quoted(source));
     }
 
-    private String render(GraphRagResult result, QueryTrace trace, TemporalFilter asOf) {
+    private static String render(GraphRagResult result, Running running, TemporalFilter asOf) {
         StringBuilder json = new StringBuilder("{");
 
         if (result.hasAnswer()) {
@@ -431,6 +603,48 @@ public class GraphQueryEndpoint implements HttpHandler {
             .map(plan -> quoted(plan.shape().getClass().getSimpleName().toLowerCase(Locale.ROOT)))
             .orElse("null"));
         appendAsOf(json, result, asOf);
+        result.walk().ifPresent(walk -> appendWalk(json, walk));
+        appendQuery(json, running, result.timedOut(), false);
+        appendTimings(json, running.trace());
+        return json.append('}').toString();
+    }
+
+    /**
+     * The answer to a question withdrawn while it ran: no results, whatever it had reached.
+     *
+     * @param running The question
+     * @return The body
+     */
+    private static String renderCancelled(Running running) {
+        StringBuilder json = new StringBuilder("{\"status\":\"cancelled\"");
+        appendQuery(json, running, false, true);
+        appendTimings(json, running.trace());
+        return json.append('}').toString();
+    }
+
+    /** The fields every answer carries about the question as a running query. */
+    private static void appendQuery(StringBuilder json, Running running, boolean timedOut,
+                                    boolean cancelled) {
+        json.append(",\"query_id\":").append(quoted(running.queryId()))
+            .append(",\"timed_out\":").append(timedOut)
+            .append(",\"cancelled\":").append(cancelled);
+    }
+
+    /**
+     * Reports what the walk's limits left out of the evidence.
+     *
+     * @param json the response being built
+     * @param walk what the frontier and fact bounds dropped
+     */
+    private static void appendWalk(StringBuilder json, WalkTruncation walk) {
+        json.append(",\"walk\":{\"truncated\":").append(walk.truncated())
+            .append(",\"entities_dropped\":").append(walk.entitiesDropped())
+            .append(",\"facts_dropped\":").append(walk.factsDropped())
+            .append('}');
+    }
+
+    /** Per-stage latency, then the total. */
+    private static void appendTimings(StringBuilder json, QueryTrace trace) {
         json.append(",\"timings_ms\":{");
         boolean first = true;
         for (Stage stage : Stage.values()) {
@@ -445,10 +659,8 @@ public class GraphQueryEndpoint implements HttpHandler {
             json.append('"').append(stage.name().toLowerCase(Locale.ROOT)).append("\":")
                 .append(JsonText.number(nanos / 1_000_000.0, 3));
         }
-        json.append(",\"total\":")
+        json.append(first ? "" : ",").append("\"total\":")
             .append(JsonText.number(trace.elapsedNanos() / 1_000_000.0, 3)).append('}');
-
-        return json.append('}').toString();
     }
 
     /**

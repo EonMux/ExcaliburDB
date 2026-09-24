@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.endpoint;
 
+import com.eonmux.excalibur.api.audit.AuditLog;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphExtraction;
@@ -60,10 +61,11 @@ import java.util.concurrent.RejectedExecutionException;
  *
  * <p>{@code extraction} says whether ingestion on this node extracts the facts a build publishes:
  * {@code active}, {@code disabled} when {@code excalibur.graph.extraction-enabled} is off,
- * {@code missing_api_key} when it is on and no LLM API key is configured, or {@code unavailable}
- * when both are set but the ingestion pipeline could not be set up. The last two also carry a
- * {@code warning}, because nobody chose them and the build they answer will publish nothing
- * new.</p>
+ * {@code missing_api_key} when it is on and the chat endpoint is the hosted default with no key,
+ * {@code chat_disabled} when it is on and {@code excalibur.llm.chat-enabled} is false, or
+ * {@code unavailable} when a chat model is configured but the ingestion pipeline could not be set
+ * up. The last three also carry a {@code warning}, because nobody chose them and the build they
+ * answer will publish nothing new.</p>
  *
  * <h2>Response (a build is already running)</h2>
  * <pre>{@code
@@ -113,6 +115,7 @@ public class GraphBuildEndpoint implements HttpHandler {
         try {
             namespace = GraphTenants.namespaceOf(
                 exchange.getRequestHeaders().getFirst(GraphTenants.NAMESPACE_HEADER));
+            AuditLog.target(exchange, "namespace", namespace.value());
         } catch (IllegalArgumentException e) {
             ResponseBody.sendError(exchange, 400, ErrorCode.INVALID_NAMESPACE, e.getMessage());
             return;

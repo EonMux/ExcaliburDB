@@ -291,19 +291,6 @@ class LlmRelevancyScorerTest {
                 .hasMessageContaining("LLMHttpClient cannot be null");
         }
 
-        @Test
-        @DisplayName("creates no-op scorer that returns input unchanged")
-        void createsNoOpScorer() {
-            LlmScorer noOp = LlmScorerFactory.noOp();
-
-            List<QueryResultItem> items = List.of(
-                createItem(1L, 0.8f, "content", 1L, 1L)
-            );
-
-            // No-op scorer should return items unchanged
-            List<QueryResultItem> result = noOp.scoreResults("query", items, 0.5f);
-            assertThat(result).isSameAs(items);
-        }
     }
 
     @Nested

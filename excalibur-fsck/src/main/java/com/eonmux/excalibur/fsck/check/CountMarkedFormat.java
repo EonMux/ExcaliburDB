@@ -1,13 +1,14 @@
 package com.eonmux.excalibur.fsck.check;
 
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
+import com.eonmux.excalibur.ingest.registry.ErasureReceiptFile;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
 import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
 
 /**
  * The line-oriented registries that end with a record count, and what their readers accept.
  *
- * <p>The three share one layout - a {@code <marker>|<version>} first line, one line per record,
+ * <p>They share one layout - a {@code <marker>|<version>} first line, one line per record,
  * an {@code \#end|<count>|<crc>} last line, or {@code \#end|<count>} in the versions written
  * before the checksum - and differ in what their readers do with a file that departs from it. That difference is the whole of what a checker has to know beyond the layout:
  * the verdict on a file has to be the reader's verdict, or the checker passes a file the node
@@ -55,7 +56,21 @@ public enum CountMarkedFormat {
         SourceStatusFile.HEADER_MARKER, SourceStatusFile.END_MARKER,
         SourceStatusFile.OLDEST_READABLE_VERSION, SourceStatusFile.FORMAT_VERSION,
         SourceStatusFile.FIRST_CHECKSUMMED_VERSION, Headerless.REFUSED, false,
-        "the node discards it, and each source reports from its next run", false);
+        "the node discards it, and each source reports from its next run", false),
+
+    /**
+     * {@code erasure-receipts}: what each recent document erasure did, for its caller to ask
+     * about later.
+     *
+     * <p>Always written with a header and a checksum. Anything the reader will not take is set
+     * aside rather than refused, because it is a report: the erasures it described answer as
+     * unknown, and the obligations they pointed at are untouched in the erasure logs.</p>
+     */
+    ERASURE_RECEIPTS(FileKind.ERASURE_RECEIPTS, "erasure receipts",
+        ErasureReceiptFile.HEADER_MARKER, ErasureReceiptFile.END_MARKER,
+        ErasureReceiptFile.OLDEST_READABLE_VERSION, ErasureReceiptFile.FORMAT_VERSION,
+        ErasureReceiptFile.FIRST_CHECKSUMMED_VERSION, Headerless.REFUSED, false,
+        "the node discards it, and the erasures it described answer as unknown", false);
 
     /** What a reader does with a file whose first line is not the format's header. */
     public enum Headerless {

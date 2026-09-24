@@ -137,6 +137,7 @@ public class LLMHttpClient {
     private final HttpClient httpClient;
     private final LLMClientConfig config;
     private final CircuitBreaker circuitBreaker;
+    private final AuthFailure authFailure = new AuthFailure();
 
     /**
      * Guards {@code /v1/embeddings}, separately from the breaker guarding chat completions.
@@ -700,10 +701,18 @@ public class LLMHttpClient {
      *   <li>PARSE_ERROR - truly unparseable responses</li>
      * </ul>
      *
+     * <p>A call its own thread was interrupted out of is none of these: the caller abandoned it -
+     * a query's deadline passed, or the query was cancelled - whatever state the endpoint is in.
+     * A half-open probe abandoned this way is reissued after the cooldown like any other probe
+     * that never reports back.</p>
+     *
      * @param e The exception to evaluate
      * @return true if this should count as a failure for circuit breaker
      */
     private boolean shouldCountAsFailure(LLMException e) {
+        if (e.getCause() instanceof InterruptedException) {
+            return false;
+        }
         return switch (e.getErrorType()) {
             case NETWORK, HTTP_ERROR, RATE_LIMITED, AUTH_ERROR, PARSE_ERROR, INVALID_REQUEST -> true;
             case CIRCUIT_OPEN -> false; // Circuit already open, don't double-count
@@ -799,6 +808,16 @@ public class LLMHttpClient {
      * @return HTTP response with successful status code (2xx)
      * @throws LLMException if all retries fail or request is non-retryable
      */
+    /**
+     * Whether requests carry a bearer token.
+     *
+     * @return true if a non-empty key is configured
+     */
+    private boolean hasApiKey() {
+        String apiKey = config.getApiKey();
+        return apiKey != null && !apiKey.isEmpty();
+    }
+
     private HttpResponse<String> executeRequest(String url, String requestBody, String correlationId) {
         int maxRetries = config.getMaxRetries();
         LLMException lastException = null;
@@ -812,9 +831,8 @@ public class LLMHttpClient {
                         .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8));
 
                 // Add authorization header if API key is configured
-                String apiKey = config.getApiKey();
-                if (apiKey != null && !apiKey.isEmpty()) {
-                    requestBuilder.header(AUTHORIZATION_HEADER, "Bearer " + apiKey);
+                if (hasApiKey()) {
+                    requestBuilder.header(AUTHORIZATION_HEADER, "Bearer " + config.getApiKey());
                 }
 
                 // Validated at the point of use: the id came from the API boundary, and an
@@ -860,8 +878,14 @@ public class LLMHttpClient {
                         LOG.warn("Retryable HTTP error {} on attempt {}/{} (correlationId={})",
                                 statusCode, attempt + 1, maxRetries + 1, correlationId);
                         // Fall through to retry logic below
+                    } else if (AuthFailure.isAuthStatus(statusCode)) {
+                        // Non-retryable, and the one refusal a setting fixes: say which.
+                        String message = AuthFailure.describe("LLM API", statusCode,
+                                SafeUrl.redact(config.getBaseUrl()), hasApiKey());
+                        authFailure.report(LOG, message);
+                        throw new LLMException(message, ErrorType.AUTH_ERROR, statusCode);
                     } else {
-                        // Non-retryable HTTP error (401, 403, 400, etc.) - throw immediately
+                        // Non-retryable HTTP error (400, 404, etc.) - throw immediately
                         throw new LLMException(
                                 "LLM API returned error status " + statusCode +
                                 " (" + HttpStatus.getReasonPhrase(statusCode) + ")",

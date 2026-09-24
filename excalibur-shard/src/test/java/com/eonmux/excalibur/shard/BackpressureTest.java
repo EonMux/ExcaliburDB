@@ -1,15 +1,22 @@
 package com.eonmux.excalibur.shard;
 
+import com.eonmux.excalibur.store.SegmentCatalog;
+import com.eonmux.excalibur.store.StorageEngine;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.io.IOException;
+import java.lang.foreign.Arena;
+import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Tests for backpressure mechanism in {@link IndexOrchestrator}.
- *
- * <p>Tests the backpressure API contract and constants.</p>
+ * Tests for the backpressure mechanism in {@link IndexOrchestrator}.
  */
 @DisplayName("IndexOrchestrator Backpressure Tests")
 class BackpressureTest {
@@ -17,12 +24,6 @@ class BackpressureTest {
     @Nested
     @DisplayName("Constants")
     class Constants {
-
-        @Test
-        @DisplayName("DEFAULT_BACKPRESSURE_TIMEOUT_MS should be 30 seconds")
-        void defaultTimeoutShouldBe30Seconds() {
-            assertEquals(30_000L, IndexOrchestrator.DEFAULT_BACKPRESSURE_TIMEOUT_MS);
-        }
 
         @Test
         @DisplayName("DEFAULT_HNSW_QUEUE_DEPTH_LIMIT should be 100000")
@@ -38,69 +39,49 @@ class BackpressureTest {
     }
 
     @Nested
-    @DisplayName("API Signature Tests")
-    class ApiSignatureTests {
+    @DisplayName("awaitBackpressureRelease")
+    class AwaitRelease {
 
-        @Test
-        @DisplayName("awaitBackpressureRelease() overload exists with correct signature")
-        void awaitBackpressureReleaseOverloadExists() {
-            // This test verifies the method exists with the correct signature
-            // by using reflection to check the method is present
-            assertDoesNotThrow(() -> {
-                IndexOrchestrator.class.getMethod("awaitBackpressureRelease");
-                IndexOrchestrator.class.getMethod("awaitBackpressureRelease", long.class);
-            }, "awaitBackpressureRelease methods should exist");
+        @TempDir
+        Path dataDir;
+
+        private Arena arena;
+        private StorageEngine storageEngine;
+        private SegmentCatalog catalog;
+        private IndexOrchestrator orchestrator;
+
+        @BeforeEach
+        void setUp() throws IOException {
+            arena = Arena.ofShared();
+            storageEngine = new StorageEngine(dataDir, arena);
+            catalog = new SegmentCatalog();
+            orchestrator = new IndexOrchestrator(catalog, storageEngine);
+        }
+
+        @AfterEach
+        void tearDown() {
+            orchestrator.close();
+            storageEngine.close();
+            catalog.close();
+            arena.close();
         }
 
         @Test
-        @DisplayName("isBackpressured method exists and returns boolean")
-        void isBackpressuredMethodExists() {
-            assertDoesNotThrow(() -> {
-                var method = IndexOrchestrator.class.getMethod("isBackpressured");
-                assertEquals(boolean.class, method.getReturnType(),
-                    "isBackpressured should return boolean");
-            }, "isBackpressured method should exist");
+        @DisplayName("returns true at once when no backpressure is applied")
+        void returnsImmediatelyWhenNotBackpressured() {
+            assertFalse(orchestrator.isBackpressured());
+            assertEquals(0L, orchestrator.getHnswQueueDepth());
+
+            assertTrue(orchestrator.awaitBackpressureRelease(0));
+            assertTrue(orchestrator.awaitBackpressureRelease(1_000));
         }
 
         @Test
-        @DisplayName("getHnswQueueDepth method exists")
-        void getHnswQueueDepthMethodExists() {
-            assertDoesNotThrow(() -> {
-                var method = IndexOrchestrator.class.getMethod("getHnswQueueDepth");
-                assertEquals(long.class, method.getReturnType(),
-                    "getHnswQueueDepth should return long");
-            }, "getHnswQueueDepth method should exist");
-        }
-
-        @Test
-        @DisplayName("getHnswQueueDepthLimit method exists")
-        void getHnswQueueDepthLimitMethodExists() {
-            assertDoesNotThrow(() -> {
-                var method = IndexOrchestrator.class.getMethod("getHnswQueueDepthLimit");
-                assertEquals(int.class, method.getReturnType(),
-                    "getHnswQueueDepthLimit should return int");
-            }, "getHnswQueueDepthLimit method should exist");
-        }
-
-        @Test
-        @DisplayName("awaitBackpressureRelease returns boolean")
-        void awaitBackpressureReleaseReturnsBoolean() throws NoSuchMethodException {
-            var methodWithTimeout = IndexOrchestrator.class.getMethod("awaitBackpressureRelease", long.class);
-            assertEquals(boolean.class, methodWithTimeout.getReturnType(),
-                "awaitBackpressureRelease(long) should return boolean");
-
-            var methodDefault = IndexOrchestrator.class.getMethod("awaitBackpressureRelease");
-            assertEquals(boolean.class, methodDefault.getReturnType(),
-                "awaitBackpressureRelease() should return boolean");
-        }
-
-        @Test
-        @DisplayName("awaitBackpressureRelease(long) takes long parameter")
-        void awaitBackpressureReleaseTakesLongParameter() throws NoSuchMethodException {
-            var method = IndexOrchestrator.class.getMethod("awaitBackpressureRelease", long.class);
-            var paramTypes = method.getParameterTypes();
-            assertEquals(1, paramTypes.length, "Should have one parameter");
-            assertEquals(long.class, paramTypes[0], "Parameter should be long");
+        @DisplayName("rejects a negative timeout")
+        void rejectsNegativeTimeout() {
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> orchestrator.awaitBackpressureRelease(-1));
+            assertTrue(e.getMessage().contains("-1"));
         }
     }
 }

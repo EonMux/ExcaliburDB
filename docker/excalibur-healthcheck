@@ -1,0 +1,60 @@
+#!/bin/sh
+# The container image's HEALTHCHECK: is the node running on this data directory alive?
+#
+# The node records where it is listening in its data directory's lock file, from the socket it
+# actually bound: `health-url=` is its liveness route with the scheme it serves (https when TLS
+# is on), the port it took (however that was configured - EXCALIBUR_PORT, excalibur.api.port,
+# EXCALIBUR_API_PORT, a properties file) and the interface it bound, with a wildcard bind
+# written as loopback. Reading that, rather than rebuilding the URL from configuration this
+# script cannot see, is what keeps the check right under every way of configuring the node.
+#
+# Liveness (/health), not readiness (/health/ready). A container health check feeds restart
+# and replacement decisions, and a drained node, or one still recovering its segments, is alive:
+# killing it would lose the recovery it is part-way through. Readiness belongs to whatever
+# routes traffic - a load balancer, a Kubernetes readinessProbe - and /health/ready is there
+# for it.
+#
+# Over TLS the certificate is not verified (--insecure). The probe connects to the node's own
+# socket inside its own network namespace, sends no credential, and only reads a status code,
+# so there is nothing for an impostor to learn or change; verifying would instead need a trust
+# store and a certificate whose names include 127.0.0.1, which a node's certificate rarely
+# has. A node that requires client certificates (excalibur.api.tls-client-auth=need) refuses
+# the handshake without one: give the probe one with EXCALIBUR_HEALTHCHECK_CLIENT_CERT and
+# EXCALIBUR_HEALTHCHECK_CLIENT_KEY (PEM paths inside the container).
+#
+# Exits 0 when /health answers 2xx, non-zero otherwise, with the reason on stderr - which
+# `docker inspect` shows under .State.Health.Log.
+
+set -u
+
+data_dir="${EXCALIBUR_DATA_DIR:-/var/lib/excalibur}"
+lock="$data_dir/.excalibur-lock"
+
+if [ ! -r "$lock" ]; then
+  echo "excalibur-healthcheck: there is no $lock, so no node has started on $data_dir" >&2
+  exit 1
+fi
+
+# The last value wins, as it does for the node's own reader of the record.
+url=$(sed -n 's/^health-url=//p' "$lock" | tail -n 1)
+if [ -z "$url" ]; then
+  echo "excalibur-healthcheck: $lock records no health-url, so the node holding $data_dir" \
+    "has not bound its listener yet (or is not a node)" >&2
+  exit 1
+fi
+
+set -- --fail --silent --show-error --output /dev/null --noproxy '*' \
+  --max-time "${EXCALIBUR_HEALTHCHECK_TIMEOUT:-4}"
+case "$url" in
+  https://*)
+    set -- "$@" --insecure
+    if [ -n "${EXCALIBUR_HEALTHCHECK_CLIENT_CERT:-}" ]; then
+      set -- "$@" --cert "$EXCALIBUR_HEALTHCHECK_CLIENT_CERT"
+    fi
+    if [ -n "${EXCALIBUR_HEALTHCHECK_CLIENT_KEY:-}" ]; then
+      set -- "$@" --key "$EXCALIBUR_HEALTHCHECK_CLIENT_KEY"
+    fi
+    ;;
+esac
+
+exec curl "$@" "$url"

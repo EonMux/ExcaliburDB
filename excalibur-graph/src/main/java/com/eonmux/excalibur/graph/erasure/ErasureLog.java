@@ -48,11 +48,12 @@ import org.slf4j.LoggerFactory;
  * repeated:
  *   [length : int32][body : length bytes][crc32 of the body : int32]
  *
- * submit body:   [0x01][id : int64][epochSecond : int64][nano : int32][scope]
- * complete body: [0x02][count : int32][id : int64] * count
+ * submit body:      [0x01][id : int64][epochSecond : int64][nano : int32][scope]
+ * complete body:    [0x02][count : int32][id : int64] * count
+ * completed-at body:[0x03][epochSecond : int64][nano : int32][count : int32][id : int64] * count
  *
  * scope: [0x01][entityId : int64]
- *      | [0x02][sourceType ordinal : int8][sourceId : int64]
+ *      | [0x02][sourceType code : int8][sourceId : int64]
  *      | [0x03][extractorVersion : int32]
  * </pre>
  *
@@ -74,6 +75,15 @@ import org.slf4j.LoggerFactory;
  * <p>Completion is recorded by appending a record rather than by rewriting the file. Rewriting
  * would put every outstanding request through a window in which the file is neither the old one nor
  * the new one, and a crash inside that window is exactly the case this class exists to survive.</p>
+ *
+ * <h2>What a completed request leaves behind</h2>
+ * <p>A completion carries the time it was recorded, so {@link #status} can say not only that a
+ * request was discharged but when - which is what a caller under an obligation reports on. What a
+ * request is about is only ever an id: an entity id, a source's provenance id or an extractor
+ * version. The name an entity was resolved from is never written here, before or after the
+ * request is discharged, so reading a status back cannot return the thing that was erased.
+ * The {@value #RETAINED_COMPLETIONS} most recently completed requests keep their scope and
+ * timestamps in memory; see {@link #RETAINED_COMPLETIONS}.</p>
  *
  * <h2>What a valid checksum obliges us to understand</h2>
  * <p>Tolerance stops at the torn tail. A record that checksums correctly but carries a record type,
@@ -120,7 +130,23 @@ public final class ErasureLog implements AutoCloseable {
     private static final long FIRST_ID = 1L;
 
     private static final byte RECORD_SUBMIT = 0x01;
+
+    /** A completion as written before completions carried a time; read, never written. */
     private static final byte RECORD_COMPLETE = 0x02;
+
+    /** A completion and when it was recorded. */
+    private static final byte RECORD_COMPLETE_AT = 0x03;
+
+    /**
+     * Completed requests whose scope and timestamps are kept for {@link #status}.
+     *
+     * <p>Bounded because the log is append-only and never forgets a completion, so what is
+     * remembered about completed requests would otherwise grow with every erasure the namespace
+     * ever discharged. The most recently completed are kept; an older one is still known to be
+     * discharged - its id is below the next one to be handed out and nothing owes it - but is
+     * reported without its scope or times.</p>
+     */
+    public static final int RETAINED_COMPLETIONS = 1024;
 
     private static final byte SCOPE_ENTITY = 0x01;
     private static final byte SCOPE_SOURCE = 0x02;
@@ -145,6 +171,12 @@ public final class ErasureLog implements AutoCloseable {
 
     /** Outstanding requests in id order. Guarded by {@link #appendLock}. */
     private final Map<Long, ErasureRequest> outstanding = new LinkedHashMap<>();
+
+    /**
+     * The most recently completed requests, oldest completion first, at most
+     * {@link #RETAINED_COMPLETIONS}. Guarded by {@link #appendLock}.
+     */
+    private final Map<Long, RequestStatus> completed = retainedCompletions();
 
     /** Next id to hand out. Guarded by {@link #appendLock}. */
     private long nextId;
@@ -229,6 +261,7 @@ public final class ErasureLog implements AutoCloseable {
 
         ErasureLog log = new ErasureLog(file, channel, out, replay.nextId());
         log.outstanding.putAll(replay.outstanding());
+        log.completed.putAll(replay.completed());
         LOGGER.debug("opened erasure log {} with {} outstanding requests",
             file, log.outstanding.size());
         return log;
@@ -286,6 +319,193 @@ public final class ErasureLog implements AutoCloseable {
                     .isNegative())
                 .orElse(false);
         }
+    }
+
+    /**
+     * Where one request stands.
+     *
+     * <p>Two states, because the log records two events. A request is pending from the moment
+     * {@link #submit} returns its id until a compaction has rewritten what it names out of the
+     * store and recorded so; from then on it is discharged. There is no state in between worth
+     * reporting: the log is only told of a completion after the erasure has actually happened.</p>
+     */
+    public enum State {
+        /** Accepted and durable, and not yet applied. */
+        PENDING,
+        /** Applied, and recorded as such. */
+        DISCHARGED
+    }
+
+    /**
+     * What the log knows about one request.
+     *
+     * <p>Scope and timestamps are absent only for a request completed so long ago that it has
+     * fallen out of the {@value #RETAINED_COMPLETIONS} completions kept in memory, or - for
+     * {@code completedAt} alone - one completed by a build that did not yet record when.</p>
+     *
+     * @param id          The request id
+     * @param state       Whether it is still owed
+     * @param scope       What it erases, when known
+     * @param requestedAt When it was accepted, when known
+     * @param completedAt When its completion was recorded, when known; always empty while pending
+     */
+    public record RequestStatus(long id, State state, Optional<ErasureScope> scope,
+                                Optional<Instant> requestedAt, Optional<Instant> completedAt) {
+
+        /**
+         * @throws NullPointerException     if any part is null
+         * @throws IllegalArgumentException if a pending request carries a completion time
+         */
+        public RequestStatus {
+            Objects.requireNonNull(state, "state must not be null");
+            Objects.requireNonNull(scope, "scope must not be null");
+            Objects.requireNonNull(requestedAt, "requestedAt must not be null");
+            Objects.requireNonNull(completedAt, "completedAt must not be null");
+            if (state == State.PENDING && completedAt.isPresent()) {
+                throw new IllegalArgumentException("a pending request has not been completed");
+            }
+        }
+
+        /** A request still owed. */
+        static RequestStatus pending(ErasureRequest request) {
+            return new RequestStatus(request.id(), State.PENDING, Optional.of(request.scope()),
+                Optional.of(request.requestedAt()), Optional.empty());
+        }
+
+        /** A request discharged at {@code completedAt}, or at an unrecorded time when null. */
+        static RequestStatus discharged(ErasureRequest request, Instant completedAt) {
+            return new RequestStatus(request.id(), State.DISCHARGED,
+                Optional.of(request.scope()), Optional.of(request.requestedAt()),
+                Optional.ofNullable(completedAt));
+        }
+
+        /** A request known to be discharged, of which nothing else is remembered. */
+        static RequestStatus dischargedLongAgo(long id) {
+            return new RequestStatus(id, State.DISCHARGED, Optional.empty(), Optional.empty(),
+                Optional.empty());
+        }
+    }
+
+    /**
+     * Where one request of a log stands, read from the file without taking it over.
+     *
+     * <p>For a namespace nothing has open, as {@link #inspect} is: the same single read and
+     * replay, refusing everything {@link #open} refuses, and answering exactly what
+     * {@link #status} would answer had the log been opened.</p>
+     *
+     * @param file The log file; need not exist
+     * @param id   The request id
+     * @return Its status, or empty when this log never handed that id out
+     * @throws IOException if the file exists and is not an erasure log this build can read
+     * @throws LogCorruptionException if damage has an intact record behind it
+     * @throws NullPointerException if {@code file} is null
+     */
+    public static Optional<RequestStatus> statusOf(Path file, long id) throws IOException {
+        return Optional.ofNullable(statusesOf(file, List.of(id)).get(id));
+    }
+
+    /**
+     * Where several requests of a log stand, from one read of the file.
+     *
+     * <p>{@link #statusOf} per id would replay the whole log once per id, and a document
+     * erasure submits one request per document it removed.</p>
+     *
+     * @param file The log file; need not exist
+     * @param ids  The request ids
+     * @return The status of each id this log handed out; an id it never did is absent
+     * @throws IOException if the file exists and is not an erasure log this build can read
+     * @throws LogCorruptionException if damage has an intact record behind it
+     * @throws NullPointerException if {@code file} or {@code ids} is null
+     */
+    public static Map<Long, RequestStatus> statusesOf(Path file, Collection<Long> ids)
+            throws IOException {
+        Objects.requireNonNull(file, "file must not be null");
+        Objects.requireNonNull(ids, "ids must not be null");
+        if (!Files.exists(file)) {
+            return Map.of();
+        }
+        if (Files.size(file) < HEADER_BYTES) {
+            // A torn creation has handed out nothing; anything else that short is refused as
+            // the open refuses it.
+            inspectLog(file);
+            return Map.of();
+        }
+        Replay replay = replay(file);
+        TailIntegrity.requireTornTail(file, "erasure log", replay.contents(),
+            replay.validBytes(), ErasureLog::recordStartsAt);
+        return statusesIn(ids, replay.outstanding(), replay.completed(), replay.nextId());
+    }
+
+    /**
+     * Where one request stands.
+     *
+     * @param id The request id
+     * @return Its status, or empty when this log never handed that id out
+     */
+    public Optional<RequestStatus> status(long id) {
+        synchronized (appendLock) {
+            return statusIn(id, outstanding, completed, nextId);
+        }
+    }
+
+    /**
+     * Where several requests stand, read under one hold of the log.
+     *
+     * @param ids The request ids
+     * @return The status of each id this log handed out; an id it never did is absent
+     * @throws NullPointerException if {@code ids} is null
+     */
+    public Map<Long, RequestStatus> statuses(Collection<Long> ids) {
+        Objects.requireNonNull(ids, "ids must not be null");
+        synchronized (appendLock) {
+            return statusesIn(ids, outstanding, completed, nextId);
+        }
+    }
+
+    private static Map<Long, RequestStatus> statusesIn(Collection<Long> ids,
+                                                       Map<Long, ErasureRequest> owed,
+                                                       Map<Long, RequestStatus> done,
+                                                       long nextId) {
+        Map<Long, RequestStatus> statuses = new LinkedHashMap<>();
+        for (long id : ids) {
+            statusIn(id, owed, done, nextId).ifPresent(status -> statuses.put(id, status));
+        }
+        return statuses;
+    }
+
+    /**
+     * Answers {@link #status} from a log's state, whether replayed from the file or held open.
+     *
+     * @param id        The request id
+     * @param owed      What is outstanding
+     * @param done      The retained completions
+     * @param nextId    The next id the log would hand out
+     * @return The status, or empty for an id never handed out
+     */
+    private static Optional<RequestStatus> statusIn(long id, Map<Long, ErasureRequest> owed,
+                                                    Map<Long, RequestStatus> done, long nextId) {
+        if (id < FIRST_ID || id >= nextId) {
+            return Optional.empty();
+        }
+        ErasureRequest pending = owed.get(id);
+        if (pending != null) {
+            return Optional.of(RequestStatus.pending(pending));
+        }
+        // Handed out and owed by nothing, so completed. An id lost with a torn tail cannot land
+        // here: submit forces before it returns an id, so the replay's next id never passes a
+        // submission that was not durable.
+        RequestStatus retained = done.get(id);
+        return Optional.of(retained != null ? retained : RequestStatus.dischargedLongAgo(id));
+    }
+
+    /** A map of completions that forgets the oldest once it holds more than it retains. */
+    private static Map<Long, RequestStatus> retainedCompletions() {
+        return new LinkedHashMap<>() {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<Long, RequestStatus> eldest) {
+                return size() > RETAINED_COMPLETIONS;
+            }
+        };
     }
 
     /**
@@ -521,7 +741,24 @@ public final class ErasureLog implements AutoCloseable {
      * @throws IllegalStateException if the log is closed
      */
     public void complete(Collection<Long> requestIds) throws IOException {
+        complete(requestIds, Instant.now());
+    }
+
+    /**
+     * Records that these requests were satisfied at {@code completedAt}.
+     *
+     * <p>As {@link #complete(Collection)}, with the time taken from the caller's clock - the one
+     * the requests' deadlines were measured against - rather than from this process's.</p>
+     *
+     * @param requestIds  The ids to mark satisfied; unknown ids are ignored
+     * @param completedAt When the erasure they name was applied
+     * @throws IOException if the record cannot be written
+     * @throws NullPointerException if an argument or any element is null
+     * @throws IllegalStateException if the log is closed
+     */
+    public void complete(Collection<Long> requestIds, Instant completedAt) throws IOException {
         Objects.requireNonNull(requestIds, "requestIds must not be null");
+        Objects.requireNonNull(completedAt, "completedAt must not be null");
 
         synchronized (appendLock) {
             requireOpen();
@@ -539,12 +776,13 @@ public final class ErasureLog implements AutoCloseable {
             for (int from = 0; from < known.size(); from += COMPLETIONS_PER_RECORD) {
                 List<Long> chunk = known.subList(from,
                     Math.min(from + COMPLETIONS_PER_RECORD, known.size()));
-                append(encodeComplete(chunk));
+                append(encodeComplete(chunk, completedAt));
                 // Flushed per chunk so a failure part way through leaves whole records behind
                 // rather than a body split across the buffer boundary.
                 out.flush();
                 for (Long id : chunk) {
-                    outstanding.remove(id);
+                    completed.put(id, RequestStatus.discharged(outstanding.remove(id),
+                        completedAt));
                 }
             }
             LOGGER.info("erasure requests {} marked satisfied; {} still outstanding",
@@ -670,11 +908,13 @@ public final class ErasureLog implements AutoCloseable {
         return bytes.toByteArray();
     }
 
-    private static byte[] encodeComplete(List<Long> ids) {
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream(8 + ids.size() * Long.BYTES);
+    private static byte[] encodeComplete(List<Long> ids, Instant completedAt) {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream(20 + ids.size() * Long.BYTES);
         DataOutputStream body = new DataOutputStream(bytes);
         try {
-            body.writeByte(RECORD_COMPLETE);
+            body.writeByte(RECORD_COMPLETE_AT);
+            body.writeLong(completedAt.getEpochSecond());
+            body.writeInt(completedAt.getNano());
             body.writeInt(ids.size());
             for (Long id : ids) {
                 body.writeLong(id);
@@ -690,13 +930,15 @@ public final class ErasureLog implements AutoCloseable {
      * What a replay recovered.
      *
      * @param outstanding Requests submitted and not completed, in id order
+     * @param completed   The most recently completed requests, as {@link #completed} keeps them
      * @param nextId      One past the highest id ever submitted, so a completed request's id is
      *                    never handed out again and an audit of the file stays unambiguous
      * @param validBytes  Length of the file up to the end of the last intact record
      * @param records     How many intact records were replayed, submissions and completions both
      * @param contents    The whole file as read, so the tail can be examined without re-reading it
      */
-    private record Replay(Map<Long, ErasureRequest> outstanding, long nextId, long validBytes,
+    private record Replay(Map<Long, ErasureRequest> outstanding,
+                          Map<Long, RequestStatus> completed, long nextId, long validBytes,
                           long records, byte[] contents) {
     }
 
@@ -729,7 +971,7 @@ public final class ErasureLog implements AutoCloseable {
             return false;
         }
         try {
-            applyRecord(SCANNING, body, new LinkedHashMap<>());
+            applyRecord(SCANNING, body, new LinkedHashMap<>(), new LinkedHashMap<>());
             return true;
         } catch (IOException e) {
             // An intact record this build cannot interpret. Reported by the replay itself when it
@@ -748,8 +990,9 @@ public final class ErasureLog implements AutoCloseable {
      */
     private static Replay replay(Path path) throws IOException {
         Map<Long, ErasureRequest> outstanding = new LinkedHashMap<>();
+        Map<Long, RequestStatus> completed = retainedCompletions();
         if (!Files.exists(path) || Files.size(path) < HEADER_BYTES) {
-            return new Replay(outstanding, FIRST_ID, HEADER_BYTES, 0, new byte[0]);
+            return new Replay(outstanding, completed, FIRST_ID, HEADER_BYTES, 0, new byte[0]);
         }
 
         byte[] contents = Files.readAllBytes(path);
@@ -788,11 +1031,11 @@ public final class ErasureLog implements AutoCloseable {
                 break;
             }
 
-            nextId = Math.max(nextId, applyRecord(path, body, outstanding));
+            nextId = Math.max(nextId, applyRecord(path, body, outstanding, completed));
             validBytes = buffer.position();
             records++;
         }
-        return new Replay(outstanding, nextId, validBytes, records, contents);
+        return new Replay(outstanding, completed, nextId, validBytes, records, contents);
     }
 
     /**
@@ -801,11 +1044,13 @@ public final class ErasureLog implements AutoCloseable {
      * @param path        The file, for error messages
      * @param body        The record body, already checksummed
      * @param outstanding The map being rebuilt
+     * @param completed   The retained completions being rebuilt
      * @return One past the id this record submitted, or {@link #FIRST_ID} for a completion
      * @throws IOException if the record is intact but this build cannot interpret it
      */
     private static long applyRecord(Path path, byte[] body,
-                                    Map<Long, ErasureRequest> outstanding) throws IOException {
+                                    Map<Long, ErasureRequest> outstanding,
+                                    Map<Long, RequestStatus> completed) throws IOException {
         ByteBuffer record = ByteBuffer.wrap(body);
         try {
             byte type = record.get();
@@ -813,15 +1058,23 @@ public final class ErasureLog implements AutoCloseable {
                 case RECORD_SUBMIT -> {
                     long id = record.getLong();
                     Instant requestedAt = Instant.ofEpochSecond(record.getLong(), record.getInt());
-                    outstanding.put(id,
-                        new ErasureRequest(id, decodeScope(path, record), requestedAt));
+                    ErasureScope scope = decodeScope(path, record);
+                    if (scope != null) {
+                        outstanding.put(id, new ErasureRequest(id, scope, requestedAt));
+                    } else if (path != SCANNING) {
+                        LOGGER.info("erasure request {} in {} names a retired source type, which "
+                            + "nothing this build stores can carry; there is nothing left for it "
+                            + "to erase, so it is not outstanding", id, path);
+                    }
                     return id + 1;
                 }
                 case RECORD_COMPLETE -> {
-                    int count = record.getInt();
-                    for (int i = 0; i < count; i++) {
-                        outstanding.remove(record.getLong());
-                    }
+                    applyCompletions(record, null, outstanding, completed);
+                    return FIRST_ID;
+                }
+                case RECORD_COMPLETE_AT -> {
+                    Instant completedAt = Instant.ofEpochSecond(record.getLong(), record.getInt());
+                    applyCompletions(record, completedAt, outstanding, completed);
                     return FIRST_ID;
                 }
                 default -> throw new IOException("erasure log " + path + " holds an intact record "
@@ -837,13 +1090,46 @@ public final class ErasureLog implements AutoCloseable {
         }
     }
 
+    /**
+     * Moves the requests a completion record names from outstanding to completed.
+     *
+     * @param record      The record, positioned at its count
+     * @param completedAt When the completion was recorded, or null for a record that did not say
+     * @param outstanding The requests still owed
+     * @param completed   The retained completions
+     */
+    private static void applyCompletions(ByteBuffer record, Instant completedAt,
+                                         Map<Long, ErasureRequest> outstanding,
+                                         Map<Long, RequestStatus> completed) {
+        int count = record.getInt();
+        for (int i = 0; i < count; i++) {
+            ErasureRequest request = outstanding.remove(record.getLong());
+            if (request != null) {
+                completed.put(request.id(), RequestStatus.discharged(request, completedAt));
+            }
+        }
+    }
+
+    /**
+     * Decodes the scope of a submitted request.
+     *
+     * @param path   The file, for error messages
+     * @param record The body, positioned at the scope
+     * @return The scope, or null for a source scope naming a retired source type
+     * @throws IOException if the scope is intact but this build cannot interpret it
+     */
     private static ErasureScope decodeScope(Path path, ByteBuffer record) throws IOException {
         byte discriminator = record.get();
         return switch (discriminator) {
             case SCOPE_ENTITY -> new ErasureScope.Entity(record.getLong());
             case SCOPE_SOURCE -> {
-                SourceType type = decodeSourceType(path, record.get());
-                yield new ErasureScope.Source(type, record.getLong());
+                byte stored = record.get();
+                long sourceId = record.getLong();
+                // An earlier build accepted requests naming these types, and nothing ever
+                // stored a fact carrying one; there is nothing such a request could still erase.
+                yield SourceType.isRetired(stored)
+                    ? null
+                    : new ErasureScope.Source(decodeSourceType(path, stored), sourceId);
             }
             case SCOPE_EXTRACTOR_VERSION -> new ErasureScope.ExtractorVersion(record.getInt());
             default -> throw new IOException("erasure log " + path + " holds an intact request of "
@@ -861,13 +1147,9 @@ public final class ErasureLog implements AutoCloseable {
      * for while leaving the one they did ask for on disk.
      */
     private static SourceType decodeSourceType(Path path, byte stored) throws IOException {
-        int ordinal = stored & 0xFF;
-        SourceType[] all = SourceType.values();
-        if (ordinal >= all.length) {
-            throw new IOException("erasure log " + path + " names source type ordinal " + ordinal
-                + ", which this build does not know; it was written by a newer build");
-        }
-        return all[ordinal];
+        return SourceType.decode(stored).orElseThrow(() -> new IOException("erasure log " + path
+            + " names source type code " + (stored & 0xFF) + ", which this build does not "
+            + "know; it was written by a newer build"));
     }
 
     @Override

@@ -49,7 +49,6 @@ import static org.junit.jupiter.api.Assertions.*;
 class ConcurrentDocumentAtomicityTest {
 
     private DocumentVisibilityTracker tracker;
-    private DocumentVisibilityRegistry registry;
     private AtomicLong epochCounter;
 
     @BeforeEach
@@ -57,7 +56,6 @@ class ConcurrentDocumentAtomicityTest {
         epochCounter = new AtomicLong(0);
         DocumentRegistry docRegistry = new DocumentRegistry();
         tracker = new DocumentVisibilityTracker(docRegistry);
-        registry = new DocumentVisibilityRegistry();
     }
 
     @Test
@@ -94,7 +92,6 @@ class ConcurrentDocumentAtomicityTest {
 
                         long commitEpoch = epochCounter.incrementAndGet();
                         tracker.registerDocument(docId, chunkIds, commitEpoch);
-                        registry.registerDocument(docId, new HashSet<>(chunkIds), commitEpoch);
                         documentCommitEpochs.put(docId, commitEpoch);
                     }
                 } catch (InterruptedException e) {
@@ -308,7 +305,7 @@ class ConcurrentDocumentAtomicityTest {
     }
 
     @Test
-    void testVisibilityRegistryAtomicRegistration() throws Exception {
+    void testTrackerAtomicRegistration() throws Exception {
         int numDocuments = 50;
         int chunksPerDoc = 3;
         CountDownLatch startLatch = new CountDownLatch(1);
@@ -324,19 +321,19 @@ class ConcurrentDocumentAtomicityTest {
                 try {
                     startLatch.await();
 
-                    String docId = "registryDoc" + docIndex;
+                    String docId = "trackedDoc" + docIndex;
                     Set<String> chunkIds = new HashSet<>();
                     for (int c = 0; c < chunksPerDoc; c++) {
                         chunkIds.add(docId + ":chunk:" + c);
                     }
 
                     long commitEpoch = epochCounter.incrementAndGet();
-                    registry.registerDocument(docId, chunkIds, commitEpoch);
+                    tracker.registerDocument(docId, chunkIds, commitEpoch);
 
                     for (String chunkId : chunkIds) {
-                        boolean visibleAtCommit = registry.isChunkVisibleAt(chunkId, commitEpoch);
-                        boolean visibleAfter = registry.isChunkVisibleAt(chunkId, commitEpoch + 1000);
-                        boolean visibleBefore = registry.isChunkVisibleAt(chunkId, commitEpoch - 1);
+                        boolean visibleAtCommit = tracker.isChunkVisible(chunkId, commitEpoch);
+                        boolean visibleAfter = tracker.isChunkVisible(chunkId, commitEpoch + 1000);
+                        boolean visibleBefore = tracker.isChunkVisible(chunkId, commitEpoch - 1);
 
                         if (!visibleAtCommit || !visibleAfter || visibleBefore) {
                             violations.incrementAndGet();
@@ -357,7 +354,7 @@ class ConcurrentDocumentAtomicityTest {
         assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
 
         assertEquals(0, violations.get(), 
-            "Visibility registry should maintain atomic visibility for all chunks");
+            "Visibility tracking should maintain atomic visibility for all chunks");
     }
 
     @Test
@@ -390,7 +387,6 @@ class ConcurrentDocumentAtomicityTest {
 
                         long epoch = tracker.advanceEpoch();
                         tracker.registerDocument(docId, chunkIds, epoch);
-                        registry.registerDocument(docId, chunkIds, epoch);
                         documentEpochs.put(docId, epoch);
 
                         Thread.sleep(2);
@@ -417,10 +413,13 @@ class ConcurrentDocumentAtomicityTest {
                             Long commitEpoch = documentEpochs.get(docId);
                             if (commitEpoch == null) continue;
 
-                            Set<String> docChunks = registry.getChunksForDocument(docId);
+                            DocumentVisibilityTracker.DocumentVisibility tracked =
+                                tracker.getVisibility(docId);
+                            if (tracked == null) continue;
+                            Set<String> docChunks = tracked.chunkIds();
                             int visibleCount = 0;
                             for (String chunkId : docChunks) {
-                                if (registry.isChunkVisibleAt(chunkId, queryEpoch)) {
+                                if (tracker.isChunkVisible(chunkId, queryEpoch)) {
                                     visibleCount++;
                                 }
                             }
@@ -456,57 +455,53 @@ class ConcurrentDocumentAtomicityTest {
     }
 
     @Test
-    void testDocumentReplacementAtomicity() throws Exception {
+    void testDocumentReplacementAtomicity() {
         String docId = "replacedDoc";
 
-        Set<String> oldChunks = new HashSet<>(Arrays.asList(docId + ":old0", docId + ":old1"));
-        registry.registerDocument(docId, oldChunks, 1L);
+        Set<String> oldChunks = new HashSet<>(Arrays.asList(
+            docId + ":chunk:0", docId + ":chunk:1"));
+        tracker.registerDocument(docId, oldChunks, 1L);
 
-        assertTrue(registry.isVisibleAt(docId, 1L));
-        assertEquals(2, registry.getChunksForDocument(docId).size());
+        assertTrue(tracker.isDocumentFullyVisible(docId, 1L));
+        assertEquals(2, tracker.getChunkCount(docId));
 
         Set<String> newChunks = new HashSet<>(Arrays.asList(
-            docId + ":new0", docId + ":new1", docId + ":new2"
+            docId + ":chunk:0", docId + ":chunk:1", docId + ":chunk:2"
         ));
-        registry.replaceDocument(docId, newChunks, 5L);
+        tracker.registerDocument(docId, newChunks, 5L);
 
-        assertFalse(registry.isVisibleAt(docId, 3L), 
-            "Document should not be visible between replacement epochs");
-        assertTrue(registry.isVisibleAt(docId, 5L), 
+        assertFalse(tracker.isDocumentFullyVisible(docId, 3L),
+            "A query older than the replacement must not see the replaced document");
+        assertTrue(tracker.isDocumentFullyVisible(docId, 5L),
             "Document should be visible at replacement epoch");
-        assertEquals(3, registry.getChunksForDocument(docId).size());
-
-        for (String oldChunk : oldChunks) {
-            assertNull(registry.getDocumentForChunk(oldChunk),
-                "Old chunk should not be registered: " + oldChunk);
-        }
+        assertEquals(newChunks, tracker.getVisibility(docId).chunkIds());
         for (String newChunk : newChunks) {
-            assertEquals(docId, registry.getDocumentForChunk(newChunk),
-                "New chunk should be registered: " + newChunk);
+            assertTrue(tracker.isChunkVisible(newChunk, 5L),
+                "New chunk should be visible with its document: " + newChunk);
         }
     }
 
     @Test
-    void testTombstoneAtomicity() throws Exception {
+    void testRemovalAtomicity() {
         String docId = "tombstonedDoc";
-        Set<String> chunkIds = new HashSet<>(Arrays.asList(docId + ":0", docId + ":1", docId + ":2"));
+        Set<String> chunkIds = new HashSet<>(Arrays.asList(
+            docId + ":chunk:0", docId + ":chunk:1", docId + ":chunk:2"));
 
-        registry.registerDocument(docId, chunkIds, 1L);
+        tracker.registerDocument(docId, chunkIds, 1L);
 
-        assertTrue(registry.isVisibleAt(docId, 5L));
+        assertTrue(tracker.isDocumentFullyVisible(docId, 5L));
         for (String chunkId : chunkIds) {
-            assertTrue(registry.isChunkVisibleAt(chunkId, 5L));
+            assertTrue(tracker.isChunkVisible(chunkId, 5L));
         }
 
-        boolean removed = registry.tombstoneDocument(docId);
-        assertTrue(removed);
+        assertTrue(tracker.removeDocument(docId));
 
-        assertFalse(registry.isVisibleAt(docId, 5L));
+        assertFalse(tracker.isDocumentFullyVisible(docId, 5L));
         for (String chunkId : chunkIds) {
-            assertFalse(registry.isChunkVisibleAt(chunkId, 5L));
+            assertFalse(tracker.isChunkVisible(chunkId, 5L));
         }
 
-        assertEquals(0, registry.getDocumentCount());
+        assertEquals(0, tracker.getDocumentCount());
     }
 
     /**

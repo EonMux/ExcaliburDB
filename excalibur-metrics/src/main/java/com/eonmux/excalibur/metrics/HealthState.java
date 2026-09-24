@@ -26,12 +26,17 @@ final class HealthState {
     /** Health score at or above which the system counts as healthy and ready. */
     static final double HEALTHY_SCORE_THRESHOLD = 0.5;
 
-    private final AtomicReference<Double> healthScore = new AtomicReference<>(0.5);
+    private final AtomicReference<Double> healthScore = new AtomicReference<>(0.0);
     private final AtomicReference<Double> estimatedCoverage = new AtomicReference<>(0.0);
 
     /**
-     * Creates a health state that starts at the threshold, neither healthy-with-margin nor
-     * unhealthy, and at zero known coverage.
+     * Creates a health state with nothing measured: zero known coverage, and the zero score that
+     * goes with it.
+     *
+     * <p>The score a node publishes is its coverage (the epoch tick and the health endpoint
+     * both write it), so before the first measurement the two start equal. Starting the score
+     * anywhere at or above the healthy threshold would report a node as healthy before anything
+     * had been measured to be visible.</p>
      */
     HealthState() {
     }

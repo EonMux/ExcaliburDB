@@ -2,10 +2,14 @@ package com.eonmux.excalibur.retrieval.pipeline;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import org.roaringbitmap.RoaringBitmap;
 
+import com.eonmux.excalibur.core.util.QueryBudget;
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.store.EdgeStore;
 import com.eonmux.excalibur.graph.store.MappedEdgeStore;
@@ -34,6 +38,19 @@ import org.slf4j.LoggerFactory;
  * start is not at either extreme; when nothing collected is dated, everything collected is kept
  * and the aggregate says so.
  *
+ * <h2>How far a walk may grow</h2>
+ * Bounded by {@link WalkLimits}: each hop admits at most {@code maxFrontier} new entities, those
+ * reached along the strongest edges, and the walk collects at most {@code maxFacts} facts, those
+ * touching the named entities first, then the most confident, then the most recent. What either
+ * bound left out is reported beside the subgraph, never silently. The frontier bound needs the
+ * edge columns a {@link MappedEdgeStore} has; another store is walked unbounded, and has no facts
+ * to collect.
+ *
+ * <h2>Deadline</h2>
+ * A walk whose query's deadline passes stops where it is and hands back what it had collected,
+ * marking the budget timed out; a hop that was in progress is discarded whole. A cancelled query
+ * ends the walk with a {@link java.util.concurrent.CancellationException}.
+ *
  * <h2>Thread Safety</h2>
  * Stateless beyond its immutable collaborators, and safe to share as long as they are.
  */
@@ -43,16 +60,40 @@ final class GraphWalker {
 
     private final EdgeStore edgeStore;
 
+    /**
+     * The order facts are kept in when a walk passes more than it may collect: nearest the named
+     * entities, then most confident, then latest start, then position in the store.
+     */
+    private static final Comparator<SubgraphEdge> PREFERRED =
+        Comparator.comparingInt(SubgraphEdge::depth)
+            .thenComparing(Comparator.comparingInt(
+                (SubgraphEdge edge) -> edge.provenance().confidence()).reversed())
+            .thenComparing(Comparator.comparingInt(SubgraphEdge::validFrom).reversed())
+            .thenComparingLong(SubgraphEdge::forwardEdgeIndex);
+
     /** Resolves relation hints and names the vocabulary; null when this node has no dictionary. */
     private final RelationResolver relations;
+
+    private final WalkLimits limits;
 
     /**
      * @param edgeStore the graph
      * @param relations the relation vocabulary, or null to traverse every relation both ways
+     * @param limits    how wide a walk may grow
      */
-    GraphWalker(EdgeStore edgeStore, RelationResolver relations) {
+    GraphWalker(EdgeStore edgeStore, RelationResolver relations, WalkLimits limits) {
         this.edgeStore = edgeStore;
         this.relations = relations;
+        this.limits = limits;
+    }
+
+    /**
+     * The facts a walk collected, and what its limits left out.
+     *
+     * @param subgraph   the seeds and the facts collected
+     * @param truncation what the frontier and fact bounds dropped
+     */
+    record Walk(Subgraph subgraph, WalkTruncation truncation) {
     }
 
     /**
@@ -80,9 +121,11 @@ final class GraphWalker {
      * @param plan      the plan, possibly temporal
      * @param seeds     the entities the question's mentions resolved to
      * @param direction which way the walk may step
-     * @return the facts collected
+     * @param budget    the query's deadline and cancellation
+     * @return the facts collected, and what the walk's limits left out
+     * @throws java.util.concurrent.CancellationException if the query was cancelled
      */
-    Subgraph walk(QueryPlan plan, long[] seeds, TraversalDirection direction) {
+    Walk walk(QueryPlan plan, long[] seeds, TraversalDirection direction, QueryBudget budget) {
         TemporalFilter asOf = plan instanceof QueryPlan.Temporal temporal
             ? temporal.asOf()
             : TemporalFilter.now();
@@ -103,8 +146,10 @@ final class GraphWalker {
             : null;
         Window window = extremum == null ? new Window(asOf, asOf::admits) : beganBy(asOf);
 
-        Subgraph collected = walkNarrowed(core, seeds, hops, direction, window);
-        return extremum == null ? collected : atExtreme(collected, extremum);
+        Walk collected = walkNarrowed(core, seeds, hops, direction, window, budget);
+        return extremum == null
+            ? collected
+            : new Walk(atExtreme(collected.subgraph(), extremum), collected.truncation());
     }
 
     /**
@@ -117,13 +162,13 @@ final class GraphWalker {
      * refusal, and the asker would have no way to see that the fact was there. A hint may sharpen
      * an answer; it may not remove one.
      */
-    private Subgraph walkNarrowed(QueryPlan core, long[] seeds, int hops,
-                                  TraversalDirection direction, Window window) {
+    private Walk walkNarrowed(QueryPlan core, long[] seeds, int hops,
+                              TraversalDirection direction, Window window, QueryBudget budget) {
         int[] wanted = relationsNamedBy(core);
         if (wanted.length > 0) {
-            Subgraph narrowed = walkAlong(seeds, hops, selectors(wanted, direction), direction,
-                window, wanted);
-            if (!narrowed.edges().isEmpty()) {
+            Walk narrowed = walkAlong(seeds, hops, selectors(wanted, direction), direction,
+                window, wanted, budget);
+            if (!narrowed.subgraph().edges().isEmpty()) {
                 return narrowed;
             }
             LOGGER.debug("relation hints {} matched no edge; traversing every relation",
@@ -132,7 +177,7 @@ final class GraphWalker {
         int[] every = direction == TraversalDirection.BOTH
             ? null
             : selectors(relations.all(), direction);
-        return walkAlong(seeds, hops, every, direction, window, null);
+        return walkAlong(seeds, hops, every, direction, window, null, budget);
     }
 
     /**
@@ -141,15 +186,45 @@ final class GraphWalker {
      * @param selectors        the relations and directions to follow, or null for all both ways
      * @param allowedRelations the relations facts may carry, or null for any
      */
-    private Subgraph walkAlong(long[] seeds, int hops, int[] selectors,
-                               TraversalDirection direction, Window window,
-                               int[] allowedRelations) {
-        long[] reachable = edgeStore.expand(seeds, hops, selectors, window.walk());
-        // Where a one-way step may start: anything reached with a hop to spare.
+    private Walk walkAlong(long[] seeds, int hops, int[] selectors,
+                           TraversalDirection direction, Window window,
+                           int[] allowedRelations, QueryBudget budget) {
+        Reach reach = expand(seeds, hops, selectors, window.walk(), budget);
+        // Where a one-way step may start: anything reached with a hop to spare. The capped walk
+        // is deterministic hop by hop, so this is exactly the walk above one hop short.
         long[] startable = direction == TraversalDirection.BOTH
-            ? reachable
-            : edgeStore.expand(seeds, hops - 1, selectors, window.walk());
-        return collect(seeds, reachable, startable, window, allowedRelations, direction);
+            ? reach.reached()
+            : expand(seeds, hops - 1, selectors, window.walk(), budget).reached();
+        return collect(seeds, reach, startable, window, allowedRelations, direction, budget);
+    }
+
+    /**
+     * The entities within {@code hops}, each hop capped when the store can rank its edges.
+     *
+     * @return the entities reached, and how many a cap left out
+     */
+    private Reach expand(long[] seeds, int hops, int[] selectors, TemporalFilter asOf,
+                         QueryBudget budget) {
+        if (!(edgeStore instanceof MappedEdgeStore mapped)) {
+            budget.throwIfCancelled();
+            return new Reach(edgeStore.expand(seeds, hops, selectors, asOf), 0);
+        }
+        MappedEdgeStore.Expansion expansion = mapped.expand(seeds, hops, selectors, asOf,
+            limits.maxFrontier(), budget::isExhausted);
+        budget.throwIfCancelled();
+        if (expansion.stopped()) {
+            budget.markTimedOut();
+        }
+        return new Reach(expansion.reached(), expansion.entitiesDropped());
+    }
+
+    /**
+     * What one expansion reached.
+     *
+     * @param reached         the entities, seeds included
+     * @param entitiesDropped how many a hop's cap left out
+     */
+    private record Reach(long[] reached, long entitiesDropped) {
     }
 
     /**
@@ -212,14 +287,16 @@ final class GraphWalker {
      * reached entities would return, for "what did this company acquire", the fact that it was
      * acquired - both ends are in reach, and only the direction says the fact is not the answer.
      */
-    private Subgraph collect(long[] seeds, long[] reachable, long[] startable, Window window,
-                             int[] allowedRelations, TraversalDirection direction) {
+    private Walk collect(long[] seeds, Reach reach, long[] startable, Window window,
+                         int[] allowedRelations, TraversalDirection direction,
+                         QueryBudget budget) {
+        long[] reachable = reach.reached();
         Subgraph.Builder builder = new Subgraph.Builder();
         for (long seed : seeds) {
             builder.seed(seed);
         }
         if (!(edgeStore instanceof MappedEdgeStore mapped)) {
-            return builder.build();
+            return new Walk(builder.build(), new WalkTruncation(reach.entitiesDropped(), 0));
         }
 
         // Bitmaps over entity ids rather than boxed sets: the membership test runs once per edge
@@ -232,7 +309,15 @@ final class GraphWalker {
         // subgraph is a handful of entities and the store can hold tens of millions of edges,
         // so a full scan made the cost of answering a question grow with the size of the graph
         // instead of with the size of the answer.
+        // An edge between two reached entities is met from each end; it is one fact.
+        List<SubgraphEdge> passed = new ArrayList<>();
+        Set<Long> met = new HashSet<>();
         for (long entity : reachable) {
+            if (budget.isExhausted()) {
+                budget.throwIfCancelled();
+                budget.markTimedOut();
+                break;
+            }
             mapped.forEachEdgeOf(entity, (subject, relation, object, index) -> {
                 if (!inScope.contains(object) || !stepped(direction, subject, object, canStart)) {
                     return;
@@ -248,13 +333,46 @@ final class GraphWalker {
                 if (!window.facts().admits(validFrom, validTo)) {
                     return;
                 }
+                if (!met.add(index)) {
+                    return;
+                }
                 Provenance provenance = mapped.provenanceOf(index);
                 int depth = seedSet.contains(subject) || seedSet.contains(object) ? 1 : 2;
-                builder.edge(new SubgraphEdge(subject, relation, object, index,
+                passed.add(new SubgraphEdge(subject, relation, object, index,
                     validFrom, validTo, provenance, depth));
             });
         }
-        return builder.build();
+        List<SubgraphEdge> kept = strongest(passed, limits.maxFacts());
+        kept.forEach(builder::edge);
+        return new Walk(builder.build(),
+            new WalkTruncation(reach.entitiesDropped(), passed.size() - kept.size()));
+    }
+
+    /**
+     * The {@code max} facts to keep of those a walk passed, in the order it passed them.
+     *
+     * <p>Ranked by {@link #PREFERRED}: a fact about a named entity is evidence for the answer,
+     * one two hops out is context, and the store position that ends the order is unique, so the
+     * choice is total. Kept in encounter order afterwards, so a walk inside its bound yields
+     * exactly the subgraph it always did.</p>
+     */
+    private static List<SubgraphEdge> strongest(List<SubgraphEdge> passed, int max) {
+        if (passed.size() <= max) {
+            return passed;
+        }
+        List<SubgraphEdge> ranked = new ArrayList<>(passed);
+        ranked.sort(PREFERRED);
+        Set<Long> chosen = new HashSet<>();
+        for (int i = 0; i < max; i++) {
+            chosen.add(ranked.get(i).forwardEdgeIndex());
+        }
+        List<SubgraphEdge> kept = new ArrayList<>(max);
+        for (SubgraphEdge edge : passed) {
+            if (chosen.contains(edge.forwardEdgeIndex())) {
+                kept.add(edge);
+            }
+        }
+        return kept;
     }
 
     /** Whether a fact from {@code subject} to {@code object} lies along the walk's direction. */

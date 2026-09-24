@@ -36,5 +36,6 @@ include(
     "excalibur-backup",
     "excalibur-fsck",
     "excalibur-bench",
-    "excalibur-integration"
+    "excalibur-integration",
+    "excalibur-coverage"
 )

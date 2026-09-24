@@ -2,8 +2,10 @@ package com.eonmux.excalibur.retrieval.rerank;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.eonmux.excalibur.core.util.QueryBudget;
 import com.eonmux.excalibur.llm.client.CircuitBreaker;
 import com.eonmux.excalibur.retrieval.rank.RankedList;
 import com.eonmux.excalibur.retrieval.rank.Ranker;
@@ -35,6 +37,13 @@ import org.slf4j.LoggerFactory;
  * — still fused, still ordered. Not an unranked dump, and not nothing. Degrading from "the model's
  * opinion of a good ranking" to "a good ranking" is a real fallback; degrading to an arbitrary
  * order is an outage that returns HTTP 200.
+ *
+ * <h2>Deadline</h2>
+ * The call is waited for only as long as the query's budget allows, not for the client's own
+ * timeout times its retries: when the deadline passes first the call is interrupted, the budget is
+ * marked timed out and the delegate's ranking is returned, as for any other failure - except that
+ * it is not recorded against the breaker, because a caller's short deadline says nothing about the
+ * model's health. A query cancelled while the call is in flight interrupts it and ends the query.
  */
 public final class BatchedLlmReranker implements Ranker {
 
@@ -96,6 +105,11 @@ public final class BatchedLlmReranker implements Ranker {
 
     @Override
     public RankedList rank(RetrievalQuery query, int limit) {
+        return rank(query, limit, QueryBudget.unbounded());
+    }
+
+    @Override
+    public RankedList rank(RetrievalQuery query, int limit, QueryBudget budget) {
         if (query == null) {
             throw new IllegalArgumentException("query must not be null");
         }
@@ -104,7 +118,7 @@ public final class BatchedLlmReranker implements Ranker {
         }
 
         int fetch = Math.min(maxCandidates, Math.max(limit, maxCandidates));
-        RankedList coarse = delegate.rank(query, fetch);
+        RankedList coarse = delegate.rank(query, fetch, budget);
         if (coarse.isEmpty()) {
             return RankedList.empty(name);
         }
@@ -114,15 +128,22 @@ public final class BatchedLlmReranker implements Ranker {
             LOGGER.debug("{}: query carries no text; keeping the fused ranking", name);
             return relabel(coarse, limit);
         }
-        if (!breaker.allowRequest()) {
-            LOGGER.debug("{}: circuit breaker is {}; keeping the fused ranking",
-                name, breaker.getState());
-            return relabel(coarse, limit);
-        }
-
         Batch batch = buildBatch(coarse);
         if (batch.candidates.isEmpty()) {
             LOGGER.debug("{}: no candidate carried text; keeping the fused ranking", name);
+            return relabel(coarse, limit);
+        }
+        // Before the breaker is asked, so a call that will not be made does not take one of the
+        // probes a half-open breaker admits.
+        budget.throwIfCancelled();
+        if (budget.isExpired()) {
+            budget.markTimedOut();
+            LOGGER.debug("{}: the query's deadline has passed; keeping the fused ranking", name);
+            return relabel(coarse, limit);
+        }
+        if (!breaker.allowRequest()) {
+            LOGGER.debug("{}: circuit breaker is {}; keeping the fused ranking",
+                name, breaker.getState());
             return relabel(coarse, limit);
         }
 
@@ -131,11 +152,17 @@ public final class BatchedLlmReranker implements Ranker {
         SingleCallGuard guard = new SingleCallGuard(model, name);
         List<Double> scores;
         try {
-            scores = guard.scoreBatch(queryText, batch.candidates);
+            scores = budget.call(() -> guard.scoreBatch(queryText, batch.candidates));
             breaker.recordSuccess();
+        } catch (TimeoutException e) {
+            budget.markTimedOut();
+            LOGGER.debug("{}: rerank call missed the query's deadline; keeping the fused ranking",
+                name);
+            return relabel(coarse, limit);
         } catch (IllegalStateException e) {
             // A broken invariant is a defect in this class, not a model outage. It must not be
-            // recorded against the breaker or swallowed into the fallback.
+            // recorded against the breaker or swallowed into the fallback. A cancelled query
+            // arrives here too, as a CancellationException, and ends the query the same way.
             throw e;
         } catch (RuntimeException e) {
             breaker.recordFailure();

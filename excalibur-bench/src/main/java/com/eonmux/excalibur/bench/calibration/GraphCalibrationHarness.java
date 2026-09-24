@@ -113,6 +113,8 @@ public final class GraphCalibrationHarness {
             switch (evidence) {
                 case Evidence.NeedsUser ignored -> needsUser++;
                 case Evidence.Unresolved ignored -> unresolved++;
+                case Evidence.TimedOut ignored -> throw new IllegalStateException(
+                    "a gather with no deadline reported one passing");
                 case Evidence.Gathered gathered -> observations.add(new Observation(
                     gathered.fused(), gathered.subgraph(), isCorrect(gathered.subgraph(),
                         expected)));
