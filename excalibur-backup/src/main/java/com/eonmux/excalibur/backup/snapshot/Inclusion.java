@@ -39,10 +39,17 @@ public enum Inclusion {
     /**
      * Derived, with a rebuild path. Copied unless the operator asks for a smaller image.
      *
-     * <p>The lexical chunk index, a tenant's built edge store and the quantiser codebooks.
-     * Each can be regenerated - by a reindex, by a graph build or by retraining - at a cost
-     * in time rather than in data. Excluding them makes a much smaller backup whose restore
-     * is followed by work; including them makes a backup that can serve immediately.</p>
+     * <p>The lexical chunk index - {@code chunk-index/}, or {@code lucene-chunks/} under the
+     * Lucene engine - a tenant's built edge store and the quantiser codebooks. Each can be
+     * regenerated - by a reindex, by a graph build or by retraining - at a cost in time rather
+     * than in data. Excluding them makes a much smaller backup whose restore is followed by
+     * work; including them makes a backup that can serve immediately.</p>
+     *
+     * <p>A lexical index's erasure log is part of the index here, kept or left out with it and
+     * never without it. Every promise in it is about text in that index: an erasure empties
+     * storage before it records the promise, so the reindex that rebuilds a left-out index
+     * reads nothing the log would have removed. An image holding the index without its log
+     * would restore text an accepted erasure promised gone, with nothing left to remove it.</p>
      */
     REBUILDABLE(true, false),
 

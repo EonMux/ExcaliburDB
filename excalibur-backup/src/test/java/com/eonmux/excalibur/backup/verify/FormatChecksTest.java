@@ -779,4 +779,57 @@ class FormatChecksTest {
         assertThat(check.proven()).isFalse();
         assertThat(check.detail()).contains("UNSEALED");
     }
+
+    /** Checks every file under the Lucene chunk index alone, as a deep verify does first. */
+    private List<ContentCheck> perFileUnderLuceneChunkIndex() throws IOException {
+        List<ContentCheck> perFile = new ArrayList<>();
+        try (var walk = Files.walk(dataDir.resolve(DataDirectoryFixture.LUCENE_CHUNK_INDEX))) {
+            for (Path file : walk.filter(Files::isRegularFile).toList()) {
+                String relative = dataDir.relativize(file).toString().replace('\\', '/');
+                perFile.add(FormatChecks.check(file, relative));
+            }
+        }
+        return perFile;
+    }
+
+    @Test
+    @DisplayName("the Lucene chunk index is proven as an index, and its erasure log line by line")
+    void theLuceneChunkIndexIsCheckedAsAWhole() throws IOException {
+        DataDirectoryFixture.writeLuceneChunkIndex(dataDir);
+        String index = DataDirectoryFixture.LUCENE_CHUNK_INDEX;
+
+        List<ContentCheck> folded =
+            FormatChecks.withLuceneChunkIndex(dataDir, perFileUnderLuceneChunkIndex());
+
+        assertThat(folded).extracting(ContentCheck::path)
+            .as("one verdict speaks for every file of the index; the log keeps its own")
+            .containsExactlyInAnyOrder(index, index + "/erasure.log");
+        assertThat(folded).allSatisfy(each -> {
+            assertThat(each.healthy()).as(each.detail()).isTrue();
+            assertThat(each.proven()).as(each.detail()).isTrue();
+        });
+    }
+
+    @Test
+    @DisplayName("a Lucene chunk index's erasure log whose line was altered fails the image")
+    void anAlteredLuceneErasureLogIsDamage() throws IOException {
+        Path log = DataDirectoryFixture.writeLuceneChunkIndex(dataDir).resolve("erasure.log");
+        Files.writeString(log, Files.readString(log).replace("doc-0", "doc-9"));
+
+        List<ContentCheck> folded =
+            FormatChecks.withLuceneChunkIndex(dataDir, perFileUnderLuceneChunkIndex());
+
+        assertThat(folded).filteredOn(each -> each.path().endsWith("/erasure.log"))
+            .singleElement()
+            .satisfies(each -> assertThat(each.healthy()).as(each.detail()).isFalse());
+    }
+
+    @Test
+    @DisplayName("an image with no Lucene chunk index is left as it was")
+    void noLuceneChunkIndexChangesNothing() {
+        List<ContentCheck> perFile = List.of(
+            new ContentCheck("catalog.dat", "catalog", true, true, "fine"));
+
+        assertThat(FormatChecks.withLuceneChunkIndex(dataDir, perFile)).isEqualTo(perFile);
+    }
 }

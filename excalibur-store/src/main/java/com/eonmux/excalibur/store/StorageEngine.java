@@ -598,7 +598,8 @@ public class StorageEngine implements AutoCloseable {
      * <p>If the split cannot complete in time, a {@link SegmentAtCapacityException}
      * is thrown to allow the caller to implement retry logic. A split that would widen the
      * routing directory past {@link #maxRoutingWidth()} is not attempted, and the caller gets
-     * {@link RoutingDirectoryFullException}, a {@code SegmentAtCapacityException}, at once. An
+     * {@link RoutingDirectoryFullException}, a {@code SegmentAtCapacityException}, at once; nor
+     * is one the segment catalog has no row for, which gets {@link CatalogFullException}. An
      * entry larger than an empty segment can hold is refused with
      * {@link IllegalArgumentException}: no split makes room for it.</p>
      *
@@ -1272,12 +1273,14 @@ public class StorageEngine implements AutoCloseable {
 
         /**
          * Returns how many times a split was refused because it would have doubled the routing
-         * directory past {@link StorageEngine#maxRoutingWidth()}.
+         * directory past {@link StorageEngine#maxRoutingWidth()}, or because the segment
+         * catalog had no row for the segment it would add.
          *
          * <p>Counts attempts, not segments: a full segment that cannot split is offered again by
          * every split sweep and every write routed to it. Zero for any store whose keys hash
-         * evenly; anything else names a lineage of segments whose keys a split cannot
-         * separate, and the log names the segment.</p>
+         * evenly and that is below the catalog's limit; anything else names either a lineage of
+         * segments whose keys a split cannot separate or a store with no row left, and the log
+         * names the segment and which.</p>
          *
          * @return Refused split attempts since the engine was created
          */

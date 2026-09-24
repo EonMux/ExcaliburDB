@@ -17,9 +17,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -150,6 +153,53 @@ class HealthcheckScriptTest {
         assertThat(result.output()).contains(DataDirectoryLock.FILE_NAME);
     }
 
+    @Test
+    @DisplayName("takes its request timeout from EXCALIBUR_HEALTHCHECK_TIMEOUT, fractions included")
+    void acceptsATimeout() throws Exception {
+        start(ApiSecurityConfig.builder().build());
+        advertise();
+
+        assertThat(run(Map.of("EXCALIBUR_HEALTHCHECK_TIMEOUT", "2.5")).exitCode()).isZero();
+        assertThat(run(Map.of("EXCALIBUR_HEALTHCHECK_TIMEOUT", "")).exitCode())
+            .as("an empty variable is the default, as it is for the node's own settings")
+            .isZero();
+    }
+
+    @Test
+    @DisplayName("gives up on a listener that never answers once the timeout has passed")
+    void boundsTheRequest() throws Exception {
+        // Accepts the connection into its backlog and never answers it: the probe has to be the
+        // one to give up, before Docker's own timeout kills it with no reason recorded.
+        try (ServerSocket silent = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            String url = "http://127.0.0.1:" + silent.getLocalPort();
+            lock = DataDirectoryLock.acquire(dataDirectory, "excalibur node");
+            lock.advertise(url, url + "/health");
+
+            long started = System.nanoTime();
+            Result result = run(Map.of("EXCALIBUR_HEALTHCHECK_TIMEOUT", "1"));
+
+            assertThat(result.exitCode()).isNotZero();
+            assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(
+                Duration.ofSeconds(30));
+        }
+    }
+
+    @Test
+    @DisplayName("fails, and says why, when the timeout is not a positive number of seconds")
+    void refusesAMalformedTimeout() throws Exception {
+        // Handed to curl as it was, "5s" failed the check with curl's complaint about its own
+        // arguments, which says nothing about the variable that caused it.
+        start(ApiSecurityConfig.builder().build());
+        advertise();
+
+        for (String malformed : new String[] {"5s", "0", "0.0", "-1", ".5", "5.", "1.2.3"}) {
+            Result result = run(Map.of("EXCALIBUR_HEALTHCHECK_TIMEOUT", malformed));
+            assertThat(result.exitCode()).as(malformed).isNotZero();
+            assertThat(result.output()).as(malformed)
+                .contains("EXCALIBUR_HEALTHCHECK_TIMEOUT").contains("'" + malformed + "'");
+        }
+    }
+
     private void start(ApiSecurityConfig security) throws IOException {
         server = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
         server.withSecurity(security);
@@ -162,9 +212,15 @@ class HealthcheckScriptTest {
     }
 
     private Result run() throws Exception {
+        return run(Map.of());
+    }
+
+    private Result run(Map<String, String> environment) throws Exception {
         ProcessBuilder builder = new ProcessBuilder("sh", script.toString())
             .redirectErrorStream(true);
+        builder.environment().remove("EXCALIBUR_HEALTHCHECK_TIMEOUT");
         builder.environment().put("EXCALIBUR_DATA_DIR", dataDirectory.toString());
+        builder.environment().putAll(environment);
         Process process = builder.start();
         String output = new String(process.getInputStream().readAllBytes(),
             StandardCharsets.UTF_8);

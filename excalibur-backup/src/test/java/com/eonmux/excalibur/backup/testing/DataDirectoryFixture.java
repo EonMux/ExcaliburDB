@@ -2,6 +2,8 @@ package com.eonmux.excalibur.backup.testing;
 
 import com.eonmux.excalibur.filter.lsh.LshConfig;
 import com.eonmux.excalibur.filter.lsh.LshIndex;
+import com.eonmux.excalibur.retrieval.lexical.LexicalIndex;
+import com.eonmux.excalibur.retrieval.lexical.native_.DocumentErasureLog;
 import com.eonmux.excalibur.retrieval.lexical.native_.LexicalStore;
 import com.eonmux.excalibur.store.StorageEngine;
 import com.eonmux.excalibur.vector.distance.L2Distance;
@@ -66,6 +68,9 @@ public final class DataDirectoryFixture {
 
     /** The in-flight ingest journal, a format that carries nothing to verify. */
     public static final String IN_FLIGHT_JOURNAL = "document-registry.in-flight";
+
+    /** The Lucene engine's lexical index directory. */
+    public static final String LUCENE_CHUNK_INDEX = "lucene-chunks";
 
     private DataDirectoryFixture() {
     }
@@ -134,6 +139,30 @@ public final class DataDirectoryFixture {
     }
 
     /**
+     * Writes the index a node on the Lucene lexical engine keeps, {@code lucene-chunks/}, through
+     * the classes that node writes it with: two chunks, and an erasure promised against one.
+     *
+     * @param dataDir The data directory
+     * @return The index directory
+     * @throws IOException if the index or its log cannot be written
+     */
+    public static Path writeLuceneChunkIndex(Path dataDir) throws IOException {
+        Path directory = dataDir.resolve(LUCENE_CHUNK_INDEX);
+        LexicalIndex index = LexicalIndex.open(directory, 4.0);
+        try {
+            index.put(1L, "cold segments move to cheaper disks", "source:doc-0:chunk:0");
+            index.put(2L, "the graph links every vector to its neighbours",
+                "source:doc-1:chunk:0");
+            index.commit();
+        } finally {
+            index.close();
+        }
+        DocumentErasureLog.open(directory)
+            .append(List.of("source:doc-0:chunk:0"), java.time.Instant.EPOCH);
+        return directory;
+    }
+
+    /**
      * Returns deterministic vectors, the same on every run.
      *
      * @param count How many
@@ -174,7 +203,8 @@ public final class DataDirectoryFixture {
             writeRandom(dataDir.resolve("segment_" + segment + ".hnsw"), 4096, 30L + segment);
             writeRandom(dataDir.resolve("segment_" + segment + ".hnsw.docmap"), 24,
                 40L + segment);
-            writeRandom(dataDir.resolve("segment_" + segment + ".pqcb"), 128, 50L + segment);
+            writeRandom(dataDir.resolve("segment_" + segment + ".hnsw.pqcb"), 128,
+                50L + segment);
         }
         writeIngestionIndex(dataDir);
         writeTenantNamespace(dataDir);
@@ -207,8 +237,9 @@ public final class DataDirectoryFixture {
     private static void writeStagingLeftovers(Path dataDir) throws IOException {
         writeRandom(dataDir.resolve("routing.dir.tmp"), 272, 80L);
         writeRandom(dataDir.resolve("segment_0.dat.compact"), 8192, 81L);
-        writeRandom(dataDir.resolve("segment_0.wal.old"), 1024, 82L);
+        writeRandom(dataDir.resolve("document-registry.7.new"), 512, 82L);
         writeRandom(dataDir.resolve("segment_1.dat.left"), 4096, 83L);
+        writeRandom(dataDir.resolve("shared/graph-staging/asserted.last-id.writing"), 16, 85L);
         writeRandom(dataDir.resolve("chunk-index/.compact-seg-0"), 64, 84L);
     }
 

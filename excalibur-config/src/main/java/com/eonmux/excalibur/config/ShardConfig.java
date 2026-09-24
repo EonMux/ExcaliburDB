@@ -213,7 +213,7 @@ public final class ShardConfig {
      * Creates a Shard config from properties.
      *
      * @param props The properties map
-     * @throws IllegalArgumentException if loadFactor is not in (0.0, 1.0]
+     * @throws IllegalArgumentException if a value cannot be parsed or is outside its range
      */
     public ShardConfig(Map<String, String> props) {
         double parsedLoadFactor = PropertyParser.parseDouble(props, "excalibur.shard.segment-load-factor", DEFAULT_LOAD_FACTOR);
@@ -222,35 +222,39 @@ public final class ShardConfig {
         // - > 1.0: impossible for open addressing (can't exceed 100% fill)
         if (parsedLoadFactor <= 0.0 || parsedLoadFactor > 1.0) {
             throw new IllegalArgumentException(
-                "loadFactor must be in (0.0, 1.0], got: " + parsedLoadFactor);
+                "excalibur.shard.segment-load-factor must be in (0.0, 1.0], got: "
+                    + parsedLoadFactor);
         }
         this.loadFactor = parsedLoadFactor;
 
         int parsedEfConstruction = PropertyParser.parseInt(props, "excalibur.shard.default-ef-construction", DEFAULT_EF_CONSTRUCTION);
         if (parsedEfConstruction < 1) {
             throw new IllegalArgumentException(
-                "efConstruction must be at least 1, got: " + parsedEfConstruction);
+                "excalibur.shard.default-ef-construction must be at least 1, got: "
+                    + parsedEfConstruction);
         }
         this.efConstruction = parsedEfConstruction;
 
         int parsedEfSearch = PropertyParser.parseInt(props, "excalibur.shard.default-ef-search", DEFAULT_EF_SEARCH);
         if (parsedEfSearch < 1) {
             throw new IllegalArgumentException(
-                "efSearch must be at least 1, got: " + parsedEfSearch);
+                "excalibur.shard.default-ef-search must be at least 1, got: " + parsedEfSearch);
         }
         this.efSearch = parsedEfSearch;
 
         int parsedCompactDelayMs = PropertyParser.parseInt(props, "excalibur.shard.compaction-delay-ms", DEFAULT_COMPACT_DELAY_MS);
         if (parsedCompactDelayMs < 0) {
             throw new IllegalArgumentException(
-                "compactDelayMs cannot be negative, got: " + parsedCompactDelayMs);
+                "excalibur.shard.compaction-delay-ms cannot be negative, got: "
+                    + parsedCompactDelayMs);
         }
         this.compactDelayMs = parsedCompactDelayMs;
 
         int parsedHnswQueueLimit = PropertyParser.parseInt(props, "excalibur.shard.hnsw-integration-queue-depth-limit", DEFAULT_HNSW_QUEUE_LIMIT);
         if (parsedHnswQueueLimit < 1) {
             throw new IllegalArgumentException(
-                "hnswQueueLimit must be at least 1, got: " + parsedHnswQueueLimit);
+                "excalibur.shard.hnsw-integration-queue-depth-limit must be at least 1, got: "
+                    + parsedHnswQueueLimit);
         }
         this.hnswQueueLimit = parsedHnswQueueLimit;
 

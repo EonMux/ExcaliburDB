@@ -252,6 +252,26 @@ public final class ApiSecurityConfig {
     }
 
     /**
+     * Warns when the bearer token was read from the properties file rather than the environment.
+     *
+     * <p>A warning and not a refusal: the file works, and a node that stopped starting on it would
+     * turn an upgrade into an outage for every deployment that already keeps its token there. But
+     * a secret in the file travels with every copy, backup and review of it, which is why the
+     * token is documented as an environment setting.</p>
+     *
+     * @param config The node's configuration
+     */
+    public static void reportTokenFromFile(com.eonmux.excalibur.config.Config config) {
+        java.util.Objects.requireNonNull(config, "config must not be null");
+        String token = ConfigText.trimToNull(config.getEffectiveProperties().get(KEY_AUTH_TOKEN));
+        if (token != null && !config.isSetByEnvironment(KEY_AUTH_TOKEN)) {
+            LOGGER.warn("{} is set in the properties file. It works, but the file is copied, backed"
+                + " up and read by more people than the token should be: supply it as"
+                + " EXCALIBUR_API_AUTH_TOKEN and delete the line.", KEY_AUTH_TOKEN);
+        }
+    }
+
+    /**
      * Resolves the policy from a properties map.
      *
      * @param properties Effective properties, from {@code Config.getEffectiveProperties()}

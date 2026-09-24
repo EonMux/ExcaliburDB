@@ -371,8 +371,11 @@ reads only a status code. A node that requires client certificates (`tls-client-
 needs the probe given one, with `EXCALIBUR_HEALTHCHECK_CLIENT_CERT` and
 `EXCALIBUR_HEALTHCHECK_CLIENT_KEY`. `EXCALIBUR_HEALTHCHECK_TIMEOUT` bounds each probe's request
 in seconds, 4 by default: under the `HEALTHCHECK`'s own 5s, so a slow answer is reported by the
-probe as a failure rather than killed by Docker mid-request. Raise the two together. A tool container started with `--entrypoint` inherits the
-check as well; pass it `--no-healthcheck`, or ignore its health.
+probe as a failure rather than killed by Docker mid-request. Raise the two together: the variable,
+and Docker's timeout with `docker run --health-timeout 15s` or `timeout: 15s` under a compose
+service's `healthcheck:`. A value that is not a positive number of seconds (fractions allowed) fails
+the check with that reason in `docker inspect`. A tool container started with `--entrypoint`
+inherits the check as well; pass it `--no-healthcheck`, or ignore its health.
 
 ### Stopping the node
 
@@ -456,8 +459,9 @@ node mapping, for instance, is read at versions 1 to 3 — its entries name each
 versions 1 and 2 and its chunk at version 3 — and a version 4 mapping is reported unreadable, not
 checked as if it were version 3. A write-ahead log is judged the same way: one whose header names a
 version this build does not read is `UNREADABLE`, and is never trimmed or moved aside — not even
-when its segment is gone; one whose header is damaged is `CORRUPT` and put to an operator, since
-records behind it were acknowledged; and one with no header at all, which a build before the
+when its segment is gone; one whose header is damaged, or whose start was zeroed, with a sound
+record behind it is `CORRUPT` and put to an operator, since records behind it were acknowledged;
+and one with no header at all, which a build before the
 header wrote, has its records weighed against their checksums as always and is reported
 `LEGACY_UNPROTECTED`, because nothing in the file says which format they are in.
 
@@ -534,6 +538,16 @@ graph staging log's unfinished rewrite (`triples.log.erasing`, `triples.log.rewr
 `entity_text.log.rewriting`, `entities.labels.rewriting`, `relations.labels.rewriting`), which the
 node deletes when it opens the namespace; it is reported as a staging leftover and left alone.
 
+A node on the Lucene lexical engine (`excalibur.ingest.lexical-engine=lucene`) keeps its keyword
+index in `lucene-chunks/` instead of `chunk-index/`, and that directory is checked too. The index
+is checked as one structure, from its commit point, with every file of every segment weighed
+against the checksum in its footer: one verdict, reported under `lucene-chunks`, speaks for every
+file in it. `CORRUPT` there is damage, since the node will not open a commit that fails its
+checksums. A directory holding only Lucene's `write.lock` is one a node created and never
+committed, and has no index to judge. The index's `erasure.log` is the native store's format,
+written by the same code, and is verified line by line by the parser the index opens it with;
+damage to it is damage, since the index does not open until the log reads cleanly.
+
 Repair is off by default: without `--repair` the plan is printed and nothing is touched. With it,
 the tool writes, and each write is stated before it is made. **No repair ever deletes anything.**
 A damaged file, an index whose segment is gone, or a staged file a rename never published is moved
@@ -545,15 +559,18 @@ opcode cleared, the same one-byte write the log itself makes when an append fail
 the log reads as ending before it. What it will not attempt matters as much as what it will: a
 damaged `catalog.dat`, a damaged `routing.dir`, a routing slot pointing at a missing segment, a
 write-ahead log damaged in the middle, a damaged lexical store `manifest`, damaged lexical key
-tables, tombstones or `erasure.log`, or a damaged graph staging log are all reported under *needs
-an operator* and left alone — a tombstone file or erasure log moved out of the way reads as nothing
+tables, tombstones or `erasure.log`, a damaged Lucene chunk index or its `erasure.log`, or a damaged
+graph staging log are all reported under *needs an operator* and left alone — a tombstone file or erasure log moved out of the way reads as nothing
 ever having been erased. Which hash slot belongs to which segment after a split is not
 recoverable from file names — that is why the directory is written down — and the records behind
 damage in a log were fsynced and acknowledged, so trimming past them would destroy committed
 writes. A log damaged in the middle is not moved aside either, for the same reason: setting the
 file aside sets those records aside with it, and unlike an index, nothing rebuilds a log. Nor is a
 lexical manifest: a store without one opens as a new, empty index and deletes every segment the
-empty manifest does not name. Nor is a staging log: nothing rebuilds one and the node opens a
+empty manifest does not name. Nor is the Lucene chunk index: it may still hold text an accepted
+erasure has not yet reclaimed, and a quarantined copy would keep that text; the plan says to delete
+`lucene-chunks/` whole, its erasure log with it, and reindex, or to restore it from a backup. Nor is
+a staging log: nothing rebuilds one and the node opens a
 missing one as empty, so moved aside, a label interner would hand its ids out again under the
 published graph, the triple log would empty the next build, and the erasure and withdrawal logs
 would forget what is still owed. A damaged lexical segment, by contrast, is moved aside like any
@@ -622,6 +639,7 @@ already there when it was copied verifies faithfully:
 | the in-flight journal | `excalibur-fsck`, read-only | every line against the CRC32C it ends with. A complete line that fails its checksum fails the image, since the node refuses to start on it; a last line cut short is an append that never finished, and does not. A version 1 journal carries no checksum and is reported unproven |
 | `routing.dir` | `excalibur-fsck`, read-only | a CRC32C over the whole file. One an older build wrote carries none and is well-formed at best, until the node next writes the directory |
 | a lexical store file beside no segment the manifest names | `excalibur-fsck`, read-only | nothing — nothing names it, so it is well-formed at best |
+| the Lucene chunk index (`lucene-chunks/`) | `excalibur-fsck`, read-only, as one structure | every file of every segment the commit point names against the checksum in its footer, reported as one verdict on the directory; and every line of its `erasure.log` against its own CRC32C, by the parser the index opens it with. Damage to either fails the image |
 
 The engine's own checkers run on a scratch copy because several of them repair what they open;
 `excalibur-fsck`'s are the ones it surveys a live directory with, so the two tools cannot disagree
@@ -679,9 +697,13 @@ is no online-backup mode, and a half-barrier that stopped the background workers
 path kept accepting writes would be worse than none: it would look like a consistent image and
 not be one.
 
-`--exclude-derived` leaves out what something will rebuild — the lexical chunk index, a tenant's
-built edge store and the quantiser codebooks. The HNSW graphs and their document
-mappings are never left out, derived though they are, because **nothing rebuilds them**: deleting a
+`--exclude-derived` leaves out what something will rebuild — the lexical chunk index
+(`chunk-index/`, or `lucene-chunks/` under the Lucene engine), a tenant's built edge store and the
+quantiser codebooks. A lexical index's `erasure.log` is left out with the index and never without
+it: every promise in it is about text in that index, an erasure empties storage before it records
+the promise, so the reindex that rebuilds the index reads nothing the log would have removed — and
+an image holding the index without its log would restore text an accepted erasure promised gone.
+The HNSW graphs and their document mappings are never left out, derived though they are, because **nothing rebuilds them**: deleting a
 `.hnsw` gives an empty graph attached to a populated segment, not a repopulated one. That includes
 a `segment_<N>.hnsw.compact.docmap` an interrupted compaction staged — alone, it is the only mapping
 that matches a graph whose swap already completed. The write-ahead logs are
@@ -689,12 +711,20 @@ never left out either — a segment's data file is forced only on flush, every l
 fsynced before it is acknowledged, and the graph integration cursor points into the log.
 
 Three things are never copied, whatever the flags, and each is reported under `omitted` with the
-reason: staged names a crash left behind (`TRANSIENT`), which nothing reads; JVM heap dumps
-(`*.hprof`, `DIAGNOSTIC`), which are a record of a process rather than state and roughly the size
-of its heap; and the term sketches an earlier build kept beside its segments (`segment_<N>.tfs`,
+reason: staged names a crash left behind (`TRANSIENT`) — a `.tmp`, a compaction's `.compact` or
+`.compact-*`, a split's `segment_<N>.dat.left` and `.right`, the document registry's
+`document-registry.<N>.new`, a staging log's `.rewriting` or `.erasing`, the fact id floor's
+`asserted.last-id.writing`, a graph build's `.body` and `.assembled` — which nothing reads; JVM
+heap dumps (`*.hprof`, `DIAGNOSTIC`), which are a record of a process rather than state and roughly
+the size of its heap; and the term sketches an earlier build kept beside its segments (`segment_<N>.tfs`,
 `OBSOLETE`), which nothing in this build reads and the node deletes when it starts. An image an
 earlier build took may name those sketches: a restore verifies them with the rest of the image,
 since the manifest certifies their bytes, and then leaves them out of the restored directory.
+What a file is comes from the same classification `excalibur-fsck` surveys a directory with, so the
+two tools cannot disagree about it: what a snapshot leaves out as scratch is exactly what
+`excalibur-fsck` reports as a staging leftover, apart from a compaction's staged
+`segment_<N>.hnsw.compact`, which is copied with the staged mapping whose meaning it decides. A file
+neither recognises is kept.
 
 `excalibur-backup <command> --help` (or `-h`) prints that command's options and the exit codes, and
 exits `0` without touching anything; `excalibur-backup --help` prints all three.
@@ -714,12 +744,12 @@ hidden.
 ## Configuration
 
 Configuration is loaded from `excalibur.properties` in the working directory by default, or from
-the path given to `--config` (or `--config=<path>`); an argument the server does not recognise,
-or a `--config` with no path after it, refuses to start rather than quietly using the defaults,
-and `--help` prints the arguments without starting anything. One file is read, not a chain: when
-the path is not on the filesystem it is looked up on the classpath, where the jar carries its own
-`excalibur.properties`. A file named with `--config` that cannot be read refuses to start; only the
-default path falls back, with a warning, to the built-in defaults.
+the path given to `--config` (or `-c <path>`, or `--config=<path>`); an argument the server does
+not recognise, or a `--config` with no path after it, refuses to start rather than quietly using
+the defaults, and `--help` (or `-h`) prints the arguments without starting anything. One file is
+read, not a chain, and only from the filesystem. A file named with `--config` that is missing or
+cannot be read refuses to start; only the default path falls back, with a warning, to the built-in
+defaults, and only when there is no file there at all.
 Copy `excalibur.properties.example` to start; the working copy is
 gitignored, because it is the file a key ends up in.
 
@@ -727,7 +757,7 @@ The file is `key=value` lines split at the first `=`, with `#` or `;` starting a
 are no trailing comments — everything after the `=` is the value, so
 `excalibur.api.max-top-k=1000  # ceiling` is refused at startup as not a number — and one pair of
 surrounding quotes is stripped. A value outside its key's range, or one that cannot be parsed, fails
-startup naming the key; a key the node does not recognise is logged as a warning with the nearest
+startup naming the full property key; a key the node does not recognise is logged as a warning with the nearest
 key it does. Booleans accept `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off`, case-insensitive,
 except `excalibur.api.allow-plaintext` and `excalibur.api.tls-enabled`, which accept only `true` or
 `false`.
@@ -740,6 +770,11 @@ export EXCALIBUR_LLM_API_KEY=sk-your-api-key-here
 export EXCALIBUR_LLM_BASE_URL=https://api.openai.com/v1
 export EXCALIBUR_PORT=9090
 ```
+
+A variable that is set but empty, or only whitespace, overrides nothing: it is ignored with a
+warning naming it, and the file's value (or the default) stands. That is what a compose file
+delivers when it interpolates a variable unset on the host - `EXCALIBUR_API_AUTH_TOKEN: ${TOKEN}`
+with no `TOKEN` - and copied through it would switch off the authentication the file turns on.
 
 Three variables are read directly rather than as property overrides, because deployments already
 spell them this way:
@@ -754,6 +789,13 @@ spell them this way:
 `excalibur.api.auth-token`, and setting either turns authentication on. The MCP server reads a
 variable of the same name as the token it presents to the node — see
 [Pointing a model at it](#pointing-a-model-at-it).
+
+The MCP server (`EXCALIBUR_URL`, `EXCALIBUR_NAMESPACE`, `EXCALIBUR_MCP_TIMEOUT_SECONDS`) and the
+container health check (`EXCALIBUR_HEALTHCHECK_*`) read variables of their own under the same
+prefix, and the node ignores them. Any other `EXCALIBUR_` variable is the override of the key it
+spells, and one that spells a key the node does not read in one of its sections -
+`EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS` - is logged at startup as a warning with the nearest setting
+it does read.
 
 ### Configuration Options
 
@@ -783,7 +825,7 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.shard.hnsw-integration-queue-depth-limit` | 100000 | Max vectors in HNSW integration queue. 10000 to 1000000 |
 | `excalibur.shard.compaction-delay-ms` | 10000 | Delay before compaction starts (ms). At least 0 |
 | `excalibur.shard.default-max-connections` | 16 | Neighbours an HNSW node keeps above layer 0, the graph's `M`. More means better recall, a larger file and a slower build. Written into a graph's header at creation, so it governs graphs built from here on; 2 to 256 |
-| `excalibur.shard.default-max-connections-layer0` | _(twice `M`)_ | Neighbours kept at layer 0, where the walk stops descending and becomes exhaustive. `0` means twice the value above; it may not be narrower than it |
+| `excalibur.shard.default-max-connections-layer0` | _(twice `M`)_ | Neighbours kept at layer 0, where the walk stops descending and becomes exhaustive. `0` means twice the value above; otherwise at least the value above and at most 512 |
 | `excalibur.shard.compaction-interval-ms` | 5000 | How often the segment compactor looks for work. At least 100 |
 | `excalibur.shard.segment-sync-interval-ms` | 1000 | How often the index registry is reconciled with the storage engine's directory. The sweep is what notices a segment the engine created without announcing it, so this is the longest a new segment can stay unsearchable. Refused rather than clamped below the sweep's own floor. At least 250 |
 | `excalibur.shard.compaction-tombstone-ratio` | 0.2 | Tombstoned fraction of a segment at which a rewrite repays itself. Above 0, at most 1 |
@@ -831,7 +873,7 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.health.healthy-threshold` | 0.9 | The same check at a higher bar, reported as `healthy`. 0.0 to 1.0 |
 | `excalibur.health.max-latency-ms` | 5000 | A `/health` response slower than this reports `healthy: false`. 100 to 60000 |
 | `excalibur.health.min-free-disk-ratio` | 0.05 | `/health/ready` answers 503 with `disk` in `failed` below this share of volume capacity being free — the point past which a compaction's replacement segment can no longer be relied on to fit. 0.0 to 1.0 |
-| `excalibur.api.auth-token` | _(none)_ | Bearer token. Supply as `EXCALIBUR_API_AUTH_TOKEN`, not in this file |
+| `excalibur.api.auth-token` | _(none)_ | Bearer token. Supply as `EXCALIBUR_API_AUTH_TOKEN`, not in this file; one read from the file works, with a warning at startup |
 | `excalibur.api.bind-address` | `127.0.0.1` | Interface to bind. Anything else also requires an auth token and TLS |
 | `excalibur.api.allow-plaintext` | `false` | Permit a non-loopback bind without TLS, for a proxy that terminates it |
 | `excalibur.api.tls-keystore` | _(none)_ | Keystore with the server certificate and key. Setting it enables TLS |
@@ -887,7 +929,7 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.graph.min-score` | 0.05 | Smallest relevance the entity the question named must reach to be answered, on the unit scale: its share of the question's BM25 weight, counting only words the graph holds, or its vector similarity. 0.0 to 1.0 |
 | `excalibur.graph.min-separation` | 0.01 | Smallest gap, as a fraction of the best, between the two best entities sharing the name the question used before the result is ambiguous. 0.0 to 1.0 |
 | `excalibur.graph.min-mean-confidence` | 0.3 | Smallest mean provenance confidence across the surviving evidence. 0.0 to 1.0 |
-| `excalibur.graph.max-ambiguous-candidates` | 5 | Candidates returned when the answer is ambiguous |
+| `excalibur.graph.max-ambiguous-candidates` | 5 | Candidates returned when the answer is ambiguous. At least 2 |
 | `excalibur.graph.confidence-temperature` | 1.0 | Divisor on the log-odds of the confidence an answer reports, in `(0.0, 20.0]`. The default leaves it untouched, which is honest: the reported number is arithmetic over a ranking score until labelled outcomes say otherwise. `AbstentionCalibrator.fitTemperature` fits it and reports the calibration error before and after — above 1.0 softens overconfident claims, below 1.0 sharpens underconfident ones. Scaling is monotone and fixes 0.5, so it changes how strongly an answer is claimed and never which answer is given or whether one is given at all |
 | `excalibur.graph.ram-buffer-mb` | 16 | Lucene RAM buffer per index. Named for the graph, but it sizes the ingestion pipeline's chunk index too when that runs on the `lucene` engine — a node with no graph still pays it, once per open index. Above 0 |
 
@@ -1893,6 +1935,10 @@ Supply the token through the environment, never the properties file:
 ```bash
 export EXCALIBUR_API_AUTH_TOKEN='...'
 ```
+
+A token in the file still works - refusing it would break every deployment that already keeps it
+there - but the node logs a warning at startup for as long as the token is read from the file
+rather than the environment.
 
 ```
 Authorization: Bearer <token>
@@ -3523,6 +3569,20 @@ once for the segment and counted in `Statistics.getRefusedSplits()`, and the wri
 gets `RoutingDirectoryFullException` rather than the heap running out. An entry larger than an
 empty segment's data region is refused outright, because no split makes room for it.
 
+The segment catalog (`catalog.dat`) has a limit of its own: one row per live segment, and at most
+65,536 rows (`CatalogFile.MAX_SEGMENTS`). A purged segment's row is reused by the next segment
+registered, so the limit counts the segments a store has now, not every one it has had. At 1 MiB
+of data region a segment that is 64 GiB of data regions, and since a split leaves both children
+about half full, a store holds less than that when it gets there. For keys that hash evenly this
+is the limit a store meets first; the routing directory's default is sixteen times wider. A split
+needs a row for its new segment, and it claims that row before it moves any file, so a split the
+catalog cannot take is refused with the store untouched: it is logged once for the segment and
+counted in `Statistics.getRefusedSplits()`, the segment keeps everything it holds, and the write
+that needed room gets `CatalogFullException` — like `RoutingDirectoryFullException`, a
+`SegmentAtCapacityException`. Writes that route to segments with room carry on, and a purge frees
+rows again. A rolling reindex that needs a new segment while the catalog is full fails with the
+catalog's own message and registers nothing.
+
 A write that reaches a segment while it is being split waits for the split to publish or be
 abandoned and then routes again, rather than failing. The directory is written down after every
 split; a restart that finds a split's children on disk but a directory written before it replays
@@ -3564,10 +3624,14 @@ the record is being read anyway: a compaction, a split, and `excalibur-fsck`. A 
 byte can still cost a single lookup before one of those finds it.
 
 Segment files written before this existed are read at their own format version and left there.
-A checksum written now would vouch for bytes nothing has ever vouched for, so nothing is upgraded
-in place: their entries are still verified where the format allows it, their slot tables are
-reported as unverifiable rather than as sound, and a file gains protection the first time a
-compaction or a split rewrites it. `excalibur-fsck` finds a damaged slot in an older file anyway,
+A checksum written now would vouch for bytes nothing has ever vouched for, so a file with any entry
+in it is never upgraded in place: its entries are still verified where the format allows it, its
+slot table is reported as unverifiable rather than as sound, and it gains protection the first time
+a compaction or a split rewrites it. The one file that is upgraded is one whose slot table has no
+occupied slot at all. Nothing in it can be reached — a record is only ever reached through a slot —
+so the node gives it the current header and slot checksums when it opens it: that writes over no
+record anything can read, and the checksums vouch only that every slot is empty, which is what the
+slot table says. `excalibur-fsck` finds a damaged slot in an older file anyway,
 by comparing each slot against the record it names — the record keeps its own copy of the key
 hash, under the record's own checksum.
 
@@ -3575,11 +3639,17 @@ A segment's write-ahead log, `segment_<N>.wal`, begins with a 16-byte header —
 format version and a CRC-32 over both — so a node can tell a log a newer build wrote from a
 damaged one. A log whose header is sound and names a version this build does not read is refused
 and left exactly as it was: not replayed, not truncated, not given a header of this build's, and
-the node does not start on it. A damaged header is refused as damage, the same way a log damaged
-in the middle is. A log an older build wrote has no header; it is replayed and appended to exactly
-as before, and keeps its format until a compaction or a split gives its segment a fresh log, since
-writing a header into it would move every record and every offset recorded against them. One with
-no record in it is given a header as soon as it is opened.
+the node does not start on it. A damaged header with a sound record anywhere behind it is refused as
+damage, the same way a log damaged in the middle is. With no sound record anywhere in the file, it
+is a header torn as the log was created — the header is forced to disk before any record is
+written behind it — so nothing was lost, and the log is given a fresh header. A log an older build
+wrote has no header; it is replayed and appended to exactly as before, and keeps its format until a
+compaction or a split gives its segment a fresh log, since writing a header into it would move every
+record and every offset recorded against them. One with no record in it is given a header as soon
+as it is opened. "No record" is established, not inferred from the first bytes: a log whose start
+was zeroed, taking the header and the first record with it, reads at offset 0 exactly like an empty
+one, and is refused as damage when a sound record survives behind it, since the header would
+otherwise be written and the next appends would land over acknowledged records.
 
 The same standard covers the index files beside the segments: the HNSW graph, its
 node-to-chunk map, the PQ codebook and the LSH tables each carry a CRC32C over their payload
@@ -4041,7 +4111,7 @@ runs the commands this README documents rather than a private variant of them. I
 (`:excalibur-api:shadowJar`, `:excalibur-fsck:installDist`, `:excalibur-backup:installDist`),
 because `installDist` is not part of `build` and a module with no build script would leave `build`
 green while those resolved to no such task. Then it smoke-tests the operator tools against a data
-directory a real node wrote: it starts the shadow jar on its packaged default (loopback, no
+directory a real node wrote: it starts the shadow jar on its built-in defaults (loopback, no
 token, no LLM key, which still ingests lexically), indexes two documents through the synchronous
 `POST /v1/documents`, and stops it with `SIGTERM` the way a scheduler would. `excalibur-fsck` must
 find nothing damaged in what it left; `excalibur-backup` must snapshot it, `verify --deep` the

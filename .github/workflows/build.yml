@@ -67,7 +67,7 @@ jobs:
           mkdir -p "$work"
 
           # Starts a node on a data directory, from a working directory with no
-          # excalibur.properties so the packaged default is what runs, and waits for it to
+          # excalibur.properties so the built-in defaults are what runs, and waits for it to
           # report ready. Its pid is left in $node.
           start_node() {
             local dir="$1" log="$2"

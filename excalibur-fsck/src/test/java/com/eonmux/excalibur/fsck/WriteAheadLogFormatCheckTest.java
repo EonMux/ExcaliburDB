@@ -135,6 +135,21 @@ class WriteAheadLogFormatCheckTest {
     }
 
     @Test
+    void aZeroedStartWithRecordsBehindItIsCorruptionNotAnEmptyLog(@TempDir Path dir)
+            throws IOException {
+        Path log = writtenLog(dir, 3);
+        try (RandomAccessFile file = new RandomAccessFile(log.toFile(), "rw")) {
+            file.write(new byte[WriteLogHeader.SIZE + LogEntry.HEADER_SIZE]);
+        }
+
+        FileCheck check = WriteAheadLogCheck.check(log, NAME);
+
+        assertThat(check.status()).isEqualTo(CheckStatus.CORRUPT);
+        assertThat(check.needsOperator()).isTrue();
+        assertThat(check.detail()).contains("nothing readable at its start");
+    }
+
+    @Test
     void aHeaderTornAsTheLogWasCreatedIsUnsealed(@TempDir Path dir) throws IOException {
         Path log = dir.resolve(NAME);
         byte[] image = new byte[4096];

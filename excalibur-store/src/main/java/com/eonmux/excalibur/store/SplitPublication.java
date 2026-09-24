@@ -104,13 +104,16 @@ final class SplitPublication {
      * a routing segment, is refused with an {@link IllegalStateException} before any file is
      * moved; see {@link SegmentCatalog#checkRoutingRegistration(long)}. Adopting that record
      * would give the live child another source's lifecycle state - often TOMBSTONED, which
-     * hides it from every query.</p>
+     * hides it from every query. A catalog with no row left for the right child is refused
+     * with {@link CatalogFullException}, also before any file is moved: the rows are reserved
+     * first, so nothing registering elsewhere can take them while the files move.</p>
      *
      * @param parent     The parent segment that was split
      * @param leftChild  The left child (entries whose split bit is 0)
      * @param rightChild The right child (entries whose split bit is 1)
      * @throws IllegalStateException if a child's index is held by a created segment, or if a
      *         child cannot be moved into place
+     * @throws CatalogFullException if the catalog has no row for a child
      */
     void handleSplitComplete(Segment parent, Segment leftChild, Segment rightChild) {
         long[] published;
@@ -135,6 +138,7 @@ final class SplitPublication {
      * @return The left and right indices the children were published at
      * @throws IllegalStateException if the publication is refused, or a child cannot be moved
      *                               into place
+     * @throws CatalogFullException if the catalog has no row for a child
      */
     private long[] publishUnderLock(Segment parent, Segment leftChild, Segment rightChild) {
         // The same plan the worker partitioned by: it depends only on the parent's own slots,
@@ -145,11 +149,39 @@ final class SplitPublication {
         long rightIndex = plan.rightIndex();
 
         // Before anything is moved: the catalog must be able to take both children at
-        // their indices. The only thing that can stop it is a segment created for a source
-        // under an older catalog at one of those ids, and once the renames below have run
-        // there is no way back - so the refusal has to come while the parent is untouched.
+        // their indices. A segment created for a source under an older catalog at one of
+        // those ids stops it, and once the renames below have run there is no way back - so
+        // the refusal has to come while the parent is untouched.
         engine.catalog.checkRoutingRegistration(leftIndex);
         engine.catalog.checkRoutingRegistration(rightIndex);
+
+        // Nor can the catalog be full. The plan found room, but a rolling reindex registers
+        // without this lock and could take the last row while the files below are moving;
+        // a reservation holds the rows until the children are written into them.
+        engine.routingTable.reserveCatalogRows(parent, plan);
+        try {
+            return moveAndRoute(parent, leftChild, rightChild, plan);
+        } finally {
+            engine.catalog.releaseRows(plan.childIndices());
+        }
+    }
+
+    /**
+     * Moves the children into place, registers them and routes to them, once nothing can
+     * refuse the publication. The caller holds {@code StorageEngine.segmentLock} and the
+     * children's catalog rows.
+     *
+     * @param parent     The parent segment that was split
+     * @param leftChild  The left child
+     * @param rightChild The right child
+     * @param plan       The parent's split plan
+     * @return The left and right indices the children were published at
+     * @throws IllegalStateException if a child cannot be moved into place
+     */
+    private long[] moveAndRoute(Segment parent, Segment leftChild, Segment rightChild,
+                                EngineRouting.SplitPlan plan) {
+        long leftIndex = plan.parentSlots().get(0);
+        long rightIndex = plan.rightIndex();
 
         // Step 1: give the children discoverable identities before publishing them.
         // The right child goes first: its target name is unused, so a failure there

@@ -8,7 +8,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.zip.CRC32;
 
 /**
@@ -71,6 +73,14 @@ import java.util.zip.CRC32;
  * released. Reads therefore serialise with each other as well as with writes; this file is
  * written once per catalog change and read on recovery, so the contention that buys is not
  * worth a torn view of the state a node is rebuilt from.</p>
+ *
+ * <h2>Reserved Rows</h2>
+ * <p>A registration that cannot be undone once it starts - a split, which moves files into
+ * place before it writes its children's rows - claims its rows with
+ * {@link #reserveRows(long...)} first. A reserved row is held for that segment id until the id
+ * is written or the reservation is released, and no other registration may take it, so a
+ * catalog that fills while the split is moving files cannot leave the split holding moved
+ * files and nowhere to record them.</p>
  *
  * <h2>Recovery</h2>
  * <p>On recovery, the catalog file is read and all valid segment records
@@ -193,6 +203,14 @@ public class CatalogFile implements AutoCloseable {
     /** Index (0 or 1) of the header slot currently in effect. */
     private int headerSlot;
 
+    /**
+     * Segment ids promised a row by {@link #reserveRows(long...)} that have not been written.
+     *
+     * <p>Held in memory only: a reservation covers a registration in progress, and a process
+     * that stops has none in progress.</p>
+     */
+    private final Set<Long> reservedIds = new HashSet<>();
+
     // ==================== Constructors ====================
 
     /**
@@ -249,10 +267,16 @@ public class CatalogFile implements AutoCloseable {
             throw new IllegalArgumentException("Metadata cannot be null");
         }
 
+        boolean reserved = reservedIds.remove(metadata.getSegmentId());
         long position = findRecordPosition(metadata.getSegmentId());
         if (position < 0) {
-            appendSegment(metadata);
+            appendSegment(metadata, reserved);
             return;
+        }
+        if (!reserved && !reservedIds.isEmpty() && isPurgedAt(position) && spareRows() < 1) {
+            // A purged row is a free row, and writing a live segment over it takes one a
+            // reservation is counting on.
+            throw catalogFull();
         }
 
         // An update to a row that already exists. Entry-count deltas come through here on
@@ -284,10 +308,20 @@ public class CatalogFile implements AutoCloseable {
      * being added, so the file's ceiling bounds live segments rather than every segment the
      * store has ever had. See {@link #findPurgedRecordPosition()}.</p>
      *
+     * <p>An append whose row was reserved always finds one: a reservation is only granted
+     * while a free row is left over for it. An append without one may not take a row a
+     * reservation is counting on.</p>
+     *
      * @param metadata The segment metadata to append
-     * @throws IOException if the file cannot be grown or written
+     * @param reserved Whether a row was reserved for this segment
+     * @throws IOException if the catalog has no row to give it, or the file cannot be grown or
+     *         written
      */
-    private void appendSegment(SegmentCatalog.SegmentMetadata metadata) throws IOException {
+    private void appendSegment(SegmentCatalog.SegmentMetadata metadata, boolean reserved)
+            throws IOException {
+        if (!reserved && !reservedIds.isEmpty() && spareRows() < 1) {
+            throw catalogFull();
+        }
         long reusable = findPurgedRecordPosition();
         if (reusable >= 0) {
             reuseRecordAt(reusable, metadata);
@@ -357,6 +391,138 @@ public class CatalogFile implements AutoCloseable {
             throws IOException {
         writeRecordAt(position, metadata);
         mappedFile.flush();
+    }
+
+    /**
+     * Whether rows can be given to every one of these segments without taking one reserved
+     * for another.
+     *
+     * <p>An id that already has a live row needs none. The answer holds only while nothing else
+     * registers a segment; a caller that must not be overtaken reserves with
+     * {@link #reserveRows(long...)} instead.</p>
+     *
+     * @param segmentIds The segment ids about to be registered
+     * @return true if the catalog has a row for each of them
+     * @throws IllegalStateException if the catalog file is closed
+     */
+    public synchronized boolean hasRoomFor(long... segmentIds) {
+        checkOpen();
+        int needed = rowsNeeded(segmentIds).size();
+        return needed <= freeRowsAtLeast(needed);
+    }
+
+    /**
+     * Reserves a row for each of these segments that does not already have a live one, or
+     * none at all.
+     *
+     * <p>A reserved row is held until {@link #writeSegment(SegmentCatalog.SegmentMetadata)}
+     * writes that segment id, or {@link #releaseRows(long...)} gives it back; meanwhile a
+     * write for any other new segment is refused rather than allowed to take it. All or
+     * nothing, so a caller that is refused has nothing to release.</p>
+     *
+     * @param segmentIds The segment ids about to be registered
+     * @return true if every id has a row, false if the catalog is too full and nothing was
+     *         reserved
+     * @throws IllegalStateException if the catalog file is closed
+     */
+    public synchronized boolean reserveRows(long... segmentIds) {
+        checkOpen();
+        Set<Long> needed = rowsNeeded(segmentIds);
+        if (needed.size() > freeRowsAtLeast(needed.size())) {
+            return false;
+        }
+        reservedIds.addAll(needed);
+        return true;
+    }
+
+    /**
+     * Gives back the rows reserved for these segments and not yet written.
+     *
+     * <p>An id with no reservation - never reserved, or already written - is ignored, so a
+     * caller can release everything it reserved whether or not it got as far as writing.</p>
+     *
+     * @param segmentIds The segment ids whose registration will not happen
+     */
+    public synchronized void releaseRows(long... segmentIds) {
+        for (long segmentId : segmentIds) {
+            reservedIds.remove(segmentId);
+        }
+    }
+
+    /**
+     * The ids among these that would take a free row: those with no row or only a purged one,
+     * leaving out any already reserved.
+     *
+     * @param segmentIds The segment ids about to be registered
+     * @return The ids that need a row
+     */
+    private Set<Long> rowsNeeded(long... segmentIds) {
+        Set<Long> needed = new HashSet<>();
+        for (long segmentId : segmentIds) {
+            if (reservedIds.contains(segmentId)) {
+                continue;
+            }
+            long position = findRecordPosition(segmentId);
+            if (position < 0 || isPurgedAt(position)) {
+                needed.add(segmentId);
+            }
+        }
+        return needed;
+    }
+
+    /**
+     * Counts the free rows no reservation holds, skipping the purged-row scan when the unused
+     * tail of the file already has {@code enough}.
+     *
+     * @param enough The count the caller needs
+     * @return The spare rows, or, when the tail alone suffices, the tail's count
+     */
+    private int freeRowsAtLeast(int enough) {
+        int unappended = MAX_SEGMENTS - segmentCount - reservedIds.size();
+        return unappended >= enough ? unappended : spareRows();
+    }
+
+    /**
+     * Counts the rows a new segment could take that no reservation holds: those past the last
+     * one written, and the purged ones.
+     *
+     * @return The spare rows
+     */
+    private int spareRows() {
+        int purged = 0;
+        for (int i = 0; i < segmentCount; i++) {
+            if (isPurgedAt(HEADER_SIZE + (long) i * RECORD_SIZE)) {
+                purged++;
+            }
+        }
+        return MAX_SEGMENTS - segmentCount + purged - reservedIds.size();
+    }
+
+    /**
+     * Whether the row at a position is purged, by the same test
+     * {@link #findPurgedRecordPosition()} reuses rows on.
+     *
+     * @param position The row's position
+     * @return true if it checksums and is purged
+     */
+    private boolean isPurgedAt(long position) {
+        SegmentCatalog.SegmentMetadata existing = readRecordAt(position);
+        return existing != null && existing.getLifecycleState() == LifecycleState.PURGED;
+    }
+
+    /**
+     * The refusal of a new segment when no row is left for it.
+     *
+     * @return The exception to throw
+     */
+    private IOException catalogFull() {
+        String reservations = reservedIds.isEmpty() ? ""
+            : " " + reservedIds.size() + " of its free rows are reserved for registrations in "
+                + "progress.";
+        return new IOException("Catalog " + catalogPath + " holds " + segmentCount + " rows of "
+            + "at most " + MAX_SEGMENTS + " and has none free for another segment." + reservations
+            + " A purged segment's row is reused, so this counts live segments: the store "
+            + "needs fewer, larger segments.");
     }
 
     /**
@@ -924,10 +1090,7 @@ public class CatalogFile implements AutoCloseable {
      */
     private void ensureCapacity(int requiredCapacity) throws IOException {
         if (requiredCapacity > MAX_SEGMENTS) {
-            throw new IOException("Catalog " + catalogPath + " already holds " + segmentCount
-                + " segments and cannot hold more than " + MAX_SEGMENTS
-                + ". Every row belongs to a segment that has not been purged, so this is a "
-                + "live-segment count: the store needs fewer, larger segments.");
+            throw catalogFull();
         }
 
         long requiredSize = calculateFileSize(requiredCapacity);
@@ -1044,7 +1207,7 @@ public class CatalogFile implements AutoCloseable {
      *
      * @return Position of the record, or -1 if not found
      */
-    private long findRecordPosition(long segmentId) throws IOException {
+    private long findRecordPosition(long segmentId) {
         for (int i = 0; i < segmentCount; i++) {
             long position = HEADER_SIZE + (long) i * RECORD_SIZE;
             long currentId = mappedFile.readLong(position);

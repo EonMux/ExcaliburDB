@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.fsck.check;
 
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
+import com.eonmux.excalibur.retrieval.lexical.native_.DocumentErasureLog;
 import com.eonmux.excalibur.retrieval.lexical.native_.LexicalSidecars;
 
 import java.nio.file.Path;
@@ -15,6 +16,12 @@ public final class FileClassifier {
 
     /** Directory name of the native lexical store inside a data directory. */
     public static final String LEXICAL_STORE_DIRECTORY = "chunk-index";
+
+    /**
+     * Directory name of the Lucene chunk index inside a data directory, which a node configured
+     * with the Lucene lexical engine writes instead of {@link #LEXICAL_STORE_DIRECTORY}.
+     */
+    public static final String LUCENE_CHUNK_DIRECTORY = "lucene-chunks";
 
     private FileClassifier() {
         throw new AssertionError("Utility class");
@@ -55,6 +62,10 @@ public final class FileClassifier {
         if (relative.startsWith(LEXICAL_STORE_DIRECTORY + "/")) {
             return name.endsWith(LexicalSidecars.LOOKUP_TABLE)
                 ? FileKind.LEXICAL_KEY_LOOKUP : FileKind.LEXICAL_STORE_PART;
+        }
+        if (relative.startsWith(LUCENE_CHUNK_DIRECTORY + "/")) {
+            return relative.equals(LUCENE_CHUNK_DIRECTORY + "/" + DocumentErasureLog.FILE)
+                ? FileKind.LUCENE_CHUNK_ERASURE_LOG : FileKind.LUCENE_CHUNK_INDEX_PART;
         }
         if (relative.contains(GraphStagingCheck.DIRECTORY_SUFFIX + "/")) {
             if (GraphStagingCheck.matches(name)) {

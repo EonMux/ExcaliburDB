@@ -179,6 +179,42 @@ class WriteLogFormatHeaderTest {
     }
 
     @Test
+    @DisplayName("a log whose start was zeroed, with records behind it, is corruption, not empty")
+    void aZeroedStartWithRecordsIsCorruption() throws IOException {
+        // A zeroed block takes the header and the first record's opcode with it. Without a
+        // magic, and with nothing readable at offset 0, the log looks exactly like a headerless
+        // one nothing was written to - and giving it a header would have the next appends
+        // overwrite the acknowledged records still sound behind the damage.
+        Path path = logWithRecords(3);
+        try (RandomAccessFile file = new RandomAccessFile(path.toFile(), "rw")) {
+            file.write(new byte[WriteLogHeader.SIZE + LogEntry.HEADER_SIZE]);
+        }
+        byte[] before = Files.readAllBytes(path);
+
+        assertThatThrownBy(() -> new WriteLog(path))
+            .isInstanceOf(CorruptLogException.class)
+            .hasMessageContaining("sound record");
+
+        assertThat(Files.readAllBytes(path)).isEqualTo(before);
+    }
+
+    @Test
+    @DisplayName("a headerless log whose first record was zeroed, with records behind it, is refused")
+    void aHeaderlessLogWithAZeroedStartIsCorruption() throws IOException {
+        Path path = directory.resolve("segment_0.wal");
+        byte[] records = legacyRecords(3);
+        Arrays.fill(records, 0, LogEntry.HEADER_SIZE, (byte) 0);
+        writeSparse(path, records, 8192);
+        byte[] before = Files.readAllBytes(path);
+
+        assertThatThrownBy(() -> new WriteLog(path))
+            .isInstanceOf(CorruptLogException.class)
+            .hasMessageContaining("sound record");
+
+        assertThat(Files.readAllBytes(path)).isEqualTo(before);
+    }
+
+    @Test
     @DisplayName("a header torn as the log was created, with nothing behind it, is rewritten")
     void aHeaderTornAtCreationIsRewritten() throws IOException {
         Path path = directory.resolve("segment_0.wal");

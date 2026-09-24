@@ -594,10 +594,12 @@ public final class ExcaliburEmbedded implements AutoCloseable {
                 merged.putAll(ConfigLoader.load(source, Map.of()).getEffectiveProperties());
             }
             merged.putAll(properties);
-            // The file's own keys were reported as it was read; these are the ones set here.
-            ConfigLoader.reportUnrecognisedKeys(source, properties);
-            ApiConfigKeys.reportUnrecognised(merged);
             Config config = new Config(source, environment, merged);
+            // The file's own keys were reported as it was read; these are the ones set here and
+            // the variables, judged by the same checks the server applies to its own.
+            ConfigLoader.reportUnrecognisedKeys(source, properties);
+            ConfigLoader.reportUnrecognisedVariables(environment);
+            ApiConfigKeys.reportUnrecognised(config.getEffectiveProperties());
             ConfigValidation.validate(config);
             return config;
         }

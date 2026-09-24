@@ -84,8 +84,8 @@ public final class ConfigValidation {
         int model = llm.getEmbeddingsDimensions();
         if (index != model) {
             throw new IllegalStateException(
-                "query.vector-dimensions (" + index + ") and llm.embeddings-dimensions ("
-                    + model + ") must be equal: the first sizes the index, the second is what "
+                "excalibur.query.vector-dimensions (" + index + ") and "
+                    + "excalibur.llm.embeddings-dimensions (" + model + ") must be equal: the first sizes the index, the second is what "
                     + "the embedding model returns, and a vector of one width cannot be stored "
                     + "in an index of the other. Set both to the width of '"
                     + llm.getEmbeddingModel() + "'. Changing this on a node that has already "
@@ -101,9 +101,9 @@ public final class ConfigValidation {
      * @throws IllegalStateException if invalid
      */
     private static void validateVisibility(VisibilityConfig visibility) {
-        requireInRange("visibility.epoch-tick-ms", visibility.getEpochTickMs(),
+        requireInRange("excalibur.visibility.epoch-tick-ms", visibility.getEpochTickMs(),
             VisibilityConfig.MIN_EPOCH_TICK_MS, VisibilityConfig.MAX_EPOCH_TICK_MS);
-        requireInRange("visibility.query-timeout-ms", visibility.getQueryTimeoutMs(),
+        requireInRange("excalibur.visibility.query-timeout-ms", visibility.getQueryTimeoutMs(),
             VisibilityConfig.MIN_QUERY_TIMEOUT_MS, VisibilityConfig.MAX_QUERY_TIMEOUT_MS);
     }
 
@@ -114,13 +114,14 @@ public final class ConfigValidation {
      * @throws IllegalStateException if invalid
      */
     private static void validateIngest(IngestConfig ingest) {
-        requireInRange("ingest.document-atomicity-timeout-ms", ingest.getDocumentTimeoutMs(),
+        requireInRange("excalibur.ingest.document-atomicity-timeout-ms",
+            ingest.getDocumentTimeoutMs(),
             IngestConfig.MIN_DOCUMENT_TIMEOUT_MS, IngestConfig.MAX_DOCUMENT_TIMEOUT_MS);
 
         // The shard module's reindex scheduler rejects an interval outside this window
         // when a source registers, which happens inside the /v1/ingest request path and
         // after the source has already been recorded. Reject it at startup instead.
-        requireInRange("ingest.reindex-interval-ms", ingest.getReindexIntervalMs(),
+        requireInRange("excalibur.ingest.reindex-interval-ms", ingest.getReindexIntervalMs(),
             IngestConfig.MIN_REINDEX_INTERVAL_MS, IngestConfig.MAX_REINDEX_INTERVAL_MS);
     }
 
@@ -132,18 +133,18 @@ public final class ConfigValidation {
      */
     private static void validateHealth(HealthConfig health) {
         double readinessThreshold = health.getReadinessThreshold();
-        requireInRange("health.readiness-threshold", readinessThreshold,
+        requireInRange("excalibur.health.readiness-threshold", readinessThreshold,
             HealthConfig.MIN_THRESHOLD, HealthConfig.MAX_THRESHOLD);
 
         double healthyThreshold = health.getHealthyThreshold();
-        requireInRange("health.healthy-threshold", healthyThreshold,
+        requireInRange("excalibur.health.healthy-threshold", healthyThreshold,
             HealthConfig.MIN_THRESHOLD, HealthConfig.MAX_THRESHOLD);
 
         // A share of capacity, like the two above, and range-checked the same way. A value near
         // 1.0 is not refused: a deployment that wants a node out of rotation while its volumes
         // are anything but nearly empty is entitled to say so, and refusing it here would be
         // this file deciding an operational policy it cannot see the reasons for.
-        requireInRange("health.min-free-disk-ratio", health.getMinFreeDiskRatio(),
+        requireInRange("excalibur.health.min-free-disk-ratio", health.getMinFreeDiskRatio(),
             HealthConfig.MIN_THRESHOLD, HealthConfig.MAX_THRESHOLD);
 
         // Semantic invariant: readiness is a lower bar than full health, so
@@ -152,11 +153,12 @@ public final class ConfigValidation {
         // the contract that ready is always at least as permissive as healthy.
         if (readinessThreshold > healthyThreshold) {
             throw new IllegalStateException(
-                "health.readiness-threshold must be <= health.healthy-threshold, got: readiness="
-                    + readinessThreshold + ", healthy=" + healthyThreshold);
+                "excalibur.health.readiness-threshold must be <= "
+                    + "excalibur.health.healthy-threshold, got: readiness=" + readinessThreshold
+                    + ", healthy=" + healthyThreshold);
         }
 
-        requireInRange("health.max-latency-ms", health.getMaxLatencyMs(),
+        requireInRange("excalibur.health.max-latency-ms", health.getMaxLatencyMs(),
             HealthConfig.MIN_MAX_LATENCY_MS, HealthConfig.MAX_MAX_LATENCY_MS);
     }
 
@@ -167,15 +169,15 @@ public final class ConfigValidation {
      * @throws IllegalStateException if invalid
      */
     private static void validateQuery(QueryConfig query) {
-        requireInRange("query.top-k-default", query.getDefaultTopK(),
+        requireInRange("excalibur.query.top-k-default", query.getDefaultTopK(),
             QueryConfig.MIN_TOP_K, QueryConfig.MAX_TOP_K);
-        requireInRange("query.threshold", query.getThreshold(),
+        requireInRange("excalibur.query.threshold", query.getThreshold(),
             QueryConfig.MIN_PROBABILITY, QueryConfig.MAX_PROBABILITY);
-        requireInRange("query.vector-dimensions", query.getVectorDimensions(),
+        requireInRange("excalibur.query.vector-dimensions", query.getVectorDimensions(),
             QueryConfig.MIN_VECTOR_DIMENSIONS, QueryConfig.MAX_VECTOR_DIMENSIONS);
-        requireInRange("query.llm-timeout-ms", query.getLlmTimeoutMs(),
+        requireInRange("excalibur.query.llm-timeout-ms", query.getLlmTimeoutMs(),
             QueryConfig.MIN_LLM_TIMEOUT_MS, QueryConfig.MAX_LLM_TIMEOUT_MS);
-        requireInRange("query.expansion-timeout-ms", query.getExpansionTimeoutMs(),
+        requireInRange("excalibur.query.expansion-timeout-ms", query.getExpansionTimeoutMs(),
             QueryConfig.MIN_EXPANSION_TIMEOUT_MS, QueryConfig.MAX_EXPANSION_TIMEOUT_MS);
     }
 
@@ -203,7 +205,8 @@ public final class ConfigValidation {
         }
         if (!isValidUrl(baseUrl)) {
             throw new IllegalStateException(
-                "llm.base-url must be a valid URL (http:// or https://), got: " + baseUrl);
+                "excalibur.llm.base-url must be a valid URL (http:// or https://), got: "
+                    + baseUrl);
         }
         validateRoleEndpoint(llm.chatEndpoint());
         validateRoleEndpoint(llm.embeddingEndpoint());
@@ -224,7 +227,7 @@ public final class ConfigValidation {
         String baseUrl = endpoint.baseUrl();
         String role = endpoint.role().label();
         if (!isValidUrl(baseUrl)) {
-            throw new IllegalStateException(settingName(endpoint.role().baseUrlKey())
+            throw new IllegalStateException(endpoint.role().baseUrlKey()
                 + " must be a valid URL (http:// or https://), got: " + baseUrl);
         }
 
@@ -237,21 +240,12 @@ public final class ConfigValidation {
         if (endpoint.enabled() && endpoint.hasApiKey()
                 && baseUrl.startsWith(HTTP_PREFIX) && !isLoopbackHost(host)) {
             throw new IllegalStateException(
-                "llm.api-key would be sent in cleartext: the " + role + " endpoint uses http:// "
-                    + "with the non-loopback host '" + host + "'. Use https://, or leave the key "
-                    + "empty for this endpoint - set it per role with llm.chat-api-key or "
-                    + "llm.embedding-api-key rather than the shared llm.api-key.");
+                "excalibur.llm.api-key would be sent in cleartext: the " + role + " endpoint uses "
+                    + "http:// with the non-loopback host '" + host + "'. Use https://, or leave "
+                    + "the key empty for this endpoint - set it per role with "
+                    + "excalibur.llm.chat-api-key or excalibur.llm.embedding-api-key rather than "
+                    + "the shared excalibur.llm.api-key.");
         }
-    }
-
-    /**
-     * The short spelling of a property this class names in its messages.
-     *
-     * @param key The full property key
-     * @return The key without the {@code excalibur.} prefix
-     */
-    private static String settingName(String key) {
-        return key.substring("excalibur.".length());
     }
 
     /**
@@ -265,23 +259,23 @@ public final class ConfigValidation {
      * @throws IllegalStateException if invalid
      */
     private static void validateLlmLimits(LlmConfig llm) {
-        requireInRange("llm.embeddings-dimensions", llm.getEmbeddingsDimensions(),
+        requireInRange("excalibur.llm.embeddings-dimensions", llm.getEmbeddingsDimensions(),
             LlmConfig.MIN_EMBEDDINGS_DIMENSIONS, LlmConfig.MAX_EMBEDDINGS_DIMENSIONS);
-        requireInRange("llm.timeout-ms", llm.getTimeoutMs(),
+        requireInRange("excalibur.llm.timeout-ms", llm.getTimeoutMs(),
             LlmConfig.MIN_TIMEOUT_MS, LlmConfig.MAX_TIMEOUT_MS);
-        requireInRange("llm.max-retries", llm.getMaxRetries(),
+        requireInRange("excalibur.llm.max-retries", llm.getMaxRetries(),
             LlmConfig.MIN_MAX_RETRIES, LlmConfig.MAX_MAX_RETRIES);
-        requireInRange("llm.failure-threshold", llm.getFailureThreshold(),
+        requireInRange("excalibur.llm.failure-threshold", llm.getFailureThreshold(),
             LlmConfig.MIN_FAILURE_THRESHOLD, LlmConfig.MAX_FAILURE_THRESHOLD);
-        requireInRange("llm.cooldown-period-ms", llm.getCooldownPeriodMs(),
+        requireInRange("excalibur.llm.cooldown-period-ms", llm.getCooldownPeriodMs(),
             LlmConfig.MIN_COOLDOWN_PERIOD_MS, LlmConfig.MAX_COOLDOWN_PERIOD_MS);
-        requireInRange("llm.max-prompts-per-query", llm.getMaxPromptsPerQuery(),
+        requireInRange("excalibur.llm.max-prompts-per-query", llm.getMaxPromptsPerQuery(),
             LlmConfig.MIN_MAX_PROMPTS_PER_QUERY, LlmConfig.MAX_MAX_PROMPTS_PER_QUERY);
-        requireInRange("llm.relevancy-threshold", llm.getRelevancyThreshold(),
+        requireInRange("excalibur.llm.relevancy-threshold", llm.getRelevancyThreshold(),
             LlmConfig.MIN_RELEVANCY_THRESHOLD, LlmConfig.MAX_RELEVANCY_THRESHOLD);
-        requireInRange("llm.max-batch-tokens", llm.getMaxBatchTokens(),
+        requireInRange("excalibur.llm.max-batch-tokens", llm.getMaxBatchTokens(),
             LlmConfig.MIN_MAX_BATCH_TOKENS, LlmConfig.MAX_MAX_BATCH_TOKENS);
-        requireInRange("llm.retry-base-delay-ms", llm.getRetryBaseDelayMs(),
+        requireInRange("excalibur.llm.retry-base-delay-ms", llm.getRetryBaseDelayMs(),
             LlmConfig.MIN_RETRY_BASE_DELAY_MS, LlmConfig.MAX_RETRY_BASE_DELAY_MS);
     }
 
@@ -292,20 +286,21 @@ public final class ConfigValidation {
      * @throws IllegalStateException if invalid
      */
     private static void validateShard(ShardConfig shard) {
-        requireInRange("shard.segment-load-factor", shard.getLoadFactor(),
+        requireInRange("excalibur.shard.segment-load-factor", shard.getLoadFactor(),
             ShardConfig.MIN_LOAD_FACTOR, ShardConfig.MAX_LOAD_FACTOR);
-        requireInRange("shard.default-ef-construction", shard.getEfConstruction(),
+        requireInRange("excalibur.shard.default-ef-construction", shard.getEfConstruction(),
             ShardConfig.MIN_EF_CONSTRUCTION, ShardConfig.MAX_EF_CONSTRUCTION);
-        requireInRange("shard.default-ef-search", shard.getEfSearch(),
+        requireInRange("excalibur.shard.default-ef-search", shard.getEfSearch(),
             ShardConfig.MIN_EF_SEARCH, ShardConfig.MAX_EF_SEARCH);
-        requireInRange("shard.hnsw-integration-queue-depth-limit", shard.getHnswQueueLimit(),
+        requireInRange("excalibur.shard.hnsw-integration-queue-depth-limit",
+            shard.getHnswQueueLimit(),
             ShardConfig.MIN_HNSW_QUEUE_DEPTH_LIMIT, ShardConfig.MAX_HNSW_QUEUE_DEPTH_LIMIT);
     }
 
     /**
      * Requires an integral setting to fall within an inclusive range.
      *
-     * @param key Setting name used in the failure message
+     * @param key The full property key, named in the failure message
      * @param value Configured value
      * @param min Inclusive lower bound
      * @param max Inclusive upper bound
@@ -327,7 +322,7 @@ public final class ConfigValidation {
      * it reads the property, so nothing that reaches here can fail an ordered comparison the
      * way NaN would.</p>
      *
-     * @param key Setting name used in the failure message
+     * @param key The full property key, named in the failure message
      * @param value Configured value
      * @param min Inclusive lower bound
      * @param max Inclusive upper bound

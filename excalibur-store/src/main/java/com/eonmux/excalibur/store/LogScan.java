@@ -42,6 +42,13 @@ import java.nio.file.StandardOpenOption;
  * unless offset 0 holds no readable record while a log's first record sits right after where a
  * header would end, which is a header that was wiped out rather than one never written.</p>
  *
+ * <p>Two of those answers end with an empty log that its open gives a fresh header: a header
+ * torn at creation, and a headerless log with nothing at offset 0. Both are established
+ * rather than inferred, by finding no sound record anywhere in the file, because the next
+ * appends land where records would be. A zeroed block that took the header and the first
+ * record with it looks, at offset 0, exactly like a log nothing was written to; the records
+ * behind it are what tell the two apart, and it is refused as damage.</p>
+ *
  * <p>Every offset this scan reports is an offset in the file, header included, because that is
  * what an operator reading the file and a repair writing to it both need.</p>
  *
@@ -62,8 +69,9 @@ public record LogScan(long nextLsn, long endOffset, String tornTail, WriteLogFor
      * @return What the scan found
      * @throws UnsupportedWriteLogFormatException if a sound header names a version this build
      *                                            does not read
-     * @throws CorruptLogException if the header is damaged with records behind it, or the log
-     *                             is damaged anywhere but its tail
+     * @throws CorruptLogException if the header, or the start of a log with none, is damaged
+     *                             with records behind it, or the log is damaged anywhere but
+     *                             its tail
      */
     public static LogScan of(Segment mapped, Path logFilePath)
             throws UnsupportedWriteLogFormatException, CorruptLogException {
@@ -81,7 +89,24 @@ public record LogScan(long nextLsn, long endOffset, String tornTail, WriteLogFor
                 + "it was fsynced and acknowledged. Refusing to open the log so the evidence "
                 + "survives: restore this segment from a backup or a replica.");
         }
-        return records(mapped, logFilePath, WriteLogFormat.V1, fileSize);
+        LogScan headerless = records(mapped, logFilePath, WriteLogFormat.V1, fileSize);
+        if (headerless.endOffset() == 0) {
+            // Empty is the one reading of a headerless log that the log's open acts on - it is
+            // given a header, and the next appends land where records would be - so it has to
+            // be established rather than inferred from the first byte. A zeroed block at the
+            // start of a log reads exactly like one nothing was written to.
+            long survivor = nextSoundRecord(mapped, 0, fileSize, -1);
+            if (survivor >= 0) {
+                throw new CorruptLogException(logFilePath, 0,
+                    "Write-ahead log " + logFilePath + " has nothing readable at its start - no "
+                    + "header and no record - but a sound record at offset " + survivor + ". An "
+                    + "empty log has no sound record anywhere in it, so this is damage to the "
+                    + "start of the log, and every record behind it was fsynced and "
+                    + "acknowledged. Refusing to open the log so the evidence survives: restore "
+                    + "this segment from a backup or a replica.");
+            }
+        }
+        return headerless;
     }
 
     /**

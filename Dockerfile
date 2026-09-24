@@ -26,8 +26,9 @@
 # All three are in excalibur-api/build.gradle.kts's applicationDefaultJvmArgs, so this image
 # launches the jar the way the generated start scripts launch it.
 #
-# Configuration: excalibur.properties is read from the working directory, then from the
-# classpath (the packaged default in excalibur-api/src/main/resources). Any setting can be
+# Configuration: excalibur.properties is read from the working directory (/var/lib/excalibur)
+# if it is there; without one the node starts on its built-in defaults. `--config <file>` names
+# another, and a named file that cannot be read refuses to start. Any setting can be
 # supplied from the environment instead - EXCALIBUR_<SECTION>_<NAME>, upper-cased with
 # hyphens as underscores, overrides the file (com.eonmux.excalibur.config.EnvOverrides). No secret is
 # baked into this image: pass excalibur.llm.api-key as EXCALIBUR_LLM_API_KEY at run time.
@@ -52,7 +53,9 @@
 #                                   run from this image. Mount it, for the same reason.
 #
 # A named volume mounted on any of them takes that directory's owner, so the process can write
-# to it; a host directory bind-mounted there has to be given uid 10001 first. The last three are
+# to it; a host directory bind-mounted there has to be owned by the node's uid first - 10001, or
+# whatever the EXCALIBUR_UID/EXCALIBUR_GID build arguments set, so an image built with
+# `--build-arg EXCALIBUR_UID=$(id -u)` can use a directory the host user already owns. The last three are
 # not VOLUMEs on purpose. A declared volume that is not mounted becomes an anonymous volume,
 # which `--rm` deletes with the container - so a declaration would promise a persistence that
 # only an explicit mount delivers, and hide that it was missing.
@@ -177,8 +180,11 @@ EXPOSE 8080
 # setting has to be repeated here and none can disagree. /health rather than /health/ready: a
 # health check drives restarts, and a drained or still-recovering node is alive; readiness is
 # for whatever routes traffic. /health is unauthenticated by policy, so the probe needs no token.
-# The start period covers segment recovery on a large data directory. See the script for TLS
-# client certificates. A container started with --entrypoint for one of the tools above inherits
+# The start period covers segment recovery on a large data directory. The probe's own request is
+# bounded by EXCALIBUR_HEALTHCHECK_TIMEOUT (seconds, 4 by default), which has to stay under the
+# 5s --timeout below; to allow a slower answer raise both, the check's with `docker run
+# --health-timeout` or `healthcheck: timeout:` in a compose file. See the script for TLS client
+# certificates. A container started with --entrypoint for one of the tools above inherits
 # the check too, and reports unhealthy if it outlives the start period: pass --no-healthcheck
 # to such a run, or ignore its health.
 COPY --chown=root:root --chmod=755 docker/excalibur-healthcheck \

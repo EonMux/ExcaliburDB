@@ -228,7 +228,7 @@ uid `10001`, with the jar owned by `root` and read-only to the process. Nothing 
 | Heap | `-XX:MaxRAMPercentage=60.0`, so the same image is right under any `docker run -m`. Not 75%: segments live in mapped arenas outside the heap, and a heap that crowds out the page cache turns every search into a disk read |
 | Heap dumps | Written on an out-of-memory exit to `/var/lib/excalibur-diagnostics`, not the data directory. Mount a volume there to keep one past `docker rm` |
 | Operator tools | `excalibur-fsck` and `excalibur-backup` are on the `PATH`. Run them with the node stopped, against the same volume; a repair needs `/var/lib/excalibur-quarantine` mounted, and a snapshot or restore `/var/lib/excalibur-backups` — see below. A repair, snapshot or restore against a volume a node is running on is refused (exit `4` from `excalibur-fsck`, `7` from `excalibur-backup`) |
-| Health | `HEALTHCHECK` runs `/opt/excalibur/bin/excalibur-healthcheck` every 15s, with a 90s start period that covers segment recovery on a large data directory. It probes liveness, `/health`, at the URL the node recorded as `health-url=` in `/var/lib/excalibur/.excalibur-lock` once its listener was bound — so the scheme, port and bind address are always the node's own. Liveness, because a health check drives restarts, and a drained or recovering node is alive. With `tls-client-auth=need`, give it a client certificate through `EXCALIBUR_HEALTHCHECK_CLIENT_CERT` and `EXCALIBUR_HEALTHCHECK_CLIENT_KEY`. `EXCALIBUR_HEALTHCHECK_TIMEOUT` (seconds, default 4) bounds each probe's request, and stays under the check's 5s timeout |
+| Health | `HEALTHCHECK` runs `/opt/excalibur/bin/excalibur-healthcheck` every 15s, with a 90s start period that covers segment recovery on a large data directory. It probes liveness, `/health`, at the URL the node recorded as `health-url=` in `/var/lib/excalibur/.excalibur-lock` once its listener was bound — so the scheme, port and bind address are always the node's own. Liveness, because a health check drives restarts, and a drained or recovering node is alive. With `tls-client-auth=need`, give it a client certificate through `EXCALIBUR_HEALTHCHECK_CLIENT_CERT` and `EXCALIBUR_HEALTHCHECK_CLIENT_KEY`. `EXCALIBUR_HEALTHCHECK_TIMEOUT` (a positive number of seconds, default 4; anything else fails the check with that reason) bounds each probe's request, and stays under the check's 5s timeout — to allow a slower answer, raise both, Docker's with `--health-timeout` or `healthcheck: timeout:` in a compose file |
 | Stop | The JVM is pid 1, so `SIGTERM` reaches the shutdown hook. The hook publishes the chunk index's buffer, which is the tail of an ingestion run, and closes the storage engine. It does all of this within `excalibur.api.shutdown-timeout-seconds` (30 by default). Give it that plus 10: `--stop-timeout 40`, or `terminationGracePeriodSeconds: 40`, and more if you raise the setting |
 
 Bind-mounting a host directory instead of a named volume means `chown 10001:10001` on it first;
@@ -302,13 +302,14 @@ Configuration comes from three sources, each overriding the one before it:
 2. **One** properties file
 3. Environment variables prefixed with `EXCALIBUR_`
 
-Step 2 is one file, not a chain. The path is whatever `--config <path>` gives, defaulting to
-`excalibur.properties`; it is read from the filesystem if it exists there, and otherwise from the
-classpath under the same name — the jar carries its own `excalibur.properties`, so a node started
-with no file beside it runs on that one. A file on the classpath does **not** layer underneath a
-filesystem one — the first that resolves is the only one read. A path named with `--config` that
-cannot be read refuses to start, because starting on the packaged defaults would run a node nobody
-configured; only the default path falls back to the built-in defaults, with a warning.
+Step 2 is one file, not a chain. The path is whatever `--config <path>` (or `-c <path>`, or
+`--config=<path>`) gives, defaulting to `excalibur.properties` in the working directory, and it is
+read from the filesystem only — nothing is looked up on the classpath. A path named with
+`--config` that is missing or cannot be read refuses to start, because starting on the built-in
+defaults would run a node nobody configured. Only the default path falls back: when there is no
+file there at all, the node logs a warning and starts on the built-in defaults and the
+environment. A file at the default path that is there but cannot be read refuses to start like a
+named one.
 
 The file is `key=value` lines, split at the first `=`. A line whose first character is `#` or `;`
 is a comment, and that is the only kind of comment there is: everything after the `=` is the value,
@@ -319,8 +320,22 @@ stripped from a value.
 Three variables are read directly rather than as overrides of a key: `EXCALIBUR_PORT` (the listen
 port, taking precedence over `excalibur.api.port`), `EXCALIBUR_DATA_DIR` (the data directory,
 default `./data`; there is no property for it) and `EXCALIBUR_LOG_LEVEL` (the root log level,
-default `INFO`). Every other `EXCALIBUR_` variable is the override of the key it names — including
-`EXCALIBUR_API_AUTH_TOKEN`, which is `excalibur.api.auth-token` like any other.
+default `INFO`). Two other processes read variables of their own under the same prefix, and the
+node ignores them: the MCP server's `EXCALIBUR_URL`, `EXCALIBUR_NAMESPACE` and
+`EXCALIBUR_MCP_TIMEOUT_SECONDS` (it also reads `EXCALIBUR_API_AUTH_TOKEN`, as the token it
+presents), and the container health check's `EXCALIBUR_HEALTHCHECK_TIMEOUT`,
+`EXCALIBUR_HEALTHCHECK_CLIENT_CERT` and `EXCALIBUR_HEALTHCHECK_CLIENT_KEY`. Every other
+`EXCALIBUR_` variable is the override of the key it names — including `EXCALIBUR_API_AUTH_TOKEN`,
+which is `excalibur.api.auth-token` like any other. One that spells a key the node does not read
+in one of its sections, such as `EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS`, is logged at startup as a
+warning with the nearest setting it does read; the variables above are never reported that way.
+The server and an embedded node given an environment check it alike.
+
+A variable that is set but empty, or only whitespace, overrides nothing. It is ignored with a
+warning naming it, and the file's value — or the default, if the file does not set the key —
+stands. A compose file that interpolates a variable unset on the host
+(`EXCALIBUR_API_AUTH_TOKEN: ${TOKEN}` with no `TOKEN`) delivers exactly that, and copying the
+blank over the file's token would start the node with authentication off.
 
 A value that is present but unparseable (a bad number, a non-finite double, an unrecognised
 boolean) fails startup naming the key, rather than silently falling back to the default. Blank and
@@ -3265,7 +3280,11 @@ the copy verifies faithfully without it:
   lexical store is checked as one structure — its manifest against the CRC32C on its last line,
   every column of every segment the manifest names, each named segment's key table against
   `seg-N.keysum` and its tombstones against their CRC32C, and every line of `erasure.log`
-  against its own; the graph erasure ledger has every record checked. A term sketch an earlier
+  against its own; the Lucene chunk index, `lucene-chunks/`, which a node on the Lucene engine
+  keeps instead, is checked as one structure too — every file of every segment its commit point
+  names against the checksum in its footer, reported as one verdict on the directory — and its
+  `erasure.log` line by line, by the parser the index opens it with; the graph erasure ledger has
+  every record checked. A term sketch an earlier
   build kept beside a segment (`segment_<N>.tfs`), in an image that build took, is reported healthy
   and unproven: nothing in this build reads it, so its contents prove nothing either way, though its
   length and digests are still held to the manifest like every file's. A compaction's
@@ -3363,21 +3382,30 @@ If a hot copy is the only option, take it knowing what it is worth. Every write-
 fsynced before it is acknowledged, so the acknowledged writes are on disk; what an inconsistent
 copy loses is whatever the catalog and the segments disagree about, not the corpus.
 
-`--exclude-derived` leaves out what something will rebuild — the lexical chunk index, a tenant's
-built edge store and the quantiser codebooks — at the cost of a reindex and a graph build on the
-far side. The HNSW graphs and their node mappings are never left out, derived though they
+`--exclude-derived` leaves out what something will rebuild — the lexical chunk index
+(`chunk-index/`, or `lucene-chunks/` under the Lucene engine), a tenant's built edge store and the
+quantiser codebooks — at the cost of a reindex and a graph build on the far side. A lexical index's
+`erasure.log` goes with the index and never without it: its promises are all about text in that
+index, and an erasure empties storage first, so the reindex that rebuilds the index reads nothing
+they would have removed. The HNSW graphs and their node mappings are never left out, derived though they
 are, because nothing rebuilds them: deleting a `.hnsw` gives an empty graph attached to a
 populated segment, not a repopulated one. A mapping an interrupted compaction staged
 (`segment_<N>.hnsw.compact.docmap`) is kept with them for the reason below. The write-ahead logs
 are never left out either.
 
 Three things are never copied, and each is reported under `omitted` with the reason: staged names
-a crash left behind, which nothing reads; JVM heap dumps (`*.hprof`), which are a record of a
+a crash left behind — a `.tmp`, a compaction's `.compact` or `.compact-*`, a split's
+`segment_<N>.dat.left` and `.right`, `document-registry.<N>.new`, a staging log's `.rewriting` or
+`.erasing`, `asserted.last-id.writing`, a graph build's `.body` and `.assembled` — which nothing
+reads; JVM heap dumps (`*.hprof`), which are a record of a
 process rather than state and roughly the size of its heap; and the term sketches an earlier build
 kept beside its segments (`segment_<N>.tfs`, reported `OBSOLETE`), which nothing in this build reads
 and the node deletes when it starts. A restore of an image an earlier build took verifies those
 sketches with the rest of the image, since the manifest certifies their bytes, and then leaves them
-out of the restored directory.
+out of the restored directory. What each file is comes from the classification `excalibur-fsck`
+surveys a directory with, so what a snapshot leaves out as scratch is exactly what fsck reports as a
+staging leftover — apart from a compaction's staged `segment_<N>.hnsw.compact`, copied with the
+staged mapping whose meaning it decides — and a file neither recognises is kept.
 
 `excalibur-backup <command> --help` prints that command's options and the exit codes, and exits
 `0` without touching anything.
@@ -3521,6 +3549,15 @@ node runs before it serves one:
   may hold what an erasure removed, so neither is moved.
 - Any other file in a graph directory is `UNCHECKED`; the next build replaces the directory whole.
 
+A node on the Lucene lexical engine keeps its keyword index in `lucene-chunks/`, and fsck checks
+that directory the way it checks a graph's Lucene indexes: from the commit point, every file of
+every segment against the CRC32 in its footer, reported as one verdict on `lucene-chunks`. It is
+`CORRUPT` when a file fails its footer, a file the commit names is missing, or files are there with
+no commit point at all; the node will not open such an index. A directory holding only Lucene's
+`write.lock` was created and never committed, and is not judged. The `erasure.log` beside the index
+is the native store's format and is checked line by line, by the parser the index opens it with.
+Damage to either goes to an operator (below), never into the quarantine.
+
 Three files are judged by what the node does with them rather than by name alone:
 
 - **`chunk-index/seg-N.keymap`, a lexical segment's lookup table**, is a derived file the store
@@ -3597,9 +3634,11 @@ quarantine and the original directory removed. What it refuses to attempt matter
 | A damaged `catalog.dat` | Segment files are rediscovered on start-up, but lifecycle state, integrated offsets, source ids and epochs live only there. A node that starts without them looks like a first start |
 | A damaged `routing.dir`, or a slot pointing at a missing segment | Which hash slot belongs to which segment after a split is not derivable from file names. That is why the directory is written down |
 | A write-ahead log damaged in the middle | The records behind the damage were fsynced and acknowledged. Trimming past them would destroy committed writes, and so would moving the file aside — nothing rebuilds a log the way a reindex rebuilds an index |
-| A write-ahead log whose header is damaged, with records behind it | The version the header names cannot be believed, and the records behind it were acknowledged. It is damage, not a newer build's log — whose header's checksum would match — so restore the segment from a backup or a replica |
+| A write-ahead log whose header is damaged, or whose start was zeroed, with records behind it | The version the header names cannot be believed, or no header is left to name one, and the records behind it were acknowledged. It is damage, not a newer build's log — whose header's checksum would match — so restore the segment from a backup or a replica |
 | A damaged `segment_<N>.hnsw.compact.docmap` with no `.hnsw.compact` beside it | The graph already holds the compacted numbering, and without this mapping it would be served through the pre-compaction one — wrong documents rather than an error. Restore the graph and both mappings together, or reindex the segment |
 | A damaged lexical store `manifest` | A store without its manifest opens as a new, empty index and deletes every segment the empty manifest does not name. Restore the manifest from a backup, or remove the whole `chunk-index` directory and reindex |
+| A damaged Lucene chunk index (`lucene-chunks`) | The node will not open a commit that fails its checksums, but the index may still hold text an accepted erasure has not yet reclaimed, and a quarantined copy would keep it. With the node stopped, delete the whole `lucene-chunks` directory — its `erasure.log` with it, since every promise there is about text in this index — and reindex, or restore the directory whole from a backup |
+| A damaged `erasure.log`, in `chunk-index` or `lucene-chunks` | Every promise in it was forced to disk before its caller was told the erasure was accepted, and a log that is not there owes nothing, so every erasure it holds would lapse. The keyword index does not open until the log reads cleanly. Restore it from a backup |
 | A damaged built graph with a `graph.previous` or `graph.retired` beside it | With the graph moved away the node would restore that copy and serve it, and a copy an erasure compaction replaced still holds what the erasure removed. Start the node once, which deletes the copy beside a served graph, or delete the copy, then repair again — or `POST /v1/graph/build`, which replaces the damaged graph without either. The move is checked again as it is made |
 | A damaged built graph beside a damaged label interner | The graph's dictionary may be all that still names the ids past the interner's damage. Moved away, the node would cut those ids off and hand them to new labels, serving one entity under another's name. Restore the namespace's `graph-staging` directory and graph from a backup. The move is checked again as it is made |
 | A damaged graph staging log | Nothing rebuilds one, and the node opens a missing one as empty. Moved aside, a label interner hands its ids out again under the published graph, so entities are served under other entities' names; `triples.log` empties the next graph build; `entity_text.log` leaves entities nothing to be ranked or embedded by; `erasure.log` and `withdrawals.log` forget what is still owed. Restore the namespace's `graph-staging` directory from a backup, all its logs together, since they refer to one another by id |

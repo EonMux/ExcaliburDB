@@ -3,7 +3,9 @@
 #
 # Copy to excalibur.properties (gitignored) and edit. Every key below can also be supplied
 # from the environment as EXCALIBUR_<KEY>, upper-cased with - and . replaced by _ , which
-# overrides the file. Supply secrets that way rather than writing them into a file.
+# overrides the file. Supply secrets that way rather than writing them into a file. A variable
+# that is set but empty overrides nothing: it is ignored with a warning, and this file's value
+# stands.
 
 # Visibility Configuration
 excalibur.visibility.epoch-tick-ms=100
@@ -54,7 +56,8 @@ excalibur.api.shutdown-timeout-seconds=30
 # refuses to start rather than serving the network unauthenticated or in cleartext.
 excalibur.api.bind-address=127.0.0.1
 # Never set the auth token here. Supply it as the EXCALIBUR_API_AUTH_TOKEN environment
-# variable, which is the environment override of this key. Setting it turns authentication on:
+# variable, which is the environment override of this key; a token set here works, and the node
+# warns about it at every start. Setting it turns authentication on:
 # every endpoint except GET /health and GET /health/ready then requires it as a bearer token (a
 # method a path does not serve is still answered 405 without one). Unset, the API is unauthenticated -- which is safe only
 # because the bind policy above will not let it listen anywhere but loopback without one.
@@ -164,6 +167,8 @@ excalibur.graph.max-walk-facts=10000
 excalibur.graph.min-score=0.05
 excalibur.graph.min-separation=0.01
 excalibur.graph.min-mean-confidence=0.3
+# Candidates handed back when the answer is ambiguous. At least 2: ambiguity is a comparison
+# between competing readings, and one candidate is not something to compare.
 excalibur.graph.max-ambiguous-candidates=5
 # Divisor on the log-odds of the confidence an answer reports. 1.0 leaves it untouched, which is
 # the honest default: the number a node reports is built from a ranking score by arithmetic, and
@@ -420,7 +425,8 @@ excalibur.shard.hnsw-integration-queue-depth-limit=100000
 # Neighbours an HNSW node keeps. More means better recall, a larger graph file and a slower build.
 # Layer 0 is where the walk stops descending and becomes exhaustive, so it is given more; 0 means
 # twice the value above it. Both are written into a graph's header when it is created and a graph
-# already on disk keeps what it was built with, so these govern graphs built from here on.
+# already on disk keeps what it was built with, so these govern graphs built from here on. The
+# first is 2 to 256; the second is 0 (twice the first), or at least the first and at most 512.
 excalibur.shard.default-max-connections=16
 excalibur.shard.default-max-connections-layer0=0
 

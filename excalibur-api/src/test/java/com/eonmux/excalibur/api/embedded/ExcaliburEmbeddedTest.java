@@ -1,7 +1,11 @@
 package com.eonmux.excalibur.api.embedded;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.eonmux.excalibur.api.bootstrap.ChunkIndexFactory;
 import com.eonmux.excalibur.api.bootstrap.NodeAssembly;
+import com.eonmux.excalibur.config.ConfigLoader;
 import com.eonmux.excalibur.core.datadir.DataDirectoryLock;
 import com.eonmux.excalibur.core.datadir.DataDirectoryLockedException;
 import com.eonmux.excalibur.core.datadir.LockHolder;
@@ -14,6 +18,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -287,6 +292,46 @@ class ExcaliburEmbeddedTest {
 
             assertThat(SourceCatalog.open(dataDir).all())
                 .extracting(SourceDescriptor::sourceId).doesNotContain("site");
+        }
+    }
+
+    @Nested
+    @DisplayName("configured from the environment")
+    class Environment {
+
+        @Test
+        @DisplayName("warns about a variable that sets nothing, as the server does")
+        void warnsAboutAMistypedVariable() throws Exception {
+            // Applied over every other source, and so as easy to mistype in a deployment manifest
+            // as a key is in a file - and exactly as silently ignored when nothing says so.
+            ListAppender<ILoggingEvent> events = new ListAppender<>();
+            events.start();
+            Logger logger = (Logger) LoggerFactory.getLogger(ConfigLoader.class);
+            logger.addAppender(events);
+            try (ExcaliburEmbedded db = lexicalNode()
+                    .environment(Map.of("EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS", "64")).open()) {
+                assertThat(db.route()).isPresent();
+            } finally {
+                logger.detachAppender(events);
+            }
+            List<String> warnings =
+                events.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+
+            assertThat(warnings).anyMatch(message ->
+                message.contains("EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS")
+                    && message.contains("EXCALIBUR_INGEST_CHUNK_TARGET_TOKENS"));
+        }
+
+        @Test
+        @DisplayName("keeps a property set here when its variable is set but empty")
+        void anEmptyVariableOverridesNothing() throws Exception {
+            try (ExcaliburEmbedded db = lexicalNode()
+                    .property("excalibur.api.max-top-k", "5")
+                    .property("excalibur.query.top-k-default", "5")
+                    .environment(Map.of("EXCALIBUR_API_MAX_TOP_K", "")).open()) {
+                assertThatThrownBy(() -> db.query("cold", 6))
+                    .isInstanceOf(IllegalArgumentException.class);
+            }
         }
     }
 

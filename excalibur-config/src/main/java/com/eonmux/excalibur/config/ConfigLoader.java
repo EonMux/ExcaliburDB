@@ -2,9 +2,10 @@ package com.eonmux.excalibur.config;
 
 import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.HashMap;
@@ -36,13 +37,12 @@ import org.slf4j.LoggerFactory;
  * supported: everything after the first <code>=</code> is part of the value.</p>
  *
  * <h2>Loading Strategy</h2>
- * <p>Configuration files are loaded in the following order:
- * <ol>
- *   <li>First, try to load from filesystem path (absolute or relative)</li>
- *   <li>If not found on filesystem, try to load from classpath</li>
- *   <li>If neither location has the file, throw IOException</li>
- * </ol>
- * </p>
+ * <p>The path is read from the filesystem, absolute or relative to the working directory, and
+ * from nowhere else. There is no classpath lookup: a name that resolved to a copy packaged in
+ * the jar whenever the file was missing would turn a mistyped path into a node running on a
+ * file the operator never wrote, with nothing to say so. A file that is absent is reported as
+ * {@link NoSuchFileException}, distinct from one that is present and cannot be read, so a
+ * caller can tell "there is no file" from "there is a file and it is not this node's".</p>
  *
  * @author ExcaliburDB
  */
@@ -53,13 +53,11 @@ public final class ConfigLoader {
     /**
      * Loads configuration from a properties file with environment variable overrides.
      *
-     * <p>The loader first attempts to read from the filesystem path. If the file
-     * does not exist on the filesystem, it falls back to loading from the classpath.</p>
-     *
-     * @param configPath Path to the properties file (filesystem path or classpath resource)
+     * @param configPath Path to the properties file, absolute or relative to the working directory
      * @param envOverrides Additional environment variable overrides
      * @return Loaded configuration object
-     * @throws IOException if the file cannot be read from filesystem or classpath
+     * @throws NoSuchFileException if there is no file at the path
+     * @throws IOException if the file is there and cannot be read
      * @throws IllegalStateException if the file format is invalid
      * @throws IllegalArgumentException if a property value cannot be parsed or violates
      *         a domain constraint
@@ -72,23 +70,18 @@ public final class ConfigLoader {
         // Resolve path relative to current directory if not absolute
         Path configFilePath = Paths.get(configPath).toAbsolutePath();
 
-        // Read properties from file or classpath
         Map<String, String> properties = new HashMap<>();
 
-        InputStream inputStream;
-        if (Files.exists(configFilePath)) {
-            // Load from filesystem
-            inputStream = Files.newInputStream(configFilePath);
-        } else {
-            // Fall back to classpath
-            inputStream = ConfigLoader.class.getClassLoader().getResourceAsStream(configPath);
-            if (inputStream == null) {
-                throw new IOException("Configuration file not found: " + configPath +
-                    " (tried filesystem: " + configFilePath + " and classpath)");
-            }
+        // notExists rather than !exists: a file whose existence cannot be determined - a directory
+        // this process may not search - is reported by the read below as the failure it is, not
+        // mistaken for the absence of a file.
+        if (Files.notExists(configFilePath)) {
+            throw new NoSuchFileException(configFilePath.toString(), null,
+                "Configuration file not found: " + configPath);
         }
 
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                Files.newInputStream(configFilePath), StandardCharsets.UTF_8))) {
             String line;
             int lineNumber = 0;
             while ((line = reader.readLine()) != null) {
@@ -127,11 +120,34 @@ public final class ConfigLoader {
         // so every construction path resolves overrides identically.
         Config config = new Config(configPath, envOverrides, properties);
 
-        // Over the effective map rather than the file: the same typo is as easy to make in a
-        // deployment manifest as in a properties file, and a key that arrived as
-        // EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS is exactly as silently ignored.
-        reportUnrecognisedKeys(configPath, config.getEffectiveProperties());
+        // The file and the environment separately, so each warning names what the operator
+        // typed: the same typo is as easy to make in a deployment manifest as in a properties
+        // file, and a key that arrived as EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS is exactly as
+        // silently ignored - but it is fixed in the manifest, under its variable's name.
+        reportUnrecognisedKeys(configPath, properties);
+        reportUnrecognisedVariables(envOverrides);
         return config;
+    }
+
+    /**
+     * Warns about an <code>EXCALIBUR_*</code> variable that would set a key no setting answers to.
+     *
+     * <p>The environment's half of {@link #reportUnrecognisedKeys}, for every path that applies
+     * one: the server's, whether or not it found a file, and an embedded node's. The warning names
+     * the variable and, where one is close, the variable that was probably meant.</p>
+     *
+     * @param environment Environment variables, keyed by variable name; null is no environment
+     */
+    public static void reportUnrecognisedVariables(Map<String, String> environment) {
+        if (environment == null) {
+            return;
+        }
+        for (String variable : EnvOverrides.unrecognisedVariables(environment)) {
+            String nearest = ConfigKeys.nearest(EnvOverrides.toPropertyKey(variable));
+            LOGGER.warn("No setting is named by the environment variable {}; it is being ignored{}",
+                variable,
+                nearest == null ? "" : ". Did you mean " + EnvOverrides.toVariableName(nearest) + "?");
+        }
     }
 
     /**
@@ -142,7 +158,7 @@ public final class ConfigLoader {
      * not take. A deployment can run for a year on a queue limit it believes it changed.</p>
      *
      * @param configPath Where the properties came from, for the message
-     * @param properties The effective settings, file and environment overlaid
+     * @param properties The settings read from there
      */
     public static void reportUnrecognisedKeys(String configPath, Map<String, String> properties) {
         for (String key : properties.keySet()) {

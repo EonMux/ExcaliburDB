@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.*;
@@ -65,6 +66,36 @@ class ConfigLoaderTest {
             assertThatThrownBy(() -> ConfigLoader.load("non-existent.properties", Collections.emptyMap()))
                 .isInstanceOf(IOException.class)
                 .hasMessageContaining("Configuration file not found");
+        }
+
+        @Test
+        @DisplayName("reports an absent file as NoSuchFileException, so a caller can tell it from an unreadable one")
+        void reportsAbsenceDistinctly() {
+            assertThatThrownBy(() -> ConfigLoader.load(
+                tempDir.resolve("absent.properties").toString(), Collections.emptyMap()))
+                .isInstanceOf(java.nio.file.NoSuchFileException.class);
+        }
+
+        @Test
+        @DisplayName("does not read a file of that name from the classpath instead")
+        void neverFallsBackToTheClasspath() {
+            // classpath-only.properties is a test resource and is not on the filesystem. A loader
+            // that looked it up on the classpath would start a node on a file the operator never
+            // wrote whenever the one they named was missing.
+            assertThatThrownBy(() -> ConfigLoader.load("classpath-only.properties",
+                Collections.emptyMap()))
+                .isInstanceOf(java.nio.file.NoSuchFileException.class);
+        }
+
+        @Test
+        @DisplayName("a file that is present but unreadable is not reported as absent")
+        void unreadableIsNotAbsent() throws IOException {
+            // A directory stands in for an unreadable file: it exists, and opening it to read fails.
+            Path directory = Files.createDirectory(tempDir.resolve("a-directory.properties"));
+
+            assertThatThrownBy(() -> ConfigLoader.load(directory.toString(), Collections.emptyMap()))
+                .isInstanceOf(IOException.class)
+                .isNotInstanceOf(java.nio.file.NoSuchFileException.class);
         }
 
         @Test
@@ -254,6 +285,61 @@ class ConfigLoaderTest {
         }
 
         @Test
+        @DisplayName("an empty variable does not wipe the value the file sets")
+        void anEmptyVariableOverridesNothing() throws IOException {
+            // What a compose file produces when it interpolates a variable unset on the host.
+            // Copied through, the blank reads as absent and the shipped default wins over the file.
+            Files.writeString(configFile, """
+                excalibur.query.top-k-default=7
+                excalibur.llm.api-key=from-the-file
+                """);
+
+            Map<String, String> envOverrides = new HashMap<>();
+            envOverrides.put("EXCALIBUR_QUERY_TOP_K_DEFAULT", "");
+            envOverrides.put("EXCALIBUR_LLM_API_KEY", "   ");
+
+            Config config = ConfigLoader.load(configFile.toString(), envOverrides);
+
+            assertThat(config.query().getDefaultTopK()).isEqualTo(7);
+            assertThat(config.llm().getApiKey()).isEqualTo("from-the-file");
+            assertThat(config.getEffectiveProperties())
+                .containsEntry("excalibur.query.top-k-default", "7");
+        }
+
+        @Test
+        @DisplayName("records which keys the environment supplied")
+        void recordsWhichKeysTheEnvironmentSupplied() throws IOException {
+            Files.writeString(configFile, """
+                excalibur.query.top-k-default=7
+                excalibur.llm.api-key=from-the-file
+                excalibur.llm.chat-model=from-the-file
+                """);
+
+            Config config = ConfigLoader.load(configFile.toString(), Map.of(
+                "EXCALIBUR_QUERY_TOP_K_DEFAULT", "9",
+                "EXCALIBUR_LLM_API_KEY", ""));
+
+            assertThat(config.isSetByEnvironment("excalibur.query.top-k-default")).isTrue();
+            assertThat(config.isSetByEnvironment("excalibur.llm.api-key"))
+                .as("an empty variable overrides nothing, so the value is still the file's")
+                .isFalse();
+            assertThat(config.isSetByEnvironment("excalibur.llm.chat-model")).isFalse();
+        }
+
+        @Test
+        @DisplayName("an empty variable for a key the file does not set leaves the default")
+        void anEmptyVariableLeavesTheDefault() throws IOException {
+            Files.writeString(configFile, "excalibur.visibility.epoch-tick-ms=100\n");
+
+            Config config = ConfigLoader.load(configFile.toString(),
+                Map.of("EXCALIBUR_QUERY_TOP_K_DEFAULT", ""));
+
+            assertThat(config.query().getDefaultTopK()).isEqualTo(QueryConfig.DEFAULT_TOP_K);
+            assertThat(config.getEffectiveProperties())
+                .doesNotContainKey("excalibur.query.top-k-default");
+        }
+
+        @Test
         @DisplayName("reaches a key whose name is more than one section deep")
         void reachesADeeperSection() throws IOException {
             // The documented rule is that any setting can be supplied from the environment.
@@ -279,6 +365,53 @@ class ConfigLoaderTest {
             // rather than one of the spellings that were tried on the way past it.
             assertThat(com.eonmux.excalibur.config.EnvOverrides.toPropertyKey("EXCALIBUR_LLM_NO_SUCH_KEY"))
                 .isEqualTo("excalibur.llm.no-such-key");
+        }
+
+        @Test
+        @DisplayName("a variable that sets no key in a parsed section is reported as a typo")
+        void aMistypedVariableIsReported() {
+            assertThat(com.eonmux.excalibur.config.EnvOverrides.unrecognisedVariables(Map.of(
+                "EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS", "512",
+                "EXCALIBUR_INGEST_CHUNK_TARGET_TOKENS", "512")))
+                .containsExactly("EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS");
+        }
+
+        @Test
+        @DisplayName("the variables read directly, rather than as a key's override, are not typos")
+        void directlyReadVariablesAreNotReported() {
+            // Each of these is read by name - by the server, logback, the MCP client or the
+            // container's health check - and names no key. Warning that one is being ignored
+            // would tell an operator to delete a line that is in force.
+            Map<String, String> environment = new HashMap<>();
+            for (String name : List.of("EXCALIBUR_PORT", "EXCALIBUR_DATA_DIR",
+                    "EXCALIBUR_LOG_LEVEL", "EXCALIBUR_URL", "EXCALIBUR_NAMESPACE",
+                    "EXCALIBUR_MCP_TIMEOUT_SECONDS", "EXCALIBUR_HEALTHCHECK_TIMEOUT",
+                    "EXCALIBUR_HEALTHCHECK_CLIENT_CERT", "EXCALIBUR_HEALTHCHECK_CLIENT_KEY",
+                    "EXCALIBUR_API_AUTH_TOKEN")) {
+                environment.put(name, "x");
+            }
+
+            assertThat(com.eonmux.excalibur.config.EnvOverrides.unrecognisedVariables(environment))
+                .isEmpty();
+        }
+
+        @Test
+        @DisplayName("an empty variable is not also reported as a typo")
+        void anEmptyVariableIsNotAlsoATypo() {
+            assertThat(com.eonmux.excalibur.config.EnvOverrides.unrecognisedVariables(
+                Map.of("EXCALIBUR_LLM_NO_SUCH_KEY", " "))).isEmpty();
+        }
+
+        @Test
+        @DisplayName("every key's variable spelling reads back as that key")
+        void everyKeyRoundTripsThroughItsVariable() {
+            // The suggestion a typo warning offers is spelled as a variable, so it has to be one
+            // that reaches the key it names.
+            for (String key : ConfigKeys.known()) {
+                String variable = com.eonmux.excalibur.config.EnvOverrides.toVariableName(key);
+                assertThat(com.eonmux.excalibur.config.EnvOverrides.toPropertyKey(variable))
+                    .as(variable).isEqualTo(key);
+            }
         }
 
         @Test

@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.fsck.check;
 
+import com.eonmux.excalibur.retrieval.lexical.LexicalIndexIntegrity;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -27,7 +29,9 @@ import java.util.Optional;
  * segment directories whose columns are verified together. {@link #inspect} reports each file
  * inside it as a lexical store part, and {@link #lexicalStore} checks the store as a whole;
  * the verdicts the second returns supersede the first's for the files they cover. A tenant's
- * built graph is the same: {@link #graphStores} judges each graph directory as a whole.</p>
+ * built graph is the same: {@link #graphStores} judges each graph directory as a whole. So is
+ * the Lucene chunk index, which {@link #luceneChunkIndex} judges from its commit point; its
+ * erasure log is a file of its own format and is verified here.</p>
  */
 public final class FileInspector {
 
@@ -85,6 +89,21 @@ public final class FileInspector {
             return Optional.empty();
         }
         return Optional.of(LexicalStoreCheck.check(store, FileClassifier.LEXICAL_STORE_DIRECTORY));
+    }
+
+    /**
+     * Checks the Lucene chunk index under a data directory, if one was ever committed there.
+     *
+     * <p>The verdict supersedes the per-file verdict {@link #inspect} gives each file under the
+     * directory but the erasure log, which is judged on its own.</p>
+     *
+     * @param dataDirectory The data directory, or a snapshot's payload root
+     * @return The verdict on the index, or empty when the directory holds none
+     * @throws NullPointerException if dataDirectory is null
+     */
+    public static Optional<LuceneChunkIndexCheck.LuceneChunkInspection> luceneChunkIndex(
+            Path dataDirectory) {
+        return LuceneChunkIndexCheck.inspect(dataDirectory);
     }
 
     /**
@@ -151,6 +170,12 @@ public final class FileInspector {
             case ERASURE_RECEIPTS -> CountMarkedTextCheck.check(
                 file, relative, CountMarkedFormat.ERASURE_RECEIPTS);
             case IN_FLIGHT_JOURNAL -> InFlightJournalCheck.check(file, relative);
+            case LUCENE_CHUNK_ERASURE_LOG -> LuceneChunkIndexCheck.erasureLog(file, relative);
+            case LUCENE_CHUNK_INDEX_PART -> unverifiable(file, relative,
+                LexicalIndexIntegrity.FORMAT,
+                "this file sits in the Lucene chunk index and was not judged with it: the "
+                    + "directory holds nothing an index commit writes, so there was no index to "
+                    + "judge. Taken alone it proves nothing");
             case LEXICAL_STORE_PART, LEXICAL_KEY_LOOKUP -> unverifiable(file, relative,
                 "lexical store sidecar",
                 "this file sits in the lexical store directory and was not judged with the "

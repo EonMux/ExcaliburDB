@@ -55,7 +55,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@link #checkRoutingRegistration(long)}.</p>
  *
  * <p>Each mutation is persisted through {@link CatalogPersistence} before it is reported as
- * done, in the same order the in-memory change was made.</p>
+ * done, in the same order the in-memory change was made. A new record whose row could not be
+ * written - the catalog file full, or the write failing - is taken back out of memory before
+ * the failure propagates, so the registry never holds a segment a restart would not.</p>
  *
  * <p><strong>Thread safety:</strong> fully thread-safe. The two maps are concurrent and the
  * id generator is atomic. The per-volume id lists are copy-on-write, so a reader iterates a
@@ -192,11 +194,15 @@ final class CatalogRegistry {
      * @return The created or existing metadata
      * @throws IllegalArgumentException if the id lies outside the routing range
      * @throws IllegalStateException if the id is held by a segment {@link #create} made
+     * @throws java.io.UncheckedIOException if the row cannot be written; a new record is not
+     *         kept
      */
     SegmentCatalog.SegmentMetadata add(long segmentId, Path volumePath) {
         checkRoutingRegistration(segmentId);
-        SegmentCatalog.SegmentMetadata metadata = segments.computeIfAbsent(segmentId, k ->
-            new SegmentCatalog.SegmentMetadata(segmentId));
+        SegmentCatalog.SegmentMetadata created = new SegmentCatalog.SegmentMetadata(segmentId);
+        SegmentCatalog.SegmentMetadata existing = segments.putIfAbsent(segmentId, created);
+        boolean fresh = existing == null;
+        SegmentCatalog.SegmentMetadata metadata = fresh ? created : existing;
 
         metadata.setVolumePath(volumePath);
         metadata.setCreationTime(System.currentTimeMillis());
@@ -210,10 +216,7 @@ final class CatalogRegistry {
         }
 
         indexByVolume(volumePath, segmentId);
-
-        // Persist to disk
-        persistence.persist(metadata);
-
+        persistOrForget(metadata, fresh);
         return metadata;
     }
 
@@ -258,6 +261,8 @@ final class CatalogRegistry {
      * @return The created segment metadata with BOOTSTRAPPING state
      * @throws NullPointerException if sourceId or volumePath is null
      * @throws IllegalStateException if the drawn id is somehow already registered
+     * @throws java.io.UncheckedIOException if the row cannot be written - the catalog file is
+     *         full, or the write fails; the record is not kept
      */
     SegmentCatalog.SegmentMetadata create(String sourceId, Path volumePath) {
         if (sourceId == null) {
@@ -286,14 +291,34 @@ final class CatalogRegistry {
         // Caller should call beginIndexing() to make it queryable
 
         indexByVolume(volumePath, segmentId);
-
-        // Persist to disk
-        persistence.persist(metadata);
+        persistOrForget(metadata, true);
 
         SegmentCatalog.logger.info("Created segment {} in BOOTSTRAPPING state for source {} at {}",
             segmentId, sourceId, volumePath);
 
         return metadata;
+    }
+
+    /**
+     * Persists a record, and forgets it again when it is new and its row could not be written.
+     *
+     * <p>A record kept in memory without a row is a segment this process serves and the next
+     * one has never heard of - and for {@link #create}, a created id the generator has already
+     * moved past, so taking it back costs nothing.</p>
+     *
+     * @param metadata The record to persist
+     * @param fresh    Whether this registration made the record
+     * @throws java.io.UncheckedIOException if the row cannot be written
+     */
+    private void persistOrForget(SegmentCatalog.SegmentMetadata metadata, boolean fresh) {
+        try {
+            persistence.persist(metadata);
+        } catch (RuntimeException e) {
+            if (fresh && segments.remove(metadata.getSegmentId(), metadata)) {
+                unindexByVolume(metadata.getVolumePath(), metadata.getSegmentId());
+            }
+            throw e;
+        }
     }
 
     /**

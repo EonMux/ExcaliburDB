@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.store;
 
+import com.eonmux.excalibur.store.catalog.CatalogFile;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -10,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.function.Function;
 import java.util.logging.Level;
 
 /**
@@ -40,7 +43,8 @@ import java.util.logging.Level;
  * it a small multiple of the segment count for keys that hash evenly, and
  * {@code StorageEngine.maxRoutingWidth} bounds what keys that do not can cost: a split that
  * would double past it is refused with {@link RoutingDirectoryFullException}, counted and
- * logged, instead of being allowed to exhaust the heap.</p>
+ * logged, instead of being allowed to exhaust the heap. A split the segment catalog has no row
+ * for is refused the same way, with {@link CatalogFullException}.</p>
  *
  * <h2>Why the directory is persisted</h2>
  * <p>The bit each split partitioned on is recorded nowhere except the directory itself. A
@@ -437,6 +441,16 @@ final class EngineRouting {
         long rightIndex() {
             return parentSlots.get(0) + (1L << splitBit);
         }
+
+        /**
+         * Returns the catalog indices the children are registered at: the left child's, which
+         * is the parent's own, then the right child's.
+         *
+         * @return The left and right indices
+         */
+        long[] childIndices() {
+            return new long[] {parentSlots.get(0), rightIndex()};
+        }
     }
 
     /**
@@ -463,6 +477,7 @@ final class EngineRouting {
      *         not a set a split can halve
      * @throws RoutingDirectoryFullException if the split needs a doubling past
      *         {@code StorageEngine.maxRoutingWidth}
+     * @throws CatalogFullException if the catalog has no row for a child
      */
     SplitPlan planSplit(Segment segment) {
         SplitPlan plan = planSplitIfRouted(segment);
@@ -483,6 +498,7 @@ final class EngineRouting {
      * @return The plan, or null when the segment owns no slot
      * @throws IllegalStateException if its slots are not a set a split can halve
      * @throws RoutingDirectoryFullException if the split needs a doubling past the limit
+     * @throws CatalogFullException if the catalog has no row for a child
      */
     private SplitPlan planSplitIfRouted(Segment segment) {
         // The published snapshot rather than the map: under the lock the two agree, and the
@@ -512,13 +528,39 @@ final class EngineRouting {
                     + "halves them; the routing directory is inconsistent");
         }
 
+        SplitPlan plan;
         if (varying != 0) {
-            return new SplitPlan(Long.numberOfTrailingZeros(varying), List.copyOf(slots), false);
+            plan = new SplitPlan(Long.numberOfTrailingZeros(varying), List.copyOf(slots), false);
+        } else {
+            if ((long) width * 2 > engine.maxRoutingWidth) {
+                refuseDoubling(segment, width);
+            }
+            plan = new SplitPlan(Integer.numberOfTrailingZeros(width), List.copyOf(slots), true);
         }
-        if ((long) width * 2 > engine.maxRoutingWidth) {
-            refuseDoubling(segment, width);
+        // Asked here so a writer hears at once and the worker does not partition in vain.
+        // Publication reserves the rows before it moves anything, which is what holds.
+        if (!engine.catalog.hasRoomFor(plan.childIndices())) {
+            refuseCatalogFull(segment);
         }
-        return new SplitPlan(Integer.numberOfTrailingZeros(width), List.copyOf(slots), true);
+        return plan;
+    }
+
+    /**
+     * Reserves the catalog rows a split's children will be registered in, before publication
+     * moves any file. The caller holds {@code StorageEngine.segmentLock}.
+     *
+     * <p>The check {@link #planSplit(Segment)} makes can be overtaken: a rolling reindex
+     * registers its segments without this lock. A reservation cannot, and publication moves the
+     * children's files into place before it writes their rows, so it has to hold one first.</p>
+     *
+     * @param segment The segment being split
+     * @param plan    Its plan
+     * @throws CatalogFullException if the catalog has no row for a child
+     */
+    void reserveCatalogRows(Segment segment, SplitPlan plan) {
+        if (!engine.catalog.reserveRows(plan.childIndices())) {
+            refuseCatalogFull(segment);
+        }
     }
 
     /**
@@ -529,6 +571,7 @@ final class EngineRouting {
      * @param segment The segment to split
      * @return The split bit
      * @throws RoutingDirectoryFullException if the split needs a doubling past the limit
+     * @throws CatalogFullException if the catalog has no row for a child
      */
     int splitBitFor(Segment segment) {
         synchronized (engine.segmentLock) {
@@ -547,6 +590,7 @@ final class EngineRouting {
      * @param segment The segment to split
      * @return The split bit, or -1 when the segment has been replaced
      * @throws RoutingDirectoryFullException if the split needs a doubling past the limit
+     * @throws CatalogFullException if the catalog has no row for a child
      */
     int splitBitIfRouted(Segment segment) {
         synchronized (engine.segmentLock) {
@@ -558,27 +602,52 @@ final class EngineRouting {
     /**
      * Counts, reports and refuses a split that would double the directory past its limit.
      *
-     * <p>Logged once per segment: the split worker offers a full segment again on every sweep
-     * and a writer on every write it routes there, and the thing worth knowing is that it
-     * happened and to which segment, not how often it was asked. Every refusal is counted.</p>
-     *
      * @param segment The segment that cannot split
      * @param width   The directory's width
      * @throws RoutingDirectoryFullException always
      */
     private void refuseDoubling(Segment segment, int width) {
-        engine.statistics.incrementRefusedSplits();
-        String message = "Segment " + segment.path() + " is full and as deep as the routing "
+        refuse(segment, "Segment " + segment.path() + " is full and as deep as the routing "
             + "directory, and splitting it would double the directory from " + width + " to "
             + (width * 2L) + " slots, past its limit of " + engine.maxRoutingWidth + ". Its keys "
             + "share their lowest " + Integer.numberOfTrailingZeros(width) + " hash bits, which "
             + "for evenly hashed keys means a store of about " + (width / 2) + " segments or "
             + "more; this one has " + engine.canonicalIndex.size() + ". The segment keeps what "
-            + "it holds and refuses further inserts.";
+            + "it holds and refuses further inserts.", RoutingDirectoryFullException::new);
+    }
+
+    /**
+     * Counts, reports and refuses a split the segment catalog has no row for.
+     *
+     * @param segment The segment that cannot split
+     * @throws CatalogFullException always
+     */
+    private void refuseCatalogFull(Segment segment) {
+        refuse(segment, "Segment " + segment.path() + " is full, and the segment catalog has no "
+            + "row left for the segment a split would add: it holds at most "
+            + CatalogFile.MAX_SEGMENTS + " live segments, and a purged segment's row is reused "
+            + "rather than added to. The segment keeps what it holds and refuses further "
+            + "inserts.", CatalogFullException::new);
+    }
+
+    /**
+     * Counts a refused split, logs it the first time this segment is refused, and throws.
+     *
+     * <p>Logged once per segment: the split worker offers a full segment again on every sweep
+     * and a writer on every write it routes there, and the thing worth knowing is that it
+     * happened and to which segment, not how often it was asked. Every refusal is counted.</p>
+     *
+     * @param segment   The segment that cannot split
+     * @param message   Why
+     * @param exception Makes the refusal from the message
+     */
+    private void refuse(Segment segment, String message,
+                        Function<String, ? extends SegmentAtCapacityException> exception) {
+        engine.statistics.incrementRefusedSplits();
         if (refusalsReported.add(segment)) {
             StorageEngine.LOGGER.log(Level.WARNING, message);
         }
-        throw new RoutingDirectoryFullException(message);
+        throw exception.apply(message);
     }
 
     /**

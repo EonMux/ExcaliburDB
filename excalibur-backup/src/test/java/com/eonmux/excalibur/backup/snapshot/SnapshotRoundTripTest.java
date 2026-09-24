@@ -115,4 +115,41 @@ class SnapshotRoundTripTest {
         assertThat(DataDirectoryFixture.digest(copied))
             .isEqualTo(DataDirectoryFixture.digest(dataDir.resolve("segment_0.wal")));
     }
+
+    @Test
+    @DisplayName("the Lucene chunk index is kept or left out whole, its erasure log with it")
+    void theLuceneChunkIndexTravelsWhole() throws IOException {
+        Path dataDir = DataDirectoryFixture.realEngineDirectory(tempDir.resolve("data"), 24);
+        DataDirectoryFixture.writeLuceneChunkIndex(dataDir);
+        String index = DataDirectoryFixture.LUCENE_CHUNK_INDEX + "/";
+
+        Path whole = tempDir.resolve("whole");
+        SnapshotResult withDerived = new SnapshotWriter()
+            .take(new SnapshotOptions(dataDir, whole, true, false));
+        Path slim = tempDir.resolve("slim");
+        SnapshotResult withoutDerived = new SnapshotWriter()
+            .take(new SnapshotOptions(dataDir, slim, false, false));
+
+        assertThat(withDerived.manifest().files())
+            .anyMatch(entry -> entry.path().equals(index + "erasure.log"))
+            .anyMatch(entry -> entry.path().startsWith(index + "segments_"));
+        assertThat(withoutDerived.manifest().files())
+            .as("an image never holds the index without the promises made against it")
+            .noneMatch(entry -> entry.path().startsWith(index));
+
+        VerificationReport deep = new SnapshotVerifier().verify(whole, VerifyDepth.DEEP);
+        assertThat(deep.problems()).isEmpty();
+        assertThat(deep.contentChecks())
+            .anyMatch(check -> check.path().equals(DataDirectoryFixture.LUCENE_CHUNK_INDEX)
+                && check.proven());
+
+        RestoreResult restored = new SnapshotRestorer().restore(new RestoreOptions(
+            whole, tempDir.resolve("restored-whole"), false, VerifyDepth.CHECKSUM));
+        assertThat(restored.rebuildRequired())
+            .noneSatisfy(line -> assertThat(line).contains("lexical chunk index"));
+        RestoreResult rebuilt = new SnapshotRestorer().restore(new RestoreOptions(
+            slim, tempDir.resolve("restored-slim"), false, VerifyDepth.CHECKSUM));
+        assertThat(rebuilt.rebuildRequired())
+            .anySatisfy(line -> assertThat(line).contains("lexical chunk index"));
+    }
 }

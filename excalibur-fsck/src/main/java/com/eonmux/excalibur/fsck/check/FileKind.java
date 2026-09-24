@@ -133,6 +133,27 @@ public enum FileKind {
      */
     LEXICAL_KEY_LOOKUP,
 
+    /**
+     * A file of the Lucene chunk index, {@code lucene-chunks/}, which a node configured with
+     * {@code excalibur.ingest.lexical-engine=lucene} writes in place of the native lexical store.
+     *
+     * <p>Judged with the index as a whole by {@link LuceneChunkIndexCheck}: Lucene reads an index
+     * from its commit point, which names every file it is made of, so one file taken alone proves
+     * nothing. Derived from the chunk text in storage, and rebuilt by a reindex.</p>
+     */
+    LUCENE_CHUNK_INDEX_PART,
+
+    /**
+     * {@code lucene-chunks/erasure.log}: the erasures the Lucene chunk index has accepted and not
+     * yet reclaimed from its segments.
+     *
+     * <p>The native store's format, written by the same class, so every line carries its own
+     * checksum and is verified by the parser the index opens it with. Each promise in it was
+     * forced to disk before its caller was told the erasure was accepted, and a log moved aside
+     * reads as owing nothing, so its damage is put to an operator.</p>
+     */
+    LUCENE_CHUNK_ERASURE_LOG,
+
     /** A half-finished write some operation left behind. */
     STAGING_LEFTOVER,
 
@@ -191,9 +212,31 @@ public enum FileKind {
     public static final Pattern SEGMENT_STAGED_MAPPING_NAME =
         Pattern.compile("^segment_(\\d+)\\.hnsw\\.compact\\.docmap$");
 
-    /** Suffixes and prefixes that mark a write that never completed. */
+    /**
+     * {@code segment_N.hnsw.compact}, the graph an HNSW compaction stages.
+     *
+     * <p>A leftover by the suffix rule, and rightly: nothing reads it, and the next open discards
+     * it. It is named here because it is half of a pair with
+     * {@link #SEGMENT_STAGED_MAPPING_NAME}, whose meaning depends on whether this file is beside
+     * it, so a copy of the directory has to keep or drop the two together.</p>
+     */
+    public static final Pattern SEGMENT_STAGED_GRAPH_NAME =
+        Pattern.compile("^segment_(\\d+)\\.hnsw\\.compact$");
+
+    /**
+     * Suffixes and prefixes that mark a write that never completed.
+     *
+     * <p>Every staged name the engine writes and nothing reads: {@code .tmp}, the general
+     * rename into place; {@code .compact} and a {@code .compact-} directory, a compaction's
+     * output; {@code .rewriting} and {@code .erasing}, a graph staging log's rewrite;
+     * {@code .new} and {@code .N.new}, the document registry's replacement; {@code .writing}, the
+     * fact id floor's; {@code .left} and {@code .right}, a split's children before they are
+     * renamed to segment names; and {@code .body} and {@code .assembled}, the halves of a graph's
+     * entity vectors before they are joined.</p>
+     */
     private static final Pattern LEFTOVER_NAME = Pattern.compile(
-        ".*(\\.tmp|\\.compact|\\.rewriting|\\.erasing)$|^\\.compact-.*|.*\\.new(\\.\\d+)?$");
+        ".*(\\.tmp|\\.compact|\\.rewriting|\\.erasing|\\.writing|\\.left|\\.right|\\.body"
+            + "|\\.assembled)$|^\\.compact-.*|.*\\.new(\\.\\d+)?$");
 
     /** The suffix the JVM gives a heap dump. */
     private static final String DIAGNOSTIC_DUMP_SUFFIX = ".hprof";
