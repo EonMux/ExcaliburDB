@@ -10,7 +10,8 @@ scoring on top.
 # 1. Build the fat JAR
 ./gradlew :excalibur-api:shadowJar
 
-# 2. Set your LLM API key (required for embeddings/scoring)
+# 2. Set your LLM API key for the hosted default endpoint (optional: without a model the node
+#    answers from BM25; a local Ollama/vLLM/TGI server needs no key - see "Keyless local models")
 export EXCALIBUR_LLM_API_KEY=sk-your-openai-key
 
 # 2b. Allow-list the directory you want indexed. Empty means DISABLED, not unrestricted,
@@ -77,7 +78,8 @@ curl http://localhost:8080/v1/stats
   (`-Xmx2g` appears in the build only for the test JVM.) Size it deliberately: Lucene's inverted
   index works on the heap while the vector and graph columns are memory-mapped outside it, so both
   budgets are real and they compete for the same machine.
-- An **LLM API key** if you want embeddings or relevancy scoring (OpenAI-compatible)
+- An **OpenAI-compatible model endpoint** if you want embeddings or relevancy scoring: a hosted
+  one with its API key, or a local Ollama, vLLM or TGI server, which needs none
 
 ## Installation
 
@@ -345,6 +347,8 @@ Property keys convert to env vars by uppercasing and replacing `.` / `-` with `_
 |---|---|
 | `excalibur.llm.api-key` | `EXCALIBUR_LLM_API_KEY` |
 | `excalibur.llm.base-url` | `EXCALIBUR_LLM_BASE_URL` |
+| `excalibur.llm.embedding-base-url` | `EXCALIBUR_LLM_EMBEDDING_BASE_URL` |
+| `excalibur.llm.chat-api-key` | `EXCALIBUR_LLM_CHAT_API_KEY` |
 | `excalibur.query.top-k-default` | `EXCALIBUR_QUERY_TOP_K_DEFAULT` |
 
 Only variables starting with `EXCALIBUR_` are processed — other env vars (`HOME`, `PATH`, etc.) are ignored.
@@ -354,7 +358,8 @@ Only variables starting with `EXCALIBUR_` are processed — other env vars (`HOM
 The most important knobs:
 
 ```properties
-# LLM (required for embeddings; optional for scoring)
+# LLM. The hosted default needs a key (better supplied as EXCALIBUR_LLM_API_KEY); any other
+# OpenAI-compatible server is called without one.
 excalibur.llm.api-key=sk-...
 # Either spelling works: the clients append /v1/embeddings themselves and a trailing
 # /v1 is stripped rather than duplicated.
@@ -365,6 +370,8 @@ excalibur.llm.embeddings-dimensions=1536
 # Set false to skip the corpus embedding pass and keep the chat model: retrieval becomes
 # BM25 over the chunk index with the query expanded by the chat model.
 excalibur.llm.embeddings-enabled=true
+# Set false to keep the embedding pass and make no chat calls at all.
+excalibur.llm.chat-enabled=true
 
 # Query
 excalibur.query.top-k-default=100
@@ -980,8 +987,8 @@ A reindex of the source reports on `GET /v1/reindex/status` instead and leaves t
 crawled, so the documents that exist are counted into `entries_pending` and none were indexed, and
 `last_error` says where the reason is — the startup log, under `Failed to configure ingestion
 pipeline`. It is deliberately not reported as `idle` at `progress: 1.0`, which would make a node
-that indexes nothing at all look exactly like a successful run. A missing API key is not this
-state: that node has a pipeline and indexes lexically.
+that indexes nothing at all look exactly like a successful run. A node with no model in use is not
+this state: that node has a pipeline and indexes lexically.
 
 ### Supply documents directly
 
@@ -1014,8 +1021,9 @@ searchable — not that indexing was scheduled. That is the difference from `POS
 answers as soon as the source is registered and leaves the crawl to run behind the response,
 because a crawl is of unknown size and duration.
 
-On a node with `excalibur.graph.extraction-enabled=true` and an LLM API key (without one,
-extraction is inactive and `/v1/graph/build` reports `"extraction": "missing_api_key"`), the facts
+On a node with `excalibur.graph.extraction-enabled=true` and a chat endpoint in use (without one,
+extraction is inactive and `/v1/graph/build` reports `"extraction": "missing_api_key"`, or
+`"chat_disabled"` when `excalibur.llm.chat-enabled=false`), the facts
 extracted from supplied
 documents are staged into the `shared` namespace's graph, ready for the next
 `POST /v1/graph/build` there. That is fixed rather than chosen per request: this route refuses the
@@ -1567,7 +1575,7 @@ curl -X POST http://localhost:8080/v1/query \
 
 The HTTP API intentionally does **not** accept pre-computed vectors. A vector is only meaningful in the embedding space of a specific model — if a client embeds with a different model than ingestion used, similarity scores become meaningless but still look plausible. Embedding is a server invariant, so the server owns both sides of it.
 
-If you need custom embeddings (e.g., a local model, a different provider), change the server config — `excalibur.llm.base-url`, `excalibur.llm.embedding-model`, and `excalibur.llm.api-key` work with any OpenAI-compatible embedding API (OpenAI, Ollama, vLLM, TGI, etc.).
+If you need custom embeddings (e.g., a local model, a different provider), change the server config — `excalibur.llm.embedding-base-url` (or `excalibur.llm.base-url` for both roles), `excalibur.llm.embedding-model`, and, only for a server that asks for one, `excalibur.llm.embedding-api-key` / `excalibur.llm.api-key` work with any OpenAI-compatible embedding API (OpenAI, Ollama, vLLM, TGI, etc.). See [Keyless local models](README.md#keyless-local-models).
 
 ### Response — `200 OK`
 
@@ -1763,8 +1771,8 @@ not threshold them against a number tuned on the vector path. That is why `thres
 as ignored rather than applied. With `llm_scored: true` a score is instead the model's 0–1
 judgement, and `llm_threshold` is what filtered it.
 
-Two ways to reach this path. With no API key it is plain BM25 — the startup log says so. With a
-key and `excalibur.llm.embeddings-enabled=false` the chat model is kept and spent on expanding the
+Two ways to reach this path. With no model in use it is plain BM25 — the startup log says so. With
+a chat endpoint and `excalibur.llm.embeddings-enabled=false` the chat model is kept and spent on expanding the
 query instead of on embedding every document, which is the deployment this path was built for: a
 few dozen generated tokens per query against billions of embedded tokens per corpus.
 
@@ -1860,7 +1868,7 @@ meaning of a question when there are no vectors, and here there are — so the l
 matches the words as typed, which makes it weaker than the same node would run with no embedding
 model at all. Whether that trade pays depends on the corpus, so
 `excalibur.query.expand-hybrid-queries=true` expands the lexical half as well, at one extra chat
-call per query. It requires `excalibur.llm.api-key`. The retrieval harness in `excalibur-bench`
+call per query. It requires a chat endpoint in use. The retrieval harness in `excalibur-bench`
 measures the two side by side on your corpus; see
 [Evaluating it](README.md#evaluating-it).
 
@@ -1947,10 +1955,10 @@ which is the largest unit anything in the index was embedded as.
 **`503 Service Unavailable` — no retrieval path configured**
 
 ```json
-{"error": "Server is not configured for text queries: this node has neither an embedding client nor a lexical index, so there is no index to search. Set excalibur.llm.api-key (or EXCALIBUR_LLM_API_KEY) so the server can embed queries with the same model that ingestion uses, or see the startup log for why the chunk lexical index was not opened."}
+{"error": "Server is not configured for text queries: this node has neither an embedding client nor a lexical index, so there is no index to search. Configure an embedding endpoint (excalibur.llm.embedding-base-url or excalibur.llm.base-url, with excalibur.llm.api-key for the hosted default) so the server can embed queries with the same model that ingestion uses, or see the startup log for why the chunk lexical index was not opened."}
 ```
 
-A missing embedding key alone does not produce this: without one the node answers from BM25
+A missing embedding endpoint alone does not produce this: without one the node answers from BM25
 instead — see **Degraded retrieval** above. Reaching 503 means the chunk lexical
 index failed to open as well. The body names the configuration key and nothing else — no paths,
 no exception text — so it stays safe to return to an unauthenticated caller while still being
@@ -2463,7 +2471,7 @@ shows up anywhere else:
   take the vector rerank away from every query, nor a burst of failed questions strip the vectors
   from a build. The three graph breakers are one each for the node, not one per namespace - every
   namespace's graph calls the same endpoint through the same client - and each appears once it is
-  first needed: `graphRerank` with the first graph on a node that has an API key,
+  first needed: `graphRerank` with the first graph on a node whose chat endpoint is in use,
   `graphQueryEmbedding` with the first graph built with entity vectors, and `graphBuildEmbedding`
   with the first build that embeds an entity (never, with `excalibur.graph.entity-vectors-enabled`
   off). All seven leave the node
@@ -3113,11 +3121,11 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `Server is not configured for text queries: this node has neither an embedding client nor a lexical index` | Not a missing API key on its own — without one the node still answers from BM25. Both retrieval paths are gone, so the chunk lexical index also failed to open | Search the startup log for `Chunk lexical index unavailable` and fix what it names (usually the data directory); set `EXCALIBUR_LLM_API_KEY` as well if you want vector retrieval |
+| `Server is not configured for text queries: this node has neither an embedding client nor a lexical index` | Not a missing model on its own — without one the node still answers from BM25. Both retrieval paths are gone, so the chunk lexical index also failed to open | Search the startup log for `Chunk lexical index unavailable` and fix what it names (usually the data directory); configure an embedding endpoint as well if you want vector retrieval |
 | Results look like noise / no relevant matches | The `excalibur.llm.embedding-model` config changed between ingestion and query runs | Reingest with the current model — old vectors are incompatible once the embedding model changes |
 | `Field 'query' is required and must be non-empty` | Request body is missing the `query` field | Send the query text in the `query` field; the HTTP API does not accept raw vectors — see [Why no client-side vectors?](#why-no-client-side-vectors) |
 | `hnsw.queueDepth` keeps growing | Integration worker falling behind | Check logs for errors; slow down ingestion; increase hardware |
-| All LLM calls failing | A circuit breaker tripped. Embeddings, relevancy scoring, query expansion, relation extraction, the graph rerank, the graph question embedding and the graph build's entity embedding each have their own, so check which on `breakers` in `/v1/stats`: relevancy scoring stopping while ingestion continues is `llmRelevancy`, the reverse is `embedding`, queries losing their expansions is `queryExpansion`, a graph that stopped growing is `graphExtraction`, graph answers no longer reranked by the model is `graphRerank` (or `graphQueryEmbedding` for the vector rerank), and a build that published entities without vectors is `graphBuildEmbedding` | Wait for the cooldown (default 60s), after which one probe is admitted. Confirm API key/endpoint. Queries still work without LLM scoring. |
+| All LLM calls failing | A circuit breaker tripped. Embeddings, relevancy scoring, query expansion, relation extraction, the graph rerank, the graph question embedding and the graph build's entity embedding each have their own, so check which on `breakers` in `/v1/stats`: relevancy scoring stopping while ingestion continues is `llmRelevancy`, the reverse is `embedding`, queries losing their expansions is `queryExpansion`, a graph that stopped growing is `graphExtraction`, graph answers no longer reranked by the model is `graphRerank` (or `graphQueryEmbedding` for the vector rerank), and a build that published entities without vectors is `graphBuildEmbedding` | Wait for the cooldown (default 60s), after which one probe is admitted. Confirm API key/endpoint: a 401 or 403 is logged once per client at ERROR, saying whether a key was sent and which of `excalibur.llm.chat-api-key` / `excalibur.llm.embedding-api-key` / `excalibur.llm.api-key` to set. Queries still work without LLM scoring. |
 | Queries return nothing on a fresh node, but `coverage` reads `1.0000` | Not a cold-start indicator. `/health` coverage counts the segments a query reads, and an empty segment is read as readily as a full one, so it reads `1.0000` and `/health` reports `ready` and `healthy` | Look at `/v1/stats` instead: `entries.total` and `segments.active` are `0` until something is indexed |
 | A node answers `200` to everything but its results are getting worse | A circuit breaker has opened: the embedding one drops retrieval to lexical-only, the relevancy one bypasses stage 4's relevancy scoring, the query-expansion one searches every query as typed, and on the graph route the rerank one keeps the BM25 order and the question-embedding one skips the vector rerank; the graph build-embedding one publishes a build's entities without vectors | `breakers` on `/v1/stats`, or `excalibur_circuit_breaker_state` on `/metrics`. Alert on `> 0` for any `breaker` label |
 | `hnsw.queueDepth` grows without bound while `coverage` stays `1.0000` and `/health` stays healthy | The index orchestrator is dead | `workers.indexOrchestratorRunning` on `/v1/stats`, `indexerRunning` on `/health`, and `/health/ready` answers `503` with `indexer` in `failed` |

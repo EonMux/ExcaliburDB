@@ -234,7 +234,7 @@ public final class GraphTenants implements AutoCloseable {
         this.maxOpen = maxOpen;
         this.models = GraphModelClients.forConfig(config);
         this.extraction = GraphExtraction.of(config.graph().isExtractionEnabled(),
-            RetrievalCapabilities.from(config.llm()).chatModel(), false);
+            config.llm().chatEndpoint().status(), false);
         // Never more than the registry can hold open: beyond that a pass is only evicting the
         // tenants it reopened earlier in the same pass.
         this.reopensPerSweep = Math.max(1, Math.min(MAX_REOPENS_PER_SWEEP, maxOpen));

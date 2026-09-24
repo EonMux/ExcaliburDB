@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.llm.client;
 
 import com.eonmux.excalibur.config.LlmConfig;
+import com.eonmux.excalibur.config.LlmEndpoint;
 
 import java.time.Duration;
 import java.util.Objects;
@@ -300,27 +301,53 @@ public final class LLMClientConfig {
     }
 
     /**
-     * Creates an LLMClientConfig from the application configuration.
+     * The client configuration for chat calls: relevancy scoring, query expansion, relation
+     * extraction and the graph rerank.
      *
-     * <p>This adapter method bridges the properties file configuration
-     * ({@link LlmConfig}) to the runtime LLM client configuration.
-     * It maps all configuration values from the properties file to
-     * the corresponding fields in LLMClientConfig.</p>
-     *
-     * <h3>Domain Correctness</h3>
-     * <p>All values from the config are validated through the builder's
-     * validation methods, ensuring the resulting configuration is valid.</p>
+     * <p>Addressed at {@link LlmConfig#chatEndpoint()}, which may be a different server with a
+     * different key from the embedding endpoint. Whether the endpoint is in use at all is the
+     * caller's decision, read from the same {@link LlmEndpoint}; this only says how to reach it.</p>
      *
      * @param llmConfig The LLM configuration from the properties file
-     * @return A new LLMClientConfig instance with values from the config
+     * @return A client configuration addressed at the chat endpoint
      * @throws NullPointerException if llmConfig is null
      */
-    public static LLMClientConfig fromConfig(LlmConfig llmConfig) {
+    public static LLMClientConfig forChat(LlmConfig llmConfig) {
         Objects.requireNonNull(llmConfig, "llmConfig cannot be null");
+        return builderFor(llmConfig, llmConfig.chatEndpoint()).build();
+    }
+
+    /**
+     * The client configuration for embedding calls: the corpus, each query and the graph's
+     * entities.
+     *
+     * @param llmConfig The LLM configuration from the properties file
+     * @return A client configuration addressed at the embedding endpoint
+     * @throws NullPointerException if llmConfig is null
+     */
+    public static LLMClientConfig forEmbeddings(LlmConfig llmConfig) {
+        Objects.requireNonNull(llmConfig, "llmConfig cannot be null");
+        return builderFor(llmConfig, llmConfig.embeddingEndpoint()).build();
+    }
+
+    /**
+     * A builder carrying every value from the properties file, addressed at one endpoint.
+     *
+     * <p>For a caller that needs to override one value - the query path's shorter timeout - on
+     * top of what configuration says. All values are validated when the builder is built.</p>
+     *
+     * @param llmConfig The LLM configuration from the properties file
+     * @param endpoint  Which of its endpoints to address
+     * @return A builder, ready to build or to adjust first
+     * @throws NullPointerException if either argument is null
+     */
+    public static Builder builderFor(LlmConfig llmConfig, LlmEndpoint endpoint) {
+        Objects.requireNonNull(llmConfig, "llmConfig cannot be null");
+        Objects.requireNonNull(endpoint, "endpoint cannot be null");
 
         return builder()
-            .baseUrl(llmConfig.getBaseUrl())
-            .apiKey(llmConfig.getApiKey())
+            .baseUrl(endpoint.baseUrl())
+            .apiKey(endpoint.apiKey())
             .chatModel(llmConfig.getChatModel())
             .embeddingModel(llmConfig.getEmbeddingModel())
             .timeout(Duration.ofMillis(llmConfig.getTimeoutMs()))
@@ -330,8 +357,7 @@ public final class LLMClientConfig {
             .maxPromptsPerQuery(llmConfig.getMaxPromptsPerQuery())
             .embeddingDimension(llmConfig.getEmbeddingsDimensions())
             .maxBatchTokens(llmConfig.getMaxBatchTokens())
-            .retryBaseDelay(Duration.ofMillis(llmConfig.getRetryBaseDelayMs()))
-            .build();
+            .retryBaseDelay(Duration.ofMillis(llmConfig.getRetryBaseDelayMs()));
     }
 
     /**

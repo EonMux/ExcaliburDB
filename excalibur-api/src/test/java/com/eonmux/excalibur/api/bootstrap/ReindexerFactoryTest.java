@@ -51,4 +51,16 @@ class ReindexerFactoryTest {
             "excalibur.llm.api-key", "sk-test"))))
             .isNotNull();
     }
+
+    @Test
+    @DisplayName("a keyless embedding server gets a client addressed at it, not at chat")
+    void keylessEmbeddingServerEmbeds() {
+        var client = ReindexerFactory.embeddingClient(llm(Map.of(
+            "excalibur.llm.chat-base-url", "https://chat.example.test",
+            "excalibur.llm.embedding-base-url", "http://localhost:11434")));
+
+        assertThat(client).isNotNull();
+        assertThat(client.getConfig().getBaseUrl()).isEqualTo("http://localhost:11434");
+        assertThat(client.getConfig().getApiKey()).isEmpty();
+    }
 }

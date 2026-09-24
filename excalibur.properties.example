@@ -333,15 +333,31 @@ excalibur.query.per-signal-over-fetch=3
 # /v1/chat/completions), so a trailing /v1 here is stripped rather than duplicated -- both
 # https://api.openai.com and https://api.openai.com/v1 work. Point it at any OpenAI-compatible
 # endpoint: Ollama (http://localhost:11434), vLLM, TGI, LiteLLM.
+# Only the hosted default needs a key. A role left on it with no key is off (the startup log says
+# so and how to fix it); any other server is called without one, and one that does want a key
+# answers 401, which is logged naming the setting to fix.
 excalibur.llm.base-url=https://api.openai.com/v1
 # Never set the api key here. Supply it as the EXCALIBUR_LLM_API_KEY environment variable,
 # so it cannot be committed or read out of the working directory.
 #excalibur.llm.api-key=
+# The chat and embedding endpoints can live on different servers. Each role's own base URL and
+# key win; left unset they fall back to the two settings above, so a file that names only those
+# means what it always did. Keys again belong in the environment:
+# EXCALIBUR_LLM_CHAT_API_KEY / EXCALIBUR_LLM_EMBEDDING_API_KEY.
+# Chat: relevancy scoring, query expansion, relation extraction, the graph rerank.
+#excalibur.llm.chat-base-url=
+#excalibur.llm.chat-api-key=
+# Whether chat calls are made at all. False keeps the embedding pass and drops every chat call.
+excalibur.llm.chat-enabled=true
+# Embedding: the corpus, each query, graph entities. A local embedding server beside a hosted chat
+# model, for instance -- set the key per role then, so it is never sent to the local box:
+#excalibur.llm.embedding-base-url=http://localhost:11434
+#excalibur.llm.embedding-api-key=
 excalibur.llm.chat-model=gpt-4o-mini
 excalibur.llm.embedding-model=text-embedding-3-small
 excalibur.llm.embeddings-dimensions=1536
-# Whether a configured key is spent on embedding the corpus. Turning it off keeps the chat model
-# and drops the embedding pass: documents are chunked, stored and term-indexed, and /v1/query
+# Whether embedding calls are made at all. Turning it off keeps the chat model and drops the
+# embedding pass: documents are chunked, stored and term-indexed, and /v1/query
 # answers from BM25 with the model spent on expanding the query. Worth it for a corpus of
 # identifiers, error codes or DOIs, where the literal token is the match.
 excalibur.llm.embeddings-enabled=true

@@ -86,7 +86,9 @@ export EXCALIBUR_LLM_API_KEY=sk-...
 ```
 
 `excalibur.properties` is gitignored precisely because it is the file a key ends up in;
-`excalibur.properties.example` is the tracked template. A node started without a key still runs, and
+`excalibur.properties.example` is the tracked template. A local model server needs no key at all:
+point `excalibur.llm.base-url` at Ollama, vLLM or TGI instead — see
+[Keyless local models](#keyless-local-models). A node started with neither still runs, and
 still indexes: documents are chunked, stored and term-indexed, `/v1/ingest/status` reports each
 source as `idle` once done, and `POST /v1/query` answers from BM25. Only dense retrieval is missing,
 which is one signal of several rather than the precondition for having an index at all.
@@ -716,12 +718,17 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.ingest.chunk-overlap-tokens` | 64 | Tokens a chunk repeats from the one before it, so an answer that straddles a boundary is not split across two chunks holding half of it each. Must be less than the target, or chunking would never advance; the node refuses the pair at startup rather than failing on the first document |
 | `excalibur.ingest.bm25-k1` | 1.2 | Where a repeated term stops earning more score. 0 reduces term frequency to a yes-or-no. Under `lexical-engine=native` this is **recorded in the index** and an index built under one value refuses to open under another — not because the bytes depend on it, but because changing it changes every score the corpus can produce, and with it every ranking and every threshold a deployment has calibrated. Changing it means reingesting. Under `lexical-engine=lucene` it is applied at query time and nothing is recorded, so a change takes effect on the next query. At least 0 |
 | `excalibur.ingest.bm25-b` | 0.75 | How much a match is discounted for the length of the chunk it was found in. 1 normalises fully by length, 0 not at all. Recorded, or not, on the same terms as `bm25-k1`. 0 to 1 |
-| `excalibur.llm.api-key` | _(none)_ | Key for the OpenAI-compatible endpoint. Supply as `EXCALIBUR_LLM_API_KEY`, not in this file. Without it the corpus is still chunked, stored and term-indexed; only the vector signal is missing |
-| `excalibur.llm.base-url` | https://api.openai.com/v1 | API root. The clients append `/v1/embeddings` and `/v1/chat/completions` themselves; a trailing `/v1` is stripped, so `https://api.openai.com` and `https://api.openai.com/v1` mean the same thing |
+| `excalibur.llm.api-key` | _(none)_ | Key both endpoints fall back to. Supply as `EXCALIBUR_LLM_API_KEY`, not in this file. Only the hosted default endpoint needs one: a role left on `https://api.openai.com/v1` with no key is off (the corpus is still chunked, stored and term-indexed; the startup log says what is missing). A keyless server — Ollama, vLLM, TGI — is used without one, and a server that does want one answers 401, which is logged naming these keys |
+| `excalibur.llm.base-url` | https://api.openai.com/v1 | API root both endpoints fall back to. The clients append `/v1/embeddings` and `/v1/chat/completions` themselves; a trailing `/v1` is stripped, so `https://api.openai.com` and `https://api.openai.com/v1` mean the same thing |
+| `excalibur.llm.chat-base-url` | _(`excalibur.llm.base-url`)_ | API root for chat calls — relevancy scoring, query expansion, relation extraction, the graph rerank. Unset or blank falls back to `excalibur.llm.base-url` |
+| `excalibur.llm.chat-api-key` | _(`excalibur.llm.api-key`)_ | Key for chat calls (`EXCALIBUR_LLM_CHAT_API_KEY`). Unset or blank falls back to `excalibur.llm.api-key` |
+| `excalibur.llm.chat-enabled` | true | Whether chat calls are made at all. `false` keeps the embedding pass and drops scoring, expansion, extraction and the graph rerank |
+| `excalibur.llm.embedding-base-url` | _(`excalibur.llm.base-url`)_ | API root for embedding calls — the corpus, each query, graph entities. Unset or blank falls back to `excalibur.llm.base-url` |
+| `excalibur.llm.embedding-api-key` | _(`excalibur.llm.api-key`)_ | Key for embedding calls (`EXCALIBUR_LLM_EMBEDDING_API_KEY`). Unset or blank falls back to `excalibur.llm.api-key` |
 | `excalibur.llm.chat-model` | gpt-4o-mini | Chat model for relevancy scoring |
 | `excalibur.llm.embedding-model` | text-embedding-3-small | Embedding model name |
 | `excalibur.llm.embeddings-dimensions` | 1536 | Embedding vector dimensions. 128 to 4096, and must equal `excalibur.query.vector-dimensions` |
-| `excalibur.llm.embeddings-enabled` | true | Whether the key is spent on embedding the corpus. Set `false` to keep the chat model and skip the embedding pass: retrieval is then BM25 over the chunk index with the chat model expanding the query. Inert without a key |
+| `excalibur.llm.embeddings-enabled` | true | Whether embedding calls are made at all. Set `false` to keep the chat model and skip the embedding pass: retrieval is then BM25 over the chunk index with the chat model expanding the query |
 | `excalibur.llm.relevancy-threshold` | 0.3 | Minimum relevancy score (0.0-1.0) |
 | `excalibur.llm.timeout-ms` | 60000 | LLM request timeout (ms). 1000 to 300000 |
 | `excalibur.llm.max-retries` | 3 | Maximum retry attempts. 0 to 10 |
@@ -824,6 +831,59 @@ traversal assembled — not the top-ranked candidate, which on this route is the
 is *about* rather than its answer. So what is measured is whether the evidence needed to answer
 survived into the context, which is what abstention decides about. Whether a model then used that
 context correctly is a different question and this does not answer it.
+
+### Keyless local models
+
+A node calls models in two roles, each resolved on its own: the **embedding** endpoint (the corpus,
+each query, graph entities) and the **chat** endpoint (relevancy scoring, query expansion, relation
+extraction, the graph rerank). Each role reads its own base URL and key and falls back to the
+shared pair, so a file that sets only `excalibur.llm.base-url` and `excalibur.llm.api-key` keeps
+meaning what it always did:
+
+| Role | Base URL, in precedence order | Key, in precedence order | Switch |
+|------|-------------------------------|--------------------------|--------|
+| Embedding | `excalibur.llm.embedding-base-url`, `excalibur.llm.base-url` | `excalibur.llm.embedding-api-key`, `excalibur.llm.api-key` | `excalibur.llm.embeddings-enabled` |
+| Chat | `excalibur.llm.chat-base-url`, `excalibur.llm.base-url` | `excalibur.llm.chat-api-key`, `excalibur.llm.api-key` | `excalibur.llm.chat-enabled` |
+
+The environment overrides each the usual way (`EXCALIBUR_LLM_EMBEDDING_BASE_URL`,
+`EXCALIBUR_LLM_CHAT_API_KEY`, ...), and a blank value counts as unset. Models, timeouts, retries
+and breaker settings stay shared: the models are already per role (`chat-model`,
+`embedding-model`), and each role gets its own client and breaker from the same limits.
+
+A role is used when its switch is on and it either has a key or names a server other than the
+hosted default. A key decides only whether `https://api.openai.com/v1` can be called, since that is
+the one endpoint that always wants one; Ollama, vLLM and TGI are called with no key at all. A server
+that does want a key answers 401, and the node says so — once at ERROR per client, naming whether a
+key was sent and which settings supply one — and counts it against the role's circuit breaker, so
+the breaker shows up open under `breakers` on `/v1/stats` rather than the role quietly doing nothing.
+At startup the log has one line per role: in use at which URL, or off and why, with the setting that
+changes it. A role left on the hosted default with no key is a WARN, because nobody chose it; one
+switched off by its flag is INFO.
+
+Everything local, no key (Ollama serving both roles):
+
+```properties
+excalibur.llm.base-url=http://localhost:11434
+excalibur.llm.chat-model=llama3.2
+excalibur.llm.embedding-model=nomic-embed-text
+excalibur.llm.embeddings-dimensions=768
+excalibur.query.vector-dimensions=768
+```
+
+Embeddings from a local vLLM or TGI server, chat from a hosted model — the key is set only for the
+role that needs it, so it is never sent to the local box:
+
+```properties
+excalibur.llm.embedding-base-url=http://gpu-box:8080
+excalibur.llm.embedding-model=BAAI/bge-base-en-v1.5
+excalibur.llm.embeddings-dimensions=768
+excalibur.query.vector-dimensions=768
+# EXCALIBUR_LLM_CHAT_API_KEY=sk-... in the environment; chat stays on the hosted default
+```
+
+A key over plain `http://` to a host other than loopback is refused at startup, per role, because it
+would travel in cleartext — which is why the example above scopes the key to chat rather than using
+the shared `excalibur.llm.api-key`.
 
 ### System properties
 
@@ -1096,7 +1156,7 @@ and not the query. A query longer than `excalibur.api.max-query-chars` is refuse
 query shorter than that is expanded, so one endpoint runs one retrieval strategy.
 
 Expansion belongs to the lexical path: it rewrites the terms BM25 is searched with. The deployment
-it is for by default has a chat model and no embedding pass — `excalibur.llm.api-key` set,
+it is for by default has a chat model and no embedding pass — a chat endpoint in use,
 `excalibur.llm.embeddings-enabled=false` — and spends the model on each query instead of on the
 whole corpus.
 
@@ -1145,10 +1205,11 @@ retrieval:
 | Graph | `/v1/graph/query` answers 503; `/v1/query` is unaffected, having never read the graph |
 | Expansion returns nothing usable | The original query is executed directly |
 
-Two of those rows are configurations rather than failures. Without `excalibur.llm.api-key` a node has
-neither a chat model nor an embedding endpoint, so the first two apply together and retrieval is
-plain BM25. With a key and `excalibur.llm.embeddings-enabled=false` only the second applies: the
-chat model expands the query and BM25 answers it.
+Two of those rows are configurations rather than failures. On the shipped defaults — the hosted
+endpoint and no `excalibur.llm.api-key` — a node has neither a chat model nor an embedding
+endpoint, so the first two apply together and retrieval is plain BM25. With a chat model and
+`excalibur.llm.embeddings-enabled=false` only the embedding row applies: the chat model expands
+the query and BM25 answers it.
 
 A response says which signals answered it. `retrieval` is `"hybrid"`, `"vector"` or `"lexical"`,
 and a `coverage.degraded` flag distinguishes "this is all there was" from "this is all we looked
@@ -2233,10 +2294,11 @@ curl -X POST http://localhost:8080/v1/graph/build
 
 `extraction` says whether ingestion on this node extracts the facts a build publishes, and is on
 every answer from both routes: `active`, `disabled` when `excalibur.graph.extraction-enabled` is
-off, `missing_api_key` when it is on but no LLM API key is configured, or `unavailable` when both
-are set but the ingestion pipeline could not be set up — its failure is in the startup log. The
-last two also carry a `warning`, because nobody chose them and the build they answer publishes
-nothing ingestion staged since startup. The status route carries the same fields.
+off, `missing_api_key` when it is on but the chat endpoint is the hosted default with no key,
+`chat_disabled` when it is on but `excalibur.llm.chat-enabled` is false, or `unavailable` when a
+chat model is configured but the ingestion pipeline could not be set up — its failure is in the
+startup log. The last three also carry a `warning`, because nobody chose them and the build they
+answer publishes nothing ingestion staged since startup. The status route carries the same fields.
 
 `202`, not `200`. On a real corpus the build takes minutes — it replays every staged fact, embeds
 every entity and writes two Lucene indexes — so it runs behind the response and the request does
@@ -2657,11 +2719,14 @@ Only one thing is required: filesystem ingestion needs the directory listed in
 `excalibur.ingest.allowed-roots`, and HTTP ingestion needs the host listed in
 `excalibur.ingest.allowed-hosts`. Without a matching entry the registration is refused.
 
-`excalibur.llm.api-key` is optional. Without it the corpus is chunked, stored and term-indexed and
-`/v1/query` answers from BM25 with query-side expansion; with it the corpus is also embedded and
-`/v1/query` fuses vector search with that same BM25 index, reporting `"retrieval": "hybrid"`. Set
-`excalibur.query.hybrid-retrieval=false` for vector-only ranking. Fact extraction needs the same
-key plus `excalibur.graph.extraction-enabled=true`.
+A model is optional. With none — the shipped defaults name the hosted endpoint and no
+`excalibur.llm.api-key` — the corpus is chunked, stored and term-indexed and `/v1/query` answers
+from BM25. With an embedding endpoint in use (a key for the hosted one, or any keyless server:
+Ollama, vLLM, TGI) the corpus is also embedded and `/v1/query` fuses vector search with that same
+BM25 index, reporting `"retrieval": "hybrid"`. Set `excalibur.query.hybrid-retrieval=false` for
+vector-only ranking. Fact extraction needs a chat endpoint in use plus
+`excalibur.graph.extraction-enabled=true`. The startup log has one line per endpoint saying
+whether it is in use and, if not, which setting would change that.
 
 ## Architecture
 
@@ -3436,7 +3501,7 @@ Server is not configured for text queries: this node has neither an embedding cl
 nor a lexical index, so there is no index to search...
 ```
 
-A missing API key alone does not cause this. Without an embedding endpoint the node still chunks,
+A missing model alone does not cause this. Without an embedding endpoint the node still chunks,
 stores and lexically indexes what it ingests, and `/v1/query` answers from BM25 with
 `"retrieval": "lexical"` and `"degraded": true`. The 503 means both paths are gone: no embedding
 client *and* no chunk lexical index, which is a failure to open the index rather than a missing
@@ -3447,8 +3512,9 @@ the check runs before the body is even read, so a malformed body will not shadow
 No, and this is deliberate. A vector only means something in one model's embedding space. If a
 client embedded with a different model than ingestion used, similarity scores would still look
 plausible and be meaningless. Owning both sides of the embedding is what makes that impossible.
-Point `excalibur.llm.base-url` at any OpenAI-compatible endpoint — Ollama, vLLM, TGI — if you want
-a different model.
+Point `excalibur.llm.embedding-base-url` (or `excalibur.llm.base-url`, for both roles) at any
+OpenAI-compatible endpoint — Ollama, vLLM, TGI — if you want a different model; no key is needed
+for one that does not ask for it.
 
 **Which embedding model should I use, and do I need one?**
 You need one for vector retrieval, not to run the server. The server embeds both the documents it
@@ -3458,12 +3524,14 @@ OpenAI-compatible `/v1/embeddings` endpoint — hosted or local.
 
 For a corpus of identifiers, DOIs, error codes and titles, embedding it may be the wrong trade
 outright: those are exactly what BM25 answers well and a dense vector blurs. Set
-`excalibur.llm.embeddings-enabled=false` with the key still configured and the chat model is spent
+`excalibur.llm.embeddings-enabled=false` with the chat endpoint still configured and the chat model is spent
 on expanding each query rather than on embedding every document — a few dozen generated tokens per
 query instead of billions of embedded tokens per corpus.
 
 The default, `text-embedding-3-small` at 1536 dimensions, is a reasonable starting point and needs
-no configuration beyond an API key. Four things about this codebase narrow the choice:
+no configuration beyond an API key. A local model needs no key at all: set
+`excalibur.llm.embedding-base-url=http://localhost:11434` (Ollama) and the model name and widths
+below, and the node embeds through it — see [Keyless local models](#keyless-local-models). Four things about this codebase narrow the choice:
 
 - **Chunks are ~512 tokens by default** (`excalibur.ingest.chunk-target-tokens`, with
   `excalibur.ingest.chunk-overlap-tokens` at 64), so at the default a long-context embedding model
@@ -3557,11 +3625,13 @@ empty one would turn every subsequent question into a refusal. The status's `mes
 nothing was staged, and `extraction` is the first thing to read.
 
 **I set `excalibur.graph.extraction-enabled=true` and nothing is ever staged.**
-Extraction is a chat-model call, so it also needs `excalibur.llm.api-key` (or
-`EXCALIBUR_LLM_API_KEY`). With the flag and no key the node starts, ingests and searches normally,
-and extracts nothing — so it says so everywhere you would look: a WARN at startup naming both
-settings, and `"extraction": "missing_api_key"` with a `warning` on the answer to
-`POST /v1/graph/build` and on `GET /v1/graph/build/status`. Set the key, restart, and re-ingest:
+Extraction is a chat-model call, so it also needs a chat endpoint in use: `excalibur.llm.api-key`
+(or `EXCALIBUR_LLM_API_KEY`) for the hosted default, or `excalibur.llm.chat-base-url` pointed at a
+keyless server. With the flag and no usable chat endpoint the node starts, ingests and searches
+normally, and extracts nothing — so it says so everywhere you would look: a WARN at startup naming
+the settings, and `"extraction": "missing_api_key"` (or `"chat_disabled"` when
+`excalibur.llm.chat-enabled=false`) with a `warning` on the answer to `POST /v1/graph/build` and
+on `GET /v1/graph/build/status`. Fix the setting, restart, and re-ingest:
 documents ingested while extraction was inactive were never offered to the extractor, and a build
 cannot recover facts nobody extracted. With both set and `"extraction": "unavailable"`, the key is
 not the problem: the ingestion pipeline failed to set up at startup, and the WARN logged then says

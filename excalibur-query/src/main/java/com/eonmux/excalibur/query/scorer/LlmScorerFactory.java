@@ -119,7 +119,8 @@ public final class LlmScorerFactory {
      *
      * <h3>Domain Correctness</h3>
      * <ul>
-     *   <li>Configuration values are validated through LLMClientConfig.fromConfig()</li>
+     *   <li>Addressed at the chat endpoint ({@link LlmConfig#chatEndpoint()})</li>
+     *   <li>Configuration values are validated through LLMClientConfig.forChat()</li>
      *   <li>Circuit breaker settings (failureThreshold, cooldownPeriod) are properly wired</li>
      *   <li>Batch handling (maxBatchTokens, maxPromptsPerQuery) is configured</li>
      * </ul>
@@ -131,7 +132,7 @@ public final class LlmScorerFactory {
      */
     public static LlmScorer fromConfig(LlmConfig llmConfig) {
         Objects.requireNonNull(llmConfig, "llmConfig cannot be null");
-        LLMClientConfig config = LLMClientConfig.fromConfig(llmConfig);
+        LLMClientConfig config = LLMClientConfig.forChat(llmConfig);
         LLMHttpClient llmClient = new LLMHttpClient(config);
         return new LlmRelevancyScorer(llmClient);
     }
@@ -146,7 +147,8 @@ public final class LlmScorerFactory {
      * <h3>Domain Correctness</h3>
      * <ul>
      *   <li>Uses query-specific timeout from excalibur.query.llm-timeout-ms</li>
-     *   <li>All other settings (baseUrl, apiKey, circuit breaker) from llmConfig</li>
+     *   <li>All other settings (the chat endpoint's baseUrl and apiKey, circuit breaker)
+     *       from llmConfig</li>
      *   <li>Timeout must be positive (&gt; 0)</li>
      * </ul>
      *
@@ -162,20 +164,9 @@ public final class LlmScorerFactory {
             throw new IllegalArgumentException("queryLlmTimeoutMs must be positive: " + queryLlmTimeoutMs);
         }
 
-        // Create LLMClientConfig from llmConfig but override the timeout
-        LLMClientConfig config = new LLMClientConfig.Builder()
-            .baseUrl(llmConfig.getBaseUrl())
-            .apiKey(llmConfig.getApiKey())
-            .chatModel(llmConfig.getChatModel())
-            .embeddingModel(llmConfig.getEmbeddingModel())
-            .timeout(java.time.Duration.ofMillis(queryLlmTimeoutMs))  // Use query-specific timeout
-            .maxRetries(llmConfig.getMaxRetries())
-            .failureThreshold(llmConfig.getFailureThreshold())
-            .cooldownPeriod(java.time.Duration.ofMillis(llmConfig.getCooldownPeriodMs()))
-            .maxPromptsPerQuery(llmConfig.getMaxPromptsPerQuery())
-            .embeddingDimension(llmConfig.getEmbeddingsDimensions())
-            .maxBatchTokens(llmConfig.getMaxBatchTokens())
-            .retryBaseDelay(java.time.Duration.ofMillis(llmConfig.getRetryBaseDelayMs()))
+        // The chat endpoint as configured, on the query-specific timeout
+        LLMClientConfig config = LLMClientConfig.builderFor(llmConfig, llmConfig.chatEndpoint())
+            .timeout(java.time.Duration.ofMillis(queryLlmTimeoutMs))
             .build();
 
         LLMHttpClient llmClient = new LLMHttpClient(config);

@@ -162,6 +162,8 @@ final class EvaluationNode implements AutoCloseable {
             String.valueOf(QUERY_DEADLINE_MS));
         properties.put("excalibur.query.cache.enabled", "false");
 
+        // Each role is switched on by naming its model, not by the key: a local endpoint needs
+        // none, and the node calls a keyless server whenever one is configured.
         properties.put("excalibur.llm.api-key", arguments.apiKey());
         if (arguments.baseUrl() != null) {
             properties.put("excalibur.llm.base-url", arguments.baseUrl());
@@ -169,6 +171,7 @@ final class EvaluationNode implements AutoCloseable {
         if (arguments.hasChatModel()) {
             properties.put("excalibur.llm.chat-model", arguments.chatModel());
         }
+        properties.put("excalibur.llm.chat-enabled", String.valueOf(arguments.hasChatModel()));
         properties.put("excalibur.llm.embeddings-enabled",
             String.valueOf(arguments.hasEmbeddingModel()));
         if (arguments.hasEmbeddingModel()) {

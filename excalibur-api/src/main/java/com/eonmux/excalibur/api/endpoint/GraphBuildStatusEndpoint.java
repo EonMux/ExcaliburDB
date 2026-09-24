@@ -59,8 +59,9 @@ import java.util.Optional;
  * {@code message} saying why nothing was staged, read from {@code extraction} - the same field
  * {@code POST /v1/graph/build} answers with, present on every status: {@code active},
  * {@code disabled}, or - each with a {@code warning} - {@code missing_api_key} when extraction was
- * asked for and no LLM API key is configured, and {@code unavailable} when it has a key but the
- * ingestion pipeline could not be set up.</p>
+ * asked for and the chat endpoint is the hosted default with no key, {@code chat_disabled} when
+ * {@code excalibur.llm.chat-enabled} is false, and {@code unavailable} when a chat model is
+ * configured but the ingestion pipeline could not be set up.</p>
  *
  * <p>A cancelled build reports {@code "published": false} for a different reason: it stopped
  * before the rename that would have published it. There is no partial graph to describe,
