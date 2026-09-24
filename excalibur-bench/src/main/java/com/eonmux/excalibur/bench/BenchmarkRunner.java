@@ -43,11 +43,6 @@ import org.openjdk.jmh.runner.options.TimeValue;
  */
 public class BenchmarkRunner {
 
-    /**
-     * Target throughput in ops/sec (1 billion = 1_000_000_000)
-     */
-    public static final double TARGET_OPS_PER_SEC = 1_000_000_000.0;
-
     /** Exit code used when the arguments name no benchmark. */
     public static final int EXIT_USAGE = 2;
 

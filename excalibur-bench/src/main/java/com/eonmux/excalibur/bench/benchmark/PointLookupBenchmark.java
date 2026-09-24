@@ -14,15 +14,13 @@ import java.util.concurrent.TimeUnit;
 /**
  * JMH benchmark for measuring pure point lookup throughput.
  *
- * <p>This benchmark is specifically designed to measure and validate the
- * Phase 2 storage engine performance with page cache hot.</p>
+ * <p>Measures the storage engine's lookup throughput with the page cache hot.</p>
  *
- * <h2>Performance Target Interpretation</h2>
- * <p>The original specification stated "≥1B/sec" which has been interpreted:</p>
+ * <h2>Performance Target</h2>
  * <ul>
- *   <li><strong>Realistic single-threaded target</strong>: ≥10M lookups/sec (10 million)</li>
- *   <li><strong>Rationale</strong>: 1B ops/sec = 1ns/op = ~3-5 CPU cycles, which is
- *       unrealistic for hash table lookups involving memory access</li>
+ *   <li><strong>Single-threaded</strong>: ≥10M lookups/sec</li>
+ *   <li><strong>Why not higher</strong>: a nanosecond per lookup is three to five CPU cycles,
+ *       less than a hash table lookup that touches memory can cost</li>
  * </ul>
  *
  * <h2>Units</h2>
@@ -78,21 +76,11 @@ public class PointLookupBenchmark {
     /**
      * Target throughput in ops/sec.
      *
-     * <p>Interpreted from "≥1B/sec" as realistic single-threaded target.
-     * 10M ops/sec is achievable with memory-mapped I/O and page cache hot.</p>
+     * <p>Single-threaded, achievable with memory-mapped I/O and the page cache hot.</p>
      *
      * <p>Domain correctness: positive value in range [1M, 100M] for single-threaded</p>
      */
     public static final double TARGET_OPS_PER_SEC = 10_000_000.0;
-
-    /**
-     * Original specification target (1B ops/sec).
-     *
-     * <p>This may need clarification from the specification author.
-     * 1B ops/sec = 1ns per operation = ~3-5 CPU cycles, which is
-     * unrealistic for hash table lookups that require memory access.</p>
-     */
-    public static final double ORIGINAL_SPEC_TARGET = 1_000_000_000.0;
 
     /**
      * Number of entries in the segment.

@@ -28,9 +28,7 @@ import java.util.regex.Pattern;
  * if two entries claim the same metric for the same benchmark, which turns a silently
  * arbitrary choice into a hard failure.</p>
  *
- * <h2>Target Interpretation</h2>
- * <p>The PROJECT GOAL specified "at least 1B ops/sec" for storage point lookups, which is
- * unrealistic for single-threaded Java. The realistic targets are documented per entry.</p>
+ * <p>Each entry documents the reasoning behind its own figure.</p>
  *
  * @author ExcaliburDB
  */
@@ -56,7 +54,7 @@ public final class BenchmarkTargetRegistry {
 
         // ===== Storage (Phase 2) - Mode.Throughput, JMH unit ops/s =====
         targets.add(throughputTarget(".*PointLookupBenchmark\\.sequentialLookupFast",
-            10_000_000.0, "Realistic single-threaded target (interpreted from the 1B/sec spec)"));
+            10_000_000.0, "Realistic single-threaded target"));
         targets.add(throughputTarget(".*PointLookupBenchmark\\.randomLookupFast",
             10_000_000.0, "Realistic single-threaded target"));
         // Per lookup (@OperationsPerInvocation(100)). A batch is the lock-free lookup of

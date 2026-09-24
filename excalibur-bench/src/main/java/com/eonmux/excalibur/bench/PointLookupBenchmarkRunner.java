@@ -9,21 +9,20 @@ import org.openjdk.jmh.runner.options.TimeValue;
 /**
  * JMH Benchmark Runner for Point Lookup Throughput.
  *
- * <p>Runs the PointLookupBenchmark to validate the Phase 2 storage engine
- * performance. The target has been interpreted based on realistic expectations
- * for single-threaded Java performance on modern hardware.</p>
+ * <p>Runs the PointLookupBenchmark to measure the storage engine's lookup throughput with
+ * the page cache hot.</p>
  *
- * <h2>Target Interpretation</h2>
- * <p>The original specification stated "≥1B/sec" which has been interpreted as:</p>
+ * <h2>Target</h2>
  * <ul>
- *   <li><strong>Realistic single-threaded target</strong>: ≥10M ops/sec (10 million)</li>
+ *   <li><strong>Single-threaded</strong>: ≥10M lookups/sec</li>
  *   <li><strong>Units</strong>: every score is per lookup, batches included</li>
  *   <li><strong>Multi-threaded scaling</strong>: With N threads, target N × 10M ops/sec</li>
  * </ul>
  *
- * <h2>Rationale for Target Interpretation</h2>
+ * <h2>Why 10M</h2>
  * <ul>
- *   <li>1B ops/sec = 1ns per op = ~3-5 CPU cycles - unrealistic for hash table lookup</li>
+ *   <li>A nanosecond per lookup is three to five CPU cycles - less than a hash table lookup
+ *       that touches memory can cost</li>
  *   <li>Modern CPU memory latency: ~50-100ns for L3 cache, ~100-300ns for RAM</li>
  *   <li>Hash table lookup involves: hash compute + slot probe + key compare + result return</li>
  *   <li>A hit also verifies its slot and entry checksums before the value is returned,
@@ -47,22 +46,16 @@ import org.openjdk.jmh.runner.options.TimeValue;
 public class PointLookupBenchmarkRunner {
 
     /**
-     * Target throughput in ops/sec.
+     * Target throughput in ops/sec, single-threaded.
      *
-     * <p>Interpreted from "≥1B/sec" as realistic single-threaded target.
-     * 10M ops/sec is achievable with memory-mapped I/O and page cache hot.</p>
+     * <p>Achievable with memory-mapped I/O and the page cache hot.</p>
      */
     public static final double TARGET_OPS_PER_SEC = 10_000_000.0;
-
-    /**
-     * Original specification target (may need clarification).
-     */
-    public static final double ORIGINAL_SPEC_TARGET = 1_000_000_000.0;
 
     public static void main(String[] args) throws RunnerException {
         System.out.println("╔══════════════════════════════════════════════════════════════════════╗");
         System.out.println("║     ExcaliburDB Point Lookup Throughput Benchmark                   ║");
-        System.out.println("║     Target: ≥10M ops/sec (interpreted from spec: ≥1B)               ║");
+        System.out.println("║     Target: ≥10M ops/sec, single-threaded                           ║");
         System.out.println("╚══════════════════════════════════════════════════════════════════════╝");
         System.out.println();
         System.out.println("Configuration:");
@@ -79,12 +72,6 @@ public class PointLookupBenchmarkRunner {
         System.out.println("  batchLookup100          - Batch of 100 with single lock (per lookup)");
         System.out.println("  batchLookupApi          - Batch of 10 via batch API (per lookup)");
         System.out.println("  lookupMiss              - Miss path (key not found)");
-        System.out.println();
-        System.out.println("Target Interpretation Note:");
-        System.out.println("  Original spec: ≥1B ops/sec (1,000,000,000)");
-        System.out.println("  Interpreted:   ≥10M ops/sec (10,000,000)");
-        System.out.println("  Rationale: 1B ops/sec = 1ns/op = ~3-5 CPU cycles");
-        System.out.println("             which is unrealistic for hash table lookups.");
         System.out.println();
 
         Options options = new OptionsBuilder()
