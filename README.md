@@ -1168,11 +1168,18 @@ and unapplied; anything the log still owes is marked again as the store opens. W
 compaction would discharge the log entry on the grounds that it names nothing tombstoned — forgetting
 the promise while the document was readable again.
 
-**Reindexing.** A reindex removes content a query could still be matching: a deleted document's
-chunks, and the tail chunks a shortened document no longer has. (A document posted again through
-`POST /v1/documents` sheds such a tail too: once the new version is published, the previous
-version's chunks past its end are removed the same way, under the document's lock.) Both are erased
-from the index as they are tombstoned in storage, and the reindex settles its own erasures at the end
+**Reindexing.** A reindex publishes a changed document exactly as ingestion publishes a new one,
+through the same visibility tracker: the document is marked in flight before its first chunk is
+rewritten and published whole once its last one is, so a query sees the previous version, nothing
+of the document while it is rewritten, or the new version — never part of each, and never part of
+the new one. A rewrite that fails after overwriting chunks of the previous version leaves the
+document withheld rather than served mixed, until the next crawl publishes it whole; the mark is
+journalled, so a crash mid-rewrite leaves the same state behind across a restart. A reindex also
+removes content a query could still be matching: a deleted document's chunks, and the tail chunks a
+shortened document no longer has. (A document posted again through `POST /v1/documents` sheds such
+a tail too.) A shortened document's tail is removed once every chunk of the new version is written
+and before it is published, under the document's lock, so the new version is never served beside
+it. Both are erased from the index as they are tombstoned in storage, and the reindex settles its own erasures at the end
 of its run rather than leaving them for whatever ingests next — except in a segment that also holds
 the previous copy of a document the same run re-published, which waits for readers to catch up as
 described under Reingestion, and is then settled by the sweep. A node that only ever reindexes still
@@ -3444,7 +3451,8 @@ The system uses epoch-based visibility tracking to ensure:
 
 - Queries see a consistent snapshot of data
 - No torn reads during concurrent ingestion
-- Document atomicity - all chunks of a document become visible together
+- Document atomicity - all chunks of a document become visible together, and a document being
+  rewritten, by a re-post or a reindex, is withheld until its new version is published whole
 - Monotonic epoch advancement
 
 ## Development
