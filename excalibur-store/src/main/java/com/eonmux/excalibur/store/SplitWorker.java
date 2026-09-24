@@ -161,7 +161,8 @@ public class SplitWorker {
      * knowledge of the routing table and must never invent a split bit of its own. The answer
      * is per segment because it depends on how many directory slots the segment owns. It may
      * throw - {@link RoutingDirectoryFullException} when the split would widen the directory past
-     * its limit - and a throw means the split does not happen.</p>
+     * its limit, {@link CatalogFullException} when the catalog has no row for a child - and a
+     * throw means the split does not happen.</p>
      */
     private final ToIntFunction<Segment> splitBitFor;
 
@@ -526,7 +527,7 @@ public class SplitWorker {
         Thread thread = Thread.ofVirtual().name("excalibur-split-request").unstarted(() -> {
             try {
                 splitSegment(segment, splitBit);
-            } catch (RoutingDirectoryFullException e) {
+            } catch (RoutingDirectoryFullException | CatalogFullException e) {
                 // Already counted and reported, once per segment, by the routing table.
                 LOGGER.log(Level.FINE, "Requested split refused: {0}", e.getMessage());
             } catch (Exception e) {
@@ -576,7 +577,7 @@ public class SplitWorker {
                         try {
                             splitSegment(segment, NO_REQUESTED_BIT);
                             splitCount++;
-                        } catch (RoutingDirectoryFullException e) {
+                        } catch (RoutingDirectoryFullException | CatalogFullException e) {
                             // Offered again every sweep for as long as it stays full; the
                             // routing table reports it once and counts every refusal.
                             LOGGER.log(Level.FINE, "Split refused: {0}", e.getMessage());
@@ -771,6 +772,11 @@ public class SplitWorker {
             }
             if (e instanceof IOException ioe) {
                 throw ioe;
+            }
+            if (e instanceof CatalogFullException refused) {
+                // Refused at publication, before anything moved: counted and reported by the
+                // routing table like a refusal before the partition.
+                throw refused;
             }
             throw new IOException("Split failed for segment: " + parentPath, e);
         }

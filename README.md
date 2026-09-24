@@ -3434,6 +3434,20 @@ once for the segment and counted in `Statistics.getRefusedSplits()`, and the wri
 gets `RoutingDirectoryFullException` rather than the heap running out. An entry larger than an
 empty segment's data region is refused outright, because no split makes room for it.
 
+The segment catalog (`catalog.dat`) has a limit of its own: one row per live segment, and at most
+65,536 rows (`CatalogFile.MAX_SEGMENTS`). A purged segment's row is reused by the next segment
+registered, so the limit counts the segments a store has now, not every one it has had. At 1 MiB
+of data region a segment that is 64 GiB of data regions, and since a split leaves both children
+about half full, a store holds less than that when it gets there. For keys that hash evenly this
+is the limit a store meets first; the routing directory's default is sixteen times wider. A split
+needs a row for its new segment, and it claims that row before it moves any file, so a split the
+catalog cannot take is refused with the store untouched: it is logged once for the segment and
+counted in `Statistics.getRefusedSplits()`, the segment keeps everything it holds, and the write
+that needed room gets `CatalogFullException` — like `RoutingDirectoryFullException`, a
+`SegmentAtCapacityException`. Writes that route to segments with room carry on, and a purge frees
+rows again. A rolling reindex that needs a new segment while the catalog is full fails with the
+catalog's own message and registers nothing.
+
 A write that reaches a segment while it is being split waits for the split to publish or be
 abandoned and then routes again, rather than failing. The directory is written down after every
 split; a restart that finds a split's children on disk but a directory written before it replays

@@ -160,7 +160,8 @@ final class EngineWrites {
      * for it again on every retry used to deepen the directory until the heap ran out; it is
      * refused as an argument error. A segment whose split would widen the directory past its
      * limit gets {@link RoutingDirectoryFullException} straight away rather than after a wait
-     * for a split that the worker will refuse.</p>
+     * for a split that the worker will refuse, and one whose split the segment catalog has no
+     * row for gets {@link CatalogFullException} the same way.</p>
      *
      * @param key          The key being written
      * @param value        The value being written
@@ -169,6 +170,7 @@ final class EngineWrites {
      * @throws IllegalArgumentException if no segment of this geometry could hold the entry
      * @throws RoutingDirectoryFullException if the split would widen the directory past its
      *         limit
+     * @throws CatalogFullException if the catalog has no row for the segment a split would add
      * @throws SegmentAtCapacityException if there is no split worker, or the split does not
      *         publish in time
      */

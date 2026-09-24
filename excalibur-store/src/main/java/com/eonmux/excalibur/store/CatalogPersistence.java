@@ -124,6 +124,39 @@ final class CatalogPersistence {
     }
 
     /**
+     * Whether the catalog has a row for each of these segments; always, with no file behind
+     * it. See {@link CatalogFile#hasRoomFor(long...)}.
+     *
+     * @param segmentIds The segment ids about to be registered
+     * @return true if each can be given a row
+     */
+    boolean hasRoomFor(long... segmentIds) {
+        return catalogFile == null || catalogFile.hasRoomFor(segmentIds);
+    }
+
+    /**
+     * Reserves a row for each of these segments, or none; always granted with no file behind
+     * it. See {@link CatalogFile#reserveRows(long...)}.
+     *
+     * @param segmentIds The segment ids about to be registered
+     * @return true if every id has a row, false if nothing was reserved
+     */
+    boolean reserveRows(long... segmentIds) {
+        return catalogFile == null || catalogFile.reserveRows(segmentIds);
+    }
+
+    /**
+     * Gives back the rows reserved for these segments and not yet written.
+     *
+     * @param segmentIds The segment ids whose registration will not happen
+     */
+    void releaseRows(long... segmentIds) {
+        if (catalogFile != null) {
+            catalogFile.releaseRows(segmentIds);
+        }
+    }
+
+    /**
      * Forces all metadata changes to the device.
      *
      * @throws UncheckedIOException if the flush fails

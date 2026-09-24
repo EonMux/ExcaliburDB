@@ -304,6 +304,44 @@ public class SegmentCatalog {
     }
 
     /**
+     * Whether the catalog file has a row for each of these routing segments.
+     *
+     * <p>An index that already has a live row needs none. The answer can be overtaken by
+     * another registration; see {@link #reserveRows(long...)} for one that cannot.</p>
+     *
+     * @param segmentIndices The routing indices about to be registered
+     * @return true if each can be given a row, always when nothing is persisted
+     */
+    boolean hasRoomFor(long... segmentIndices) {
+        return persistence.hasRoomFor(segmentIndices);
+    }
+
+    /**
+     * Reserves a catalog row for each of these routing segments, or none.
+     *
+     * <p>For callers that must know before they commit to anything - split publication,
+     * which cannot undo its file moves once made. A reserved row is held until {@link #add} or
+     * {@link #registerFile} writes that index, or {@link #releaseRows(long...)} gives it back,
+     * and no other registration can take it meanwhile.</p>
+     *
+     * @param segmentIndices The routing indices about to be registered
+     * @return true if every index has a row, false if the catalog file is full and nothing
+     *         was reserved
+     */
+    boolean reserveRows(long... segmentIndices) {
+        return persistence.reserveRows(segmentIndices);
+    }
+
+    /**
+     * Gives back the rows {@link #reserveRows(long...)} reserved and nothing has written.
+     *
+     * @param segmentIndices The routing indices whose registration will not happen
+     */
+    void releaseRows(long... segmentIndices) {
+        persistence.releaseRows(segmentIndices);
+    }
+
+    /**
      * Gives a routing segment its own row in place of a created record holding its index.
      *
      * <p>For start-up, which is where such a row is found. See
