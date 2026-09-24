@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.retrieval.rank;
 
+import com.eonmux.excalibur.core.util.QueryBudget;
+
 /**
  * One retrieval signal: something that can order candidates for a query.
  *
@@ -39,4 +41,22 @@ public interface Ranker {
      * @return results ordered best first, never null
      */
     RankedList rank(RetrievalQuery query, int limit);
+
+    /**
+     * Ranks within what is left of a query's time.
+     *
+     * <p>A ranker that only reads local indexes has nothing to bound and keeps this default,
+     * which ignores the budget. One that waits on something slower - a model, or another ranker
+     * that does - overrides it, so a deadline or a cancellation reaches the wait: a ranker that
+     * runs out of time hands back the best ranking it has and marks the budget timed out, and one
+     * whose query is cancelled throws {@link java.util.concurrent.CancellationException}.</p>
+     *
+     * @param query  the query to rank for
+     * @param limit  maximum results to return; implementations must not exceed it
+     * @param budget the query's deadline and cancellation; never null
+     * @return results ordered best first, never null
+     */
+    default RankedList rank(RetrievalQuery query, int limit, QueryBudget budget) {
+        return rank(query, limit);
+    }
 }

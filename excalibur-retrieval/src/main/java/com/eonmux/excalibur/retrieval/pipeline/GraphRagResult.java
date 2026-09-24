@@ -23,6 +23,12 @@ import com.eonmux.excalibur.retrieval.serialize.SerializedSubgraph;
  * system could not tell which of several things was meant, and a caller that renders that as "not
  * found" has thrown away the one word that would have answered it.
  *
+ * <p>A query whose deadline passed is still one of the three: what it had gathered by then is
+ * judged like any other evidence, and {@link #timedOut} says the answer - or the refusal - may be
+ * missing what more time would have found. Only a deadline that passed before the graph was walked
+ * leaves nothing to judge, and that is a refusal with the reason
+ * {@link RetrievalOutcome.Reason#TIMED_OUT}.
+ *
  * <p>The trace is always present. A refusal that took two seconds is as much a performance question
  * as an answer that did, and a result type that only carried timings on success would hide exactly
  * the slow paths worth looking at.
@@ -34,6 +40,8 @@ import com.eonmux.excalibur.retrieval.serialize.SerializedSubgraph;
  * @param declined    why retrieval refused, when it did
  * @param plan        the plan the walk used, when planning produced one
  * @param aggregation the computed aggregate, when the plan asked for one and it was answered
+ * @param walk        what the walk's limits left out, when the graph was walked
+ * @param timedOut    whether the query's deadline cut any stage short
  * @param trace       per-stage latency
  */
 public record GraphRagResult(
@@ -44,6 +52,8 @@ public record GraphRagResult(
     Optional<RetrievalOutcome.NoResults> declined,
     Optional<QueryPlan> plan,
     Optional<Aggregation> aggregation,
+    Optional<WalkTruncation> walk,
+    boolean timedOut,
     QueryTrace trace
 ) {
 
@@ -54,28 +64,41 @@ public record GraphRagResult(
     }
 
     static GraphRagResult answered(RetrievalOutcome.Results results, SerializedSubgraph context,
-                                   QueryPlan plan, Aggregation aggregation, QueryTrace trace) {
+                                   QueryPlan plan, Aggregation aggregation, WalkTruncation walk,
+                                   boolean timedOut, QueryTrace trace) {
         return new GraphRagResult(Optional.of(results), Optional.of(context), Optional.empty(),
             Optional.empty(), Optional.empty(), Optional.of(plan), Optional.ofNullable(aggregation),
-            trace);
+            Optional.of(walk), timedOut, trace);
     }
 
     static GraphRagResult askUser(PlanningOutcome.AskUser ask, QueryTrace trace) {
         return new GraphRagResult(Optional.empty(), Optional.empty(), Optional.of(ask),
-            Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), trace);
+            Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+            Optional.empty(), false, trace);
     }
 
     static GraphRagResult ambiguous(RetrievalOutcome.Ambiguous ambiguity, QueryPlan plan,
-                                    QueryTrace trace) {
+                                    WalkTruncation walk, boolean timedOut, QueryTrace trace) {
         return new GraphRagResult(Optional.empty(), Optional.empty(), Optional.empty(),
-            Optional.of(ambiguity), Optional.empty(), Optional.of(plan), Optional.empty(), trace);
+            Optional.of(ambiguity), Optional.empty(), Optional.of(plan), Optional.empty(),
+            Optional.of(walk), timedOut, trace);
     }
 
     static GraphRagResult declined(RetrievalOutcome.NoResults outcome, QueryPlan plan,
                                    QueryTrace trace) {
+        return declined(outcome, plan, null, false, trace);
+    }
+
+    static GraphRagResult declined(RetrievalOutcome.NoResults outcome, QueryPlan plan,
+                                   WalkTruncation walk, boolean timedOut, QueryTrace trace) {
         return new GraphRagResult(Optional.empty(), Optional.empty(), Optional.empty(),
             Optional.empty(), Optional.of(outcome), Optional.ofNullable(plan), Optional.empty(),
-            trace);
+            Optional.ofNullable(walk), timedOut, trace);
+    }
+
+    static GraphRagResult timedOut(QueryPlan plan, QueryTrace trace) {
+        return declined(RetrievalOutcome.NoResults.of(RetrievalOutcome.Reason.TIMED_OUT), plan,
+            null, true, trace);
     }
 
     /** Whether there is context to give a model. */

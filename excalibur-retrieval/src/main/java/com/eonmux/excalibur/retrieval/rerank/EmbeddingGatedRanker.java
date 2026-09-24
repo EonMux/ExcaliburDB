@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.retrieval.rerank;
 
+import com.eonmux.excalibur.core.util.QueryBudget;
 import com.eonmux.excalibur.retrieval.rank.RankedList;
 import com.eonmux.excalibur.retrieval.rank.Ranker;
 import com.eonmux.excalibur.retrieval.rank.RetrievalQuery;
@@ -56,14 +57,19 @@ public final class EmbeddingGatedRanker implements Ranker {
 
     @Override
     public RankedList rank(RetrievalQuery query, int limit) {
+        return rank(query, limit, QueryBudget.unbounded());
+    }
+
+    @Override
+    public RankedList rank(RetrievalQuery query, int limit, QueryBudget budget) {
         if (query == null) {
             throw new IllegalArgumentException("query must not be null");
         }
         if (query.hasEmbedding()) {
-            return whenEmbedded.rank(query, limit);
+            return whenEmbedded.rank(query, limit, budget);
         }
         LOGGER.debug("query carries no embedding; answering from {} without an exact rerank",
             whenNotEmbedded.name());
-        return whenNotEmbedded.rank(query, limit);
+        return whenNotEmbedded.rank(query, limit, budget);
     }
 }
