@@ -47,8 +47,9 @@ public final class RestoreCommand {
             // The two paths contradict each other: a line to correct, not a failure.
             throw new UsageException(e.getMessage());
         }
-        RestoreResult result = new SnapshotRestorer().restore(options);
-        result.recovery().ifPresent(recovery -> out.printf("recovered  %s%n", recovery));
+        // Printed as it happens, so a restore that then fails still says what it already did.
+        RestoreResult result = new SnapshotRestorer().restore(options,
+            recovery -> out.printf("recovered  %s%n", recovery));
         out.printf("restored   %s%n", result.target());
         out.printf("  from     %s (%s)%n", options.snapshotDir(),
             result.manifest().snapshotId());

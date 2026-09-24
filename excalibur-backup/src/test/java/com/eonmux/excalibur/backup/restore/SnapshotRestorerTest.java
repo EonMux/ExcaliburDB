@@ -561,6 +561,33 @@ class SnapshotRestorerTest {
     }
 
     @Test
+    @DisplayName("a restore refused after finishing an interrupted one still reports the recovery")
+    void aRecoveryIsReportedWhenTheRestoreAfterItIsRefused() throws IOException {
+        Path snapshotDir = snapshot();
+        Path otherData = Files.createDirectories(tempDir.resolve("other-data"));
+        DataDirectoryFixture.writeRandom(otherData.resolve("catalog.dat"), 2048, 911L);
+        Path otherSnapshot = tempDir.resolve("other-snap");
+        new SnapshotWriter().take(new SnapshotOptions(otherData, otherSnapshot, true, false));
+        Path target = occupiedTarget();
+        assertThatThrownBy(() -> new SnapshotRestorer(crashing(Step.INSTALL, 2))
+            .restore(new RestoreOptions(snapshotDir, target, true, VerifyDepth.CHECKSUM)))
+            .isInstanceOf(Crash.class);
+        List<String> reported = new ArrayList<>();
+
+        assertThatThrownBy(() -> new SnapshotRestorer().restore(
+            new RestoreOptions(otherSnapshot, target, false, VerifyDepth.CHECKSUM),
+            reported::add))
+            .as("without --force the finished image is an occupied target")
+            .isInstanceOf(RestoreRefusedException.class);
+
+        String interrupted = ManifestCodec.read(snapshotDir.resolve(ManifestCodec.FILE_NAME))
+            .snapshotId();
+        assertThat(reported).singleElement().satisfies(recovery -> assertThat(recovery)
+            .contains(interrupted).contains("completed"));
+        assertThat(DataDirectoryFixture.digestTree(target)).isEqualTo(imageOf(snapshotDir));
+    }
+
+    @Test
     @DisplayName("a journal left while the image was still being staged is discarded")
     void aStagingJournalIsDiscarded() throws IOException {
         Path snapshotDir = snapshot();

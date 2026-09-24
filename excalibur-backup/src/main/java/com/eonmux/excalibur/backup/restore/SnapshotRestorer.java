@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Consumer;
 
 /**
  * Rebuilds a data directory from a snapshot.
@@ -116,19 +117,39 @@ public final class SnapshotRestorer {
     }
 
     /**
-     * Restores a snapshot.
+     * Restores a snapshot, with nobody told of a recovery until the restore succeeds.
      *
      * @param options What to restore and where
+     * @return What now exists, and what still has to be rebuilt, and any recovery made first
+     * @throws IOException          if the restore is refused or anything cannot be read or
+     *                              written; see {@link #restore(RestoreOptions, Consumer)}
+     * @throws NullPointerException if options is null
+     */
+    public RestoreResult restore(RestoreOptions options) throws IOException {
+        return restore(options, recovery -> { });
+    }
+
+    /**
+     * Restores a snapshot, first finishing any restore of the target that was interrupted.
+     *
+     * <p>That recovery changes the target whatever happens next, so it is reported the moment it
+     * is made rather than only in the result: a restore that is then refused or fails still
+     * leaves the target rolled forward or back, and the operator has to be told which.</p>
+     *
+     * @param options     What to restore and where
+     * @param onRecovered Told what an interrupted restore was finished with, as soon as it is
      * @return What now exists, and what still has to be rebuilt
      * @throws RestoreRefusedException if the image does not verify, the target holds
      *                                 something and was not explicitly allowed to be
      *                                 replaced, or another process holds the target; in each
      *                                 case the target's data is untouched
      * @throws IOException             if anything cannot be read or written
-     * @throws NullPointerException    if options is null
+     * @throws NullPointerException    if either argument is null
      */
-    public RestoreResult restore(RestoreOptions options) throws IOException {
+    public RestoreResult restore(RestoreOptions options, Consumer<String> onRecovered)
+            throws IOException {
         Objects.requireNonNull(options, "options");
+        Objects.requireNonNull(onRecovered, "onRecovered");
         VerificationReport report = verifyOrRefuse(options);
         SnapshotManifest manifest = report.manifest();
         Path target = options.target();
@@ -143,7 +164,7 @@ public final class SnapshotRestorer {
         boolean restored = false;
         DataDirectoryLock lock = claim(target, created);
         try {
-            RestoreResult result = restoreUnderLock(options, manifest, target);
+            RestoreResult result = restoreUnderLock(options, manifest, target, onRecovered);
             restored = true;
             return result;
         } finally {
@@ -159,14 +180,17 @@ public final class SnapshotRestorer {
      *
      * @param options  What to restore and where
      * @param manifest The verified image
-     * @param target   The target, which exists and is locked
+     * @param target      The target, which exists and is locked
+     * @param onRecovered Told of a recovery before anything else can fail
      * @return What now exists
      * @throws IOException if the restore is refused or fails
      */
     private RestoreResult restoreUnderLock(RestoreOptions options, SnapshotManifest manifest,
-                                           Path target) throws IOException {
+                                           Path target, Consumer<String> onRecovered)
+            throws IOException {
         List<FileEntry> restored = restorable(manifest);
         Optional<Recovery> recovery = recover(target);
+        recovery.map(Recovery::describe).ifPresent(onRecovered);
         if (recovery.isPresent() && recovery.get().completed()
                 && recovery.get().snapshotId().equals(manifest.snapshotId())) {
             // This very restore was interrupted, and it has now been finished from its journal.
