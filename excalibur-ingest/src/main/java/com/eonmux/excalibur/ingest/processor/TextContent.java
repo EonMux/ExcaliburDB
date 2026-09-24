@@ -51,6 +51,9 @@ public final class TextContent {
     /** Decoded binary is full of these; decoded text has none. */
     private static final char NUL = '\u0000';
 
+    /** Appended to a decoding whose markup is reduced to the text it shows. */
+    private static final String MARKUP_DECODING = "+markup";
+
     /** What a lenient decoder substitutes for bytes it cannot read. */
     private static final char REPLACEMENT = '\uFFFD';
 
@@ -117,6 +120,30 @@ public final class TextContent {
     public static String decode(FetchedDocument document) {
         Objects.requireNonNull(document, "document must not be null");
         return decode(document.getContent(), document.getCharset(), document.getContentType());
+    }
+
+    /**
+     * Names how a fetched document's bytes become its text, apart from the bytes themselves.
+     *
+     * <p>{@link #decode(FetchedDocument)} depends on exactly two things besides the content: the
+     * encoding the bytes are read in, and whether they are markup to be reduced to the text it
+     * shows. This names both - {@code windows-1252}, or {@code UTF-8+markup} - and nothing else,
+     * so it moves when the same bytes would decode to different text and not otherwise. A source
+     * registered again with another {@code charset}, or a server that starts labelling the same
+     * page with another encoding or as HTML, moves it; a new crawl delay, a moved modification
+     * time or a content type that is still not markup do not.</p>
+     *
+     * <p>Recorded beside each indexed document, so a re-crawl can tell a document whose bytes
+     * are unchanged but whose text would not be from one it can leave alone.</p>
+     *
+     * @param document What the source handed back
+     * @return The decoding, never null
+     * @throws NullPointerException if document is null
+     */
+    public static String decodingOf(FetchedDocument document) {
+        Objects.requireNonNull(document, "document must not be null");
+        String charset = document.getCharset().name();
+        return HtmlText.isMarkup(document.getContentType()) ? charset + MARKUP_DECODING : charset;
     }
 
     /**

@@ -119,7 +119,7 @@ class DocumentRegistryDurabilityTest {
 
         List<String> body = List.of(
             "\\#document-registry|2",
-            "src|old.md|1000|4242|128|2000|src:old.md:chunk:0|");
+            "src|old.md|1000|4242|128|2000|src:old.md:chunk:0||");
         assertThat(Files.readString(file, StandardCharsets.UTF_8))
             .isEqualTo(Sealed.seal(body, DocumentRegistry.END_MARKER, 1));
     }
@@ -162,7 +162,52 @@ class DocumentRegistryDurabilityTest {
 
         assertThat(Files.readAllLines(file, StandardCharsets.UTF_8))
             .element(1)
-            .isEqualTo("src|tagged.md|1000|4242|128|2000|src:tagged.md:chunk:0|\"v1\"");
+            .isEqualTo("src|tagged.md|1000|4242|128|2000|src:tagged.md:chunk:0|\"v1\"|");
+    }
+
+    @Test
+    @DisplayName("a decoding survives a restart, as the last field after the entity tag")
+    void decodingsSurviveARestart(@TempDir Path tempDir) throws IOException {
+        // The decoding is what tells a re-crawl that intact bytes would now be read as other
+        // text. Forgotten at a restart, a charset changed afterwards is never seen for the
+        // documents indexed before it.
+        Path file = tempDir.resolve("document-registry");
+        DocumentRegistry registry = new DocumentRegistry(file);
+        registry.register(DocumentMetadata.builder()
+            .sourceId("src").documentId("page.html")
+            .lastModifiedMillis(1000).contentHash(4242).contentLength(128)
+            .indexTimeMillis(2000).chunkIds(List.of("src:page.html:chunk:0"))
+            .decoding("windows-1252+markup")
+            .build());
+        registry.register(metadata("src", "undecoded.md"));
+        registry.persist();
+
+        assertThat(Files.readAllLines(file, StandardCharsets.UTF_8))
+            .contains("src|page.html|1000|4242|128|2000|src:page.html:chunk:0||windows-1252+markup");
+
+        DocumentRegistry reloaded = new DocumentRegistry(file);
+
+        assertThat(reloaded.get("src", "page.html").getDecoding())
+            .isEqualTo("windows-1252+markup");
+        assertThat(reloaded.get("src", "page.html").getEntityTag()).isNull();
+        assertThat(reloaded.get("src", "undecoded.md").getDecoding()).isNull();
+    }
+
+    @Test
+    @DisplayName("a record written before decodings were kept reads as one without a decoding")
+    void aRecordWithoutADecodingStillReads(@TempDir Path tempDir) throws IOException {
+        Path file = tempDir.resolve("document-registry");
+        Files.write(file, List.of(
+                "\\#document-registry|1",
+                "src|tagged.md|1000|4242|128|2000|src:tagged.md:chunk:0|W/\"t\"",
+                "\\#end|1"),
+            StandardCharsets.UTF_8);
+
+        DocumentMetadata loaded = new DocumentRegistry(file).get("src", "tagged.md");
+
+        assertThat(loaded.getEntityTag()).isEqualTo("W/\"t\"");
+        assertThat(loaded.getDecoding()).isNull();
+        assertThat(loaded.hasDecoding()).isFalse();
     }
 
     @Test

@@ -1036,6 +1036,15 @@ now. The whole configuration is replaced, not merged — a setting left out of t
 to its default. `source_type` may change too; the next crawl then removes whatever the old
 configuration indexed that the new one does not find.
 
+A setting that changes how a file's bytes become text — `charset` — reaches the documents already
+indexed as well. Each document's registry entry records how its text was read out of its bytes
+(the encoding, and whether it was HTML reduced to its text), and the next re-crawl reads a document
+again when its bytes are unchanged but would now be read differently, so a directory indexed as
+mojibake is re-read in the encoding it was corrected to. A setting that does not change the text —
+a crawl delay, a filter, a timeout — reads nothing again. A document indexed before the node
+recorded this is taken to have been read as its source reads it now; its entry gains the record at
+the first re-crawl, and a `charset` changed after that is seen.
+
 **Error — `404 Not Found`** (`source_not_found`) — no source is running under that id. A catalog
 record the node could not start at boot (`registered: false` on `GET /v1/ingest`) is not running either; register it
 again with `POST`.

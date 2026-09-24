@@ -609,6 +609,48 @@ class ChangeDetectionTest {
     }
 
     @Test
+    void testMetadataIsChangedByDecoding() {
+        DocumentMetadata metadata = DocumentMetadata.builder()
+            .sourceId("source1")
+            .documentId("doc1")
+            .contentHash(1000L)
+            .contentLength(100)
+            .lastModifiedMillis(1000L)
+            .decoding("UTF-8")
+            .build();
+
+        assertTrue(metadata.isChanged(
+                new DocumentMetadata.FetchedDocumentInfo(1000L, 1000L, 100, "windows-1252")),
+            "the same bytes read in another encoding are other text");
+        assertFalse(metadata.isChanged(
+            new DocumentMetadata.FetchedDocumentInfo(1000L, 1000L, 100, "UTF-8")));
+        assertFalse(metadata.isChanged(new DocumentMetadata.FetchedDocumentInfo(1000L, 1000L, 100)),
+            "a fetch that names no decoding is compared by its bytes");
+        assertFalse(metadata.toBuilder().decoding(null).build().isChanged(
+                new DocumentMetadata.FetchedDocumentInfo(1000L, 1000L, 100, "windows-1252")),
+            "an entry recorded without a decoding is compared by its bytes");
+    }
+
+    @Test
+    void testDocumentLabelledWithAnotherEncodingIsChanged() throws SourceException {
+        byte[] content = "caf\u00e9".getBytes(java.nio.charset.Charset.forName("windows-1252"));
+        registry.register(DocumentMetadata.builder()
+            .sourceId("test-source")
+            .documentId("doc1")
+            .contentHash(DocumentRegistry.computeContentHash(content))
+            .contentLength(content.length)
+            .lastModifiedMillis(1000L)
+            .decoding("UTF-8")
+            .build());
+
+        Source relabelled = new MockSource("test-source", List.of("doc1"),
+            docId -> new FetchedDocument(docId, content, "text/plain",
+                java.nio.charset.Charset.forName("windows-1252"), 1000L));
+
+        assertEquals(1, detector.detectChanges(relabelled).getChangedCount());
+    }
+
+    @Test
     void testMetadataWithoutHashFallsBackToTimestamp() {
         DocumentMetadata unhashed = DocumentMetadata.builder()
             .sourceId("source1")

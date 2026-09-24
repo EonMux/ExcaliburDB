@@ -2370,6 +2370,14 @@ is recorded in the registry in place of the old one. The same holds for a page a
 full with a new `ETag` or `Last-Modified` over the same body, as a redeployment does: it is kept
 as indexed, and the validators it came with are what the next re-crawl asks with.
 
+What was indexed is the text, not the bytes, so the registry also records how each document's
+text was read out of them: the encoding, and whether it was HTML reduced to the text it shows. A
+document whose bytes are intact but would now be read differently — its source's `charset`
+replaced with `PUT /v1/ingest`, a page the server now labels with another encoding or as HTML — is
+changed, and is read again. A setting that leaves the text as it was, such as a crawl delay, reads
+nothing again. An entry written before the registry recorded this is taken to have been read as
+its source reads it now, and gains the record at the first re-crawl that finds it unchanged.
+
 ### Reindex Status Example
 
 `POST /v1/reindex` answers 202 and rewrites the source on a background thread, so this is where
@@ -3593,7 +3601,8 @@ only let one of them lapse. A tombstone file, key checksum file or erasure log w
 build stops it opening too, and nothing is deleted.
 
 Beside it, `<data dir>/document-registry` records which documents this node holds, the chunk ids
-each was written under, and the `ETag` and `Last-Modified` an HTTP source reported for it. It is
+each was written under, the `ETag` and `Last-Modified` an HTTP source reported for it, and how its
+text was read out of its bytes — the encoding, and whether it was HTML reduced to its text. It is
 what change detection compares a re-crawl against and what an erasure
 request resolves a document name through, so it is written after every ingestion, reindex and
 erasure. A node that lost it would read every document as new — reingesting the corpus beside the

@@ -36,7 +36,12 @@ import java.util.stream.Stream;
  *
  * <p>A document that came back with its bytes intact is unchanged even when its timestamp or its
  * entity tag moved - a touched file, a redeployed page - and nothing of it is re-chunked or
- * re-embedded. What it came back with is recorded instead; see {@link #refreshValidators}.</p>
+ * re-embedded. What it came back with is recorded instead; see {@link #refreshRecord}.</p>
+ *
+ * <p>Bytes intact are not the whole answer, because the text is what was indexed. A document
+ * whose bytes came back unchanged and would now be read into other text - its source's
+ * {@code charset} was replaced, a server labels the page with another encoding - is changed, and
+ * is read again with the decoding its source now declares.</p>
  *
  * <h2>Deleted Document Detection</h2>
  * <p>After processing all crawled documents, any document in the registry that was not
@@ -150,8 +155,8 @@ public class ChangeDetector {
      * content hash.</p>
      *
      * <p>A document sent back in full and found unchanged still brought news: the validators
-     * its source now names this version by. They are recorded, so the next re-crawl asks with
-     * them - see {@link #refreshValidators}.</p>
+     * its source now names this version by, and the decoding it would be read with. They are
+     * recorded, so the next re-crawl asks with them - see {@link #refreshRecord}.</p>
      *
      * @param source     The source holding the document
      * @param documentId The document
@@ -170,12 +175,13 @@ public class ChangeDetector {
         if (existing.isChanged(info)) {
             return Optional.of(info);
         }
-        refreshValidators(existing, fetched.get().validators());
+        refreshRecord(existing, fetched.get().validators(), info.getDecoding());
         return Optional.empty();
     }
 
     /**
-     * Records the validators an unchanged document came back with, when they differ.
+     * Records the validators an unchanged document came back with, when they differ, and its
+     * decoding, when the entry has none.
      *
      * <p>Only a changed document is reindexed, and reindexing is what otherwise writes a
      * document's validators. Without this, one whose entity tag the registry never held - every
@@ -194,25 +200,36 @@ public class ChangeDetector {
      * if the entry is still the one read, so a reindex that registered a new version meanwhile
      * is never overwritten with this older one.</p>
      *
+     * <p>A decoding is recorded only for an entry that has none - one registered before
+     * decodings were kept - since an entry that has one and differs was reported changed rather
+     * than reaching here. It is taken from the document as it would be read now, the best
+     * account there is of how it was read; from then on the entry has a decoding to compare, and
+     * a later change to its source's configuration is seen.</p>
+     *
      * @param existing What the registry recorded for the indexed version
      * @param received What the source named the same version by just now
+     * @param decoding How the same bytes would be read into text now, or null when not known
      */
-    private void refreshValidators(DocumentMetadata existing, DocumentValidators received) {
+    private void refreshRecord(DocumentMetadata existing, DocumentValidators received,
+                               String decoding) {
         DocumentValidators recorded = existing.validators();
         long lastModified = received.hasLastModified()
             ? received.lastModifiedMillis()
             : recorded.lastModifiedMillis();
         String entityTag = received.hasEntityTag() ? received.entityTag() : recorded.entityTag();
+        String recordedDecoding = existing.hasDecoding() ? existing.getDecoding() : decoding;
         if (lastModified == recorded.lastModifiedMillis()
-                && Objects.equals(entityTag, recorded.entityTag())) {
+                && Objects.equals(entityTag, recorded.entityTag())
+                && Objects.equals(recordedDecoding, existing.getDecoding())) {
             return;
         }
         DocumentMetadata refreshed = existing.toBuilder()
             .lastModifiedMillis(lastModified)
             .entityTag(entityTag)
+            .decoding(recordedDecoding)
             .build();
         if (registry.replace(existing, refreshed)) {
-            LOGGER.debug("Recorded new validators for unchanged document {} of source {}",
+            LOGGER.debug("Recorded what unchanged document {} of source {} came back with",
                 existing.getDocumentId(), existing.getSourceId());
         }
     }
