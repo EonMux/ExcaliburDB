@@ -347,9 +347,11 @@ docker run --rm -v excalibur-data:/var/lib/excalibur \
 ```
 
 All four take the data directory's lock, so none of them can run against a volume a node is
-running on: a repair exits `4` and a snapshot or restore `7`, naming the node's pid, and nothing
-is written. A check without `--repair` goes ahead with a warning. CI runs all four against a node
-the image started and stopped, and runs the repair once more with the node up to see it refused.
+running on: a repair exits `4` and a snapshot `7`, naming the node's pid, and nothing is written.
+A restore checks that its target is empty before it tries the lock, and a running node's volume is
+not, so it exits `4` — or `7`, naming the pid, under `--force`. A check without `--repair` goes
+ahead with a warning. CI runs all four against a node the image started and stopped, and runs the
+repair and the snapshot once more with the node up to see them refused.
 
 Nothing is baked in. The API binds `127.0.0.1` by default and binding anything else requires a
 bearer token and either TLS or an explicit `EXCALIBUR_API_ALLOW_PLAINTEXT=true` where something in
@@ -434,6 +436,10 @@ excalibur-fsck /var/lib/excalibur --json
 excalibur-fsck --help                          # the flags and the exit codes
 ```
 
+`--help`, `-h` or a bare `help`, anywhere on the line, prints the flags and exits `0` without
+reading the directory. `--repair`, `--json` and `--strict` take no value; `--repair=false` is
+refused with exit `2` rather than read as either `--repair` or its opposite.
+
 Without `--repair` it never opens a file for writing: most are mapped read-only — enforced by the
 kernel, not by intention, because several of the engine's own open paths stamp headers or migrate
 formats on the way in — and the rest are streamed past a digest without being mapped at all. It
@@ -516,7 +522,10 @@ begin it — is `CORRUPT`. The verdict on
 `erasure.log` also counts the outstanding entity erasures that name an id nothing in the namespace
 holds, which the node discharges when it next opens the namespace. The `erasure.interrupted`
 marker beside them is recognised as well; the node writes it empty and reads only whether it is
-there, so an empty one is `INTACT`. So is `asserted.last-id`, the checksummed record of the highest
+there, so an empty one is `INTACT`. So is `unpublished.changes`, the empty marker staging keeps
+from the first change after a publish until a build publishes every change, which says the served
+graph is behind its staged facts; a snapshot copies both markers, since the node reads them. So is
+`asserted.last-id`, the checksummed record of the highest
 fact id handed out (see [Stating facts](#stating-facts)): `INTACT` when it matches its checksum,
 otherwise `CORRUPT`, since the node asserts no fact in that namespace until it is restored or
 removed.
@@ -604,8 +613,8 @@ reads may be changing. The lock file is the node's, not data, and is left out of
 its journal, `.excalibur-restore`, still in the directory — is reported as damage and put to the
 operator: running the same `excalibur-backup restore` again finishes it.
 
-Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself
-failed, so nothing is known about the directory — which is not the same claim as `0` — and `4`
+Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, or the data directory
+is missing or not a directory, `3` the check itself failed, so nothing is known about the directory — which is not the same claim as `0` — and `4`
 `--repair` was refused because another process holds the directory.
 
 ### Snapshots — `excalibur-backup`
@@ -737,7 +746,9 @@ Exit codes: `0` done, `2` bad command line — including an `--out` inside `--da
 `--target` inside `--snapshot` (inside where the path really leads, through any symbolic link), and a path the platform cannot name — `3` the image did not verify
 and nothing was restored, `4` the restore target or the snapshot's `--out` is not empty, `5` the data directory
 moved while being copied, `6` a file could not be read or written — or a copy did not read back as
-what was written — `7` another process holds the data directory or the restore target, and
+what was written, the `--data-dir` is not there, the `--out` or the restore `--target` is a regular
+file, or the data directory holds the journal of a restore that did not finish, which a snapshot
+refuses to copy — `7` another process holds the data directory or the restore target, and
 nothing was written, and `70` something this build did not anticipate, reported rather than
 hidden.
 
@@ -746,7 +757,8 @@ hidden.
 Configuration is loaded from `excalibur.properties` in the working directory by default, or from
 the path given to `--config` (or `-c <path>`, or `--config=<path>`); an argument the server does
 not recognise, or a `--config` with no path after it, refuses to start rather than quietly using
-the defaults, and `--help` (or `-h`) prints the arguments without starting anything. One file is
+the defaults, and `--help` (or `-h`, or a bare `help`, anywhere on the line) prints the arguments
+without starting anything. One file is
 read, not a chain, and only from the filesystem. A file named with `--config` that is missing or
 cannot be read refuses to start; only the default path falls back, with a warning, to the built-in
 defaults, and only when there is no file there at all.
@@ -1077,7 +1089,7 @@ Two routes retrieve, and they are separate pipelines rather than two entry point
 
 ```
 user query
-   -> query expansion (chat model, and only when the corpus is not embedded)
+   -> query expansion (chat model; on an embedded corpus only with expand-hybrid-queries)
    -> BM25 over ingested chunks (the engine's own inverted index)
    -> vector retrieval                           [when the corpus is embedded]
    -> reciprocal rank fusion                     [when both signals ran]
@@ -2176,9 +2188,11 @@ search rather than resuming a cursor, because a ranked index has none, which is 
 `offset + top_k` is bounded by `excalibur.api.max-top-k`.
 
 `"explain": true` says why each result is there: `explain.signals` gives each contributing
-signal's own absolute rank and its score *on its own scale*, and `explain.matched_terms` names the
-query terms the passage actually contains. The response also carries `query_expansion` once, with
-a `status` of `applied`, `not_applied`, `fell_back` when the model could not widen the query and it
+signal — `{"signal", "rank", "score"}` — with its own absolute rank and its score *on its own
+scale*, and `explain.matched_terms` names the
+query terms the passage actually contains. The response also carries `query_expansion` once: the `terms` the query was widened with, each
+`{"term", "weight"}`, `terms_truncated` when more than the 32 reported were produced, and a
+`status` of `applied`, `not_applied`, `fell_back` when the model could not widen the query and it
 was searched as typed, or `unreported` when this node cannot say, which is a different fact from
 the query not having been widened. It is read from the expansion the answer was searched with, a
 replayed answer included, so explaining never calls the model a second time.
@@ -2223,7 +2237,8 @@ curl -X POST http://localhost:8080/v1/ingest \
 
 `registered` means recorded and started, not finished. `root_path` must resolve inside
 `excalibur.ingest.allowed-roots`, which is empty until configured — a 403 here is the allow-list,
-not the path. The other supported `source_type` is `http`, whose `base_url` is checked against
+not the path. A relative path is resolved against the node's working directory and held to the same
+rule. The other supported `source_type` is `http`, whose `base_url` is checked against
 `excalibur.ingest.allowed-hosts` and refused if it resolves to any non-public address (see
 [Securing the API](#securing-the-api) for the ranges). A crawl stays on that host and under that URL's
 path: only URLs whose path begins with the path of `base_url` are fetched, redirect hops included,
@@ -2235,7 +2250,7 @@ rather than a silent clamp:
 
 | Field | Applies to | Bound | What it does |
 |-------|-----------|-------|--------------|
-| `included_extensions` | filesystem | — | Only these file extensions are read |
+| `included_extensions` | filesystem | — | Only these file extensions are read. An empty list reads every file, as leaving it out does |
 | `excluded_directories` | filesystem | — | Directory names the walk does not descend into, matched at any depth below the root. The walk never opens them, so a large `node_modules` costs nothing and a link cycle inside one cannot abort the crawl. A file that shares a name with one is still a file |
 | `follow_symlinks` | filesystem | — | Whether the walk descends through symbolic links. A link out of the allowed root is still refused: the real path is what is checked |
 | `include_hidden` | filesystem | — | Whether dot-files are read, and whether the walk enters dot-directories — `.config/notes.md` is hidden with its directory. The root itself may be hidden |
@@ -2280,7 +2295,8 @@ both `team:wiki:home.md`, and the node can store only one of them. The key belon
 source's document was registered under it first. The other source's document is refused before
 anything of it is written — on its first crawl, on every re-crawl and when supplied to
 `POST /v1/documents` — and counted in `documents_failed`, with the source's `/v1/ingest/status`
-error saying how many were refused because another source holds their key; it is not retried
+error, and on a re-crawl its `/v1/reindex/status` `last_error`, saying how many were refused
+because another source holds their key; it is not retried
 into success, so the cure is an id that does not collide. The holder's document is never
 overwritten, and an erasure, re-crawl or document listing that names the other source never
 reaches it.
@@ -2717,6 +2733,10 @@ curl http://localhost:8080/v1/stats
     "unreadableChunksDropped": 0, "unsearchableChunks": 0, "unreadableSegments": 0,
     "outdatedSegments": 0
   },
+  "queryCache": {
+    "hits": 8412, "misses": 2190, "evictions": 0, "invalidations": 1877,
+    "size": 1024, "capacity": 1024, "hitRatio": 0.7934
+  },
   "graph": {
     "namespaces": {"open": 3, "maxOpen": 16, "evictions": 41},
     "budget": {"graphMappings": 81, "processMappings": 12408, "mappingHighWater": 45871,
@@ -2734,8 +2754,8 @@ curl http://localhost:8080/v1/stats
 }
 ```
 
-The `lexical` block is present only on a node that keeps a chunk index, and `graph` only on a node
-that serves a graph. `breakers` holds one entry per circuit breaker the node has — `embedding`,
+The `lexical` block is present only on a node that keeps a chunk index, `queryCache` only with
+`excalibur.query.cache.enabled=true`, and `graph` only on a node that serves a graph. `breakers` holds one entry per circuit breaker the node has — `embedding`,
 `llmRelevancy` for stage 4's relevancy scoring, `queryExpansion` for the chat call that widens a
 lexical query, `graphExtraction` for the chat call that finds a document's facts, `graphRerank` for the
 chat call `POST /v1/graph/query` reranks its candidates with, `graphQueryEmbedding` for the
@@ -2825,7 +2845,8 @@ too. An automatic build overtaken the same way ends `superseded` rather than `fa
 
 The top-level fields describe the last build asked for. `freshness` says whether the served graph
 is behind what the namespace has staged — `behind_staging`, with `staged_changes_since_ms` and
-`last_staged_change_ms` when it is — and `automatic` what the node is doing about it: `state` is
+`last_staged_change_ms` when it is, and `withheld` while the graph is withheld until an interrupted
+erasure is applied; when that cannot be read it is `{"error": "<why>"}` instead — and `automatic` what the node is doing about it: `state` is
 `current`, `pending` (waiting for the debounce or the maximum delay), `running`, `backing_off`
 (after a failure, or after several builds in a row were superseded, until `next_attempt_at_ms`),
 `deferred` (after `DELETE /v1/graph/build` stopped an automatic build, until `next_attempt_at_ms`),
@@ -2841,8 +2862,8 @@ one would turn every question into a refusal. Its status says so and why, from `
 
 ```json
 {"state": "completed", "namespace": "shared", "extraction": "missing_api_key",
- "warning": "excalibur.graph.extraction-enabled is true, but no LLM API key is configured, ...",
- "message": "Nothing was staged, so nothing was published and this namespace is still serving the graph it had. excalibur.graph.extraction-enabled is true, but no LLM API key is configured, ...",
+ "warning": "excalibur.graph.extraction-enabled is true, but the chat endpoint requires an API key and none is configured, ...",
+ "message": "Nothing was staged, so nothing was published and this namespace is still serving the graph it had. excalibur.graph.extraction-enabled is true, but the chat endpoint requires an API key and none is configured, ...",
  "published": false, "edges": 0, "staged_facts": 0, ...}
 ```
 
@@ -2906,6 +2927,10 @@ A client has to tell the statuses apart:
 | `needs_input` | The question did not say which entity it meant. Carries `reason` — one of `unbound_pronoun`, `ambiguous_pronoun`, `no_entity_mention` or `ambiguous_entity` (a name several entities share, which the evidence could not tell apart) — plus `question` and `candidates`; send the chosen one back in `context_entities` with the same query. Entities that share a name are offered as the name followed by ` #` and the entity id (`Ada #12`), so the one sent back names exactly one of them. Returned as 200 — the request was well-formed and the system did what it should |
 | `declined` | The evidence does not support an answer. `reason` is one of `no_match`, `below_confidence_threshold`, `low_provenance_confidence`, `unresolved_reference` or `timed_out` (the deadline passed before the graph was walked, so there was nothing to judge). Deliberately not an empty `answered`, which a client would render as "nothing found" |
 | `cancelled` | `DELETE /v1/query/{query_id}` withdrew the question while it ran. No context, whatever it had reached; `cancelled` is `true` |
+
+`plan` is the shape the question was classified as: `lookup`, `traverse` or `aggregate` — a
+question asked as of a time is reported by the plan that does the work, since the time says when
+to evaluate and not what, so `temporal` never appears — or `null` when no plan was made.
 
 `tokens`, `facts_included`, `facts_dropped`, `truncated` and `format` come with the serialised
 context, so they are absent on an `answered` response that carries none — read `context` and treat
@@ -3045,7 +3070,8 @@ not a discharge — the data is still staged — so the request stays `pending` 
 deadline that has to be able to say the data is gone. The scopes are
 `{"scope":"entity","entity_id":N}`, `{"scope":"entity","entity_name":"Ada Lovelace"}`,
 `{"scope":"source","source_type":"DOCUMENT","source_id":N}` and
-`{"scope":"extractor","version":N}`.
+`{"scope":"extractor","version":N}`. An entity scope naming both `entity_id` and `entity_name` is
+refused with a 400, since the two could name different entities and an erasure is not reversible.
 
 `request_id` is how the obligation is followed afterwards, with the same `X-Excalibur-Namespace`
 it was recorded under:
@@ -3275,13 +3301,18 @@ curl -X DELETE 'http://localhost:8080/v1/graph/facts?subject=Ada%20Lovelace&rela
 ```
 
 By subject, relation and object it retracts every asserted fact stating that triple, matched on
-exact labels; a fact extraction found is never touched by this route — erase its document for
-that. Nothing staged to retract is a 404 and records nothing, as is a namespace that does not
-exist, which is not created. Otherwise the answer is 202 with the `fact_ids` retracted, their
-`request_ids`, and the compaction outcome. As with any erasure, accepting is not removing: until a
+the labels as staging normalises them: the subject and object trimmed of surrounding whitespace
+and otherwise exact, the relation trimmed, lowercased and with each space made an underscore, so
+`worked with` retracts what was asserted as `worked_with`. A fact extraction found is never
+touched by this route — erase its document for that. A fact id in the path together with any of
+`subject`, `relation` or `object` is a 400: retract by one or the other. Nothing staged to retract
+is a 404 and records nothing, as is a namespace that does not exist, which is not created.
+Otherwise the answer is 202 with `namespace`, the `fact_ids` retracted, their `request_ids`,
+`accepted: true`, and the compaction outcome — `compacted`, `edges_removed`, the namespace's
+`outstanding` obligations and a `detail` saying what happened. As with any erasure, accepting is not removing: until a
 compaction runs the fact is still staged and still served by the graph already published, though
 no build publishes it again — every build leaves out what an outstanding erasure covers.
-`compact=true` runs one now. An entity-scoped erasure covers asserted facts as it covers extracted ones.
+`compact=true`, or a bare `compact`, runs one now. An entity-scoped erasure covers asserted facts as it covers extracted ones.
 
 The provenance source types are `UNKNOWN`, `DOCUMENT` and `USER_ASSERTED`, and those are what
 `"scope": "source"` accepts. Three more were defined and never produced — a knowledge-base import, a
@@ -3526,7 +3557,7 @@ whether it is in use and, if not, which setting would change that.
 | `excalibur-planner` | Deterministic query classification and lexical coreference |
 | `excalibur-tenancy` | Per-namespace graph directories, mapping budget, eviction |
 | `excalibur-filter` | Cuckoo filters, LSH indexes |
-| `excalibur-query` | Query pipeline with multi-stage filtering |
+| `excalibur-query` | The vector query pipeline: epoch snapshot, LSH candidates, HNSW search, rerank and relevancy scoring |
 | `excalibur-ingest` | Document ingestion, chunking, source adapters |
 | `excalibur-shard` | Index orchestration, volume management, visibility tracking |
 | `excalibur-llm` | LLM client with circuit breaker and retry logic |
@@ -3538,13 +3569,17 @@ whether it is in use and, if not, which setting would change that.
 | `excalibur-test` | Test utilities and fixtures |
 | `excalibur-test-bootstrap` | Initializes `java.lang.foreign` before the first test in every module |
 | `excalibur-integration` | Integration tests |
-| `excalibur-bench` | JMH benchmarks |
+| `excalibur-bench` | JMH benchmarks, the retrieval evaluation harness and `GraphCalibrationHarness` |
 | `excalibur-coverage` | The coverage summary and gap report behind `./gradlew coverage` and `coverageGaps` |
 
 ### Query Pipeline
 
-Queries execute through a pipeline of five stages, numbered here as the code and its log lines
-(`Stage 1: ...`, `Stage 3: ...`) number them:
+The vector half of `POST /v1/query` executes through a pipeline of five stages in
+`excalibur-query`, numbered here as the code and its log lines (`Stage 1: ...`, `Stage 3: ...`)
+number them. The lexical and hybrid route — BM25 (`LexicalQueryService`), reciprocal rank fusion
+(`HybridFusion`) and relevancy scoring of the fused list (`RelevancyScoring`), all in
+`excalibur-api` — is not part of it; `QueryEndpoint` chooses the route by what the node holds, and
+[Retrieval](#retrieval) describes it.
 
 - **Stage 0 — Epoch Snapshot** - Capture visibility epoch, resolve queryable segments
 - **Stage 1 — LSH Candidates** - Name each segment's entries that share the query's hash buckets, for stage 2 to measure beside its graph search. Excludes no segment and confines no search
@@ -3552,7 +3587,10 @@ Queries execute through a pipeline of five stages, numbered here as the code and
 - **Stage 3 — Full Vector Rerank** - Exact distance computation on candidates
 - **Stage 4 — LLM Relevancy Scoring** - Optional semantic relevancy scoring
 
-Each stage checks for cancellation and timeout, allowing queries to return partial results if time-constrained.
+Every stage checks for cancellation, which withdraws the question and returns nothing. The timeout
+is enforced around the whole run: when it expires, the results of the last stage to complete are
+returned as a partial answer. Stage 2, which dispatches searches of its own across segments, is
+also handed the deadline, so its work finishes inside it rather than running on after it.
 
 Every segment stage 0 admits is searched, in no order that depends on the query. Stage 0 admits by
 segment state alone: it holds back a segment with no graph to search, and one still taking entries
@@ -3939,7 +3977,7 @@ excaliburdb/
 ├── excalibur-llm/          # LLM client
 ├── excalibur-metrics/      # JMX metrics
 ├── excalibur-planner/      # Query classification and coreference
-├── excalibur-query/        # Query execution
+├── excalibur-query/        # Vector query pipeline
 ├── excalibur-retrieval/    # Ranking, fusion, rerank, serialisation, abstention
 ├── excalibur-shard/        # Index orchestration
 ├── excalibur-store/        # Storage engine
@@ -3947,7 +3985,7 @@ excaliburdb/
 ├── excalibur-test/         # Test utilities
 ├── excalibur-test-bootstrap/  # Foreign-memory warm-up for every test JVM
 ├── excalibur-vector/       # HNSW, distance, quantization
-└── excalibur-bench/        # JMH benchmarks
+└── excalibur-bench/        # JMH benchmarks, retrieval evaluation, graph calibration
 ```
 
 ### Running Benchmarks
@@ -4090,12 +4128,15 @@ Every module meets it. The per-module exception map in `build.gradle.kts` is emp
 one number and no module is held to less than the rest — a floor left where coverage used to be
 is what lets it fall back there unnoticed, which is the one thing a floor exists to prevent.
 
-`excalibur-bench` is the permanent outlier. Most of it is JMH state classes, `@Benchmark` methods
-and runner `main`s, which exist to be executed by a benchmark run lasting minutes to hours — not by
-`check`. Its validators, report writers and result parsing are ordinary code and are tested; the
-harness around them deliberately is not, for the same reason JMH's generated classes are excluded
-from the reports altogether. Counting machine-written code measures code generation rather than
-testing, and including it drags the aggregate from the high seventies to 35%.
+What is measured leaves out three sets of classes, in the per-module reports, the floors and the
+aggregate alike: JMH's generated harness classes (`**/jmh_generated/**`) and anything else under a
+`generated` package, which are machine-written — counting them measures code generation rather
+than testing, and JMH's alone drag the aggregate from the high seventies to 35% — and the
+hand-written half of the same harness in `excalibur-bench`, `com.eonmux.excalibur.bench.benchmark`:
+the `@Benchmark` bodies, `@Setup` fixtures and `@State` classes, which are established by a trial
+lasting minutes to hours, and a unit test of which would either not run it or not be a unit test.
+The rest of `excalibur-bench` — the distance kernels, ground truth and recall, the validators,
+report writers, result parsing and runners — is ordinary code, counted and held to the same 80%.
 
 ```bash
 # Per-module reports for every module, plus the aggregate across them
@@ -4158,6 +4199,10 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 - `SegmentPrefilterLifecycleTest` - A segment's vector pre-filter lives and dies with the graph it is keyed against, including across a split
 - `AtomicDocumentWriterTest` - The write-log driver the other suites ingest through records true offsets and keeps each document's chunks contiguous
 - `VectorApiResolutionTest` - The test JVM resolves `jdk.incubator.vector`, so the SIMD kernels are what the suites exercise rather than the scalar fallback
+- `AutomaticGraphBuildIntegrationTest` - Over HTTP, a document ingested, replaced and removed reaches the served graph through the node's automatic build with no build asked for, and with automatic builds disabled the graph waits for one
+- `ReindexGraphIntegrationTest` - A reindex replaces a changed document's staged facts and withdraws a removed one's, so the graph stops answering with what the source no longer says
+- `ChunkAttributionNodeTest` - A vector hit names the chunk it embeds, fuses with the BM25 hit on that chunk and reads its text; a reposted or erased document leaves no vector rankable, and a directory an older build attributed by document is re-keyed to chunks
+- `FailureReportGeneratorTest` - The `util` helper that groups test failures into a categorised report
 
 ```bash
 ./gradlew :excalibur-integration:test
@@ -4195,15 +4240,21 @@ token, no LLM key, which still ingests lexically), indexes two documents through
 `POST /v1/documents`, and stops it with `SIGTERM` the way a scheduler would. `excalibur-fsck` must
 find nothing damaged in what it left; `excalibur-backup` must snapshot it, `verify --deep` the
 snapshot with nothing but the report on stdout, and `restore --deep` it into a directory
-`excalibur-fsck` passes too. That runs every format checker against the formats a node writes,
+`excalibur-fsck` passes too. A node is then started on the restored directory, must answer a
+`POST /v1/query` with the document indexed before the snapshot, and must stop cleanly on `SIGTERM`
+in turn. That runs every format checker against the formats a node writes,
 through the installed start scripts and the JVM flags they carry. It finishes with
 `./gradlew publishToMavenLocal`, the only thing that asks the library modules for a POM Maven can
 read.
 
 **Gates.** `./gradlew benchmarkTest`, the task `test` leaves out: the Cuckoo filter's false
-positive rate over a million items, HNSW recall@10 against brute force, the query pipeline's
-end-to-end recall@10 against brute force and against its own graphs, the point-lookup
-regression floor, and 300 MB of embedded chunks ingested by eight writers into a store running
+positive rate over a million items (`FPRateMeasurementTest`, and the `slow` method of
+`CuckooFilterTest` that holds it to 0.1% at a 0.95 load factor), HNSW recall@10 against brute
+force, the HNSW build-time and search-latency floor (`HnswThroughputRegressionTest`), the `slow`
+method of `PQConfigTest` that trains and encodes with a quantiser built from its configuration,
+the query pipeline's end-to-end recall@10 against brute force and against its own graphs, the
+point-lookup regression floor, `MultiThreadedPointLookupTest`'s check that one thread per core across
+sixteen segments looks up more in aggregate than one thread, and 300 MB of embedded chunks ingested by eight writers into a store running
 in a 256 MB heap (`SplitHeapBoundBenchmarkTest`, which forks that JVM itself). It is a job of its own because it takes minutes, and a timing gate going red
 should not make the build look as though the code failed to compile or pass. Running it on a
 shared runner is sound because of what those tests assert: the recall and false-positive gates are
@@ -4215,16 +4266,19 @@ question, answered on a machine whose clock you trust.
 **Image.** Builds the container image from the repository's `Dockerfile`, as `docker build .`
 does, starts it with the bind address, plaintext opt-in and token the image needs to come up,
 waits for `/health/ready` and for Docker to report the container `healthy` from its own
-`HEALTHCHECK`, checks that an `excalibur-fsck --repair` run against the live volume is refused
-with exit `4`, and stops the node the way a scheduler would. An image that builds and never
+`HEALTHCHECK`, indexes a document through the authenticated `POST /v1/documents` so the volume
+holds what a node wrote rather than only what it creates on start, checks that an
+`excalibur-fsck --repair` against the live volume is refused with exit `4` and an
+`excalibur-backup snapshot` with exit `7`, and stops the node the way a scheduler would, which must
+leave a segment file and the lexical store on the volume. An image that builds and never
 reports ready or healthy fails here. Then it runs the container commands [In a
 container](#in-a-container) documents against the stopped node's volume: an `excalibur-fsck
 --repair` into a mounted quarantine volume, after planting a staged file for it to set aside — it
 must arrive in the quarantine and be gone from the data directory, which must then check clean —
 an `excalibur-backup snapshot` into a backup volume, verified `--deep` from a second container,
 and an `excalibur-backup restore` of that image both over the node's own volume with `--force`
-and into a fresh volume, each of which must then check clean and start a node that reports
-healthy.
+and into a fresh volume, each of which must then check clean and hold no restore scratch. A node
+started on the fresh volume must report healthy and stop cleanly.
 
 ## FAQ
 
@@ -4565,18 +4619,22 @@ the only thing that runs them, and `:<module>:benchmarkTest` runs one module's.
 
 **Can I depend on these modules from Maven?**
 Not from Maven Central — nothing is published there. `./gradlew publishToMavenLocal` installs the
-sixteen library modules into `~/.m2`. The five that stay out are not libraries: `excalibur-bench`
-is a JMH harness whose entry points are benchmark runs, `excalibur-integration` and
-`excalibur-test-bootstrap` are test modules with nothing an embedder would depend on, and
-`excalibur-fsck` and `excalibur-backup` are commands that run against a stopped data directory —
-build them with `installDist` rather than depending on them. A
+sixteen library modules into `~/.m2`. The six that stay out are not libraries: `excalibur-bench`
+is a benchmark and evaluation harness whose entry points are runs, `excalibur-integration` and
+`excalibur-test-bootstrap` are test modules with nothing an embedder would depend on,
+`excalibur-coverage` is the build's own coverage reporting, and `excalibur-fsck` and
+`excalibur-backup` are commands that run against a stopped data directory — build them with
+`installDist` rather than depending on them. A
 composite build is the better option while you are also changing ExcaliburDB — see
 [USAGE.md](USAGE.md#programmatic-usage-jvm-embedded).
 
 **Is the coverage number in the report the whole project?**
-The aggregate is. Per-module floors are enforced by `check`, and JMH's generated harness classes
-are excluded everywhere — they are machine-written and counting them measures code generation
-rather than testing.
+The aggregate is. Per-module floors are enforced by `check`, and three sets of classes are excluded
+everywhere: JMH's generated harness classes and anything under a `generated` package, which are
+machine-written, so counting them measures code generation rather than testing, and
+`excalibur-bench`'s hand-written `@Benchmark`, `@Setup` and `@State` classes in
+`com.eonmux.excalibur.bench.benchmark`, which only a benchmark run exercises. See
+[Test Coverage](#test-coverage).
 
 ## License
 

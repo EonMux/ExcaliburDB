@@ -145,7 +145,9 @@ COPY --from=build --chown=root:root \
 #
 # /var/lib/excalibur is a mount point in its root-owned parent, so it can be neither renamed
 # nor replaced; restore works inside it, under the directory's lock, journaling each step. A
-# volume a node is running on is refused (exit 7) by both, as by excalibur-fsck --repair (exit 4).
+# volume a node is running on is refused by both, as by excalibur-fsck --repair (exit 4): a
+# snapshot with exit 7, and a restore with exit 4 for a target that is not empty - checked
+# before the lock, and a running node's volume holds data - or with exit 7 under --force.
 COPY --from=build --chown=root:root \
      /workspace/excalibur-backup/build/install/excalibur-backup /opt/excalibur-backup
 ENV PATH="/opt/excalibur-fsck/bin:/opt/excalibur-backup/bin:${PATH}"
