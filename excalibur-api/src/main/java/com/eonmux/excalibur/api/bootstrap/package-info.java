@@ -4,6 +4,8 @@
  * <p>The pieces of process startup and shutdown that carry their own correctness
  * requirements, factored out of the application entry point so they can be tested:</p>
  * <ul>
+ *   <li>{@link com.eonmux.excalibur.api.bootstrap.NodeAssembly} - the one composition of a node
+ *       over a data directory, shared by the server and the embedded facade</li>
  *   <li>{@link com.eonmux.excalibur.api.bootstrap.StorageChunkWriter} - hash-routed chunk writes
  *       and the routed tombstone adapter</li>
  *   <li>{@link com.eonmux.excalibur.api.bootstrap.ReindexerFactory} - wiring for the document
