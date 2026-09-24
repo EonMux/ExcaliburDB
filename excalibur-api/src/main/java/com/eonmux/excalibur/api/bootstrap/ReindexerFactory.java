@@ -9,6 +9,7 @@ import com.eonmux.excalibur.ingest.pipeline.OffsetAwareStorageWriter;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
+import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.llm.client.LLMClientConfig;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.shard.allocator.VolumeManager;
@@ -31,6 +32,12 @@ import java.util.Objects;
  * <p>The lexical index is part of that. A reindex removes content a query could still be
  * matching, so a reindexer that wrote to storage alone would leave deleted documents answering
  * BM25 queries under identifiers whose chunks are gone.</p>
+ *
+ * <p>So is the document visibility tracker, and it has to be the one ingestion publishes through.
+ * A reindex rewrites a document's chunks in place, one at a time, and a query's tail scan reads
+ * each write as it lands; the tracker is what hides the document until the new version is
+ * published whole. A reindexer publishing on the epoch alone would let a query see part of each
+ * version.</p>
  *
  * <p>The embedding half is optional, because on many deployments it is simply not there. A node
  * with no embedding endpoint chunked, stored and term-indexed its corpus at ingestion; a reindex
@@ -82,7 +89,8 @@ public final class ReindexerFactory {
      * @param storageEngine      Storage engine chunks are written to and tombstoned in
      * @param volumeManager      Volume manager, enabling rolling replacement when present
      * @param indexOrchestrator  Orchestrator supplying the visibility tracker
-     * @param registry           Document registry shared with the ingestion pipeline
+     * @param documents          The document visibility tracker the ingestion pipeline
+     *                           publishes through, and through it the document registry
      * @param chunkIndex         Lexical index to keep in step with storage, or null for none
      * @return A configured reindexer
      * @throws NullPointerException if any required argument is null
@@ -91,12 +99,13 @@ public final class ReindexerFactory {
                                            StorageEngine storageEngine,
                                            VolumeManager volumeManager,
                                            IndexOrchestrator indexOrchestrator,
-                                           DocumentRegistry registry,
+                                           DocumentVisibilityTracker documents,
                                            ChunkIndex chunkIndex) {
         Objects.requireNonNull(config, "config cannot be null");
         Objects.requireNonNull(storageEngine, "storageEngine cannot be null");
         Objects.requireNonNull(indexOrchestrator, "indexOrchestrator cannot be null");
-        Objects.requireNonNull(registry, "registry cannot be null");
+        Objects.requireNonNull(documents, "documents cannot be null");
+        DocumentRegistry registry = documents.getRegistry();
 
         // The same sizing ingestion used. A reindex that chunked differently would republish
         // every document under chunk ids the original pass never wrote, leaving the corpus
@@ -113,10 +122,7 @@ public final class ReindexerFactory {
 
         OffsetAwareStorageWriter offsetWriter = new StorageChunkWriter(storageEngine);
 
-        DocumentBatchPublisher batchPublisher = new DocumentBatchPublisher(
-            indexOrchestrator.getVisibilityTracker(),
-            registry
-        );
+        DocumentBatchPublisher batchPublisher = new DocumentBatchPublisher(documents);
 
         boolean rollingReplacement = volumeManager != null && storageEngine.getCatalog() != null;
         DocumentReindexer reindexer;

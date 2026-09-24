@@ -239,7 +239,7 @@ public final class NodeAssembly {
         // After the server exists, because it is handed to the server, and after ingestion,
         // because it keeps the chunk index ingestion opened in step with what it rewrites.
         server.withReindexer(ReindexerFactory.create(config, core.storageEngine(),
-            core.volumeManager(), core.indexOrchestrator(), tracker.getRegistry(),
+            core.volumeManager(), core.indexOrchestrator(), tracker,
             ingestion.chunkIndex()));
         LOGGER.info("Document reindexer configured");
 
