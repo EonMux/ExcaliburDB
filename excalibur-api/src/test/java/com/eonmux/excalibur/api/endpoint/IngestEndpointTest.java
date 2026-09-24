@@ -1006,6 +1006,7 @@ class IngestEndpointTest {
             Response response = put(root, body(root, "docs"), null);
 
             assertThat(response.status()).isEqualTo(404);
+            assertThat(response.body()).contains("\"code\": \"source_not_found\"");
             assertThat(registry.getAllSourceIds()).isEmpty();
         }
 
@@ -1018,7 +1019,8 @@ class IngestEndpointTest {
             Response response = put(root, body(root, "docs"), "acme");
 
             assertThat(response.status()).isEqualTo(409);
-            assertThat(response.body()).contains("namespace");
+            assertThat(response.body()).contains("namespace")
+                .contains("\"code\": \"source_namespace_mismatch\"");
             assertThat(registry.get("docs")).isSameAs(original);
         }
 
@@ -1034,6 +1036,7 @@ class IngestEndpointTest {
             Response response = put(root, body(root, "docs"), null);
 
             assertThat(response.status()).isEqualTo(409);
+            assertThat(response.body()).contains("\"code\": \"source_busy\"");
             assertThat(registry.get("docs")).isSameAs(original);
         }
 

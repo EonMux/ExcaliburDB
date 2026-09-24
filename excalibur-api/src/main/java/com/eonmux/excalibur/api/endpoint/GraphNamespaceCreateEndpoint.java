@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 
+import com.eonmux.excalibur.api.audit.AuditLog;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.bootstrap.NamespaceRefusedException;
 import com.eonmux.excalibur.api.protocol.ErrorCode;
@@ -89,6 +90,7 @@ public class GraphNamespaceCreateEndpoint implements HttpHandler {
         // NamespaceId.of refuses the shared name so no tenant can claim it, and it is not a
         // malformed request: it names the one namespace that always exists.
         if (NamespaceId.SHARED.value().equals(requested)) {
+            AuditLog.target(exchange, "namespace", NamespaceId.SHARED.value());
             ResponseBody.sendJson(exchange, 200, body(NamespaceId.SHARED, false));
             return;
         }
@@ -96,6 +98,7 @@ public class GraphNamespaceCreateEndpoint implements HttpHandler {
         NamespaceId id;
         try {
             id = NamespaceId.of(requested);
+            AuditLog.target(exchange, "namespace", id.value());
         } catch (IllegalArgumentException e) {
             ResponseBody.sendError(exchange, 400, ErrorCode.INVALID_NAMESPACE, e.getMessage());
             return;

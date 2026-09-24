@@ -559,12 +559,16 @@ below, because new specific codes may be added.
 | `source_not_found` | 404 | No source is registered under that `source_id` |
 | `query_not_found` | 404 | No query in flight has that id |
 | `namespace_not_found` | 404 | No namespace by that name exists — including one that must be created with `PUT /v1/graph/namespaces/{namespace}` first |
-| `entity_not_found` | 404 | No entity in the namespace has that name or `entity_id` |
+| `entity_not_found` | 404 | No entity in the namespace has that name or `entity_id`, or the served graph holds no entity with that id |
+| `fact_not_found` | 404 | No asserted fact in the namespace has that `fact_id`, or states that subject, relation and object |
+| `erasure_not_found` | 404 | No erasure receipt or graph erasure request has that id - never issued, or older than the receipts kept |
 | `method_not_allowed` | 405 | The path exists and does not serve this method; the `Allow` header lists the ones it does |
 | `timeout` | 408, 504 | The work did not finish within the time it was given |
 | `conflict` | 409 | The request conflicts with the node's current state. The default for `409` |
 | `source_exists` | 409 | A source is already registered under that `source_id` |
 | `source_kind_conflict` | 409 | The `source_id` belongs to the other kind of source — a crawl versus documents supplied directly |
+| `source_busy` | 409 | `PUT /v1/ingest` while a crawl or re-index of the source is running; replace it once that ends |
+| `source_namespace_mismatch` | 409 | `PUT /v1/ingest` names a namespace other than the one the source was registered in |
 | `reindex_in_progress` | 409 | A re-index of that source is already running; poll its status instead |
 | `compaction_in_progress` | 409 | A compaction is already running |
 | `build_in_progress` | 409 | A graph build is already running |
@@ -992,14 +996,15 @@ now. The whole configuration is replaced, not merged — a setting left out of t
 to its default. `source_type` may change too; the next crawl then removes whatever the old
 configuration indexed that the new one does not find.
 
-**Error — `404 Not Found`** — no source is running under that id. A catalog record the node could
-not start at boot (`registered: false` on `GET /v1/ingest`) is not running either; register it
+**Error — `404 Not Found`** (`source_not_found`) — no source is running under that id. A catalog
+record the node could not start at boot (`registered: false` on `GET /v1/ingest`) is not running either; register it
 again with `POST`.
 
-**Error — `409 Conflict`** — a crawl or re-index of the source is running, and would carry on with
+**Error — `409 Conflict`** (`source_busy`) — a crawl or re-index of the source is running, and would carry on with
 the configuration it started with; send the replacement again once it has finished, or stop it —
-a crawl with `DELETE /v1/ingest/run`, a re-index with `DELETE /v1/reindex`. Also `409` when `X-Excalibur-Namespace` names a namespace other than
-the one the source was registered in: its documents' facts are already staged there, and moving a
+a crawl with `DELETE /v1/ingest/run`, a re-index with `DELETE /v1/reindex`. Also `409`
+(`source_namespace_mismatch`) when `X-Excalibur-Namespace` names a namespace other than the one the
+source was registered in: its documents' facts are already staged there, and moving a
 source is a deregistration and a new registration.
 
 **Error — `400 Bad Request`**, **`403 Forbidden`**, **`413 Payload Too Large`** — as for
@@ -2949,7 +2954,7 @@ limited, because the guard runs inside the audit and not before it. Reads are no
 | `compaction.start`, `compaction.cancel` | `POST`, `DELETE /v1/compact` |
 | `graph.build.start`, `graph.build.cancel` | `POST`, `DELETE /v1/graph/build` |
 | `graph.facts.assert`, `graph.facts.retract` | `POST /v1/graph/facts`, `DELETE /v1/graph/facts/{fact_id}` |
-| `graph.namespace.delete` | `DELETE /v1/graph/namespaces/{namespace}` |
+| `graph.namespace.create`, `graph.namespace.delete` | `PUT`, `DELETE /v1/graph/namespaces/{namespace}` |
 | `query.cancel` | `DELETE /v1/query/{query_id}` |
 | `node.drain`, `node.undrain` | `POST`, `DELETE /v1/drain` |
 

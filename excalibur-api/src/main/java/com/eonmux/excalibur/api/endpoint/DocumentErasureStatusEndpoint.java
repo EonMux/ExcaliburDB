@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
 import com.eonmux.excalibur.graph.erasure.ErasureLog;
@@ -121,9 +122,9 @@ public class DocumentErasureStatusEndpoint implements HttpHandler {
         }
         Optional<ErasureReceiptFile.Receipt> found = receipts.find(id);
         if (found.isEmpty()) {
-            ResponseBody.sendJson(exchange, 404, "{\"error\": \"No erasure request " + id
-                + " is known to this node; receipts are kept for the "
-                + ErasureReceiptFile.RETAINED_RECEIPTS + " most recent erasures\"}");
+            ResponseBody.sendError(exchange, 404, ErrorCode.ERASURE_NOT_FOUND,
+                "No erasure request " + id + " is known to this node; receipts are kept for "
+                    + "the " + ErasureReceiptFile.RETAINED_RECEIPTS + " most recent erasures");
             return;
         }
         String json;

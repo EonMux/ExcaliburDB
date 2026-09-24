@@ -120,7 +120,8 @@ class ExcaliburMcpServerTest {
                     McpTools.LIST_DOCUMENTS, McpTools.FETCH_DOCUMENTS, McpTools.LIST_NAMESPACES,
                     McpTools.CREATE_NAMESPACE, McpTools.LIST_QUERIES, McpTools.CANCEL_QUERY,
                     McpTools.CANCEL_INGESTION, McpTools.CANCEL_REINDEX, McpTools.CANCEL_COMPACTION,
-                    McpTools.CANCEL_GRAPH_BUILD, McpTools.ERASE_DOCUMENTS, McpTools.DELETE_NAMESPACE);
+                    McpTools.CANCEL_GRAPH_BUILD, McpTools.ERASE_DOCUMENTS, McpTools.DELETE_NAMESPACE,
+                    McpTools.READ_DOCUMENT, McpTools.ERASURE_STATUS);
         }
     }
 

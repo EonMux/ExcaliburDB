@@ -359,4 +359,95 @@ class GraphFactsEndpointTest {
             .as("the erased fact's id names nothing now")
             .isEqualTo(404);
     }
+
+    @Nested
+    @DisplayName("error codes")
+    class ErrorCodes {
+
+        @Test
+        @DisplayName("a malformed namespace is invalid_namespace on both methods")
+        void invalidNamespace() throws IOException {
+            GraphRouteFixture.Response asserted =
+                fixture.facts("POST", PATH, ADA_WORKED_WITH_BABBAGE, "Not A Namespace");
+            GraphRouteFixture.Response retracted =
+                fixture.facts("DELETE", PATH + "/1", "", "Not A Namespace");
+
+            assertThat(asserted.status()).isEqualTo(400);
+            assertThat(asserted.string("code")).isEqualTo("invalid_namespace");
+            assertThat(retracted.status()).isEqualTo(400);
+            assertThat(retracted.string("code")).isEqualTo("invalid_namespace");
+        }
+
+        @Test
+        @DisplayName("a malformed fact is invalid_request")
+        void malformedFact() throws IOException {
+            GraphRouteFixture.Response response = fixture.assertFacts("{\"subject\": \"Ada\"}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.string("code")).isEqualTo("invalid_request");
+        }
+
+        @Test
+        @DisplayName("nothing staged to retract is fact_not_found")
+        void nothingToRetract() throws IOException {
+            long worked = assertOne(ADA_WORKED_WITH_BABBAGE);
+
+            GraphRouteFixture.Response byId = fixture.retract(PATH + "/" + (worked + 1000));
+            GraphRouteFixture.Response byTriple = fixture.retract(PATH
+                + "?subject=Nobody&relation=worked_with&object=Charles%20Babbage");
+            GraphRouteFixture.Response elsewhere =
+                fixture.facts("DELETE", PATH + "/" + worked, "", "nobody-here");
+
+            for (GraphRouteFixture.Response response : List.of(byId, byTriple, elsewhere)) {
+                assertThat(response.status()).isEqualTo(404);
+                assertThat(response.string("code")).isEqualTo("fact_not_found");
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("namespace admission")
+    class Admission {
+
+        @Test
+        @DisplayName("with explicit creation required, a namespace nobody created is refused "
+            + "and nothing is written")
+        void explicitCreationIsRequired(@TempDir Path root) throws IOException {
+            fixture.close();
+            fixture = new GraphRouteFixture(root,
+                Map.of("excalibur.graph.require-explicit-namespaces", "true"));
+
+            GraphRouteFixture.Response refused =
+                fixture.assertFacts(ADA_WORKED_WITH_BABBAGE, "typo-tenant");
+
+            assertThat(refused.status()).isEqualTo(404);
+            assertThat(refused.string("code")).isEqualTo("namespace_not_found");
+            assertThat(fixture.tenants().namespacesOnDisk())
+                .doesNotContain(NamespaceId.of("typo-tenant"));
+
+            fixture.tenants().create(NamespaceId.of("typo-tenant"));
+            assertThat(fixture.assertFacts(ADA_WORKED_WITH_BABBAGE, "typo-tenant").status())
+                .isEqualTo(201);
+            assertThat(fixture.assertFacts(ADA_WORKED_WITH_BABBAGE).status())
+                .as("the shared namespace always exists")
+                .isEqualTo(201);
+        }
+
+        @Test
+        @DisplayName("past the namespace cap, asserting into a new namespace is refused")
+        void theCapHolds(@TempDir Path root) throws IOException {
+            fixture.close();
+            fixture = new GraphRouteFixture(root, Map.of("excalibur.graph.max-namespaces", "1"));
+
+            assertThat(fixture.assertFacts(ADA_WORKED_WITH_BABBAGE, "tenant-a").status())
+                .isEqualTo(201);
+            GraphRouteFixture.Response refused =
+                fixture.assertFacts(ADA_WORKED_WITH_BABBAGE, "tenant-b");
+
+            assertThat(refused.status()).isEqualTo(429);
+            assertThat(refused.string("code")).isEqualTo("namespace_limit_reached");
+            assertThat(fixture.tenants().namespacesOnDisk())
+                .doesNotContain(NamespaceId.of("tenant-b"));
+        }
+    }
 }

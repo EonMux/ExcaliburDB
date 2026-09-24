@@ -1,5 +1,9 @@
 package com.eonmux.excalibur.api.server;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import com.eonmux.excalibur.api.audit.AuditLog;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.config.Config;
@@ -15,6 +19,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.URI;
@@ -25,7 +30,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -126,6 +134,53 @@ class NamespaceCreationRoutesTest {
     }
 
     @Test
+    @DisplayName("asserting facts into a namespace nobody created is refused, and writes nothing")
+    void assertingFactsNeedsACreatedNamespace() throws Exception {
+        String fact = "{\"subject\": \"Ada Lovelace\", \"relation\": \"worked_with\", "
+            + "\"object\": \"Charles Babbage\"}";
+
+        HttpResponse<String> typo = send("POST", "/v1/graph/facts", "acmee", fact);
+
+        assertThat(typo.statusCode()).isEqualTo(404);
+        assertThat(typo.body()).contains("\"code\": \"namespace_not_found\"");
+        assertThat(root.resolve("graphs").resolve("acmee")).doesNotExist();
+
+        assertThat(send("PUT", "/v1/graph/namespaces/acme", null).statusCode()).isEqualTo(201);
+        assertThat(send("POST", "/v1/graph/facts", "acme", fact).statusCode()).isEqualTo(201);
+    }
+
+    @Test
+    @DisplayName("creating a namespace is audited as graph.namespace.create, naming it")
+    void creatingIsAudited() throws Exception {
+        Logger audit = (Logger) LoggerFactory.getLogger(AuditLog.LOGGER_NAME);
+        ListAppender<ILoggingEvent> events = new ListAppender<>();
+        events.start();
+        audit.addAppender(events);
+        try {
+            assertThat(send("PUT", "/v1/graph/namespaces/acme", null).statusCode())
+                .isEqualTo(201);
+
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            List<ILoggingEvent> seen;
+            do {
+                synchronized (events) {
+                    seen = List.copyOf(events.list);
+                }
+            } while (seen.isEmpty() && System.nanoTime() < deadline);
+
+            assertThat(seen).singleElement().satisfies(event -> {
+                Map<String, Object> pairs = event.getKeyValuePairs().stream()
+                    .collect(Collectors.toMap(pair -> pair.key, pair -> pair.value));
+                assertThat(pairs).containsEntry("audit_action", "graph.namespace.create")
+                    .containsEntry("audit_outcome", "success")
+                    .containsEntry("audit_targets", Map.of("namespace", "acme"));
+            });
+        } finally {
+            audit.detachAppender(events);
+        }
+    }
+
+    @Test
     @DisplayName("the listing pages through the query string")
     void theListingPages() throws Exception {
         send("PUT", "/v1/graph/namespaces/one", null);
@@ -156,10 +211,16 @@ class NamespaceCreationRoutesTest {
 
     private HttpResponse<String> send(String method, String path, String namespace)
             throws Exception {
+        return send(method, path, namespace, null);
+    }
+
+    private HttpResponse<String> send(String method, String path, String namespace,
+                                      String body) throws Exception {
         HttpRequest.Builder request = HttpRequest.newBuilder()
             .uri(URI.create("http://127.0.0.1:" + server.getPort() + path))
             .header("Authorization", "Bearer " + TOKEN)
-            .method(method, HttpRequest.BodyPublishers.noBody())
+            .method(method, body == null ? HttpRequest.BodyPublishers.noBody()
+                : HttpRequest.BodyPublishers.ofString(body))
             .timeout(Duration.ofSeconds(10));
         if (namespace != null) {
             request.header(GraphTenants.NAMESPACE_HEADER, namespace);

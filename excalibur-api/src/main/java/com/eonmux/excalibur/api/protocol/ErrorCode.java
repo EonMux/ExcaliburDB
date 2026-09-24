@@ -63,6 +63,10 @@ public enum ErrorCode {
     AMBIGUOUS_ENTITY("ambiguous_entity"),
     /** 404: no entity in the namespace matches the name or id. */
     ENTITY_NOT_FOUND("entity_not_found"),
+    /** 404: no asserted fact in the namespace has that id or states that triple. */
+    FACT_NOT_FOUND("fact_not_found"),
+    /** 404: no erasure request with that id is known, in that namespace or on this node. */
+    ERASURE_NOT_FOUND("erasure_not_found"),
     /** 409: a graph build is already running. */
     BUILD_IN_PROGRESS("build_in_progress"),
     /** 409: a compaction is already running. */

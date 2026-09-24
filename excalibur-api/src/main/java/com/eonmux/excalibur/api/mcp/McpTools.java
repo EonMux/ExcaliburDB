@@ -159,14 +159,21 @@ public final class McpTools {
     /** Stop the graph build in progress. */
     public static final String CANCEL_GRAPH_BUILD = "cancel_graph_build";
 
+    /** Read one document's chunks, in the order it was chunked. */
+    public static final String READ_DOCUMENT = "read_document";
+
+    /** Read back where an erasure stands. */
+    public static final String ERASURE_STATUS = "erasure_status";
+
     /** The argument a destructive tool requires, repeating what it destroys. */
     static final String CONFIRM = "confirm";
 
     /**
-     * What a query id looks like: the node issues UUIDs, and the id goes into a path, so nothing
-     * that could name another path segment is let through.
+     * What an id the node issued looks like - a query's, or an erasure's receipt. Both are UUIDs,
+     * and each goes into a path, so nothing that could name another path segment is let through.
      */
-    private static final Pattern QUERY_ID = Pattern.compile("[A-Za-z0-9-]{1,64}");
+    private static final Pattern ISSUED_ID = Pattern.compile("[A-Za-z0-9-]{1,64}");
+
     /** Find entities in the served graph by name, and learn their ids. */
     public static final String FIND_GRAPH_ENTITIES = "find_graph_entities";
 
@@ -644,16 +651,51 @@ public final class McpTools {
 
         tools.add(ToolSchema.tool(CREATE_NAMESPACE,
             "Create a graph namespace, before ingesting into it. A node configured to require "
-            + "explicit creation refuses to ingest into, build or record erasures in a "
-            + "namespace nobody created, with a 404 'namespace_not_found'; this is how one is "
-            + "created there. Elsewhere naming a namespace creates it, and this only does so "
-            + "ahead of time. Answers 201 when it created the namespace and 200 when it "
-            + "already existed. A 429 'namespace_limit_reached' means the node holds as many "
-            + "as it is allowed.",
+            + "explicit creation refuses to ingest into, build, assert facts into or record "
+            + "erasures in a namespace nobody created, with a 404 'namespace_not_found'; this "
+            + "is how one is created there. Elsewhere naming a namespace creates it, and this "
+            + "only does so ahead of time. Answers 201 when it created the namespace and 200 "
+            + "when it already existed. A 429 'namespace_limit_reached' means the node holds as "
+            + "many as it is allowed.",
             ToolSchema.object(
                 ToolSchema.required("namespace", "string",
                     "The namespace to create: lowercase letters, digits, '-' and '_', starting "
                     + "with a letter or digit, at most 64 characters."))));
+
+        tools.add(ToolSchema.tool(READ_DOCUMENT,
+            "Read one document whole: its chunks in the order it was chunked, each with its "
+            + "'position', 'chunk_id' and 'text', plus the document's 'chunk_count', length, "
+            + "hash and when it was indexed. Name it by the 'source_id' and 'document_id' "
+            + LIST_DOCUMENTS + " reports - a document id is unique only within its source. "
+            + "Pages by chunks: pass 'next_cursor' back as 'cursor' until it is null. "
+            + "'text_truncated' true means a chunk's text was clipped to the server's per-result "
+            + "limit. A 404 means the node holds no such document.",
+            ToolSchema.object(
+                ToolSchema.required("source_id", "string",
+                    "The source the document belongs to."),
+                ToolSchema.required("document_id", "string",
+                    "The document, as it was ingested under the source, e.g. 'guide.md'."),
+                ToolSchema.optional("include_text", "boolean",
+                    "Omit, or send true, for each chunk's text; false for the chunk ids alone, "
+                    + "which pages further.", null),
+                ToolSchema.optional("limit", "integer",
+                    "Most chunks per page. Omit for the server's default.", null),
+                ToolSchema.optional("cursor", "string",
+                    "The previous page's 'next_cursor', passed back unchanged. Omit for the "
+                    + "first page.", null))));
+
+        tools.add(ToolSchema.tool(ERASURE_STATUS,
+            "Read back where an erasure made by " + ERASE_DOCUMENTS + " stands, by the "
+            + "'request_id' its reply carried. 'state' is 'discharged' when every part the node "
+            + "tracks is done; 'applied' when nothing is searchable or served any more and the "
+            + "index has still to reclaim the space; 'pending' while the graph still owes "
+            + "withdrawals; 'incomplete' when some documents could not be removed and the "
+            + "erasure has to be repeated for them. 'remaining' says what is still owed. It "
+            + "names no documents. A 404 means the node keeps no receipt with that id - only "
+            + "the most recent erasures are kept.",
+            ToolSchema.object(
+                ToolSchema.required("request_id", "string",
+                    "The 'request_id' " + ERASE_DOCUMENTS + " answered with."))));
     }
 
     /**
@@ -730,7 +772,8 @@ public final class McpTools {
             + "also deregisters it and erases at most 1000 documents per call - repeat until "
             + "'documents_remaining' is 0. 'documents_not_found' counts ids the node never held. "
             + "A 202 means the corpus half is done and the graph half is still queued; "
-            + "'graph_erasure_complete' says when it is not.",
+            + "'graph_erasure_complete' says when it is not, and " + ERASURE_STATUS + " with "
+            + "the reply's 'request_id' says when it has finished.",
             ToolSchema.object(
                 ToolSchema.required("source_id", "string",
                     "The source the documents belong to."),
@@ -791,6 +834,8 @@ public final class McpTools {
                 case LIST_NAMESPACES -> listNamespaces(args);
                 case CREATE_NAMESPACE -> createNamespace(args);
                 case LIST_QUERIES -> answer(client.get("/v1/query/status", Map.of(), null));
+                case READ_DOCUMENT -> readDocument(args);
+                case ERASURE_STATUS -> erasureStatus(args);
                 case CANCEL_QUERY -> cancelQuery(args);
                 case CANCEL_INGESTION -> stopSource("/v1/ingest/run", args);
                 case CANCEL_REINDEX -> stopSource("/v1/reindex", args);
@@ -864,12 +909,45 @@ public final class McpTools {
 
     private ToolResult cancelQuery(Map<String, Object> args)
             throws IOException, InterruptedException {
-        String queryId = ToolArguments.requiredString(args, "query_id");
-        if (!QUERY_ID.matcher(queryId).matches()) {
-            throw new IllegalArgumentException("Argument 'query_id' is not a query id, got: "
-                + queryId + ". Use one list_queries reported.");
-        }
+        String queryId = issuedId(args, "query_id", LIST_QUERIES);
         return answer(client.delete("/v1/query/" + queryId, null));
+    }
+
+    private ToolResult readDocument(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        Map<String, String> query = new LinkedHashMap<>();
+        query.put("source_id", ToolArguments.requiredString(args, "source_id"));
+        query.put("document_id", ToolArguments.requiredString(args, "document_id"));
+        // On unless the model turns it off, for search_documents' reason: an id is nothing a
+        // model can read, so a read of a document that answered ids alone would answer nothing.
+        Boolean includeText = ToolArguments.optionalBoolean(args, "include_text");
+        query.put("include_text", String.valueOf(includeText == null || includeText));
+        query.putAll(page(args, null));
+        return answer(client.get("/v1/documents/list", query, null));
+    }
+
+    private ToolResult erasureStatus(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        String requestId = issuedId(args, "request_id", ERASE_DOCUMENTS);
+        return answer(client.get("/v1/erasure/" + requestId, Map.of(), null));
+    }
+
+    /**
+     * Reads an id the node issued, which the call puts into a path.
+     *
+     * @param args     The call's arguments
+     * @param field    The argument holding it
+     * @param issuedBy The tool whose reply carries it, for the message
+     * @return The id
+     * @throws IllegalArgumentException if it is absent or could name a different path
+     */
+    private static String issuedId(Map<String, Object> args, String field, String issuedBy) {
+        String id = ToolArguments.requiredString(args, field);
+        if (!ISSUED_ID.matcher(id).matches()) {
+            throw new IllegalArgumentException("Argument '" + field + "' is not an id the node "
+                + "issued, got: " + id + ". Use one " + issuedBy + " reported.");
+        }
+        return id;
     }
 
     /**

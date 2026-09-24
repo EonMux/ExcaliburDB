@@ -278,6 +278,82 @@ class McpParityToolsTest {
                 assertThat(result.text()).contains("\"created\": true");
             }
         }
+
+        @Test
+        @DisplayName("read_document reads one document's chunks with their text by default")
+        void readDocument() throws IOException {
+            try (StubNode node = StubNode.start()) {
+                McpTools tools = new McpTools(node.client(Map.of("EXCALIBUR_NAMESPACE", "acme")));
+
+                tools.call(McpTools.READ_DOCUMENT,
+                    Map.of("source_id", "my notes", "document_id", "guide.md"));
+                tools.call(McpTools.READ_DOCUMENT, Map.of("source_id", "notes",
+                    "document_id", "a.md", "include_text", false, "limit", 50,
+                    "cursor", "Y3Vyc29y"));
+
+                StubNode.Received first = node.requests().get(0);
+                assertThat(first.method()).isEqualTo("GET");
+                assertThat(first.path()).isEqualTo("/v1/documents/list");
+                assertThat(first.query())
+                    .isEqualTo("source_id=my notes&document_id=guide.md&include_text=true");
+                assertThat(first.headers()).doesNotContainKey(ExcaliburClient.NAMESPACE_HEADER);
+                assertThat(node.requests().get(1).query()).isEqualTo(
+                    "source_id=notes&document_id=a.md&include_text=false&limit=50"
+                        + "&cursor=Y3Vyc29y");
+                assertThat(required(McpTools.READ_DOCUMENT))
+                    .containsExactlyInAnyOrder("source_id", "document_id");
+            }
+        }
+
+        @Test
+        @DisplayName("read_document needs both the source and the document")
+        void readDocumentNeedsBoth() throws IOException {
+            try (StubNode node = StubNode.start()) {
+                McpTools tools = new McpTools(node.client(Map.of()));
+
+                assertThat(tools.call(McpTools.READ_DOCUMENT,
+                    Map.of("source_id", "notes")).isError()).isTrue();
+                assertThat(tools.call(McpTools.READ_DOCUMENT,
+                    Map.of("document_id", "a.md")).isError()).isTrue();
+                assertThat(node.requests()).isEmpty();
+            }
+        }
+
+        @Test
+        @DisplayName("erasure_status reads back the receipt erase_documents answered with")
+        void erasureStatus() throws IOException {
+            try (StubNode node = StubNode.start()) {
+                String id = "0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11";
+
+                new McpTools(node.client(Map.of("EXCALIBUR_NAMESPACE", "acme")))
+                    .call(McpTools.ERASURE_STATUS, Map.of("request_id", id));
+
+                StubNode.Received request = node.onlyRequest();
+                assertThat(request.method()).isEqualTo("GET");
+                assertThat(request.path()).isEqualTo("/v1/erasure/" + id);
+                assertThat(request.headers()).doesNotContainKey(ExcaliburClient.NAMESPACE_HEADER);
+                assertThat(required(McpTools.ERASURE_STATUS)).containsExactly("request_id");
+                assertThat(Json.stringAt(tool(McpTools.ERASURE_STATUS), "description"))
+                    .contains(McpTools.ERASE_DOCUMENTS);
+                assertThat(Json.stringAt(tool(McpTools.ERASE_DOCUMENTS), "description"))
+                    .contains(McpTools.ERASURE_STATUS);
+            }
+        }
+
+        @Test
+        @DisplayName("erasure_status refuses an id that could name another path")
+        void erasureStatusRefusesHostileIds() throws IOException {
+            try (StubNode node = StubNode.start()) {
+                McpTools tools = new McpTools(node.client(Map.of()));
+
+                for (String hostile : List.of("..", "../compact", "a/b", "a b", "x".repeat(65))) {
+                    assertThat(tools.call(McpTools.ERASURE_STATUS,
+                        Map.of("request_id", hostile)).isError()).as(hostile).isTrue();
+                }
+                assertThat(tools.call(McpTools.ERASURE_STATUS, Map.of()).isError()).isTrue();
+                assertThat(node.requests()).isEmpty();
+            }
+        }
     }
 
     @Nested

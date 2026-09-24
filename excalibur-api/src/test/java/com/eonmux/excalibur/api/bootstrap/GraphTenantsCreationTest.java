@@ -2,6 +2,9 @@ package com.eonmux.excalibur.api.bootstrap;
 
 import com.eonmux.excalibur.api.protocol.ErrorCode;
 import com.eonmux.excalibur.config.Config;
+import com.eonmux.excalibur.graph.provenance.Provenance;
+import com.eonmux.excalibur.graph.provenance.SourceType;
+import com.eonmux.excalibur.graph.staging.ExtractedTriple;
 import com.eonmux.excalibur.tenancy.MappingBudget;
 import com.eonmux.excalibur.tenancy.NamespaceId;
 import com.eonmux.excalibur.tenancy.NamespaceRegistry;
@@ -307,6 +310,48 @@ class GraphTenantsCreationTest {
                 .hasMessageContaining("cursor");
             assertThatThrownBy(() -> tenants.describeNamespaces(null, 0))
                 .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    @Nested
+    @DisplayName("the automatic build")
+    class AutomaticBuild {
+
+        @Test
+        @DisplayName("never creates a namespace, whatever the node allows")
+        void neverCreates() throws IOException {
+            open(Map.of("excalibur.graph.require-explicit-namespaces", "true",
+                "excalibur.graph.max-namespaces", "1"));
+            NamespaceId ghost = NamespaceId.of("ghost");
+
+            assertThat(tenants.freshness(ghost)).isNotNull();
+            assertThat(tenants.buildIfBehind(ghost, () -> false)).isEmpty();
+
+            assertThat(tenants.exists(ghost)).isFalse();
+            assertThat(tenants.namespacesOnDisk()).doesNotContain(ghost);
+            assertThat(root.resolve("ghost")).doesNotExist();
+            assertThat(tenants.create(NamespaceId.of("acme")))
+                .as("nothing it did counted against the cap")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("builds a namespace that exists even when the node is at its cap")
+        void buildsAtTheCap() throws IOException {
+            open(Map.of("excalibur.graph.require-explicit-namespaces", "true",
+                "excalibur.graph.max-namespaces", "1"));
+            NamespaceId acme = NamespaceId.of("acme");
+            tenants.create(acme);
+            try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(acme)) {
+                lease.resource().staging().append(ExtractedTriple.alwaysValid(
+                    "Ada Lovelace", "worked_with", "Charles Babbage",
+                    new Provenance(SourceType.DOCUMENT, 7, 90, 3)));
+                lease.resource().staging().flush();
+            }
+
+            assertThat(tenants.buildIfBehind(acme, () -> false)).isPresent();
+            assertThat(tenants.namespacesOnDisk()).containsExactlyInAnyOrder(
+                acme, NamespaceId.SHARED);
         }
     }
 }

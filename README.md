@@ -1636,8 +1636,9 @@ something a node should acquire by accident. Each namespace gets its own directo
 root: its own store, its own staged facts, its own erasure obligations.
 
 By default, naming a namespace that does not exist creates it — on `POST /v1/ingest`,
-`POST /v1/graph/build`, and a source- or extractor-scoped `POST /v1/graph/erasure`; a read or an
-entity erasure never creates one. That is convenient, and it is also how a typo in the header
+`POST /v1/graph/build`, `POST /v1/graph/facts`, and a source- or extractor-scoped
+`POST /v1/graph/erasure`; a read, a retraction, an entity erasure and the automatic build never
+create one. That is convenient, and it is also how a typo in the header
 becomes a tenant whose documents nobody finds. `excalibur.graph.require-explicit-namespaces=true`
 closes it: a namespace then exists only once `PUT /v1/graph/namespaces/{namespace}` has created it,
 and every route that would have created one answers a name nobody created with
@@ -1875,7 +1876,8 @@ or rate-limited attempt is on the record too. The actions are `source.register`,
 `source.deregister`, `ingest.cancel`, `documents.supply`, `reindex.start`, `reindex.cancel`,
 `erasure.documents`, `erasure.graph`, `compaction.start`, `compaction.cancel`,
 `graph.build.start`, `graph.build.cancel`, `graph.facts.assert`, `graph.facts.retract`,
-`graph.namespace.delete`, `query.cancel`, `node.drain` and `node.undrain`. Reads are not audited.
+`graph.namespace.create`, `graph.namespace.delete`, `query.cancel`, `node.drain` and
+`node.undrain`. Reads are not audited.
 
 Each event is a JSON line with the usual `timestamp` and these top-level fields:
 
@@ -2921,6 +2923,12 @@ malformed fact is a 400 naming it, and nothing in the request is staged.
 namespace's graph is next built, exactly as an extracted fact does — the edge store is rebuilt
 rather than appended to. The answer is 201 with `"served": false` and says so.
 
+Facts are staged into the namespace `X-Excalibur-Namespace` names, admitted as any other route
+admits one: with `excalibur.graph.require-explicit-namespaces` on, a namespace nobody created is
+refused with `404 namespace_not_found`, and one more than `excalibur.graph.max-namespaces` allows
+with `429 namespace_limit_reached`, before anything is staged. A retraction never creates a
+namespace, and one with nothing to retract is `404 fact_not_found`.
+
 Each fact is staged with `USER_ASSERTED` provenance whose source id is the fact id the answer
 returns. Fact ids rise, and are never handed out again — not after a retraction, not after an
 erasure of either entity, and not after a restart, even one with the clock set back. A fact id is
@@ -3002,6 +3010,7 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `search_documents` | **`query`**, `top_k`, `offset`, `timeout_ms`, `snippet`, `snippet_chars` | Searches the indexed documents and returns the matching passages, best first. `offset` pages past the first `top_k`, `timeout_ms` bounds how long the search may run, and `snippet` returns a window around the match (`snippet_chars` wide) instead of the whole chunk |
 | `list_documents` | `source_id`, `limit`, `cursor` | The documents the node holds, a page at a time, with each one's chunk ids |
 | `fetch_documents` | **`document_ids`** | The text of chunks by their ids, in the order asked; `null` for one the node no longer holds |
+| `read_document` | **`source_id`**, **`document_id`**, `include_text`, `limit`, `cursor` | One document whole, its chunks in order with their text unless `include_text` is `false` — `GET /v1/documents/list?document_id=` |
 | `list_queries` | | The searches running right now, with the id `cancel_query` takes |
 | `cancel_query` | **`query_id`** | Cancels a running search, which then answers with no results |
 | `cancel_ingestion` | **`source_id`** | Stops a source's ingestion run in flight; the source and its documents stay |
@@ -3014,6 +3023,7 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `create_namespace` | **`namespace`** | Creates a namespace — the only way to on a node with `excalibur.graph.require-explicit-namespaces` on |
 | `erase_documents` | **`source_id`**, `document_ids`, `scope`, `compact`, **`confirm`** | Permanently erases the named documents, or with `scope` `source` everything the source holds, from the corpus and the graph. `confirm` must repeat `source_id` |
 | `delete_namespace` | **`namespace`**, **`confirm`** | Permanently removes a namespace's graph, staged facts and erasure log. `confirm` must repeat `namespace` |
+| `erasure_status` | **`request_id`** | Where an `erase_documents` call stands — `pending`, `applied`, `discharged` or `incomplete` — by the `request_id` its reply carried; `GET /v1/erasure/{request_id}` |
 | `search_graph` | **`query`**, `context_entities`, `as_of`, `direction`, `namespace` | Asks the graph a question, optionally `as_of` a date, an instant or `all` of history, in one `direction`, and in a conversation: `context_entities` names what was mentioned, each with an optional grammatical shape and turn so a pronoun binds the right one |
 | `find_graph_entities` | `name`, `prefix`, `limit`, `cursor`, `namespace` | Finds entities in the served graph by exact name or prefix, ignoring case, with their ids and degrees — `GET /v1/graph/entities` |
 | `graph_entity_edges` | **`entity_id`**, `relation`, `direction`, `as_of`, `limit`, `cursor`, `namespace` | Lists one entity's facts with their intervals and provenance — `GET /v1/graph/entities/{id}/edges` |
@@ -3053,7 +3063,11 @@ differs, so a model cannot erase by filling in a plausible-looking argument it w
 Their descriptions say the call is irreversible and is to be made only when the user explicitly
 asked for it. `delete_namespace` never falls back on `EXCALIBUR_NAMESPACE`, and every namespace a
 tool puts in a path is checked against the node's naming rule first, so `..` or a `/` cannot turn
-it into a different route. Graph erasure (`POST /v1/graph/erasure`) stays operator-only.
+it into a different route; the ids `cancel_query` and `erasure_status` put in a path are held to
+the shape the node issues them in, for the same reason. Graph erasure (`POST /v1/graph/erasure`)
+and its read-back stay operator-only: its obligations come from graph erasures and fact
+retractions, neither of which is a tool, and the graph half of a document erasure is already in
+what `erasure_status` reports.
 
 The two searches are not alternatives. `search_documents` returns the passages that match and
 needs nothing but an ingestion run - the adapter asks the node for the text, because a model has

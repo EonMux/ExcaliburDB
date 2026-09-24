@@ -134,7 +134,39 @@ class RouteMethodSweepTest {
         assertThat(server.registeredPaths()).contains(
             "/health", "/health/ready", "/metrics", "/v1/stats", "/v1/query",
             "/v1/documents", "/v1/documents/list", "/v1/erasure", "/v1/ingest",
-            "/v1/graph/query", "/v1/graph/namespaces", "/v1/graph/build/status");
+            "/v1/graph/query", "/v1/graph/namespaces", "/v1/graph/build/status",
+            "/v1/graph/erasure", "/v1/graph/entities", "/v1/graph/facts");
+    }
+
+    @Test
+    @DisplayName("the collections and members that landed with the read-backs answer 405 too")
+    void theLandedRoutesRefuseBeforeAuthentication() throws Exception {
+        Map<String, String> allowByRequest = new LinkedHashMap<>();
+        allowByRequest.put("GET /v1/erasure", "POST");
+        allowByRequest.put("PUT /v1/erasure/receipt-1", "GET");
+        allowByRequest.put("GET /v1/graph/erasure", "POST");
+        allowByRequest.put("DELETE /v1/graph/erasure/5", "GET");
+        allowByRequest.put("GET /v1/graph/facts", "POST");
+        allowByRequest.put("POST /v1/graph/facts/7", "DELETE");
+        allowByRequest.put("DELETE /v1/graph/entities", "GET");
+        allowByRequest.put("POST /v1/graph/entities/1", "GET");
+        allowByRequest.put("DELETE /v1/graph/entities/1/edges", "GET");
+        allowByRequest.put("PATCH /v1/ingest", "DELETE, GET, POST, PUT");
+
+        for (Map.Entry<String, String> entry : allowByRequest.entrySet()) {
+            String[] request = entry.getKey().split(" ");
+            HttpResponse<String> response = anonymous(request[0], request[1]);
+            assertThat(response.statusCode()).as(entry.getKey()).isEqualTo(405);
+            assertThat(response.headers().firstValue("Allow")).as(entry.getKey())
+                .contains(entry.getValue());
+            assertCoded(request[0], request[1], response);
+        }
+        assertThat(anonymous("GET", "/v1/graph/entities/1/edges").statusCode())
+            .as("a served method on a deep entity path reaches authentication")
+            .isEqualTo(401);
+        assertThat(anonymous("DELETE", "/v1/graph/facts/7/again").statusCode())
+            .as("anything deeper than a member is not a route")
+            .isEqualTo(404);
     }
 
     @Test
