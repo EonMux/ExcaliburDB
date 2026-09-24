@@ -1506,8 +1506,12 @@ curl http://localhost:8080/v1/reindex/status
 
 `state` is one of `crawling`, `embedding`, `indexing` while a run is in flight, `idle` at
 `progress: 1.0` once it finished, `cancelled` when someone stopped it, or `failed` with
-`last_error` set when it broke — which means it failed on documents and neither indexed any nor
-confirmed any current. A document the source confirmed unchanged counts as work done, so a
+`last_error` set when it stopped without finishing: it failed on documents and neither indexed
+any nor confirmed any current, or it could not run at all — the source could no longer be found
+(`"Source not found: ..."`), no volume had room for the rolling replacement (`"No volume available
+for reindex"`), the run raised an exception (`"Reindex failed (<type>); see the node's log ..."`),
+or it could not be started (`"Reindex could not be started"`). A document the source confirmed
+unchanged counts as work done, so a
 re-crawl of a source that has barely moved, with one page timing out, has not failed. A run that
 indexed or confirmed some documents and failed on others finished, so it reads `idle`, with `last_error` counting what failed and what
 was indexed (`"Reindex completed with 3 errors; 400 documents indexed; see the node's log for the
@@ -2411,15 +2415,22 @@ Only on a node with no embedding client: BM25 is its only signal, and every perm
 concurrent BM25 search is taken. Retry with backoff. A node that also has vector search sheds the
 BM25 half instead and answers from vectors.
 
-**`503 Service Unavailable` — the query service is not available, or was interrupted**
+**`503 Service Unavailable` — the query service is not available**
 
 ```json
 {"error": "Query service is not available", "code": "unavailable"}
 ```
 
 The embedding came back unusable and BM25 could not answer in its place, or the node is not ready
-to search. `"Query interrupted"` is the same status for a request the node stopped while shutting
-down. Retry against a node that is up.
+to search. Retry against a node that is up.
+
+**`503 Service Unavailable` — the query was interrupted by shutdown**
+
+```json
+{"error": "Query interrupted", "code": "shutting_down"}
+```
+
+The node stopped the request while shutting down. Retry against another node.
 
 **`401 Unauthorized` — missing or wrong bearer token**
 

@@ -2562,9 +2562,11 @@ and `failed`, which the ingest status has no equivalent of. A run stopped throug
 parsing `state`: a stop that was asked for is not a crash, and reporting it as one sends an
 operator looking for a fault that is not there. `finished_at_ms` is when the run ended, `0`
 while one is still going, so how long it took and how stale its result is are both readable.
-A run is `failed` only when it failed on documents and neither indexed any nor confirmed any
-current; it leaves the old segments serving, and `last_error` says what kind of failure it was and
-how many documents it affected. A document the source confirmed unchanged counts as work done, so
+A run is `failed` when it stopped without finishing: it failed on documents and neither indexed
+any nor confirmed any current, or it could not run at all — the source could no longer be found,
+no volume had room for the rolling replacement, the run raised an exception, or it could not be
+started. It leaves the old segments serving, and `last_error` says what kind of failure it was and,
+for failed documents, how many it affected. A document the source confirmed unchanged counts as work done, so
 a re-crawl of a source that has barely moved, with one page timing out, is not a failed run. A run
 that indexed or confirmed some documents and failed on others did finish, and reads `idle` at `progress: 1.0` with
 `last_error` counting the failures and the documents indexed (`"Reindex completed with 3 errors;
