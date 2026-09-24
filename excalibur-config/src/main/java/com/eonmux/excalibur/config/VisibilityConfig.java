@@ -46,26 +46,6 @@ public final class VisibilityConfig {
     }
 
     /**
-     * Gets the visibility epoch number.
-     *
-     * @return Current epoch number
-     */
-    public long getEpoch() {
-        return System.currentTimeMillis() / epochTickMs;
-    }
-
-    /**
-     * Gets the time until the next epoch tick in milliseconds.
-     *
-     * @return Time remaining until next epoch
-     */
-    public long timeUntilEpochTick() {
-        long now = System.currentTimeMillis();
-        long elapsed = now % epochTickMs;
-        return epochTickMs - elapsed;
-    }
-
-    /**
      * Gets the query timeout in milliseconds.
      *
      * @return Query timeout in milliseconds

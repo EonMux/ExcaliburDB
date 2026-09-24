@@ -40,9 +40,8 @@ public final class Config {
     private final ShardConfig shard;
     private final GraphConfig graph;
 
-    // Application settings - final for immutability
+    /** Where the settings were read from; reported by {@link #toString()}. */
     private final String configPath;
-    private final Map<String, String> envOverrides;
 
     /** The file's properties with the environment applied; see {@link #getEffectiveProperties()}. */
     private final Map<String, String> effectiveProperties;
@@ -81,13 +80,10 @@ public final class Config {
      */
     public Config(String configPath, Map<String, String> envOverrides, Map<String, String> props) {
         this.configPath = Objects.requireNonNull(configPath, "configPath cannot be null");
-        this.envOverrides = Collections.unmodifiableMap(
-            new HashMap<>(envOverrides != null ? envOverrides : Collections.emptyMap())
-        );
-
         // Initialize configuration sections with the file values overlaid by the
         // environment, so no construction path can silently discard an override.
-        Map<String, String> effectiveProps = EnvOverrides.apply(props, this.envOverrides);
+        Map<String, String> effectiveProps = EnvOverrides.apply(props,
+            envOverrides != null ? envOverrides : Collections.emptyMap());
         this.effectiveProperties = Collections.unmodifiableMap(new HashMap<>(effectiveProps));
         this.visibility = new VisibilityConfig(effectiveProps);
         this.ingest = new IngestConfig(effectiveProps);
@@ -148,13 +144,6 @@ public final class Config {
     }
 
     /**
-     * Gets the path to the configuration file.
-     */
-    public String getConfigPath() {
-        return configPath;
-    }
-
-    /**
      * Every property in effect: the file's values with {@code EXCALIBUR_*} overrides applied.
      *
      * <p>The typed sections below cover what this module knows about, but a module that owns its
@@ -168,16 +157,6 @@ public final class Config {
      */
     public Map<String, String> getEffectiveProperties() {
         return effectiveProperties;
-    }
-
-    /**
-     * Gets the environment variable overrides applied to configuration.
-     *
-     * @return an unmodifiable view of the {@code EXCALIBUR_*} variables this Config was built
-     *         with, keyed by variable name
-     */
-    public Map<String, String> getEnvOverrides() {
-        return envOverrides;
     }
 
     @Override
@@ -197,8 +176,8 @@ public final class Config {
     /**
      * Compares two configurations by the settings they carry.
      *
-     * <p>The seven sections are the value; {@code configPath}, the environment overrides and
-     * the effective property map are how this instance came to hold them. Two nodes given the
+     * <p>The seven sections are the value; {@code configPath} and the effective property map
+     * are how this instance came to hold them. Two nodes given the
      * same settings are configured the same way whether one read a file and the other read the
      * environment, so provenance is deliberately left out of the comparison.</p>
      *
