@@ -43,6 +43,13 @@ public final class ConfigKeys {
      * nothing - an operator who acts on it deletes the line.</p>
      */
     private static final Set<String> KNOWN = Set.of(
+        "excalibur.graph.auto-build-debounce-seconds",
+        "excalibur.graph.auto-build-enabled",
+        "excalibur.graph.auto-build-failure-backoff-seconds",
+        "excalibur.graph.auto-build-interval-seconds",
+        "excalibur.graph.auto-build-max-concurrent",
+        "excalibur.graph.auto-build-max-delay-seconds",
+        "excalibur.graph.auto-build-max-failure-backoff-seconds",
         "excalibur.graph.cold-namespaces",
         "excalibur.graph.context-token-budget",
         "excalibur.graph.entity-vectors-enabled",

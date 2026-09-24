@@ -222,6 +222,86 @@ class ConfigGraphTest {
     }
 
     @Nested
+    @DisplayName("Automatic build")
+    class AutomaticBuild {
+
+        @Test
+        @DisplayName("on by default, debounced, one namespace at a time, backing off on failure")
+        void defaults() {
+            GraphConfig graph = graph(Map.of());
+
+            assertThat(graph.isAutoBuildEnabled()).isTrue();
+            assertThat(graph.getAutoBuildIntervalSeconds())
+                .isEqualTo(GraphConfig.DEFAULT_AUTO_BUILD_INTERVAL_SECONDS);
+            assertThat(graph.getAutoBuildDebounceSeconds())
+                .isEqualTo(GraphConfig.DEFAULT_AUTO_BUILD_DEBOUNCE_SECONDS);
+            assertThat(graph.getAutoBuildMaxDelaySeconds())
+                .isEqualTo(GraphConfig.DEFAULT_AUTO_BUILD_MAX_DELAY_SECONDS);
+            assertThat(graph.getAutoBuildMaxConcurrent()).isOne();
+            assertThat(graph.getAutoBuildFailureBackoffSeconds())
+                .isEqualTo(GraphConfig.DEFAULT_AUTO_BUILD_FAILURE_BACKOFF_SECONDS);
+            assertThat(graph.getAutoBuildMaxFailureBackoffSeconds())
+                .isEqualTo(GraphConfig.DEFAULT_AUTO_BUILD_MAX_FAILURE_BACKOFF_SECONDS);
+        }
+
+        @Test
+        @DisplayName("every setting is read")
+        void explicitValues() {
+            GraphConfig graph = graph(Map.of(
+                "excalibur.graph.auto-build-enabled", "false",
+                "excalibur.graph.auto-build-interval-seconds", "5",
+                "excalibur.graph.auto-build-debounce-seconds", "0",
+                "excalibur.graph.auto-build-max-delay-seconds", "120",
+                "excalibur.graph.auto-build-max-concurrent", "3",
+                "excalibur.graph.auto-build-failure-backoff-seconds", "10",
+                "excalibur.graph.auto-build-max-failure-backoff-seconds", "600"));
+
+            assertThat(graph.isAutoBuildEnabled()).isFalse();
+            assertThat(graph.getAutoBuildIntervalSeconds()).isEqualTo(5);
+            assertThat(graph.getAutoBuildDebounceSeconds()).isZero();
+            assertThat(graph.getAutoBuildMaxDelaySeconds()).isEqualTo(120);
+            assertThat(graph.getAutoBuildMaxConcurrent()).isEqualTo(3);
+            assertThat(graph.getAutoBuildFailureBackoffSeconds()).isEqualTo(10);
+            assertThat(graph.getAutoBuildMaxFailureBackoffSeconds()).isEqualTo(600);
+        }
+
+        @Test
+        @DisplayName("values that cannot schedule anything are refused")
+        void refusals() {
+            assertThatThrownBy(() -> graph(Map.of(
+                "excalibur.graph.auto-build-interval-seconds", "0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("auto-build-interval-seconds");
+            assertThatThrownBy(() -> graph(Map.of(
+                "excalibur.graph.auto-build-debounce-seconds", "-1")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("auto-build-debounce-seconds");
+            assertThatThrownBy(() -> graph(Map.of(
+                "excalibur.graph.auto-build-max-delay-seconds", "0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("auto-build-max-delay-seconds");
+            assertThatThrownBy(() -> graph(Map.of(
+                "excalibur.graph.auto-build-max-concurrent", "0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("auto-build-max-concurrent");
+            assertThatThrownBy(() -> graph(Map.of(
+                "excalibur.graph.auto-build-failure-backoff-seconds", "0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("auto-build-failure-backoff-seconds");
+        }
+
+        @Test
+        @DisplayName("a backoff ceiling below its first step is refused")
+        void ceilingBelowFirstStep() {
+            assertThatThrownBy(() -> graph(Map.of(
+                "excalibur.graph.auto-build-failure-backoff-seconds", "60",
+                "excalibur.graph.auto-build-max-failure-backoff-seconds", "30")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("auto-build-max-failure-backoff-seconds");
+        }
+    }
+
+    @Nested
     @DisplayName("Identity")
     class Identity {
 
@@ -242,17 +322,22 @@ class ConfigGraphTest {
             // Equality is what tells a caller two configurations are the same configuration.
             // A field left out of it says "identical" about sections that would run differently.
             Map<String, String> base = Map.of("excalibur.graph.top-k", "7");
-            Map<String, String> keys = Map.of(
-                "excalibur.graph.path", "/srv/graph",
-                "excalibur.graph.extraction-enabled", "true",
-                "excalibur.graph.extractor-version", "3",
-                "excalibur.graph.entity-vectors-enabled", "false",
-                "excalibur.graph.single-valued-relations", "employed-by",
-                "excalibur.graph.hot-namespaces", "vip",
-                "excalibur.graph.cold-namespaces", "bulk-import",
-                "excalibur.graph.max-open-namespaces", "32",
-                "excalibur.graph.erasure-tombstone-ratio", "0.4",
-                "excalibur.graph.erasure-max-latency-seconds", "600");
+            Map<String, String> keys = Map.ofEntries(
+                Map.entry("excalibur.graph.path", "/srv/graph"),
+                Map.entry("excalibur.graph.extraction-enabled", "true"),
+                Map.entry("excalibur.graph.extractor-version", "3"),
+                Map.entry("excalibur.graph.entity-vectors-enabled", "false"),
+                Map.entry("excalibur.graph.single-valued-relations", "employed-by"),
+                Map.entry("excalibur.graph.hot-namespaces", "vip"),
+                Map.entry("excalibur.graph.cold-namespaces", "bulk-import"),
+                Map.entry("excalibur.graph.max-open-namespaces", "32"),
+                Map.entry("excalibur.graph.erasure-tombstone-ratio", "0.4"),
+                Map.entry("excalibur.graph.erasure-max-latency-seconds", "600"),
+                Map.entry("excalibur.graph.auto-build-enabled", "false"),
+                Map.entry("excalibur.graph.auto-build-interval-seconds", "5"),
+                Map.entry("excalibur.graph.auto-build-debounce-seconds", "5"),
+                Map.entry("excalibur.graph.auto-build-max-delay-seconds", "60"),
+                Map.entry("excalibur.graph.auto-build-max-concurrent", "2"));
 
             keys.forEach((key, value) -> {
                 Map<String, String> changed = new HashMap<>(base);

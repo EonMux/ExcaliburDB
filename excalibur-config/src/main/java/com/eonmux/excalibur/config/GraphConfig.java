@@ -126,6 +126,44 @@ public final class GraphConfig {
      */
     public static final long DEFAULT_ERASURE_MAX_LATENCY_SECONDS = 3600L;
 
+    /**
+     * Whether the node rebuilds a namespace's graph by itself once its staging has changed.
+     *
+     * <p>On, because a graph that only an explicit build brings up to date goes on answering
+     * with the facts of documents a crawl has since replaced or removed, while the chunk index
+     * beside it already reflects the change.</p>
+     */
+    public static final boolean DEFAULT_AUTO_BUILD_ENABLED = true;
+
+    /** How often the node looks for namespaces whose graph is behind their staging. */
+    public static final long DEFAULT_AUTO_BUILD_INTERVAL_SECONDS = 30L;
+
+    /**
+     * How long staging must have been quiet before a namespace is rebuilt.
+     *
+     * <p>A build is proportional to the whole graph, so rebuilding after every document of a
+     * crawl would spend the node rebuilding rather than ingesting. A minute of quiet lets a crawl
+     * finish, or a burst of edits settle, before the one build that publishes all of it.</p>
+     */
+    public static final long DEFAULT_AUTO_BUILD_DEBOUNCE_SECONDS = 60L;
+
+    /**
+     * Longest a staged change waits for a build, however busy staging stays.
+     *
+     * <p>The bound on how long a replaced or removed document's facts go on being served while
+     * ingestion never pauses long enough for the debounce to elapse.</p>
+     */
+    public static final long DEFAULT_AUTO_BUILD_MAX_DELAY_SECONDS = 900L;
+
+    /** How many namespaces may be rebuilt automatically at once. */
+    public static final int DEFAULT_AUTO_BUILD_MAX_CONCURRENT = 1;
+
+    /** How long an automatic build that failed waits before the next attempt, doubling each time. */
+    public static final long DEFAULT_AUTO_BUILD_FAILURE_BACKOFF_SECONDS = 60L;
+
+    /** The longest the wait after repeated failures grows to. */
+    public static final long DEFAULT_AUTO_BUILD_MAX_FAILURE_BACKOFF_SECONDS = 3600L;
+
     private final String path;
     private final double minScore;
     private final double minSeparation;
@@ -145,6 +183,13 @@ public final class GraphConfig {
     private final List<String> coldNamespaces;
     private final double erasureTombstoneRatio;
     private final long erasureMaxLatencySeconds;
+    private final boolean autoBuildEnabled;
+    private final long autoBuildIntervalSeconds;
+    private final long autoBuildDebounceSeconds;
+    private final long autoBuildMaxDelaySeconds;
+    private final int autoBuildMaxConcurrent;
+    private final long autoBuildFailureBackoffSeconds;
+    private final long autoBuildMaxFailureBackoffSeconds;
 
     /**
      * Creates a Graph config from properties.
@@ -173,6 +218,30 @@ public final class GraphConfig {
                 "excalibur.graph.erasure-max-latency-seconds must be positive, got: "
                     + erasureMaxLatencySeconds);
         }
+        this.autoBuildEnabled = PropertyParser.parseBoolean(
+            props, "excalibur.graph.auto-build-enabled", DEFAULT_AUTO_BUILD_ENABLED);
+        this.autoBuildIntervalSeconds = ConfigBounds.atLeastLong(
+            props, "excalibur.graph.auto-build-interval-seconds",
+            DEFAULT_AUTO_BUILD_INTERVAL_SECONDS, 1);
+        // Zero is meaningful: rebuild at the first look after a change.
+        this.autoBuildDebounceSeconds = ConfigBounds.atLeastLong(
+            props, "excalibur.graph.auto-build-debounce-seconds",
+            DEFAULT_AUTO_BUILD_DEBOUNCE_SECONDS, 0);
+        this.autoBuildMaxDelaySeconds = ConfigBounds.atLeastLong(
+            props, "excalibur.graph.auto-build-max-delay-seconds",
+            DEFAULT_AUTO_BUILD_MAX_DELAY_SECONDS, 1);
+        this.autoBuildMaxConcurrent = ConfigBounds.atLeast(
+            props, "excalibur.graph.auto-build-max-concurrent",
+            DEFAULT_AUTO_BUILD_MAX_CONCURRENT, 1);
+        this.autoBuildFailureBackoffSeconds = ConfigBounds.atLeastLong(
+            props, "excalibur.graph.auto-build-failure-backoff-seconds",
+            DEFAULT_AUTO_BUILD_FAILURE_BACKOFF_SECONDS, 1);
+        // At least the first step, or the doubling would start above its own ceiling.
+        this.autoBuildMaxFailureBackoffSeconds = ConfigBounds.atLeastLong(
+            props, "excalibur.graph.auto-build-max-failure-backoff-seconds",
+            Math.max(DEFAULT_AUTO_BUILD_MAX_FAILURE_BACKOFF_SECONDS,
+                autoBuildFailureBackoffSeconds),
+            autoBuildFailureBackoffSeconds);
         if (extractorVersion < Short.MIN_VALUE || extractorVersion > Short.MAX_VALUE) {
             throw new IllegalArgumentException(
                 "excalibur.graph.extractor-version must fit in a short, got "
@@ -381,6 +450,69 @@ public final class GraphConfig {
     }
 
     /**
+     * Whether the node rebuilds a namespace's graph by itself once its staging has changed.
+     *
+     * @return true when stale graphs are rebuilt automatically
+     */
+    public boolean isAutoBuildEnabled() {
+        return autoBuildEnabled;
+    }
+
+    /**
+     * How often the node looks for graphs behind their staging.
+     *
+     * @return The interval in seconds, at least 1
+     */
+    public long getAutoBuildIntervalSeconds() {
+        return autoBuildIntervalSeconds;
+    }
+
+    /**
+     * How long staging must have been quiet before its graph is rebuilt.
+     *
+     * @return The quiet period in seconds, zero to rebuild at the first look
+     */
+    public long getAutoBuildDebounceSeconds() {
+        return autoBuildDebounceSeconds;
+    }
+
+    /**
+     * Longest a staged change waits for a build, however busy staging stays.
+     *
+     * @return The bound in seconds, at least 1
+     */
+    public long getAutoBuildMaxDelaySeconds() {
+        return autoBuildMaxDelaySeconds;
+    }
+
+    /**
+     * How many namespaces may be rebuilt automatically at once.
+     *
+     * @return The bound, at least 1
+     */
+    public int getAutoBuildMaxConcurrent() {
+        return autoBuildMaxConcurrent;
+    }
+
+    /**
+     * How long a namespace whose automatic build failed waits before the next attempt.
+     *
+     * @return The first wait in seconds; each further failure doubles it
+     */
+    public long getAutoBuildFailureBackoffSeconds() {
+        return autoBuildFailureBackoffSeconds;
+    }
+
+    /**
+     * The longest the wait after repeated automatic build failures grows to.
+     *
+     * @return The ceiling in seconds, at least the first wait
+     */
+    public long getAutoBuildMaxFailureBackoffSeconds() {
+        return autoBuildMaxFailureBackoffSeconds;
+    }
+
+    /**
      * Whether ingestion extracts facts from the documents it publishes.
      *
      * @return true when each ingested document is passed to the chat model for extraction
@@ -439,6 +571,13 @@ public final class GraphConfig {
             && maxOpenNamespaces == other.maxOpenNamespaces
             && Double.compare(erasureTombstoneRatio, other.erasureTombstoneRatio) == 0
             && erasureMaxLatencySeconds == other.erasureMaxLatencySeconds
+            && autoBuildEnabled == other.autoBuildEnabled
+            && autoBuildIntervalSeconds == other.autoBuildIntervalSeconds
+            && autoBuildDebounceSeconds == other.autoBuildDebounceSeconds
+            && autoBuildMaxDelaySeconds == other.autoBuildMaxDelaySeconds
+            && autoBuildMaxConcurrent == other.autoBuildMaxConcurrent
+            && autoBuildFailureBackoffSeconds == other.autoBuildFailureBackoffSeconds
+            && autoBuildMaxFailureBackoffSeconds == other.autoBuildMaxFailureBackoffSeconds
             && Objects.equals(singleValuedRelations, other.singleValuedRelations)
             && Objects.equals(hotNamespaces, other.hotNamespaces)
             && Objects.equals(coldNamespaces, other.coldNamespaces)
@@ -452,6 +591,8 @@ public final class GraphConfig {
             maxAmbiguousCandidates, contextTokenBudget, topK, rerankOverFetch, ramBufferMb,
             extractionEnabled, extractorVersion, entityVectorsEnabled, maxOpenNamespaces,
             erasureTombstoneRatio, erasureMaxLatencySeconds, singleValuedRelations,
-            hotNamespaces, coldNamespaces);
+            hotNamespaces, coldNamespaces, autoBuildEnabled, autoBuildIntervalSeconds,
+            autoBuildDebounceSeconds, autoBuildMaxDelaySeconds, autoBuildMaxConcurrent,
+            autoBuildFailureBackoffSeconds, autoBuildMaxFailureBackoffSeconds);
     }
 }
