@@ -91,6 +91,22 @@ class TenantedGraphRouteTest {
     }
 
     @Test
+    @DisplayName("an erasure request reads back by its id, and the collection still refuses GET")
+    void erasureStatusIsRouted() throws IOException {
+        Response accepted = send("POST", "/v1/graph/erasure",
+            "{\"scope\":\"source\",\"source_type\":\"DOCUMENT\",\"source_id\":1}");
+        String id = accepted.body().replaceAll("(?s).*\"request_id\": (\\d+).*", "$1");
+
+        Response status = send("GET", "/v1/graph/erasure/" + id, null);
+
+        assertThat(status.status()).isEqualTo(200);
+        assertThat(status.body()).contains("\"state\": \"pending\"");
+        assertThat(send("GET", "/v1/graph/erasure", null).status()).isEqualTo(405);
+        assertThat(send("POST", "/v1/graph/erasure/" + id, "{}").status()).isEqualTo(405);
+        assertThat(send("GET", "/v1/graph/erasure/424242", null).status()).isEqualTo(404);
+    }
+
+    @Test
     @DisplayName("the namespace inventory names the shared namespace")
     void theInventoryNamesShared() throws IOException {
         Response response = send("GET", "/v1/graph/namespaces", null);

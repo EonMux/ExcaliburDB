@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.bootstrap;
 import com.eonmux.excalibur.ingest.graph.LlmRelationExtractor;
 import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.graph.erasure.EdgeStoreCompactor;
+import com.eonmux.excalibur.graph.erasure.ErasureLog;
 import com.eonmux.excalibur.graph.erasure.ErasureScope;
 import com.eonmux.excalibur.graph.erasure.GraphErasureCoordinator;
 import com.eonmux.excalibur.graph.file.Durability;
@@ -16,9 +17,11 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -247,21 +250,28 @@ public final class GraphErasureService {
      * @param withheld   How many it deliberately left outstanding as not yet reachable
      * @param outstanding How many obligations the node still owes in this namespace
      * @param compacted  Whether the served graph was actually rewritten
-     * @param complete   Whether the obligations submitted here can be said to be discharged.
-     *                   False whenever the pass withheld anything or discharged fewer than were
-     *                   submitted, because the coordinator's counts cannot be attributed to
-     *                   individual requests and reporting an erasure that did not happen is the
-     *                   worse of the two errors
+     * @param complete   Whether every obligation submitted here is discharged, read back from
+     *                   the log request by request rather than inferred from the pass's counts,
+     *                   which cover everything the namespace owed and not only these
      * @param detail     Why the compaction ran, or why it did not
+     * @param requestIds The ids of the obligations submitted here, in the namespace's own log,
+     *                   so that where each one stands can be asked later
      */
     public record DocumentGraphOutcome(int submitted, int satisfied, int withheld,
                                        int outstanding, boolean compacted, boolean complete,
-                                       String detail) {
+                                       String detail, List<Long> requestIds) {
+
+        /** @throws NullPointerException if {@code detail} or {@code requestIds} is null */
+        public DocumentGraphOutcome {
+            Objects.requireNonNull(detail, "detail must not be null");
+            requestIds = List.copyOf(requestIds);
+        }
 
         /** What a node serving no graph reports: nothing was extracted into one. */
         public static final DocumentGraphOutcome NO_GRAPH = new DocumentGraphOutcome(
             0, 0, 0, 0, false, true,
-            "this node serves no graph, so nothing was extracted from these documents into one");
+            "this node serves no graph, so nothing was extracted from these documents into one",
+            List.of());
 
         /**
          * What a node with a graph but nothing to withdraw reports.
@@ -270,7 +280,7 @@ public final class GraphErasureService {
          * @return An outcome that submitted nothing and owes nothing
          */
         public static DocumentGraphOutcome none(String detail) {
-            return new DocumentGraphOutcome(0, 0, 0, 0, false, true, detail);
+            return new DocumentGraphOutcome(0, 0, 0, 0, false, true, detail, List.of());
         }
 
         /**
@@ -298,7 +308,9 @@ public final class GraphErasureService {
             boolean compacted = false;
             boolean complete = true;
             StringBuilder detail = new StringBuilder();
+            List<Long> requestIds = new ArrayList<>();
             for (DocumentGraphOutcome part : parts) {
+                requestIds.addAll(part.requestIds());
                 submitted += part.submitted();
                 satisfied += part.satisfied();
                 withheld += part.withheld();
@@ -311,7 +323,7 @@ public final class GraphErasureService {
                 detail.append(part.detail());
             }
             return new DocumentGraphOutcome(submitted, satisfied, withheld, outstanding,
-                compacted, complete, detail.toString());
+                compacted, complete, detail.toString(), requestIds);
         }
     }
 
@@ -345,15 +357,15 @@ public final class GraphErasureService {
             return DocumentGraphOutcome.none(
                 "no document was erased, so the graph holds nothing more of one");
         }
+        List<Long> requestIds = new ArrayList<>(documentKeys.size());
         for (String documentKey : List.copyOf(documentKeys)) {
-            submit(new ErasureScope.Source(SourceType.DOCUMENT,
-                LlmRelationExtractor.sourceIdOf(documentKey)));
+            requestIds.add(submit(new ErasureScope.Source(SourceType.DOCUMENT,
+                LlmRelationExtractor.sourceIdOf(documentKey))));
         }
 
         ErasureOutcome outcome = compactNow ? compactNow() : compactIfDue();
         int submitted = documentKeys.size();
-        boolean complete = outcome.requestsWithheld() == 0
-            && outcome.requestsSatisfied() >= submitted;
+        boolean complete = allDischarged(requestIds);
         if (!complete) {
             LOGGER.info("{} document(s) withdrawn from the corpus and still owed by the graph: "
                 + "{} obligation(s) outstanding after {}", submitted, outstandingCount(),
@@ -361,8 +373,27 @@ public final class GraphErasureService {
         }
         return new DocumentGraphOutcome(submitted, outcome.requestsSatisfied(),
             outcome.requestsWithheld(), outstandingCount(), outcome.ran(), complete,
-            outcome.reason());
+            outcome.reason(), requestIds);
     }
+
+    /**
+     * Whether every one of these obligations has been discharged.
+     *
+     * @param requestIds Ids this namespace handed out
+     * @return true when none of them is still owed
+     */
+    private boolean allDischarged(List<Long> requestIds) {
+        for (long id : requestIds) {
+            boolean discharged = status(id)
+                .map(status -> status.state() == ErasureLog.State.DISCHARGED)
+                .orElse(false);
+            if (!discharged) {
+                return false;
+            }
+        }
+        return true;
+    }
+
 
     /**
      * Runs a compaction if the policy says one is due.
@@ -499,6 +530,16 @@ public final class GraphErasureService {
      */
     public com.eonmux.excalibur.graph.erasure.ErasureLog.Pending pending() {
         return coordinator.pending();
+    }
+
+    /**
+     * Where one obligation stands.
+     *
+     * @param requestId The id {@link #submit} returned
+     * @return Its status, or empty when this namespace never handed that id out
+     */
+    public Optional<ErasureLog.RequestStatus> status(long requestId) {
+        return coordinator.status(requestId);
     }
 
     /**

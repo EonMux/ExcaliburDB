@@ -20,6 +20,7 @@ import com.eonmux.excalibur.api.endpoint.GraphBuildEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphBuildRunner;
 import com.eonmux.excalibur.api.endpoint.GraphBuildStatusEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphErasureEndpoint;
+import com.eonmux.excalibur.api.endpoint.GraphErasureStatusEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespaceDeleteEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespacesEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphQueryEndpoint;
@@ -1070,9 +1071,17 @@ final class EndpointRegistrar {
             target.createContext("/v1/graph/build/status", wrapHandler(
                 exactPath("/v1/graph/build/status", onlyMethod("GET", guard.protect(RequestGuard.Access.READ,
                     new GraphBuildStatusEndpoint(graphBuildRunner))), notFound)));
-            target.createContext("/v1/graph/erasure", wrapHandler(exactPath("/v1/graph/erasure",
-                onlyMethod("POST", audited("erasure.graph", guard.protect(RequestGuard.Access.MUTATE,
-                    new GraphErasureEndpoint(in.graphTenants())))), notFound)));
+            // One context for the collection and its members: POST on the collection records an
+            // obligation, GET on a member reads back where one stands. The readback is a read, so
+            // polling a deadline is not rationed against the mutate budget.
+            target.createContext("/v1/graph/erasure", wrapHandler(pathOrChild("/v1/graph/erasure",
+                exactPath("/v1/graph/erasure",
+                    onlyMethod("POST", audited("erasure.graph",
+                        guard.protect(RequestGuard.Access.MUTATE,
+                            new GraphErasureEndpoint(in.graphTenants())))),
+                    onlyMethod("GET", guard.protect(RequestGuard.Access.READ,
+                        new GraphErasureStatusEndpoint(in.graphTenants())))),
+                notFound)));
             // The namespace inventory and the drop. One context with pathOrChild, because the
             // collection is a GET and its members carry the namespace in the path. Registered
             // only where graphTenants is: a node serving somebody else's pipeline has no

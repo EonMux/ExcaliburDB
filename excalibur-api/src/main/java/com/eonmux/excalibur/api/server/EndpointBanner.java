@@ -88,6 +88,8 @@ final class EndpointBanner {
             lines.add(route("DELETE", "/v1/graph/build", "Stop the graph build in progress"));
             lines.add(route("GET", "/v1/graph/build/status", "What the last graph build did"));
             lines.add(route("POST", "/v1/graph/erasure", "Record an obligation to erase"));
+            lines.add(route("GET", "/v1/graph/erasure/{request_id}",
+                "Where one erasure obligation stands"));
             lines.add(route("GET", "/v1/graph/namespaces", "Every namespace on this node"));
             lines.add(route("DELETE", "/v1/graph/namespaces/{namespace}",
                 "Drop a namespace entirely"));
