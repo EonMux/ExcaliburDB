@@ -2503,6 +2503,8 @@ curl http://localhost:8080/v1/stats
                "mappingLimit": 65530, "limitRead": true, "graphDescriptors": 0,
                "processDescriptors": 412, "descriptorHighWater": 734003, "descriptorLimit": 1048576},
     "builds": {"running": false, "completed": 12, "failed": 0, "cancelled": 1},
+    "automaticBuilds": {"enabled": true, "running": 0, "completed": 184, "unchanged": 3,
+                        "failed": 0, "cancelled": 0, "superseded": 2},
     "erasure": {"namespacesOwing": 1, "outstanding": 2, "overdueNamespaces": 0,
                 "unreadableNamespaces": 0, "oldestAgeMs": 91000},
     "ingest": {"documentsSeen": 20412, "factsStaged": 131877, "unresolvedDocuments": 0,

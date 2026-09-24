@@ -281,7 +281,7 @@ final class EndpointRegistrar {
         if (graphBuildRunner != null) {
             IngestionOrchestrator ingestion = in.ingestionOrchestrator();
             collector.withGraph(new GraphStatsReader(in.graphTenants(), graphBuildRunner,
-                in.graphIngestSink(),
+                graphAutoBuilder, in.graphIngestSink(),
                 ingestion != null ? ingestion::graphReportFailures : () -> 0L));
         }
 

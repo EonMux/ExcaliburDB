@@ -224,6 +224,24 @@ class AutomaticGraphBuildIntegrationTest {
         return new Reply(response.statusCode(), json, response.body());
     }
 
+    /** The node's Prometheus scrape, which is text rather than JSON. */
+    private String scrape() throws Exception {
+        HttpResponse<String> response = http.send(HttpRequest.newBuilder(
+                URI.create("http://127.0.0.1:" + server.getPort() + "/metrics"))
+            .header("Authorization", "Bearer " + TOKEN)
+            .timeout(Duration.ofSeconds(30)).GET().build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
+        return response.body();
+    }
+
+    /** The value of one sample in a scrape, or -1 when the scrape has no such sample. */
+    private static double sample(String scrape, String series) {
+        return scrape.lines()
+            .filter(line -> line.startsWith(series + " "))
+            .mapToDouble(line -> Double.parseDouble(line.substring(series.length() + 1)))
+            .findFirst().orElse(-1);
+    }
+
     /** Sends a request until its reply satisfies the condition, or time runs out. */
     private Reply await(String method, String path, String body, Predicate<Reply> condition,
                         String what) throws Exception {
@@ -340,6 +358,20 @@ class AutomaticGraphBuildIntegrationTest {
         assertThat(Json.stringAt(at(status, "automatic"), "last_result")).isEqualTo("completed");
         assertThat(Json.stringAt(at(status, "automatic"), "state")).isEqualTo("current");
         assertThat(at(sharedNamespace(), "behind_staging")).isEqualTo(Boolean.FALSE);
+
+        Object stats = send("GET", "/v1/stats", null).json();
+        assertThat(at(stats, "graph", "automaticBuilds", "enabled")).isEqualTo(Boolean.TRUE);
+        assertThat(number(stats, "graph", "automaticBuilds", "completed"))
+            .as("the automatic builds are counted where the asked-for ones are")
+            .isGreaterThanOrEqualTo(3);
+        assertThat(number(stats, "graph", "automaticBuilds", "failed")).isZero();
+        assertThat(number(stats, "graph", "builds", "completed")).isZero();
+        String metrics = scrape();
+        assertThat(sample(metrics, "excalibur_graph_auto_build_enabled")).isEqualTo(1);
+        assertThat(sample(metrics, "excalibur_graph_auto_builds_total{outcome=\"completed\"}"))
+            .isGreaterThanOrEqualTo(3);
+        assertThat(sample(metrics, "excalibur_graph_builds_total{outcome=\"completed\"}"))
+            .isZero();
     }
 
     @Test
@@ -361,6 +393,9 @@ class AutomaticGraphBuildIntegrationTest {
         assertThat(at(status, "automatic", "enabled")).isEqualTo(Boolean.FALSE);
         assertThat(number(status, "freshness", "staged_changes_since_ms")).isPositive();
         assertThat(at(sharedNamespace(), "behind_staging")).isEqualTo(Boolean.TRUE);
+        assertThat(at(send("GET", "/v1/stats", null).json(), "graph", "automaticBuilds",
+            "enabled")).isEqualTo(Boolean.FALSE);
+        assertThat(sample(scrape(), "excalibur_graph_auto_build_enabled")).isZero();
 
         // Several passes' worth of the interval a scheduler would have used.
         Thread.sleep(3_000);

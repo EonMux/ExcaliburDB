@@ -200,7 +200,7 @@ public final class MetricsEndpoint implements HttpHandler {
         }
         GraphStats.NamespaceStats namespaces = graph.namespaces();
         GraphStats.BuildStats builds = graph.builds();
-        String buildsHelp = "Graph builds since startup, by how they ended";
+        String buildsHelp = "Graph builds asked for since startup, by how they ended";
         text.gauge("excalibur_graph_namespaces_open", "Graph namespaces open now",
                 namespaces.open())
             .gauge("excalibur_graph_namespaces_open_limit",
@@ -216,9 +216,44 @@ public final class MetricsEndpoint implements HttpHandler {
                 Map.of("outcome", "failed"), builds.failed())
             .counter("excalibur_graph_builds_total", buildsHelp,
                 Map.of("outcome", "cancelled"), builds.cancelled());
+        appendAutomaticBuilds(text, graph.automaticBuilds());
         appendBudget(text, graph.budget());
         appendGraphErasure(text, graph.erasure());
         appendGraphIngest(text, graph.ingest());
+    }
+
+    /**
+     * The builds the node started by itself, apart from the ones asked for.
+     *
+     * <p>A family of their own rather than a {@code trigger} label on
+     * {@code excalibur_graph_builds_total}: adding a label to that family would split the series
+     * every existing query and alert reads, and the two have different outcomes - an automatic
+     * build can find nothing left to build, or be superseded by an erasure recorded while it ran,
+     * which is not a failure. The running figure is a count, not a flag, since several run at
+     * once.</p>
+     *
+     * @param text      The scrape being built
+     * @param automatic Their counts
+     */
+    private static void appendAutomaticBuilds(PrometheusText text,
+                                              GraphStats.AutomaticBuildStats automatic) {
+        String help = "Graph builds the node started by itself since startup, by how they ended";
+        text.gauge("excalibur_graph_auto_build_enabled",
+                "1 when the node rebuilds graphs that fall behind their staging by itself",
+                automatic.enabled() ? 1 : 0)
+            .gauge("excalibur_graph_auto_builds_running",
+                "Graph builds the node started by itself that are in progress now",
+                automatic.running())
+            .counter("excalibur_graph_auto_builds_total", help,
+                Map.of("outcome", "completed"), automatic.completed())
+            .counter("excalibur_graph_auto_builds_total", help,
+                Map.of("outcome", "unchanged"), automatic.unchanged())
+            .counter("excalibur_graph_auto_builds_total", help,
+                Map.of("outcome", "failed"), automatic.failed())
+            .counter("excalibur_graph_auto_builds_total", help,
+                Map.of("outcome", "cancelled"), automatic.cancelled())
+            .counter("excalibur_graph_auto_builds_total", help,
+                Map.of("outcome", "superseded"), automatic.superseded());
     }
 
     /**

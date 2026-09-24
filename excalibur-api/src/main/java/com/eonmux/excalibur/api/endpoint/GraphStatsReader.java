@@ -16,9 +16,10 @@ import java.util.function.LongSupplier;
 /**
  * Reads the graph half of a node into one {@link GraphStats}.
  *
- * <p>Four owners hold the figures and none of them is a stats component: the tenant registry,
- * the build runner, the ingest sink and the ingestion that reports into it. This is the one place that knows where each lives, so
- * the collector asks one question and the renderers stay ignorant of the graph's structure.</p>
+ * <p>Five owners hold the figures and none of them is a stats component: the tenant registry,
+ * the build runner, the automatic build, the ingest sink and the ingestion that reports into it.
+ * This is the one place that knows where each lives, so the collector asks one question and the
+ * renderers stay ignorant of the graph's structure.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Thread-safe. Every source is read through its own thread-safe accessor.</p>
@@ -31,24 +32,31 @@ public final class GraphStatsReader {
 
     private final GraphTenants tenants;
     private final GraphBuildRunner builds;
+    private final GraphAutoBuilder automaticBuilds;
     private final NamespaceRoutingGraphIngestSink ingest;
     private final LongSupplier sinkRefusals;
 
     /**
      * Creates a reader over a node's graph.
      *
-     * @param tenants Every namespace's graph
-     * @param builds  The runner every build goes through
-     * @param ingest  The sink ingestion stages facts through, or null on a node with none
-     * @param sinkRefusals How many documents the sink threw on, as the ingestion that reports
-     *                     into it counts them; ignored, and may be null, where ingest is null
-     * @throws NullPointerException if tenants or builds is null, or sinkRefusals is null while
-     *                              ingest is not
+     * @param tenants         Every namespace's graph
+     * @param builds          The runner every build asked for goes through
+     * @param automaticBuilds The automatic build, whose builds the runner never sees
+     * @param ingest          The sink ingestion stages facts through, or null on a node with
+     *                        none
+     * @param sinkRefusals    How many documents the sink threw on, as the ingestion that
+     *                        reports into it counts them; ignored, and may be null, where ingest
+     *                        is null
+     * @throws NullPointerException if tenants, builds or automaticBuilds is null, or
+     *                              sinkRefusals is null while ingest is not
      */
     public GraphStatsReader(GraphTenants tenants, GraphBuildRunner builds,
+                            GraphAutoBuilder automaticBuilds,
                             NamespaceRoutingGraphIngestSink ingest, LongSupplier sinkRefusals) {
         this.tenants = Objects.requireNonNull(tenants, "tenants cannot be null");
         this.builds = Objects.requireNonNull(builds, "builds cannot be null");
+        this.automaticBuilds = Objects.requireNonNull(automaticBuilds,
+            "automaticBuilds cannot be null");
         this.ingest = ingest;
         this.sinkRefusals = ingest == null
             ? null
@@ -62,12 +70,16 @@ public final class GraphStatsReader {
      */
     public GraphStats read() {
         GraphBuildRunner.Counts buildCounts = builds.counts();
+        GraphAutoBuilder.Counts automatic = automaticBuilds.counts();
         return new GraphStats(
             new GraphStats.NamespaceStats(tenants.openCount(), tenants.maxOpenNamespaces(),
                 tenants.evictionCount()),
             budgetStats(tenants.budget().usage()),
             new GraphStats.BuildStats(buildCounts.running(), buildCounts.completed(),
                 buildCounts.failed(), buildCounts.cancelled()),
+            new GraphStats.AutomaticBuildStats(automaticBuilds.enabled(), automatic.running(),
+                automatic.completed(), automatic.unchanged(), automatic.failed(),
+                automatic.cancelled(), automatic.superseded()),
             erasureStats(),
             ingestStats());
     }
