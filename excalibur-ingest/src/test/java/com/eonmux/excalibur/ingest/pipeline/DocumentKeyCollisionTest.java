@@ -163,6 +163,11 @@ class DocumentKeyCollisionTest {
 
         assertThat(result.isSuccess()).isFalse();
         assertThat(result.getError()).contains("already holds");
+        assertThat(result.isKeyTaken())
+            .as("marked, so the run's summary can say the cure is an id, not a retry")
+            .isTrue();
+        assertThat(DocumentReindexer.ReindexResult.builder("team:wiki")
+            .addDocumentResult(result).build().getDocumentsKeyTaken()).isEqualTo(1);
         assertThat(writer.stored.get(KEY + ":chunk:0")).isEqualTo("the team page");
         assertThat(documents.getByKey(KEY).getSourceId()).isEqualTo("team");
     }
@@ -184,6 +189,7 @@ class DocumentKeyCollisionTest {
 
         assertThat(result.isSuccess()).isFalse();
         assertThat(result.getError()).contains("already holds");
+        assertThat(result.isKeyTaken()).isTrue();
         assertThat(writer.stored.get(KEY + ":chunk:0")).isEqualTo("the team page");
         assertThat(tracker.isDocumentTracked(KEY))
             .as("the holder's document was never hidden for the other's attempt")

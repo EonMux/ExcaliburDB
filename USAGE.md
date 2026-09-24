@@ -942,9 +942,10 @@ and every chunk id begins with it, so a source whose id extends another's by a c
 key the other already holds: document `wiki:home.md` of source `team` and document `home.md` of
 source `team:wiki` are both `team:wiki:home.md`. The first source to register a document under
 the key keeps it. The other's document is refused before anything of it is written, on every crawl
-and re-crawl and from `POST /v1/documents`, counted in `documents_failed`, and named in the
-source's `/v1/ingest/status` error as refused because another source holds its key — a failure
-retrying does not cure, so give one of the sources an id that does not collide. An erasure, a
+and re-crawl and from `POST /v1/documents`, counted in `documents_failed`, and named as refused
+because another source holds its key — in the source's `/v1/ingest/status` error after a crawl,
+in `last_error` on `/v1/reindex/status` after a re-crawl. It is a failure retrying does not cure,
+so give one of the sources an id that does not collide. An erasure, a
 re-crawl or a document listing under the other source never reaches the holder's document.
 
 **`400 Bad Request` — an `X-Excalibur-Namespace` that is not a legal namespace id.** Refused

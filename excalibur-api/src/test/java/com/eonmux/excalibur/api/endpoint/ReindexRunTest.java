@@ -226,6 +226,28 @@ class ReindexRunTest {
         }
 
         @Test
+        @DisplayName("a run refused documents for a key another source holds says so, by count")
+        void partialRunNamesKeyCollisions() throws Exception {
+            DocumentReindexer.ReindexResult.Builder builder =
+                new DocumentReindexer.ReindexResult.Builder(SOURCE_ID)
+                    .documentsIndexed(400)
+                    .chunksCreated(1200);
+            builder.addDocumentResult(new DocumentReindexer.DocumentResult("home.md", 1, 0, 0, 1L,
+                "document 'home.md' of source 'team:wiki' has the key 'team:wiki:home.md'")
+                .asKeyTaken());
+            builder.addDocumentResult(new DocumentReindexer.DocumentResult("b.md", 1, 0, 1, 1L,
+                "b failed"));
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(builder.build());
+
+            standardRun().execute(SOURCE_ID);
+
+            assertThat(status().lastError())
+                .isEqualTo("Reindex completed with 2 errors, 1 of them because a document of "
+                    + "another source already holds the same key (source id, colon, document id)"
+                    + "; 400 documents indexed; see the node's log for the reason");
+        }
+
+        @Test
         @DisplayName("a clean run after a partial one clears what the partial one reported")
         void aCleanRunClearsTheFailures() throws Exception {
             when(reindexer.reindexAll(eq(source), any(), any()))

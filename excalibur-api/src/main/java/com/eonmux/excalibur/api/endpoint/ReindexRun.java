@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.eonmux.excalibur.core.util.StopSignal;
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.pipeline.ReindexCancelledException;
+import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
 import com.eonmux.excalibur.ingest.source.SourceResolver;
@@ -483,7 +484,7 @@ public final class ReindexRun {
             LOGGER.error("[reindex-{}] Reindex failed completely with {} errors for "
                     + "source {}: {}", threadName, result.getErrorCount(), sourceId,
                 errorDetail(result.getBasicResult().getErrors()));
-            statusRegistry.failReindex(sourceId, countedFailure(result.getErrorCount()));
+            statusRegistry.failReindex(sourceId, countedFailure(result.getBasicResult()));
             return false;
         }
         if (result.hasErrors()) {
@@ -493,7 +494,7 @@ public final class ReindexRun {
                 result.getTombstonedSegmentIds().size(), result.getNewSegmentId(),
                 errorDetail(result.getBasicResult().getErrors()));
             statusRegistry.completeReindexWithErrors(sourceId,
-                countedPartialFailure(result.getErrorCount(), result.getDocumentsIndexed()));
+                countedPartialFailure(result.getBasicResult()));
             return true;
         }
         LOGGER.info("[reindex-{}] Rolling reindex completed successfully for source {}: "
@@ -547,7 +548,7 @@ public final class ReindexRun {
             LOGGER.error("[reindex-{}] Reindex failed completely with {} errors for "
                     + "source {}: {}", threadName, result.getErrorCount(), sourceId,
                 errorDetail(result.getErrors()));
-            statusRegistry.failReindex(sourceId, countedFailure(result.getErrorCount()));
+            statusRegistry.failReindex(sourceId, countedFailure(result));
             return false;
         }
         if (result.hasErrors()) {
@@ -557,7 +558,7 @@ public final class ReindexRun {
                 result.getDocumentsSkipped(), result.getChunksCreated(),
                 errorDetail(result.getErrors()));
             statusRegistry.completeReindexWithErrors(sourceId,
-                countedPartialFailure(result.getErrorCount(), result.getDocumentsIndexed()));
+                countedPartialFailure(result));
             return true;
         }
         LOGGER.info("[reindex-{}] Reindex completed successfully for {}: {} docs "
@@ -615,11 +616,12 @@ public final class ReindexRun {
     /**
      * The readback text for a run that indexed nothing.
      *
-     * @param errorCount How many documents failed
+     * @param result What the run came to
      * @return What the caller is told
      */
-    private static String countedFailure(int errorCount) {
-        return "Reindex failed completely with " + errorCount + " errors" + SEE_THE_LOG;
+    private static String countedFailure(DocumentReindexer.ReindexResult result) {
+        return "Reindex failed completely with " + result.getErrorCount() + " errors"
+            + keysTaken(result) + SEE_THE_LOG;
     }
 
     /**
@@ -628,12 +630,23 @@ public final class ReindexRun {
      * <p>The counts and nothing else, for the reason {@link #SEE_THE_LOG} gives: the messages
      * name the documents and the paths and URLs they were read from.</p>
      *
-     * @param errorCount How many documents failed
-     * @param indexed    How many were indexed
+     * @param result What the run came to
      * @return What the caller is told
      */
-    private static String countedPartialFailure(int errorCount, int indexed) {
-        return "Reindex completed with " + errorCount + " errors; " + indexed
-            + " documents indexed" + SEE_THE_LOG;
+    private static String countedPartialFailure(DocumentReindexer.ReindexResult result) {
+        return "Reindex completed with " + result.getErrorCount() + " errors"
+            + keysTaken(result) + "; " + result.getDocumentsIndexed() + " documents indexed"
+            + SEE_THE_LOG;
+    }
+
+    /**
+     * The clause naming the failures a retry cannot cure, or nothing when there are none.
+     *
+     * @param result What the run came to
+     * @return The clause, with its separator
+     */
+    private static String keysTaken(DocumentReindexer.ReindexResult result) {
+        int keysTaken = result.getDocumentsKeyTaken();
+        return keysTaken == 0 ? "" : ", " + DocumentRegistry.keysTakenNote(keysTaken);
     }
 }

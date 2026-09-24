@@ -768,6 +768,7 @@ public class DocumentReindexer {
         private final List<String> chunkIds;
         private final SkipReason skipReason;
         private final int chunksRetired;
+        private final boolean keyTaken;
 
         public DocumentResult(String documentId, int totalChunks, int successfulChunks, 
                             int failedChunks, long elapsedMillis, String error) {
@@ -777,13 +778,13 @@ public class DocumentReindexer {
         public DocumentResult(String documentId, int totalChunks, int successfulChunks,
                             int failedChunks, long elapsedMillis, String error, List<String> chunkIds) {
             this(documentId, totalChunks, successfulChunks, failedChunks, elapsedMillis, error,
-                chunkIds, null, 0);
+                chunkIds, null, 0, false);
         }
 
         private DocumentResult(String documentId, int totalChunks, int successfulChunks,
                                int failedChunks, long elapsedMillis, String error,
                                List<String> chunkIds, SkipReason skipReason,
-                               int chunksRetired) {
+                               int chunksRetired, boolean keyTaken) {
             this.documentId = documentId;
             this.totalChunks = totalChunks;
             this.successfulChunks = successfulChunks;
@@ -793,6 +794,7 @@ public class DocumentReindexer {
             this.chunkIds = chunkIds != null ? List.copyOf(chunkIds) : List.of();
             this.skipReason = skipReason;
             this.chunksRetired = chunksRetired;
+            this.keyTaken = keyTaken;
         }
 
         /**
@@ -811,7 +813,7 @@ public class DocumentReindexer {
                                              long elapsedMillis) {
             Objects.requireNonNull(reason, "reason must not be null");
             return new DocumentResult(documentId, 0, 0, 0, elapsedMillis, reason.description(),
-                List.of(), reason, 0);
+                List.of(), reason, 0, false);
         }
 
         /**
@@ -836,7 +838,28 @@ public class DocumentReindexer {
                 throw new IllegalArgumentException("retired must be non-negative: " + retired);
             }
             return new DocumentResult(documentId, totalChunks, successfulChunks, failedChunks,
-                elapsedMillis, error, chunkIds, skipReason, retired);
+                elapsedMillis, error, chunkIds, skipReason, retired, keyTaken);
+        }
+
+        /**
+         * A copy of this failure marking it as refused because a document of another source
+         * holds the document's key.
+         *
+         * @return The copy
+         */
+        public DocumentResult asKeyTaken() {
+            return new DocumentResult(documentId, totalChunks, successfulChunks, failedChunks,
+                elapsedMillis, error, chunkIds, skipReason, chunksRetired, true);
+        }
+
+        /**
+         * Whether the document was refused because a document of another source holds its key -
+         * a failure no retry cures, since the cure is a source id that does not collide.
+         *
+         * @return true if it was
+         */
+        public boolean isKeyTaken() {
+            return keyTaken;
         }
 
         /**
@@ -942,6 +965,7 @@ public class DocumentReindexer {
         private final int documentsSkipped;
         private final int documentsNotText;
         private final int documentsFailed;
+        private final int documentsKeyTaken;
         private final int documentsUnchecked;
         private final List<String> uncheckedSample;
         private final int documentsUnchanged;
@@ -954,6 +978,7 @@ public class DocumentReindexer {
             this.documentsSkipped = builder.documentsSkipped;
             this.documentsNotText = builder.documentsNotText;
             this.documentsFailed = builder.documentsFailed;
+            this.documentsKeyTaken = builder.documentsKeyTaken;
             this.documentsUnchecked = builder.documentsUnchecked;
             this.uncheckedSample = List.copyOf(builder.uncheckedSample);
             this.documentsUnchanged = builder.documentsUnchanged;
@@ -1028,6 +1053,16 @@ public class DocumentReindexer {
          */
         public int getDocumentsFailed() {
             return documentsFailed;
+        }
+
+        /**
+         * Of the documents that failed, those refused because a document of another source holds
+         * their key; see {@link DocumentResult#isKeyTaken()}.
+         *
+         * @return How many
+         */
+        public int getDocumentsKeyTaken() {
+            return documentsKeyTaken;
         }
 
         /**
@@ -1108,6 +1143,7 @@ public class DocumentReindexer {
             private int chunksTombstoned = 0;
             private int chunksFailed = 0;
             private int documentsFailed = 0;
+            private int documentsKeyTaken = 0;
             private int documentsUnchecked = 0;
             private final List<String> uncheckedSample = new ArrayList<>();
             private int documentsUnchanged = 0;
@@ -1215,6 +1251,9 @@ public class DocumentReindexer {
                         documentsNotText++;
                     }
                 } else if (docResult.hasError()) {
+                    if (docResult.isKeyTaken()) {
+                        documentsKeyTaken++;
+                    }
                     addDocumentFailure("document", docResult.getDocumentId(), docResult.getError());
                 }
                 return this;

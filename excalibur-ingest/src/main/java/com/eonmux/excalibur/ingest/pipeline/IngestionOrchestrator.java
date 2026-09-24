@@ -801,8 +801,7 @@ public class IngestionOrchestrator {
         String error = failedDocs + " of " + totalPending
             + " documents were not ingested; each failure is logged separately";
         if (keysTaken > 0) {
-            error = error + "; " + keysTaken + " of them because a document of another source "
-                + "already holds the same key (source id, colon, document id)";
+            error = error + "; " + DocumentRegistry.keysTakenNote(keysTaken);
         }
         status.setError(error);
     }

@@ -165,15 +165,28 @@ final class DocumentReindexStep {
      * @param writes    What the write loop got through
      * @param committed The publication, or null when the document was not published
      * @param error     Why it was not, or null when it was
+     * @param keyTaken  Whether it was not because another source's document holds its key
      */
-    private record Attempt(ChunkWrites writes, Committed committed, String error) {
+    private record Attempt(ChunkWrites writes, Committed committed, String error,
+                           boolean keyTaken) {
 
         static Attempt published(ChunkWrites writes, Committed committed) {
-            return new Attempt(writes, committed, null);
+            return new Attempt(writes, committed, null, false);
         }
 
         static Attempt failed(ChunkWrites writes, String error) {
-            return new Attempt(writes, null, error);
+            return new Attempt(writes, null, error, false);
+        }
+
+        static Attempt refusedForKey(String reason) {
+            return new Attempt(new ChunkWrites(List.of(), 0, 0, List.of()), null, reason, true);
+        }
+
+        /** The failure as the run reports it. */
+        DocumentResult failure(String documentId, int totalChunks, long elapsedMillis) {
+            DocumentResult result = new DocumentResult(documentId, totalChunks, 0,
+                writes.failures(), elapsedMillis, error);
+            return keyTaken ? result.asKeyTaken() : result;
         }
     }
 
@@ -356,8 +369,7 @@ final class DocumentReindexStep {
             // The failed chunk count is the chunks that could not be written. When every chunk
             // was written and it is the publication that failed, that is none of them: the
             // failure is the document's, once, and it is what the run reports in its errors.
-            return new DocumentResult(documentId, chunks.size(), 0, writes.failures(), elapsed,
-                attempt.error());
+            return attempt.failure(documentId, chunks.size(), elapsed);
         }
 
         Committed committed = attempt.committed();
@@ -378,7 +390,7 @@ final class DocumentReindexStep {
                                     List<TextChunk> chunks, List<float[]> vectors) {
         String keyTaken = keyTaken(sourceId, documentId);
         if (keyTaken != null) {
-            return Attempt.failed(new ChunkWrites(List.of(), 0, 0, List.of()), keyTaken);
+            return Attempt.refusedForKey(keyTaken);
         }
         // Read before anything is written, under the lock that orders every rewrite of the
         // document: this is the version the new one replaces.
@@ -476,8 +488,7 @@ final class DocumentReindexStep {
                 vectors));
         ChunkWrites writes = attempt.writes();
         if (attempt.committed() == null) {
-            return new DocumentResult(documentId, chunks.size(), 0, writes.failures(),
-                System.currentTimeMillis() - startTime, attempt.error());
+            return attempt.failure(documentId, chunks.size(), System.currentTimeMillis() - startTime);
         }
         Committed committed = attempt.committed();
 
@@ -500,7 +511,7 @@ final class DocumentReindexStep {
                                      List<TextChunk> chunks, List<float[]> vectors) {
         String keyTaken = keyTaken(sourceId, documentId);
         if (keyTaken != null) {
-            return Attempt.failed(new ChunkWrites(List.of(), 0, 0, List.of()), keyTaken);
+            return Attempt.refusedForKey(keyTaken);
         }
         ChunkWrites writes = writeChunks(sourceId, documentId, chunks, vectors,
             (chunkId, chunk, embedding) ->

@@ -395,6 +395,22 @@ public final class DocumentRegistry {
     }
 
     /**
+     * Says how many of a run's failures were refusals for a key another source holds, without
+     * naming documents or paths.
+     *
+     * <p>The clause a run's summary appends to its count of failures - the ingest status error,
+     * a re-crawl's {@code last_error} - so a summary that carries counts and not messages still
+     * says that the cure is an id, not a retry.</p>
+     *
+     * @param keysTaken How many were refused for their key; positive
+     * @return The clause, beginning with the count
+     */
+    public static String keysTakenNote(int keysTaken) {
+        return keysTaken + " of them because a document of another source already holds the same "
+            + "key (source id, colon, document id)";
+    }
+
+    /**
      * Replaces a document's metadata, but only if it is still exactly what the caller read.
      *
      * <p>For a caller that derived the replacement from an earlier read and must not overwrite a
