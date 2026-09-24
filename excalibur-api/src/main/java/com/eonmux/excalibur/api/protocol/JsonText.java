@@ -594,6 +594,66 @@ public final class JsonText {
         }
     }
 
+    /**
+     * Refuses a document that is not one object whose members can all be walked.
+     *
+     * <p>Every reader here finds a member by walking the members before it, and stops at the
+     * first one it cannot walk - so a member written after a missing comma or a stray token reads
+     * as absent. For most fields that only swaps a value for its default. For a field that
+     * confines what a request may touch, absent means unconfined, and a typo would widen the
+     * request rather than fail it. A route with such a field checks the whole document with this
+     * before reading any of it.</p>
+     *
+     * <p>Structural only: it walks each member's name, colon and value to the closing brace, as
+     * the readers do, and does not re-validate what is inside a nested value.</p>
+     *
+     * @param json The document
+     * @throws IllegalArgumentException if it is not a single object whose members are separated
+     *                                  by commas and closed by a brace, with nothing after it
+     */
+    public static void requireObject(String json) {
+        String malformed = "The request body must be a single well-formed JSON object";
+        int i = json == null ? 0 : skipWhitespace(json, 0);
+        if (json == null || i >= json.length() || json.charAt(i) != '{') {
+            throw new IllegalArgumentException(malformed);
+        }
+        i = skipWhitespace(json, i + 1);
+        if (i < json.length() && json.charAt(i) == '}') {
+            requireNothingAfter(json, i + 1, malformed);
+            return;
+        }
+        while (true) {
+            if (i >= json.length() || json.charAt(i) != '"') {
+                throw new IllegalArgumentException(malformed);
+            }
+            int nameEnd = closingQuote(json, i + 1);
+            i = nameEnd < 0 ? -1 : skipWhitespace(json, nameEnd + 1);
+            if (i < 0 || i >= json.length() || json.charAt(i) != ':') {
+                throw new IllegalArgumentException(malformed);
+            }
+            i = skipWhitespace(json, i + 1);
+            i = i >= json.length() ? -1 : endOfValue(json, i);
+            if (i < 0) {
+                throw new IllegalArgumentException(malformed);
+            }
+            i = skipWhitespace(json, i);
+            if (i < json.length() && json.charAt(i) == '}') {
+                requireNothingAfter(json, i + 1, malformed);
+                return;
+            }
+            if (i >= json.length() || json.charAt(i) != ',') {
+                throw new IllegalArgumentException(malformed);
+            }
+            i = skipWhitespace(json, i + 1);
+        }
+    }
+
+    private static void requireNothingAfter(String json, int from, String malformed) {
+        if (skipWhitespace(json, from) != json.length()) {
+            throw new IllegalArgumentException(malformed);
+        }
+    }
+
     private static int skipWhitespace(String json, int from) {
         int i = from;
         while (i < json.length() && Character.isWhitespace(json.charAt(i))) {

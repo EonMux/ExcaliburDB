@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.query.pipeline;
 
+import com.eonmux.excalibur.core.text.ChunkSources;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker;
 import com.eonmux.excalibur.query.IndexCoverage;
 import com.eonmux.excalibur.query.QueryRequest;
@@ -79,6 +80,8 @@ public class QueryPipeline {
     private final StorageEngine storageEngine;
     private final VisibilityTracker visibilityTracker;
     private final DocumentVisibilityChecker visibilityChecker;
+    /** Names each chunk's source for a request scoped to some; null on a node that cannot. */
+    private final ChunkSources chunkSources;
     private final HnswGraphProvider graphProvider;
     private final DistanceFunction distanceFunction;
     private final LlmScorer llmScorer;
@@ -285,8 +288,9 @@ public class QueryPipeline {
             PqSearchSettings pqSearch) {
 
         // Dispatcher and pipeline executor are lazily initialized on first use
-        this(storageEngine, visibilityTracker, visibilityChecker, graphProvider, distanceFunction,
-            llmScorer, coverageThreshold, epochIsolationValidator, pqSearch, null, null);
+        this(storageEngine, visibilityTracker, visibilityChecker, null, graphProvider,
+            distanceFunction, llmScorer, coverageThreshold, epochIsolationValidator, pqSearch,
+            null, null);
     }
 
     /**
@@ -299,6 +303,7 @@ public class QueryPipeline {
             StorageEngine storageEngine,
             VisibilityTracker visibilityTracker,
             DocumentVisibilityChecker visibilityChecker,
+            ChunkSources chunkSources,
             HnswGraphProvider graphProvider,
             DistanceFunction distanceFunction,
             LlmScorer llmScorer,
@@ -311,6 +316,7 @@ public class QueryPipeline {
         this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
         this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "VisibilityTracker cannot be null");
         this.visibilityChecker = visibilityChecker;
+        this.chunkSources = chunkSources;
         this.graphProvider = Objects.requireNonNull(graphProvider, "GraphProvider cannot be null");
         this.distanceFunction = Objects.requireNonNull(distanceFunction, "DistanceFunction cannot be null");
         this.llmScorer = llmScorer;
@@ -326,7 +332,7 @@ public class QueryPipeline {
         this.hnswSearchStage = new HnswSearchStage(this::getDispatcher, this.distanceFunction,
             this.epochIsolationValidator, this::llmScoringWillRun, this.pqSearch);
         this.rerankStage = new RerankStage(this.distanceFunction, this.coverageThreshold,
-            this.visibilityChecker, this::llmScoringWillRun);
+            this.visibilityChecker, this.chunkSources, this::llmScoringWillRun);
         this.llmScoringStage = new LlmScoringStage(this.llmScorer, this.payloadResolver,
             this::llmScoringWillRun);
         this.responseAssembler = new ResponseAssembler(this.coverageCounts, this.coverageThreshold,
@@ -410,7 +416,7 @@ public class QueryPipeline {
      * @return A new QueryPipeline instance with the specified LLM scorer
      */
     public QueryPipeline withLlmScorer(LlmScorer llmScorer) {
-        return copyWith(llmScorer, this.visibilityChecker);
+        return copyWith(llmScorer, this.visibilityChecker, this.chunkSources);
     }
 
     /**
@@ -424,7 +430,22 @@ public class QueryPipeline {
      * @return A new QueryPipeline instance with the specified visibility checker
      */
     public QueryPipeline withVisibilityChecker(DocumentVisibilityChecker visibilityChecker) {
-        return copyWith(this.llmScorer, visibilityChecker);
+        return copyWith(this.llmScorer, visibilityChecker, this.chunkSources);
+    }
+
+    /**
+     * Returns a new QueryPipeline that can answer requests scoped to some sources.
+     *
+     * <p>A request naming sources ({@link QueryRequest#sourceScope()}) is answered only from
+     * their chunks, and which source a chunk is from is the node's to say - see
+     * {@link ChunkSources}. A pipeline without one refuses such a request rather than answering
+     * it from every source.</p>
+     *
+     * @param chunkSources Names each chunk's source, or null to refuse scoped requests
+     * @return A new QueryPipeline instance attributing chunks through it
+     */
+    public QueryPipeline withChunkSources(ChunkSources chunkSources) {
+        return copyWith(this.llmScorer, this.visibilityChecker, chunkSources);
     }
 
     /**
@@ -437,10 +458,12 @@ public class QueryPipeline {
      * @param scorer The LLM scorer the copy uses, or null to disable Stage 4
      * @param checker The visibility checker the copy uses, or null to disable atomicity
      *                filtering
+     * @param sources Names each chunk's source for a scoped request, or null to refuse one
      * @return The reconfigured copy
      */
-    private QueryPipeline copyWith(LlmScorer scorer, DocumentVisibilityChecker checker) {
-        return new QueryPipeline(this.storageEngine, this.visibilityTracker, checker,
+    private QueryPipeline copyWith(LlmScorer scorer, DocumentVisibilityChecker checker,
+                                   ChunkSources sources) {
+        return new QueryPipeline(this.storageEngine, this.visibilityTracker, checker, sources,
             this.graphProvider, this.distanceFunction, scorer, this.coverageThreshold,
             this.epochIsolationValidator, this.pqSearch, this.dispatcher, this.pipelineExecutor);
     }
@@ -461,6 +484,15 @@ public class QueryPipeline {
      */
     public DocumentVisibilityChecker getVisibilityChecker() {
         return visibilityChecker;
+    }
+
+    /**
+     * Returns what names each chunk's source, if anything does.
+     *
+     * @return The attribution, or null if this pipeline refuses scoped requests
+     */
+    public ChunkSources getChunkSources() {
+        return chunkSources;
     }
 
     /**
@@ -564,6 +596,9 @@ public class QueryPipeline {
      * @param request The query request
      * @param token The cancellation token
      * @return A CompletableFuture containing the query response
+     * @throws IllegalStateException if the request is scoped to sources and this pipeline has
+     *                               nothing to attribute chunks with - see
+     *                               {@link #withChunkSources}
      */
     public CompletableFuture<QueryResponse> execute(
             QueryRequest request,
@@ -571,6 +606,12 @@ public class QueryPipeline {
 
         Objects.requireNonNull(request, "Request cannot be null");
         Objects.requireNonNull(token, "CancellationToken cannot be null");
+        // Refused before any stage runs: a stage that failed on it would be answered as an
+        // empty, degraded result, which reads as "nothing in these sources matched".
+        if (!request.sourceScope().isUnrestricted() && chunkSources == null) {
+            throw new IllegalStateException("this pipeline cannot attribute chunks to sources, "
+                + "so it cannot answer a request scoped to " + request.sourceScope().sourceIds());
+        }
 
         long startTime = System.nanoTime();
         QueryDeadline deadline = QueryDeadline.from(startTime, request.timeoutMs());

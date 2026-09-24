@@ -6,6 +6,7 @@ import com.eonmux.excalibur.api.retrieval.LexicalSignal;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.server.InProcessServices;
 import com.eonmux.excalibur.config.Config;
+import com.eonmux.excalibur.core.text.SourceScope;
 import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
 import com.eonmux.excalibur.query.QueryOptions;
 import com.eonmux.excalibur.query.QueryRequest;
@@ -107,23 +108,33 @@ final class EmbeddedRetrieval {
      * @param text      The query text
      * @param topK      Most hits to return
      * @param timeoutMs The search's budget
+     * @param scope     The sources the answer is drawn from
      * @return The answer, which says which signals produced it
      * @throws IllegalArgumentException if a bound is violated
-     * @throws IllegalStateException    if the node has no signal, or every signal it has failed
+     * @throws IllegalStateException    if the node has no signal, every signal it has failed, or
+     *                                  the search is scoped and the node cannot attribute chunks
+     *                                  to sources
      * @throws InterruptedException     if the calling thread is interrupted while it waits
      */
-    SearchAnswer search(String text, int topK, long timeoutMs) throws InterruptedException {
+    SearchAnswer search(String text, int topK, long timeoutMs, SourceScope scope)
+            throws InterruptedException {
         validate(text, topK, timeoutMs);
+        Objects.requireNonNull(scope, "scope cannot be null");
+        if (!scope.isUnrestricted() && pipeline.getChunkSources() == null) {
+            throw new IllegalStateException("This node cannot confine a search to sources: it "
+                + "keeps no document registry to say which source a chunk is from");
+        }
         long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
         SearchRoute planned = route().orElseThrow(() -> new IllegalStateException(NO_SIGNAL));
+        Search search = new Search(text, topK, scope, deadlineNanos);
         if (planned == SearchRoute.LEXICAL) {
-            return lexicalOnly(text, topK, deadlineNanos);
+            return lexicalOnly(search);
         }
         LexicalSignal signal = planned == SearchRoute.HYBRID
-            ? LexicalSignal.start(lexical, executor, text, topK)
+            ? LexicalSignal.start(lexical, executor, text, scope, topK)
             : null;
         try {
-            return withVectors(text, topK, deadlineNanos, signal);
+            return withVectors(search, signal);
         } finally {
             if (signal != null) {
                 signal.cancel();
@@ -149,10 +160,22 @@ final class EmbeddedRetrieval {
         }
     }
 
+    /**
+     * What one search asked for.
+     *
+     * @param text          The query text
+     * @param topK          Most hits to return
+     * @param scope         The sources the answer is drawn from
+     * @param deadlineNanos {@link System#nanoTime()} value the search must finish by
+     */
+    private record Search(String text, int topK, SourceScope scope, long deadlineNanos) {
+    }
+
     /** A node with no vectors: BM25 is the whole answer. */
-    private SearchAnswer lexicalOnly(String text, int topK, long deadlineNanos)
-            throws InterruptedException {
-        LexicalSignal signal = LexicalSignal.start(lexical, executor, text, topK);
+    private SearchAnswer lexicalOnly(Search search) throws InterruptedException {
+        long deadlineNanos = search.deadlineNanos();
+        LexicalSignal signal =
+            LexicalSignal.start(lexical, executor, search.text(), search.scope(), search.topK());
         if (signal == null) {
             throw new IllegalStateException("Every BM25 search permit is in use; try again");
         }
@@ -171,14 +194,17 @@ final class EmbeddedRetrieval {
     }
 
     /** A node with vectors, and a BM25 search already running beside them or not. */
-    private SearchAnswer withVectors(String text, int topK, long deadlineNanos,
-                                     LexicalSignal signal) throws InterruptedException {
+    private SearchAnswer withVectors(Search search, LexicalSignal signal)
+            throws InterruptedException {
+        String text = search.text();
+        int topK = search.topK();
+        long deadlineNanos = search.deadlineNanos();
         CancellationToken token = new CancellationToken();
         try {
             float[] vector = embed(text, deadlineNanos);
             if (vector == null) {
                 LOGGER.warn("Query embedding ran out of the search's budget");
-                return fallBack(text, topK, deadlineNanos, signal, true, null);
+                return fallBack(search, signal, true, null);
             }
             long budgetMs = Math.max(1, remainingMillis(deadlineNanos));
             QueryRequest request = QueryRequest.builder()
@@ -192,6 +218,7 @@ final class EmbeddedRetrieval {
                 .oversamplingFactor(QueryOptions.DEFAULT_OVERSAMPLING_FACTOR)
                 // A hit an embedder cannot name is one it cannot fetch or erase.
                 .requireNamedResults(true)
+                .sourceScope(search.scope())
                 .maxSearchDepth(Math.min(limits.maxTopK(), QueryRequest.MAX_TOP_K))
                 .build();
             QueryResponse response = pipeline.execute(request, token)
@@ -209,14 +236,14 @@ final class EmbeddedRetrieval {
         } catch (TimeoutException e) {
             token.cancel("Query timeout");
             LOGGER.warn("Vector search ran out of the search's budget");
-            return fallBack(text, topK, deadlineNanos, signal, true, null);
+            return fallBack(search, signal, true, null);
         } catch (ExecutionException e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             LOGGER.error("Vector search failed: {}", cause.getMessage(), cause);
-            return fallBack(text, topK, deadlineNanos, signal, false, cause);
+            return fallBack(search, signal, false, cause);
         } catch (IllegalStateException e) {
             LOGGER.error("Query embedding is unusable: {}", e.getMessage(), e);
-            return fallBack(text, topK, deadlineNanos, signal, false, e);
+            return fallBack(search, signal, false, e);
         } catch (InterruptedException e) {
             token.cancel("Query interrupted");
             throw e;
@@ -262,13 +289,14 @@ final class EmbeddedRetrieval {
      * @param timedOut Whether a deadline, rather than a failure, ended the vector half
      * @param failure  What ended it, when it was a failure
      */
-    private SearchAnswer fallBack(String text, int topK, long deadlineNanos,
-                                  LexicalSignal running, boolean timedOut, Throwable failure)
-            throws InterruptedException {
+    private SearchAnswer fallBack(Search search, LexicalSignal running, boolean timedOut,
+                                  Throwable failure) throws InterruptedException {
+        long deadlineNanos = search.deadlineNanos();
         LexicalSignal signal = running;
         boolean startedHere = false;
         if (signal == null && !timedOut && lexical != null && remainingMillis(deadlineNanos) > 0) {
-            signal = LexicalSignal.start(lexical, executor, text, topK);
+            signal = LexicalSignal.start(lexical, executor, search.text(), search.scope(),
+                search.topK());
             startedHere = signal != null;
         }
         try {

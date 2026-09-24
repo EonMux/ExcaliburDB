@@ -339,22 +339,27 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
      * <p>A document key is {@code sourceId:documentId} and a document id may itself contain
      * colons - an HTTP source's ids are absolute URLs - so the split cannot be made on the last
      * colon. It is not made on the first one either: a source id is not required to be free of
-     * colons, so each candidate prefix is offered to the registry in turn and the first one that
-     * names a registered source is the answer. In the ordinary case, where the id has no colon,
-     * that is a single lookup.</p>
+     * colons, so each candidate prefix is offered to the registry in turn.</p>
+     *
+     * <p>The longest one that names a registered source is the answer. With {@code team} and
+     * {@code team:wiki} both registered, {@code team:wiki:home.md} begins with the key of each;
+     * the key alone cannot say which registered it, and the more specific source is the one a
+     * document so named was almost certainly crawled by. Taking the first match would stage every
+     * {@code team:wiki} document into the namespace {@code team} was registered in.</p>
      *
      * @param documentKey The source-qualified document key
      * @return The namespace, or empty if no registered source owns the document
      */
     private Optional<NamespaceId> resolve(String documentKey) {
+        Optional<NamespaceId> found = Optional.empty();
         for (int colon = documentKey.indexOf(KEY_SEPARATOR); colon > 0;
                 colon = documentKey.indexOf(KEY_SEPARATOR, colon + 1)) {
-            Optional<NamespaceId> found = sources.namespaceOf(documentKey.substring(0, colon));
-            if (found.isPresent()) {
-                return found;
+            Optional<NamespaceId> candidate = sources.namespaceOf(documentKey.substring(0, colon));
+            if (candidate.isPresent()) {
+                found = candidate;
             }
         }
-        return Optional.empty();
+        return found;
     }
 
     /**

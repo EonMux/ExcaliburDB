@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.query.cache;
 
+import com.eonmux.excalibur.core.text.SourceScope;
+
 import java.util.Objects;
 
 /**
@@ -31,9 +33,11 @@ import java.util.Objects;
  * </ul>
  *
  * <h2>Scope, which is the part that must never be wrong</h2>
- * <p>{@code namespace} and {@code securityContext} come first because they are the two fields
- * whose omission leaks data rather than merely confusing a caller. A cached answer is served
- * only to a request naming the same namespace and presenting the same credential.</p>
+ * <p>{@code namespace}, {@code securityContext} and {@code sourceScope} come first because they
+ * are the fields whose omission leaks data rather than merely confusing a caller. A cached answer
+ * is served only to a request naming the same namespace, presenting the same credential and
+ * confined to the same sources - an answer drawn from every source handed to a caller that asked
+ * for one would carry the documents it filtered out.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Immutable, and safe to use as a map key from any thread.</p>
@@ -42,6 +46,8 @@ import java.util.Objects;
  *                               that partitions none
  * @param securityContext        An opaque identity for the credential the request presented,
  *                               or empty for an unauthenticated node
+ * @param sourceScope            The sources the answer is drawn from, {@link SourceScope#ALL}
+ *                               for every source
  * @param retrievalMode          Which signals answer: {@code vector}, {@code lexical} or
  *                               {@code hybrid}
  * @param queryText              The query as validated, before embedding
@@ -61,6 +67,7 @@ import java.util.Objects;
 public record QueryCacheKey(
     String namespace,
     String securityContext,
+    SourceScope sourceScope,
     String retrievalMode,
     String queryText,
     int topK,
@@ -90,6 +97,7 @@ public record QueryCacheKey(
     public QueryCacheKey {
         namespace = namespace == null ? "" : namespace;
         securityContext = securityContext == null ? "" : securityContext;
+        sourceScope = sourceScope == null ? SourceScope.ALL : sourceScope;
         Objects.requireNonNull(retrievalMode, "retrievalMode must not be null");
         Objects.requireNonNull(queryText, "queryText must not be null");
         if (topK <= 0) {
@@ -126,6 +134,7 @@ public record QueryCacheKey(
         return new Builder()
             .namespace(namespace)
             .securityContext(securityContext)
+            .sourceScope(sourceScope)
             .retrievalMode(retrievalMode)
             .queryText(queryText)
             .topK(topK)
@@ -153,16 +162,18 @@ public record QueryCacheKey(
     @Override
     public String toString() {
         return String.format(
-            "QueryCacheKey{ns=%s, mode=%s, queryChars=%d, topK=%d, offset=%d, text=%s, "
-                + "snippet=%s/%d, explain=%s}",
-            namespace.isEmpty() ? "-" : namespace, retrievalMode, queryText.length(),
+            "QueryCacheKey{ns=%s, sources=%s, mode=%s, queryChars=%d, topK=%d, offset=%d, "
+                + "text=%s, snippet=%s/%d, explain=%s}",
+            namespace.isEmpty() ? "-" : namespace,
+            sourceScope.isUnrestricted() ? "all" : sourceScope.sourceIds(), retrievalMode,
+            queryText.length(),
             topK, offset, includeText, snippet, snippetChars, explain);
     }
 
     /**
      * Builds a {@link QueryCacheKey} field by field.
      *
-     * <p>Fifteen positional arguments is a constructor nobody reads correctly, and every one
+     * <p>Sixteen positional arguments is a constructor nobody reads correctly, and every one
      * of them being wrong is a cache that serves the wrong answer. Not thread-safe; build one
      * per request.</p>
      */
@@ -170,6 +181,7 @@ public record QueryCacheKey(
 
         private String namespace = "";
         private String securityContext = "";
+        private SourceScope sourceScope = SourceScope.ALL;
         private String retrievalMode = "vector";
         private String queryText;
         private int topK = 1;
@@ -206,6 +218,17 @@ public record QueryCacheKey(
          */
         public Builder securityContext(String securityContext) {
             this.securityContext = securityContext;
+            return this;
+        }
+
+        /**
+         * Sets the sources the request is confined to.
+         *
+         * @param sourceScope The scope, or null for every source
+         * @return This builder
+         */
+        public Builder sourceScope(SourceScope sourceScope) {
+            this.sourceScope = sourceScope;
             return this;
         }
 
@@ -360,8 +383,8 @@ public record QueryCacheKey(
          * @throws IllegalArgumentException if any bound is outside what a request may carry
          */
         public QueryCacheKey build() {
-            return new QueryCacheKey(namespace, securityContext, retrievalMode, queryText,
-                topK, offset, threshold, includePartialSegments, enableLlmScoring,
+            return new QueryCacheKey(namespace, securityContext, sourceScope, retrievalMode,
+                queryText, topK, offset, threshold, includePartialSegments, enableLlmScoring,
                 llmThreshold, oversamplingFactor, includeText, snippet, snippetChars, explain);
         }
     }

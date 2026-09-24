@@ -90,6 +90,28 @@ class NamespaceRoutingGraphIngestSinkTest {
     }
 
     @Test
+    @DisplayName("a source whose id extends another's stages into its own namespace")
+    void theMostSpecificSourceOwnsADocument(@TempDir Path root) throws IOException {
+        // A source id may contain a colon, so team:wiki:home.md begins with the key of source
+        // team as much as with that of team:wiki. The longer id is the one registered for it.
+        NamespaceId team = NamespaceId.of("team");
+        NamespaceId wiki = NamespaceId.of("wiki");
+        try (GraphTenants tenants = tenants(root, 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("team", team, "team:wiki", wiki)), oneFact());
+
+            sink.onDocumentPublished("team:wiki:home.md", "Ada knows Babbage.");
+            sink.onDocumentPublished("team:guide.md", "Ada knows Babbage.");
+
+            assertThat(staged(tenants, wiki))
+                .as("the document of team:wiki belongs in the namespace team:wiki was "
+                    + "registered in, not in that of the shorter id its key also begins with")
+                .isEqualTo(1);
+            assertThat(staged(tenants, team)).isEqualTo(1);
+        }
+    }
+
+    @Test
     @DisplayName("a namespace the node refuses stages nothing, and owes no withdrawal")
     void aRefusedNamespaceStagesNothing(@TempDir Path root) throws IOException {
         // A source registered into a namespace that was dropped since, on a node that does not

@@ -1,6 +1,6 @@
 package com.eonmux.excalibur.api.retrieval;
 
-
+import com.eonmux.excalibur.core.text.SourceScope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -59,6 +59,7 @@ public final class LexicalSignal {
      * @param service  The index to search, or null when this node keeps none
      * @param executor Where the search runs
      * @param query    The query text
+     * @param scope    The sources the search is confined to
      * @param limit    Most hits to return - {@code top_k}, not a multiple of it. A document
      *                 only BM25 returned has to out-score the weakest of the vector signal's
      *                 top-k to enter a top-k fused list, and by the reciprocal-rank arithmetic
@@ -68,7 +69,7 @@ public final class LexicalSignal {
      * @return The running search, or null when only the other signal will answer
      */
     public static LexicalSignal start(LexicalQueryService service, ExecutorService executor,
-                                      String query, int limit) {
+                                      String query, SourceScope scope, int limit) {
         if (service == null || executor == null) {
             return null;
         }
@@ -79,7 +80,7 @@ public final class LexicalSignal {
         try {
             return new LexicalSignal(service, executor.submit(() -> {
                 try {
-                    return service.search(query, limit);
+                    return service.search(query, limit, scope);
                 } finally {
                     LexicalSearchPermits.release();
                 }

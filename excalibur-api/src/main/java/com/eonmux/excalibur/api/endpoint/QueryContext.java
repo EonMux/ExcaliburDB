@@ -81,9 +81,7 @@ public record QueryContext(QuerySearchOptions options, ResultPassages passages,
         if (options.offset() == 0) {
             return parsed;
         }
-        return new QueryRequestParser.ParsedQuery(parsed.query(), depth(), parsed.threshold(),
-            parsed.timeoutMs(), parsed.includePartial(), parsed.enableLlmScoring(),
-            parsed.llmThreshold(), parsed.oversamplingFactor(), parsed.includeText());
+        return parsed.rankedTo(depth(), parsed.enableLlmScoring());
     }
 
     /**

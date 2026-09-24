@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.query.pipeline;
 
+import com.eonmux.excalibur.core.text.ChunkSources;
+import com.eonmux.excalibur.core.text.SourceScope;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker;
 import com.eonmux.excalibur.query.QueryRequest;
 import com.eonmux.excalibur.query.QueryResultItem;
@@ -34,6 +36,8 @@ import java.util.stream.Collectors;
  *   <li>For each segment, use VectorReranker to compute exact distances from full-precision vectors stored in HNSW graph</li>
  *   <li>Merge all reranked results and take top-k</li>
  *   <li>Apply DocumentAtomicityFilter to exclude partial documents</li>
+ *   <li>Keep only the chunks of the sources the request is scoped to, when it names any - see
+ *       {@link QueryRequest#sourceScope()}</li>
  *   <li>Drop results that carry no chunk identity, when the request can only use named
  *       ones - see {@link QueryRequest#requireNamedResults()}</li>
  * </ol>
@@ -65,6 +69,9 @@ final class RerankStage {
     private final double coverageThreshold;
     private final DocumentVisibilityChecker visibilityChecker;
 
+    /** Names each chunk's source, for a request scoped to some; null refuses such a request. */
+    private final ChunkSources chunkSources;
+
     /**
      * Whether Stage 4 will score this request, which decides whether this stage may truncate
      * to topK or must leave spare candidates behind. The pipeline supplies its own predicate
@@ -75,10 +82,12 @@ final class RerankStage {
     RerankStage(DistanceFunction distanceFunction,
                 double coverageThreshold,
                 DocumentVisibilityChecker visibilityChecker,
+                ChunkSources chunkSources,
                 Predicate<QueryRequest> llmScoringWillRun) {
         this.distanceFunction = distanceFunction;
         this.coverageThreshold = coverageThreshold;
         this.visibilityChecker = visibilityChecker;
+        this.chunkSources = chunkSources;
         this.llmScoringWillRun = llmScoringWillRun;
     }
 
@@ -137,12 +146,20 @@ final class RerankStage {
         int withheld = beforeAtomicityFilter - rerankedResults.size();
 
         // Before truncation, for the same reason as the atomicity filter: a dropped result is
-        // replaced by the next named one rather than leaving the page short.
+        // replaced by the next named one rather than leaving the page short. Before the scope,
+        // too, so a result with no name is reported as the damage it is rather than counted as
+        // out of scope, which would hide it on every scoped request.
         int beforeNaming = rerankedResults.size();
         if (context.request.requireNamedResults()) {
             rerankedResults = namedOnly(rerankedResults);
         }
         int unnamedDropped = beforeNaming - rerankedResults.size();
+
+        // Out of scope counts as withheld: either way a result the answer cannot use was ranked
+        // above ones it can, and the refill ranks deeper past both alike.
+        int beforeScope = rerankedResults.size();
+        rerankedResults = inScope(rerankedResults, context.request.sourceScope());
+        withheld += beforeScope - rerankedResults.size();
 
         // Step 6: Truncate to topK once the result set is final. When Stage 4 is going to
         // run, leave the oversampled list intact: its threshold filter would otherwise be
@@ -156,6 +173,38 @@ final class RerankStage {
             candidates.size(), rerankedResults.size(), beforeAtomicityFilter);
 
         return context.withRanking(rerankedResults, exhausted, unnamedDropped, withheld);
+    }
+
+    /**
+     * Keeps the results from the sources a request is scoped to.
+     *
+     * <p>Applied to the whole candidate list before it is cut to topK, for the reason the
+     * atomicity filter is: filtering the cut list returns fewer than topK whenever a refused
+     * result ranked inside it. A result carrying no chunk id cannot be placed in any source and
+     * is refused.</p>
+     *
+     * @param results The reranked results
+     * @param scope   The request's scope
+     * @return The results the scope admits, or the input unchanged for {@link SourceScope#ALL}
+     * @throws IllegalStateException if the request is scoped and this pipeline cannot say which
+     *                               source a chunk is from - answering it from every source
+     *                               would hand the caller results it excluded
+     */
+    private List<QueryResultItem> inScope(List<QueryResultItem> results, SourceScope scope) {
+        if (scope.isUnrestricted()) {
+            return results;
+        }
+        if (chunkSources == null) {
+            throw new IllegalStateException("this pipeline cannot attribute chunks to sources, "
+                + "so it cannot answer a request scoped to " + scope.sourceIds());
+        }
+        List<QueryResultItem> admitted = new ArrayList<>(results.size());
+        for (QueryResultItem item : results) {
+            if (scope.admits(item.documentIdStr(), chunkSources)) {
+                admitted.add(item);
+            }
+        }
+        return admitted;
     }
 
     /**

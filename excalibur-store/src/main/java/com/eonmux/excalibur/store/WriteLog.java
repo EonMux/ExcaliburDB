@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.store;
 
-import com.eonmux.excalibur.core.checksum.CRC32Checksum;
 import com.eonmux.excalibur.core.memory.Segment;
 import com.eonmux.excalibur.core.memory.MemorySegmentFactory;
 import com.eonmux.excalibur.store.format.LogEntry;

@@ -32,25 +32,4 @@ class ExceptionTests {
             assertThat(ex.getCause()).isEqualTo(cause);
         }
     }
-
-    @Nested
-    @DisplayName("ChecksumException Tests")
-    class ChecksumExceptionTests {
-
-        @Test
-        @DisplayName("Should create with message")
-        void shouldCreateWithMessage() {
-            ChecksumException ex = new ChecksumException("Checksum mismatch");
-            assertThat(ex.getMessage()).isEqualTo("Checksum mismatch");
-            assertThat(ex).isInstanceOf(ExcaliburException.class);
-        }
-
-        @Test
-        @DisplayName("Should create with message and cause")
-        void shouldCreateWithMessageAndCause() {
-            Throwable cause = new RuntimeException("Data corrupted");
-            ChecksumException ex = new ChecksumException("Checksum mismatch", cause);
-            assertThat(ex.getCause()).isEqualTo(cause);
-        }
-    }
 }

@@ -1,7 +1,10 @@
 package com.eonmux.excalibur.query.cache;
 
+import com.eonmux.excalibur.core.text.SourceScope;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -77,6 +80,21 @@ class QueryCacheKeyTest {
     }
 
     @Test
+    @DisplayName("requests confined to different sources do not share a key")
+    void sourceScopeSeparatesKeys() {
+        QueryCacheKey everySource = base().build();
+        QueryCacheKey team = base().sourceScope(SourceScope.of(List.of("team"))).build();
+        QueryCacheKey wiki = base().sourceScope(SourceScope.of(List.of("team:wiki"))).build();
+
+        assertThat(team).isNotEqualTo(everySource).isNotEqualTo(wiki);
+        assertThat(base().sourceScope(SourceScope.of(List.of("b", "a"))).build())
+            .as("the same sources named in another order ask the same question")
+            .isEqualTo(base().sourceScope(SourceScope.of(List.of("a", "b"))).build());
+        assertThat(team.toBuilder().build()).isEqualTo(team);
+        assertThat(team.toString()).contains("team");
+    }
+
+    @Test
     @DisplayName("requests differing only in retrieval mode do not share a key")
     void retrievalModeSeparatesKeys() {
         assertThat(base().retrievalMode("vector").build())
@@ -106,11 +124,13 @@ class QueryCacheKeyTest {
     }
 
     @Test
-    @DisplayName("an absent namespace or security context is normalised rather than null")
+    @DisplayName("an absent namespace, security context or source scope is normalised rather than null")
     void absentScopeIsNormalised() {
-        QueryCacheKey key = base().namespace(null).securityContext(null).build();
+        QueryCacheKey key =
+            base().namespace(null).securityContext(null).sourceScope(null).build();
         assertThat(key.namespace()).isEmpty();
         assertThat(key.securityContext()).isEmpty();
+        assertThat(key.sourceScope()).isEqualTo(SourceScope.ALL);
     }
 
     @Test

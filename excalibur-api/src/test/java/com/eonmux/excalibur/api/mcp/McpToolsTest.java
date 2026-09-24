@@ -50,7 +50,8 @@ class McpToolsTest {
                 McpTools.CREATE_NAMESPACE, McpTools.LIST_QUERIES, McpTools.CANCEL_QUERY,
                 McpTools.CANCEL_INGESTION, McpTools.CANCEL_REINDEX, McpTools.CANCEL_COMPACTION,
                 McpTools.CANCEL_GRAPH_BUILD, McpTools.ERASE_DOCUMENTS, McpTools.DELETE_NAMESPACE,
-                McpTools.READ_DOCUMENT, McpTools.ERASURE_STATUS);
+                McpTools.READ_DOCUMENT, McpTools.ERASURE_STATUS, McpTools.COMPACT,
+                McpTools.COMPACTION_STATUS, McpTools.LIST_SOURCES, McpTools.GRAPH_ENTITY);
         for (Object described : catalogue) {
             assertThat(Json.stringAt(described, "name")).isNotBlank();
             assertThat(Json.stringAt(described, "description"))
@@ -145,6 +146,33 @@ class McpToolsTest {
 
             assertThat(Json.at(Json.parse(node.onlyRequest().body()), "include_text"))
                 .isEqualTo(Boolean.TRUE);
+        }
+    }
+
+    @Test
+    @DisplayName("a search confined to sources sends them, and an unconfined one sends none")
+    void searchDocumentsForwardsSources() throws IOException {
+        assertThat(Json.objectAt(Json.objectAt(tool(McpTools.SEARCH_DOCUMENTS), "inputSchema"),
+            "properties")).containsKey("source_ids");
+        try (StubNode node = StubNode.start()) {
+            node.answerWith(200, "{\"results\":[],\"coverage\":{}}");
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            tools.call(McpTools.SEARCH_DOCUMENTS,
+                Map.of("query", "analytical engine", "source_ids", List.of("team", "team:wiki")));
+
+            assertThat(Json.at(Json.parse(node.onlyRequest().body()), "source_ids"))
+                .isEqualTo(List.of("team", "team:wiki"));
+        }
+        try (StubNode node = StubNode.start()) {
+            node.answerWith(200, "{\"results\":[],\"coverage\":{}}");
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            tools.call(McpTools.SEARCH_DOCUMENTS, Map.of("query", "analytical engine"));
+
+            assertThat(Json.at(Json.parse(node.onlyRequest().body()), "source_ids"))
+                .as("omitted, so the node searches every source")
+                .isNull();
         }
     }
 

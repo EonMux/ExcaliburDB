@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.ingest.registry;
 
+import com.eonmux.excalibur.core.text.ChunkIdentifiers;
 import com.eonmux.excalibur.store.hash.XxHash64;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -403,24 +404,58 @@ public final class DocumentRegistry {
     }
 
     /**
+     * Retrieves the metadata registered under a document key.
+     *
+     * <p>For a caller holding a key rather than its two halves - a chunk id names its document by
+     * key, and a source id may contain a colon, so the key cannot be split back into them. The
+     * record says which source registered it.</p>
+     *
+     * @param documentKey The {@code sourceId:documentId} key
+     * @return The document metadata, or null if not found
+     * @throws NullPointerException if documentKey is null
+     */
+    public DocumentMetadata getByKey(String documentKey) {
+        Objects.requireNonNull(documentKey, "documentKey must not be null");
+        return documents.get(documentKey);
+    }
+
+    /**
+     * Names the source a chunk was ingested from.
+     *
+     * <p>The record's own source id, not a prefix of the chunk id, which cannot tell source
+     * {@code team} from source {@code team:wiki}. Usable as a
+     * {@link com.eonmux.excalibur.core.text.ChunkSources}.</p>
+     *
+     * @param chunkId The chunk's id, {@code sourceId:documentId:chunk:N}
+     * @return The source id, or null when no registered document holds the chunk
+     * @throws NullPointerException if chunkId is null
+     */
+    public String sourceOfChunk(String chunkId) {
+        DocumentMetadata metadata = getByKey(ChunkIdentifiers.documentKeyOfChunk(chunkId));
+        return metadata == null ? null : metadata.getSourceId();
+    }
+
+    /**
      * Returns all document IDs for a specific source.
      *
      * @param sourceId The source identifier
      * @return Collection of document IDs (never null)
      * @throws NullPointerException if sourceId is null
+     * @see #getBySource(String)
      */
     public Collection<String> getDocumentIds(String sourceId) {
-        Objects.requireNonNull(sourceId, "sourceId must not be null");
-        String prefix = sourceId + KEY_SEPARATOR;
-        
-        return documents.keySet().stream()
-            .filter(key -> key.startsWith(prefix))
-            .map(key -> key.substring(prefix.length()))
+        return getBySource(sourceId).stream()
+            .map(DocumentMetadata::getDocumentId)
             .collect(Collectors.toList());
     }
 
     /**
      * Returns all metadata entries for a specific source.
+     *
+     * <p>Matched on the source each record names, not on its key. A source id may contain a
+     * colon, so {@code team:} begins the keys of source {@code team:wiki} as well as those of
+     * {@code team}, and a match on the key would hand one source's documents to the other - to
+     * a re-crawl that then reports them deleted, and to an erasure that removes them.</p>
      *
      * @param sourceId The source identifier
      * @return Collection of document metadata (never null)
@@ -429,9 +464,10 @@ public final class DocumentRegistry {
     public Collection<DocumentMetadata> getBySource(String sourceId) {
         Objects.requireNonNull(sourceId, "sourceId must not be null");
         String prefix = sourceId + KEY_SEPARATOR;
-        
+
         return documents.entrySet().stream()
-            .filter(entry -> entry.getKey().startsWith(prefix))
+            .filter(entry -> entry.getKey().startsWith(prefix)
+                && sourceId.equals(entry.getValue().getSourceId()))
             .map(Map.Entry::getValue)
             .collect(Collectors.toList());
     }

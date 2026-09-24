@@ -50,7 +50,8 @@ class RelevancyScoringTest {
     private static QueryRequestParser.ParsedQuery parsed(boolean enable, float llmThreshold,
                                                          int oversampling) {
         return new QueryRequestParser.ParsedQuery("which one", 10, 0.0f, 5_000L, true, enable,
-            llmThreshold, oversampling, false);
+            llmThreshold, oversampling, false,
+            com.eonmux.excalibur.core.text.SourceScope.ALL);
     }
 
     private static List<LexicalQueryService.Hit> hits(String... ids) {

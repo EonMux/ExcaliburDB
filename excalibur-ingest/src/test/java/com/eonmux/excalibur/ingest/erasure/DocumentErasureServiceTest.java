@@ -969,8 +969,9 @@ class DocumentErasureServiceTest {
         }
 
         @Override
-        public com.eonmux.excalibur.retrieval.rank.Ranker ranker(QueryExpander expander) {
-            return delegate.ranker(expander);
+        public com.eonmux.excalibur.retrieval.rank.Ranker ranker(QueryExpander expander,
+                java.util.function.Predicate<String> admits) {
+            return delegate.ranker(expander, admits);
         }
 
         @Override

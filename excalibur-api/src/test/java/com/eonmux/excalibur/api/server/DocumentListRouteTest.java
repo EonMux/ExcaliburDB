@@ -16,6 +16,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.Answers;
 
 import java.io.IOException;
 import java.net.HttpURLConnection;
@@ -51,7 +52,7 @@ class DocumentListRouteTest {
         SegmentCatalog catalog = new SegmentCatalog();
         indexOrchestrator = mock(IndexOrchestrator.class);
         storageEngine = mock(StorageEngine.class);
-        queryPipeline = mock(QueryPipeline.class);
+        queryPipeline = mock(QueryPipeline.class, Answers.RETURNS_SELF);
 
         EpochTickScheduler scheduler = mock(EpochTickScheduler.class);
         when(indexOrchestrator.getVisibilityTracker())

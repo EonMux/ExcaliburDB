@@ -19,6 +19,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.Answers;
 
 import java.io.IOException;
 import java.net.URI;
@@ -103,7 +104,7 @@ class RouteMethodSweepTest {
         DocumentRegistry registry = new DocumentRegistry();
 
         server = new ExcaliburDBServer(0, indexOrchestrator, storageEngine,
-            mock(QueryPipeline.class));
+            mock(QueryPipeline.class, Answers.RETURNS_SELF));
         server.withSecurity(ApiSecurityConfig.builder()
             .authToken(TOKEN)
             .readBudget(100_000, 100_000)

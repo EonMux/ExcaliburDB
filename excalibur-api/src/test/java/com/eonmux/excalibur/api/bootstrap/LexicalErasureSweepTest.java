@@ -296,7 +296,8 @@ class LexicalErasureSweepTest {
 
         @Override
         public com.eonmux.excalibur.retrieval.rank.Ranker ranker(
-                com.eonmux.excalibur.retrieval.expand.QueryExpander expander) {
+                com.eonmux.excalibur.retrieval.expand.QueryExpander expander,
+                java.util.function.Predicate<String> admits) {
             return null;
         }
 
@@ -384,7 +385,8 @@ class LexicalErasureSweepTest {
 
         @Override
         public com.eonmux.excalibur.retrieval.rank.Ranker ranker(
-                com.eonmux.excalibur.retrieval.expand.QueryExpander expander) {
+                com.eonmux.excalibur.retrieval.expand.QueryExpander expander,
+                java.util.function.Predicate<String> admits) {
             return null;
         }
 

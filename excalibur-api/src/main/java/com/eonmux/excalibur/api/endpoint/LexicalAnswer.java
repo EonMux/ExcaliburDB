@@ -9,6 +9,7 @@ import com.eonmux.excalibur.api.retrieval.LexicalCoverage;
 import com.eonmux.excalibur.api.retrieval.LexicalQueryService;
 import com.eonmux.excalibur.api.retrieval.LexicalSearchPermits;
 import com.eonmux.excalibur.api.retrieval.LexicalSignal;
+import com.eonmux.excalibur.core.text.SourceScope;
 import com.eonmux.excalibur.query.IndexCoverage;
 import com.eonmux.excalibur.query.executor.CancellationToken;
 import com.eonmux.excalibur.query.executor.QueryRegistry;
@@ -236,6 +237,11 @@ final class LexicalAnswer {
             ResponseBody.sendError(exchange, 400, "Bad Request: " + e.getMessage());
             return;
         }
+        if (!QueryEndpoint.canScope(parsed, queryPipeline)) {
+            ResponseBody.sendError(exchange, 503, ErrorCode.NOT_CONFIGURED,
+                QueryEndpoint.UNSCOPED_NODE_REASON);
+            return;
+        }
         RelevancyScoring.Plan plan = plan(parsed);
 
         // Fingerprinted before the search and stored against afterwards, for the same reason
@@ -416,11 +422,13 @@ final class LexicalAnswer {
      *
      * @param lexical The index to search
      * @param query   The query text
+     * @param scope   The sources the search is confined to
      * @param limit   How deep the search ranks
      * @return The running search, or null when it could not be started
      */
     private Future<List<LexicalQueryService.Hit>> start(LexicalQueryService lexical,
-                                                        String query, int limit) {
+                                                        String query, SourceScope scope,
+                                                        int limit) {
         // The same node-wide bound the hybrid route takes. This route is the whole answer on a
         // node that does not embed its corpus, so a bound held only by the other route leaves
         // that deployment with none: a BM25 search outlives the request's deadline, and at the
@@ -432,7 +440,7 @@ final class LexicalAnswer {
         try {
             return executorService.submit(() -> {
                 try {
-                    return lexical.search(query, limit);
+                    return lexical.search(query, limit, scope);
                 } finally {
                     // Released when the search stops, not when the request stops waiting for
                     // it. Releasing at the call site would let abandoned searches pile up
@@ -464,7 +472,8 @@ final class LexicalAnswer {
      */
     private Outcome search(LexicalQueryService lexical, QueryRequestParser.ParsedQuery parsed,
                            int limit, CancellationToken token, long deadlineNanos) {
-        Future<List<LexicalQueryService.Hit>> pending = start(lexical, parsed.query(), limit);
+        Future<List<LexicalQueryService.Hit>> pending = start(lexical, parsed.query(),
+            parsed.sourceScope(), limit);
         if (pending == null) {
             return Outcome.refused(QueryReply.error(503, ErrorCode.SATURATED,
                 "Query service is saturated"));

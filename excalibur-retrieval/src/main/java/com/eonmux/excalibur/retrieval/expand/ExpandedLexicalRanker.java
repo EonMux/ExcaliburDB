@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.retrieval.expand;
 
 import com.eonmux.excalibur.retrieval.lexical.LexicalIndex;
+import com.eonmux.excalibur.retrieval.lexical.StoredKeyFilterQuery;
 import com.eonmux.excalibur.retrieval.rank.RankedList;
 import com.eonmux.excalibur.retrieval.rank.Ranker;
 import com.eonmux.excalibur.retrieval.rank.RetrievalQuery;
@@ -29,6 +30,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Predicate;
 
 /**
  * Runs a query and its expansions against Lucene as one weighted search.
@@ -63,6 +65,9 @@ public final class ExpandedLexicalRanker implements Ranker {
     private final String name;
     private final VocabularyGate vocabulary;
 
+    /** Whether a document, by its stored key, may be returned; null admits every document. */
+    private final Predicate<String> admits;
+
     public ExpandedLexicalRanker(LexicalIndex index, QueryExpander expander) {
         this(index, expander, "lexical-expanded", VocabularyGate.permissive());
     }
@@ -81,6 +86,30 @@ public final class ExpandedLexicalRanker implements Ranker {
         this.expander = Objects.requireNonNull(expander, "expander must not be null");
         this.name = Objects.requireNonNull(name, "name must not be null");
         this.vocabulary = Objects.requireNonNull(vocabulary, "vocabulary must not be null");
+        this.admits = null;
+    }
+
+    private ExpandedLexicalRanker(ExpandedLexicalRanker base, Predicate<String> admits) {
+        this.index = base.index;
+        this.expander = base.expander;
+        this.name = base.name;
+        this.vocabulary = base.vocabulary;
+        this.admits = admits;
+    }
+
+    /**
+     * This ranker, returning only the documents a filter admits.
+     *
+     * <p>The filter is a clause of the search rather than a pass over its results - see
+     * {@link StoredKeyFilterQuery} - so the page is filled from the admitted documents, ranked as
+     * they would be without it. Only documents indexed with a caller key can be admitted.</p>
+     *
+     * @param admits Whether a document, by the key it was stored under, may be returned; null
+     *               for every document
+     * @return A ranker sharing this one's index, expander, name and gate
+     */
+    public ExpandedLexicalRanker admitting(Predicate<String> admits) {
+        return admits == this.admits ? this : new ExpandedLexicalRanker(this, admits);
     }
 
     @Override
@@ -219,7 +248,14 @@ public final class ExpandedLexicalRanker implements Ranker {
         }
         try (LexicalIndex.Lease lease = leased.get()) {
             IndexSearcher searcher = lease.searcher();
-            TopDocs top = searcher.search(builder.build(), limit);
+            Query scored = builder.build();
+            if (admits != null) {
+                scored = new BooleanQuery.Builder()
+                    .add(scored, BooleanClause.Occur.MUST)
+                    .add(new StoredKeyFilterQuery(admits), BooleanClause.Occur.FILTER)
+                    .build();
+            }
+            TopDocs top = searcher.search(scored, limit);
             StoredFields storedFields = searcher.storedFields();
             List<ScoredDocument> results = new ArrayList<>(top.scoreDocs.length);
             for (ScoreDoc hit : top.scoreDocs) {

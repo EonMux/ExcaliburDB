@@ -192,6 +192,7 @@ record QueryCacheLookup(QueryResultCache cache, QueryCacheKey key, CorpusVersion
         return QueryCacheKey.builder()
             .namespace("")
             .securityContext(securityContext(exchange))
+            .sourceScope(parsed.sourceScope())
             .retrievalMode(route)
             .queryText(parsed.query())
             .topK(parsed.topK())

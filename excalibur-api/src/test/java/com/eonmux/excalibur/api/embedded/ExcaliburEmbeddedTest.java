@@ -62,6 +62,25 @@ class ExcaliburEmbeddedTest {
             .property("excalibur.llm.chat-enabled", "false");
     }
 
+    /**
+     * Supplies the same document under {@code team} and under {@code team:wiki}, whose id extends
+     * it, plus one under {@code other} - so only attribution, not the query, tells their hits
+     * apart.
+     */
+    private static void supplyOverlappingSources(ExcaliburEmbedded db) throws Exception {
+        List<EmbeddedDocument> same = List.of(EmbeddedDocument.of("tiering.txt",
+            "Cold segments are moved to cheaper disks by the tiering policy."));
+        db.supply("team", same);
+        db.supply("team:wiki", same);
+        db.supply("other", same);
+    }
+
+    /** Asserts every hit of a scoped search is the {@code team} source's own. */
+    private static void assertOnlyTeam(SearchAnswer answer) {
+        assertThat(answer.hits()).extracting(SearchHit::chunkId)
+            .containsExactly("team:tiering.txt:chunk:0");
+    }
+
     private static List<EmbeddedDocument> handbook() {
         return List.of(
             EmbeddedDocument.of("tiering.txt",
@@ -121,6 +140,27 @@ class ExcaliburEmbeddedTest {
                     });
                 assertThat(db.documents("nothing")).isEmpty();
                 assertThat(db.dataDirectory()).isEqualTo(dataDir.toAbsolutePath());
+            }
+        }
+
+        @Test
+        @DisplayName("searches only the sources it is asked to, telling team from team:wiki")
+        void searchesWithinSources() throws Exception {
+            try (ExcaliburEmbedded db = lexicalNode().open()) {
+                supplyOverlappingSources(db);
+
+                assertThat(db.query("cold segments cheaper disks", 5).hits()).hasSize(3);
+                assertOnlyTeam(db.query("cold segments cheaper disks", 5, Duration.ofSeconds(10),
+                    List.of("team")));
+                assertThat(db.query("cold segments cheaper disks", 5, Duration.ofSeconds(10),
+                        List.of("team:wiki", "other")).hits())
+                    .extracting(SearchHit::chunkId)
+                    .containsExactlyInAnyOrder("team:wiki:tiering.txt:chunk:0",
+                        "other:tiering.txt:chunk:0");
+                assertThat(db.query("cold segments cheaper disks", 5, Duration.ofSeconds(10),
+                    List.of("nobody")).hits()).isEmpty();
+                assertThatThrownBy(() -> db.query("cold", 5, Duration.ofSeconds(10), List.of()))
+                    .isInstanceOf(IllegalArgumentException.class);
             }
         }
 
@@ -188,6 +228,36 @@ class ExcaliburEmbeddedTest {
                 assertThat(answer.route()).isEqualTo(SearchRoute.HYBRID);
                 assertThat(answer.hits().getFirst().chunkId()).isEqualTo(TIERING_CHUNK);
                 assertThat(answer.hits().getFirst().signals()).contains("vector", "bm25");
+            }
+        }
+
+        @Test
+        @DisplayName("confines both fused signals to the sources it is asked to")
+        void fusedSearchWithinSources() throws Exception {
+            try (ExcaliburEmbedded db = vectorNode(embeddings).open()) {
+                supplyOverlappingSources(db);
+
+                SearchAnswer answer = db.query("cold segments cheaper disks", 5,
+                    Duration.ofSeconds(10), List.of("team"));
+
+                assertThat(answer.route()).isEqualTo(SearchRoute.HYBRID);
+                assertOnlyTeam(answer);
+                assertThat(answer.hits().getFirst().signals()).contains("vector", "bm25");
+            }
+        }
+
+        @Test
+        @DisplayName("confines vector search alone to the sources it is asked to")
+        void vectorSearchWithinSources() throws Exception {
+            try (ExcaliburEmbedded db = vectorNode(embeddings)
+                    .property("excalibur.query.hybrid-retrieval", "false").open()) {
+                supplyOverlappingSources(db);
+
+                SearchAnswer answer = db.query("cold segments cheaper disks", 5,
+                    Duration.ofSeconds(10), List.of("team"));
+
+                assertThat(answer.route()).isEqualTo(SearchRoute.VECTOR);
+                assertOnlyTeam(answer);
             }
         }
 

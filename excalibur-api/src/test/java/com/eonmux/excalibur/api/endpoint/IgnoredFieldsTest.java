@@ -20,7 +20,8 @@ class IgnoredFieldsTest {
 
     private static QueryRequestParser.ParsedQuery parsed(boolean enableLlmScoring) {
         return new QueryRequestParser.ParsedQuery("q", 10, 0.5f, 1_000L, false,
-            enableLlmScoring, 0.7f, 3, false);
+            enableLlmScoring, 0.7f, 3, false,
+            com.eonmux.excalibur.core.text.SourceScope.ALL);
     }
 
     @Test

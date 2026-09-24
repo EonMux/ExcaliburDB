@@ -237,7 +237,22 @@ public interface ChunkIndex extends AutoCloseable {
     }
 
     /** This index's retrieval signal, using {@code expander} for the semantic work. */
-    Ranker ranker(QueryExpander expander);
+    default Ranker ranker(QueryExpander expander) {
+        return ranker(expander, null);
+    }
+
+    /**
+     * This index's retrieval signal over the chunks a filter admits.
+     *
+     * <p>The filter is applied inside the search, where its page is decided, so the page is filled
+     * from admitted chunks ranked as an unfiltered search would rank them. Filtering a page after
+     * the search comes back short whenever the best matches are refused ones.</p>
+     *
+     * @param expander The expander doing the semantic work
+     * @param admits   Whether a chunk, by its id, may be returned; null admits every chunk
+     * @return The ranker
+     */
+    Ranker ranker(QueryExpander expander, java.util.function.Predicate<String> admits);
 
     /** Which engine backs this index, for startup logging and diagnostics. */
     String engine();

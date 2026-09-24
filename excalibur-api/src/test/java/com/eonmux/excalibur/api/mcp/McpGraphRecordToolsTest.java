@@ -75,6 +75,28 @@ class McpGraphRecordToolsTest {
     }
 
     @Test
+    @DisplayName("graph_entity reads one entity, scoped by namespace, refusing a bad id first")
+    void entityReadsOne() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            assertThat(tools.call(McpTools.GRAPH_ENTITY, Map.of()).text()).contains("entity_id");
+            assertThat(tools.call(McpTools.GRAPH_ENTITY, Map.of("entity_id", -1)).isError())
+                .isTrue();
+            assertThat(node.requests()).isEmpty();
+
+            assertThat(tools.call(McpTools.GRAPH_ENTITY,
+                Map.of("entity_id", 42, "namespace", "beta")).isError()).isFalse();
+
+            StubNode.Received request = node.onlyRequest();
+            assertThat(request.method()).isEqualTo("GET");
+            assertThat(request.path()).isEqualTo("/v1/graph/entities/42");
+            assertThat(request.query()).isNull();
+            assertThat(request.headers().get(ExcaliburClient.NAMESPACE_HEADER)).isEqualTo("beta");
+        }
+    }
+
+    @Test
     @DisplayName("graph_entity_edges reads one entity's edges, checking the direction first")
     void edgesSendsItsQuery() throws IOException {
         try (StubNode node = StubNode.start()) {

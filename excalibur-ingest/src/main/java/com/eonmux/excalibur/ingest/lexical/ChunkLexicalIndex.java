@@ -420,13 +420,16 @@ public final class ChunkLexicalIndex implements ChunkIndex {
 
     @Override
     public com.eonmux.excalibur.retrieval.rank.Ranker ranker(
-            com.eonmux.excalibur.retrieval.expand.QueryExpander expander) {
+            com.eonmux.excalibur.retrieval.expand.QueryExpander expander,
+            java.util.function.Predicate<String> admits) {
         // Ungated deliberately. A term the corpus lacks matches nothing, so refusing such a
         // formulation cannot change what this ranker answers, only the work it does getting
         // there - and whether that trade pays against Lucene's own term dictionary is what the
         // bench's expansion and expansion+vocab strategies exist to measure. The native engine,
         // whose gate is the dictionary its search already reads, takes the trade.
-        return new com.eonmux.excalibur.retrieval.expand.ExpandedLexicalRanker(index, expander);
+        // Every chunk is stored under its id as the caller key, which is what the filter reads.
+        return new com.eonmux.excalibur.retrieval.expand.ExpandedLexicalRanker(index, expander)
+            .admitting(admits);
     }
 
     /**

@@ -25,6 +25,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.Answers;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -71,7 +72,7 @@ class DocumentVisibilityRouteTest {
         VisibilityTracker clock = new VisibilityTracker(catalog);
         IndexOrchestrator indexOrchestrator = mock(IndexOrchestrator.class);
         StorageEngine storageEngine = mock(StorageEngine.class);
-        QueryPipeline queryPipeline = mock(QueryPipeline.class);
+        QueryPipeline queryPipeline = mock(QueryPipeline.class, Answers.RETURNS_SELF);
         EpochTickScheduler scheduler = mock(EpochTickScheduler.class);
         when(indexOrchestrator.getVisibilityTracker()).thenReturn(clock);
         when(indexOrchestrator.getEpochTickScheduler()).thenReturn(scheduler);

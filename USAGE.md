@@ -228,12 +228,13 @@ uid `10001`, with the jar owned by `root` and read-only to the process. Nothing 
 | Heap | `-XX:MaxRAMPercentage=60.0`, so the same image is right under any `docker run -m`. Not 75%: segments live in mapped arenas outside the heap, and a heap that crowds out the page cache turns every search into a disk read |
 | Heap dumps | Written on an out-of-memory exit to `/var/lib/excalibur-diagnostics`, not the data directory. Mount a volume there to keep one past `docker rm` |
 | Operator tools | `excalibur-fsck` and `excalibur-backup` are on the `PATH`. Run them with the node stopped, against the same volume; a repair needs `/var/lib/excalibur-quarantine` mounted, and a snapshot or restore `/var/lib/excalibur-backups` — see below. A repair, snapshot or restore against a volume a node is running on is refused (exit `4` from `excalibur-fsck`, `7` from `excalibur-backup`) |
-| Health | `HEALTHCHECK` runs `/opt/excalibur/bin/excalibur-healthcheck` every 15s, with a 90s start period that covers segment recovery on a large data directory. It probes liveness, `/health`, at the URL the node recorded as `health-url=` in `/var/lib/excalibur/.excalibur-lock` once its listener was bound — so the scheme, port and bind address are always the node's own. Liveness, because a health check drives restarts, and a drained or recovering node is alive. With `tls-client-auth=need`, give it a client certificate through `EXCALIBUR_HEALTHCHECK_CLIENT_CERT` and `EXCALIBUR_HEALTHCHECK_CLIENT_KEY` |
+| Health | `HEALTHCHECK` runs `/opt/excalibur/bin/excalibur-healthcheck` every 15s, with a 90s start period that covers segment recovery on a large data directory. It probes liveness, `/health`, at the URL the node recorded as `health-url=` in `/var/lib/excalibur/.excalibur-lock` once its listener was bound — so the scheme, port and bind address are always the node's own. Liveness, because a health check drives restarts, and a drained or recovering node is alive. With `tls-client-auth=need`, give it a client certificate through `EXCALIBUR_HEALTHCHECK_CLIENT_CERT` and `EXCALIBUR_HEALTHCHECK_CLIENT_KEY`. `EXCALIBUR_HEALTHCHECK_TIMEOUT` (seconds, default 4) bounds each probe's request, and stays under the check's 5s timeout |
 | Stop | The JVM is pid 1, so `SIGTERM` reaches the shutdown hook. The hook publishes the chunk index's buffer, which is the tail of an ingestion run, and closes the storage engine. It does all of this within `excalibur.api.shutdown-timeout-seconds` (30 by default). Give it that plus 10: `--stop-timeout 40`, or `terminationGracePeriodSeconds: 40`, and more if you raise the setting |
 
 Bind-mounting a host directory instead of a named volume means `chown 10001:10001` on it first;
-the process does not run as root and will not be able to create its catalog otherwise. The same
-goes for the three other directories the image owns for its user — diagnostics, quarantine and
+the process does not run as root and will not be able to create its catalog otherwise — or build
+the image with `--build-arg EXCALIBUR_UID=<uid> --build-arg EXCALIBUR_GID=<gid>` to run it as an
+owner the host directory already has. The same goes for the three other directories the image owns for its user — diagnostics, quarantine and
 backups. None of the three is a declared `VOLUME`, deliberately: an unmounted declared volume is an
 anonymous one, which `docker run --rm` deletes with the container, taking a repair's quarantined
 files or a fresh snapshot with it. Mount each one by name when it is used:
@@ -1795,6 +1796,7 @@ curl -X POST http://localhost:8080/v1/query \
 | `explain` | bool | `false` | Say why each result was returned: `explain.signals` (each contributing signal's own rank and score) and `explain.matched_terms`. Needs chunk storage, and a query of at most 64 distinct terms; otherwise `400`. |
 | `snippet` | bool | `false` | Return the part of the passage the query matched rather than the passage from its start. Requires `include_text: true`; without it, `400`. |
 | `snippet_chars` | int | `min(320, ceiling)` | Width of that window. Requires `snippet`. Between 16 and `excalibur.api.max-result-text-chars`; outside is a `400`. |
+| `source_ids` | string[] | every source | Search only the documents of these sources, on every route and every signal. A source is told from another whose id extends it — `team` from `team:wiki` — by the source each document was ingested under, not by its id's prefix. An id the node holds no source under contributes nothing rather than failing, so a scope over only such ids answers an empty page. At least one id when present, none blank or over 256 characters, and at most 1000 of them; otherwise `400`. `null` is the same as omitting it. |
 
 ### Why no client-side vectors?
 
@@ -3968,9 +3970,10 @@ What each call does:
   neither signal refuses every query with `IllegalStateException`; `route()` on the node answers
   that before any query is made. The limits are the server's: `excalibur.api.max-query-chars`,
   `max-top-k` and `max-query-timeout-ms`, and `query(text, topK, timeout)` sets a budget below the
-  default. Each `SearchHit` carries the chunk id, its score, the signals that found it and the
-  chunk's text; `timedOut()` on the answer says the budget ran out and the hits are what was
-  found before it did.
+  default, and `query(text, topK, timeout, sourceIds)` searches only the documents of those
+  sources, as `source_ids` does on the route. Each `SearchHit` carries the chunk id, its score,
+  the signals that found it and the chunk's text; `timedOut()` on the answer says the budget ran
+  out and the hits are what was found before it did.
 - **`fetch(chunkId)`** reads a chunk's text back. **`documents()`** and **`documents(sourceId)`**
   list what the node holds, with each document's chunk ids, length and indexing time, as
   `GET /v1/documents/list` does.

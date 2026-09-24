@@ -65,7 +65,7 @@ class PipelineAnswerContractTest {
     }
 
     private static RerankStage stage() {
-        return new RerankStage(L2Distance.getInstance(), 0.5, null, r -> false);
+        return new RerankStage(L2Distance.getInstance(), 0.5, null, null, r -> false);
     }
 
     private static List<String> named(int count) {

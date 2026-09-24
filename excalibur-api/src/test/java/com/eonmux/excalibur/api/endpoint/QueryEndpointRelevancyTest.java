@@ -65,7 +65,7 @@ class QueryEndpointRelevancyTest extends QueryEndpointTestBase {
     @BeforeEach
     void setUpLexical() {
         lexical = mock(LexicalQueryService.class);
-        when(lexical.search(anyString(), anyInt())).thenAnswer(invocation -> {
+        when(lexical.search(anyString(), anyInt(), any())).thenAnswer(invocation -> {
             int limit = invocation.getArgument(1);
             searchedDepths.add(limit);
             List<LexicalQueryService.Hit> hits = new ArrayList<>();
@@ -335,7 +335,7 @@ class QueryEndpointRelevancyTest extends QueryEndpointTestBase {
             + "and not cached under the fused key")
         void vectorAloneWhenBm25Fails() throws IOException {
             ArgumentCaptor<QueryRequest> asked = pipelineAnswersAsAsked();
-            when(lexical.search(anyString(), anyInt()))
+            when(lexical.search(anyString(), anyInt(), any()))
                 .thenThrow(new IllegalStateException("index closed"));
             QueryEndpoint node = hybridNode(judging(Map.of("d4", 0.97f)));
             node.setQueryResultCache(new QueryResultCache(16));

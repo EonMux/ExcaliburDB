@@ -35,7 +35,7 @@ class RerankInFlightOnlyTest {
         DocumentVisibilityTracker tracker = new DocumentVisibilityTracker(new DocumentRegistry());
         tracker.beginIngestion("src:torn.md", 1);
         RerankStage stage = new RerankStage(L2Distance.getInstance(), 0.5,
-            new DocumentVisibilityTrackerAdapter(tracker), request -> false);
+            new DocumentVisibilityTrackerAdapter(tracker), null, request -> false);
 
         PipelineContext ranked = stage.rerank(
             searched(List.of("src:torn.md:chunk:0", "src:kept.md:chunk:0")),

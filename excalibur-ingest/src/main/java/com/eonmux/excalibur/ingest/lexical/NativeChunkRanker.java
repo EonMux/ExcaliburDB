@@ -20,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Predicate;
 
 /**
  * BM25 over the engine's own index, with the semantic work done on the query.
@@ -52,9 +53,17 @@ public final class NativeChunkRanker implements Ranker {
     private final NativeChunkIndex index;
     private final QueryExpander expander;
 
+    /** Whether a chunk, by its id, may be returned; null admits every chunk. */
+    private final Predicate<String> admits;
+
     NativeChunkRanker(NativeChunkIndex index, QueryExpander expander) {
+        this(index, expander, null);
+    }
+
+    NativeChunkRanker(NativeChunkIndex index, QueryExpander expander, Predicate<String> admits) {
         this.index = Objects.requireNonNull(index, "index must not be null");
         this.expander = expander == null ? QueryExpander.identity() : expander;
+        this.admits = admits;
     }
 
     @Override
@@ -92,7 +101,7 @@ public final class NativeChunkRanker implements Ranker {
                 at++;
             }
 
-            List<LexicalStore.Hit> hits = index.search(terms, weights, limit);
+            List<LexicalStore.Hit> hits = index.search(terms, weights, limit, admits);
             List<ScoredDocument> results = new ArrayList<>(hits.size());
             for (LexicalStore.Hit hit : hits) {
                 results.add(new ScoredDocument(index.remember(hit.key()), hit.score()));

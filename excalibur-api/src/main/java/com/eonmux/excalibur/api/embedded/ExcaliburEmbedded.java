@@ -10,6 +10,7 @@ import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.config.ConfigLoader;
 import com.eonmux.excalibur.config.ConfigValidation;
 import com.eonmux.excalibur.core.memory.ForeignMemoryBootstrap;
+import com.eonmux.excalibur.core.text.SourceScope;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.lexical.StoredChunkText;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
@@ -241,7 +242,34 @@ public final class ExcaliburEmbedded implements AutoCloseable {
     public SearchAnswer query(String text, int topK, Duration timeout) throws InterruptedException {
         requireOpen();
         Objects.requireNonNull(timeout, "timeout cannot be null");
-        return retrieval.search(text, topK, timeout.toMillis());
+        return retrieval.search(text, topK, timeout.toMillis(), SourceScope.ALL);
+    }
+
+    /**
+     * Searches the documents of some sources.
+     *
+     * <p>Ranked as {@link #query(String, int, Duration)} ranks, with every hit from one of the
+     * named sources. A source is told from another whose id extends it - {@code team} from
+     * {@code team:wiki} - by the source each document was supplied under, not by its id. An id no
+     * source is registered under contributes nothing rather than failing.</p>
+     *
+     * @param text      The query text
+     * @param topK      Most hits to return, at most {@code excalibur.api.max-top-k}
+     * @param timeout   The search's budget, at most {@code excalibur.api.max-query-timeout-ms}
+     * @param sourceIds The sources to answer from; at least one
+     * @return The hits, best first, and the route that produced them
+     * @throws IllegalArgumentException if the text is blank, a bound is violated, or sourceIds
+     *                                  is empty, names a blank id or names more than
+     *                                  {@link SourceScope#MAX_SOURCES}
+     * @throws IllegalStateException    if the node is closed, has no signal to search, or every
+     *                                  signal it has failed
+     * @throws InterruptedException     if the calling thread is interrupted while it waits
+     */
+    public SearchAnswer query(String text, int topK, Duration timeout,
+                              Collection<String> sourceIds) throws InterruptedException {
+        requireOpen();
+        Objects.requireNonNull(timeout, "timeout cannot be null");
+        return retrieval.search(text, topK, timeout.toMillis(), SourceScope.of(sourceIds));
     }
 
     /**

@@ -76,6 +76,23 @@ class QueryResultCacheEndpointTest {
     }
 
     @Test
+    @DisplayName("an answer confined to some sources is not served to another scope")
+    void sourceScopeSeparatesCachedAnswers() throws IOException {
+        when(queryPipeline.getChunkSources()).thenReturn(chunkId -> "team");
+
+        endpoint.handle(exchange("{\"query\": \"compaction\", \"top_k\": 5}"));
+        endpoint.handle(exchange(
+            "{\"query\": \"compaction\", \"top_k\": 5, \"source_ids\": [\"team\"]}"));
+        endpoint.handle(exchange(
+            "{\"query\": \"compaction\", \"top_k\": 5, \"source_ids\": [\"team:wiki\"]}"));
+        endpoint.handle(exchange(
+            "{\"query\": \"compaction\", \"top_k\": 5, \"source_ids\": [\"team\"]}"));
+
+        verify(queryPipeline, times(3))
+            .execute(any(QueryRequest.class), any(CancellationToken.class));
+    }
+
+    @Test
     @DisplayName("a repeated query is not served once the corpus has moved")
     void corpusChangeSendsTheQueryBackToThePipeline() throws IOException {
         endpoint.handle(exchange("{\"query\": \"compaction\", \"top_k\": 5}"));

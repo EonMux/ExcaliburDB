@@ -416,10 +416,11 @@ public final class NativeChunkIndex implements ChunkIndex {
     }
 
     /** Searches the published corpus at the current epoch. */
-    List<LexicalStore.Hit> search(String[] terms, double[] weights, int limit) throws IOException {
+    List<LexicalStore.Hit> search(String[] terms, double[] weights, int limit,
+                                  java.util.function.Predicate<String> admits) throws IOException {
         lock.readLock().lock();
         try {
-            return store.search(terms, weights, limit, epochs.getAsLong());
+            return store.search(terms, weights, limit, epochs.getAsLong(), admits);
         } finally {
             lock.readLock().unlock();
         }
@@ -495,8 +496,8 @@ public final class NativeChunkIndex implements ChunkIndex {
     }
 
     @Override
-    public Ranker ranker(QueryExpander expander) {
-        return new NativeChunkRanker(this, expander);
+    public Ranker ranker(QueryExpander expander, java.util.function.Predicate<String> admits) {
+        return new NativeChunkRanker(this, expander, admits);
     }
 
     @Override

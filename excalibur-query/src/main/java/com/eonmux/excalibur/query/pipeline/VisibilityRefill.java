@@ -19,6 +19,13 @@ import java.util.function.UnaryOperator;
  * paging by offset stops there - so a short answer that is not the end of the matches is a wrong
  * one.</p>
  *
+ * <p>A request scoped to some sources ({@link com.eonmux.excalibur.query.QueryRequest#sourceScope()})
+ * is refilled the same way: Stage 3 counts what it refused as out of scope among what it
+ * withheld, since either way a result the answer cannot use ranked above ones it can. There the
+ * extra depth is bounded by how little of the corpus the scope covers, and the ceiling below is
+ * what stops it: a source that is a small share of a large corpus can come back short with more
+ * to find, and the ranking then says it did not run out.</p>
+ *
  * <h2>How</h2>
  * <p>Stages 2 and 3 run again at a greater depth, over the same epoch and the same candidate
  * segments Stages 0 and 1 settled, until the answer holds topK results, the segments run dry, or

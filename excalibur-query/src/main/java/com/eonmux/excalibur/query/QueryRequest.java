@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.query;
 
+import com.eonmux.excalibur.core.text.SourceScope;
+
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Objects;
@@ -124,6 +126,11 @@ public final class QueryRequest {
      */
     private final int maxSearchDepth;
 
+    /**
+     * The sources the answer may come from.
+     */
+    private final SourceScope sourceScope;
+
     // ==================== Constructors ====================
 
     private QueryRequest(Builder builder) {
@@ -141,6 +148,7 @@ public final class QueryRequest {
         this.correlationId = builder.correlationId;
         this.requireNamedResults = builder.requireNamedResults;
         this.maxSearchDepth = builder.maxSearchDepth;
+        this.sourceScope = builder.sourceScope;
 
         validate();
     }
@@ -376,6 +384,22 @@ public final class QueryRequest {
         return Math.max(topK, maxSearchDepth);
     }
 
+    /**
+     * The sources the answer may come from.
+     *
+     * <p>A scoped search ranks the whole corpus and keeps what its sources hold, ranking deeper
+     * to fill {@link #topK()} past what it refused, within {@link #maxSearchDepth()} - the same
+     * refill that fills an answer past documents being written. A source that is a small share of
+     * a large corpus can therefore come back short of topK while it holds more: the pipeline then
+     * reports that retrieval did not run out, and nothing reads the short answer as the end of the
+     * matches.</p>
+     *
+     * @return The scope, {@link SourceScope#ALL} unless the caller named sources
+     */
+    public SourceScope sourceScope() {
+        return sourceScope;
+    }
+
     // ==================== Object Methods ====================
 
     @Override
@@ -392,6 +416,7 @@ public final class QueryRequest {
             oversamplingFactor == that.oversamplingFactor &&
             requireNamedResults == that.requireNamedResults &&
             maxSearchDepth == that.maxSearchDepth &&
+            sourceScope.equals(that.sourceScope) &&
             Objects.equals(queryText, that.queryText) &&
             Arrays.equals(queryVector, that.queryVector) &&
             Objects.equals(correlationId, that.correlationId);
@@ -401,7 +426,7 @@ public final class QueryRequest {
     public int hashCode() {
         int result = Objects.hash(queryText, topK, timeoutMs,
             includePartialSegments, threshold, enableLlmScoring, llmThreshold,
-            oversamplingFactor, correlationId, requireNamedResults, maxSearchDepth);
+            oversamplingFactor, correlationId, requireNamedResults, maxSearchDepth, sourceScope);
         result = 31 * result + Arrays.hashCode(queryVector);
         return result;
     }
@@ -409,8 +434,10 @@ public final class QueryRequest {
     @Override
     public String toString() {
         return String.format(
-            "QueryRequest{dim=%d, topK=%d, timeout=%dms, partial=%s, threshold=%.2f, oversampling=%d}",
-            queryVector.length, topK, timeoutMs, includePartialSegments, threshold, oversamplingFactor);
+            "QueryRequest{dim=%d, topK=%d, timeout=%dms, partial=%s, threshold=%.2f, oversampling=%d, "
+                + "scope=%s}",
+            queryVector.length, topK, timeoutMs, includePartialSegments, threshold, oversamplingFactor,
+            sourceScope);
     }
 
     // ==================== Builder ====================
@@ -431,6 +458,7 @@ public final class QueryRequest {
         private String correlationId;
         private boolean requireNamedResults;
         private int maxSearchDepth = MAX_TOP_K;
+        private SourceScope sourceScope = SourceScope.ALL;
 
         private Builder() {}
 
@@ -599,6 +627,19 @@ public final class QueryRequest {
                     + "]: " + maxSearchDepth);
             }
             this.maxSearchDepth = maxSearchDepth;
+            return this;
+        }
+
+        /**
+         * Sets the sources the answer may come from.
+         *
+         * @param sourceScope The scope; {@link SourceScope#ALL} for every source
+         * @return This builder
+         * @throws NullPointerException if sourceScope is null
+         * @see QueryRequest#sourceScope()
+         */
+        public Builder sourceScope(SourceScope sourceScope) {
+            this.sourceScope = Objects.requireNonNull(sourceScope, "sourceScope must not be null");
             return this;
         }
 

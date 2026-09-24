@@ -300,7 +300,10 @@ The last three are deliberately not `VOLUME`s: an unmounted declared volume is a
 which `docker run --rm` deletes with the container — a repair's quarantined evidence or a fresh
 backup gone the moment the command returns, with nothing to say so. A named volume takes the
 directory's owner when first mounted; a host directory bind-mounted in its place needs
-`chown 10001:10001` first.
+`chown 10001:10001` first. The uid and gid are build arguments, `EXCALIBUR_UID` and
+`EXCALIBUR_GID`, both `10001` by default: `docker build --build-arg EXCALIBUR_UID=1000
+--build-arg EXCALIBUR_GID=1000 .` builds an image whose user already owns a host directory
+instead.
 
 Both operator tools are on the image's `PATH`, so they are reachable at the moments anyone wants
 them — when the node will not start, and when it has been stopped to be backed up. Stop the node
@@ -366,7 +369,9 @@ wildcard — and `/opt/excalibur/bin/excalibur-healthcheck` reads it from there 
 certificate is not verified: the probe talks to the node's own socket, sends no credential and
 reads only a status code. A node that requires client certificates (`tls-client-auth=need`)
 needs the probe given one, with `EXCALIBUR_HEALTHCHECK_CLIENT_CERT` and
-`EXCALIBUR_HEALTHCHECK_CLIENT_KEY`. A tool container started with `--entrypoint` inherits the
+`EXCALIBUR_HEALTHCHECK_CLIENT_KEY`. `EXCALIBUR_HEALTHCHECK_TIMEOUT` bounds each probe's request
+in seconds, 4 by default: under the `HEALTHCHECK`'s own 5s, so a slow answer is reported by the
+probe as a failure rather than killed by Docker mid-request. Raise the two together. A tool container started with `--entrypoint` inherits the
 check as well; pass it `--no-healthcheck`, or ignore its health.
 
 ### Stopping the node
@@ -2034,6 +2039,18 @@ chunk and `highlights` locating each matched term inside it. The window is a ver
 no ellipsis, no markup — so those offsets mean something to a caller rendering them.
 `snippet_chars` sets the width, between 16 and `excalibur.api.max-result-text-chars`.
 
+`"source_ids": ["team", "notes"]` confines the search to the documents of those sources. Every
+signal applies it where its ranking is decided - BM25 inside its scorer, vector search as it
+reranks, refilling from deeper candidates when out-of-scope hits push in-scope ones off the page -
+so a scoped page is the unscoped ranking with the other sources' chunks left out, not a short
+page. Which source a chunk belongs to is read from the document registry rather than from the
+chunk id, because a source id may contain a colon: `team` does not match the documents of
+`team:wiki`. An id no source is registered under contributes nothing. How deep vector search
+refills is bounded by `excalibur.api.max-top-k`, so on a corpus where the named sources are a small
+fraction, a vector or hybrid answer can come back short with `result_total` an `at_least` bound;
+BM25 alone is never short for this reason. A node assembled without a document registry, which
+the server never is, refuses a scoped request with `503 not_configured`.
+
 Every answer carries `page` (`offset`, `limit`, `returned`, `next_offset`) and `result_total`.
 `result_total` is an object, not an integer, because the honest answer has two parts: `{"value":
 N, "relation": "exact"}` when the engine came back shallower than the depth it was searched to
@@ -3085,7 +3102,8 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `reindex_source` | **`source_id`** | Re-reads a registered source and replaces what changed |
 | `reindex_status` | `source_id` | How far a reindex has got, and whether it finished, failed or was cancelled |
 | `deregister_source` | **`source_id`** | Stops a source being crawled again; the documents already indexed stay |
-| `search_documents` | **`query`**, `top_k`, `offset`, `timeout_ms`, `snippet`, `snippet_chars` | Searches the indexed documents and returns the matching passages, best first. `offset` pages past the first `top_k`, `timeout_ms` bounds how long the search may run, and `snippet` returns a window around the match (`snippet_chars` wide) instead of the whole chunk |
+| `list_sources` | `source_id` | What each source was registered as — its type, namespace and settings — and whether the node still crawls it — `GET /v1/ingest` |
+| `search_documents` | **`query`**, `top_k`, `offset`, `timeout_ms`, `snippet`, `snippet_chars`, `source_ids` | Searches the indexed documents and returns the matching passages, best first. `offset` pages past the first `top_k`, `timeout_ms` bounds how long the search may run, `snippet` returns a window around the match (`snippet_chars` wide) instead of the whole chunk, and `source_ids` confines the search to those sources |
 | `list_documents` | `source_id`, `limit`, `cursor` | The documents the node holds, a page at a time, with each one's chunk ids |
 | `fetch_documents` | **`document_ids`** | The text of chunks by their ids, in the order asked; `null` for one the node no longer holds |
 | `read_document` | **`source_id`**, **`document_id`**, `include_text`, `limit`, `cursor` | One document whole, its chunks in order with their text unless `include_text` is `false` — `GET /v1/documents/list?document_id=` |
@@ -3093,6 +3111,8 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `cancel_query` | **`query_id`** | Cancels a running search, which then answers with no results |
 | `cancel_ingestion` | **`source_id`** | Stops a source's ingestion run in flight; the source and its documents stay |
 | `cancel_reindex` | **`source_id`** | Stops a running `reindex_source`, keeping what it had already re-indexed |
+| `compact` | `force` | Reclaims the space erased and replaced documents still hold, behind the reply — `POST /v1/compact`. `force` rewrites every segment, the thing to send after a large erasure |
+| `compaction_status` | | How the most recent compaction went — `GET /v1/compact/status` |
 | `cancel_compaction` | | Stops the compaction in progress, keeping what it had reclaimed |
 | `build_graph` | `namespace` | Publishes the staged facts as the served graph |
 | `graph_build_status` | `namespace` | How far a build has got, and what the last one published |
@@ -3104,6 +3124,7 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `erasure_status` | **`request_id`** | Where an `erase_documents` call stands — `pending`, `applied`, `discharged` or `incomplete` — by the `request_id` its reply carried; `GET /v1/erasure/{request_id}` |
 | `search_graph` | **`query`**, `context_entities`, `as_of`, `direction`, `namespace` | Asks the graph a question, optionally `as_of` a date, an instant or `all` of history, in one `direction`, and in a conversation: `context_entities` names what was mentioned, each with an optional grammatical shape and turn so a pronoun binds the right one |
 | `find_graph_entities` | `name`, `prefix`, `limit`, `cursor`, `namespace` | Finds entities in the served graph by exact name or prefix, ignoring case, with their ids and degrees — `GET /v1/graph/entities` |
+| `graph_entity` | **`entity_id`**, `namespace` | One entity with its facts counted by relation and direction, to choose which relation to page through — `GET /v1/graph/entities/{id}` |
 | `graph_entity_edges` | **`entity_id`**, `relation`, `direction`, `as_of`, `limit`, `cursor`, `namespace` | Lists one entity's facts with their intervals and provenance — `GET /v1/graph/entities/{id}/edges` |
 | `assert_graph_facts` | **`facts`** (each **`subject`**, **`relation`**, **`object`**, `valid_from`, `valid_to`, `confidence`), `namespace` | Stages facts the model states, served after the next `build_graph` — `POST /v1/graph/facts` |
 
@@ -3114,8 +3135,8 @@ Together they are the whole loop, so a model can prepare a corpus as well as que
 matters: `build_graph` has to run after ingestion finishes - it answers as soon as the build
 starts, so `graph_build_status` is how a model waits for one - and `search_graph` reports that no
 graph is being served until it has. The same holds for `assert_graph_facts`: what it states is
-served after the next `build_graph`, and `find_graph_entities` and `graph_entity_edges` read only
-the graph being served.
+served after the next `build_graph`, and `find_graph_entities`, `graph_entity` and
+`graph_entity_edges` read only the graph being served.
 
 The two ways in are not alternatives either. `ingest_documents` points the node at a directory,
 which has to be inside an allow-listed root - the right policy for a node that goes and reads
@@ -3132,7 +3153,13 @@ registered and replaces what changed - which is what a model reaching for a seco
 `ingest_documents` under the same id was trying to do, and what that call refuses with a 409.
 `deregister_source` is the way back: it stops the source being crawled again and leaves every
 document it indexed in place. Neither erases anything, and the `cancel_` tools do not either: each
-stops work in flight and keeps whatever it had already done.
+stops work in flight and keeps whatever it had already done. `list_sources` reads back what a
+source was registered as, which is how a model learns what an id points at before re-crawling or
+erasing it; changing a registration in place (`PUT /v1/ingest`) stays operator-only, and a model
+that needs different settings deregisters the source and registers it again under the same id,
+whose first crawl reconciles what is indexed with what the new settings find.
+`compact` frees the space erased and replaced documents still hold - nothing searchable changes -
+and `compaction_status` reads back how it went.
 
 Two tools do destroy data, `erase_documents` and `delete_namespace`, and both are gated the same
 way. Each requires a `confirm` argument that repeats exactly what it destroys — the `source_id`,

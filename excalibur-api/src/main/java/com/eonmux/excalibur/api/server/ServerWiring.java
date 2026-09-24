@@ -329,9 +329,20 @@ final class ServerWiring {
         this.erasureReceipts = receipts;
     }
 
-    /** @param registry What this node holds, or null to omit {@code GET /v1/documents/list} */
+    /**
+     * Records what this node holds.
+     *
+     * <p>The registry is also what places a chunk in its source, so the query pipeline is handed
+     * it here: a search scoped to some sources is refused by a pipeline that cannot tell them
+     * apart. Pipelines derived later - the atomicity wrapper, the LLM scorer - carry it on.</p>
+     *
+     * @param registry What this node holds, or null to omit {@code GET /v1/documents/list} and
+     *                 refuse source-scoped searches
+     */
     void withDocumentRegistry(DocumentRegistry registry) {
         this.documentRegistry = registry;
+        this.queryPipeline = queryPipeline.withChunkSources(
+            registry == null ? null : registry::sourceOfChunk);
     }
 
     /** @param catalog Where source registrations are recorded across restarts, or null */
@@ -560,7 +571,8 @@ final class ServerWiring {
     }
 
     /**
-     * The lexical service, withholding the documents the query pipeline withholds.
+     * The lexical service, withholding the documents the query pipeline withholds and placing
+     * chunks in sources as it does.
      *
      * <p>The checker is the wrapped pipeline's, so it is read here rather than when the service
      * was attached: ingestion hands the pipeline its checker, and the document-atomicity setting
@@ -572,6 +584,7 @@ final class ServerWiring {
     private LexicalQueryService visibleLexical() {
         LexicalQueryService service = lexicalQueryService;
         return service == null ? null
-            : service.withVisibility(queryPipeline.getVisibilityChecker());
+            : service.withVisibility(queryPipeline.getVisibilityChecker())
+                .withChunkSources(queryPipeline.getChunkSources());
     }
 }

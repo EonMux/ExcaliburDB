@@ -157,7 +157,8 @@ class StatsEndpointTest {
         }
 
         @Override
-        public Ranker ranker(QueryExpander expander) {
+        public Ranker ranker(QueryExpander expander,
+                             java.util.function.Predicate<String> admits) {
             throw new UnsupportedOperationException();
         }
 

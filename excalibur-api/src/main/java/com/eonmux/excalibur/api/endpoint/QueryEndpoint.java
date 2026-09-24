@@ -50,9 +50,14 @@ import java.util.concurrent.*;
  *   "include_text": false,
  *   "snippet": false,
  *   "snippet_chars": 320,
- *   "explain": false
+ *   "explain": false,
+ *   "source_ids": ["my-docs"]
  * }
  * }</pre>
+ *
+ * <p>{@code source_ids}, when present, confines every signal to the documents of the named
+ * sources; the answer is ranked as an unscoped one would be, with the other sources' chunks left
+ * out. See {@link QueryRequestParser} for its bounds.</p>
  *
  * <h2>Response Format</h2>
  * <pre>{@code
@@ -227,6 +232,12 @@ public class QueryEndpoint implements HttpHandler {
      * means without the response saying anything different.</p>
      */
     private final boolean hybridRetrieval;
+
+    /** Why a request naming {@code source_ids} is refused by a node that cannot honour it. */
+    static final String UNSCOPED_NODE_REASON =
+        "This node cannot confine a search to sources: it was assembled without a document "
+        + "registry, which is what records the source each document was ingested from. Omit "
+        + "source_ids to search every source.";
 
     /**
      * Why a node answers 503 to every query, and what to change.
@@ -464,6 +475,11 @@ public class QueryEndpoint implements HttpHandler {
                 // runs, and so every exit below - fused, vector, or the BM25 fallback -
                 // answers through the same page, total and explanation.
                 QueryContext context = contexts.of(requestBody, parsed);
+                if (!canScope(parsed, queryPipeline)) {
+                    ResponseBody.sendError(exchange, 503, ErrorCode.NOT_CONFIGURED,
+                        UNSCOPED_NODE_REASON);
+                    return;
+                }
 
                 LOGGER.debug("Processing query: topK={}, offset={}, timeout={}ms",
                     parsed.topK(), context.offset(), parsed.timeoutMs());
@@ -866,9 +882,7 @@ public class QueryEndpoint implements HttpHandler {
         if (!plan.runs()) {
             return context.deepened(parsed);
         }
-        return new QueryRequestParser.ParsedQuery(parsed.query(), candidates,
-            parsed.threshold(), parsed.timeoutMs(), parsed.includePartial(), false,
-            parsed.llmThreshold(), parsed.oversamplingFactor(), parsed.includeText());
+        return parsed.rankedTo(candidates, false);
     }
 
     /**
@@ -1026,7 +1040,7 @@ public class QueryEndpoint implements HttpHandler {
         if (signal == null && !timedOut && request.lexical() != null
                 && Deadline.remainingMillis(deadlineNanos) > 0) {
             signal = com.eonmux.excalibur.api.retrieval.LexicalSignal.start(request.lexical(),
-                executorService, request.parsed().query(),
+                executorService, request.parsed().query(), request.parsed().sourceScope(),
                 plan.candidates(request.context().depth()));
             startedHere = signal != null;
             if (startedHere) {
@@ -1080,7 +1094,23 @@ public class QueryEndpoint implements HttpHandler {
             return null;
         }
         return com.eonmux.excalibur.api.retrieval.LexicalSignal.start(request.lexical(),
-            executorService, request.parsed().query(), depth);
+            executorService, request.parsed().query(), request.parsed().sourceScope(), depth);
+    }
+
+    /**
+     * Whether this node can answer a request within the sources it names.
+     *
+     * <p>Asked before any search starts, so a scoped request on a node that cannot tell one
+     * source's chunks from another's is refused with the reason rather than failing inside a
+     * signal - where the vector half would degrade to an empty answer and the BM25 half to an
+     * error, and neither would say why.</p>
+     *
+     * @param parsed   The validated request
+     * @param pipeline The pipeline both signals take their attribution from
+     * @return true when the request names no sources or the node can attribute chunks to them
+     */
+    static boolean canScope(QueryRequestParser.ParsedQuery parsed, QueryPipeline pipeline) {
+        return parsed.sourceScope().isUnrestricted() || pipeline.getChunkSources() != null;
     }
 
     /**

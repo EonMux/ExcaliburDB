@@ -325,7 +325,7 @@ class QueryEndpointLexicalTest extends QueryEndpointTestBase {
                 mock(com.eonmux.excalibur.api.retrieval.LexicalQueryService.class);
             when(blocking.stats()).thenReturn(new com.eonmux.excalibur.ingest.lexical.ChunkIndexStats(
                 "test", 1, 1, 1, 0, 0, java.util.Optional.empty(), false));
-            when(blocking.search(anyString(), anyInt())).thenAnswer(invocation -> {
+            when(blocking.search(anyString(), anyInt(), any())).thenAnswer(invocation -> {
                 searching.countDown();
                 Thread.sleep(30_000);
                 return java.util.List.of();
@@ -376,7 +376,7 @@ class QueryEndpointLexicalTest extends QueryEndpointTestBase {
                 mock(com.eonmux.excalibur.api.retrieval.LexicalQueryService.class);
             when(slow.stats()).thenReturn(new com.eonmux.excalibur.ingest.lexical.ChunkIndexStats(
                 "test", 1, 1, 1, 0, 0, java.util.Optional.empty(), false));
-            when(slow.search(anyString(), anyInt())).thenAnswer(invocation -> {
+            when(slow.search(anyString(), anyInt(), any())).thenAnswer(invocation -> {
                 Thread.sleep(2_000);
                 return java.util.List.of();
             });

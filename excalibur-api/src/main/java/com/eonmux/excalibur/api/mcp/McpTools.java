@@ -156,6 +156,15 @@ public final class McpTools {
     /** Stop the compaction in progress. */
     public static final String CANCEL_COMPACTION = "cancel_compaction";
 
+    /** Reclaim the space erased and replaced documents still hold. */
+    public static final String COMPACT = "compact";
+
+    /** Read back how the most recent compaction went. */
+    public static final String COMPACTION_STATUS = "compaction_status";
+
+    /** Read back what each source was registered as. */
+    public static final String LIST_SOURCES = "list_sources";
+
     /** Stop the graph build in progress. */
     public static final String CANCEL_GRAPH_BUILD = "cancel_graph_build";
 
@@ -176,6 +185,9 @@ public final class McpTools {
 
     /** Find entities in the served graph by name, and learn their ids. */
     public static final String FIND_GRAPH_ENTITIES = "find_graph_entities";
+
+    /** One entity of the served graph, with its facts counted by relation. */
+    public static final String GRAPH_ENTITY = "graph_entity";
 
     /** List the facts the served graph holds about one entity. */
     public static final String GRAPH_ENTITY_EDGES = "graph_entity_edges";
@@ -244,7 +256,13 @@ public final class McpTools {
                     + "when passages are long and the match is deep inside them.", null),
                 ToolSchema.optional("snippet_chars", "integer",
                     "Width of each snippet in characters, from 16 up to the server's per-result "
-                    + "limit. Only with snippet true. Omit for the server's default.", null))));
+                    + "limit. Only with snippet true. Omit for the server's default.", null),
+                ToolSchema.optional("source_ids", "array",
+                    "Search only the documents of these sources, by the 'source_id' they "
+                    + "were ingested under, as " + INGESTION_STATUS + " and " + LIST_DOCUMENTS
+                    + " report it; at least one when given. A source named here "
+                    + "that the node does not hold contributes nothing. Omit to search every "
+                    + "source.", "string"))));
 
         tools.add(ToolSchema.tool(SEARCH_GRAPH,
             "Answer a question from the knowledge graph built out of the ingested documents. "
@@ -529,6 +547,20 @@ public final class McpTools {
                     "Namespace to read. Omit for the configured default, or the shared one.",
                     null))));
 
+        tools.add(ToolSchema.tool(GRAPH_ENTITY,
+            "Describe one entity of the served graph, named by the 'id' " + FIND_GRAPH_ENTITIES
+            + " returned: its name, how many facts it is the subject ('out_degree') and object "
+            + "('in_degree') of, and in 'relations' those counts broken down by relation. Read "
+            + "it before " + GRAPH_ENTITY_EDGES + " on an entity with many facts, to page "
+            + "through only the relation that matters. An id the graph does not hold is a 404.",
+            ToolSchema.object(
+                ToolSchema.required("entity_id", "integer",
+                    "The entity's 'id', as " + FIND_GRAPH_ENTITIES + " or a fact's subject or "
+                    + "object gives it."),
+                ToolSchema.optional("namespace", "string",
+                    "Namespace to read. Omit for the configured default, or the shared one.",
+                    null))));
+
         tools.add(ToolSchema.tool(GRAPH_ENTITY_EDGES,
             "List the facts the served graph holds about one entity, named by the 'id' "
             + FIND_GRAPH_ENTITIES + " returned: outgoing ones (the entity is the subject) first, "
@@ -601,6 +633,7 @@ public final class McpTools {
                     + "one.", null))));
 
         addReadingTools(tools);
+        MaintenanceTools.addTo(tools);
         addStoppingTools(tools);
         addDestructiveTools(tools);
         return tools;
@@ -846,10 +879,14 @@ public final class McpTools {
                 case CANCEL_INGESTION -> stopSource("/v1/ingest/run", args);
                 case CANCEL_REINDEX -> stopSource("/v1/reindex", args);
                 case CANCEL_COMPACTION -> answer(client.delete("/v1/compact", null));
+                case COMPACT -> answer(MaintenanceTools.compact(client, args));
+                case COMPACTION_STATUS -> answer(MaintenanceTools.compactionStatus(client));
+                case LIST_SOURCES -> answer(MaintenanceTools.listSources(client, args));
                 case CANCEL_GRAPH_BUILD -> answer(client.delete("/v1/graph/build", scope(args)));
                 case ERASE_DOCUMENTS -> eraseDocuments(args);
                 case DELETE_NAMESPACE -> deleteNamespace(args);
                 case FIND_GRAPH_ENTITIES -> findGraphEntities(args);
+                case GRAPH_ENTITY -> graphEntity(args);
                 case GRAPH_ENTITY_EDGES -> graphEntityEdges(args);
                 case ASSERT_GRAPH_FACTS -> assertGraphFacts(args);
                 default -> ToolResult.error("No such tool: " + name);
@@ -882,6 +919,7 @@ public final class McpTools {
         putWholeNumber(args, body, "timeout_ms");
         putFlag(args, body, "snippet");
         putWholeNumber(args, body, "snippet_chars");
+        putStrings(args, body, "source_ids");
         return answer(client.post("/v1/query", Json.write(body), null));
     }
 
@@ -1233,16 +1271,15 @@ public final class McpTools {
         return answer(client.get("/v1/graph/entities", query, scope(args)));
     }
 
+    private ToolResult graphEntity(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        long entityId = entityId(args);
+        return answer(client.get("/v1/graph/entities/" + entityId, Map.of(), scope(args)));
+    }
+
     private ToolResult graphEntityEdges(Map<String, Object> args)
             throws IOException, InterruptedException {
-        Long entityId = ToolArguments.wholeLong(args, "entity_id");
-        if (entityId == null) {
-            return ToolResult.error("Argument 'entity_id' is required.");
-        }
-        if (entityId < 0) {
-            return ToolResult.error("Argument 'entity_id' must not be negative, got: "
-                + entityId);
-        }
+        long entityId = entityId(args);
         Map<String, String> query = new LinkedHashMap<>();
         query.put("relation", ToolArguments.optionalString(args, "relation"));
         // Checked here as search_graph checks its direction, so a misspelt one is refused naming
@@ -1253,6 +1290,24 @@ public final class McpTools {
         putPage(args, query);
         return answer(client.get("/v1/graph/entities/" + entityId + "/edges", query,
             scope(args)));
+    }
+
+    /**
+     * Reads the entity id a graph tool puts in its path, as a whole number the node could have
+     * issued, so nothing else can reach the path.
+     *
+     * @throws IllegalArgumentException if it is missing or negative
+     */
+    private static long entityId(Map<String, Object> args) {
+        Long entityId = ToolArguments.wholeLong(args, "entity_id");
+        if (entityId == null) {
+            throw new IllegalArgumentException("Argument 'entity_id' is required.");
+        }
+        if (entityId < 0) {
+            throw new IllegalArgumentException("Argument 'entity_id' must not be negative, got: "
+                + entityId);
+        }
+        return entityId;
     }
 
     private ToolResult assertGraphFacts(Map<String, Object> args)

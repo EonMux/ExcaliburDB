@@ -26,6 +26,7 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.IntConsumer;
 import java.util.function.IntPredicate;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 /**
@@ -892,6 +893,28 @@ public final class LexicalStore implements AutoCloseable {
      */
     public List<Hit> search(String[] terms, double[] weights, int limit, long epoch)
             throws IOException {
+        return search(terms, weights, limit, epoch, null);
+    }
+
+    /**
+     * Searches every segment visible at an epoch, over the documents a filter admits.
+     *
+     * <p>The filter is applied where the ranking is decided, beside the tombstones, and for the
+     * same reason: a page cut from the best matches and filtered afterwards comes back short
+     * whenever the best matches are ones the filter refuses, while admitted documents that belong
+     * on it are never looked at. A document is judged by its name, read from the segment's key
+     * file only for a document that matches a query term.</p>
+     *
+     * @param terms   Query terms
+     * @param weights Weight per term
+     * @param limit   Results wanted
+     * @param epoch   The epoch to read at
+     * @param admits  Whether a document, by the name it was stored under, may be returned; null
+     *                admits every document
+     * @return Hits, best first, every one admitted
+     */
+    public List<Hit> search(String[] terms, double[] weights, int limit, long epoch,
+                            Predicate<String> admits) throws IOException {
         List<SegmentManifest.Entry> visible = readable(manifest.visibleAt(epoch));
         PostingsIndex.Stats stats = collectionStats(visible, terms);
         List<Hit> merged = new ArrayList<>();
@@ -910,6 +933,10 @@ public final class LexicalStore implements AutoCloseable {
             IntPredicate live = erased == null ? null
                 : replaced == null || replaced.isEmpty() ? doc -> !erased[doc]
                 : doc -> !erased[doc] || replaced.getOrDefault(doc, Long.MIN_VALUE) > epoch;
+            if (admits != null) {
+                IntPredicate named = doc -> admits.test(segmentKeys.at(doc));
+                live = live == null ? named : live.and(named);
+            }
             for (PostingsIndex.Hit hit : index.search(terms, weights, limit, stats, live)) {
                 merged.add(new Hit(segmentKeys.at(hit.docId()), hit.score()));
             }

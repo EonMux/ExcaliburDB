@@ -2,10 +2,12 @@ package com.eonmux.excalibur.api.endpoint;
 
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
+import com.eonmux.excalibur.core.text.SourceScope;
 import com.eonmux.excalibur.query.QueryOptions;
 import com.eonmux.excalibur.query.QueryRequest;
 import com.eonmux.excalibur.config.Config;
 
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -51,6 +53,8 @@ public final class QueryRequestParser {
      *
      * <p><strong>Domain Correctness:</strong> validates that:</p>
      * <ul>
+     *   <li>the body is one well-formed JSON object, so no field is read as absent because the
+     *       walk to it broke on a typo before it</li>
      *   <li>{@code query} is present, non-empty, and no longer than
      *       {@code excalibur.api.max-query-chars} - the server embeds it with the
      *       same model ingestion used, so a client-supplied vector is not accepted</li>
@@ -59,6 +63,8 @@ public final class QueryRequestParser {
      *   <li>{@code timeout_ms} is positive and within the configured maximum</li>
      *   <li>{@code oversampling_factor} is at least 1 and within the configured maximum</li>
      *   <li>{@code include_text} is a boolean, defaulting to false</li>
+     *   <li>{@code source_ids}, when present, is a non-empty array of non-blank source ids, each
+     *       within the source-id length bound, and at most {@link SourceScope#MAX_SOURCES}</li>
      * </ul>
      *
      * @param json The request body
@@ -67,6 +73,9 @@ public final class QueryRequestParser {
      * @throws IllegalStateException if the server cannot embed query text
      */
     public ParsedQuery parse(String json) {
+        // Walked whole before any field is read: source_ids confines the search, and a member
+        // the readers cannot reach would otherwise read as absent - an unconfined search.
+        JsonText.requireObject(json);
         String query = JsonText.string(json, "query");
 
         int defaultTopK = config != null
@@ -169,7 +178,51 @@ public final class QueryRequestParser {
         }
 
         return new ParsedQuery(query, topK, threshold, timeoutMs,
-            includePartial, enableLlmScoring, llmThreshold, oversamplingFactor, includeText);
+            includePartial, enableLlmScoring, llmThreshold, oversamplingFactor, includeText,
+            sourceScope(json));
+    }
+
+    /**
+     * Reads the sources a request is confined to.
+     *
+     * <p>Absent means every source. Present and empty is refused rather than read as every
+     * source: a caller that built the list from a filter that matched nothing asked for nothing,
+     * and answering from the whole corpus would hand it what it filtered out. An id no source is
+     * registered under is not refused - it scopes to nothing, as {@code /v1/documents/list}
+     * answers an unknown source with an empty page.</p>
+     *
+     * @param json The request body
+     * @return The scope, {@link SourceScope#ALL} when the field is absent or null
+     * @throws IllegalArgumentException if the field is empty, not an array of strings, names a
+     *                                  blank or over-long id, or names more than
+     *                                  {@link SourceScope#MAX_SOURCES} sources
+     */
+    private SourceScope sourceScope(String json) {
+        String[] named = JsonText.stringArray(json, "source_ids");
+        if (named == null) {
+            return SourceScope.ALL;
+        }
+        if (named.length == 0) {
+            throw new IllegalArgumentException(
+                "Field 'source_ids' must name at least one source when present");
+        }
+        // Each named source is a prefix every candidate is compared against; SourceScope.of
+        // holds the bound, and this names the field in the message.
+        if (named.length > SourceScope.MAX_SOURCES) {
+            throw new IllegalArgumentException("Field 'source_ids' must name at most "
+                + SourceScope.MAX_SOURCES + " sources: " + named.length);
+        }
+        for (String sourceId : named) {
+            if (sourceId.isBlank()) {
+                throw new IllegalArgumentException(
+                    "Field 'source_ids' must not contain a blank source id");
+            }
+            String violation = SourceIds.violation(sourceId, "source_ids");
+            if (violation != null) {
+                throw new IllegalArgumentException(violation);
+            }
+        }
+        return SourceScope.of(List.of(named));
     }
 
     /**
@@ -187,10 +240,32 @@ public final class QueryRequestParser {
      * @param llmThreshold        Minimum LLM relevancy score
      * @param oversamplingFactor  Candidate oversampling factor
      * @param includeText         Whether each result carries the text behind its identifier
+     * @param sourceScope         The sources the answer is drawn from
      */
     public record ParsedQuery(String query, int topK, float threshold,
                                long timeoutMs, boolean includePartial, boolean enableLlmScoring,
-                               float llmThreshold, int oversamplingFactor, boolean includeText) {
+                               float llmThreshold, int oversamplingFactor, boolean includeText,
+                               SourceScope sourceScope) {
+
+        /**
+         * @throws NullPointerException if sourceScope is null; {@link SourceScope#ALL} names
+         *                              every source
+         */
+        public ParsedQuery {
+            Objects.requireNonNull(sourceScope, "sourceScope must not be null");
+        }
+
+        /**
+         * The same request, ranked to another depth.
+         *
+         * @param depth            How many results to rank
+         * @param enableLlmScoring Whether Stage 4 LLM scoring runs
+         * @return The request
+         */
+        public ParsedQuery rankedTo(int depth, boolean enableLlmScoring) {
+            return new ParsedQuery(query, depth, threshold, timeoutMs, includePartial,
+                enableLlmScoring, llmThreshold, oversamplingFactor, includeText, sourceScope);
+        }
 
         /**
          * Builds the pipeline request once the embedding is available.
@@ -220,6 +295,7 @@ public final class QueryRequestParser {
                 // A client can only use a result it can name: the node id a result falls back
                 // to without one is renumbered by compaction and names nothing it can fetch.
                 .requireNamedResults(true)
+                .sourceScope(sourceScope)
                 .maxSearchDepth(Math.min(maxDepth, QueryRequest.MAX_TOP_K))
                 .build();
         }
