@@ -101,8 +101,26 @@ class AuditRouteTest {
         return new Answer(status, id);
     }
 
-    private List<Map<String, Object>> recorded() {
-        return events.list.stream()
+    /**
+     * The events recorded so far, once at least {@code expected} have arrived.
+     *
+     * <p>An event is written when the route returns, which can be after the caller has read
+     * its response, so reading the appender straight after a call races the write.</p>
+     */
+    private List<Map<String, Object>> recorded(int expected) {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+        List<ILoggingEvent> seen;
+        while (true) {
+            // The appender adds under its own monitor; copying under it sees a whole list.
+            synchronized (events) {
+                seen = List.copyOf(events.list);
+            }
+            if (seen.size() >= expected || System.nanoTime() > deadline) {
+                break;
+            }
+            Thread.onSpinWait();
+        }
+        return seen.stream()
             .map(event -> event.getKeyValuePairs().stream()
                 .collect(Collectors.toMap(pair -> pair.key, pair -> pair.value)))
             .toList();
@@ -112,11 +130,13 @@ class AuditRouteTest {
     @DisplayName("a drain and an undrain are each recorded, under the caller's request id")
     void drainIsAudited() throws IOException {
         Answer drained = call("POST", "/v1/drain", null, TOKEN, "op-42");
+        // Waited for before the next call, so the two events land in the order they were made.
+        recorded(1);
         call("DELETE", "/v1/drain", null, TOKEN, null);
 
         assertThat(drained.status()).isEqualTo(200);
         assertThat(drained.requestId()).isEqualTo("op-42");
-        List<Map<String, Object>> recorded = recorded();
+        List<Map<String, Object>> recorded = recorded(2);
         assertThat(recorded).hasSize(2);
         assertThat(recorded.get(0)).containsEntry("audit_action", "node.drain")
             .containsEntry("audit_outcome", "success")
@@ -131,7 +151,7 @@ class AuditRouteTest {
         Answer refused = call("POST", "/v1/drain", null, null, null);
 
         assertThat(refused.status()).isEqualTo(401);
-        assertThat(recorded()).singleElement().satisfies(event -> assertThat(event)
+        assertThat(recorded(1)).singleElement().satisfies(event -> assertThat(event)
             .containsEntry("audit_action", "node.drain")
             .containsEntry("audit_outcome", "unauthenticated"));
     }
@@ -142,7 +162,7 @@ class AuditRouteTest {
         Answer missing = call("DELETE", "/v1/ingest", "{\"source_id\": \"docs\"}", TOKEN, null);
 
         assertThat(missing.status()).isEqualTo(404);
-        assertThat(recorded()).singleElement().satisfies(event -> assertThat(event)
+        assertThat(recorded(1)).singleElement().satisfies(event -> assertThat(event)
             .containsEntry("audit_action", "source.deregister")
             .containsEntry("audit_outcome", "rejected")
             .containsEntry("audit_targets", Map.of("source_id", "docs")));
@@ -155,7 +175,7 @@ class AuditRouteTest {
             + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"/nowhere\"}}", TOKEN, null);
 
         assertThat(refused.status()).as("no root is allow-listed on this node").isEqualTo(403);
-        assertThat(recorded()).singleElement().satisfies(event -> assertThat(event)
+        assertThat(recorded(1)).singleElement().satisfies(event -> assertThat(event)
             .containsEntry("audit_action", "source.update")
             .containsEntry("audit_targets", Map.of("source_id", "docs",
                 "source_type", "filesystem", "namespace", "shared")));
@@ -166,7 +186,10 @@ class AuditRouteTest {
     void readsAreNotAudited() throws IOException {
         call("GET", "/v1/stats", null, TOKEN, null);
         call("GET", "/v1/drain", null, TOKEN, null);
+        // An audited call after them: once its event is in, any event the reads wrote would be too.
+        call("DELETE", "/v1/drain", null, TOKEN, null);
 
-        assertThat(events.list).isEmpty();
+        assertThat(recorded(1)).singleElement().satisfies(event -> assertThat(event)
+            .containsEntry("audit_action", "node.undrain"));
     }
 }
