@@ -88,7 +88,7 @@ class GraphRagPipelineTest {
         EdgeStoreWriter writer = new EdgeStoreWriter()
             .supersessionPolicy(SupersessionPolicy.forRelations(LIVED_IN));
 
-        Provenance curated = new Provenance(SourceType.KNOWLEDGE_BASE, 1, 98, 7);
+        Provenance curated = new Provenance(SourceType.USER_ASSERTED, 1, 98, 7);
         Provenance extracted = new Provenance(SourceType.DOCUMENT, 2, 75, 7);
 
         writer.add(ADA, COLLABORATED_WITH, BABBAGE, Integer.MIN_VALUE, TemporalFilter.OPEN, curated);
@@ -204,7 +204,7 @@ class GraphRagPipelineTest {
 
         assertThat(result.contextText())
             .as("the model must be able to tell a curated claim from an extracted one")
-            .contains("knowledge_base")
+            .contains("user_asserted")
             .contains("conf=");
     }
 

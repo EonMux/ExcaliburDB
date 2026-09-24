@@ -22,14 +22,15 @@ import com.eonmux.excalibur.retrieval.fusion.FusedDocument;
  *
  * <h2>Where the labels come from</h2>
  * From the provenance columns. An edge whose {@link SourceType} is {@link
- * SourceType#KNOWLEDGE_BASE} came from a curated statement, so for the slice of queries answered
- * entirely from such edges the correct answer is already known and no human labelling is needed.
- * That slice is what {@link #isVerifiable} identifies. It is a biased sample — curated facts are
- * cleaner than extracted ones — so a threshold fitted here is a floor, and the section below says
- * what to do about that.
+ * SourceType#USER_ASSERTED} was stated through {@code POST /v1/graph/facts} by someone who knew
+ * it, not guessed at by an extractor, so for the slice of queries answered entirely from such
+ * edges the correct answer is already known and no human labelling is needed. That slice is what
+ * {@link #isVerifiable} identifies. It is a biased sample — asserted facts are cleaner than
+ * extracted ones — so a threshold fitted here is a floor, and the section below says what to do
+ * about that.
  *
  * <h2>The bias, and what it means</h2>
- * Precision measured on curated edges overstates precision on extracted ones. A threshold fitted
+ * Precision measured on asserted edges overstates precision on extracted ones. A threshold fitted
  * here will therefore be slightly too permissive in production. Two honest responses: fit at a
  * higher target precision than actually required, or fit separately per {@link SourceType} once
  * enough labelled extracted queries exist. What is not honest is quoting the fitted precision as
@@ -200,17 +201,17 @@ public final class AbstentionCalibrator {
     /**
      * Whether a query's answer can be checked without a human.
      *
-     * <p>True when the evidence is non-empty and every edge came from a knowledge base. "Every",
-     * not "mostly": one extracted edge in an otherwise curated subgraph is enough to make the
-     * answer unverifiable, and counting it as verified would quietly put unlabelled data into the
-     * ground truth.
+     * <p>True when the evidence is non-empty and every edge was asserted through the API.
+     * "Every", not "mostly": one extracted edge in an otherwise asserted subgraph is enough to make
+     * the answer unverifiable, and counting it as verified would quietly put unlabelled data into
+     * the ground truth.
      */
     public static boolean isVerifiable(Subgraph subgraph) {
         if (subgraph == null || subgraph.edges().isEmpty()) {
             return false;
         }
         return subgraph.edges().stream()
-            .allMatch(edge -> edge.provenance().sourceType() == SourceType.KNOWLEDGE_BASE);
+            .allMatch(edge -> edge.provenance().sourceType() == SourceType.USER_ASSERTED);
     }
 
     /**

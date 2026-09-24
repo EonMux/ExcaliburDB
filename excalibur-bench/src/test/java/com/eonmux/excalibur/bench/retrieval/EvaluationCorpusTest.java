@@ -113,7 +113,7 @@ class EvaluationCorpusTest {
             LlmRelationExtractor.sourceIdOf(documentKey), 0.9, 1);
 
         assertThat(corpus.documentOf(extracted)).isEqualTo(documentKey);
-        assertThat(corpus.documentOf(Provenance.of(SourceType.CONVERSATION,
+        assertThat(corpus.documentOf(Provenance.of(SourceType.USER_ASSERTED,
             LlmRelationExtractor.sourceIdOf(documentKey), 0.9, 1)))
             .as("the same number from a conversation is not this document")
             .isNull();

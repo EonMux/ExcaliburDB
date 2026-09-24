@@ -143,13 +143,13 @@ class GraphStagingStoreTest {
         void aFactRoundTrips(@TempDir Path tempDir) throws IOException {
             try (GraphStagingStore staging = GraphStagingStore.open(tempDir)) {
                 staging.append(new ExtractedTriple("Ada", "employer", "Acme",
-                    100, 200, Provenance.of(SourceType.CONVERSATION, 77, 0.8, 3)));
+                    100, 200, Provenance.of(SourceType.USER_ASSERTED, 77, 0.8, 3)));
 
                 List<String> seen = new ArrayList<>();
                 staging.forEach((subject, relation, object, validFrom, validTo, provenance) -> {
                     assertThat(validFrom).isEqualTo(100);
                     assertThat(validTo).isEqualTo(200);
-                    assertThat(provenance.sourceType()).isEqualTo(SourceType.CONVERSATION);
+                    assertThat(provenance.sourceType()).isEqualTo(SourceType.USER_ASSERTED);
                     assertThat(provenance.sourceId()).isEqualTo(77);
                     assertThat(provenance.confidence()).isEqualTo(80);
                     assertThat(provenance.extractorVersion()).isEqualTo(3);

@@ -76,7 +76,7 @@ class ErasureTest {
                     .add(0, KNOWS, 2, Integer.MIN_VALUE, TemporalFilter.OPEN,
                         from(SourceType.DOCUMENT, 200, 1))
                     .add(0, KNOWS, 3, Integer.MIN_VALUE, TemporalFilter.OPEN,
-                        from(SourceType.CONVERSATION, 100, 1)))) {
+                        from(SourceType.USER_ASSERTED, 100, 1)))) {
 
                 RoaringBitmap tombstoned = EdgeStoreCompactor.resolve(store, List.of(
                     new ErasureRequest(1,
@@ -234,7 +234,7 @@ class ErasureTest {
             Path dir = parent.resolve("store");
             int from = 100;
             int to = 500;
-            Provenance kept = new Provenance(SourceType.KNOWLEDGE_BASE, 42, 87, 3);
+            Provenance kept = new Provenance(SourceType.USER_ASSERTED, 42, 87, 3);
 
             MappedEdgeStore store = build(dir, 4, w -> w
                 .add(0, KNOWS, 1, from, to, kept)

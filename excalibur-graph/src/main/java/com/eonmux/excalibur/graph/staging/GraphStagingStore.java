@@ -202,6 +202,15 @@ public final class GraphStagingStore implements AutoCloseable {
     /** Longest snippet recorded for one mention; see {@link EntityTextLog#MAX_SNIPPET_BYTES}. */
     public static final int MAX_SNIPPET_BYTES = EntityTextLog.MAX_SNIPPET_BYTES;
 
+    /**
+     * The extractor version recorded on every asserted fact: no extractor made it.
+     *
+     * <p>Below the version an extractor is given when none is configured, which is 1, so an
+     * extractor-scoped erasure aimed at an extractor does not reach assertions - unless the
+     * deployment numbered its extractor 0, when that erasure covers both.</p>
+     */
+    public static final int ASSERTED_EXTRACTOR_VERSION = 0;
+
     /** Suffix of the partially rewritten log an erasure builds before swapping it in. */
     private static final String ERASING_SUFFIX = ".erasing";
 
@@ -223,7 +232,8 @@ public final class GraphStagingStore implements AutoCloseable {
         TRIPLE_LOG + REWRITE_SUFFIX,
         ENTITY_TEXT_LOG + EntityTextLog.REWRITE_SUFFIX,
         ENTITY_LABELS + LabelInterner.REWRITE_SUFFIX,
-        RELATION_LABELS + LabelInterner.REWRITE_SUFFIX);
+        RELATION_LABELS + LabelInterner.REWRITE_SUFFIX,
+        FactIdFloor.REWRITE_NAME);
 
     private final Path directory;
     private final Path logPath;
@@ -232,6 +242,12 @@ public final class GraphStagingStore implements AutoCloseable {
     private final EntityTextLog text;
     private final Clock clock;
     private final Object appendLock = new Object();
+
+    /** Orders fact ids; see {@link #assertFacts}. */
+    private final Object assertionLock = new Object();
+
+    /** The last fact id handed out, or -1 until the log has been read for it. */
+    private long lastAssertionId = -1;
 
     private DataOutputStream out;
     private long staged;
@@ -470,6 +486,132 @@ public final class GraphStagingStore implements AutoCloseable {
             unsynced = true;
             recordChange();
         }
+    }
+
+    /**
+     * Stages facts a person asserted, each under a fact id of its own, and forces them to the
+     * device before handing the ids back.
+     *
+     * <h3>The fact id is the source</h3>
+     * <p>Each fact is recorded with {@link SourceType#USER_ASSERTED} provenance whose source id
+     * is its fact id, so it is a source of its own: a source-scoped erasure naming the id removes
+     * exactly that fact, from staging and from any graph built out of it, and nothing else. That
+     * is how an assertion is retracted, and why an id must never name a second fact - a
+     * retraction still owed would remove the newcomer. Ids are therefore the later of one past
+     * the last id this store handed out and the current time in microseconds since the epoch, and
+     * stay exact as JSON numbers until the year 2255. The last id is recorded in
+     * {@link FactIdFloor#FILE_NAME} before any of a batch's ids is used, so they rise across
+     * restarts even after the newest facts have been erased and the clock set back.</p>
+     *
+     * <h3>Forced before returning</h3>
+     * <p>An id handed back is a promise that the fact is kept, and a caller that goes on to
+     * retract it by that id has to find it. So the facts are forced along with the labels they
+     * named, as {@link #sync()} forces them.</p>
+     *
+     * <p>A batch is not atomic against a failure part way: the facts appended before the failure
+     * stay staged. Each is complete and correct on its own, and the failure is reported.</p>
+     *
+     * @param facts The facts, in the order to stage them
+     * @return The fact id of each, in the same order
+     * @throws IOException if a record cannot be written or forced
+     * @throws NullPointerException if {@code facts} or any fact in it is null
+     */
+    public List<Long> assertFacts(List<AssertedFact> facts) throws IOException {
+        Objects.requireNonNull(facts, "facts must not be null");
+        List<AssertedFact> batch = List.copyOf(facts);
+        List<Long> ids = assertionIds(batch.size());
+        for (int i = 0; i < batch.size(); i++) {
+            AssertedFact fact = batch.get(i);
+            append(new ExtractedTriple(fact.subject(), fact.relation(), fact.object(),
+                fact.validFrom(), fact.validTo(),
+                new Provenance(SourceType.USER_ASSERTED, ids.get(i), fact.confidence(),
+                    ASSERTED_EXTRACTOR_VERSION)));
+        }
+        sync();
+        return ids;
+    }
+
+    /**
+     * Every asserted fact still staged, in the order it was staged.
+     *
+     * <p>Read from the log, so a fact a retraction has removed from staging is not among them.</p>
+     *
+     * @return The assertions
+     * @throws IOException if the log cannot be read, or holds a record whose checksum fails
+     */
+    public List<StagedAssertion> assertions() throws IOException {
+        flush();
+        List<StagedAssertion> found = new ArrayList<>();
+        if (!Files.exists(logPath) || Files.size(logPath) < HEADER_BYTES) {
+            return found;
+        }
+        Cursor cursor = new Cursor(Files.readAllBytes(logPath), logPath);
+        while (cursor.next()) {
+            Provenance provenance = cursor.provenance;
+            if (provenance.sourceType() == SourceType.USER_ASSERTED) {
+                found.add(new StagedAssertion(provenance.sourceId(), cursor.subject,
+                    cursor.relation, cursor.object, cursor.validFrom, cursor.validTo,
+                    provenance.confidence()));
+            }
+        }
+        return found;
+    }
+
+    /**
+     * The next fact ids, recorded as handed out before they are returned; see
+     * {@link #assertFacts}.
+     *
+     * <p>An id recorded and then not used - the append after this failed - is simply never
+     * seen; it is never handed out again either.</p>
+     *
+     * @param count How many
+     * @return Ids no fact in this store has had, rising
+     * @throws IOException if the last id cannot be read or the new one cannot be recorded
+     */
+    private List<Long> assertionIds(int count) throws IOException {
+        synchronized (assertionLock) {
+            Path floor = directory.resolve(FactIdFloor.FILE_NAME);
+            if (lastAssertionId < 0) {
+                long highest = FactIdFloor.read(floor);
+                for (StagedAssertion staged : assertions()) {
+                    highest = Math.max(highest, staged.factId());
+                }
+                lastAssertionId = highest;
+            }
+            java.time.Instant now = clock.instant();
+            long micros = Math.addExact(Math.multiplyExact(now.getEpochSecond(), 1_000_000L),
+                now.getNano() / 1_000L);
+            long first = Math.max(lastAssertionId + 1, micros);
+            List<Long> ids = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                ids.add(first + i);
+            }
+            if (count > 0) {
+                FactIdFloor.write(floor, first + count - 1);
+                lastAssertionId = first + count - 1;
+            }
+            return List.copyOf(ids);
+        }
+    }
+
+    /**
+     * The id an entity label has, without giving it one.
+     *
+     * @param label The label, exactly as it was staged
+     * @return Its id, or -1 when no fact or snippet has named it
+     */
+    public int findEntity(String label) {
+        return entities.find(label);
+    }
+
+    /**
+     * The id a relation label has, without giving it one.
+     *
+     * @param label The label, exactly as it was staged
+     * @return Its id, or -1 when no fact has used it
+     */
+    public int findRelation(String label) {
+        return relations.find(label);
     }
 
     /**

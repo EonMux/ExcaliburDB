@@ -89,7 +89,7 @@ class ErasureLogTest {
             Path file = logFile(dir);
             try (ErasureLog log = ErasureLog.open(file)) {
                 log.submit(new ErasureScope.Entity(7), WHEN);
-                log.submit(new ErasureScope.Source(SourceType.CONVERSATION, 900), WHEN);
+                log.submit(new ErasureScope.Source(SourceType.USER_ASSERTED, 900), WHEN);
                 log.submit(new ErasureScope.ExtractorVersion(13), WHEN);
             }
 
@@ -97,7 +97,7 @@ class ErasureLogTest {
                 assertThat(reopened.outstanding()).extracting(ErasureRequest::scope)
                     .containsExactly(
                         new ErasureScope.Entity(7),
-                        new ErasureScope.Source(SourceType.CONVERSATION, 900),
+                        new ErasureScope.Source(SourceType.USER_ASSERTED, 900),
                         new ErasureScope.ExtractorVersion(13));
             }
         }

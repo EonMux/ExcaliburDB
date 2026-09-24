@@ -462,9 +462,24 @@ public class GraphErasureEndpoint implements HttpHandler {
             return SourceType.valueOf(value.trim().toUpperCase(Locale.ROOT));
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException(
-                "unknown source_type '" + value + "'; expected one of UNKNOWN, KNOWLEDGE_BASE, "
-                    + "DOCUMENT, CONVERSATION, USER_ASSERTED, INFERRED");
+                "unknown source_type '" + value + "'; expected one of " + sourceTypeNames());
         }
+    }
+
+    /**
+     * The source types a request may name, as it spells them.
+     *
+     * @return The names, comma-separated, in code order
+     */
+    private static String sourceTypeNames() {
+        StringBuilder names = new StringBuilder();
+        for (SourceType type : SourceType.values()) {
+            if (!names.isEmpty()) {
+                names.append(", ");
+            }
+            names.append(type.name());
+        }
+        return names.toString();
     }
 
     /**

@@ -69,7 +69,7 @@ class AbstentionTest {
         @DisplayName("a weak best score declines rather than answering")
         void weakScoreDeclines() {
             RetrievalOutcome outcome = policy.decide(
-                List.of(doc(1, 0.005, 1)), subgraphWith(SourceType.KNOWLEDGE_BASE, 90, 2));
+                List.of(doc(1, 0.005, 1)), subgraphWith(SourceType.USER_ASSERTED, 90, 2));
 
             assertThat(outcome).isInstanceOf(RetrievalOutcome.NoResults.class);
             RetrievalOutcome.NoResults declined = (RetrievalOutcome.NoResults) outcome;
@@ -83,7 +83,7 @@ class AbstentionTest {
         void clearWinnerAnswers() {
             RetrievalOutcome outcome = policy.decide(
                 List.of(doc(1, 0.05, 2), doc(2, 0.01, 1)),
-                subgraphWith(SourceType.KNOWLEDGE_BASE, 95, 3));
+                subgraphWith(SourceType.USER_ASSERTED, 95, 3));
 
             assertThat(outcome).isInstanceOf(RetrievalOutcome.Results.class);
             RetrievalOutcome.Results results = (RetrievalOutcome.Results) outcome;
@@ -98,7 +98,7 @@ class AbstentionTest {
             // a coin flip presented as an answer, and the caller can often resolve it by asking.
             RetrievalOutcome outcome = policy.decide(
                 List.of(doc(1, 0.050, 2), doc(2, 0.049, 2)),
-                subgraphWith(SourceType.KNOWLEDGE_BASE, 95, 2));
+                subgraphWith(SourceType.USER_ASSERTED, 95, 2));
 
             assertThat(outcome).isInstanceOf(RetrievalOutcome.Ambiguous.class);
             RetrievalOutcome.Ambiguous ambiguous = (RetrievalOutcome.Ambiguous) outcome;
@@ -114,7 +114,7 @@ class AbstentionTest {
             // and the evidence underneath it is guesswork.
             RetrievalOutcome outcome = policy.decide(
                 List.of(doc(1, 0.09, 2), doc(2, 0.01, 1)),
-                subgraphWith(SourceType.CONVERSATION, 20, 3));
+                subgraphWith(SourceType.DOCUMENT, 20, 3));
 
             assertThat(outcome).isInstanceOf(RetrievalOutcome.NoResults.class);
             assertThat(((RetrievalOutcome.NoResults) outcome).reason())
@@ -127,7 +127,7 @@ class AbstentionTest {
             List<FusedDocument> fused = List.of(doc(1, 0.20, 2), doc(2, 0.01, 1));
 
             RetrievalOutcome strong = policy.decide(
-                fused, subgraphWith(SourceType.KNOWLEDGE_BASE, 100, 2));
+                fused, subgraphWith(SourceType.USER_ASSERTED, 100, 2));
             RetrievalOutcome weaker = policy.decide(
                 fused, subgraphWith(SourceType.DOCUMENT, 60, 2));
 
@@ -140,7 +140,7 @@ class AbstentionTest {
         @Test
         @DisplayName("agreement between signals raises confidence over a lone signal")
         void agreementRaisesConfidence() {
-            Subgraph evidence = subgraphWith(SourceType.KNOWLEDGE_BASE, 100, 2);
+            Subgraph evidence = subgraphWith(SourceType.USER_ASSERTED, 100, 2);
 
             RetrievalOutcome lone = policy.decide(List.of(doc(1, 0.05, 1)), evidence);
             RetrievalOutcome agreed = policy.decide(List.of(doc(1, 0.05, 3)), evidence);
@@ -155,7 +155,7 @@ class AbstentionTest {
             // Nothing this policy observes justifies 1.0, and downstream code that sees 1.0 will
             // reasonably stop hedging. The ceiling has to be unreachable, not merely unusual.
             RetrievalOutcome outcome = policy.decide(
-                List.of(doc(1, 1000.0, 8)), subgraphWith(SourceType.KNOWLEDGE_BASE, 100, 2));
+                List.of(doc(1, 1000.0, 8)), subgraphWith(SourceType.USER_ASSERTED, 100, 2));
 
             double confidence = ((RetrievalOutcome.Results) outcome).confidence();
             assertThat(confidence).isBetween(0.0, 1.0).isLessThan(1.0);
@@ -180,7 +180,7 @@ class AbstentionTest {
             // separation running past the whole of the best score.
             RetrievalOutcome outcome = policy.decide(
                 List.of(doc(1, 0.30, 1), doc(2, -0.70, 1)),
-                subgraphWith(SourceType.KNOWLEDGE_BASE, 95, 2));
+                subgraphWith(SourceType.USER_ASSERTED, 95, 2));
 
             assertThat(outcome).isInstanceOf(RetrievalOutcome.Results.class);
         }
@@ -204,7 +204,7 @@ class AbstentionTest {
         @DisplayName("a single candidate is never ambiguous")
         void singleCandidateNotAmbiguous() {
             RetrievalOutcome outcome = policy.decide(
-                List.of(doc(1, 0.05, 1)), subgraphWith(SourceType.KNOWLEDGE_BASE, 95, 1));
+                List.of(doc(1, 0.05, 1)), subgraphWith(SourceType.USER_ASSERTED, 95, 1));
 
             assertThat(outcome).isInstanceOf(RetrievalOutcome.Results.class);
         }
@@ -238,9 +238,9 @@ class AbstentionTest {
         @DisplayName("only a wholly knowledge-base subgraph counts as verifiable")
         void verifiableSlice() {
             assertThat(AbstentionCalibrator.isVerifiable(
-                subgraphWith(SourceType.KNOWLEDGE_BASE, 90, 3))).isTrue();
+                subgraphWith(SourceType.USER_ASSERTED, 90, 3))).isTrue();
             assertThat(AbstentionCalibrator.isVerifiable(
-                subgraphWith(SourceType.CONVERSATION, 90, 3))).isFalse();
+                subgraphWith(SourceType.DOCUMENT, 90, 3))).isFalse();
             assertThat(AbstentionCalibrator.isVerifiable(Subgraph.empty())).isFalse();
         }
 
@@ -251,9 +251,9 @@ class AbstentionTest {
             Subgraph mixed = new Subgraph.Builder()
                 .seed(0)
                 .edge(new SubgraphEdge(0, 1, 2, 0, Integer.MIN_VALUE, TemporalFilter.OPEN,
-                    new Provenance(SourceType.KNOWLEDGE_BASE, 1, 99, 1), 1))
+                    new Provenance(SourceType.USER_ASSERTED, 1, 99, 1), 1))
                 .edge(new SubgraphEdge(0, 1, 3, 1, Integer.MIN_VALUE, TemporalFilter.OPEN,
-                    new Provenance(SourceType.CONVERSATION, 2, 40, 1), 1))
+                    new Provenance(SourceType.DOCUMENT, 2, 40, 1), 1))
                 .build();
 
             assertThat(AbstentionCalibrator.isVerifiable(mixed)).isFalse();
@@ -341,7 +341,7 @@ class AbstentionTest {
         void observeDerivesSeparation() {
             AbstentionCalibrator.LabelledOutcome observed = AbstentionCalibrator.observe(
                 List.of(doc(1, 0.10, 2), doc(2, 0.05, 1)),
-                subgraphWith(SourceType.KNOWLEDGE_BASE, 80, 2), true);
+                subgraphWith(SourceType.USER_ASSERTED, 80, 2), true);
 
             assertThat(observed.topScore()).isEqualTo(0.10);
             assertThat(observed.separation()).isCloseTo(0.5, org.assertj.core.data.Offset.offset(1e-9));
@@ -421,7 +421,7 @@ class AbstentionTest {
                                                                    boolean correct) {
             return AbstentionCalibrator.observe(
                 List.of(doc(1, top, 1), doc(2, second, 1)),
-                subgraphWith(SourceType.KNOWLEDGE_BASE, (int) Math.round(confidence * 100), 2),
+                subgraphWith(SourceType.USER_ASSERTED, (int) Math.round(confidence * 100), 2),
                 correct);
         }
 
@@ -555,7 +555,7 @@ class AbstentionTest {
             for (Query query : queries) {
                 samples.add(AbstentionCalibrator.observe(
                     List.of(doc(1, query.top(), 1), doc(2, query.second(), 1)),
-                    subgraphWith(SourceType.KNOWLEDGE_BASE, query.confidence(), 2),
+                    subgraphWith(SourceType.USER_ASSERTED, query.confidence(), 2),
                     query.correct()));
             }
 
@@ -570,7 +570,7 @@ class AbstentionTest {
             for (Query query : queries) {
                 RetrievalOutcome outcome = policy.decide(
                     List.of(doc(1, query.top(), 1), doc(2, query.second(), 1)),
-                    subgraphWith(SourceType.KNOWLEDGE_BASE, query.confidence(), 2));
+                    subgraphWith(SourceType.USER_ASSERTED, query.confidence(), 2));
                 if (outcome instanceof RetrievalOutcome.Results) {
                     answered++;
                     if (query.correct()) {

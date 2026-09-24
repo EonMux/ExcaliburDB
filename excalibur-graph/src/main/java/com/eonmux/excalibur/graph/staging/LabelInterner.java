@@ -126,6 +126,12 @@ public final class LabelInterner implements AutoCloseable {
     /** Suffix of the whole-file replacement a tombstoning rewrite builds before swapping it in. */
     static final String REWRITE_SUFFIX = ".rewriting";
 
+    /** What an erased label's placeholder starts with; see {@link #erasedLabel}. */
+    private static final String ERASED_PREFIX = "(erased ";
+
+    /** What an erased label's placeholder ends with. */
+    private static final String ERASED_SUFFIX = ")";
+
     /** What this log is called in messages. */
     private static final String WHAT = "label interner";
 
@@ -536,7 +542,34 @@ public final class LabelInterner implements AutoCloseable {
      * @return A non-blank label that names nobody
      */
     public static String erasedLabel(int id) {
-        return "(erased " + id + ")";
+        return ERASED_PREFIX + id + ERASED_SUFFIX;
+    }
+
+    /**
+     * Whether a label has the shape of an {@link #erasedLabel} placeholder, whichever id it names.
+     *
+     * <p>A placeholder stays interned under the erased id, so staging a fact under one would hand
+     * that fact to the entity that was erased: the name is gone, and the id would acquire facts
+     * again. Whatever stages facts refuses such a label rather than interning it.</p>
+     *
+     * @param label A label
+     * @return true when it reads as the placeholder of some id
+     */
+    public static boolean isErasedLabel(String label) {
+        if (label == null || !label.startsWith(ERASED_PREFIX) || !label.endsWith(ERASED_SUFFIX)) {
+            return false;
+        }
+        String digits = label.substring(ERASED_PREFIX.length(),
+            label.length() - ERASED_SUFFIX.length());
+        if (digits.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < digits.length(); i++) {
+            if (digits.charAt(i) < '0' || digits.charAt(i) > '9') {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -653,6 +686,23 @@ public final class LabelInterner implements AutoCloseable {
         synchronized (appendLock) {
             return id >= 0 && id < forced ? labels.get(id) : null;
         }
+    }
+
+    /**
+     * The id a label was assigned, without assigning one.
+     *
+     * <p>For a caller asking about a label rather than recording it: a lookup that interned would
+     * hand an id to every name anybody asked about, and ids are never taken back.</p>
+     *
+     * @param label The label, exactly as it was interned
+     * @return Its id, or -1 when it has none - never given one, or erased since
+     */
+    public int find(String label) {
+        if (label == null) {
+            return -1;
+        }
+        Integer id = ids.get(label);
+        return id == null ? -1 : id;
     }
 
     /**

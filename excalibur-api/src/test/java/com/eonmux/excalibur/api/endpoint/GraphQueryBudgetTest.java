@@ -80,11 +80,11 @@ class GraphQueryBudgetTest {
     void setUp(@TempDir Path root) throws IOException {
         EdgeStoreWriter writer = new EdgeStoreWriter();
         writer.add(ADA, COLLABORATED_WITH, BABBAGE, Integer.MIN_VALUE, TemporalFilter.OPEN,
-            new Provenance(SourceType.KNOWLEDGE_BASE, 1, 96, 7));
+            new Provenance(SourceType.USER_ASSERTED, 1, 96, 7));
         writer.add(ADA, COLLABORATED_WITH, MENABREA, Integer.MIN_VALUE, TemporalFilter.OPEN,
-            new Provenance(SourceType.KNOWLEDGE_BASE, 2, 80, 7));
+            new Provenance(SourceType.USER_ASSERTED, 2, 80, 7));
         writer.add(ADA, COLLABORATED_WITH, SOMERVILLE, Integer.MIN_VALUE, TemporalFilter.OPEN,
-            new Provenance(SourceType.KNOWLEDGE_BASE, 3, 70, 7));
+            new Provenance(SourceType.USER_ASSERTED, 3, 70, 7));
         writer.build(root.resolve("graph"), 8);
         edgeStore = MappedEdgeStore.open(root.resolve("graph"));
 

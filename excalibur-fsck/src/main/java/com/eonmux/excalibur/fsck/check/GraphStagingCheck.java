@@ -5,6 +5,7 @@ import com.eonmux.excalibur.graph.file.LogCorruptionException;
 import com.eonmux.excalibur.graph.file.LogHeader;
 import com.eonmux.excalibur.graph.file.LogInspection;
 import com.eonmux.excalibur.graph.staging.EntityTextLog;
+import com.eonmux.excalibur.graph.staging.FactIdFloor;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.graph.staging.LabelInterner;
 import com.eonmux.excalibur.graph.staging.ReferencedLabels;
@@ -80,6 +81,12 @@ import java.util.List;
  * node starts the log afresh. Any other file that short is not one the node wrote, and it refuses
  * to write after it, so it is {@link CheckStatus#CORRUPT}.</p>
  *
+ * <h2>The last fact id</h2>
+ * <p>{@link FactIdFloor#FILE_NAME} is not a log but one checksummed value: the highest fact id the
+ * namespace has handed out, read with {@link FactIdFloor#read}. It is {@link CheckStatus#INTACT}
+ * or {@link CheckStatus#CORRUPT}, and a damaged one is put to an operator like the logs: the node
+ * refuses to assert facts past it rather than risk handing out an id twice.</p>
+ *
  * <h2>The header first</h2>
  * <p>The version in the header is judged before the records are, against the range each log's
  * reader opens. A version outside it is a file the node refuses, whatever the records behind it
@@ -124,6 +131,9 @@ public final class GraphStagingCheck {
     /** Name {@link GraphStagingStore#UNPUBLISHED_MARKER} goes by in a report. */
     public static final String UNPUBLISHED_MARKER_FORMAT = "unpublished changes marker";
 
+    /** Name the record of the last fact id goes by in a report. */
+    public static final String FACT_ID_FORMAT = "graph fact id floor";
+
     private GraphStagingCheck() {
         throw new AssertionError("Utility class");
     }
@@ -164,7 +174,8 @@ public final class GraphStagingCheck {
             || GraphStagingStore.TRIPLE_LOG.equals(fileName)
             || GraphStagingStore.ENTITY_TEXT_LOG.equals(fileName)
             || ERASURE_LOG.equals(fileName)
-            || WITHDRAWAL_LOG.equals(fileName);
+            || WITHDRAWAL_LOG.equals(fileName)
+            || FactIdFloor.FILE_NAME.equals(fileName);
     }
 
     /**
@@ -238,6 +249,9 @@ public final class GraphStagingCheck {
      */
     public static FileCheck check(Path file, String relative) {
         String name = file.getFileName().toString();
+        if (FactIdFloor.FILE_NAME.equals(name)) {
+            return factIdFloor(file, relative);
+        }
         if (ERASURE_LOG.equals(name)) {
             return replayed(file, relative, "graph erasure log", "erasure requests");
         }
@@ -259,6 +273,25 @@ public final class GraphStagingCheck {
         return inspected(file, relative, new LogFormat("graph label interner",
             LabelInterner.MAGIC, LabelInterner.VERSION, LabelInterner.VERSION), "labels",
             interner -> GraphStagingStore.inspectLabels(interner, holders));
+    }
+
+    /**
+     * Checks the record of the highest fact id a namespace has handed out.
+     *
+     * @param file     The record
+     * @param relative Its path relative to the data directory
+     * @return The verdict
+     */
+    private static FileCheck factIdFloor(Path file, String relative) {
+        long size = sizeOf(file);
+        try {
+            long last = FactIdFloor.read(file);
+            return new FileCheck(file, relative, FACT_ID_FORMAT, null, CheckStatus.INTACT,
+                "matched its checksum: the highest fact id handed out is " + last, size);
+        } catch (IOException e) {
+            return new FileCheck(file, relative, FACT_ID_FORMAT, null, CheckStatus.CORRUPT,
+                e.getMessage(), size, true);
+        }
     }
 
     /**

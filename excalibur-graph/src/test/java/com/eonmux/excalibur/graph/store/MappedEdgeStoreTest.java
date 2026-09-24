@@ -614,8 +614,8 @@ class MappedEdgeStoreTest {
         @Test
         @DisplayName("provenance survives the round-trip in forward edge order")
         void provenanceRoundTrip(@TempDir Path dir) throws IOException {
-            Provenance kb = new Provenance(SourceType.KNOWLEDGE_BASE, 42L, 95, 7);
-            Provenance chat = new Provenance(SourceType.CONVERSATION, 1234L, 30, 9);
+            Provenance kb = new Provenance(SourceType.USER_ASSERTED, 42L, 95, 7);
+            Provenance chat = new Provenance(SourceType.DOCUMENT, 1234L, 30, 9);
 
             try (MappedEdgeStore store = build(dir, 3, w -> w
                     .add(0, KNOWS, 1, Integer.MIN_VALUE, TemporalFilter.OPEN, kb)
@@ -630,8 +630,8 @@ class MappedEdgeStoreTest {
         @Test
         @DisplayName("confidence spans the full byte range without wrapping")
         void confidenceRange(@TempDir Path dir) throws IOException {
-            Provenance certain = new Provenance(SourceType.KNOWLEDGE_BASE, 1L, 100, 1);
-            Provenance doubtful = new Provenance(SourceType.INFERRED, 2L, 0, 1);
+            Provenance certain = new Provenance(SourceType.USER_ASSERTED, 1L, 100, 1);
+            Provenance doubtful = new Provenance(SourceType.DOCUMENT, 2L, 0, 1);
 
             try (MappedEdgeStore store = build(dir, 3, w -> w
                     .add(0, KNOWS, 1, Integer.MIN_VALUE, TemporalFilter.OPEN, certain)

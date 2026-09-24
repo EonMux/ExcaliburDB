@@ -387,6 +387,114 @@ public final class MappedEdgeStore implements EdgeStore, MappedFootprint {
         void visit(int subject, int relation, int object, long forwardEdgeIndex);
     }
 
+    // ---------------------------------------------------------------- incident runs
+
+    /**
+     * Where an entity's edges lie in one index, optionally narrowed to one relation.
+     *
+     * <p>The forward index holds the edges an entity is the subject of, sorted by relation and
+     * then object; the reverse index the edges it is the object of, sorted by relation and then
+     * subject. Either run is therefore ordered by {@code (relation, neighbour)}, and edges that
+     * agree on both keep the order they were staged in. That order is what lets a reader page
+     * through a run by key, and resume after a rebuild at the same place: relation and entity ids
+     * are never renumbered.</p>
+     *
+     * @param entity   The entity
+     * @param reverse  The reverse index rather than the forward one
+     * @param relation The relation id to narrow to, or a negative value for every relation
+     * @return {@code {start, end}}, positions in that index, end exclusive
+     * @throws IllegalArgumentException if {@code entity} is not a valid id for this store
+     */
+    public long[] runOf(long entity, boolean reverse, int relation) {
+        int id = checkEntity(entity);
+        EdgeColumn offsets = reverse ? EdgeColumn.OFFSETS_REV : EdgeColumn.OFFSETS_FWD;
+        long start = columns.getLong(offsets, id);
+        long end = columns.getLong(offsets, id + 1L);
+        if (relation >= 0) {
+            EdgeColumn rel = reverse ? EdgeColumn.REL_REV : EdgeColumn.REL_FWD;
+            long from = lowerBound(rel, start, end, relation);
+            end = upperBound(rel, from, end, relation);
+            start = from;
+        }
+        return new long[] {start, end};
+    }
+
+    /**
+     * How many edges an entity has in one direction, over all of valid time.
+     *
+     * @param entity  The entity
+     * @param reverse Count the edges it is the object of rather than the subject of
+     * @return The count, from the offset array alone
+     * @throws IllegalArgumentException if {@code entity} is not a valid id for this store
+     */
+    public long degree(long entity, boolean reverse) {
+        long[] run = runOf(entity, reverse, -1);
+        return run[1] - run[0];
+    }
+
+    /**
+     * The relation of the edge at a position of one index.
+     *
+     * @param reverse  Which index
+     * @param position A position within it
+     * @return The relation id
+     */
+    public int relationAt(boolean reverse, long position) {
+        return columns.getInt(reverse ? EdgeColumn.REL_REV : EdgeColumn.REL_FWD, position);
+    }
+
+    /**
+     * The other endpoint of the edge at a position of one index: its object in the forward
+     * index, its subject in the reverse one.
+     *
+     * @param reverse  Which index
+     * @param position A position within it
+     * @return The neighbouring entity id
+     */
+    public int neighborAt(boolean reverse, long position) {
+        return columns.getInt(reverse ? EdgeColumn.EDGES_REV : EdgeColumn.EDGES_FWD, position);
+    }
+
+    /**
+     * The forward index of the edge at a position of one index, which is what the validity and
+     * provenance columns are addressed by.
+     *
+     * @param reverse  Which index
+     * @param position A position within it
+     * @return The edge's position in the forward index
+     */
+    public long forwardIndexAt(boolean reverse, long position) {
+        return reverse ? columns.getLong(EdgeColumn.PERM_REV, position) : position;
+    }
+
+    /**
+     * The first position of a run whose {@code (relation, neighbour)} is at or after the given
+     * pair.
+     *
+     * @param reverse  Which index
+     * @param start    Where the run starts
+     * @param end      Where it ends, exclusive
+     * @param relation The relation id of the pair
+     * @param neighbor The neighbouring entity id of the pair
+     * @return A position in {@code [start, end]}
+     */
+    public long seek(boolean reverse, long start, long end, int relation, int neighbor) {
+        long lo = start;
+        long hi = end;
+        while (lo < hi) {
+            long mid = (lo + hi) >>> 1;
+            int midRelation = relationAt(reverse, mid);
+            boolean before = midRelation < relation
+                || (midRelation == relation && neighborAt(reverse, mid) < neighbor);
+            if (before) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
     // ---------------------------------------------------------------- internals
 
     /**

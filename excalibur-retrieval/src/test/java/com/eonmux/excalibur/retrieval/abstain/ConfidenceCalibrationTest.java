@@ -320,7 +320,7 @@ class ConfidenceCalibrationTest {
         void answeredQueryIsObserved() {
             Optional<ConfidenceOutcome> observed = AbstentionCalibrator.observeConfidence(
                 policy, List.of(doc(1, 0.05, 2), doc(2, 0.01, 1)),
-                subgraphWith(SourceType.KNOWLEDGE_BASE, 95, 3), true);
+                subgraphWith(SourceType.USER_ASSERTED, 95, 3), true);
 
             assertThat(observed).isPresent();
             assertThat(observed.get().correct()).isTrue();
@@ -332,7 +332,7 @@ class ConfidenceCalibrationTest {
         void refusalIsNotObserved() {
             Optional<ConfidenceOutcome> observed = AbstentionCalibrator.observeConfidence(
                 policy, List.of(doc(1, 0.005, 1)),
-                subgraphWith(SourceType.KNOWLEDGE_BASE, 90, 2), false);
+                subgraphWith(SourceType.USER_ASSERTED, 90, 2), false);
 
             assertThat(observed).isEmpty();
         }
@@ -342,7 +342,7 @@ class ConfidenceCalibrationTest {
         void ambiguityIsNotObserved() {
             Optional<ConfidenceOutcome> observed = AbstentionCalibrator.observeConfidence(
                 policy, List.of(doc(1, 0.050, 1), doc(2, 0.049, 1)),
-                subgraphWith(SourceType.KNOWLEDGE_BASE, 90, 2), true);
+                subgraphWith(SourceType.USER_ASSERTED, 90, 2), true);
 
             assertThat(observed).isEmpty();
         }
@@ -369,7 +369,7 @@ class ConfidenceCalibrationTest {
         @DisplayName("the reported confidence is scaled")
         void confidenceIsScaled() {
             List<FusedDocument> fused = List.of(doc(1, 0.05, 2), doc(2, 0.01, 1));
-            Subgraph evidence = subgraphWith(SourceType.KNOWLEDGE_BASE, 95, 3);
+            Subgraph evidence = subgraphWith(SourceType.USER_ASSERTED, 95, 3);
 
             double raw = ((RetrievalOutcome.Results) delegate.decide(fused, evidence)).confidence();
             double calibrated = ((RetrievalOutcome.Results) AbstentionCalibrator
@@ -391,7 +391,7 @@ class ConfidenceCalibrationTest {
                 List.of(doc(1, 0.05, 2), doc(2, 0.01, 1)));
 
             for (List<FusedDocument> fused : cases) {
-                Subgraph evidence = subgraphWith(SourceType.KNOWLEDGE_BASE, 95, 3);
+                Subgraph evidence = subgraphWith(SourceType.USER_ASSERTED, 95, 3);
                 assertThat(calibrated.decide(fused, evidence))
                     .as("case %s", fused)
                     .hasSameClassAs(delegate.decide(fused, evidence));
@@ -414,7 +414,7 @@ class ConfidenceCalibrationTest {
         void ambiguityPassesThrough() {
             List<FusedDocument> fused = List.of(doc(1, 0.050, 1), doc(2, 0.049, 1));
             RetrievalOutcome outcome = AbstentionCalibrator.toPolicy(delegate, softening)
-                .decide(fused, subgraphWith(SourceType.KNOWLEDGE_BASE, 90, 2));
+                .decide(fused, subgraphWith(SourceType.USER_ASSERTED, 90, 2));
 
             assertThat(outcome).isInstanceOf(RetrievalOutcome.Ambiguous.class);
             assertThat(((RetrievalOutcome.Ambiguous) outcome).candidates().get(0).score())
@@ -426,7 +426,7 @@ class ConfidenceCalibrationTest {
         @DisplayName("a bare temperature is enough, because that is all a node configures")
         void bareTemperatureIsEnough() {
             List<FusedDocument> fused = List.of(doc(1, 0.05, 2), doc(2, 0.01, 1));
-            Subgraph evidence = subgraphWith(SourceType.KNOWLEDGE_BASE, 95, 3);
+            Subgraph evidence = subgraphWith(SourceType.USER_ASSERTED, 95, 3);
 
             double fromFit = ((RetrievalOutcome.Results) AbstentionCalibrator
                 .toPolicy(delegate, softening).decide(fused, evidence)).confidence();
@@ -441,7 +441,7 @@ class ConfidenceCalibrationTest {
         @DisplayName("the neutral temperature is the identity, so opting out costs nothing")
         void neutralTemperatureIsIdentity() {
             List<FusedDocument> fused = List.of(doc(1, 0.05, 2), doc(2, 0.01, 1));
-            Subgraph evidence = subgraphWith(SourceType.KNOWLEDGE_BASE, 95, 3);
+            Subgraph evidence = subgraphWith(SourceType.USER_ASSERTED, 95, 3);
 
             double raw = ((RetrievalOutcome.Results) delegate.decide(fused, evidence)).confidence();
             double neutral = ((RetrievalOutcome.Results) new CalibratedAbstentionPolicy(

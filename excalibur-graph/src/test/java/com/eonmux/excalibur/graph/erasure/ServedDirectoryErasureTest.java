@@ -405,7 +405,7 @@ class ServedDirectoryErasureTest {
         MappedEdgeStore store = servedGraph(dir);
         Recording recording = new Recording();
         List<ErasureRequest> withdraw = List.of(new ErasureRequest(7,
-            new ErasureScope.Source(com.eonmux.excalibur.graph.provenance.SourceType.CONVERSATION, 99),
+            new ErasureScope.Source(com.eonmux.excalibur.graph.provenance.SourceType.USER_ASSERTED, 99),
             Instant.now()));
 
         EdgeStoreCompactor.CompactionResult result = EdgeStoreCompactor.compact(store, dir,

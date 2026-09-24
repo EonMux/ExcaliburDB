@@ -102,6 +102,15 @@ public class GraphQueryEndpoint implements HttpHandler {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(GraphQueryEndpoint.class);
 
+    /**
+     * What a namespace with no graph being served is told, whatever the reason: never built,
+     * damaged, or withheld until an interrupted erasure has been applied. Shared with the
+     * structured read routes, which must not tell those cases apart where the query does not.
+     */
+    static final String NO_GRAPH = "No graph is being served for this namespace. One is built "
+        + "automatically once facts are staged, unless excalibur.graph.auto-build-enabled is "
+        + "off; POST /v1/graph/build builds one now";
+
     /** The {@code as_of} value asking for the whole history rather than a snapshot. */
     private static final String ALL_HISTORY = "all";
 
@@ -450,9 +459,7 @@ public class GraphQueryEndpoint implements HttpHandler {
      * @return The refusal
      */
     private static Reply noGraph() {
-        return new Reply(503,
-            "{\"error\":\"No graph is being served for this namespace; POST "
-                + "/v1/graph/build to build one from the facts ingestion has staged\"}");
+        return new Reply(503, "{\"error\":" + quoted(NO_GRAPH) + "}");
     }
 
     /**
