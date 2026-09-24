@@ -121,6 +121,9 @@ public final class GraphStagingCheck {
     /** Name the marker goes by in a report. */
     public static final String MARKER_FORMAT = "erasure interrupted marker";
 
+    /** Name {@link GraphStagingStore#UNPUBLISHED_MARKER} goes by in a report. */
+    public static final String UNPUBLISHED_MARKER_FORMAT = "unpublished changes marker";
+
     private GraphStagingCheck() {
         throw new AssertionError("Utility class");
     }
@@ -176,22 +179,52 @@ public final class GraphStagingCheck {
      * @return The verdict
      */
     public static FileCheck marker(Path file, String relative) {
+        return emptyMarker(file, relative, MARKER_FORMAT,
+            "the tenant's graph is withheld until the erasures it still owes have been applied "
+                + "to it, which the node does on its next open or compaction before it serves "
+                + "the graph, removing the marker once they are");
+    }
+
+    /**
+     * Checks the marker that says staging holds changes the served graph does not have.
+     *
+     * <p>Written empty and read only for whether it is there, like the interrupted-erasure
+     * marker, and judged the same way.</p>
+     *
+     * @param file     The marker
+     * @param relative Its path relative to the data directory
+     * @return The verdict
+     */
+    public static FileCheck unpublishedMarker(Path file, String relative) {
+        return emptyMarker(file, relative, UNPUBLISHED_MARKER_FORMAT,
+            "the tenant's served graph is behind its staged facts, which the node's automatic "
+                + "build or POST /v1/graph/build publishes, removing the marker once it has");
+    }
+
+    /**
+     * Judges a marker whose presence is its whole content.
+     *
+     * @param file     The marker
+     * @param relative Its path relative to the data directory
+     * @param format   What the marker is called in a report
+     * @param meaning  What its presence says
+     * @return The verdict
+     */
+    private static FileCheck emptyMarker(Path file, String relative, String format,
+                                         String meaning) {
         long size;
         try {
             size = Files.size(file);
         } catch (IOException e) {
-            return new FileCheck(file, relative, MARKER_FORMAT, null, CheckStatus.UNREADABLE,
+            return new FileCheck(file, relative, format, null, CheckStatus.UNREADABLE,
                 "the marker could not be sized: " + e, -1);
         }
-        String meaning = "the tenant's graph is withheld until the erasures it still owes have "
-            + "been applied to it, which the node does on its next open or compaction before it "
-            + "serves the graph, removing the marker once they are";
         if (size == 0) {
-            return new FileCheck(file, relative, MARKER_FORMAT, null, CheckStatus.INTACT,
+            return new FileCheck(file, relative, format, null, CheckStatus.INTACT,
                 "empty, as written: its presence is its whole content, and says " + meaning,
                 size);
         }
-        return new FileCheck(file, relative, MARKER_FORMAT, null, CheckStatus.UNCHECKED,
+        return new FileCheck(file, relative, format, null, CheckStatus.UNCHECKED,
             "holds " + size + " bytes, which the node never writes and never reads; its presence "
                 + "still says " + meaning, size);
     }

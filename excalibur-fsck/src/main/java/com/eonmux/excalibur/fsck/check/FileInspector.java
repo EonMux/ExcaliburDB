@@ -137,6 +137,7 @@ public final class FileInspector {
             case LSH_TABLE -> LshTableCheck.check(file, relative);
             case GRAPH_STAGING_LOG -> GraphStagingCheck.check(file, relative);
             case GRAPH_ERASURE_MARKER -> GraphStagingCheck.marker(file, relative);
+            case GRAPH_UNPUBLISHED_MARKER -> GraphStagingCheck.unpublishedMarker(file, relative);
             case GRAPH_STORE_PART -> unverifiable(file, relative, GraphStoreCheck.FORMAT,
                 "this file sits in a tenant's graph directory and is judged with the graph as a "
                     + "whole, which records what each of its files must hold; taken alone it "

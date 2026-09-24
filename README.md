@@ -179,7 +179,8 @@ is why it is off by default:
 excalibur.graph.extraction-enabled=true
 ```
 
-Ingest, wait for `idle`, then publish what was staged and ask:
+Ingest and wait for `idle`. The node publishes what was staged by itself, a minute after
+ingestion goes quiet; to publish it now instead, ask for the build, then ask the graph:
 
 ```bash
 curl -X POST http://localhost:8080/v1/graph/build
@@ -844,6 +845,13 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.graph.cold-namespaces` | *(empty)* | Comma-separated namespaces evicted before any other, whatever their recency — for a bulk import or an idle tenant. Naming one in both lists refuses to start |
 | `excalibur.graph.erasure-tombstone-ratio` | 0.2 | Tombstoned fraction of the store at which a compaction becomes worthwhile. Above 0, at most 1 |
 | `excalibur.graph.erasure-max-latency-seconds` | 3600 | Longest an erasure obligation waits before a compaction runs regardless. Checked every tenth of it by a sweep over **every namespace on disk**, so the bound holds on an idle node and on an evicted tenant nobody is querying. The sweep reads each non-resident namespace's erasure log — a small append-only file, not a served store — and reopens only the tenants whose oldest obligation has passed the bound, at most four per pass, oldest first; a longer backlog is logged at WARN, because the node is then not meeting its deadline. At least 1 |
+| `excalibur.graph.auto-build-enabled` | true | Rebuild each namespace whose served graph is behind its staging without being asked. Off, a graph changes only when `POST /v1/graph/build` asks. See [Keeping the graph current](#keeping-the-graph-current) |
+| `excalibur.graph.auto-build-interval-seconds` | 30 | How often every namespace on disk is checked for changes its graph does not have. At least 1 |
+| `excalibur.graph.auto-build-debounce-seconds` | 60 | How long a namespace's staging must be quiet before it is rebuilt, so a crawl is published by one build rather than one per document. At least 0 |
+| `excalibur.graph.auto-build-max-delay-seconds` | 900 | Longest an unpublished change waits however busy staging stays: past it the namespace is rebuilt without waiting for quiet. At least 1 |
+| `excalibur.graph.auto-build-max-concurrent` | 1 | Most automatic builds at once across the node. At least 1 |
+| `excalibur.graph.auto-build-failure-backoff-seconds` | 60 | Wait after a failed automatic build before the namespace is tried again, doubling with each further failure. At least 1 |
+| `excalibur.graph.auto-build-max-failure-backoff-seconds` | 3600 | Longest that wait grows to. At least `excalibur.graph.auto-build-failure-backoff-seconds` |
 | `excalibur.graph.top-k` | 10 | Documents each retrieval signal contributes before fusion. At least 1 |
 | `excalibur.graph.rerank-over-fetch` | 4 | Candidates the full-precision reranker reads per result it returns. Reranking can only reorder what it is given, so this is what lets an entity that term overlap ranked poorly be rescued by its vector. At least 1 |
 | `excalibur.graph.max-frontier` | 1000 | Most new entities one hop of a graph walk admits. When a hop reaches more, it keeps those reached along the strongest edge — highest extraction confidence, then latest valid-time start, then lowest entity id — so a hub cannot make one question read the graph, and a capped answer is the same every time. The entities the question named are always admitted. At least 1 |
@@ -1418,9 +1426,47 @@ tidy up a corpus would have every reason to reach for them.
 ### The graph store
 
 The node builds its own graph from what it ingests. Ingestion extracts facts from each published
-document and stages them; `POST /v1/graph/build` turns everything staged into the store and starts
-serving it, without a restart. A node that has ingested but never built answers `/v1/graph/query`
-with 503 and says so, rather than 404 — the capability is there, the data is not yet.
+document and stages them; a build turns everything staged into the store and starts serving it,
+without a restart. The node runs one by itself once a namespace's graph falls behind its staging
+(see [Keeping the graph current](#keeping-the-graph-current)), and `POST /v1/graph/build` runs one
+now. A node that has ingested but never built answers `/v1/graph/query` with 503 and says so,
+rather than 404 — the capability is there, the data is not yet.
+
+#### Keeping the graph current
+
+Ingestion stages every change: a new document's facts, and — when a crawl replaces or removes a
+document — the withdrawal of the facts its earlier version contributed. `/v1/graph/query` answers
+from the graph the last build published, so until a build runs it still answers with what a
+replaced document used to say. Staging records each change no published graph has, durably, in a
+`unpublished.changes` marker beside the staging logs, and every
+`excalibur.graph.auto-build-interval-seconds` the node rebuilds each namespace that is behind:
+
+- once its staging has been quiet for `excalibur.graph.auto-build-debounce-seconds`, so a crawl is
+  published by one build, or once its oldest unpublished change has waited
+  `excalibur.graph.auto-build-max-delay-seconds`, so ingestion that never pauses cannot hold the
+  graph back — oldest first;
+- never twice at once for one namespace, never one an explicit build is running for, and at most
+  `excalibur.graph.auto-build-max-concurrent` across the node. The build takes the namespace's
+  replacement lock, as explicit builds and erasure compactions do, and checks again under it
+  whether the graph is still behind, so a namespace an explicit build caught up is left alone;
+- not while extraction is asked for but has no API key or could not be wired: a replaced
+  document's old facts are withdrawn whether or not its new ones could be extracted, and a build
+  would publish a graph that lost them with nothing in their place. The status says it is paused;
+- not while the graph is withheld for an interrupted erasure, which the erasure sweep applies first.
+
+A failed automatic build is retried after `excalibur.graph.auto-build-failure-backoff-seconds`,
+doubling with each further failure up to `excalibur.graph.auto-build-max-failure-backoff-seconds`.
+An erasure compaction is not a change to publish: it rewrites staging and the served graph alike.
+A build that finds every staged fact withdrawn — its documents all removed — stops serving the
+graph they built rather than going on answering from it. A node upgraded from one that kept no
+marker notices staged facts written after its graph was built, from the files' times, when the
+namespace opens.
+
+`GET /v1/graph/build/status` reports, beside the last explicit build, a `freshness` block —
+whether the graph is behind its staging and since when — and an `automatic` block with what the
+node is doing about it; `GET /v1/graph/namespaces` carries `behind_staging` for every namespace.
+Automatic builds replace a waiting ingest with a debounce and a build: with the defaults a changed
+document reaches the graph a minute or so after its crawl goes quiet, plus the build.
 
 Each namespace keeps its own store, under the root `excalibur.graph.path` names — the data
 directory by default. A node that never sees the `X-Excalibur-Namespace` header uses exactly one,
@@ -2386,13 +2432,28 @@ curl http://localhost:8080/v1/graph/build/status
   "relations": 87,
   "entities_with_text": 5210,
   "entities_with_vectors": 5210,
-  "staged_facts": 19004
+  "staged_facts": 19004,
+  "retired": false,
+  "freshness": {"behind_staging": false, "withheld": false},
+  "automatic": {"enabled": true, "state": "current", "debounce_seconds": 60,
+                "max_delay_seconds": 900, "last_started_at_ms": 1736899500000,
+                "last_finished_at_ms": 1736899560000, "last_result": "completed",
+                "consecutive_failures": 0}
 }
 ```
 
 `state` is `idle`, `running`, `completed`, `cancelled` or `failed`. One build runs at a time across
 the node — it saturates the same disk and the same embedding endpoint either way — so a second
 `POST` while one is in flight is refused with `409` naming the namespace that holds it.
+
+The top-level fields describe the last build asked for. `freshness` says whether the served graph
+is behind what the namespace has staged — `behind_staging`, with `staged_changes_since_ms` and
+`last_staged_change_ms` when it is — and `automatic` what the node is doing about it: `state` is
+`current`, `pending` (waiting for the debounce or the maximum delay), `running`, `backing_off`
+(after a failure, until `next_attempt_at_ms`), `paused` (with `paused_reason`, while extraction is
+`missing_api_key` or `unavailable`), `withheld` or `disabled`; `last_result` is `completed`,
+`unchanged` (an explicit build got there first), `failed` (with `last_error`) or `cancelled`. See
+[Keeping the graph current](#keeping-the-graph-current).
 
 A node that has staged nothing keeps serving the graph it already had — replacing it with an empty
 one would turn every question into a refusal. Its status says so and why, from `extraction`:
@@ -3731,7 +3792,18 @@ staged to build from.
 **`/v1/graph/build` returned `"published": false`.**
 Nothing was staged, so the graph you were already serving was left alone. Replacing it with an
 empty one would turn every subsequent question into a refusal. The status's `message` says why
-nothing was staged, and `extraction` is the first thing to read.
+nothing was staged, and `extraction` is the first thing to read. The exception is
+`"retired": true`: every fact the graph was built from has been withdrawn — its documents removed
+from their sources — so the namespace stops serving it, and `/v1/graph/query` answers 503.
+
+**`/v1/graph/query` still answers with what a replaced document used to say.**
+The served graph is what the last build published. Read `freshness` and `automatic` on
+`GET /v1/graph/build/status` with the namespace's header: `behind_staging: true` with `pending`
+means the node rebuilds once staging has been quiet for
+`excalibur.graph.auto-build-debounce-seconds`; `paused` means extraction is not active and nothing
+is built automatically until it is; `backing_off` means the last automatic build failed, and
+`last_error` says why; `disabled` means `excalibur.graph.auto-build-enabled=false`.
+`POST /v1/graph/build` publishes it now in every case.
 
 **I set `excalibur.graph.extraction-enabled=true` and nothing is ever staged.**
 Extraction is a chat-model call, so it also needs a chat endpoint in use: `excalibur.llm.api-key`

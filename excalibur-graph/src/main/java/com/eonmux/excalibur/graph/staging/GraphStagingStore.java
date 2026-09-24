@@ -21,15 +21,18 @@ import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Clock;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.zip.CRC32;
 
 /**
@@ -115,6 +118,23 @@ import java.util.zip.CRC32;
  * cut short, which the open starts afresh, or bytes some other writer left, which the open
  * refuses and leaves alone. See {@link LogHeader}.</p>
  *
+ * <h2>Changes the published graph does not have</h2>
+ * <p>The served graph is rebuilt from this store, so it is current exactly when nothing here has
+ * changed since the build that published it read it. The store therefore counts its own changes
+ * - a staged fact, a recorded snippet, a withdrawal that removed something - and keeps
+ * {@value #UNPUBLISHED_MARKER}, an empty file, for as long as any of them is unpublished. A build
+ * reads {@link #changeCount()} before it reads anything else and hands it back to
+ * {@link #markPublished(long)} once it has published; a change made in between leaves the count
+ * moved and the marker in place, so the graph is never taken to be current by a build that did
+ * not see everything. The marker is what survives a restart, which is what lets a node tell which
+ * of its namespaces are behind without rebuilding them all or opening any of them.</p>
+ *
+ * <p>The marker's name is made durable with the facts it describes: {@link #sync()} forces the
+ * directory, and nothing acknowledges a staged fact before a sync. A withdrawal is durable the
+ * moment its rewrite is, so it forces the marker before it rewrites anything. An erasure that
+ * removes the same records from the published graph in the same operation is not a change the
+ * graph lacks, and {@link #eraseAlongsidePublished} leaves the marker alone.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent appends, which is what ingestion does - one virtual thread per document.
  * Replay is not concurrent with appending: {@link #forEach} reads the file, so a caller that wants
@@ -171,6 +191,14 @@ public final class GraphStagingStore implements AutoCloseable {
     /** File holding the text each entity was mentioned in. */
     public static final String ENTITY_TEXT_LOG = "entity_text.log";
 
+    /**
+     * Empty file whose presence says staging holds changes no published graph has.
+     *
+     * <p>Created by the first change after a publish and removed by the publish that saw every
+     * change; see "Changes the published graph does not have".</p>
+     */
+    public static final String UNPUBLISHED_MARKER = "unpublished.changes";
+
     /** Longest snippet recorded for one mention; see {@link EntityTextLog#MAX_SNIPPET_BYTES}. */
     public static final int MAX_SNIPPET_BYTES = EntityTextLog.MAX_SNIPPET_BYTES;
 
@@ -219,9 +247,33 @@ public final class GraphStagingStore implements AutoCloseable {
      */
     private volatile boolean unsynced;
 
+    /**
+     * Guards the record of unpublished changes below.
+     *
+     * <p>Apart from {@link #appendLock} so that asking whether a namespace is behind never waits
+     * for a sync or an erasure rewrite. Where both are held, {@link #appendLock} is taken
+     * first.</p>
+     */
+    private final Object changeLock = new Object();
+
+    /** Changes since this store opened; see {@link #changeCount()}. */
+    private long changes;
+
+    /** Whether staging holds a change no published graph has. */
+    private boolean pending;
+
+    /** Whether {@value #UNPUBLISHED_MARKER} is on disk, as far as this store knows. */
+    private boolean markerOnDisk;
+
+    /** When the oldest unpublished change was made, or null when nothing is pending. */
+    private Instant pendingSince;
+
+    /** When the newest unpublished change was made, or null when nothing is pending. */
+    private Instant lastChangedAt;
+
     private GraphStagingStore(Path directory, Path logPath, LabelInterner entities,
                               LabelInterner relations, EntityTextLog text, Clock clock,
-                              DataOutputStream out, long staged) {
+                              DataOutputStream out, long staged, Unpublished unpublished) {
         this.directory = directory;
         this.logPath = logPath;
         this.entities = entities;
@@ -230,6 +282,21 @@ public final class GraphStagingStore implements AutoCloseable {
         this.clock = clock;
         this.out = out;
         this.staged = staged;
+        if (unpublished != null) {
+            this.pending = true;
+            this.markerOnDisk = true;
+            this.pendingSince = unpublished.since();
+            this.lastChangedAt = unpublished.lastChanged();
+        }
+    }
+
+    /**
+     * The unpublished changes a store found on disk when it opened.
+     *
+     * @param since       When the marker was written
+     * @param lastChanged When staging was last written
+     */
+    private record Unpublished(Instant since, Instant lastChanged) {
     }
 
     /**
@@ -304,6 +371,12 @@ public final class GraphStagingStore implements AutoCloseable {
         LogHeader.requireCreatable(directory.resolve(ENTITY_TEXT_LOG), "entity text log",
             EntityTextLog.MAGIC, EntityTextLog.VERSION);
 
+        // Read before the open writes a header or trims a tail, which would date the last
+        // change to this open rather than to the write it describes.
+        Unpublished unpublished = unpublishedOnDisk(directory)
+            .map(since -> new Unpublished(since, lastChangedOnDisk(directory).orElse(since)))
+            .orElse(null);
+
         ReferencedLabels held = everythingHolding(directory, holders);
         LabelInterner entities = LabelInterner.open(directory.resolve(ENTITY_LABELS),
             () -> held.reach().entities());
@@ -341,7 +414,7 @@ public final class GraphStagingStore implements AutoCloseable {
             LOGGER.info("graph staging at {}: {} facts, {} entities, {} relations",
                 directory, existing, entities.size(), relations.size());
             return new GraphStagingStore(directory, logPath, entities, relations, text, clock,
-                out, existing);
+                out, existing, unpublished);
         } catch (IOException | RuntimeException e) {
             closeQuietly(entities);
             closeQuietly(relations);
@@ -395,6 +468,7 @@ public final class GraphStagingStore implements AutoCloseable {
             out.write(record.array());
             staged++;
             unsynced = true;
+            recordChange();
         }
     }
 
@@ -637,9 +711,16 @@ public final class GraphStagingStore implements AutoCloseable {
      * silently keeping them would discharge a promise that had not been kept; leaving the
      * request outstanding and failing loudly is the only option that does neither.</p>
      *
+     * <h3>What the published graph is told</h3>
+     * <p>Anything this removes is a change the graph published from staging does not have yet,
+     * and is recorded as one: see "Changes the published graph does not have". The marker is
+     * forced before the logs are rewritten, because the rewrite is durable the moment it is
+     * renamed into place and a crash after it must not find a graph that looks current. A pass
+     * that removes nothing takes back a marker it created.</p>
+     *
      * @param erasure What the requests cover
      * @return What was removed, and what could not be judged
-     * @throws IOException if a log cannot be read or rewritten
+     * @throws IOException if a log cannot be read or rewritten, or the marker cannot be written
      * @throws NullPointerException if {@code erasure} is null
      */
     public EraseResult erase(StagedErasure erasure) throws IOException {
@@ -647,13 +728,54 @@ public final class GraphStagingStore implements AutoCloseable {
 
         synchronized (appendLock) {
             requireOpen();
-            flush();
-            long facts = rewriteTriples(erasure);
-            EntityTextLog.Erased snippets = text.erase(erasure::erasesSnippet);
-            int labels = entities.tombstone(erasure::erasesLabel);
-            return new EraseResult(facts, snippets.removed(), labels,
-                snippets.ofUnknownOrigin());
+            boolean created = ensureMarkerDurably();
+            EraseResult result = eraseLocked(erasure);
+            if (result.removed() > 0) {
+                recordChange();
+            } else if (created) {
+                removeMarker();
+            }
+            return result;
         }
+    }
+
+    /**
+     * As {@link #erase}, for an erasure that removes the same records from the published graph
+     * in the same operation.
+     *
+     * <p>An erasure compaction rewrites the served store and rebuilds the indexes over it from
+     * the staging this has just erased, so what it removes is not something the published graph
+     * lacks, and recording it as a change would rebuild a graph the compaction has already
+     * brought into line. A change recorded before it stays recorded: this neither adds nor
+     * clears one.</p>
+     *
+     * @param erasure What the requests cover
+     * @return What was removed, and what could not be judged
+     * @throws IOException if a log cannot be read or rewritten
+     * @throws NullPointerException if {@code erasure} is null
+     */
+    public EraseResult eraseAlongsidePublished(StagedErasure erasure) throws IOException {
+        Objects.requireNonNull(erasure, "erasure must not be null");
+
+        synchronized (appendLock) {
+            requireOpen();
+            return eraseLocked(erasure);
+        }
+    }
+
+    /**
+     * Rewrites the three logs without what an erasure covers, holding {@link #appendLock}.
+     *
+     * @param erasure What the requests cover
+     * @return What was removed
+     * @throws IOException if a log cannot be read or rewritten
+     */
+    private EraseResult eraseLocked(StagedErasure erasure) throws IOException {
+        flush();
+        long facts = rewriteTriples(erasure);
+        EntityTextLog.Erased snippets = text.erase(erasure::erasesSnippet);
+        int labels = entities.tombstone(erasure::erasesLabel);
+        return new EraseResult(facts, snippets.removed(), labels, snippets.ofUnknownOrigin());
     }
 
     /**
@@ -1169,6 +1291,11 @@ public final class GraphStagingStore implements AutoCloseable {
         requireOpen();
         text.append(entityId, snippet, provenance);
         unsynced = true;
+        // After the write, under the lock a publish clears the record under: a build that read
+        // the text log before this snippet reached it sees the count move and keeps the marker.
+        synchronized (appendLock) {
+            recordChange();
+        }
     }
 
     /**
@@ -1266,6 +1393,213 @@ public final class GraphStagingStore implements AutoCloseable {
      */
     public Path directory() {
         return directory;
+    }
+
+    /**
+     * Whether staging holds changes no published graph has, and since when.
+     *
+     * @param changeCount   Changes made since this store opened; see {@link #changeCount()}
+     * @param pending       Whether any change is unpublished
+     * @param pendingSince  When the oldest unpublished change was made, empty when none is
+     * @param lastChangedAt When the newest unpublished change was made, empty when none is
+     */
+    public record UnpublishedChanges(long changeCount, boolean pending,
+                                     Optional<Instant> pendingSince,
+                                     Optional<Instant> lastChangedAt) {
+
+        /**
+         * Validates the record.
+         *
+         * @throws NullPointerException if an optional is null
+         */
+        public UnpublishedChanges {
+            Objects.requireNonNull(pendingSince, "pendingSince must not be null");
+            Objects.requireNonNull(lastChangedAt, "lastChangedAt must not be null");
+        }
+    }
+
+    /**
+     * What staging has changed that no published graph has.
+     *
+     * <p>Never waits for an append, a sync or an erasure rewrite.</p>
+     *
+     * @return The record, read together
+     */
+    public UnpublishedChanges unpublishedChanges() {
+        synchronized (changeLock) {
+            return new UnpublishedChanges(changes, pending, Optional.ofNullable(pendingSince),
+                Optional.ofNullable(lastChangedAt));
+        }
+    }
+
+    /**
+     * How many changes this store has recorded since it opened.
+     *
+     * <p>A build reads this before it reads staging and hands it to {@link #markPublished(long)}
+     * after it has published. Only equality with a later reading means anything: it restarts at
+     * zero with every open.</p>
+     *
+     * @return The count
+     */
+    public long changeCount() {
+        synchronized (changeLock) {
+            return changes;
+        }
+    }
+
+    /**
+     * Records that a graph built from staging as it stood at {@code asOfChangeCount} has been
+     * published, clearing the record of unpublished changes if nothing has changed since.
+     *
+     * <p>Held under the lock appends and erasures record their changes under, so a change is
+     * either counted before this compares - and the marker stays - or made after it, and puts
+     * the marker back.</p>
+     *
+     * @param asOfChangeCount {@link #changeCount()} as the build read it, before reading staging
+     * @return true if the record was cleared; false if something changed while the build ran
+     * @throws IOException if the marker cannot be removed; the record is then left pending
+     */
+    public boolean markPublished(long asOfChangeCount) throws IOException {
+        synchronized (appendLock) {
+            synchronized (changeLock) {
+                if (changes != asOfChangeCount) {
+                    return false;
+                }
+            }
+            removeMarker();
+            return true;
+        }
+    }
+
+    /**
+     * Records that the published graph lacks something staging holds, found by a caller rather
+     * than by a change this store made - a graph older than its staging logs.
+     *
+     * @throws IOException if the marker cannot be written
+     */
+    public void markUnpublished() throws IOException {
+        synchronized (appendLock) {
+            requireOpen();
+            ensureMarkerDurably();
+            recordChange();
+        }
+    }
+
+    /**
+     * When the unpublished changes a staging directory records began, without opening it.
+     *
+     * @param directory A staging directory
+     * @return When its marker was written, or empty when it has none
+     */
+    public static Optional<Instant> unpublishedOnDisk(Path directory) {
+        return modifiedAt(directory.resolve(UNPUBLISHED_MARKER));
+    }
+
+    /**
+     * When a staging directory's facts or text were last written, without opening it.
+     *
+     * @param directory A staging directory
+     * @return The newest modification among its logs and its marker, or empty when none exists
+     */
+    public static Optional<Instant> lastChangedOnDisk(Path directory) {
+        Instant newest = null;
+        for (String name : List.of(TRIPLE_LOG, ENTITY_TEXT_LOG, UNPUBLISHED_MARKER)) {
+            Optional<Instant> modified = modifiedAt(directory.resolve(name));
+            if (modified.isPresent() && (newest == null || modified.get().isAfter(newest))) {
+                newest = modified.get();
+            }
+        }
+        return Optional.ofNullable(newest);
+    }
+
+    /**
+     * When a file was last modified, or empty when it cannot be read.
+     *
+     * @param file The file
+     * @return Its modification time
+     */
+    private static Optional<Instant> modifiedAt(Path file) {
+        try {
+            return Optional.of(Files.getLastModifiedTime(file).toInstant());
+        } catch (IOException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Counts one change and makes sure the marker says so, holding {@link #appendLock}.
+     *
+     * <p>A marker that cannot be written does not fail the change, which has already been
+     * made: it is logged, the change is still recorded in memory, and the next change tries
+     * again.</p>
+     */
+    private void recordChange() {
+        Instant now = clock.instant();
+        synchronized (changeLock) {
+            changes++;
+            if (!pending) {
+                pendingSince = now;
+            }
+            pending = true;
+            lastChangedAt = now;
+        }
+        if (!markerOnDisk) {
+            try {
+                createMarker();
+            } catch (IOException e) {
+                LOGGER.error("could not record at {} that staging holds changes no published "
+                    + "graph has; a restart before the next build will not know the graph is "
+                    + "behind: {}", directory.resolve(UNPUBLISHED_MARKER), e.toString());
+            }
+        }
+    }
+
+    /**
+     * Writes the marker and forces its name, holding {@link #appendLock}.
+     *
+     * @return true if this call created it
+     * @throws IOException if it cannot be written or forced
+     */
+    private boolean ensureMarkerDurably() throws IOException {
+        if (markerOnDisk) {
+            return false;
+        }
+        createMarker();
+        Durability.DEVICE.fsyncDirectory(directory);
+        return true;
+    }
+
+    /**
+     * Writes the marker, holding {@link #appendLock}. Its name reaches the device with the next
+     * {@link #sync()}, which forces the directory.
+     *
+     * @throws IOException if it cannot be written
+     */
+    private void createMarker() throws IOException {
+        try {
+            Files.createFile(directory.resolve(UNPUBLISHED_MARKER));
+        } catch (FileAlreadyExistsException alreadyThere) {
+            // Left by a publish that could not remove it; it says what it has to.
+        }
+        markerOnDisk = true;
+    }
+
+    /**
+     * Clears the record of unpublished changes, holding {@link #appendLock}.
+     *
+     * <p>Not forced: a removal a crash undoes costs one rebuild of a graph that was current,
+     * never a stale graph taken for a current one.</p>
+     *
+     * @throws IOException if the marker cannot be removed; the record is then left pending
+     */
+    private void removeMarker() throws IOException {
+        Files.deleteIfExists(directory.resolve(UNPUBLISHED_MARKER));
+        markerOnDisk = false;
+        synchronized (changeLock) {
+            pending = false;
+            pendingSince = null;
+            lastChangedAt = null;
+        }
     }
 
     /**

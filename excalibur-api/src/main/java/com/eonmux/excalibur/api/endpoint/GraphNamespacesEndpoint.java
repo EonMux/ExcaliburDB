@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 
+import com.eonmux.excalibur.api.bootstrap.GraphFreshness;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.protocol.JsonText;
 import com.eonmux.excalibur.api.protocol.ResponseBody;
@@ -13,6 +14,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.StringJoiner;
@@ -31,12 +33,20 @@ import java.util.StringJoiner;
  * {
  *   "namespaces": [
  *     {"namespace": "acme", "open": false, "built": true,
- *      "staged_facts": 1204, "outstanding_erasures": 2, "error": null}
+ *      "staged_facts": 1204, "outstanding_erasures": 2,
+ *      "behind_staging": true, "staged_changes_since_ms": 1736899500000, "error": null}
  *   ],
  *   "count": 1,
  *   "open": 0
  * }
  * }</pre>
+ *
+ * <h3>Whether the graph is current</h3>
+ * <p>{@code behind_staging} is true when the namespace has staged a change - a new document's
+ * facts, or a replaced or removed one's withdrawal - that the graph it serves does not have yet,
+ * and {@code staged_changes_since_ms} is when the oldest such change was made, or {@code null}
+ * when that is not known. The node's automatic build publishes it; {@code GET
+ * /v1/graph/build/status} says when.</p>
  *
  * <h3>What it costs</h3>
  * <p>No graph is opened. A resident namespace answers from the tenant already in memory; one
@@ -126,6 +136,9 @@ public class GraphNamespacesEndpoint implements HttpHandler {
             + "\"built\": " + summary.built() + ", "
             + "\"staged_facts\": " + unknownAsNull(summary.stagedFacts()) + ", "
             + "\"outstanding_erasures\": " + unknownAsNull(summary.outstandingErasures()) + ", "
+            + "\"behind_staging\": "
+            + summary.freshness().map(f -> Boolean.toString(f.behind())).orElse("null") + ", "
+            + "\"staged_changes_since_ms\": " + pendingSince(summary.freshness()) + ", "
             + "\"error\": " + quotedOrNull(summary.error())
             + "}";
     }
@@ -148,6 +161,19 @@ public class GraphNamespacesEndpoint implements HttpHandler {
      */
     private static String unknownAsNull(OptionalInt value) {
         return value.isPresent() ? Integer.toString(value.getAsInt()) : "null";
+    }
+
+    /**
+     * Renders when the oldest change the served graph does not have was staged.
+     *
+     * @param freshness Whether the graph is behind its staging, or empty when unknown
+     * @return Epoch milliseconds, or {@code null} when current, unknown or undated
+     */
+    private static String pendingSince(Optional<GraphFreshness> freshness) {
+        return freshness.filter(GraphFreshness::behind)
+            .flatMap(GraphFreshness::pendingSince)
+            .map(since -> Long.toString(since.toEpochMilli()))
+            .orElse("null");
     }
 
     /**

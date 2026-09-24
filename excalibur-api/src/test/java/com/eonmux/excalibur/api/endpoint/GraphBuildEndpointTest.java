@@ -7,6 +7,8 @@ import com.sun.net.httpserver.HttpHandler;
 import com.eonmux.excalibur.api.bootstrap.GraphExtraction;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.mcp.Json;
+import com.eonmux.excalibur.ingest.graph.LlmRelationExtractor;
+import com.eonmux.excalibur.ingest.graph.StagingGraphIngestSink;
 
 import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.graph.provenance.Provenance;
@@ -32,6 +34,8 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -67,6 +71,7 @@ class GraphBuildEndpointTest {
     private Config config;
     private GraphTenants tenants;
     private GraphBuildRunner runner;
+    private GraphAutoBuilder autoBuilder;
     private GraphBuildEndpoint build;
     private GraphBuildStatusEndpoint status;
     private GraphBuildCancelEndpoint cancel;
@@ -83,9 +88,19 @@ class GraphBuildEndpointTest {
         if (runner != null) {
             runner.close();
         }
+        if (autoBuilder != null) {
+            autoBuilder.close();
+        }
         runner = replacement;
+        // Never started: its passes run when a test calls for one. No debounce, so a pass
+        // builds whatever is behind.
+        GraphBuildRunner current = runner;
+        autoBuilder = new GraphAutoBuilder(new GraphAutoBuilder.Settings(true,
+            Duration.ofSeconds(30), Duration.ZERO, Duration.ofSeconds(900), 1,
+            Duration.ofSeconds(60), Duration.ofSeconds(3600)), GraphAutoBuilder.over(tenants),
+            current::extraction, id -> current.snapshot(id).isRunning(), Clock.systemUTC());
         build = new GraphBuildEndpoint(runner);
-        status = new GraphBuildStatusEndpoint(runner);
+        status = new GraphBuildStatusEndpoint(runner, autoBuilder);
         cancel = new GraphBuildCancelEndpoint(runner);
     }
 
@@ -93,6 +108,9 @@ class GraphBuildEndpointTest {
     void tearDown() {
         if (runner != null) {
             runner.close();
+        }
+        if (autoBuilder != null) {
+            autoBuilder.close();
         }
         if (tenants != null) {
             tenants.close();
@@ -324,8 +342,132 @@ class GraphBuildEndpointTest {
         @Test
         @DisplayName("a null runner is refused at construction")
         void nullRunnerIsRefused() {
-            assertThatThrownBy(() -> new GraphBuildStatusEndpoint(null))
+            assertThatThrownBy(() -> new GraphBuildStatusEndpoint(null, autoBuilder))
                 .isInstanceOf(NullPointerException.class);
+            assertThatThrownBy(() -> new GraphBuildStatusEndpoint(runner, null))
+                .isInstanceOf(NullPointerException.class);
+        }
+    }
+
+    @Nested
+    @DisplayName("saying whether the graph is current")
+    class Freshness {
+
+        /** Facts attributed to the document they came from, so removing it withdraws them. */
+        private StagingGraphIngestSink sinkFor(NamespaceId namespace) {
+            try (NamespaceRegistry.Lease<com.eonmux.excalibur.api.bootstrap.GraphTenant> lease =
+                     tenants.borrow(namespace)) {
+                return new StagingGraphIngestSink(lease.resource().staging(),
+                    (documentKey, text) -> java.util.List.of(ExtractedTriple.alwaysValid(
+                        "Ada", "knows", "Babbage", Provenance.of(SourceType.DOCUMENT,
+                            LlmRelationExtractor.sourceIdOf(documentKey), 0.9, 1))));
+            }
+        }
+
+        /** The value at a dotted path through nested objects, or null. */
+        private static Object path(Object json, String dotted) {
+            Object value = json;
+            for (String field : dotted.split("\\.")) {
+                value = Json.at(value, field);
+            }
+            return value;
+        }
+
+        /** Waits for the namespace's automatic build to finish. */
+        private Object awaitAutomatic(String namespace, String result) throws IOException {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+            Object json = call(status, "GET", namespace).json();
+            while (!result.equals(Json.stringAt(Json.at(json, "automatic"), "last_result"))
+                    && System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+                json = call(status, "GET", namespace).json();
+            }
+            assertThat(Json.stringAt(Json.at(json, "automatic"), "last_result"))
+                .isEqualTo(result);
+            return json;
+        }
+
+        @Test
+        @DisplayName("a namespace with nothing staged is current")
+        void currentBeforeAnything() throws IOException {
+            Object json = call(status, "GET", "acme").json();
+
+            assertThat(path(json, "freshness.behind_staging")).isEqualTo(Boolean.FALSE);
+            assertThat(path(json, "freshness.withheld")).isEqualTo(Boolean.FALSE);
+            assertThat(path(json, "freshness.staged_changes_since_ms")).isNull();
+            assertThat(path(json, "automatic.enabled")).isEqualTo(Boolean.TRUE);
+            assertThat((String) path(json, "automatic.state"))
+                .isEqualTo(GraphAutoBuilder.STATE_CURRENT);
+            assertThat(path(json, "automatic.debounce_seconds")).isEqualTo(0L);
+            assertThat(path(json, "automatic.max_delay_seconds")).isEqualTo(900L);
+            assertThat(path(json, "automatic.last_result")).isNull();
+            assertThat(root.resolve("acme")).as("asking creates nothing").doesNotExist();
+        }
+
+        @Test
+        @DisplayName("staged facts no build has published read as behind until one does")
+        void behindUntilBuilt() throws IOException {
+            tenants.reportExtraction(GraphExtraction.ACTIVE);
+            sinkFor(NamespaceId.of("acme")).onDocumentPublished("docs:ada", "Ada knows Babbage.");
+
+            Object behind = call(status, "GET", "acme").json();
+            assertThat(path(behind, "freshness.behind_staging")).isEqualTo(Boolean.TRUE);
+            assertThat((Long) path(behind, "freshness.staged_changes_since_ms")).isPositive();
+            assertThat((Long) path(behind, "freshness.last_staged_change_ms")).isPositive();
+            assertThat((String) path(behind, "automatic.state"))
+                .isEqualTo(GraphAutoBuilder.STATE_PENDING);
+
+            assertThat(autoBuilder.runPass()).containsExactly(NamespaceId.of("acme"));
+            Object built = awaitAutomatic("acme", GraphAutoBuilder.RESULT_COMPLETED);
+
+            assertThat(path(built, "freshness.behind_staging")).isEqualTo(Boolean.FALSE);
+            assertThat((String) path(built, "automatic.state"))
+                .isEqualTo(GraphAutoBuilder.STATE_CURRENT);
+            assertThat((Long) path(built, "automatic.last_started_at_ms")).isPositive();
+            assertThat((Long) path(built, "automatic.last_finished_at_ms")).isPositive();
+            assertThat(path(built, "automatic.consecutive_failures")).isEqualTo(0L);
+            assertThat(Json.stringAt(built, "state"))
+                .as("the top-level fields are the builds asked for, and none was")
+                .isEqualTo(GraphBuildRunner.STATE_IDLE);
+            assertThat(graphDirectoryOf(NamespaceId.of("acme"))).isDirectory();
+        }
+
+        @Test
+        @DisplayName("automatic builds pause while extraction is missing its key, and say why")
+        void pausedWithoutExtraction() throws IOException {
+            tenants.reportExtraction(GraphExtraction.MISSING_API_KEY);
+            stage(NamespaceId.of("acme"), "Ada", "knows", "Babbage");
+
+            Object json = call(status, "GET", "acme").json();
+
+            assertThat((String) path(json, "automatic.state"))
+                .isEqualTo(GraphAutoBuilder.STATE_PAUSED);
+            assertThat((String) path(json, "automatic.paused_reason"))
+                .isEqualTo("missing_api_key");
+            assertThat(autoBuilder.runPass()).isEmpty();
+        }
+
+        @Test
+        @DisplayName("a build after every fact was withdrawn retires the graph, and says so")
+        void aRetiredGraphIsExplained() throws IOException {
+            tenants.reportExtraction(GraphExtraction.ACTIVE);
+            StagingGraphIngestSink sink = sinkFor(NamespaceId.of("acme"));
+            sink.onDocumentPublished("docs:ada", "Ada knows Babbage.");
+            call(build, "POST", "acme");
+            awaitState("acme", GraphBuildRunner.STATE_COMPLETED);
+
+            sink.onDocumentRemoved("docs:ada");
+            assertThat(path(call(status, "GET", "acme").json(), "freshness.behind_staging"))
+                .isEqualTo(Boolean.TRUE);
+            call(build, "POST", "acme");
+            Object json = awaitState("acme", GraphBuildRunner.STATE_COMPLETED);
+
+            assertThat(Json.at(json, "retired")).isEqualTo(Boolean.TRUE);
+            assertThat(Json.at(json, "published")).isEqualTo(Boolean.FALSE);
+            assertThat(Json.stringAt(json, "message")).contains("withdrawn")
+                .doesNotContain("still serving");
+            assertThat(path(json, "freshness.behind_staging")).isEqualTo(Boolean.FALSE);
+            assertThat(graphDirectoryOf(NamespaceId.of("acme"))).doesNotExist();
         }
     }
 
@@ -566,7 +708,7 @@ class GraphBuildEndpointTest {
             entered.countDown();
             await(release);
             return new com.eonmux.excalibur.api.bootstrap.GraphBuildService.BuildOutcome(
-                false, 0, 0, 0, 0, 0, 0);
+                false, false, 0, 0, 0, 0, 0, 0);
         };
     }
 

@@ -16,6 +16,7 @@ import com.eonmux.excalibur.api.endpoint.DocumentUpsertEndpoint;
 import com.eonmux.excalibur.api.endpoint.DrainEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphBuildCancelEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphBuildEndpoint;
+import com.eonmux.excalibur.api.endpoint.GraphAutoBuilder;
 import com.eonmux.excalibur.api.endpoint.GraphBuildRunner;
 import com.eonmux.excalibur.api.endpoint.GraphBuildStatusEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphErasureEndpoint;
@@ -67,6 +68,7 @@ import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.shard.allocator.VolumeManager;
 import com.eonmux.excalibur.shard.worker.SegmentReindexScheduler;
 import com.eonmux.excalibur.config.Config;
+import com.eonmux.excalibur.config.GraphConfig;
 import com.eonmux.excalibur.config.VisibilityConfig;
 import com.eonmux.excalibur.llm.client.CircuitBreaker;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
@@ -203,11 +205,14 @@ final class EndpointRegistrar {
      * @param compaction Runs what {@code POST /v1/compact} asked for, behind the response
      * @param graphBuild Runs what {@code POST /v1/graph/build} asked for, behind the response,
      *                   or null on a node that serves no graph of its own
+     * @param graphAutoBuild Rebuilds each namespace whose graph falls behind its staging, or
+     *                   null on a node that serves no graph of its own
      * @param suppliedSources The ids documents have been supplied under, which the graph sink
      *                   reads to find the namespace a supplied document's facts belong to
      */
     record Endpoints(QueryEndpoint query, ReindexEndpoint reindex, CompactionRunner compaction,
-                     GraphBuildRunner graphBuild, InlineSourceIds suppliedSources) {
+                     GraphBuildRunner graphBuild, GraphAutoBuilder graphAutoBuild,
+                     InlineSourceIds suppliedSources) {
     }
 
     /**
@@ -238,6 +243,12 @@ final class EndpointRegistrar {
         // a second one would report builds nothing ever started.
         GraphBuildRunner graphBuildRunner = in.graphTenants() != null
             ? new GraphBuildRunner(in.graphTenants())
+            : null;
+        // Beside the runner, which it defers to: a namespace an explicit build is running for
+        // is left to that build.
+        GraphAutoBuilder graphAutoBuilder = graphBuildRunner != null
+            ? GraphAutoBuilder.start(in.graphTenants(), graphBuildRunner, in.config() != null
+                ? in.config().graph() : new GraphConfig(Map.of()))
             : null;
         if (graphBuildRunner != null) {
             IngestionOrchestrator ingestion = in.ingestionOrchestrator();
@@ -280,11 +291,11 @@ final class EndpointRegistrar {
         CompactionRunner compactionRunner = new CompactionRunner(
             in.indexOrchestrator()::compactNow, lexicalCompactor(chunkText));
         registerCompaction(target, notFound, compactionRunner);
-        registerGraph(target, notFound, graphBuildRunner);
+        registerGraph(target, notFound, graphBuildRunner, graphAutoBuilder);
         target.createContext("/", wrapHandler(notFound));
 
         return new Endpoints(queryHandler, reindexHandler, compactionRunner, graphBuildRunner,
-            suppliedSources);
+            graphAutoBuilder, suppliedSources);
     }
 
     // ==================== Endpoint construction ====================
@@ -1033,7 +1044,8 @@ final class EndpointRegistrar {
      * charging it against the smaller mutate budget would throttle ordinary questions.</p>
      */
     private void registerGraph(HttpServer target, HttpHandler notFound,
-                               GraphBuildRunner graphBuildRunner) {
+                               GraphBuildRunner graphBuildRunner,
+                               GraphAutoBuilder graphAutoBuilder) {
         if (in.graphTenants() != null) {
             target.createContext("/v1/graph/query", wrapHandler(exactPath("/v1/graph/query",
                 onlyMethod("POST", guard.protect(RequestGuard.Access.READ,
@@ -1059,7 +1071,8 @@ final class EndpointRegistrar {
             // takes minutes must not be rationed against the smaller mutate budget.
             target.createContext("/v1/graph/build/status", wrapHandler(
                 exactPath("/v1/graph/build/status", onlyMethod("GET", guard.protect(RequestGuard.Access.READ,
-                    new GraphBuildStatusEndpoint(graphBuildRunner))), notFound)));
+                    new GraphBuildStatusEndpoint(graphBuildRunner, graphAutoBuilder))),
+                notFound)));
             target.createContext("/v1/graph/erasure", wrapHandler(exactPath("/v1/graph/erasure",
                 onlyMethod("POST", guard.protect(RequestGuard.Access.MUTATE,
                     new GraphErasureEndpoint(in.graphTenants()))), notFound)));

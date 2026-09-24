@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.server;
 
 import com.eonmux.excalibur.api.endpoint.CompactionRunner;
+import com.eonmux.excalibur.api.endpoint.GraphAutoBuilder;
 import com.eonmux.excalibur.api.endpoint.GraphBuildRunner;
 import com.eonmux.excalibur.api.endpoint.QueryEndpoint;
 import com.eonmux.excalibur.api.endpoint.ReindexEndpoint;
@@ -137,6 +138,7 @@ final class ShutdownSequence {
         boolean pipelineDrained;
         CompactionRunner.Drained compaction;
         boolean graphBuildDrained;
+        boolean graphAutoBuildDrained;
         boolean ingestionDrained;
         boolean orchestratorDrained;
         boolean storageWorkDrained;
@@ -155,6 +157,8 @@ final class ShutdownSequence {
                 drains.submit(() -> drainCompaction(endpoints, budget.forDrains()));
             Future<Boolean> graphBuild =
                 drains.submit(() -> drainGraphBuild(endpoints, budget.forDrains()));
+            Future<Boolean> graphAutoBuild =
+                drains.submit(() -> drainGraphAutoBuild(endpoints, budget.forDrains()));
             Future<Boolean> ingestion =
                 drains.submit(() -> drainIngestion(wiring, budget.forDrains()));
 
@@ -165,6 +169,8 @@ final class ShutdownSequence {
             compaction = steps.await("the compaction", compacting,
                 new CompactionRunner.Drained(false, false));
             graphBuildDrained = steps.await("the graph build", graphBuild, false);
+            graphAutoBuildDrained =
+                steps.await("the automatic graph builds", graphAutoBuild, false);
             ingestionDrained = steps.await("ingestion", ingestion, false);
 
             // After the listener has stopped and the requests, the endpoints and ingestion have
@@ -194,7 +200,8 @@ final class ShutdownSequence {
             compaction.storageReleased() && indexUsersDrained && pipelineDrained
                 && orchestratorDrained && storageWorkDrained,
             compaction.chunkIndexReleased() && indexUsersDrained,
-            graphBuildDrained && requestsDrained && ingestionDrained);
+            graphBuildDrained && graphAutoBuildDrained && requestsDrained
+                && ingestionDrained);
         steps.rethrow();
         return drained;
     }
@@ -479,6 +486,29 @@ final class ShutdownSequence {
         if (graphBuild != null && !graphBuild.drain(wait)) {
             LOGGER.error("A graph build was still running when the node shut down; the graph "
                 + "tenants will be left open rather than closed underneath it");
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Stops the automatic graph builds and waits for any in progress.
+     *
+     * <p>Before the graph tenants are closed, for the reasons {@link #drainGraphBuild} gives:
+     * an automatic build writes into a tenant exactly as an explicit one does, and is stopped the
+     * same way.</p>
+     *
+     * @param endpoints What was registered, or null
+     * @param wait      How long the budget leaves it
+     * @return false if an automatic build outlived the wait and is still writing into a graph
+     *         tenant
+     */
+    private static boolean drainGraphAutoBuild(EndpointRegistrar.Endpoints endpoints,
+                                               Duration wait) {
+        GraphAutoBuilder autoBuild = endpoints == null ? null : endpoints.graphAutoBuild();
+        if (autoBuild != null && !autoBuild.drain(wait)) {
+            LOGGER.error("An automatic graph build was still running when the node shut down; "
+                + "the graph tenants will be left open rather than closed underneath it");
             return false;
         }
         return true;

@@ -270,7 +270,16 @@ class ConfigSectionEqualityTest {
             v("hotNamespaces", "excalibur.graph.hot-namespaces", "alpha,beta"),
             v("coldNamespaces", "excalibur.graph.cold-namespaces", "gamma"),
             v("erasureTombstoneRatio", "excalibur.graph.erasure-tombstone-ratio", "0.5"),
-            v("erasureMaxLatencySeconds", "excalibur.graph.erasure-max-latency-seconds", "7200")));
+            v("erasureMaxLatencySeconds", "excalibur.graph.erasure-max-latency-seconds", "7200"),
+            v("autoBuildEnabled", "excalibur.graph.auto-build-enabled", "false"),
+            v("autoBuildIntervalSeconds", "excalibur.graph.auto-build-interval-seconds", "7"),
+            v("autoBuildDebounceSeconds", "excalibur.graph.auto-build-debounce-seconds", "9"),
+            v("autoBuildMaxDelaySeconds", "excalibur.graph.auto-build-max-delay-seconds", "1800"),
+            v("autoBuildMaxConcurrent", "excalibur.graph.auto-build-max-concurrent", "2"),
+            v("autoBuildFailureBackoffSeconds",
+                "excalibur.graph.auto-build-failure-backoff-seconds", "30"),
+            v("autoBuildMaxFailureBackoffSeconds",
+                "excalibur.graph.auto-build-max-failure-backoff-seconds", "7200")));
     }
 
     /**

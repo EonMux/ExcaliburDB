@@ -194,7 +194,8 @@ public final class GraphErasureCoordinator {
         for (ErasureRequest request : requests) {
             scopes.add(request.scope());
         }
-        GraphStagingStore.EraseResult result = staging.erase(ScopedStagedErasure.of(scopes));
+        GraphStagingStore.EraseResult result =
+            staging.eraseAlongsidePublished(ScopedStagedErasure.of(scopes));
         if (result.removed() > 0) {
             LOGGER.info("erased {} staged record(s) so the next build cannot republish them: "
                 + "{} fact(s), {} snippet(s), {} label(s)", result.removed(),
