@@ -428,9 +428,8 @@ final class DocumentReindexStep {
         int retired = retireSuperseded(previous, writes.chunkIds());
         try {
             long epoch = publisher.publish(batchBuffer, metadata).epoch();
-            return Attempt.published(writes,
-                new Committed(epoch, graphReporter.published(documentKey, previous != null),
-                    retired));
+            return Attempt.published(writes, new Committed(epoch,
+                graphReporter.published(sourceId, documentKey, previous != null), retired));
         } catch (DocumentBatchPublisher.PublicationException e) {
             LOG.error("Atomic publication failed for document {}: {}", documentId,
                 e.getMessage());
@@ -526,8 +525,8 @@ final class DocumentReindexStep {
         DocumentMetadata previous = registry.get(sourceId, documentId);
         int retired = retireSuperseded(previous, writes.chunkIds());
         registry.register(metadata);
-        return Attempt.published(writes,
-            new Committed(-1L, graphReporter.published(documentKey, previous != null), retired));
+        return Attempt.published(writes, new Committed(-1L,
+            graphReporter.published(sourceId, documentKey, previous != null), retired));
     }
 
     /**

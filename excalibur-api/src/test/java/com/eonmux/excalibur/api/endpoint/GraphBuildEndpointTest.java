@@ -496,7 +496,8 @@ class GraphBuildEndpointTest {
         @DisplayName("staged facts no build has published read as behind until one does")
         void behindUntilBuilt() throws IOException {
             tenants.reportExtraction(GraphExtraction.ACTIVE);
-            sinkFor(NamespaceId.of("acme")).onDocumentPublished("docs:ada", "Ada knows Babbage.");
+            sinkFor(NamespaceId.of("acme"))
+                .onDocumentPublished("docs", "docs:ada", "Ada knows Babbage.");
 
             Object behind = call(status, "GET", "acme").json();
             assertThat(path(behind, "freshness.behind_staging")).isEqualTo(Boolean.TRUE);
@@ -525,7 +526,8 @@ class GraphBuildEndpointTest {
         @DisplayName("an automatic build an erasure overtook is superseded, not failed")
         void aSupersededBuildIsNotAFailure() throws IOException {
             tenants.reportExtraction(GraphExtraction.ACTIVE);
-            sinkFor(NamespaceId.of("acme")).onDocumentPublished("docs:ada", "Ada knows Babbage.");
+            sinkFor(NamespaceId.of("acme"))
+                .onDocumentPublished("docs", "docs:ada", "Ada knows Babbage.");
             GraphAutoBuilder.Namespaces real = GraphAutoBuilder.over(tenants);
             GraphAutoBuilder.Namespaces overtaken = new GraphAutoBuilder.Namespaces() {
                 @Override
@@ -588,11 +590,11 @@ class GraphBuildEndpointTest {
         void aRetiredGraphIsExplained() throws IOException {
             tenants.reportExtraction(GraphExtraction.ACTIVE);
             StagingGraphIngestSink sink = sinkFor(NamespaceId.of("acme"));
-            sink.onDocumentPublished("docs:ada", "Ada knows Babbage.");
+            sink.onDocumentPublished("docs", "docs:ada", "Ada knows Babbage.");
             call(build, "POST", "acme");
             awaitState("acme", GraphBuildRunner.STATE_COMPLETED);
 
-            sink.onDocumentRemoved("docs:ada");
+            sink.onDocumentRemoved("docs", "docs:ada");
             assertThat(path(call(status, "GET", "acme").json(), "freshness.behind_staging"))
                 .isEqualTo(Boolean.TRUE);
             call(build, "POST", "acme");

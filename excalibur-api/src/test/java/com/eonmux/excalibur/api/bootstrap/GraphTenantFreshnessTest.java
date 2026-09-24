@@ -92,7 +92,7 @@ class GraphTenantFreshnessTest {
         try (GraphTenant tenant = open(root.resolve("graph"))) {
             StagingGraphIngestSink sink =
                 new StagingGraphIngestSink(tenant.staging(), collaborator());
-            sink.onDocumentPublished("docs:ada", "Ada worked with Babbage.");
+            sink.onDocumentPublished("docs", "docs:ada", "Ada worked with Babbage.");
 
             GraphFreshness staged = tenant.freshness();
             assertThat(staged.behind()).isTrue();
@@ -104,7 +104,7 @@ class GraphTenantFreshnessTest {
             assertThat(tenant.freshness().behind()).isFalse();
             assertThat(servedContext(tenant).orElseThrow()).contains("Charles Babbage");
 
-            sink.onDocumentReplaced("docs:ada", "Ada worked with Menabrea.", 0);
+            sink.onDocumentReplaced("docs", "docs:ada", "Ada worked with Menabrea.", 0);
             assertThat(tenant.freshness().behind()).isTrue();
             assertThat(servedContext(tenant).orElseThrow())
                 .as("the served graph still answers from the last build until the next")
@@ -126,11 +126,11 @@ class GraphTenantFreshnessTest {
         try (GraphTenant tenant = open(directory)) {
             StagingGraphIngestSink sink =
                 new StagingGraphIngestSink(tenant.staging(), collaborator());
-            sink.onDocumentPublished("docs:ada", "Ada worked with Babbage.");
+            sink.onDocumentPublished("docs", "docs:ada", "Ada worked with Babbage.");
             tenant.buildIfBehind(NEVER);
             assertThat(tenant.holder().isPresent()).isTrue();
 
-            sink.onDocumentRemoved("docs:ada");
+            sink.onDocumentRemoved("docs", "docs:ada");
             assertThat(tenant.freshness().behind()).isTrue();
 
             GraphBuildService.BuildOutcome outcome = tenant.buildIfBehind(NEVER).orElseThrow();
@@ -148,7 +148,7 @@ class GraphTenantFreshnessTest {
     void anExplicitBuildGotThereFirst(@TempDir Path root) throws IOException {
         try (GraphTenant tenant = open(root.resolve("graph"))) {
             new StagingGraphIngestSink(tenant.staging(), collaborator())
-                .onDocumentPublished("docs:ada", "Ada worked with Babbage.");
+                .onDocumentPublished("docs", "docs:ada", "Ada worked with Babbage.");
             assertThat(tenant.freshness().behind()).isTrue();
 
             tenant.buildService().build();
@@ -164,7 +164,7 @@ class GraphTenantFreshnessTest {
         Path directory = root.resolve("graph");
         try (GraphTenant tenant = open(directory)) {
             new StagingGraphIngestSink(tenant.staging(), collaborator())
-                .onDocumentPublished("docs:ada", "Ada worked with Babbage.");
+                .onDocumentPublished("docs", "docs:ada", "Ada worked with Babbage.");
             tenant.buildIfBehind(NEVER);
 
             tenant.erasureService().submit(
@@ -187,7 +187,7 @@ class GraphTenantFreshnessTest {
     void aCancelledBuildLeavesItBehind(@TempDir Path root) throws IOException {
         try (GraphTenant tenant = open(root.resolve("graph"))) {
             new StagingGraphIngestSink(tenant.staging(), collaborator())
-                .onDocumentPublished("docs:ada", "Ada worked with Babbage.");
+                .onDocumentPublished("docs", "docs:ada", "Ada worked with Babbage.");
 
             org.assertj.core.api.Assertions.assertThatThrownBy(() -> tenant.buildIfBehind(() -> true))
                 .isInstanceOf(com.eonmux.excalibur.graph.build.BuildCancelledException.class);
@@ -207,7 +207,7 @@ class GraphTenantFreshnessTest {
             Path directory = root.resolve("graph");
             try (GraphTenant tenant = open(directory)) {
                 new StagingGraphIngestSink(tenant.staging(), collaborator())
-                    .onDocumentPublished("docs:ada", "Ada worked with Babbage.");
+                    .onDocumentPublished("docs", "docs:ada", "Ada worked with Babbage.");
             }
 
             GraphFreshness freshness = GraphTenant.freshnessOnDisk(directory);
@@ -228,7 +228,7 @@ class GraphTenantFreshnessTest {
             Path directory = root.resolve("graph");
             try (GraphTenant tenant = open(directory)) {
                 new StagingGraphIngestSink(tenant.staging(), collaborator())
-                    .onDocumentPublished("docs:ada", "Ada worked with Babbage.");
+                    .onDocumentPublished("docs", "docs:ada", "Ada worked with Babbage.");
             }
             Files.delete(GraphTenant.stagingDirectoryOf(directory)
                 .resolve(GraphStagingStore.UNPUBLISHED_MARKER));
@@ -247,9 +247,9 @@ class GraphTenantFreshnessTest {
             try (GraphTenant tenant = open(directory)) {
                 StagingGraphIngestSink sink =
                     new StagingGraphIngestSink(tenant.staging(), collaborator());
-                sink.onDocumentPublished("docs:ada", "Ada worked with Babbage.");
+                sink.onDocumentPublished("docs", "docs:ada", "Ada worked with Babbage.");
                 tenant.buildIfBehind(NEVER);
-                sink.onDocumentPublished("docs:note", "Ada worked with Menabrea.");
+                sink.onDocumentPublished("docs", "docs:note", "Ada worked with Menabrea.");
             }
             Path staging = GraphTenant.stagingDirectoryOf(directory);
             Files.delete(staging.resolve(GraphStagingStore.UNPUBLISHED_MARKER));
@@ -276,7 +276,7 @@ class GraphTenantFreshnessTest {
             Path directory = root.resolve("graph");
             try (GraphTenant tenant = open(directory)) {
                 new StagingGraphIngestSink(tenant.staging(), collaborator())
-                    .onDocumentPublished("docs:ada", "Ada worked with Babbage.");
+                    .onDocumentPublished("docs", "docs:ada", "Ada worked with Babbage.");
                 tenant.buildIfBehind(NEVER);
             }
             Path staging = GraphTenant.stagingDirectoryOf(directory);
@@ -303,7 +303,7 @@ class GraphTenantFreshnessTest {
             Path directory = root.resolve("graph");
             try (GraphTenant tenant = open(directory)) {
                 new StagingGraphIngestSink(tenant.staging(), collaborator())
-                    .onDocumentPublished("docs:ada", "Ada worked with Babbage.");
+                    .onDocumentPublished("docs", "docs:ada", "Ada worked with Babbage.");
             }
             Files.createFile(GraphTenant.stagingDirectoryOf(directory)
                 .resolve(GraphTenant.ERASURE_INTERRUPTED_MARKER));
@@ -328,7 +328,7 @@ class GraphTenantFreshnessTest {
             try (GraphTenants tenants = tenants(root)) {
                 try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(ACME)) {
                     new StagingGraphIngestSink(lease.resource().staging(), collaborator())
-                        .onDocumentPublished("docs:ada", "Ada worked with Babbage.");
+                        .onDocumentPublished("docs", "docs:ada", "Ada worked with Babbage.");
                 }
                 assertThat(tenants.freshness(ACME).behind()).as("resident").isTrue();
                 assertThat(tenants.invalidate(ACME)).isTrue();
@@ -358,7 +358,7 @@ class GraphTenantFreshnessTest {
             try (GraphTenants tenants = tenants(root)) {
                 try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(ACME)) {
                     new StagingGraphIngestSink(lease.resource().staging(), collaborator())
-                        .onDocumentPublished("docs:ada", "Ada worked with Babbage.");
+                        .onDocumentPublished("docs", "docs:ada", "Ada worked with Babbage.");
                 }
                 assertThat(summaryOf(tenants, ACME).freshness()).get()
                     .extracting(GraphFreshness::behind).isEqualTo(true);

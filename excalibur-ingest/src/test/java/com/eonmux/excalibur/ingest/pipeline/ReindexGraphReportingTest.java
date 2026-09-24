@@ -110,6 +110,19 @@ class ReindexGraphReportingTest {
         }
 
         @Test
+        @DisplayName("every change is reported under the source the re-crawl read")
+        void everyChangeNamesItsSource() throws SourceException {
+            source.put("doc-a", "Ada runs Acme.");
+            reindexer.reindexAll(source);
+            source.put("doc-a", "Ada left Acme.");
+            reindexer.reindexAll(source);
+            source.drop("doc-a");
+            reindexer.reindexAll(source);
+
+            assertThat(sink.sources).containsExactly(SOURCE, SOURCE, SOURCE);
+        }
+
+        @Test
         @DisplayName("a single document reindexed on its own is reported too")
         void aSingleDocumentIsReported() {
             reindexer.reindexDocument(SOURCE, "doc-a", document("doc-a", "Ada runs Acme."));
@@ -248,21 +261,25 @@ class ReindexGraphReportingTest {
     /** A sink that records what it was told, in order. */
     private static final class RecordingSink implements GraphIngestSink {
         final List<String> calls = new CopyOnWriteArrayList<>();
+        final List<String> sources = new CopyOnWriteArrayList<>();
 
         @Override
-        public void onDocumentPublished(String documentKey, String text,
+        public void onDocumentPublished(String sourceId, String documentKey, String text,
                                         long lastModifiedMillis) {
+            sources.add(sourceId);
             calls.add("publish " + documentKey + " " + text);
         }
 
         @Override
-        public void onDocumentReplaced(String documentKey, String text,
+        public void onDocumentReplaced(String sourceId, String documentKey, String text,
                                        long lastModifiedMillis) {
+            sources.add(sourceId);
             calls.add("replace " + documentKey + " " + text);
         }
 
         @Override
-        public void onDocumentRemoved(String documentKey) {
+        public void onDocumentRemoved(String sourceId, String documentKey) {
+            sources.add(sourceId);
             calls.add("remove " + documentKey);
         }
 

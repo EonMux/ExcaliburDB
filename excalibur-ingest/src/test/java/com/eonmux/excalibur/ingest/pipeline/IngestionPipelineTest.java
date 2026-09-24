@@ -1028,19 +1028,19 @@ class IngestionPipelineTest {
             }
 
             @Override
-            public void onDocumentPublished(String documentKey, String text,
+            public void onDocumentPublished(String sourceId, String documentKey, String text,
                                             long lastModifiedMillis) {
                 published.add(documentKey);
             }
 
             @Override
-            public void onDocumentReplaced(String documentKey, String text,
+            public void onDocumentReplaced(String sourceId, String documentKey, String text,
                                            long lastModifiedMillis) {
                 replaced.add(documentKey + "=" + text);
             }
 
             @Override
-            public void onDocumentRemoved(String documentKey) {
+            public void onDocumentRemoved(String sourceId, String documentKey) {
                 removed.add(documentKey);
             }
 

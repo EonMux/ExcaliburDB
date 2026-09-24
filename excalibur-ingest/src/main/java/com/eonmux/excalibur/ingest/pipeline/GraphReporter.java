@@ -102,16 +102,24 @@ final class GraphReporter {
      * handed to {@link #report} exactly once.</p>
      */
     static final class Publication {
+        private final String sourceId;
         private final String documentKey;
         private final Change change;
         private final long number;
         private final Reports reports;
 
-        private Publication(String documentKey, Change change, long number, Reports reports) {
+        private Publication(String sourceId, String documentKey, Change change, long number,
+                            Reports reports) {
+            this.sourceId = sourceId;
             this.documentKey = documentKey;
             this.change = change;
             this.number = number;
             this.reports = reports;
+        }
+
+        /** The source that ingested the document, which its key alone cannot name. */
+        String sourceId() {
+            return sourceId;
         }
 
         /** The source-qualified document key. */
@@ -151,12 +159,14 @@ final class GraphReporter {
      * versions were published in. Every publication obtained here must be passed to
      * {@link #report}, which releases it.</p>
      *
+     * @param sourceId               The source that ingested the document
      * @param documentKey            The source-qualified document key
      * @param replacedEarlierVersion Whether the node already held a version of the document
      * @return The publication to report
      */
-    Publication published(String documentKey, boolean replacedEarlierVersion) {
-        return numbered(documentKey, replacedEarlierVersion ? Change.REPLACED : Change.PUBLISHED);
+    Publication published(String sourceId, String documentKey, boolean replacedEarlierVersion) {
+        return numbered(sourceId, documentKey,
+            replacedEarlierVersion ? Change.REPLACED : Change.PUBLISHED);
     }
 
     /**
@@ -168,15 +178,17 @@ final class GraphReporter {
      * rather than staging facts about text the corpus no longer holds. The publication obtained
      * here must be passed to {@link #report}.</p>
      *
+     * @param sourceId    The source that ingested the document
      * @param documentKey The source-qualified document key
      * @return The removal to report
      */
-    Publication removed(String documentKey) {
-        return numbered(documentKey, Change.REMOVED);
+    Publication removed(String sourceId, String documentKey) {
+        return numbered(sourceId, documentKey, Change.REMOVED);
     }
 
     /** Numbers a change to a document and holds it outstanding until it is reported. */
-    private Publication numbered(String documentKey, Change change) {
+    private Publication numbered(String sourceId, String documentKey, Change change) {
+        Objects.requireNonNull(sourceId, "sourceId must not be null");
         Objects.requireNonNull(documentKey, "documentKey must not be null");
         long number = publications.incrementAndGet();
         Reports reports = outstanding.compute(documentKey, (key, existing) -> {
@@ -185,7 +197,7 @@ final class GraphReporter {
             held.latest = number;
             return held;
         });
-        return new Publication(documentKey, change, number, reports);
+        return new Publication(sourceId, documentKey, change, number, reports);
     }
 
     /**
@@ -234,6 +246,7 @@ final class GraphReporter {
         if (sink == null) {
             return;
         }
+        String sourceId = publication.sourceId;
         String documentKey = publication.documentKey;
         try {
             // With the document's own date, which is what its facts are ordered by when a later
@@ -241,11 +254,11 @@ final class GraphReporter {
             // that was chunked, markup stripped, so facts are extracted from what the document
             // says rather than from its tags.
             switch (publication.change) {
-                case PUBLISHED -> sink.onDocumentPublished(documentKey, TextContent.decode(doc),
-                    doc.getLastModifiedMillis());
-                case REPLACED -> sink.onDocumentReplaced(documentKey, TextContent.decode(doc),
-                    doc.getLastModifiedMillis());
-                case REMOVED -> sink.onDocumentRemoved(documentKey);
+                case PUBLISHED -> sink.onDocumentPublished(sourceId, documentKey,
+                    TextContent.decode(doc), doc.getLastModifiedMillis());
+                case REPLACED -> sink.onDocumentReplaced(sourceId, documentKey,
+                    TextContent.decode(doc), doc.getLastModifiedMillis());
+                case REMOVED -> sink.onDocumentRemoved(sourceId, documentKey);
             }
         } catch (RuntimeException e) {
             long failed = failures.incrementAndGet();

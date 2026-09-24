@@ -37,23 +37,27 @@ class GraphReporterTest {
     private static class RecordingSink implements GraphIngestSink {
         final List<Reported> reported = new CopyOnWriteArrayList<>();
         final List<String> calls = new CopyOnWriteArrayList<>();
+        final List<String> sources = new CopyOnWriteArrayList<>();
         volatile RuntimeException failure;
         volatile IOException syncFailure;
 
         @Override
-        public void onDocumentPublished(String documentKey, String text,
+        public void onDocumentPublished(String sourceId, String documentKey, String text,
                                         long lastModifiedMillis) {
+            sources.add(sourceId);
             record("publish", documentKey, text, lastModifiedMillis);
         }
 
         @Override
-        public void onDocumentReplaced(String documentKey, String text,
+        public void onDocumentReplaced(String sourceId, String documentKey, String text,
                                        long lastModifiedMillis) {
+            sources.add(sourceId);
             record("replace", documentKey, text, lastModifiedMillis);
         }
 
         @Override
-        public void onDocumentRemoved(String documentKey) {
+        public void onDocumentRemoved(String sourceId, String documentKey) {
+            sources.add(sourceId);
             record("remove", documentKey, null, 0L);
         }
 
@@ -85,7 +89,7 @@ class GraphReporterTest {
 
     private static void publishAndReport(GraphReporter reporter, String documentKey,
                                          boolean replaced, FetchedDocument doc) {
-        reporter.report(reporter.published(documentKey, replaced), doc);
+        reporter.report(reporter.published("docs", documentKey, replaced), doc);
     }
 
     @Test
@@ -101,6 +105,23 @@ class GraphReporterTest {
         assertThat(sink.reported).containsExactly(
             new Reported("publish", "docs:ada.md", "Ada runs Acme.", 1_620_000_000_000L),
             new Reported("publish", "docs:undated.md", "Ada runs Acme.", 0L));
+    }
+
+    @Test
+    @DisplayName("names the source that ingested the document, which its key cannot")
+    void namesTheSource() {
+        RecordingSink sink = new RecordingSink();
+        GraphReporter reporter = new GraphReporter();
+        reporter.setSink(sink);
+
+        // Both keys begin "team:wiki:", and only the report says which source each came from.
+        reporter.report(reporter.published("team", "team:wiki:home.md", false), document(1L));
+        reporter.report(reporter.published("team:wiki", "team:wiki:faq.md", true), document(2L));
+        reporter.report(reporter.removed("team", "team:wiki:home.md"), null);
+
+        assertThat(sink.sources).containsExactly("team", "team:wiki", "team");
+        assertThat(sink.calls).containsExactly("publish team:wiki:home.md",
+            "replace team:wiki:faq.md", "remove team:wiki:home.md");
     }
 
     @Test
@@ -125,8 +146,8 @@ class GraphReporterTest {
         GraphReporter reporter = new GraphReporter();
         reporter.setSink(sink);
 
-        GraphReporter.Publication older = reporter.published("docs:ada.md", true);
-        GraphReporter.Publication newer = reporter.published("docs:ada.md", true);
+        GraphReporter.Publication older = reporter.published("docs", "docs:ada.md", true);
+        GraphReporter.Publication newer = reporter.published("docs", "docs:ada.md", true);
         reporter.report(newer, document("Ada left Acme.", 2L));
         reporter.report(older, document("Ada runs Acme.", 1L));
 
@@ -134,7 +155,7 @@ class GraphReporterTest {
             .as("the older version's report would withdraw the newer version's facts")
             .containsExactly(new Reported("replace", "docs:ada.md", "Ada left Acme.", 2L));
 
-        GraphReporter.Publication again = reporter.published("docs:ada.md", true);
+        GraphReporter.Publication again = reporter.published("docs", "docs:ada.md", true);
         reporter.report(again, document("Ada is back.", 3L));
         assertThat(sink.reported).last()
             .as("a document whose reports have all run is reported again on its next version")
@@ -151,21 +172,21 @@ class GraphReporterTest {
         reporter.setSink(sink);
 
         publishAndReport(reporter, "docs:ada.md", false, document("Ada runs Acme.", 1L));
-        GraphReporter.Publication removal = reporter.removed("docs:ada.md");
+        GraphReporter.Publication removal = reporter.removed("docs", "docs:ada.md");
         assertThat(removal.removal()).isTrue();
         assertThat(removal.replacedEarlierVersion()).isFalse();
         reporter.report(removal, null);
         assertThat(sink.calls).containsExactly("publish docs:ada.md", "remove docs:ada.md");
 
-        GraphReporter.Publication late = reporter.published("docs:ada.md", true);
-        GraphReporter.Publication removedAgain = reporter.removed("docs:ada.md");
+        GraphReporter.Publication late = reporter.published("docs", "docs:ada.md", true);
+        GraphReporter.Publication removedAgain = reporter.removed("docs", "docs:ada.md");
         reporter.report(removedAgain, null);
         reporter.report(late, document("Ada left Acme.", 2L));
         assertThat(sink.calls)
             .as("a version removed before its report ran must not stage facts about it")
             .containsExactly("publish docs:ada.md", "remove docs:ada.md", "remove docs:ada.md");
 
-        GraphReporter.Publication stale = reporter.removed("docs:ada.md");
+        GraphReporter.Publication stale = reporter.removed("docs", "docs:ada.md");
         publishAndReport(reporter, "docs:ada.md", false, document("Ada is back.", 3L));
         reporter.report(stale, null);
         assertThat(sink.calls).last()
@@ -177,7 +198,7 @@ class GraphReporterTest {
     @DisplayName("refuses to report a published version without its document")
     void refusesAPublicationWithoutItsDocument() {
         GraphReporter reporter = new GraphReporter();
-        GraphReporter.Publication publication = reporter.published("docs:ada.md", false);
+        GraphReporter.Publication publication = reporter.published("docs", "docs:ada.md", false);
 
         assertThatThrownBy(() -> reporter.report(publication, null))
             .isInstanceOf(IllegalArgumentException.class)
@@ -192,7 +213,7 @@ class GraphReporterTest {
         sink.failure = new IllegalStateException("graph staging store is closed");
         reporter.setSink(sink);
 
-        assertThatCode(() -> reporter.report(reporter.removed("docs:ada.md"), null))
+        assertThatCode(() -> reporter.report(reporter.removed("docs", "docs:ada.md"), null))
             .doesNotThrowAnyException();
         assertThat(reporter.failures()).isEqualTo(1);
     }
@@ -220,7 +241,7 @@ class GraphReporterTest {
         GraphReporter reporter = new GraphReporter();
         reporter.setSink(sink);
 
-        GraphReporter.Publication first = reporter.published("docs:ada.md", false);
+        GraphReporter.Publication first = reporter.published("docs", "docs:ada.md", false);
         Thread slow = Thread.ofVirtual().start(() -> reporter.report(first, document("slow", 1L)));
         assertThat(firstEntered.await(30, TimeUnit.SECONDS)).isTrue();
 
@@ -229,7 +250,7 @@ class GraphReporterTest {
             .as("another document's report does not wait for this one's")
             .containsExactly("publish docs:babbage.md");
 
-        GraphReporter.Publication second = reporter.published("docs:ada.md", true);
+        GraphReporter.Publication second = reporter.published("docs", "docs:ada.md", true);
         Thread waiting = Thread.ofVirtual().start(
             () -> reporter.report(second, document("second", 2L)));
         waiting.join(200);

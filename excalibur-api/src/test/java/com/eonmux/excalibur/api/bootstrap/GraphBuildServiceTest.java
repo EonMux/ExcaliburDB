@@ -150,7 +150,7 @@ class GraphBuildServiceTest {
                 new GraphBuildService(staging, holder, config, models(config), List.of());
 
             // Exactly what IngestionOrchestrator does once a document is durably published.
-            sink.onDocumentPublished("docs:ada",
+            sink.onDocumentPublished("docs", "docs:ada",
                 "Ada Lovelace worked with Charles Babbage on the Analytical Engine.");
 
             assertThat(sink.factsStaged()).isEqualTo(2);
@@ -181,7 +181,7 @@ class GraphBuildServiceTest {
             GraphBuildService service =
                 new GraphBuildService(staging, holder, config, models(config), List.of());
 
-            sink.onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
+            sink.onDocumentPublished("docs", "docs:ada", "Ada Lovelace and Charles Babbage.");
             service.build();
             Object first = served(holder).orElseThrow();
 
@@ -204,7 +204,7 @@ class GraphBuildServiceTest {
         try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"));
              GraphRagHolder holder = new GraphRagHolder(graphDirectory, null)) {
             new StagingGraphIngestSink(staging, fixedFacts())
-                .onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
+                .onDocumentPublished("docs", "docs:ada", "Ada Lovelace and Charles Babbage.");
             assertThat(staging.unpublishedChanges().pending()).isTrue();
 
             GraphBuildService.BuildOutcome outcome =
@@ -247,10 +247,10 @@ class GraphBuildServiceTest {
                 new StagingGraphIngestSink(staging, factsOfTheDocument());
             GraphBuildService service =
                 new GraphBuildService(staging, holder, config, models(config), List.of());
-            sink.onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
+            sink.onDocumentPublished("docs", "docs:ada", "Ada Lovelace and Charles Babbage.");
             assertThat(service.build().published()).isTrue();
 
-            sink.onDocumentRemoved("docs:ada");
+            sink.onDocumentRemoved("docs", "docs:ada");
             assertThat(staging.stagedCount()).isZero();
             assertThat(staging.unpublishedChanges().pending()).isTrue();
 
@@ -293,7 +293,7 @@ class GraphBuildServiceTest {
         try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"));
              GraphRagHolder holder = new GraphRagHolder(graphDirectory, null)) {
             new StagingGraphIngestSink(staging, fixedFacts())
-                .onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
+                .onDocumentPublished("docs", "docs:ada", "Ada Lovelace and Charles Babbage.");
             assertThat(new GraphBuildService(staging, holder, config, models(config), List.of())
                 .build().edges()).isEqualTo(2);
             Object served = served(holder).orElseThrow();
@@ -353,7 +353,7 @@ class GraphBuildServiceTest {
 
             // The document is already published and searchable by the time the sink runs;
             // throwing here would report a loss that did not happen.
-            sink.onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
+            sink.onDocumentPublished("docs", "docs:ada", "Ada Lovelace and Charles Babbage.");
 
             assertThat(sink.extractionFailures()).isEqualTo(1);
             assertThat(sink.factsStaged()).isZero();
@@ -371,7 +371,7 @@ class GraphBuildServiceTest {
         try (GraphStagingStore staging = GraphStagingStore.open(stagingDirectory);
              GraphRagHolder holder = new GraphRagHolder(graphDirectory, null)) {
             new StagingGraphIngestSink(staging, fixedFacts())
-                .onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
+                .onDocumentPublished("docs", "docs:ada", "Ada Lovelace and Charles Babbage.");
             new GraphBuildService(staging, holder, config, models(config), List.of()).build();
         }
 
@@ -395,7 +395,7 @@ class GraphBuildServiceTest {
                 staging, holder, configFor(holder.directory()),
                 models(configFor(holder.directory())), List.of());
             new StagingGraphIngestSink(staging, fixedFacts())
-                .onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
+                .onDocumentPublished("docs", "docs:ada", "Ada Lovelace and Charles Babbage.");
             assertThat(service.build().published()).isTrue();
             return service;
         }

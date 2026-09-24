@@ -272,7 +272,7 @@ final class DocumentIngestor {
         // A previous version means facts may have been staged from it, which the report of this
         // one has to withdraw before staging its own.
         return new Written(DocumentOutcome.published(chunks.size()),
-            graphReporter.published(documentKey, previous != null));
+            graphReporter.published(sourceId, documentKey, previous != null));
     }
 
     /**

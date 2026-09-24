@@ -318,7 +318,7 @@ class GraphTenantsTest {
 
             try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(acme)) {
                 new StagingGraphIngestSink(lease.resource().staging(), facts("Ada", "Babbage"))
-                    .onDocumentPublished("acme:doc", "Ada knows Babbage.");
+                    .onDocumentPublished("acme", "acme:doc", "Ada knows Babbage.");
                 assertThat(lease.resource().buildService().build().published()).isTrue();
             }
 
@@ -342,7 +342,7 @@ class GraphTenantsTest {
 
             try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(acme)) {
                 new StagingGraphIngestSink(lease.resource().staging(), facts("Ada", "Babbage"))
-                    .onDocumentPublished("acme:doc", "Ada knows Babbage.");
+                    .onDocumentPublished("acme", "acme:doc", "Ada knows Babbage.");
                 assertThat(lease.resource().buildService().build().edges()).isEqualTo(1);
             }
 
@@ -384,7 +384,7 @@ class GraphTenantsTest {
 
             try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(acme)) {
                 new StagingGraphIngestSink(lease.resource().staging(), facts("Ada", "Babbage"))
-                    .onDocumentPublished("acme:doc", "Ada knows Babbage.");
+                    .onDocumentPublished("acme", "acme:doc", "Ada knows Babbage.");
                 lease.resource().buildService().build();
 
                 // Evicted while it is being read. The eviction is deferred, so what this lease
@@ -542,7 +542,7 @@ class GraphTenantsTest {
                 try (NamespaceRegistry.Lease<GraphTenant> lease =
                          tenants.borrow(NamespaceId.SHARED)) {
                     new StagingGraphIngestSink(lease.resource().staging(), facts("Ada", "Babbage"))
-                        .onDocumentPublished("doc-" + attempt, "Ada knows Babbage.");
+                        .onDocumentPublished("docs", "doc-" + attempt, "Ada knows Babbage.");
                     assertThat(lease.resource().buildService().build().published()).isTrue();
                     tenants.recost(NamespaceId.SHARED);
                 }
@@ -570,7 +570,7 @@ class GraphTenantsTest {
                 long before = tenants.budget().mappings();
 
                 new StagingGraphIngestSink(lease.resource().staging(), facts("Ada", "Babbage"))
-                    .onDocumentPublished("acme:doc", "Ada knows Babbage.");
+                    .onDocumentPublished("acme", "acme:doc", "Ada knows Babbage.");
                 assertThat(lease.resource().buildService().build().published()).isTrue();
 
                 long mapped = lease.resource().cost()[0];
@@ -604,7 +604,7 @@ class GraphTenantsTest {
                     .containsExactly(0L, 0L);
 
                 new StagingGraphIngestSink(lease.resource().staging(), facts("Ada", "Babbage"))
-                    .onDocumentPublished("acme:doc", "Ada knows Babbage.");
+                    .onDocumentPublished("acme", "acme:doc", "Ada knows Babbage.");
                 assertThat(lease.resource().buildService().build().published()).isTrue();
 
                 long[] cost = lease.resource().cost();

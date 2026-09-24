@@ -423,7 +423,7 @@ class LlmRelationExtractorTest {
                         "Ada", "knows", "Babbage",
                         com.eonmux.excalibur.graph.provenance.Provenance.UNKNOWN)));
 
-                sink.onDocumentPublished("docs:ada", "Ada knows Babbage.");
+                sink.onDocumentPublished("docs", "docs:ada", "Ada knows Babbage.");
 
                 assertThat(sink.documentsSeen()).isEqualTo(1);
                 assertThat(sink.factsStaged()).isEqualTo(1);
@@ -441,9 +441,9 @@ class LlmRelationExtractorTest {
                 StagingGraphIngestSink sink =
                     new StagingGraphIngestSink(staging, RelationExtractor.none());
 
-                sink.onDocumentPublished("docs:ada", "   ");
-                sink.onDocumentPublished("docs:ada", null);
-                sink.onDocumentPublished(null, "text");
+                sink.onDocumentPublished("docs", "docs:ada", "   ");
+                sink.onDocumentPublished("docs", "docs:ada", null);
+                sink.onDocumentPublished("docs", null, "text");
 
                 assertThat(sink.documentsSeen()).isZero();
             }
@@ -470,9 +470,9 @@ class LlmRelationExtractorTest {
         @Test
         @DisplayName("a sink with nothing to do reports nothing")
         void theNoneSinkDoesNothing() {
-            GraphIngestSink.none().onDocumentPublished("docs:ada", "text");
-            GraphIngestSink.none().onDocumentPublished("docs:ada", "text", 1L);
-            GraphIngestSink.none().onDocumentReplaced("docs:ada", "text", 1L);
+            GraphIngestSink.none().onDocumentPublished("docs", "docs:ada", "text");
+            GraphIngestSink.none().onDocumentPublished("docs", "docs:ada", "text", 1L);
+            GraphIngestSink.none().onDocumentReplaced("docs", "docs:ada", "text", 1L);
         }
 
         @Test
@@ -491,7 +491,7 @@ class LlmRelationExtractorTest {
                             com.eonmux.excalibur.graph.provenance.Provenance.UNKNOWN)
                             .withStatedOn(statedByModel)));
 
-                sink.onDocumentPublished("docs:ada", "Ada runs Acme.", lastModified);
+                sink.onDocumentPublished("docs", "docs:ada", "Ada runs Acme.", lastModified);
 
                 List<Integer> stated = new java.util.ArrayList<>();
                 staging.forEachStaged((s, r, o, from, to, statedOn, provenance) ->
@@ -515,7 +515,7 @@ class LlmRelationExtractorTest {
                         "Ada", "ceo_of", "Acme",
                         com.eonmux.excalibur.graph.provenance.Provenance.UNKNOWN)));
 
-                sink.onDocumentPublished("docs:ada", "Ada runs Acme.", 0L);
+                sink.onDocumentPublished("docs", "docs:ada", "Ada runs Acme.", 0L);
 
                 staging.forEachStaged((s, r, o, from, to, statedOn, provenance) ->
                     assertThat(statedOn).isEqualTo(Math.toIntExact(today.toEpochDay())));

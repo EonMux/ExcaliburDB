@@ -40,6 +40,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>A document removed outright is withdrawn the same way, with nothing staged after it.</p>
  *
+ * <p>The source a document came from is not consulted: this sink stages into one store, and
+ * every document reported to it belongs there.</p>
+ *
  * <p>A withdrawal that fails is owed rather than dropped: {@link StagedWithdrawals} records it and
  * retries it until it is made, and nothing newer is staged for the document in the meantime,
  * since the retry withdraws by document and would take a newer version's facts with the old
@@ -110,12 +113,14 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
      * published again once its source listed it again. When that withdrawal fails once more,
      * nothing is staged, for the reason {@link #onDocumentReplaced} gives.</p>
      *
+     * @param sourceId           The source that ingested the document
      * @param documentKey        The source-qualified document key
      * @param text               The document's text
      * @param lastModifiedMillis The document's own date, or 0 when unknown
      */
     @Override
-    public void onDocumentPublished(String documentKey, String text, long lastModifiedMillis) {
+    public void onDocumentPublished(String sourceId, String documentKey, String text,
+                                    long lastModifiedMillis) {
         if (documentKey == null || documentKey.isBlank() || text == null || text.isBlank()) {
             return;
         }
@@ -134,12 +139,14 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
      * the owed withdrawal is retried by document rather than by version, so it would take the
      * new facts with the old ones - and until it did, the next build would publish both.</p>
      *
+     * @param sourceId           The source that ingested the document
      * @param documentKey        The source-qualified document key
      * @param text               The new version's text
      * @param lastModifiedMillis The new version's date, or 0 when unknown
      */
     @Override
-    public void onDocumentReplaced(String documentKey, String text, long lastModifiedMillis) {
+    public void onDocumentReplaced(String sourceId, String documentKey, String text,
+                                   long lastModifiedMillis) {
         if (documentKey == null || documentKey.isBlank()) {
             return;
         }
@@ -157,10 +164,11 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
      *
      * <p>A failed withdrawal is counted, logged and owed, as a replacement's is.</p>
      *
+     * @param sourceId    The source that ingested the document
      * @param documentKey The source-qualified document key
      */
     @Override
-    public void onDocumentRemoved(String documentKey) {
+    public void onDocumentRemoved(String sourceId, String documentKey) {
         if (documentKey == null || documentKey.isBlank()) {
             return;
         }

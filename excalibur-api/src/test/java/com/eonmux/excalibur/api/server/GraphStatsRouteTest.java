@@ -90,7 +90,8 @@ class GraphStatsRouteTest {
         NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(tenants,
             sourceId -> Optional.empty(), RelationExtractor.none());
         // A document whose source this node does not hold: seen, and dropped for that reason.
-        sink.onDocumentPublished("gone-source:doc-1", "Ada Lovelace wrote the first program.");
+        sink.onDocumentPublished("gone-source", "gone-source:doc-1",
+            "Ada Lovelace wrote the first program.");
         server = server(root, true, sink);
         server.start();
 

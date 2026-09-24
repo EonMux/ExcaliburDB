@@ -3,6 +3,7 @@ package com.eonmux.excalibur.ingest.pipeline;
 import com.eonmux.excalibur.core.codec.ChunkPayloadCodec;
 import com.eonmux.excalibur.core.text.ChunkIdentifiers;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
+import com.eonmux.excalibur.ingest.graph.GraphIngestSink;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
@@ -28,6 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 
@@ -98,6 +100,39 @@ class DocumentKeyCollisionTest {
     }
 
     @Test
+    @DisplayName("is reported to the graph under the source that ingested it, not one read from "
+        + "its key")
+    void theGraphIsToldEachDocumentsOwnSource() {
+        List<String> reported = new CopyOnWriteArrayList<>();
+        IngestionOrchestrator orchestrator = new IngestionOrchestrator(new TextChunker(64, 0),
+            null, storage, index, sourceId -> new RecordingStatus(),
+            new DocumentVisibilityTracker(documents));
+        orchestrator.setGraphSink(new GraphIngestSink() {
+            @Override
+            public void onDocumentPublished(String sourceId, String documentKey, String text,
+                                            long lastModifiedMillis) {
+                reported.add(sourceId + " " + documentKey);
+            }
+
+            @Override
+            public void onDocumentReplaced(String sourceId, String documentKey, String text,
+                                           long lastModifiedMillis) {
+                reported.add(sourceId + " " + documentKey);
+            }
+
+            @Override
+            public void onDocumentRemoved(String sourceId, String documentKey) {
+                reported.add(sourceId + " " + documentKey);
+            }
+        });
+
+        orchestrator.ingestNow(new FixedSource("team", Map.of("wiki:home.md", "the team page")));
+        orchestrator.ingestNow(new FixedSource("team:wiki", Map.of("faq.md", "the wiki faq")));
+
+        assertThat(reported).containsExactly("team " + KEY, "team:wiki team:wiki:faq.md");
+    }
+
+    @Test
     @DisplayName("is refused whichever source registered first")
     void theFirstRegistrationWins() {
         IngestionOrchestrator orchestrator = new IngestionOrchestrator(new TextChunker(64, 0),
@@ -133,7 +168,8 @@ class DocumentKeyCollisionTest {
     }
 
     @Test
-    @DisplayName("is refused by a re-crawl that publishes atomically, before it is marked in flight")
+    @DisplayName("is refused by a re-crawl that publishes atomically, before it is marked in "
+        + "flight")
     void anAtomicReindexIsRefused() {
         MapWriter writer = new MapWriter();
         DocumentVisibilityTracker tracker = new DocumentVisibilityTracker(documents);

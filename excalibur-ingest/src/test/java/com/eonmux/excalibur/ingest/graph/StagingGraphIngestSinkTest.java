@@ -105,10 +105,10 @@ class StagingGraphIngestSinkTest {
     void aReplacementWithdrawsTheEarlierVersion(@TempDir Path dir) throws IOException {
         try (GraphStagingStore staging = GraphStagingStore.open(dir)) {
             StagingGraphIngestSink sink = new StagingGraphIngestSink(staging, lineExtractor());
-            sink.onDocumentPublished("docs:ada.md", "Ada runs Acme", 1L);
-            sink.onDocumentPublished("docs:babbage.md", "Babbage runs Initech", 1L);
+            sink.onDocumentPublished("docs", "docs:ada.md", "Ada runs Acme", 1L);
+            sink.onDocumentPublished("docs", "docs:babbage.md", "Babbage runs Initech", 1L);
 
-            sink.onDocumentReplaced("docs:ada.md", "Ada runs Globex", 2L);
+            sink.onDocumentReplaced("docs", "docs:ada.md", "Ada runs Globex", 2L);
 
             assertThat(stagedFacts(staging))
                 .as("what the document used to say is gone, what it says now is staged")
@@ -130,10 +130,10 @@ class StagingGraphIngestSinkTest {
     void aReplacementWithNoFactsStillWithdraws(@TempDir Path dir) throws IOException {
         try (GraphStagingStore staging = GraphStagingStore.open(dir)) {
             StagingGraphIngestSink sink = new StagingGraphIngestSink(staging, lineExtractor());
-            sink.onDocumentPublished("docs:ada.md", "Ada runs Acme", 1L);
+            sink.onDocumentPublished("docs", "docs:ada.md", "Ada runs Acme", 1L);
 
             new StagingGraphIngestSink(staging, RelationExtractor.none())
-                .onDocumentReplaced("docs:ada.md", "nothing to say", 2L);
+                .onDocumentReplaced("docs", "docs:ada.md", "nothing to say", 2L);
 
             assertThat(stagedFacts(staging)).isEmpty();
         }
@@ -144,10 +144,10 @@ class StagingGraphIngestSinkTest {
     void aRemovalWithdrawsTheDocument(@TempDir Path dir) throws IOException {
         try (GraphStagingStore staging = GraphStagingStore.open(dir)) {
             StagingGraphIngestSink sink = new StagingGraphIngestSink(staging, lineExtractor());
-            sink.onDocumentPublished("docs:ada.md", "Ada runs Acme", 1L);
-            sink.onDocumentPublished("docs:babbage.md", "Babbage runs Initech", 1L);
+            sink.onDocumentPublished("docs", "docs:ada.md", "Ada runs Acme", 1L);
+            sink.onDocumentPublished("docs", "docs:babbage.md", "Babbage runs Initech", 1L);
 
-            sink.onDocumentRemoved("docs:ada.md");
+            sink.onDocumentRemoved("docs", "docs:ada.md");
 
             assertThat(stagedFacts(staging)).containsExactly("Babbage Initech");
             List<String> snippets = new ArrayList<>();
@@ -165,10 +165,10 @@ class StagingGraphIngestSinkTest {
         doThrow(new IOException("log unreadable")).when(store).erase(any(StagedErasure.class));
         StagingGraphIngestSink sink = new StagingGraphIngestSink(store, lineExtractor());
 
-        sink.onDocumentReplaced("docs:ada.md", "Ada runs Globex", 2L);
-        sink.onDocumentReplaced(null, "Ada runs Globex", 2L);
-        sink.onDocumentReplaced(" ", "Ada runs Globex", 2L);
-        sink.onDocumentRemoved("docs:babbage.md");
+        sink.onDocumentReplaced("docs", "docs:ada.md", "Ada runs Globex", 2L);
+        sink.onDocumentReplaced("docs", null, "Ada runs Globex", 2L);
+        sink.onDocumentReplaced("docs", " ", "Ada runs Globex", 2L);
+        sink.onDocumentRemoved("docs", "docs:babbage.md");
 
         assertThat(sink.withdrawalFailures()).isEqualTo(2);
         assertThat(sink.factsStaged())
@@ -176,7 +176,7 @@ class StagingGraphIngestSinkTest {
             .isZero();
         assertThat(sink.withdraw("docs:ada.md")).isEqualTo(-1);
 
-        sink.onDocumentPublished("docs:babbage.md", "Babbage runs Initech", 3L);
+        sink.onDocumentPublished("docs", "docs:babbage.md", "Babbage runs Initech", 3L);
         assertThat(sink.factsStaged())
             .as("published again while its removal is still owed: nothing is staged beside it")
             .isZero();
@@ -191,16 +191,16 @@ class StagingGraphIngestSinkTest {
              StagedWithdrawals withdrawals =
                  StagedWithdrawals.open(staging, dir.resolve(StagedWithdrawals.LOG_FILE))) {
             StagingGraphIngestSink sink = new StagingGraphIngestSink(withdrawals, lineExtractor());
-            sink.onDocumentPublished("docs:ada.md", "Ada runs Acme", 1L);
+            sink.onDocumentPublished("docs", "docs:ada.md", "Ada runs Acme", 1L);
             Path blocker = dir.resolve(GraphStagingStore.TRIPLE_LOG + ".erasing");
             java.nio.file.Files.createDirectories(blocker.resolve("held"));
 
-            sink.onDocumentRemoved("docs:ada.md");
+            sink.onDocumentRemoved("docs", "docs:ada.md");
             assertThat(stagedFacts(staging)).containsExactly("Ada Acme");
 
             java.nio.file.Files.delete(blocker.resolve("held"));
             java.nio.file.Files.delete(blocker);
-            sink.onDocumentPublished("docs:ada.md", "Ada runs Globex", 2L);
+            sink.onDocumentPublished("docs", "docs:ada.md", "Ada runs Globex", 2L);
 
             assertThat(stagedFacts(staging))
                 .as("the removed version withdrawn first, then the new one staged")
