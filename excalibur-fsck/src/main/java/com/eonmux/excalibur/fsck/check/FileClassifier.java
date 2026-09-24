@@ -26,6 +26,11 @@ public final class FileClassifier {
      * @return What the file is
      */
     public static FileKind classify(String relative) {
+        // At the top of the directory only: the lock is taken there and nowhere else, and the
+        // same name deeper down is not this build's.
+        if (relative.equals(com.eonmux.excalibur.core.datadir.DataDirectoryLock.FILE_NAME)) {
+            return FileKind.NODE_LOCK;
+        }
         String name = nameOf(relative);
         // First, and wherever it sits: a heap dump is the JVM's, not any format's, so the
         // directory it landed in says nothing about what it is.

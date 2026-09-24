@@ -8,6 +8,10 @@ import com.eonmux.excalibur.backup.manifest.Consistency;
 import com.eonmux.excalibur.backup.manifest.FileEntry;
 import com.eonmux.excalibur.backup.manifest.ManifestCodec;
 import com.eonmux.excalibur.backup.manifest.SnapshotManifest;
+import com.eonmux.excalibur.core.datadir.DataDirectoryLock;
+import com.eonmux.excalibur.core.datadir.DataDirectoryLockedException;
+import com.eonmux.excalibur.core.datadir.InterruptedRestore;
+import com.eonmux.excalibur.core.datadir.LockHolder;
 import com.eonmux.excalibur.store.catalog.CatalogFile;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,6 +25,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -31,14 +36,17 @@ import java.util.function.Supplier;
  * <p>Nothing in this engine orders one file against another. The catalog, the lexical
  * manifest and the two registries are published by atomic rename; the segments, their
  * write-ahead logs and the HNSW graphs are written in place through memory mappings that
- * are forced only on flush and on close. There is no global write barrier, no durable
- * checkpoint and no lock on the directory. A clean shutdown is the only moment at which
- * every file in the directory describes the same instant, which is why the offline path is
- * the one this tool is built around.</p>
+ * are forced only on flush and on close. There is no global write barrier and no durable
+ * checkpoint. A clean shutdown is the only moment at which every file in the directory
+ * describes the same instant, which is why the offline path is the one this tool is built
+ * around.</p>
  *
  * <p>So an image is consistent when three things hold. Every file was copied from a
- * directory nothing was writing to, which is checked by fingerprinting the tree before and
- * after the copy and refusing if anything moved. Each segment's data file and its
+ * directory nothing was writing to. That is established twice: the snapshot takes the data
+ * directory's lock ({@link DataDirectoryLock}) before it copies anything - refusing a directory
+ * a node holds, and keeping one from starting until the copy is done - and it fingerprints the
+ * tree before and after the copy and refuses if anything moved, which still catches a writer
+ * that does not take the lock. Each segment's data file and its
  * write-ahead log came from the same moment, which follows from the first, and matters
  * because the {@code .dat} is forced only on flush while every log append is fsynced before
  * it is acknowledged - the pair is the segment, and either half alone is lossy. And each
@@ -60,6 +68,9 @@ public final class SnapshotWriter {
     private static final String PRODUCER = "excalibur-backup/"
         + Objects.requireNonNullElse(SnapshotWriter.class.getPackage()
         .getImplementationVersion(), "1.0.0-SNAPSHOT");
+
+    /** What a snapshot calls itself in the data directory's lock file. */
+    static final String LOCK_HOLDER = "excalibur-backup snapshot";
 
     /** Where the timestamp in the manifest comes from. */
     private final Clock clock;
@@ -89,9 +100,12 @@ public final class SnapshotWriter {
      *
      * @param options What to copy and where
      * @return The image and what was left out of it
-     * @throws SnapshotRefusedException if the destination is occupied, the directory moved
-     *                                  underneath the copy, or a copy did not read back
-     * @throws IOException              if anything cannot be read or written
+     * @throws SnapshotRefusedException if another process holds the directory and
+     *                                  {@code --allow-live} was not given, the destination is
+     *                                  occupied, the directory moved underneath the copy, or a
+     *                                  copy did not read back
+     * @throws IOException              if a restore into the directory was interrupted, or
+     *                                  anything cannot be read or written
      * @throws NullPointerException     if options is null
      */
     public SnapshotResult take(SnapshotOptions options) throws IOException {
@@ -100,14 +114,104 @@ public final class SnapshotWriter {
         if (!Files.isDirectory(dataDir)) {
             throw new IOException("There is no data directory at " + dataDir);
         }
-        boolean destinationIsOurs = !Files.exists(options.destination());
-        requireUsableDestination(options.destination());
+        Optional<DataDirectoryLock> lock = claim(dataDir, options.allowLive());
         try {
-            return build(options, dataDir);
-        } catch (IOException | RuntimeException e) {
-            discard(options.destination(), destinationIsOurs, e);
-            throw e;
+            InterruptedRestore.requireNoneIn(dataDir);
+            boolean destinationIsOurs = !Files.exists(options.destination());
+            requireUsableDestination(options.destination());
+            try {
+                return build(options, dataDir);
+            } catch (IOException | RuntimeException e) {
+                discard(options.destination(), destinationIsOurs, e);
+                throw e;
+            }
+        } finally {
+            release(lock);
         }
+    }
+
+    /**
+     * Takes the data directory's lock for the length of the copy, or learns why it cannot.
+     *
+     * <p>A directory another process holds is refused - a node is running on it - unless
+     * {@code --allow-live} asked for a live image, in which case it is copied under the holder
+     * and the image says so. A lock that cannot be taken for any other reason - a read-only
+     * mount, a directory this user may read and not write - is not a reason to refuse: the
+     * directory is probed without writing, a holder found that way is treated the same, and
+     * otherwise the copy goes ahead on the fingerprint alone, which is how every snapshot was
+     * taken before there was a lock.</p>
+     *
+     * @param dataDir   The source
+     * @param allowLive Whether a held directory may be copied anyway
+     * @return The lock, or empty when it is not held by this snapshot
+     * @throws SnapshotRefusedException if another process holds the directory and a live image
+     *                                  was not asked for
+     */
+    private static Optional<DataDirectoryLock> claim(Path dataDir, boolean allowLive)
+        throws IOException {
+        try {
+            return Optional.of(DataDirectoryLock.acquire(dataDir, LOCK_HOLDER));
+        } catch (DataDirectoryLockedException e) {
+            return inUse(dataDir, e.getMessage(), allowLive);
+        } catch (IOException e) {
+            Optional<LockHolder> holder;
+            try {
+                holder = DataDirectoryLock.probe(dataDir);
+            } catch (IOException probeFailure) {
+                e.addSuppressed(probeFailure);
+                LOGGER.warn("Could not take or test the lock on {} ({}). Whether a node is "
+                    + "running there is left to the fingerprint of the copy.", dataDir,
+                    e.toString());
+                return Optional.empty();
+            }
+            if (holder.isPresent()) {
+                return inUse(dataDir, "The data directory " + dataDir + " is in use by "
+                    + holder.get().describe() + ".", allowLive);
+            }
+            LOGGER.warn("Could not take the lock on {} ({}), and no process holds it. The "
+                + "snapshot goes ahead; a node that started during the copy would be caught "
+                + "only by the fingerprint.", dataDir, e.toString());
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Refuses a held directory, or lets a live snapshot proceed with a warning.
+     *
+     * @param dataDir   The source
+     * @param detail    Who holds it
+     * @param allowLive Whether a live image was asked for
+     * @return Empty, when the snapshot proceeds without the lock
+     * @throws SnapshotRefusedException if a live image was not asked for
+     */
+    private static Optional<DataDirectoryLock> inUse(Path dataDir, String detail,
+                                                     boolean allowLive)
+        throws SnapshotRefusedException {
+        if (!allowLive) {
+            throw new SnapshotRefusedException(SnapshotRefusedException.Reason.SOURCE_IN_USE,
+                detail + " A snapshot is taken with the node stopped; stop it and take the "
+                    + "snapshot again, or pass --allow-live to accept an image whose files may "
+                    + "not agree with one another.");
+        }
+        LOGGER.warn("{} --allow-live: copying it anyway, and recording the image as {}.",
+            detail, Consistency.LIVE_UNSAFE);
+        return Optional.empty();
+    }
+
+    /**
+     * Releases the lock, if this snapshot held one.
+     *
+     * @param lock The lock, or empty
+     */
+    private static void release(Optional<DataDirectoryLock> lock) {
+        lock.ifPresent(held -> {
+            try {
+                held.close();
+            } catch (IOException e) {
+                LOGGER.warn("Could not release the lock on {}: {}. It is released when this "
+                    + "process exits.", held.directory(), e.toString());
+            }
+        });
     }
 
     /**

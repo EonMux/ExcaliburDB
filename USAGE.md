@@ -227,8 +227,8 @@ uid `10001`, with the jar owned by `root` and read-only to the process. Nothing 
 | Secrets | None are in the image. Pass `EXCALIBUR_LLM_API_KEY` at run time, or mount a properties file and point `--config` at it — arguments after the image name reach the application |
 | Heap | `-XX:MaxRAMPercentage=60.0`, so the same image is right under any `docker run -m`. Not 75%: segments live in mapped arenas outside the heap, and a heap that crowds out the page cache turns every search into a disk read |
 | Heap dumps | Written on an out-of-memory exit to `/var/lib/excalibur-diagnostics`, not the data directory. Mount a volume there to keep one past `docker rm` |
-| Operator tools | `excalibur-fsck` and `excalibur-backup` are on the `PATH`. Run them with the node stopped, against the same volume; a repair needs `/var/lib/excalibur-quarantine` mounted, and a snapshot `/var/lib/excalibur-backups` — see below |
-| Health | `HEALTHCHECK` polls `/health/ready` with a 90s start period, which covers segment recovery on a large data directory |
+| Operator tools | `excalibur-fsck` and `excalibur-backup` are on the `PATH`. Run them with the node stopped, against the same volume; a repair needs `/var/lib/excalibur-quarantine` mounted, and a snapshot or restore `/var/lib/excalibur-backups` — see below. A repair, snapshot or restore against a volume a node is running on is refused (exit `4` from `excalibur-fsck`, `7` from `excalibur-backup`) |
+| Health | `HEALTHCHECK` runs `/opt/excalibur/bin/excalibur-healthcheck` every 15s, with a 90s start period that covers segment recovery on a large data directory. It probes liveness, `/health`, at the URL the node recorded as `health-url=` in `/var/lib/excalibur/.excalibur-lock` once its listener was bound — so the scheme, port and bind address are always the node's own. Liveness, because a health check drives restarts, and a drained or recovering node is alive. With `tls-client-auth=need`, give it a client certificate through `EXCALIBUR_HEALTHCHECK_CLIENT_CERT` and `EXCALIBUR_HEALTHCHECK_CLIENT_KEY` |
 | Stop | The JVM is pid 1, so `SIGTERM` reaches the shutdown hook. The hook publishes the chunk index's buffer, which is the tail of an ingestion run, and closes the storage engine. It does all of this within `excalibur.api.shutdown-timeout-seconds` (30 by default). Give it that plus 10: `--stop-timeout 40`, or `terminationGracePeriodSeconds: 40`, and more if you raise the setting |
 
 Bind-mounting a host directory instead of a named volume means `chown 10001:10001` on it first;
@@ -258,8 +258,20 @@ docker run --rm -v excalibur-data:/var/lib/excalibur \
   --entrypoint excalibur-backup excalibur \
   snapshot --data-dir /var/lib/excalibur --out /var/lib/excalibur-backups/$(date +%F)
 
+# Restore an image over the volume. /var/lib/excalibur is a mount point, which cannot be
+# renamed, so restore works inside it; --force because the volume holds a data directory.
+docker run --rm -v excalibur-data:/var/lib/excalibur \
+  -v excalibur-backups:/var/lib/excalibur-backups \
+  --entrypoint excalibur-backup excalibur \
+  restore --snapshot /var/lib/excalibur-backups/2026-09-14 --target /var/lib/excalibur --force
+
 docker start excalibur
 ```
+
+Each of these takes the data directory's lock, so run against a volume whose node is still up, a
+repair exits `4`, and a snapshot or a restore `7`, each naming the node's pid; nothing is written.
+The containers inherit the image's `HEALTHCHECK`, which has no node to ask in them; add
+`--no-healthcheck` to a long snapshot or restore if its health status matters to you.
 
 The data and the quarantine are two mounts, which no rename can cross, so `excalibur-fsck` copies
 each file it sets aside, forces the copy to disk and compares it byte for byte before removing the
@@ -2853,10 +2865,9 @@ the copy verifies faithfully without it:
 The report counts the structures proven and lists every one that was not, with why, rather than
 leaving them out, which would read as though nothing went unverified.
 
-Restoring verifies the image first, builds the tree beside the target, and renames it on in one
-move. It verifies to the same depth `verify` does by default — every length and CRC32C — and
-`restore --deep` adds the SHA-256 comparison and the format checkers, which is worth the time
-whenever the image has not already been through `verify --deep`:
+Restoring verifies the image first, to the same depth `verify` does by default — every length and
+CRC32C — and `restore --deep` adds the SHA-256 comparison and the format checkers, which is worth
+the time whenever the image has not already been through `verify --deep`:
 
 ```bash
 $B restore --snapshot /backups/excalibur-2026-09-14 --target /var/lib/excalibur/data --deep
@@ -2864,25 +2875,44 @@ $B restore --snapshot /backups/excalibur-2026-09-14 --target /var/lib/excalibur/
 
 An image that does not verify is refused and the target is left exactly as it was — exit 3, and
 nothing written. A target that already holds something needs `--force`, because a restore
-replaces a data directory wholesale rather than merging into one. Afterwards, start the node
-against it: it rediscovers the segments from the catalog, replays each write log, and serves the
-same answers the node it was taken from served. No import step and no reindex.
+replaces a data directory wholesale rather than merging into one; a lock file a stopped node left
+does not count. A target a node, a repair or another restore holds is refused with exit 7.
+Afterwards, start the node against it: it rediscovers the segments from the catalog, replays each
+write log, and serves the same answers the node it was taken from served. No import step and no
+reindex.
+
+The target is replaced in place — never renamed — so it can be a mount point such as a container
+volume, and only the target itself has to be writable. Under the target's lock, the image is
+copied into `.excalibur-restore-staging-*` inside the target and forced to disk; then the
+target's previous entries are moved into `.excalibur-restore-replaced-*` and the staged ones into
+place, one rename each, and both scratch directories are deleted. Each phase is recorded in a
+journal, `.excalibur-restore`, before it starts:
+
+| If it stops... | ...the target holds | and then |
+|---|---|---|
+| while the image is copied | its previous contents, untouched | the next restore discards the partial copy |
+| on a rename that fails | its previous contents, put back on the spot | the error says so; nothing else to do |
+| on a crash while entries move | a mixture, with the journal | the node refuses to start on it and `excalibur-fsck` reports it; run the same restore again, which completes it — or, if it was unwinding, undoes it — before anything else |
+
+At no point are the previous contents deleted before every entry of the image is in place.
 
 **Take the image with the node stopped.** The state is spread over many files, written two
 different ways: the catalog, the manifests and the registries are replaced by an atomic rename,
 while the segments, their write logs and the HNSW graphs are written in place through their
-mappings. Nothing orders one file against another, and nothing locks the directory. A copy taken
-while the node is writing can catch a catalog naming a segment the copy does not yet hold, or a
-mapping caught half-flushed. A clean `SIGTERM` shutdown is the only moment at which every file
-describes the same instant.
+mappings. Nothing orders one file against another. A copy taken while the node is writing can
+catch a catalog naming a segment the copy does not yet hold, or a mapping caught half-flushed. A
+clean `SIGTERM` shutdown is the only moment at which every file describes the same instant.
 
-The tool enforces this as far as it can: it fingerprints the directory before and after the copy
-and refuses an image whose source moved underneath it, with exit 5. That check is one-sided — it
-can prove a node *was* running, never that one was not — so `--allow-live` downgrades the refusal
-to a warning and stamps the image `LIVE_UNSAFE` rather than claiming a consistency it cannot
-establish. There is no online-backup mode. Stopping the background workers while the write path
-kept accepting writes would produce something that looked like a consistent image and was not,
-which is worse than having none.
+The tool enforces this two ways. A running node holds an exclusive operating-system lock on its
+data directory, the file `.excalibur-lock`, and the snapshot takes the same lock for the length of
+the copy: a directory a node holds is refused with exit 7, naming the node's pid, and a node
+started during the copy fails to start. It also fingerprints the directory before and after the
+copy and refuses an image whose source moved underneath it, with exit 5 — which catches a writer
+that does not take the lock, such as an older build. `--allow-live` downgrades both refusals to a
+warning and stamps the image `LIVE_UNSAFE` rather than claiming a consistency it cannot
+establish. The lock file is never copied into an image. There is no online-backup mode. Stopping
+the background workers while the write path kept accepting writes would produce something that
+looked like a consistent image and was not, which is worse than having none.
 
 If a hot copy is the only option, take it knowing what it is worth. Every write-log append is
 fsynced before it is acknowledged, so the acknowledged writes are on disk; what an inconsistent
@@ -3118,7 +3148,13 @@ quarantine and the original directory removed. What it refuses to attempt matter
 | A damaged graph staging log | Nothing rebuilds one, and the node opens a missing one as empty. Moved aside, a label interner hands its ids out again under the published graph, so entities are served under other entities' names; `triples.log` empties the next graph build; `entity_text.log` leaves entities nothing to be ranked or embedded by; `erasure.log` and `withdrawals.log` forget what is still owed. Restore the namespace's `graph-staging` directory from a backup, all its logs together, since they refer to one another by id |
 | Anything `UNREADABLE` | A device or permission problem, or a header naming a format version a newer build wrote. Either way nothing is known about the contents, and a newer build's file is not damaged. A newer build's write-ahead log is never trimmed, and is not moved aside even when its segment is gone |
 
-Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself failed — which says nothing about the directory and must not be read as `0`.
+Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself failed — which says nothing about the directory and must not be read as `0` — and `4` `--repair` was refused because a node or another tool holds the directory.
+
+`--repair` takes the data directory's lock before reading anything, so it can never write under a
+live node, and a node cannot start while it runs. A check without `--repair` writes nothing and
+proceeds against a held directory, warning that the files may change under it. A data directory
+holding `.excalibur-restore` — a restore that was interrupted — is reported as damage for the
+operator: re-run the same `excalibur-backup restore`, which finishes or undoes it.
 
 ---
 
@@ -3586,9 +3622,12 @@ served node built over the same directory; erase through the HTTP API where a gr
 
 ### Remember when embedding
 
-- **One process per data directory.** A directory can be served and embedded in turn, never at
-  once, and two `ExcaliburEmbedded` instances over the same directory are two nodes writing the
-  same files.
+- **One node per data directory.** An embedded node claims its directory with the same lock a
+  server takes (`.excalibur-lock`), so a server, another embedded node - in this process or
+  another - or an `excalibur-fsck --repair` or `excalibur-backup restore` on it is refused with a
+  `DataDirectoryLockedException` naming the holder. `close()` gives the claim back once the node
+  has shut down cleanly, so the directory can be opened again in the same process; a shutdown that
+  left work running keeps it claimed until the process exits.
 - **Call `ExcaliburEmbedded.prepare()` first if your application starts threads that might reach
   `java.lang.foreign` before the node is opened.** Two threads reaching it for the first time at
   the same instant deadlock the JVM inside the JDK's own class-initialization monitors, and a

@@ -313,7 +313,16 @@ public final class ExcaliburEmbedded implements AutoCloseable {
         }
         LOGGER.info("Closing the embedded node over {}", node.dataDirectory());
         try {
-            node.shutdown(shutdownTimeout).run();
+            if (node.shutdown(shutdownTimeout).run()) {
+                node.releaseDataDirectory();
+            } else {
+                LOGGER.error("The embedded node over {} did not shut down cleanly; its data "
+                    + "directory stays claimed until this process exits, so nothing opens it "
+                    + "while it may still be written", node.dataDirectory());
+            }
+        } catch (IOException e) {
+            LOGGER.error("Could not release the claim on {}: {}", node.dataDirectory(),
+                e.toString());
         } finally {
             executor.shutdownNow();
         }
@@ -485,14 +494,17 @@ public final class ExcaliburEmbedded implements AutoCloseable {
                 ShutdownBudget.configuredTimeout(config.getEffectiveProperties());
 
             NodeAssembly node =
-                NodeAssembly.open(config, dataDirectory.toAbsolutePath(), limits, 0);
+                NodeAssembly.open(config, dataDirectory.toAbsolutePath(), limits, 0,
+                    NodeAssembly.EMBEDDED_LOCK_HOLDER);
             InProcessServices services;
             try {
                 services = node.server().startInProcess();
             } catch (RuntimeException e) {
                 try {
-                    node.shutdown(shutdownTimeout).run();
-                } catch (RuntimeException suppressed) {
+                    if (node.shutdown(shutdownTimeout).run()) {
+                        node.releaseDataDirectory();
+                    }
+                } catch (IOException | RuntimeException suppressed) {
                     e.addSuppressed(suppressed);
                 }
                 throw e;

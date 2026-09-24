@@ -164,6 +164,7 @@ public final class FileInspector {
                     : "this is a half-finished write, not state: nothing reads it, and it is "
                     + "here because the operation that staged it did not finish");
             case DIAGNOSTIC_DUMP -> diagnosticDump(file, relative);
+            case NODE_LOCK -> nodeLock(file, relative);
             case OBSOLETE -> obsolete(file, relative);
             case UNRECOGNISED -> unverifiable(file, relative, "unrecognised",
                 "nothing in this build recognises this file, so it was not read at all. It is "
@@ -215,6 +216,29 @@ public final class FileInspector {
                 + "build reads it, so there is nothing in it to verify, and it does not count "
                 + "against --strict. The node removes it the next time it starts; deleting it by "
                 + "hand loses nothing", size);
+    }
+
+    /**
+     * Builds the verdict for the data directory's lock file, which is never read as data.
+     *
+     * @param file     The lock file
+     * @param relative Its path relative to the data directory
+     * @return A not-data verdict carrying the file's size
+     */
+    private static FileCheck nodeLock(Path file, String relative) {
+        String format = "data directory lock";
+        long size;
+        try {
+            size = Files.size(file);
+        } catch (IOException e) {
+            return new FileCheck(file, relative, format, null, CheckStatus.UNREADABLE,
+                "the file could not be sized: " + e, -1);
+        }
+        return new FileCheck(file, relative, format, null, CheckStatus.NOT_DATA,
+            "the lock a node or an operator tool takes to have the directory to itself, and the "
+                + "pid of its last holder. Not engine state: nothing reads it back, and it does "
+                + "not count against --strict. Leave it in place - deleting it while a node runs "
+                + "would let a second process lock a new file beside the first", size);
     }
 
     /**

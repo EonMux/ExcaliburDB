@@ -472,7 +472,8 @@ public final class RepairPlanner {
                 }
             }
             case "routing-names-missing-segment", "lexical-segment-missing",
-                 "lexical-column-missing" ->
+                 "lexical-column-missing",
+                 com.eonmux.excalibur.fsck.check.DataDirectoryScanner.INTERRUPTED_RESTORE ->
                 operator.add(finding.subject() + ": " + finding.detail());
             case CrossFileChecks.PENDING_MAPPING -> {
                 // Named rather than left to the default, because this is the one finding

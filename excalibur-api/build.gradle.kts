@@ -109,6 +109,11 @@ tasks.test {
     inputs.file(rootProject.file("excalibur.properties.example"))
         .withPropertyName("propertiesTemplate")
         .withPathSensitivity(PathSensitivity.RELATIVE)
+    // HealthcheckScriptTest runs the container's health check against a live listener, for the
+    // same reason: an edit to the script must re-run the test that holds it to the node.
+    inputs.file(rootProject.file("docker/excalibur-healthcheck"))
+        .withPropertyName("healthcheckScript")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
 }
 
 // Shadow JAR configuration for fat JAR packaging

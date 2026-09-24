@@ -1,6 +1,10 @@
 package com.eonmux.excalibur.api.embedded;
 
 import com.eonmux.excalibur.api.bootstrap.ChunkIndexFactory;
+import com.eonmux.excalibur.api.bootstrap.NodeAssembly;
+import com.eonmux.excalibur.core.datadir.DataDirectoryLock;
+import com.eonmux.excalibur.core.datadir.DataDirectoryLockedException;
+import com.eonmux.excalibur.core.datadir.LockHolder;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
 import com.eonmux.excalibur.ingest.source.SourceDescriptor;
 import org.junit.jupiter.api.AfterEach;
@@ -333,6 +337,37 @@ class ExcaliburEmbeddedTest {
             assertThatThrownBy(() -> db.documents("s")).isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> db.erase("s", List.of("a")))
                 .isInstanceOf(IllegalStateException.class);
+        }
+
+        @Test
+        @DisplayName("a second node on a directory one already holds, until the first closes")
+        void heldDirectory() throws Exception {
+            try (ExcaliburEmbedded db = lexicalNode().open()) {
+                assertThat(DataDirectoryLock.probe(dataDir)).get()
+                    .extracting(LockHolder::description)
+                    .isEqualTo(NodeAssembly.EMBEDDED_LOCK_HOLDER);
+                assertThatThrownBy(() -> lexicalNode().open())
+                    .isInstanceOf(DataDirectoryLockedException.class)
+                    .hasMessageContaining(NodeAssembly.EMBEDDED_LOCK_HOLDER);
+                db.supply("handbook", handbook());
+            }
+
+            assertThat(DataDirectoryLock.probe(dataDir)).isEmpty();
+            try (ExcaliburEmbedded db = lexicalNode().open()) {
+                assertThat(db.documents()).hasSize(3);
+            }
+        }
+
+        @Test
+        @DisplayName("a directory another process's tool holds")
+        void directoryHeldElsewhere() throws Exception {
+            Files.createDirectories(dataDir);
+            try (DataDirectoryLock ignored =
+                     DataDirectoryLock.acquire(dataDir, "excalibur-fsck --repair")) {
+                assertThatThrownBy(() -> lexicalNode().open())
+                    .isInstanceOf(DataDirectoryLockedException.class)
+                    .hasMessageContaining("excalibur-fsck --repair");
+            }
         }
 
         @Test

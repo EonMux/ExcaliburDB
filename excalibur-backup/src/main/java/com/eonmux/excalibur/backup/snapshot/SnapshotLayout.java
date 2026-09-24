@@ -33,16 +33,6 @@ public final class SnapshotLayout {
     /** The version of this layout, recorded in every manifest. */
     public static final String LAYOUT_VERSION = "1";
 
-    /**
-     * Appears in the name of every directory a restore stages into.
-     *
-     * <p>A restore builds the new tree beside the target and renames it on, so the target
-     * is never a blend of the old contents and the new. The infix is distinctive so that a
-     * staging directory stranded by a crash is recognisable as scratch rather than as a
-     * data directory somebody should try to start a node on.</p>
-     */
-    public static final String STAGING_INFIX = ".excalibur-restore-";
-
     private SnapshotLayout() {
     }
 }

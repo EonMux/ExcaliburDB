@@ -207,6 +207,40 @@ class ExcaliburDBServerTlsTest {
             .isEqualTo("http://0.0.0.0:8080");
     }
 
+    @Test
+    @DisplayName("the liveness probe URL is the bound address, with a wildcard bind probed on loopback")
+    void probeAddressOfTheBoundSocket() throws Exception {
+        // A wildcard is where the node listens, not an address a probe can connect to; the
+        // loopback of the same family is on every interface the wildcard covers.
+        assertThat(ExcaliburDBServer.probeUrlOf(false, new java.net.InetSocketAddress(
+            java.net.InetAddress.getByName("0.0.0.0"), 8080)))
+            .isEqualTo("http://127.0.0.1:8080/health");
+        assertThat(ExcaliburDBServer.probeUrlOf(true, new java.net.InetSocketAddress(
+            java.net.InetAddress.getByName("::"), 8443)))
+            .isEqualTo("https://[0:0:0:0:0:0:0:1]:8443/health");
+        assertThat(ExcaliburDBServer.probeUrlOf(true, new java.net.InetSocketAddress(
+            java.net.InetAddress.getByName("10.1.2.3"), 8443)))
+            .isEqualTo("https://10.1.2.3:8443/health");
+    }
+
+    @Test
+    @DisplayName("a started TLS node names an https liveness URL on the port it took")
+    void livenessProbeUrlOfAStartedNode(@TempDir Path dir) throws Exception {
+        Path keystore = TestKeystore.create(dir, "server.p12", "PKCS12", PASSWORD, "server");
+        start(tlsFor(keystore));
+
+        assertThat(server.livenessProbeUrl())
+            .isEqualTo("https://127.0.0.1:" + server.getPort() + "/health");
+    }
+
+    @Test
+    @DisplayName("a node not yet started has no liveness URL")
+    void livenessProbeUrlBeforeStartIsNull() {
+        server = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
+
+        assertThat(server.livenessProbeUrl()).isNull();
+    }
+
     private static TlsConfig tlsFor(Path keystore) {
         return TlsConfig.fromProperties(Map.of(
             TlsConfig.KEY_KEYSTORE, keystore.toString(),

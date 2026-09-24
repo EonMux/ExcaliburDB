@@ -33,8 +33,8 @@ public final class RestoreCommand {
      * @return Always {@link ExitCode#OK}; every refusal is thrown
      * @throws UsageException if a required option is missing, or --target is inside
      *                        --snapshot
-     * @throws IOException    if the image does not verify, the target is occupied, or a
-     *                        file cannot be read or written
+     * @throws IOException    if the image does not verify, the target is occupied or held
+     *                        by another process, or a file cannot be read or written
      */
     public static ExitCode execute(Arguments arguments, PrintStream out)
         throws UsageException, IOException {
@@ -48,6 +48,7 @@ public final class RestoreCommand {
             throw new UsageException(e.getMessage());
         }
         RestoreResult result = new SnapshotRestorer().restore(options);
+        result.recovery().ifPresent(recovery -> out.printf("recovered  %s%n", recovery));
         out.printf("restored   %s%n", result.target());
         out.printf("  from     %s (%s)%n", options.snapshotDir(),
             result.manifest().snapshotId());

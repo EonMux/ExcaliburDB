@@ -12,6 +12,7 @@ import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.config.ConfigLoader;
 import com.eonmux.excalibur.config.ConfigValidation;
 import com.eonmux.excalibur.config.ShardConfig;
+import com.eonmux.excalibur.core.datadir.DataDirectoryLock;
 import com.eonmux.excalibur.core.memory.ForeignMemoryBootstrap;
 import com.eonmux.excalibur.metrics.Metrics;
 import com.eonmux.excalibur.metrics.MetricsRegistry;
@@ -319,7 +320,12 @@ public final class ExcaliburApplication {
         Path dataDir = initializeDataDirectory();
 
         // The node itself, assembled the one way both the server and the embedded facade use.
-        this.node = NodeAssembly.open(config, dataDir, apiSecurity, port);
+        // It claims the directory before reading anything in it. The claim is never released:
+        // the operating system releases it when the process exits, and releasing it any earlier -
+        // after a shutdown that left a drain running, say - would let a second node in while this
+        // one could still be writing.
+        this.node = NodeAssembly.open(config, dataDir, apiSecurity, port,
+            NodeAssembly.SERVER_LOCK_HOLDER);
 
         LOGGER.info("ExcaliburApplication initialized successfully");
     }
@@ -440,6 +446,7 @@ public final class ExcaliburApplication {
         // refuses the http URL, a node bound to one interface is not on localhost, and port 0
         // binds an ephemeral port the configuration never names.
         String baseUrl = server.baseUrl();
+        advertiseEndpoint(server);
         LOGGER.info("Listening on: {}", baseUrl);
         LOGGER.info("Health endpoint: {}/health", baseUrl);
         LOGGER.info("Stats endpoint: {}/v1/stats", baseUrl);
@@ -566,5 +573,23 @@ public final class ExcaliburApplication {
      */
     public DocumentVisibilityChecker getDocumentVisibilityChecker() {
         return node.documentVisibilityChecker();
+    }
+
+    /**
+     * Records in the data directory's lock file where this node is listening.
+     *
+     * <p>Read by the container's health check. A failure is logged rather than fatal: the node
+     * serves either way, and the health check reporting it unhealthy is what surfaces it.</p>
+     *
+     * @param server The started server
+     */
+    private void advertiseEndpoint(ExcaliburDBServer server) {
+        try {
+            node.advertise(server.baseUrl(), server.livenessProbeUrl());
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("Could not record the listening address in {}: {}. A health check "
+                + "that reads it will report this node unhealthy.",
+                node.dataDirectory().resolve(DataDirectoryLock.FILE_NAME), e.toString());
+        }
     }
 }

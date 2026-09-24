@@ -180,6 +180,7 @@ public final class BackupCli {
             return switch (refusal.reason()) {
                 case SNAPSHOT_DOES_NOT_VERIFY -> ExitCode.VERIFICATION_FAILED;
                 case TARGET_NOT_EMPTY -> ExitCode.TARGET_NOT_EMPTY;
+                case TARGET_IN_USE -> ExitCode.IN_USE;
             };
         }
         if (failure instanceof SnapshotRefusedException refusal) {
@@ -187,6 +188,7 @@ public final class BackupCli {
                 case DESTINATION_NOT_EMPTY -> ExitCode.TARGET_NOT_EMPTY;
                 case SOURCE_CHANGED_UNDERNEATH -> ExitCode.NOT_QUIESCED;
                 case COPY_DID_NOT_MATCH -> ExitCode.IO_ERROR;
+                case SOURCE_IN_USE -> ExitCode.IN_USE;
             };
         }
         return failure instanceof ManifestFormatException

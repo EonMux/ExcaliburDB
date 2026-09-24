@@ -32,11 +32,12 @@ public final class Usage {
           plus the format versions and the epoch the image is coherent at.
 
           The node must be stopped. Nothing in this engine orders one file against
-          another and nothing locks the directory, so a clean shutdown is the only moment
-          at which every file describes the same instant. The directory is fingerprinted
-          before and after the copy, and a snapshot whose source moved underneath it is
-          refused; --allow-live downgrades that refusal to a warning and records the
-          image as LIVE_UNSAFE.
+          another, so a clean shutdown is the only moment at which every file describes
+          the same instant. The snapshot takes the data directory's lock for the length
+          of the copy, so a directory a node holds is refused and a node cannot start
+          during the copy. The directory is also fingerprinted before and after the copy,
+          and a snapshot whose source moved underneath it is refused. --allow-live
+          downgrades both refusals to a warning and records the image as LIVE_UNSAFE.
 
           --exclude-derived leaves out state something will rebuild: the lexical chunk
           index, a tenant's built edge store and the quantiser codebooks. The HNSW graphs and their node mappings, a compaction's staged
@@ -79,10 +80,16 @@ public final class Usage {
 
         RESTORE
           Verifies the image to the same depth as verify - lengths and CRC32C, or with
-          --deep also SHA-256 and the format checkers - then builds the new tree beside
-          the target and renames it on in one move. Refuses an image that does not
-          verify. Refuses a target that already holds something unless --force is given.
-          In both cases the target is left exactly as it was. A term sketch in an image an
+          --deep also SHA-256 and the format checkers - then takes the target's lock,
+          stages the image inside the target and moves it into place entry by entry. The
+          target itself is never renamed, so it may be a mount point, such as the
+          container image's volume. Every step is journaled: a failure puts back what the
+          target held, and after a crash the node refuses the directory until restore is
+          run into it again, which first completes or undoes the interrupted one.
+
+          Refuses an image that does not verify, a target a node or another tool holds,
+          and a target that already holds something unless --force is given. In each case
+          the target's data is left exactly as it was. A term sketch in an image an
           earlier build took is verified with the image and not restored.
 
         """;
@@ -106,9 +113,11 @@ public final class Usage {
           3   a snapshot did not verify; nothing was restored
           4   the restore target is not empty and --force was not given, or the
               snapshot --out directory is not empty
-          5   the data directory moved while it was being copied; a node is running
+          5   the data directory moved while it was being copied; a writer is running
           6   a file could not be read or written, or a copy did not read back as
               what was written
+          7   another process holds the data directory or restore target: a node is
+              running on it, or a repair or restore is; nothing was written
           70  an unanticipated failure
         """;
 

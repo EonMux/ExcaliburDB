@@ -232,6 +232,23 @@ jobs:
           docker logs excalibur-ci
           exit 1
 
+      # The image's own HEALTHCHECK, as Docker runs it: the script reads the liveness URL the
+      # node wrote into its lock file and asks it. Ready above says the node answers; healthy
+      # here says the check a supervisor restarts on can find it, from inside the container.
+      - name: Wait for the image's health check to pass
+        run: |
+          for _ in $(seq 1 40); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' excalibur-ci)
+            if [ "$status" = healthy ]; then
+              echo "healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "the health check never passed; last status: $status"
+          docker inspect --format '{{json .State.Health}}' excalibur-ci
+          exit 1
+
       # A document through the authenticated write path, so that what the steps below check,
       # repair and back up is a volume a node wrote to, not one holding only what it creates on
       # start - which every check passes as readily as a sound one.
@@ -244,6 +261,32 @@ jobs:
             -d '{"source_id": "smoke", "documents": [
                   {"document_id": "a.md", "text": "The quick brown fox jumps over the lazy dog."}]}'
           echo
+
+      # The node holds its data directory's lock while it runs, so the tools that write, or
+      # need the directory to hold still, must refuse the live volume with their own exit code
+      # and write nothing: 4 from a repair, 7 from a snapshot.
+      - name: The tools refuse the running node's volume
+        run: |
+          # Not -e, which the runner's shell starts with: the refusals are the expected result.
+          set +e -uo pipefail
+          docker run --rm --volumes-from excalibur-ci \
+            -v excalibur-ci-quarantine:/var/lib/excalibur-quarantine \
+            --entrypoint excalibur-fsck excalibur:ci \
+            /var/lib/excalibur --repair --quarantine-dir=/var/lib/excalibur-quarantine
+          code=$?
+          if [ "$code" -ne 4 ]; then
+            echo "excalibur-fsck --repair exited $code against a running node's volume, not 4"
+            exit 1
+          fi
+          docker run --rm --volumes-from excalibur-ci \
+            -v excalibur-ci-backups:/var/lib/excalibur-backups \
+            --entrypoint excalibur-backup excalibur:ci \
+            snapshot --data-dir /var/lib/excalibur --out /var/lib/excalibur-backups/live
+          code=$?
+          if [ "$code" -ne 7 ]; then
+            echo "excalibur-backup snapshot exited $code against a running node's volume, not 7"
+            exit 1
+          fi
 
       # Always, so a failed step above still leaves no node running over the volume. The exit
       # code is the point: the entrypoint execs java so the JVM is PID 1 and receives SIGTERM
@@ -307,3 +350,55 @@ jobs:
           docker run --rm -v excalibur-ci-backups:/var/lib/excalibur-backups \
             --entrypoint excalibur-backup excalibur:ci \
             verify --snapshot /var/lib/excalibur-backups/ci --deep
+
+      # The restore the README documents for this image. /var/lib/excalibur is a mount point
+      # whose parent the image's user cannot write, so a restore that renamed the target, or
+      # staged beside it, could not run here at all. Over the node's own volume with --force,
+      # and into a fresh named volume; each must check clean and hold no restore scratch.
+      - name: Restore the image into the node's volume and a fresh one
+        run: |
+          set -euo pipefail
+          docker run --rm --volumes-from excalibur-ci \
+            -v excalibur-ci-backups:/var/lib/excalibur-backups \
+            --entrypoint excalibur-backup excalibur:ci \
+            restore --snapshot /var/lib/excalibur-backups/ci --target /var/lib/excalibur --force
+          docker run --rm -v excalibur-ci-restored:/var/lib/excalibur \
+            -v excalibur-ci-backups:/var/lib/excalibur-backups \
+            --entrypoint excalibur-backup excalibur:ci \
+            restore --snapshot /var/lib/excalibur-backups/ci --target /var/lib/excalibur
+          for mount in "--volumes-from excalibur-ci" "-v excalibur-ci-restored:/var/lib/excalibur"; do
+            # shellcheck disable=SC2086
+            docker run --rm $mount --entrypoint excalibur-fsck excalibur:ci /var/lib/excalibur
+            # shellcheck disable=SC2086
+            docker run --rm $mount --entrypoint sh excalibur:ci -c '
+              left=$(find /var/lib/excalibur -maxdepth 1 -name ".excalibur-restore*")
+              if [ -n "$left" ]; then echo "restore left $left behind"; exit 1; fi'
+          done
+
+      # A node must start on what was restored, on the image's defaults, and its health check
+      # pass - the end of the path an operator restoring a volume takes.
+      - name: Start a node on the restored volume
+        run: |
+          set -euo pipefail
+          docker run -d --name excalibur-ci-restored \
+            -v excalibur-ci-restored:/var/lib/excalibur excalibur:ci
+          status=starting
+          for _ in $(seq 1 40); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' excalibur-ci-restored)
+            if [ "$status" = healthy ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ "$status" != healthy ]; then
+            echo "the node on the restored volume never passed its health check ($status)"
+            docker logs excalibur-ci-restored
+            exit 1
+          fi
+          docker stop --time 40 excalibur-ci-restored
+          code=$(docker inspect --format '{{.State.ExitCode}}' excalibur-ci-restored)
+          if [ "$code" -ne 143 ]; then
+            echo "the node on the restored volume exited $code on SIGTERM, not 143"
+            docker logs excalibur-ci-restored
+            exit 1
+          fi

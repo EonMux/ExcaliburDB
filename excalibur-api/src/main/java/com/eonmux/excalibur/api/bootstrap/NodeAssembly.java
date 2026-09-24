@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.bootstrap;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.server.ExcaliburDBServer;
 import com.eonmux.excalibur.config.Config;
+import com.eonmux.excalibur.core.datadir.DataDirectoryLock;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.erasure.SegmentVectorEraser;
 import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
@@ -64,6 +65,12 @@ public final class NodeAssembly {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(NodeAssembly.class);
 
+    /** What a server node calls itself in its data directory's lock file. */
+    public static final String SERVER_LOCK_HOLDER = "excalibur node";
+
+    /** What an embedded node calls itself in its data directory's lock file. */
+    public static final String EMBEDDED_LOCK_HOLDER = "excalibur embedded node";
+
     /** How long a failed assembly waits for each worker it started to stop. */
     private static final Duration ABANDON_WAIT = Duration.ofSeconds(10);
 
@@ -77,6 +84,13 @@ public final class NodeAssembly {
     private final GraphTenants graphTenants;
     private final ExcaliburDBServer server;
     private final IngestionWiring.Attachment ingestion;
+
+    /**
+     * This node's exclusive claim on {@link #dataDirectory}, taken before anything in it was
+     * read. Held in a field so the channel it was taken through stays reachable for as long as
+     * the claim is meant to last.
+     */
+    private volatile DataDirectoryLock dataDirectoryLock;
 
     private NodeAssembly(Config config, Path dataDirectory, HnswConfigFactory hnswConfigFactory,
                          CoreComponents core, DocumentVisibilityTracker documentVisibilityTracker,
@@ -102,16 +116,40 @@ public final class NodeAssembly {
      * @param dataDir  The data directory, which must exist
      * @param security The security policy the server's routes are guarded by
      * @param port     The port a listener would bind; 0 for an ephemeral one
-     * @return The node, with nothing started that a caller has to start
-     * @throws IllegalStateException if a component cannot be opened; everything opened before
-     *                               it has been released
-     * @throws NullPointerException  if an argument is null
+     * @param holder   What the data directory's lock file names as holding it, such as
+     *                 {@link #SERVER_LOCK_HOLDER}
+     * @return The node, with nothing started that a caller has to start, holding the claim on
+     *         its data directory
+     * @throws com.eonmux.excalibur.core.datadir.DataDirectoryLockedException if another process,
+     *                                  or another node in this one, holds the directory
+     * @throws IOException              if the directory cannot be claimed, or a restore was
+     *                                  interrupted there
+     * @throws IllegalStateException    if a component cannot be opened; everything opened
+     *                                  before it, the claim included, has been released
+     * @throws NullPointerException     if an argument is null
      */
     public static NodeAssembly open(Config config, Path dataDir, ApiSecurityConfig security,
-                                    int port) {
+                                    int port, String holder) throws IOException {
         Objects.requireNonNull(config, "config cannot be null");
         Objects.requireNonNull(dataDir, "dataDir cannot be null");
         Objects.requireNonNull(security, "security cannot be null");
+        Objects.requireNonNull(holder, "holder cannot be null");
+
+        // Before anything in the directory is read: a second node is refused here rather than
+        // after both have mapped its segments.
+        DataDirectoryLock lock = DataDirectoryClaim.claim(dataDir, holder);
+        try {
+            NodeAssembly node = assembleUnder(config, dataDir, security, port);
+            node.dataDirectoryLock = lock;
+            return node;
+        } catch (RuntimeException e) {
+            DataDirectoryClaim.release(lock, e);
+            throw e;
+        }
+    }
+
+    private static NodeAssembly assembleUnder(Config config, Path dataDir,
+                                              ApiSecurityConfig security, int port) {
 
         // Built from the shard settings so the properties file's efConstruction and efSearch are
         // what the graphs are built and searched with.
@@ -237,6 +275,45 @@ public final class NodeAssembly {
         return new NodeShutdown(server, core.indexOrchestrator(), ingestion.lexicalErasureSweep(),
             ingestion.chunkIndex(), documentVisibilityTracker, graphTenants,
             core.storageEngine(), core.arena(), shutdownTimeout);
+    }
+
+    /**
+     * Records in the data directory's lock file where this node is listening.
+     *
+     * <p>Read by the container's health check, which has only the environment to go on and
+     * would otherwise have to reconstruct the scheme, the port and the address from
+     * configuration it cannot see and get one of them wrong.</p>
+     *
+     * @param listening The base URL the listener bound
+     * @param health    The liveness probe's URL
+     * @throws IOException if the lock file cannot be rewritten
+     * @throws IllegalStateException if the claim has been released
+     */
+    public void advertise(String listening, String health) throws IOException {
+        DataDirectoryLock lock = dataDirectoryLock;
+        if (lock == null) {
+            throw new IllegalStateException("the data directory claim has been released");
+        }
+        lock.advertise(listening, health);
+    }
+
+    /**
+     * Gives up the claim on the data directory, once the node is taken apart.
+     *
+     * <p>Only after a shutdown that closed the storage engine: one that left work running also
+     * left files being written, and releasing the claim then would let a second node in while
+     * this one could still be writing. A server never calls this - the operating system
+     * releases the claim when the process exits - but an embedded node is closed and reopened
+     * inside one process, and the second open needs the claim back. Idempotent.</p>
+     *
+     * @throws IOException if the lock cannot be released
+     */
+    public void releaseDataDirectory() throws IOException {
+        DataDirectoryLock lock = dataDirectoryLock;
+        dataDirectoryLock = null;
+        if (lock != null) {
+            lock.close();
+        }
     }
 
     /** @return The configuration the node was assembled from */

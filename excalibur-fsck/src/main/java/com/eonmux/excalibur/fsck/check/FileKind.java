@@ -140,6 +140,17 @@ public enum FileKind {
      */
     DIAGNOSTIC_DUMP,
 
+    /**
+     * {@code .excalibur-lock}: the lock that gives one process at a time the directory.
+     *
+     * <p>Coordination, not state: it holds the current or last holder's pid and, for a node,
+     * where it listens, and nothing in the engine reads it back. It is not data, not even
+     * unverified data - and a scan leaves it out of the report altogether, as it does a
+     * restore's journal and scratch, so that every run does not list the same file that
+     * describes a process rather than the store.</p>
+     */
+    NODE_LOCK,
+
     /** Nothing here recognises this file. */
     UNRECOGNISED;
 
