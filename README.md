@@ -434,7 +434,9 @@ restart, so losing it loses that history, though never any of the corpus. But no
 serves depends on it, and the node reads one it will not take — cut short, without its header, or
 at a version it does not read, or altered so its checksum no longer matches — as no history and
 reports each source from its next run, so such a file is reported `CORRUPT` and not counted as
-damage. Every other derived file — a graph, a
+damage. The erasure receipts, `erasure-receipts`, are excused the same way: the node discards a
+set it cannot read, and what is lost is the readback of earlier erasures, never the erasures.
+Every other derived file — a graph, a
 mapping, a codebook, an LSH table — is rebuilt only by a reindex or a retrain, and its damage fails
 the run. A `segment_<N>.hnsw.compact.docmap` is
 the mapping an HNSW compaction stages: beside its `segment_<N>.hnsw.compact` the compaction never
@@ -985,6 +987,24 @@ A document whose chunks would not all come out of storage or out of the index is
 to finish it. That is a failure rather than a partial success: the caller asked for content to be
 gone and some of it is not.
 
+Every `POST /v1/erasure` answer carries a `request_id`, and `GET /v1/erasure/{request_id}` says
+where that erasure stands, after the response and after a restart. The answer is `incomplete` while
+a document the request named is still held (repeat the request), `pending` while a graph erasure
+it queued has not been discharged, `applied` while the lexical index still keeps the removed
+content's bytes awaiting a compaction, and `discharged` once nothing the request removed remains
+anywhere the node keeps it, with `discharged_at_ms`. `remaining` counts what is still owed and
+`graph` lists each namespace's queued requests. What backs it is `<data dir>/erasure-receipts`: the
+source, the scope, the per-document counts and the graph request ids of the 1024 most recent
+erasures — never a document id, a name or any content. An older request is `404`; a receipt that
+could not be written leaves the erasure itself done and answers `request_id: null`.
+
+`GET /v1/graph/erasure/{request_id}` answers the same question for a graph obligation, in the
+namespace `X-Excalibur-Namespace` names: `pending` until a compaction has rewritten what it covers
+out of the store and the staged facts, then `discharged` with `discharged_at_ms`. It reads the
+namespace's own erasure log, so it survives a restart. The completion of the most recent 1024
+requests per namespace is kept in full; an older one still answers `discharged`, with no scope,
+no timestamps and `detail_retained: false`. A request id the namespace never issued is `404`.
+
 What no erasure can reach is the source itself. A document removed here and still served by the
 directory or website it was crawled from comes back on the next re-crawl. That half of an obligation
 belongs to whoever owns the source.
@@ -1252,9 +1272,10 @@ separate so a burst of writes cannot starve ordinary reads.
 | `DELETE` | `/v1/query/{query_id}` | bearer | mutate | Cancel an in-progress query |
 | `GET` | `/v1/documents` | bearer | read | Read one chunk's text, named by `document_id` |
 | `POST` | `/v1/documents/fetch` | bearer | read | Read the text of a page of chunks in one request |
-| `GET` | `/v1/documents/list` | bearer | read | Which documents this node holds, with their chunk ids — paged by `limit` and `cursor`, narrowed by `source_id` |
+| `GET` | `/v1/documents/list` | bearer | read | Which documents this node holds, with their chunk ids — paged by `limit` and `cursor`, narrowed by `source_id`. With `document_id` and its `source_id`, one document's chunks in order, with their text when `include_text=true` |
 | `POST` | `/v1/documents` | bearer | mutate | Index documents supplied in the request, for a caller that holds the content rather than a target to crawl |
 | `POST` | `/v1/ingest` | bearer | mutate | Register an ingestion source and start indexing it |
+| `PUT` | `/v1/ingest` | bearer | mutate | Replace a registered source's configuration, keeping its id, status history, schedule and indexed documents. 404 for an unknown source, 409 while it is being crawled or reindexed |
 | `GET` | `/v1/ingest` | bearer | read | Read back what each source was registered as, or one named source |
 | `DELETE` | `/v1/ingest` | bearer | mutate | Stop crawling a source. Its indexed documents are kept |
 | `DELETE` | `/v1/ingest/run` | bearer | mutate | Stop the ingestion run in flight and leave the source registered |
@@ -1262,7 +1283,8 @@ separate so a burst of writes cannot starve ordinary reads.
 | `POST` | `/v1/reindex` | bearer | mutate | Re-index a registered source. A node with no embedding endpoint re-chunks and re-indexes lexically |
 | `DELETE` | `/v1/reindex` | bearer | mutate | Ask a running re-index to stop, so a hung one does not hold its source's claim for the life of the process |
 | `GET` | `/v1/reindex/status` | bearer | read | Re-index state per source, or all sources. The readback for the 202 `/v1/reindex` returns |
-| `POST` | `/v1/erasure` | bearer | mutate | Remove named documents from the corpus: storage, the lexical index, and the registry — and withdraw what was extracted from them into the graph of the namespace they were staged into. 200 when both halves are done, 202 while the graph half is queued, 500 when some content could not be removed |
+| `POST` | `/v1/erasure` | bearer | mutate | Remove named documents from the corpus: storage, the lexical index, and the registry — and withdraw what was extracted from them into the graph of the namespace they were staged into. 200 when both halves are done, 202 while the graph half is queued, 500 when some content could not be removed. Answers with a `request_id` |
+| `GET` | `/v1/erasure/{request_id}` | bearer | read | Where one document erasure stands: `incomplete`, `pending`, `applied` or `discharged`, with timestamps and what remains |
 | `POST` | `/v1/compact` | bearer | mutate | Reclaim the space tombstoned entries still hold, without waiting for the next background sweep. Answers 202 and works behind the response |
 | `DELETE` | `/v1/compact` | bearer | mutate | Ask the compaction in progress to stop. 200 either way, saying whether there was one |
 | `GET` | `/v1/compact/status` | bearer | read | What the last compaction examined, reclaimed and failed on. The readback for the 202 `/v1/compact` returns |
@@ -1271,6 +1293,7 @@ separate so a burst of writes cannot starve ordinary reads.
 | `DELETE` | `/v1/graph/build` | bearer | mutate | Stop the build in progress. It publishes nothing, and the namespace keeps serving the graph it had |
 | `GET` | `/v1/graph/build/status` | bearer | read | What the build is doing, and what the last one published |
 | `POST` | `/v1/graph/erasure` | bearer | mutate | Record an obligation to erase, and compact when it is due |
+| `GET` | `/v1/graph/erasure/{request_id}` | bearer | read | Where one graph erasure obligation stands: `pending` or `discharged`, with timestamps, in the namespace `X-Excalibur-Namespace` names |
 | `GET` | `/v1/graph/namespaces` | bearer | read | Every namespace on disk, and what each one holds and owes |
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | mutate | Remove a namespace entirely. Irreversible, and `409` for `shared` |
 
@@ -1629,7 +1652,38 @@ allow-listed and every address it resolves to is rejected if it is loopback, lin
 any-local or multicast, which is what keeps ingestion away from cloud metadata endpoints and
 internal services.
 
+### Audit log
+
+Every request that changes what the node holds or how it behaves writes one structured event to
+the `excalibur.audit` logger, whatever its outcome — including a refused one, so an unauthenticated
+or rate-limited attempt is on the record too. The actions are `source.register`, `source.update`,
+`source.deregister`, `ingest.cancel`, `documents.supply`, `reindex.start`, `reindex.cancel`,
+`erasure.documents`, `erasure.graph`, `compaction.start`, `compaction.cancel`,
+`graph.build.start`, `graph.build.cancel`, `graph.namespace.delete`, `query.cancel`, `node.drain`
+and `node.undrain`. Reads are not audited.
+
+Each event is a JSON line with the usual `timestamp` and these top-level fields:
+
+| Field | Meaning |
+|-------|---------|
+| `audit_action` | One of the actions above |
+| `audit_outcome` | `success`, `accepted` (a 202), `rejected` (4xx), `unauthenticated` (401), `rate_limited` (429), `failed` (5xx) or `error` |
+| `http_status`, `http_method`, `http_path` | The request and the status it was answered with |
+| `request_id` | The caller's `X-Request-Id` when it is 1–128 characters of `[A-Za-z0-9._:-]`, otherwise one the node generates. Returned in the same response header |
+| `client_address` | The caller, resolved as rate limiting resolves it, so `excalibur.api.trusted-proxies` applies |
+| `audit_targets` | What the action applied to: source ids, source types, namespaces, erasure scope and request ids, counts |
+
+No event carries content an erasure removes: a graph erasure by name records `entity_by: name`
+and never the name, and a document erasure records how many documents it named, never which.
+
+The logger is pinned at `INFO`, so lowering `EXCALIBUR_LOG_LEVEL` does not silence it, and it writes
+to the same JSON stream as everything else. To keep audit events apart, start the node with
+`-Dlogback.configurationFile` pointing at a copy of the shipped `logback.xml` that routes the
+logger to its own appender with additivity off — the shipped file carries a commented example of
+exactly that.
+
 ### Query Example
+
 
 Send raw query text. On a node with an embedding model the server embeds it using the same model that ingestion uses, guaranteeing the query lives in the same embedding space as the indexed vectors; a node without one answers from its BM25 index:
 
@@ -2441,6 +2495,23 @@ deadline that has to be able to say the data is gone. The scopes are
 `{"scope":"source","source_type":"DOCUMENT","source_id":N}` and
 `{"scope":"extractor","version":N}`.
 
+`request_id` is how the obligation is followed afterwards, with the same `X-Excalibur-Namespace`
+it was recorded under:
+
+```bash
+curl http://localhost:8080/v1/graph/erasure/7
+```
+
+```json
+{"request_id": 7, "state": "discharged", "scope": "entity", "entity_id": 42,
+ "requested_at_ms": 1756649000000, "discharged_at_ms": 1756649900000,
+ "detail_retained": true, "namespace": "shared", "remaining": null}
+```
+
+`pending` carries a `remaining` sentence saying what is still owed; `discharged` means the edges
+the scope selects are gone from the served graph and from the staged facts. An entity erased by
+name reports its `entity_id`, never the name.
+
 In the source scope, `N` names one ingested document, not a registered source: it is the XxHash64
 (seed 0) of the UTF-8 bytes of the document's key, `<source_id>:<document_id>` — `my-docs:guide.md`
 for the document whose chunks come back from `/v1/query` as `my-docs:guide.md:chunk:N`. It is
@@ -2999,6 +3070,14 @@ needs nothing; it is written when the first run ends. Versions 1 and 2 carry no 
 still read — version 1, written before a crawl counted the pages `robots.txt` kept it from, with
 each source's `entries_disallowed` as 0 — and the next run to end rewrites the file at version
 3.
+
+`<data dir>/erasure-receipts` is what `GET /v1/erasure/{request_id}` answers from: one line per
+document erasure — its id, when it was made, the source and scope, the per-document counts and the
+graph erasure requests it queued — for the 1024 most recent, the oldest dropped as a newer one is
+written. It holds no document id and no content. It is written like `source-status` — a
+`\#erasure-receipts|1` header, a `\#end|<count>|<crc>` marker, an atomic rename — and like it, one
+the node cannot read is logged and ignored rather than failing the start: the erasures it described
+were carried out when they were requested, and only the readback of them is lost.
 
 ### Visibility and Consistency
 

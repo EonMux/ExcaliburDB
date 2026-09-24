@@ -30,9 +30,9 @@ import java.util.Optional;
  *
  * <h3>Response</h3>
  * <pre>
- * {"request_id": 7, "namespace": "acme", "state": "discharged", "scope": "entity",
- *  "entity_id": 42, "requested_at_ms": 1736899200000, "discharged_at_ms": 1736899260000,
- *  "detail_retained": true, "remaining": null}
+ * {"request_id": 7, "state": "discharged", "scope": "entity", "entity_id": 42,
+ *  "requested_at_ms": 1736899200000, "discharged_at_ms": 1736899260000,
+ *  "detail_retained": true, "namespace": "acme", "remaining": null}
  * </pre>
  * <ul>
  *   <li>{@code pending} - accepted and durable; {@code remaining} says what is still owed.</li>
