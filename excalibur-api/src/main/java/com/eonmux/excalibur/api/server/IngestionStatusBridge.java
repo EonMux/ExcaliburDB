@@ -54,6 +54,11 @@ final class IngestionStatusBridge implements IngestionOrchestrator.StatusRegistr
             }
 
             @Override
+            public void setFailed(long documentsFailed) {
+                status.setFailed(documentsFailed);
+            }
+
+            @Override
             public void setError(String error) {
                 status.setError(error);
             }

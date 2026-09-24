@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.ingest.registry;
 
 import com.eonmux.excalibur.core.text.ChunkIdentifiers;
+import com.eonmux.excalibur.ingest.processor.TextContent;
 import com.eonmux.excalibur.store.hash.XxHash64;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,13 +36,14 @@ import java.util.stream.Collectors;
  *   <li>Chunk IDs - identifiers of the chunks this document was split into</li>
  *   <li>Index time - when this document was indexed</li>
  *   <li>Entity tag - the validator the source's server named the indexed version by</li>
+ *   <li>Decoding - how the indexed text was read out of the document's bytes</li>
  * </ul>
  *
  * <h2>Change Detection</h2>
  * <p>When re-crawling, the registry is used to determine:
  * <ul>
- *   <li><strong>Changed documents:</strong> Documents where lastModified, contentHash,
- *       or contentLength differ from the stored metadata</li>
+ *   <li><strong>Changed documents:</strong> Documents whose content differs from the stored
+ *       metadata - by length, or by hash; see {@link DocumentMetadata#isChanged}</li>
  *   <li><strong>Deleted documents:</strong> Documents present in the registry but
  *       not returned by the current crawl</li>
  *   <li><strong>New documents:</strong> Documents returned by the crawl but not
@@ -70,12 +72,19 @@ import java.util.stream.Collectors;
  * neither can the closing line: {@link #escape(String)} doubles every backslash, so no formatted
  * record begins with a single one.</p>
  *
- * <p>A record may carry the entity tag as a last field after the chunk ids. It is persisted
+ * <p>A record may carry the entity tag as a field after the chunk ids. It is persisted
  * rather than held in memory because it is what a re-crawl sends back as {@code If-None-Match}: a
  * node that forgot it at every restart would transfer every unchanged page again on its first
  * re-crawl after one, which is exactly the crawl a restarted node runs. The field is optional
  * rather than tied to a version: a record that ends at the chunk ids reads as a document without
  * a tag, in every version.</p>
+ *
+ * <p>The decoding follows the tag, as the last field, on the same terms. It is persisted because
+ * it is what tells a re-crawl that a document's bytes are intact but would now be read as other
+ * text - a {@code charset} changed with {@code PUT /v1/ingest} - and a node that forgot it at a
+ * restart could never see that change for the documents indexed before it. A record that ends at
+ * the tag reads as a document whose decoding was not recorded, in every version, and a build that
+ * predates the field reads past it.</p>
  *
  * <p>Each part of the frame answers a different failure. A registry that lost its tail is a
  * registry of whole, well-formed records that simply omits documents, and those documents are
@@ -616,7 +625,8 @@ public final class DocumentRegistry {
         return new DocumentMetadata.FetchedDocumentInfo(
             document.getLastModifiedMillis(),
             hash,
-            document.getContentLength()
+            document.getContentLength(),
+            TextContent.decodingOf(document)
         );
     }
 
@@ -920,11 +930,11 @@ public final class DocumentRegistry {
     /**
      * Formats metadata for persistence.
      *
-     * <p>Format: {@code sourceId|documentId|lastModifiedMillis|contentHash|contentLength|indexTimeMillis|chunkId1,chunkId2,...|entityTag}
-     * with every free-text field escaped, and an empty last field for a document with no entity
-     * tag. The tag comes last, where a reader that knows nothing of it - the build before this
-     * one - reads past it, and where a record that ends at the chunk ids is a record with no
-     * tag.</p>
+     * <p>Format: {@code sourceId|documentId|lastModifiedMillis|contentHash|contentLength|indexTimeMillis|chunkId1,chunkId2,...|entityTag|decoding}
+     * with every free-text field escaped, and an empty field for a document with no entity tag or
+     * no recorded decoding. The two come last, the decoding after the tag, where a reader that
+     * knows nothing of them - a build from before either - reads past them, and where a record
+     * that ends before one is a record without it.</p>
      *
      * <p>Escaping is not optional here: document ids are filesystem paths and absolute URLs, and
      * chunk ids are built from them, so all three delimiters - {@code |}, {@code ,} and the
@@ -949,7 +959,8 @@ public final class DocumentRegistry {
             Long.toString(metadata.getContentLength()),
             Long.toString(metadata.getIndexTimeMillis()),
             chunkIds.toString(),
-            metadata.getEntityTag() == null ? "" : escape(metadata.getEntityTag())
+            metadata.getEntityTag() == null ? "" : escape(metadata.getEntityTag()),
+            metadata.getDecoding() == null ? "" : escape(metadata.getDecoding())
         );
     }
 
@@ -986,6 +997,9 @@ public final class DocumentRegistry {
             }
             if (parts.size() > 7 && !parts.get(7).isEmpty()) {
                 builder.entityTag(unescape(parts.get(7)));
+            }
+            if (parts.size() > 8 && !parts.get(8).isEmpty()) {
+                builder.decoding(unescape(parts.get(8)));
             }
 
             return builder.build();

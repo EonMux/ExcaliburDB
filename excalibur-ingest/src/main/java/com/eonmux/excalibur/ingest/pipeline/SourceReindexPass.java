@@ -63,7 +63,21 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <h2>Why a document that could not be read still counts</h2>
  * <p>The progress counter advances in a {@code finally}. A run answers 202 and continues on a
  * background thread, so the counter is the only thing anyone can watch, and one that stalls on
- * the first unreadable document is indistinguishable from a run that has stopped.</p>
+ * the first unreadable document is indistinguishable from a run that has stopped. What the run
+ * has failed on and passed over is reported beside it, for the same reason and so that a run
+ * stopped partway has already said it.</p>
+ *
+ * <h2>Documents that could not be checked</h2>
+ * <p>A registered document whose source could not say whether it changed is kept as it is
+ * indexed, and counted as a document the run failed on, as a fetch that failed during the run
+ * would be. Passed over as unchanged, a source that times out on every request would report a
+ * clean run that looked at nothing.</p>
+ *
+ * <h2>When its writes become searchable</h2>
+ * <p>The lexical index is refreshed between documents once the interval ingestion uses has
+ * passed, in every phase, and once more when the pass ends; see {@link ReindexLexicalIndex}.
+ * Every other signal serves a republished document as soon as it is published, and a long pass
+ * that left BM25 behind until its end would serve the same corpus two ways for hours.</p>
  *
  * <h2>Stopping</h2>
  * <p>The pass is stopped through its {@link StopSignal}, read between documents; see
@@ -210,29 +224,43 @@ final class SourceReindexPass {
                 sourceId, changeSet.getNewCount(), changeSet.getChangedCount(),
                 changeSet.getDeletedCount());
 
-        ReindexResult.Builder resultBuilder = ReindexResult.builder(sourceId);
+        ReindexResult.Builder resultBuilder = ReindexResult.builder(sourceId)
+            .documentsUnchanged(changeSet.getUnchangedCount());
+        changeSet.getUncheckedDocuments().forEach(resultBuilder::addUnchecked);
+        if (changeSet.getUncheckedCount() > 0) {
+            LOG.warn("Reindex of {} could not check {} document(s), whose indexed versions are "
+                    + "kept; the first: {}", sourceId, changeSet.getUncheckedCount(),
+                resultBuilder.getUncheckedSample());
+        }
 
         // Published before the first document rather than after it: the size of the run is the
         // one number a caller cannot infer from anything else, and a status that reports a
         // total only once the run is over reports it to nobody who needed it.
         long documentsTotal = (long) changeSet.getNewCount() + changeSet.getChangedCount();
         AtomicInteger documentsDone = new AtomicInteger();
+        progress.documentsUnchecked(resultBuilder.getDocumentsUnchecked(),
+            resultBuilder.getUncheckedSample());
         progress.documentsDone(0, documentsTotal);
+        reportCounts(progress, resultBuilder);
 
         int chunksTombstoned = 0;
         Removals removals = new Removals();
+        ReindexLexicalIndex.Pacing pacing = lexical.pacing();
         ReindexCancelledException cancelled = null;
         try {
             // Only removals are safe to apply before the replacement content exists: a changed
             // document removed now and then failing to re-embed would be lost in both forms.
             // Changed documents retire their surplus chunks once the replacement is written,
             // inside the step; see SupersededVersion.
-            removeDeleted(sourceId, changeSet, stop, removals, resultBuilder);
+            removeDeleted(sourceId, changeSet, stop, pacing, removals, resultBuilder);
 
             for (String newDocId : changeSet.getNewDocuments()) {
                 // Before the fetch, so a run that has been asked to stop starts no new work.
                 ReindexCancellation.checkpoint(stop, sourceId, documentsDone.get(),
                     documentsTotal);
+                // After the checkpoint, which clears an interrupt that would close the index's
+                // channels, and between documents, so no refresh publishes part of one.
+                pacing.refreshIfDue(sourceId, stop);
                 try {
                     FetchedDocument fetched = stop.interruptibly(() -> source.fetch(newDocId));
                     DocumentResult docResult =
@@ -251,25 +279,27 @@ final class SourceReindexPass {
                     String msg = "Failed to fetch new document " + newDocId + ": "
                         + e.getMessage();
                     LOG.error(msg, e);
-                    resultBuilder.addError("fetch", newDocId, msg);
+                    resultBuilder.addDocumentFailure("fetch", newDocId, msg);
                 } catch (Exception e) {
                     ReindexCancellation.stopIfCancelled(stop, sourceId, documentsDone.get(),
                         documentsTotal, e);
                     String msg = "Failed to re-index new document " + newDocId + ": "
                         + e.getMessage();
                     LOG.error(msg, e);
-                    resultBuilder.addError("reindex", newDocId, msg);
+                    resultBuilder.addDocumentFailure("reindex", newDocId, msg);
                 } finally {
                     // In a finally, so a document that could not be read advances the counter
                     // too. A run that stalls its counter on the first unreadable document is
                     // indistinguishable from one that has stopped.
                     progress.documentsDone(documentsDone.incrementAndGet(), documentsTotal);
+                    reportCounts(progress, resultBuilder);
                 }
             }
 
             for (ChangeSet.ChangedDocument changed : changeSet.getChangedDocuments()) {
                 ReindexCancellation.checkpoint(stop, sourceId, documentsDone.get(),
                     documentsTotal);
+                pacing.refreshIfDue(sourceId, stop);
                 try {
                     FetchedDocument fetched =
                         stop.interruptibly(() -> source.fetch(changed.getDocumentId()));
@@ -289,16 +319,17 @@ final class SourceReindexPass {
                     String msg = "Failed to fetch changed document " + changed.getDocumentId()
                         + ": " + e.getMessage();
                     LOG.error(msg, e);
-                    resultBuilder.addError("fetch", changed.getDocumentId(), msg);
+                    resultBuilder.addDocumentFailure("fetch", changed.getDocumentId(), msg);
                 } catch (Exception e) {
                     ReindexCancellation.stopIfCancelled(stop, sourceId, documentsDone.get(),
                         documentsTotal, e);
                     String msg = "Failed to re-index changed document " + changed.getDocumentId()
                         + ": " + e.getMessage();
                     LOG.error(msg, e);
-                    resultBuilder.addError("reindex", changed.getDocumentId(), msg);
+                    resultBuilder.addDocumentFailure("reindex", changed.getDocumentId(), msg);
                 } finally {
                     progress.documentsDone(documentsDone.incrementAndGet(), documentsTotal);
+                    reportCounts(progress, resultBuilder);
                 }
             }
         } catch (ReindexCancelledException e) {
@@ -331,6 +362,11 @@ final class SourceReindexPass {
         return result;
     }
 
+    /** Tells the listener what the run has failed on and passed over so far. */
+    private static void reportCounts(ReindexProgress progress, ReindexResult.Builder counts) {
+        progress.documentsCounted(counts.getDocumentsFailed(), counts.getDocumentsNotText());
+    }
+
     /**
      * Removes every document the source has stopped listing, one at a time under its lock.
      *
@@ -354,14 +390,19 @@ final class SourceReindexPass {
      * removed whole under its lock - and the next reindex detects the documents this one did not
      * reach as deleted again.</p>
      *
+     * <p>Refreshes the lexical index on the run's pacing between removals, so a source that
+     * dropped most of its documents stops answering for them as the run goes.</p>
+     *
      * @throws ReindexCancelledException if the run was asked to stop
      */
     private void removeDeleted(String sourceId, ChangeSet changeSet, StopSignal stop,
-                               Removals removals, ReindexResult.Builder resultBuilder) {
+                               ReindexLexicalIndex.Pacing pacing, Removals removals,
+                               ReindexResult.Builder resultBuilder) {
         List<DocumentMetadata> deleted = changeSet.getDeletedDocuments();
         int considered = 0;
         for (DocumentMetadata listed : deleted) {
             ReindexCancellation.checkpoint(stop, sourceId, considered++, deleted.size());
+            pacing.refreshIfDue(sourceId, stop);
             String documentKey = ChunkIdentifiers.documentKey(sourceId, listed.getDocumentId());
             Removed removed = DocumentLocks.shared().inDocument(documentKey,
                 () -> removeIfUnchanged(sourceId, documentKey, listed));

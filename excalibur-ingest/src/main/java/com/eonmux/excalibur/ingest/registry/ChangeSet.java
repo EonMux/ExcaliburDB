@@ -9,13 +9,19 @@ import java.util.Objects;
  * Represents the result of change detection between a crawl and the document registry.
  *
  * <h2>Categories</h2>
- * <p>A ChangeSet categorizes documents into three groups:
+ * <p>A ChangeSet categorizes documents into four groups:
  * <ul>
  *   <li><strong>New documents:</strong> Documents that exist in the crawl but not in the registry</li>
  *   <li><strong>Changed documents:</strong> Documents that exist in both but have different content
- *       (detected via lastModified, contentHash, or contentLength)</li>
+ *       (see {@link DocumentMetadata#isChanged})</li>
  *   <li><strong>Deleted documents:</strong> Documents that exist in the registry but not in the crawl</li>
+ *   <li><strong>Unchecked documents:</strong> Documents in both that the source could not be
+ *       asked about - a timeout, a server error, a {@code 304} to a request that asked
+ *       nothing. Whether they changed is unknown, so their indexed version is kept; they are
+ *       listed so the run can report them as failures rather than as unchanged</li>
  * </ul>
+ * <p>Every other document in both is unchanged: its source confirmed the indexed version is
+ * current.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is immutable and thread-safe. Once constructed, the ChangeSet cannot be modified.
@@ -38,6 +44,7 @@ public final class ChangeSet {
     private final List<String> newDocuments;
     private final List<ChangedDocument> changedDocuments;
     private final List<DocumentMetadata> deletedDocuments;
+    private final List<String> uncheckedDocuments;
     private final int totalCrawled;
     private final int totalRegistered;
 
@@ -46,6 +53,7 @@ public final class ChangeSet {
         this.newDocuments = List.copyOf(builder.newDocuments);
         this.changedDocuments = List.copyOf(builder.changedDocuments);
         this.deletedDocuments = List.copyOf(builder.deletedDocuments);
+        this.uncheckedDocuments = List.copyOf(builder.uncheckedDocuments);
         this.totalCrawled = builder.totalCrawled;
         this.totalRegistered = builder.totalRegistered;
     }
@@ -90,6 +98,17 @@ public final class ChangeSet {
     }
 
     /**
+     * Returns the registered documents whose source could not say whether they changed.
+     *
+     * <p>Each is kept as it is indexed, and the reason is in the log.</p>
+     *
+     * @return Unmodifiable list of document IDs, in crawl order
+     */
+    public List<String> getUncheckedDocuments() {
+        return uncheckedDocuments;
+    }
+
+    /**
      * Returns the count of new documents.
      *
      * @return New document count
@@ -117,6 +136,26 @@ public final class ChangeSet {
     }
 
     /**
+     * Returns the count of documents that could not be checked.
+     *
+     * @return Unchecked document count
+     */
+    public int getUncheckedCount() {
+        return uncheckedDocuments.size();
+    }
+
+    /**
+     * Returns how many registered documents the source confirmed are current.
+     *
+     * <p>What the crawl listed less what is new, changed or could not be checked.</p>
+     *
+     * @return Unchanged document count
+     */
+    public int getUnchangedCount() {
+        return Math.max(0, totalCrawled - getNewCount() - getChangedCount() - getUncheckedCount());
+    }
+
+    /**
      * Returns the total number of documents in the crawl.
      *
      * @return Total crawled count
@@ -135,12 +174,14 @@ public final class ChangeSet {
     }
 
     /**
-     * Checks if there are any changes (new, changed, or deleted).
+     * Checks if there is anything for a run to act on or report: a new, changed, deleted or
+     * unchecked document.
      *
-     * @return true if there are any changes
+     * @return true if there are any
      */
     public boolean hasChanges() {
-        return !newDocuments.isEmpty() || !changedDocuments.isEmpty() || !deletedDocuments.isEmpty();
+        return !newDocuments.isEmpty() || !changedDocuments.isEmpty() || !deletedDocuments.isEmpty()
+            || !uncheckedDocuments.isEmpty();
     }
 
     /**
@@ -180,8 +221,10 @@ public final class ChangeSet {
 
     @Override
     public String toString() {
-        return String.format("ChangeSet[sourceId=%s, new=%d, changed=%d, deleted=%d, crawled=%d, registered=%d]",
-            sourceId, getNewCount(), getChangedCount(), getDeletedCount(), totalCrawled, totalRegistered);
+        return String.format("ChangeSet[sourceId=%s, new=%d, changed=%d, deleted=%d, unchecked=%d, "
+                + "crawled=%d, registered=%d]",
+            sourceId, getNewCount(), getChangedCount(), getDeletedCount(), getUncheckedCount(),
+            totalCrawled, totalRegistered);
     }
 
     /**
@@ -245,6 +288,7 @@ public final class ChangeSet {
         private final List<String> newDocuments = new ArrayList<>();
         private final List<ChangedDocument> changedDocuments = new ArrayList<>();
         private final List<DocumentMetadata> deletedDocuments = new ArrayList<>();
+        private final List<String> uncheckedDocuments = new ArrayList<>();
         private int totalCrawled = 0;
         private int totalRegistered = 0;
 
@@ -290,6 +334,18 @@ public final class ChangeSet {
         public Builder addDeleted(DocumentMetadata metadata) {
             Objects.requireNonNull(metadata, "metadata must not be null");
             deletedDocuments.add(metadata);
+            return this;
+        }
+
+        /**
+         * Adds a registered document the source could not be asked about.
+         *
+         * @param documentId The document ID
+         * @return This builder
+         */
+        public Builder addUnchecked(String documentId) {
+            Objects.requireNonNull(documentId, "documentId must not be null");
+            uncheckedDocuments.add(documentId);
             return this;
         }
 

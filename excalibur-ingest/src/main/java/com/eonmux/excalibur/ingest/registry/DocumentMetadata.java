@@ -21,15 +21,25 @@ import java.util.Objects;
  *   <li>Content length - size of the original document in bytes</li>
  *   <li>Index time - when this document was indexed</li>
  *   <li>Entity tag - the validator the source's server named this version by, if any</li>
+ *   <li>Decoding - how the indexed text was read out of the bytes, if it was recorded</li>
  * </ul>
  *
  * <h2>Change Detection</h2>
- * <p>A document is considered changed if any of these conditions are true:
- * <ul>
- *   <li>Last modified timestamp is newer than the stored timestamp</li>
- *   <li>Content hash differs (for sources that support hashing)</li>
- *   <li>Content length differs</li>
- * </ul>
+ * <p>A document is compared by its content: it has changed when its length differs, or when
+ * both versions carry a content hash and the hashes differ. The timestamp decides only for an
+ * entry that recorded no hash, where a newer one is all there is to go on. A file that was
+ * touched, copied or restored with its bytes intact is therefore unchanged whatever its
+ * modification time now says - re-chunking and re-embedding it would pay for the same chunks
+ * twice - and the time it came back with is recorded in its place, so the entry describes the
+ * document as the source now reports it.</p>
+ *
+ * <p>Bytes are not the whole of what was indexed: the text is, and the same bytes read in another
+ * encoding, or as markup rather than plain text, are other text. So the decoding the text was
+ * read with is compared too, and a document whose bytes are intact but whose decoding moved - its
+ * source registered again with another {@code charset}, a page now labelled with another
+ * encoding - has changed and is read again. An entry recorded before decodings were kept has none
+ * to compare, and is taken to have been read as its source reads it now; the decoding is recorded
+ * for it at the first re-crawl that finds it unchanged, and compared from then on.</p>
  *
  * <p>The timestamp and the entity tag have a second use: they are what a re-crawl sends back to
  * the source as {@link #validators()}, so a source that can ask its origin conditionally learns
@@ -48,6 +58,8 @@ import java.util.Objects;
  *   <li>contentLength: non-negative byte count</li>
  *   <li>chunkIds: immutable list of non-null strings</li>
  *   <li>entityTag: the tag exactly as the source reported it, or null for none</li>
+ *   <li>decoding: as {@link com.eonmux.excalibur.ingest.processor.TextContent#decodingOf} names
+ *       it, or null when it was not recorded</li>
  * </ul>
  */
 public final class DocumentMetadata {
@@ -60,6 +72,7 @@ public final class DocumentMetadata {
     private final List<String> chunkIds;
     private final long indexTimeMillis;
     private final String entityTag;
+    private final String decoding;
 
     private DocumentMetadata(Builder builder) {
         this.documentId = Objects.requireNonNull(builder.documentId, "documentId must not be null");
@@ -79,6 +92,8 @@ public final class DocumentMetadata {
             : System.currentTimeMillis();
         this.entityTag = builder.entityTag == null || builder.entityTag.isBlank()
             ? null : builder.entityTag;
+        this.decoding = builder.decoding == null || builder.decoding.isBlank()
+            ? null : builder.decoding;
     }
 
     public String getDocumentId() {
@@ -127,6 +142,16 @@ public final class DocumentMetadata {
     }
 
     /**
+     * How the indexed text was read out of the document's bytes.
+     *
+     * @return The decoding, as {@link com.eonmux.excalibur.ingest.processor.TextContent#decodingOf}
+     *         names it, or null when the entry was recorded without one
+     */
+    public String getDecoding() {
+        return decoding;
+    }
+
+    /**
      * What the source reported about the indexed version, in the form it can be asked about again.
      *
      * @return The timestamp and entity tag this entry recorded
@@ -147,24 +172,41 @@ public final class DocumentMetadata {
         return contentHash != 0;
     }
 
+    /**
+     * Whether this entry records how its text was read out of the bytes.
+     *
+     * @return true when there is a decoding to compare against
+     */
+    public boolean hasDecoding() {
+        return decoding != null;
+    }
+
+    /**
+     * Whether what the source now holds differs from the version this entry describes.
+     *
+     * <p>See the class documentation: by decoding where both sides name one, by content where
+     * both sides were hashed, and by timestamp only where this entry recorded no hash to
+     * compare.</p>
+     *
+     * @param fetched What the source handed back, or null when it handed back nothing
+     * @return true if the document has to be indexed again
+     */
     public boolean isChanged(FetchedDocumentInfo fetched) {
         if (fetched == null) {
             return true;
         }
-        if (fetched.getLastModifiedMillis() > 0 && lastModifiedMillis > 0) {
-            if (fetched.getLastModifiedMillis() > lastModifiedMillis) {
-                return true;
-            }
+        if (decoding != null && fetched.getDecoding() != null
+                && !decoding.equals(fetched.getDecoding())) {
+            return true;
         }
         if (fetched.getContentLength() != contentLength) {
             return true;
         }
         if (fetched.getContentHash() != 0 && contentHash != 0) {
-            if (fetched.getContentHash() != contentHash) {
-                return true;
-            }
+            return fetched.getContentHash() != contentHash;
         }
-        return false;
+        return fetched.getLastModifiedMillis() > 0 && lastModifiedMillis > 0
+            && fetched.getLastModifiedMillis() > lastModifiedMillis;
     }
 
     public static Builder builder() {
@@ -180,7 +222,8 @@ public final class DocumentMetadata {
             .contentLength(contentLength)
             .chunkIds(chunkIds)
             .indexTimeMillis(indexTimeMillis)
-            .entityTag(entityTag);
+            .entityTag(entityTag)
+            .decoding(decoding);
     }
 
     @Override
@@ -195,13 +238,14 @@ public final class DocumentMetadata {
                Objects.equals(documentId, that.documentId) &&
                Objects.equals(sourceId, that.sourceId) &&
                Objects.equals(chunkIds, that.chunkIds) &&
-               Objects.equals(entityTag, that.entityTag);
+               Objects.equals(entityTag, that.entityTag) &&
+               Objects.equals(decoding, that.decoding);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(documentId, sourceId, lastModifiedMillis, contentHash,
-                           contentLength, chunkIds, indexTimeMillis, entityTag);
+                           contentLength, chunkIds, indexTimeMillis, entityTag, decoding);
     }
 
     @Override
@@ -215,6 +259,7 @@ public final class DocumentMetadata {
                ", chunkCount=" + chunkIds.size() +
                ", indexTime=" + Instant.ofEpochMilli(indexTimeMillis) +
                ", entityTag=" + entityTag +
+               ", decoding=" + decoding +
                '}';
     }
 
@@ -227,6 +272,7 @@ public final class DocumentMetadata {
         private List<String> chunkIds = new ArrayList<>();
         private long indexTimeMillis;
         private String entityTag;
+        private String decoding;
 
         public Builder documentId(String documentId) {
             this.documentId = documentId;
@@ -291,6 +337,18 @@ public final class DocumentMetadata {
             return this;
         }
 
+        /**
+         * Records how the indexed text was read out of the document's bytes.
+         *
+         * @param decoding As {@link com.eonmux.excalibur.ingest.processor.TextContent#decodingOf}
+         *                 names it, or null when it is not known
+         * @return This builder
+         */
+        public Builder decoding(String decoding) {
+            this.decoding = decoding;
+            return this;
+        }
+
         public DocumentMetadata build() {
             return new DocumentMetadata(this);
         }
@@ -303,11 +361,28 @@ public final class DocumentMetadata {
         private final long lastModifiedMillis;
         private final long contentHash;
         private final long contentLength;
+        private final String decoding;
 
         public FetchedDocumentInfo(long lastModifiedMillis, long contentHash, long contentLength) {
+            this(lastModifiedMillis, contentHash, contentLength, null);
+        }
+
+        /**
+         * Describes a fetched document, with how its bytes would be read into text.
+         *
+         * @param lastModifiedMillis The modification time the source reported, 0 for none
+         * @param contentHash        The hash of the bytes, 0 when not computed
+         * @param contentLength      The number of bytes
+         * @param decoding           As
+         *                           {@link com.eonmux.excalibur.ingest.processor.TextContent#decodingOf}
+         *                           names it, or null when it is not known
+         */
+        public FetchedDocumentInfo(long lastModifiedMillis, long contentHash, long contentLength,
+                                   String decoding) {
             this.lastModifiedMillis = Math.max(0, lastModifiedMillis);
             this.contentHash = contentHash;
             this.contentLength = Math.max(0, contentLength);
+            this.decoding = decoding == null || decoding.isBlank() ? null : decoding;
         }
 
         public long getLastModifiedMillis() {
@@ -320,6 +395,15 @@ public final class DocumentMetadata {
 
         public long getContentLength() {
             return contentLength;
+        }
+
+        /**
+         * How the fetched bytes would be read into text.
+         *
+         * @return The decoding, or null when it is not known
+         */
+        public String getDecoding() {
+            return decoding;
         }
     }
 }

@@ -708,8 +708,10 @@ class DocumentReindexerTest {
                 source.addDocument("doc-stays", "routine capacity planning. ".repeat(20));
                 reindex(reindexer, source);
 
+                // Edited, so the run re-publishes it: a document is compared by its content, and
+                // a newer timestamp over the same bytes would leave it alone.
                 MockSource without = new MockSource("test-source").modifiedAt(2_000L);
-                without.addDocument("doc-stays", "routine capacity planning. ".repeat(20));
+                without.addDocument("doc-stays", "routine capacity planning, revised. ".repeat(20));
                 reindex(reindexer, without);
 
                 assertEquals(0, hits(index, "postmortem"),

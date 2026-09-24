@@ -420,8 +420,8 @@ final class DocumentReindexStep {
         }
 
         batchBuffer.seal();
-        DocumentMetadata metadata = metadataOf(sourceId, documentId, content,
-            fetched.validators(), writes.chunkIds());
+        DocumentMetadata metadata = metadataOf(sourceId, documentId, content, fetched,
+            writes.chunkIds());
 
         // Before the publication, while the document is still hidden: retired after it, the
         // previous version's tail would be served beside the new version until it went.
@@ -521,7 +521,7 @@ final class DocumentReindexStep {
         }
 
         DocumentMetadata metadata = metadataOf(sourceId, documentId, content,
-            fetched.validators(), writes.chunkIds());
+            fetched, writes.chunkIds());
         DocumentMetadata previous = registry.get(sourceId, documentId);
         int retired = retireSuperseded(previous, writes.chunkIds());
         registry.register(metadata);
@@ -654,16 +654,20 @@ final class DocumentReindexStep {
      * <p>Built only once every chunk has landed: the content hash recorded here is what change
      * detection compares on the next run, so it must never describe a document storage does not
      * hold in full. The same goes for the validators: the next run hands them back to the source,
-     * and a source that answers "not modified" to them is never asked for the body again.</p>
+     * and a source that answers "not modified" to them is never asked for the body again. And for
+     * the decoding: the next run reads these bytes again only if they would now become other
+     * text.</p>
      */
     private static DocumentMetadata metadataOf(String sourceId, String documentId, byte[] content,
-                                               DocumentValidators version,
+                                               FetchedDocument fetched,
                                                List<String> chunkIds) {
+        DocumentValidators version = fetched.validators();
         return DocumentMetadata.builder()
             .sourceId(sourceId)
             .documentId(documentId)
             .lastModifiedMillis(version.lastModifiedMillis())
             .entityTag(version.entityTag())
+            .decoding(TextContent.decodingOf(fetched))
             .contentHash(DocumentRegistry.computeContentHash(content))
             .contentLength(content.length)
             .chunkIds(chunkIds)

@@ -155,6 +155,9 @@ public final class ReindexerFactory {
             // so what compaction rebuilds a segment from is what a query would have resolved.
             reindexer.setLexicalIndex(chunkIndex, StoredChunkText.of(storageEngine));
         }
+        // The pace ingestion refreshes the index at, so a re-crawl's documents become lexically
+        // searchable on the same schedule as the crawl that first indexed them.
+        reindexer.setLexicalRefreshIntervalMs(config.ingest().getLexicalRefreshIntervalMs());
 
         // The counterpart of the lexical retirement above, for the vector signal. A reindex that
         // finds a document deleted at the source tombstones its chunks and retires its terms; a

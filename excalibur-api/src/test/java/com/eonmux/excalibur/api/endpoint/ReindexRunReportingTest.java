@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.endpoint;
 
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
+import com.eonmux.excalibur.ingest.pipeline.ReindexCancelledException;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
 import com.eonmux.excalibur.ingest.source.SourceResolver;
@@ -8,6 +9,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -205,6 +208,154 @@ class ReindexRunReportingTest {
             });
 
             run().execute(SOURCE_ID);
+        }
+    }
+
+    @Nested
+    @DisplayName("the documents a run failed on")
+    class FailedDocuments {
+
+        @Test
+        @DisplayName("are counted while the run goes, and by the result it ends with")
+        void failuresAreCountedAsTheRunGoes() throws Exception {
+            when(reindexer.reindexAll(eq(source), any(), any())).thenAnswer(invocation -> {
+                DocumentReindexer.ReindexProgress progress = invocation.getArgument(1);
+                progress.documentsDone(0, 3);
+                progress.documentsCounted(1, 0);
+                assertThat(status().documentsFailed())
+                    .as("a run that is failing on every document has to be seen doing it")
+                    .isEqualTo(1);
+                return new DocumentReindexer.ReindexResult.Builder(SOURCE_ID)
+                    .documentsIndexed(1)
+                    .addDocumentFailure("fetch", "a.txt", "timed out")
+                    .addDocumentFailure("document", "b.txt", "could not be embedded")
+                    .build();
+            });
+
+            run().execute(SOURCE_ID);
+
+            assertThat(status().documentsFailed()).isEqualTo(2);
+            assertThat(status().state()).isEqualTo("idle");
+            assertThat(status().lastError()).contains("2 errors");
+        }
+
+        @Test
+        @DisplayName("name the documents that could not be checked, and how many there were")
+        void uncheckedDocumentsAreReported() throws Exception {
+            DocumentReindexer.ReindexResult.Builder result =
+                new DocumentReindexer.ReindexResult.Builder(SOURCE_ID).documentsUnchanged(40);
+            for (int i = 0; i < DocumentReindexer.ReindexResult.UNCHECKED_SAMPLE_SIZE + 2; i++) {
+                result.addUnchecked("https://example.com/page-" + i);
+            }
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(result.build());
+
+            run().execute(SOURCE_ID);
+
+            int unchecked = DocumentReindexer.ReindexResult.UNCHECKED_SAMPLE_SIZE + 2;
+            assertThat(status().documentsUnchecked()).isEqualTo(unchecked);
+            assertThat(status().documentsFailed()).isEqualTo(unchecked);
+            assertThat(status().uncheckedSample())
+                .hasSize(DocumentReindexer.ReindexResult.UNCHECKED_SAMPLE_SIZE)
+                .startsWith("https://example.com/page-0");
+            assertThat(status().state())
+                .as("forty documents were confirmed current: the run did its work, and says "
+                    + "what it could not")
+                .isEqualTo("idle");
+            assertThat(status().lastError()).isNotNull();
+        }
+
+        @Test
+        @DisplayName("fail a run that indexed nothing and confirmed nothing")
+        void aRunThatCouldNotCheckAnythingFailed() throws Exception {
+            when(reindexer.reindexAll(eq(source), any(), any())).thenReturn(
+                new DocumentReindexer.ReindexResult.Builder(SOURCE_ID)
+                    .addUnchecked("https://example.com/")
+                    .build());
+
+            run().execute(SOURCE_ID);
+
+            assertThat(status().state()).isEqualTo(ReindexEndpoint.ReindexStatus.STATE_FAILED);
+            assertThat(status().documentsUnchecked()).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("are reported the moment the run knows them, so a stopped run keeps them")
+        void uncheckedDocumentsSurviveACancellation() throws Exception {
+            when(reindexer.reindexAll(eq(source), any(), any())).thenAnswer(invocation -> {
+                DocumentReindexer.ReindexProgress progress = invocation.getArgument(1);
+                progress.documentsUnchecked(2, List.of("a.txt", "b.txt"));
+                progress.documentsDone(0, 5);
+                progress.documentsCounted(2, 0);
+                throw new ReindexCancelledException("stopped after 0 of 5");
+            });
+
+            run().execute(SOURCE_ID);
+
+            assertThat(status().cancelled()).isTrue();
+            assertThat(status().documentsFailed()).isEqualTo(2);
+            assertThat(status().documentsUnchecked()).isEqualTo(2);
+            assertThat(status().uncheckedSample()).containsExactly("a.txt", "b.txt");
+        }
+    }
+
+    @Nested
+    @DisplayName("a run that stopped partway")
+    class StoppedPartway {
+
+        @Test
+        @DisplayName("reports what it passed over before it was stopped")
+        void aCancelledRunReportsItsSkips() throws Exception {
+            ingestionStatus.getOrCreate(SOURCE_ID).setSkipped(40);
+            when(source.getDisallowedCount()).thenReturn(2L);
+            when(reindexer.reindexAll(eq(source), any(), any())).thenAnswer(invocation -> {
+                DocumentReindexer.ReindexProgress progress = invocation.getArgument(1);
+                progress.documentsDone(0, 10);
+                progress.documentsDone(4, 10);
+                progress.documentsCounted(0, 3);
+                throw new ReindexCancelledException("stopped after 4 of 10");
+            });
+
+            run().execute(SOURCE_ID);
+
+            assertThat(status().cancelled()).isTrue();
+            assertThat(ingestionStatus.getStatus(SOURCE_ID).entriesSkipped())
+                .as("what the run found before it stopped, not the figure of the run before it")
+                .isEqualTo(3);
+            assertThat(ingestionStatus.getStatus(SOURCE_ID).entriesDisallowed()).isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("reports what it passed over before it broke")
+        void aFailedRunReportsItsSkips() throws Exception {
+            ingestionStatus.getOrCreate(SOURCE_ID).setSkipped(40);
+            when(reindexer.reindexAll(eq(source), any(), any())).thenAnswer(invocation -> {
+                DocumentReindexer.ReindexProgress progress = invocation.getArgument(1);
+                progress.documentsDone(0, 10);
+                progress.documentsCounted(1, 5);
+                throw new IllegalStateException("the lexical index is closed");
+            });
+
+            run().execute(SOURCE_ID);
+
+            assertThat(status().state()).isEqualTo(ReindexEndpoint.ReindexStatus.STATE_FAILED);
+            assertThat(status().documentsFailed()).isEqualTo(1);
+            assertThat(ingestionStatus.getStatus(SOURCE_ID).entriesSkipped()).isEqualTo(5);
+        }
+
+        @Test
+        @DisplayName("leaves the figures alone when it stopped before judging any document")
+        void aRunStoppedBeforeItStartedReportsNothing() throws Exception {
+            ingestionStatus.getOrCreate(SOURCE_ID).setSkipped(40);
+            ingestionStatus.getStatus(SOURCE_ID).setDisallowed(6);
+            when(reindexer.reindexAll(eq(source), any(), any()))
+                .thenThrow(new ReindexCancelledException("stopped while listing"));
+
+            run().execute(SOURCE_ID);
+
+            assertThat(ingestionStatus.getStatus(SOURCE_ID).entriesSkipped())
+                .as("a run that never got past its listing found nothing to replace them with")
+                .isEqualTo(40);
+            assertThat(ingestionStatus.getStatus(SOURCE_ID).entriesDisallowed()).isEqualTo(6);
         }
     }
 

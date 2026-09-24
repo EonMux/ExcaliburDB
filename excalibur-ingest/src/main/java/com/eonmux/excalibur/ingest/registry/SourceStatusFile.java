@@ -38,7 +38,7 @@ import java.util.Objects;
  * <h2>Record format</h2>
  * <p>The catalog's conventions, deliberately, so the tools that check a data directory read both
  * the same way. A first line, {@code \#source-status|<version>}, names the format; one line per
- * source follows, {@code id|state|progress|ingested|pending|skipped|disallowed|updated_ms[|error]},
+ * source follows, {@code id|state|progress|ingested|pending|skipped|disallowed|failed|updated_ms[|error]},
  * escaped as the catalog escapes; and a last line, {@code \#end|<count>|<crc>}, closes the file:
  * the count, so a file that lost its tail is told apart from a shorter history, and the CRC32C of
  * every byte before the line, header included (see {@link EndLine}), so a record altered in place
@@ -47,11 +47,13 @@ import java.util.Objects;
  *
  * <p>Version 1 had no {@code disallowed} field, since nothing was left out of a crawl on a
  * publisher's say-so before robots.txt was honoured; its records are still read, with that count
- * as zero. Versions 1 and 2 closed with {@code \#end|count} and no checksum, and are read with
- * their count checked and their records unverified. Either is rewritten in the current version
- * when the next run ends. How many fields a record has is a property of the version its file
- * declares, never guessed from the record, because a version 1 record carrying an error has as
- * many fields as a version 2 record without one.</p>
+ * as zero. Versions 1 to 3 had no {@code failed} field, since a run's failures were reported
+ * only in words; their records are read with that count as zero. Versions 1 and 2 closed with
+ * {@code \#end|count} and no checksum, and are read with their count checked and their records
+ * unverified. Any of them is rewritten in the current version when the next run ends. How many
+ * fields a record has is a property of the version its file declares, never guessed from the
+ * record, because a version 1 record carrying an error has as many fields as a version 2 record
+ * without one.</p>
  *
  * <h2>Reading an unreadable file</h2>
  * <p>A file with no header, a version this build does not know, a missing or disagreeing record
@@ -81,7 +83,7 @@ public final class SourceStatusFile {
      * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
      * judge this file offline and must accept exactly what this class accepts.</p>
      */
-    public static final int FORMAT_VERSION = 3;
+    public static final int FORMAT_VERSION = 4;
 
     /**
      * The first version whose closing line carries a checksum.
@@ -101,6 +103,9 @@ public final class SourceStatusFile {
 
     /** The version that first carried the disallowed count. */
     private static final int FIRST_DISALLOWED_VERSION = 2;
+
+    /** The version that first carried the failed count. */
+    private static final int FIRST_FAILED_VERSION = 4;
 
     /**
      * Opens the first line, which names the format the rest of the file is in.
@@ -128,8 +133,11 @@ public final class SourceStatusFile {
     /** Fields every version 1 record carries: id, state, progress, three counts and the time. */
     private static final int FIXED_FIELDS_V1 = 7;
 
-    /** Fields every record carries from version 2 on, the disallowed count among the counts. */
+    /** Fields every record carries in versions 2 and 3, the disallowed count among the counts. */
     private static final int FIXED_FIELDS_V2 = 8;
+
+    /** Fields every record carries from version 4 on, the failed count after the disallowed. */
+    private static final int FIXED_FIELDS_V4 = 9;
 
     private final Path file;
     private final SourceCatalog.CatalogWriter writer;
@@ -147,12 +155,13 @@ public final class SourceStatusFile {
      * @param skipped       Documents it passed over because they are not text
      * @param disallowed    Documents it left alone because their publisher forbids fetching
      *                      them
+     * @param failed        Documents it listed and could not index
      * @param lastUpdatedMs When it ended, epoch milliseconds
      * @param lastError     What went wrong, or null if nothing did
      */
     public record Entry(String sourceId, String state, double progress, long ingested,
-                        long pending, long skipped, long disallowed, long lastUpdatedMs,
-                        String lastError) {
+                        long pending, long skipped, long disallowed, long failed,
+                        long lastUpdatedMs, String lastError) {
 
         /**
          * Validates an entry.
@@ -164,7 +173,7 @@ public final class SourceStatusFile {
         public Entry {
             Objects.requireNonNull(sourceId, "sourceId must not be null");
             Objects.requireNonNull(state, "state must not be null");
-            if (ingested < 0 || pending < 0 || skipped < 0 || disallowed < 0
+            if (ingested < 0 || pending < 0 || skipped < 0 || disallowed < 0 || failed < 0
                     || lastUpdatedMs < 0) {
                 throw new IllegalArgumentException("status counts must not be negative");
             }
@@ -267,6 +276,7 @@ public final class SourceStatusFile {
             .append(entry.pending()).append(FIELD_SEPARATOR)
             .append(entry.skipped()).append(FIELD_SEPARATOR)
             .append(entry.disallowed()).append(FIELD_SEPARATOR)
+            .append(entry.failed()).append(FIELD_SEPARATOR)
             .append(entry.lastUpdatedMs());
         if (entry.lastError() != null) {
             line.append(FIELD_SEPARATOR).append(SourceCatalog.escape(entry.lastError()));
@@ -363,12 +373,14 @@ public final class SourceStatusFile {
     private static Entry parse(String line, int version) {
         List<String> fields = SourceCatalog.splitEscaped(line, FIELD_SEPARATOR);
         boolean countsDisallowed = version >= FIRST_DISALLOWED_VERSION;
-        int fixed = countsDisallowed ? FIXED_FIELDS_V2 : FIXED_FIELDS_V1;
+        boolean countsFailed = version >= FIRST_FAILED_VERSION;
+        int fixed = countsFailed ? FIXED_FIELDS_V4
+            : countsDisallowed ? FIXED_FIELDS_V2 : FIXED_FIELDS_V1;
         if (fields.size() != fixed && fields.size() != fixed + 1) {
             return null;
         }
-        // The fields after the skipped count shift by one where the disallowed count is present.
-        int time = countsDisallowed ? 7 : 6;
+        // The time closes the fixed fields, so it moves with each count a version added before it.
+        int time = fixed - 1;
         try {
             return new Entry(
                 SourceCatalog.unescape(fields.get(0)),
@@ -378,6 +390,7 @@ public final class SourceStatusFile {
                 Long.parseLong(fields.get(4)),
                 Long.parseLong(fields.get(5)),
                 countsDisallowed ? Long.parseLong(fields.get(6)) : 0L,
+                countsFailed ? Long.parseLong(fields.get(7)) : 0L,
                 Long.parseLong(fields.get(time)),
                 fields.size() > fixed ? SourceCatalog.unescape(fields.get(fixed)) : null);
         } catch (IllegalArgumentException e) {

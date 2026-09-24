@@ -589,10 +589,10 @@ class ChangeDetectionTest {
             new DocumentMetadata.FetchedDocumentInfo(1000L, 1000L, 100);
         assertFalse(metadata.isChanged(sameInfo));
 
-        // Different timestamp - changed
+        // Newer timestamp over the same bytes - a touched file - not changed
         DocumentMetadata.FetchedDocumentInfo newerTimestamp = 
             new DocumentMetadata.FetchedDocumentInfo(2000L, 1000L, 100);
-        assertTrue(metadata.isChanged(newerTimestamp));
+        assertFalse(metadata.isChanged(newerTimestamp));
 
         // Different length - changed
         DocumentMetadata.FetchedDocumentInfo differentLength = 
@@ -606,6 +606,124 @@ class ChangeDetectionTest {
 
         // Null fetched info - changed
         assertTrue(metadata.isChanged(null));
+    }
+
+    @Test
+    void testMetadataIsChangedByDecoding() {
+        DocumentMetadata metadata = DocumentMetadata.builder()
+            .sourceId("source1")
+            .documentId("doc1")
+            .contentHash(1000L)
+            .contentLength(100)
+            .lastModifiedMillis(1000L)
+            .decoding("UTF-8")
+            .build();
+
+        assertTrue(metadata.isChanged(
+                new DocumentMetadata.FetchedDocumentInfo(1000L, 1000L, 100, "windows-1252")),
+            "the same bytes read in another encoding are other text");
+        assertFalse(metadata.isChanged(
+            new DocumentMetadata.FetchedDocumentInfo(1000L, 1000L, 100, "UTF-8")));
+        assertFalse(metadata.isChanged(new DocumentMetadata.FetchedDocumentInfo(1000L, 1000L, 100)),
+            "a fetch that names no decoding is compared by its bytes");
+        assertFalse(metadata.toBuilder().decoding(null).build().isChanged(
+                new DocumentMetadata.FetchedDocumentInfo(1000L, 1000L, 100, "windows-1252")),
+            "an entry recorded without a decoding is compared by its bytes");
+    }
+
+    @Test
+    void testDocumentLabelledWithAnotherEncodingIsChanged() throws SourceException {
+        byte[] content = "caf\u00e9".getBytes(java.nio.charset.Charset.forName("windows-1252"));
+        registry.register(DocumentMetadata.builder()
+            .sourceId("test-source")
+            .documentId("doc1")
+            .contentHash(DocumentRegistry.computeContentHash(content))
+            .contentLength(content.length)
+            .lastModifiedMillis(1000L)
+            .decoding("UTF-8")
+            .build());
+
+        Source relabelled = new MockSource("test-source", List.of("doc1"),
+            docId -> new FetchedDocument(docId, content, "text/plain",
+                java.nio.charset.Charset.forName("windows-1252"), 1000L));
+
+        assertEquals(1, detector.detectChanges(relabelled).getChangedCount());
+    }
+
+    @Test
+    void testMetadataWithoutHashFallsBackToTimestamp() {
+        DocumentMetadata unhashed = DocumentMetadata.builder()
+            .sourceId("source1")
+            .documentId("doc1")
+            .contentLength(100)
+            .lastModifiedMillis(1000L)
+            .build();
+
+        assertTrue(unhashed.isChanged(new DocumentMetadata.FetchedDocumentInfo(2000L, 1000L, 100)),
+            "with no hash recorded, a newer timestamp is all there is to go on");
+        assertFalse(unhashed.isChanged(new DocumentMetadata.FetchedDocumentInfo(1000L, 1000L, 100)));
+    }
+
+    @Test
+    void testTouchedDocumentIsUnchangedAndItsTimestampRecorded() throws SourceException {
+        byte[] content = "same content".getBytes(StandardCharsets.UTF_8);
+        registry.register(DocumentMetadata.builder()
+            .sourceId("test-source")
+            .documentId("doc1")
+            .contentHash(DocumentRegistry.computeContentHash(content))
+            .contentLength(content.length)
+            .lastModifiedMillis(1000L)
+            .addChunkId("chunk1")
+            .build());
+
+        // Touched: a newer modification time over the bytes that were indexed.
+        Source source = new MockSource("test-source", List.of("doc1"),
+            docId -> new FetchedDocument(docId, content, "text/plain", 5000L));
+
+        ChangeSet changes = detector.detectChanges(source);
+
+        assertFalse(changes.hasChanges(), "identical bytes are not re-chunked or re-embedded");
+        DocumentMetadata recorded = registry.get("test-source", "doc1");
+        assertEquals(5000L, recorded.getLastModifiedMillis(),
+            "the time it came back with is recorded, so the entry describes the file as it is");
+        assertEquals(List.of("chunk1"), recorded.getChunkIds());
+    }
+
+    @Test
+    void testDocumentThatCannotBeCheckedIsReportedUnchecked() throws SourceException {
+        byte[] content = "same content".getBytes(StandardCharsets.UTF_8);
+        for (String id : List.of("down", "fine")) {
+            registry.register(DocumentMetadata.builder()
+                .sourceId("test-source")
+                .documentId(id)
+                .contentHash(DocumentRegistry.computeContentHash(content))
+                .contentLength(content.length)
+                .lastModifiedMillis(1000L)
+                .addChunkId(id + "#0")
+                .build());
+        }
+        Source source = new MockSource("test-source", List.of("down", "fine", "added"),
+            docId -> new FetchedDocument(docId, content, "text/plain", 1000L)) {
+            @Override
+            public FetchedDocument fetch(String documentId) {
+                if (documentId.equals("down")) {
+                    throw new UncheckedSourceFailure();
+                }
+                return super.fetch(documentId);
+            }
+        };
+
+        ChangeSet changes = detector.detectChanges(new Rethrowing(source));
+
+        assertEquals(List.of("down"), changes.getUncheckedDocuments(),
+            "a document its source could not be asked about is neither changed nor gone");
+        assertEquals(1, changes.getUncheckedCount());
+        assertEquals(0, changes.getChangedCount());
+        assertEquals(0, changes.getDeletedCount(), "its indexed version is kept");
+        assertEquals(1, changes.getNewCount());
+        assertEquals(1, changes.getUnchangedCount(),
+            "only the document the source answered for is confirmed current");
+        assertTrue(changes.hasChanges());
     }
 
     // ==================== Helper Methods ====================
@@ -626,6 +744,49 @@ class ChangeDetectionTest {
     }
 
     // ==================== Mock Source ====================
+
+    /** Marks a fetch the {@link Rethrowing} wrapper turns into a {@link SourceException}. */
+    private static final class UncheckedSourceFailure extends RuntimeException {
+    }
+
+    /** A source whose marked fetches fail as a source does: a timeout, a 5xx. */
+    private static final class Rethrowing implements Source {
+        private final Source delegate;
+
+        Rethrowing(Source delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public String getSourceId() {
+            return delegate.getSourceId();
+        }
+
+        @Override
+        public String getSourceType() {
+            return delegate.getSourceType();
+        }
+
+        @Override
+        public Stream<String> crawl() throws SourceException {
+            return delegate.crawl();
+        }
+
+        @Override
+        public FetchedDocument fetch(String documentId) throws SourceException {
+            try {
+                return delegate.fetch(documentId);
+            } catch (UncheckedSourceFailure e) {
+                throw new SourceException("HTTP error 503 fetching: " + documentId,
+                    getSourceId(), true);
+            }
+        }
+
+        @Override
+        public void close() throws java.io.IOException {
+            delegate.close();
+        }
+    }
 
     private static class MockSource implements Source {
         private final String sourceId;

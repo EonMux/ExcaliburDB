@@ -1050,7 +1050,7 @@ above; nothing resolves them from the file or the environment.
 | `excalibur.ingest.lexical-tombstone-ratio` | 0.2 | Tombstoned fraction at which reclaiming repays the rewrite. Above 0, at most 1 |
 | `excalibur.ingest.lexical-max-latency-seconds` | 3600 | How long an erased chunk may remain on disk before cost stops being a consideration. Checked every tenth of it by a sweep, so the bound holds on an idle node. At least 1 |
 | `excalibur.ingest.lexical-max-segments` | 16 | Segments tolerated before the smallest are merged. At least 1 |
-| `excalibur.ingest.lexical-refresh-interval-ms` | 30000 | Longest a document published by a run still in progress waits to become searchable by BM25. A run also refreshes when it ends or is stopped. At least 1000 |
+| `excalibur.ingest.lexical-refresh-interval-ms` | 30000 | Longest a document published by a run still in progress — an ingestion or a re-crawl — waits to become searchable by BM25. A run also refreshes when it ends or is stopped. At least 1000 |
 
 The two engines are alternatives, not layers. The native one stores postings and reads a chunk's
 text back from storage when a compaction needs it, so the corpus exists once; Lucene keeps a second
@@ -1135,7 +1135,8 @@ document that is rolled back never reaches the index at all. Half a document is 
 rather than a partial one. A run refreshes every `excalibur.ingest.lexical-refresh-interval-ms`
 (30 seconds by default) while it is running, and again when it ends, is stopped or fails, so a
 crawl that runs for days is searchable as it goes rather than only when it finishes, and whatever a
-stopped run published is searchable once it stops. Publication is at the epoch *after* the current
+stopped run published is searchable once it stops. A re-crawl paces its refreshes the same way,
+between documents, through its removals as well as its rewrites. Publication is at the epoch *after* the current
 one, so a query already running does not acquire results halfway through.
 
 A query captures its epoch once, when it arrives, and every part of the answer reads at it: the
@@ -2295,6 +2296,7 @@ curl 'http://localhost:8080/v1/ingest/status?source_id=my-docs'
   "entries_pending": 170000,
   "entries_skipped": 1204,
   "entries_disallowed": 0,
+  "documents_failed": 0,
   "last_updated_ms": 1730000042000,
   "last_error": null
 }
@@ -2311,10 +2313,12 @@ curl http://localhost:8080/v1/ingest/status
   "sources": [
     {"source_id": "my-docs", "state": "embedding", "progress": 0.7300,
      "entries_ingested": 450000, "entries_pending": 170000, "entries_skipped": 1204,
-     "entries_disallowed": 0, "last_updated_ms": 1730000042000, "last_error": null},
+     "entries_disallowed": 0, "documents_failed": 0, "last_updated_ms": 1730000042000,
+     "last_error": null},
     {"source_id": "docs-site", "state": "idle", "progress": 1.0000,
      "entries_ingested": 12034, "entries_pending": 0, "entries_skipped": 0,
-     "entries_disallowed": 37, "last_updated_ms": 1729900000000, "last_error": null}
+     "entries_disallowed": 37, "documents_failed": 0, "last_updated_ms": 1729900000000,
+     "last_error": null}
   ]
 }
 ```
@@ -2344,6 +2348,7 @@ progress when the node stopped did not finish.
 | `entries_pending` | Documents the crawl listed and has not reached yet |
 | `entries_skipped` | Documents the crawl listed that are not text, so nothing was indexed from them. Not a failure, and deliberately not folded into `last_error`: a directory holding photographs beside its documents is the ordinary case, and calling those failures would leave every such source reading as broken. An empty file, or one that decodes to nothing worth a chunk, is not counted here by the first crawl or by any re-crawl |
 | `entries_disallowed` | Pages a web crawl left alone because the site's `robots.txt` disallows them — met as links, or reached through a redirect. Counted apart from `entries_skipped` because it answers a different question: a skipped photograph is ordinary, a disallowed page is one the site asked to be left out, which only its owner or a registration with `respect_robots_txt: false` can change. Not an error. Always 0 for a filesystem source. See [robots.txt](#robotstxt) |
+| `documents_failed` | Documents the crawl listed and could not index: a fetch or read that failed, a document over the per-document limits, or chunks that could not all be embedded and written. An error, which `last_error` states in words; those documents are not searchable. Named as `POST /v1/documents` names the same count |
 
 ### What gets indexed
 
@@ -2389,8 +2394,11 @@ is wrong with it where a crawl can only pass a file over and count it.
 the source's root now rather than the state it was in the first time the node walked it. Every
 run counts the same thing - documents that are not text, and nothing else - so an unchanged root
 reads the same after a re-crawl as after the crawl that first registered it. A run that passes
-over nothing, including one whose root lists no documents at all, sets it back to zero; the rest of `/v1/ingest/status` is left
-to the run that wrote it, because a reindex reports how far it got through
+over nothing, including one whose root lists no documents at all, sets it back to zero. A
+re-crawl that is cancelled, or fails, once it has begun on its documents reports what it had
+passed over up to then, and `entries_disallowed` the same way; one that ends while still listing
+the source has looked at nothing and leaves both as they were. The rest of `/v1/ingest/status` is
+left to the run that wrote it, because a reindex reports how far it got through
 `/v1/reindex/status`.
 
 A document that passes is chunked as it reads, with one exception: a document whose content type
@@ -2461,14 +2469,32 @@ transferred and nothing about it is re-chunked, re-embedded or re-written. Any o
 read in full and compared by content; a changed page is then fetched again and replaced. A server
 that ignores the conditions costs a full fetch per page and nothing worse. A `304` to a request
 that carried no condition — a page the server never gave validators for, or whose stored tag
-cannot travel in a header — names no version at all, so it fails that document's fetch rather
-than keeping it unchecked. The link walk still reads every HTML page it follows links from,
-because a page's links cannot be read from a `304`.
+cannot travel in a header — names no version at all, so it is a failed fetch, not a page found
+current. The link walk still reads every HTML page it follows links from, because a page's links
+cannot be read from a `304`.
+
+A document the re-crawl cannot ask about — the request timed out, the server answered `5xx`, or
+the `304` above — has not been shown to be either changed or current. It keeps its indexed
+version, is counted in the run's `documents_failed` and `documents_unchecked` on
+[`/v1/reindex/status`](#reindex-status-example) with the first ten named in `unchecked_sample`,
+and is asked again by the next re-crawl. Each failure's reason is in the node's log.
 
 The validators live in the registry file, not in memory, so this holds across a restart — the
 first re-crawl after one is exactly when a node would otherwise transfer the whole site again. A
 filesystem source has nothing to ask with and reads each file, and an unchanged one is recognised
-by its modification time, length and content hash.
+by its length and content hash. A newer modification time over the same bytes — a file touched,
+copied or restored — is not a change: nothing of it is re-chunked or re-embedded, and the new time
+is recorded in the registry in place of the old one. The same holds for a page a server sends in
+full with a new `ETag` or `Last-Modified` over the same body, as a redeployment does: it is kept
+as indexed, and the validators it came with are what the next re-crawl asks with.
+
+What was indexed is the text, not the bytes, so the registry also records how each document's
+text was read out of them: the encoding, and whether it was HTML reduced to the text it shows. A
+document whose bytes are intact but would now be read differently — its source's `charset`
+replaced with `PUT /v1/ingest`, a page the server now labels with another encoding or as HTML — is
+changed, and is read again. A setting that leaves the text as it was, such as a crawl delay, reads
+nothing again. An entry written before the registry recorded this is taken to have been read as
+its source reads it now, and gains the record at the first re-crawl that finds it unchanged.
 
 ### Reindex Status Example
 
@@ -2490,6 +2516,9 @@ curl 'http://localhost:8080/v1/reindex/status?source_id=my-docs'
   "progress": 0.6200,
   "documents_processed": 62,
   "documents_total": 100,
+  "documents_failed": 1,
+  "documents_unchecked": 1,
+  "unchecked_sample": ["https://docs.example.com/guide/install"],
   "started_at_ms": 1730000000000,
   "finished_at_ms": 0,
   "last_error": null
@@ -2504,7 +2533,8 @@ curl http://localhost:8080/v1/reindex/status
 {
   "sources": [
     {"source_id": "my-docs", "state": "idle", "cancelled": false, "progress": 1.0000,
-     "documents_processed": 100, "documents_total": 100,
+     "documents_processed": 100, "documents_total": 100, "documents_failed": 0,
+     "documents_unchecked": 0, "unchecked_sample": [],
      "started_at_ms": 1730000000000, "finished_at_ms": 1730000042000,
      "last_error": null}
   ]
@@ -2517,14 +2547,16 @@ and `failed`, which the ingest status has no equivalent of. A run stopped throug
 parsing `state`: a stop that was asked for is not a crash, and reporting it as one sends an
 operator looking for a fault that is not there. `finished_at_ms` is when the run ended, `0`
 while one is still going, so how long it took and how stale its result is are both readable.
-A run is `failed` only when it indexed nothing; it leaves the old segments serving, and
-`last_error` says what kind of failure it was and how many documents it affected. A run that
-indexed some documents and failed on others did finish, and reads `idle` at `progress: 1.0` with
+A run is `failed` only when it failed on documents and neither indexed any nor confirmed any
+current; it leaves the old segments serving, and `last_error` says what kind of failure it was and
+how many documents it affected. A document the source confirmed unchanged counts as work done, so
+a re-crawl of a source that has barely moved, with one page timing out, is not a failed run. A run
+that indexed or confirmed some documents and failed on others did finish, and reads `idle` at `progress: 1.0` with
 `last_error` counting the failures and the documents indexed (`"Reindex completed with 3 errors;
 400 documents indexed; ..."`), so a clean run is the one with `last_error: null`. Either way
 `last_error` points at the node's log for the reasons themselves — those carry filesystem paths
-and embedding endpoint URLs, and this route answers any caller holding a read token. A run that
-indexed nothing is not reported as `idle`, because a failed run reported as idle-with-a-note
+and embedding endpoint URLs, and this route answers any caller holding a read token. A failed run
+is not reported as `idle`, because a failed run reported as idle-with-a-note
 reads as a run that finished.
 
 A source that has never been reindexed is a 404 rather than an invented idle run: "nothing has
@@ -2537,6 +2569,12 @@ chunks, and giving the two the same name for different units would be worse than
 different names. They are the run's own counts: `documents_total` is how many documents the
 change detection found new or changed, `documents_processed` rises by one as each is written,
 and `progress` is their ratio.
+
+| Count | What it counts |
+|-------|----------------|
+| `documents_failed` | Documents the run could not index or could not check: a fetch or read that failed, a document over the per-document limits, chunks that could not all be embedded and written, and the unchecked documents below. Counted as the run goes, so a stopped or failed run reports what it had failed on by then. Each failed document keeps whatever version was indexed before |
+| `documents_unchecked` | The part of `documents_failed` the re-crawl could not ask its source about — a timeout, a `5xx`, a `304` to a request that carried no condition. See [How a re-crawl finds what changed](#how-a-re-crawl-finds-what-changed) |
+| `unchecked_sample` | The first ten unchecked documents, by document id — the id a query result names, never an error message. Enough to tell one host that is down from scattered timeouts; the count above is always whole |
 
 ### Compaction Example
 
@@ -3768,7 +3806,8 @@ only let one of them lapse. A tombstone file, key checksum file or erasure log w
 build stops it opening too, and nothing is deleted.
 
 Beside it, `<data dir>/document-registry` records which documents this node holds, the chunk ids
-each was written under, and the `ETag` and `Last-Modified` an HTTP source reported for it. It is
+each was written under, the `ETag` and `Last-Modified` an HTTP source reported for it, and how its
+text was read out of its bytes — the encoding, and whether it was HTML reduced to its text. It is
 what change detection compares a re-crawl against and what an erasure
 request resolves a document name through, so it is written after every ingestion, reindex and
 erasure. A node that lost it would read every document as new — reingesting the corpus beside the
@@ -3816,15 +3855,16 @@ progress and counts, when it finished, and its `last_error` — so `GET /v1/inge
 restart reports that run rather than zeros stamped with the moment the node came up. Only finished
 runs are written (`idle` or `unconfigured`); a crawl the restart cut short comes back `idle` with
 `last_error` saying that the run in progress when the node stopped did not finish, never still
-claiming to run. The file is written the way the catalog is — a `\#source-status|3` header, one
+claiming to run. The file is written the way the catalog is — a `\#source-status|4` header, one
 line per source, a `\#end|<count>|<crc>` marker, forced to disk and published by an atomic rename
 — but unlike the catalog, one that cannot be read, or whose checksum does not match, does not fail
 the start. It is a report, not state the store depends on: the node logs it, treats the history as
 empty, and each source reports from its next run. A data directory from a build without the file
-needs nothing; it is written when the first run ends. Versions 1 and 2 carry no checksum and are
-still read — version 1, written before a crawl counted the pages `robots.txt` kept it from, with
-each source's `entries_disallowed` as 0 — and the next run to end rewrites the file at version
-3.
+needs nothing; it is written when the first run ends. Older versions are still read: versions 1
+to 3, written before a run's failures were counted, with each source's `documents_failed` as 0;
+version 1, written before a crawl counted the pages `robots.txt` kept it from, with its
+`entries_disallowed` as 0 too; and versions 1 and 2 with no checksum to verify. The next run to end
+rewrites the file at version 4.
 
 `<data dir>/erasure-receipts` is what `GET /v1/erasure/{request_id}` answers from: one line per
 document erasure — its id, when it was made, the source and scope, the per-document counts and the

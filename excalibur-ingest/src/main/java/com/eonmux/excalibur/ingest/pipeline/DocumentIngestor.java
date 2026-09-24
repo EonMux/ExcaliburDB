@@ -512,6 +512,9 @@ final class DocumentIngestor {
             // Kept so the next re-crawl can ask the source whether this version is still
             // current instead of transferring it again to find out.
             .entityTag(doc.getEntityTag())
+            // Kept so the next re-crawl can tell these bytes being read into other text - a
+            // charset changed since - from the same text it already holds.
+            .decoding(TextContent.decodingOf(doc))
             .contentHash(DocumentRegistry.computeContentHash(content))
             .contentLength(content.length)
             .chunkIds(chunkIds)

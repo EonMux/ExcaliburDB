@@ -28,7 +28,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class SourceStatusFileTest {
 
     private static SourceStatusFile.Entry entry(String sourceId, String lastError) {
-        return new SourceStatusFile.Entry(sourceId, "idle", 1.0, 420, 0, 7, 3,
+        return new SourceStatusFile.Entry(sourceId, "idle", 1.0, 420, 0, 7, 3, 2,
             1_730_000_000_000L, lastError);
     }
 
@@ -38,7 +38,7 @@ class SourceStatusFileTest {
         SourceStatusFile file = SourceStatusFile.open(dataDir);
         SourceStatusFile.Entry clean = entry("docs", null);
         SourceStatusFile.Entry failed = new SourceStatusFile.Entry("site", "unconfigured", 0.0,
-            0, 12, 0, 0, 1_730_000_000_123L, "No ingestion pipeline is configured");
+            0, 12, 0, 0, 0, 1_730_000_000_123L, "No ingestion pipeline is configured");
 
         file.write(List.of(clean, failed));
 
@@ -76,7 +76,7 @@ class SourceStatusFileTest {
 
         List<String> lines =
             Files.readAllLines(dataDir.resolve(SourceStatusFile.FILE), StandardCharsets.UTF_8);
-        assertThat(lines.get(0)).isEqualTo("\\#source-status|3");
+        assertThat(lines.get(0)).isEqualTo("\\#source-status|4");
         assertThat(lines.get(lines.size() - 1)).matches("\\\\#end\\|1\\|[0-9a-f]{8}");
         assertThat(lines).hasSize(3);
     }
@@ -102,13 +102,33 @@ class SourceStatusFileTest {
     }
 
     @Test
-    @DisplayName("a disallowed count is written in its own field")
-    void theDisallowedCountIsWritten(@TempDir Path dataDir) throws IOException {
+    @DisplayName("the disallowed and failed counts are written in fields of their own")
+    void theDisallowedAndFailedCountsAreWritten(@TempDir Path dataDir) throws IOException {
         SourceStatusFile.open(dataDir).write(List.of(entry("docs", "partial")));
 
         List<String> lines =
             Files.readAllLines(dataDir.resolve(SourceStatusFile.FILE), StandardCharsets.UTF_8);
-        assertThat(lines.get(1)).isEqualTo("docs|idle|1.0|420|0|7|3|1730000000000|partial");
+        assertThat(lines.get(1)).isEqualTo("docs|idle|1.0|420|0|7|3|2|1730000000000|partial");
+    }
+
+    @Test
+    @DisplayName("a file from the build before the failed count reads it as zero")
+    void aVersionThreeFileLoads(@TempDir Path dataDir) throws IOException {
+        try (ChecksummedTextWriter out =
+                 ChecksummedTextWriter.create(dataDir.resolve(SourceStatusFile.FILE))) {
+            out.writeLine("\\#source-status|3");
+            out.writeLine("docs|idle|1.0|420|0|7|3|1730000000000");
+            out.writeLine("site|idle|1.0|3|0|0|1|1730000000001|2 of 5 documents were not ingested");
+            out.writeEnd(SourceStatusFile.END_MARKER, 2);
+        }
+
+        Map<String, SourceStatusFile.Entry> loaded = SourceStatusFile.open(dataDir).loaded();
+
+        assertThat(loaded.get("docs")).isEqualTo(new SourceStatusFile.Entry(
+            "docs", "idle", 1.0, 420, 0, 7, 3, 0, 1_730_000_000_000L, null));
+        assertThat(loaded.get("site").lastError()).isEqualTo("2 of 5 documents were not ingested");
+        assertThat(loaded.get("site").disallowed()).isEqualTo(1);
+        assertThat(loaded.get("site").failed()).isZero();
     }
 
     @Test
@@ -123,7 +143,7 @@ class SourceStatusFileTest {
         Map<String, SourceStatusFile.Entry> loaded = SourceStatusFile.open(dataDir).loaded();
 
         assertThat(loaded.get("docs")).isEqualTo(new SourceStatusFile.Entry(
-            "docs", "idle", 1.0, 420, 0, 7, 0, 1_730_000_000_000L, null));
+            "docs", "idle", 1.0, 420, 0, 7, 0, 0, 1_730_000_000_000L, null));
         assertThat(loaded.get("site").lastError()).isEqualTo("2 of 5 documents were not ingested");
         assertThat(loaded.get("site").disallowed()).isZero();
     }
@@ -233,15 +253,17 @@ class SourceStatusFileTest {
     @Test
     @DisplayName("an entry refuses values the readback could never have reported")
     void anEntryIsValidated() {
-        assertThatThrownBy(() -> new SourceStatusFile.Entry(null, "idle", 0, 0, 0, 0, 0, 0, null))
+        assertThatThrownBy(() -> new SourceStatusFile.Entry(null, "idle", 0, 0, 0, 0, 0, 0, 0, null))
             .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> new SourceStatusFile.Entry("docs", null, 0, 0, 0, 0, 0, 0, null))
+        assertThatThrownBy(() -> new SourceStatusFile.Entry("docs", null, 0, 0, 0, 0, 0, 0, 0, null))
             .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> new SourceStatusFile.Entry("docs", "idle", 0, -1, 0, 0, 0, 0, null))
+        assertThatThrownBy(() -> new SourceStatusFile.Entry("docs", "idle", 0, -1, 0, 0, 0, 0, 0, null))
             .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new SourceStatusFile.Entry("docs", "idle", 0, 0, 0, 0, -1, 0, null))
+        assertThatThrownBy(() -> new SourceStatusFile.Entry("docs", "idle", 0, 0, 0, 0, -1, 0, 0, null))
             .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new SourceStatusFile.Entry("docs", "idle", 2.0, 0, 0, 0, 0, 0, null))
+        assertThatThrownBy(() -> new SourceStatusFile.Entry("docs", "idle", 0, 0, 0, 0, 0, -1, 0, null))
+            .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new SourceStatusFile.Entry("docs", "idle", 2.0, 0, 0, 0, 0, 0, 0, null))
             .isInstanceOf(IllegalArgumentException.class);
     }
 

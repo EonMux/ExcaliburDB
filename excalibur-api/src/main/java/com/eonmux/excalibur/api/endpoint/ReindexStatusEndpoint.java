@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -132,6 +133,13 @@ public class ReindexStatusEndpoint implements HttpHandler {
      * string-match a state name - or worse, an error message - to find it is how a deliberate
      * stop ends up filed as an outage. {@code finished_at_ms} is 0 while the run is going, and
      * with {@code started_at_ms} it is how long the run took.</p>
+     *
+     * <p>{@code documents_failed} counts the documents the run could not index or could not
+     * check, as the ingest status's field of that name does for a crawl. {@code
+     * documents_unchecked} is the part of it whose source could not say whether they had
+     * changed, and {@code unchecked_sample} names the first of those by document id - an id a
+     * query result names too, and no error message, for the reason {@code last_error} carries
+     * none.</p>
      */
     private String toJson(ReindexEndpoint.ReindexStatus status) {
         // Locale.ROOT, because the default locale picks the decimal separator: under de_DE a
@@ -145,6 +153,9 @@ public class ReindexStatusEndpoint implements HttpHandler {
                 + "\"progress\": %.4f, "
                 + "\"documents_processed\": %d, "
                 + "\"documents_total\": %d, "
+                + "\"documents_failed\": %d, "
+                + "\"documents_unchecked\": %d, "
+                + "\"unchecked_sample\": %s, "
                 + "\"started_at_ms\": %d, "
                 + "\"finished_at_ms\": %d, "
                 + "\"last_error\": %s"
@@ -155,12 +166,27 @@ public class ReindexStatusEndpoint implements HttpHandler {
             status.progress(),
             status.entriesProcessed(),
             status.entriesTotal(),
+            status.documentsFailed(),
+            status.documentsUnchecked(),
+            jsonArray(status.uncheckedSample()),
             status.startTimeMs(),
             status.finishedAtMs(),
             status.lastError() != null
                 ? "\"" + JsonText.escape(status.lastError()) + "\""
                 : "null"
         );
+    }
+
+    /** Renders strings as a JSON array of strings. */
+    private static String jsonArray(List<String> values) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append('"').append(JsonText.escape(values.get(i))).append('"');
+        }
+        return sb.append(']').toString();
     }
 
     private void send(HttpExchange exchange, int statusCode, String json) throws IOException {

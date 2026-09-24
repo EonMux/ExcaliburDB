@@ -227,4 +227,44 @@ class TextContentTest {
             assertThatNullPointerException().isThrownBy(() -> TextContent.isText(null));
         }
     }
+    @Nested
+    @DisplayName("The decoding is named")
+    class DecodingIsNamed {
+
+        private FetchedDocument document(String contentType, Charset charset) {
+            return new FetchedDocument("doc", "caf\u00e9".getBytes(charset), contentType, charset,
+                0L);
+        }
+
+        @Test
+        @DisplayName("by the charset the bytes are read in")
+        void namesTheCharset() {
+            assertThat(TextContent.decodingOf(document("text/plain", StandardCharsets.UTF_8)))
+                .isEqualTo("UTF-8");
+            assertThat(TextContent.decodingOf(
+                    document("text/plain", Charset.forName("windows-1252"))))
+                .isEqualTo("windows-1252");
+        }
+
+        @Test
+        @DisplayName("and by whether markup is reduced to its text")
+        void namesMarkup() {
+            assertThat(TextContent.decodingOf(
+                    document("text/html; charset=utf-8", StandardCharsets.UTF_8)))
+                .isEqualTo("UTF-8+markup");
+        }
+
+        @Test
+        @DisplayName("and by nothing else a content type says")
+        void ignoresTypesThatDecodeAlike() {
+            assertThat(TextContent.decodingOf(document("text/markdown", StandardCharsets.UTF_8)))
+                .isEqualTo(TextContent.decodingOf(document("text/plain", StandardCharsets.UTF_8)));
+        }
+
+        @Test
+        @DisplayName("Null document is refused")
+        void nullDocument() {
+            assertThatNullPointerException().isThrownBy(() -> TextContent.decodingOf(null));
+        }
+    }
 }

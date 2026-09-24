@@ -276,6 +276,10 @@ class DocumentKeyCollisionTest {
         }
 
         @Override
+        public void setFailed(long failed) {
+        }
+
+        @Override
         public void setError(String error) {
             this.error = error;
         }

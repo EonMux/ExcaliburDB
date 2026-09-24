@@ -24,14 +24,31 @@ import java.util.stream.Stream;
  * registry recorded for the indexed version (see {@link Source#fetchIfChanged}). A source that
  * confirms the version is current - an HTTP origin answering {@code 304 Not Modified} - settles
  * it without transferring the body, and the document is unchanged. Every other answer carries
- * the document, and the detector compares what came back:
+ * the document, and the detector compares what came back by content (see
+ * {@link DocumentMetadata#isChanged}):
  * <ol>
- *   <li><strong>Last Modified Timestamp:</strong> If the source provides lastModified,
- *       compare with the stored timestamp. Newer = changed.</li>
  *   <li><strong>Content Length:</strong> If lengths differ, document is changed.</li>
- *   <li><strong>Content Hash:</strong> If both old and new hashes are available and differ,
- *       document is changed.</li>
+ *   <li><strong>Content Hash:</strong> If both old and new hashes are available, they
+ *       decide.</li>
+ *   <li><strong>Last Modified Timestamp:</strong> Only for an entry that recorded no hash: a
+ *       newer timestamp is then taken as a change.</li>
  * </ol>
+ *
+ * <p>A document that came back with its bytes intact is unchanged even when its timestamp or its
+ * entity tag moved - a touched file, a redeployed page - and nothing of it is re-chunked or
+ * re-embedded. What it came back with is recorded instead; see {@link #refreshRecord}.</p>
+ *
+ * <p>Bytes intact are not the whole answer, because the text is what was indexed. A document
+ * whose bytes came back unchanged and would now be read into other text - its source's
+ * {@code charset} was replaced, a server labels the page with another encoding - is changed, and
+ * is read again with the decoding its source now declares.</p>
+ *
+ * <h2>Documents that could not be checked</h2>
+ * <p>A source that cannot answer for a document - it timed out, a server failed, a server
+ * answered {@code 304 Not Modified} to a request that asked nothing - says nothing about whether
+ * it changed. Such a document is kept as it is indexed and reported unchecked in the
+ * {@link ChangeSet}, so the run counts it as a fetch that failed rather than passing it as
+ * current.</p>
  *
  * <h2>Deleted Document Detection</h2>
  * <p>After processing all crawled documents, any document in the registry that was not
@@ -145,8 +162,8 @@ public class ChangeDetector {
      * content hash.</p>
      *
      * <p>A document sent back in full and found unchanged still brought news: the validators
-     * its source now names this version by. They are recorded, so the next re-crawl asks with
-     * them - see {@link #refreshValidators}.</p>
+     * its source now names this version by, and the decoding it would be read with. They are
+     * recorded, so the next re-crawl asks with them - see {@link #refreshRecord}.</p>
      *
      * @param source     The source holding the document
      * @param documentId The document
@@ -165,19 +182,22 @@ public class ChangeDetector {
         if (existing.isChanged(info)) {
             return Optional.of(info);
         }
-        refreshValidators(existing, fetched.get().validators());
+        refreshRecord(existing, fetched.get().validators(), info.getDecoding());
         return Optional.empty();
     }
 
     /**
-     * Records the validators an unchanged document came back with, when they differ.
+     * Records the validators an unchanged document came back with, when they differ, and its
+     * decoding, when the entry has none.
      *
      * <p>Only a changed document is reindexed, and reindexing is what otherwise writes a
      * document's validators. Without this, one whose entity tag the registry never held - every
      * document registered before tags were kept - or whose tag the server rotated over the same
      * bytes, as a redeployment does, would be sent in full on every re-crawl for as long as its
      * content did not change: each fetch asks with the stale tag, the server cannot match it,
-     * and the tag the answer carried is thrown away.</p>
+     * and the tag the answer carried is thrown away. The same goes for a file touched with its
+     * bytes intact: its new modification time is recorded, so the entry goes on describing the
+     * file as it now stands.</p>
      *
      * <p>Each validator is replaced only when the answer carried one. An answer without a tag
      * is not evidence against the recorded one - the server can only ever answer 304 to a tag
@@ -187,25 +207,36 @@ public class ChangeDetector {
      * if the entry is still the one read, so a reindex that registered a new version meanwhile
      * is never overwritten with this older one.</p>
      *
+     * <p>A decoding is recorded only for an entry that has none - one registered before
+     * decodings were kept - since an entry that has one and differs was reported changed rather
+     * than reaching here. It is taken from the document as it would be read now, the best
+     * account there is of how it was read; from then on the entry has a decoding to compare, and
+     * a later change to its source's configuration is seen.</p>
+     *
      * @param existing What the registry recorded for the indexed version
      * @param received What the source named the same version by just now
+     * @param decoding How the same bytes would be read into text now, or null when not known
      */
-    private void refreshValidators(DocumentMetadata existing, DocumentValidators received) {
+    private void refreshRecord(DocumentMetadata existing, DocumentValidators received,
+                               String decoding) {
         DocumentValidators recorded = existing.validators();
         long lastModified = received.hasLastModified()
             ? received.lastModifiedMillis()
             : recorded.lastModifiedMillis();
         String entityTag = received.hasEntityTag() ? received.entityTag() : recorded.entityTag();
+        String recordedDecoding = existing.hasDecoding() ? existing.getDecoding() : decoding;
         if (lastModified == recorded.lastModifiedMillis()
-                && Objects.equals(entityTag, recorded.entityTag())) {
+                && Objects.equals(entityTag, recorded.entityTag())
+                && Objects.equals(recordedDecoding, existing.getDecoding())) {
             return;
         }
         DocumentMetadata refreshed = existing.toBuilder()
             .lastModifiedMillis(lastModified)
             .entityTag(entityTag)
+            .decoding(recordedDecoding)
             .build();
         if (registry.replace(existing, refreshed)) {
-            LOGGER.debug("Recorded new validators for unchanged document {} of source {}",
+            LOGGER.debug("Recorded what unchanged document {} of source {} came back with",
                 existing.getDocumentId(), existing.getSourceId());
         }
     }
@@ -217,8 +248,9 @@ public class ChangeDetector {
      * apart. A {@link DocumentNotFoundException} means the crawl listed a document that is no
      * longer there, so it is reported as unseen and the deleted-document pass tombstones it. Any
      * other failure is transient - the host is down, the request timed out - and treating it as
-     * unseen would tombstone a document that still exists, so the previous version is kept and
-     * the failure is logged rather than silently recorded as "unchanged".</p>
+     * unseen would tombstone a document that still exists, so the previous version is kept, the
+     * failure is logged, and the document is reported unchecked rather than silently recorded as
+     * unchanged.</p>
      *
      * <p>A {@link FetchDisallowedException} is not a failure but an answer: the publisher now
      * forbids fetching the document - a robots.txt that disallows it, or the URL it redirects
@@ -251,6 +283,7 @@ public class ChangeDetector {
         } catch (SourceException e) {
             LOGGER.warn("Could not determine whether document {} of source {} changed: {}. "
                 + "Keeping the indexed version.", documentId, sourceId, e.getMessage());
+            builder.addUnchecked(documentId);
             return true;
         }
     }

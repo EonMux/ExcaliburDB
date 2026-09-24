@@ -664,6 +664,9 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         private volatile long finishedAtMs;
         private volatile long entriesProcessed;
         private volatile long entriesTotal;
+        private volatile long documentsFailed;
+        private volatile long documentsUnchecked;
+        private volatile List<String> uncheckedSample;
         private volatile String lastError;
 
         public ReindexStatus(String sourceId) {
@@ -674,6 +677,9 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
             this.finishedAtMs = 0;
             this.entriesProcessed = 0;
             this.entriesTotal = 0;
+            this.documentsFailed = 0;
+            this.documentsUnchecked = 0;
+            this.uncheckedSample = List.of();
             this.lastError = null;
         }
 
@@ -684,6 +690,28 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         public long entriesProcessed() { return entriesProcessed; }
         public long entriesTotal() { return entriesTotal; }
         public String lastError() { return lastError; }
+
+        /**
+         * Documents this run could not index or could not check.
+         *
+         * @return The count so far, or the run's whole count once it has ended
+         */
+        public long documentsFailed() { return documentsFailed; }
+
+        /**
+         * Documents whose source could not say whether they had changed, among
+         * {@link #documentsFailed()}.
+         *
+         * @return The count
+         */
+        public long documentsUnchecked() { return documentsUnchecked; }
+
+        /**
+         * The first of the documents that could not be checked, by id.
+         *
+         * @return An unmodifiable list, empty when none were
+         */
+        public List<String> uncheckedSample() { return uncheckedSample; }
 
         /**
          * When this run stopped, however it stopped, or 0 while it is still going.
@@ -714,7 +742,31 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
             this.finishedAtMs = 0;
             this.entriesProcessed = 0;
             this.entriesTotal = 0;
+            this.documentsFailed = 0;
+            this.documentsUnchecked = 0;
+            this.uncheckedSample = List.of();
             this.lastError = null;
+        }
+
+        /**
+         * Records how many documents the run has failed on.
+         *
+         * @param failed The run's count so far; negative is read as zero
+         */
+        public void recordFailures(long failed) {
+            this.documentsFailed = Math.max(0, failed);
+        }
+
+        /**
+         * Records the documents the run's source could not say had changed or not.
+         *
+         * @param unchecked How many there were; negative is read as zero
+         * @param sample    The first of them, by id
+         * @throws NullPointerException if sample is null
+         */
+        public void recordUnchecked(long unchecked, List<String> sample) {
+            this.uncheckedSample = List.copyOf(sample);
+            this.documentsUnchecked = Math.max(0, unchecked);
         }
 
         /**
@@ -809,6 +861,23 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         void failReindex(String sourceId, String error);
 
         /**
+         * Records how many documents a run has failed on, while it runs or once it has ended.
+         *
+         * @param sourceId The source whose run it is
+         * @param failed   The run's count
+         */
+        void recordFailures(String sourceId, long failed);
+
+        /**
+         * Records the documents a run's source could not say had changed or not.
+         *
+         * @param sourceId  The source whose run it is
+         * @param unchecked How many there were
+         * @param sample    The first of them, by id
+         */
+        void recordUnchecked(String sourceId, long unchecked, List<String> sample);
+
+        /**
          * Records that a run stopped because it was asked to.
          *
          * <p>Separate from {@link #failReindex(String, String)} because a caller acts
@@ -892,6 +961,22 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
             ReindexStatus status = statuses.get(sourceId);
             if (status != null) {
                 status.cancel();
+            }
+        }
+
+        @Override
+        public void recordFailures(String sourceId, long failed) {
+            ReindexStatus status = statuses.get(sourceId);
+            if (status != null) {
+                status.recordFailures(failed);
+            }
+        }
+
+        @Override
+        public void recordUnchecked(String sourceId, long unchecked, List<String> sample) {
+            ReindexStatus status = statuses.get(sourceId);
+            if (status != null) {
+                status.recordUnchecked(unchecked, sample);
             }
         }
 

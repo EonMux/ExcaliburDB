@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.ingest.registry;
 
+import com.eonmux.excalibur.ingest.processor.TextContent;
 import com.eonmux.excalibur.ingest.source.DocumentValidators;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.HttpSource;
@@ -130,6 +131,15 @@ class ConditionalRecrawlTest {
                 "always sent in full");
         });
 
+        // A section of its own, so the pages above are crawled without it. Its one page
+        // answers 304 to every request, including one that asked nothing.
+        server.createContext("/stale/", exchange -> send(exchange, 200,
+            Map.of("Content-Type", "text/html"), "<a href=\"/stale/page.txt\">p</a>"));
+        server.createContext("/stale/page.txt", exchange -> {
+            record(exchange);
+            send(exchange, 304, Map.of(), null);
+        });
+
         server.start();
     }
 
@@ -200,6 +210,7 @@ class ConditionalRecrawlTest {
                     .documentId(id)
                     .lastModifiedMillis(doc.getLastModifiedMillis())
                     .entityTag(withTags ? doc.getEntityTag() : null)
+                    .decoding(TextContent.decodingOf(doc))
                     .contentHash(DocumentRegistry.computeContentHash(content))
                     .contentLength(content.length)
                     .chunkIds(List.of(id + "#0"))
@@ -329,6 +340,44 @@ class ConditionalRecrawlTest {
             new ChangeDetector(registry).detectChanges(source);
         }
         assertThat(registry.isModified()).isFalse();
+    }
+
+    @Test
+    @DisplayName("a 304 to a request that asked nothing is a check that failed, not an unchanged page")
+    void aNotModifiedToAnUnconditionalRequestIsUnchecked() throws Exception {
+        String page = baseUrl + "/stale/page.txt";
+        // Recorded with nothing to ask with - no tag, no date - so the check goes out
+        // unconditional, and a 304 to it names no version this registry holds.
+        DocumentRegistry registry = new DocumentRegistry();
+        registry.register(DocumentMetadata.builder()
+            .sourceId(SOURCE_ID)
+            .documentId(page)
+            .contentHash(42L)
+            .contentLength(10)
+            .chunkIds(List.of(page + "#0"))
+            .indexTimeMillis(System.currentTimeMillis())
+            .build());
+        HttpSource stale = HttpSource.builder()
+            .allowPrivateAddresses(true)
+            .sourceId(SOURCE_ID)
+            .baseUrl(baseUrl + "/stale/")
+            .maxDepth(1)
+            .crawlDelayMillis(0)
+            .build();
+
+        ChangeSet changes;
+        try (stale) {
+            changes = new ChangeDetector(registry).detectChanges(stale);
+        }
+
+        assertThat(conditionsSeen.get("/stale/page.txt")).last().asString()
+            .isEqualTo("If-None-Match=null; If-Modified-Since=null");
+        assertThat(changes.getUncheckedDocuments()).containsExactly(page);
+        assertThat(changes.getChangedDocuments()).isEmpty();
+        assertThat(changes.getDeletedDocuments())
+            .as("the page is still there, so its indexed version is kept")
+            .isEmpty();
+        assertThat(changes.getUnchangedCount()).isZero();
     }
 
     @Test
