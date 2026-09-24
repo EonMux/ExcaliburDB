@@ -40,7 +40,7 @@ class GraphBuildRunnerTest {
     private static final NamespaceId OTHER = NamespaceId.of("other");
 
     private static final GraphBuildService.BuildOutcome PUBLISHED =
-        new GraphBuildService.BuildOutcome(true, false, 12, 5, 2, 5, 0, 12);
+        new GraphBuildService.BuildOutcome(true, false, 12, 5, 2, 5, 0, 12, 0);
 
     /** A build that blocks until it is released, so the state in between can be read. */
     /** Far longer than any build here takes to act on its stop. */

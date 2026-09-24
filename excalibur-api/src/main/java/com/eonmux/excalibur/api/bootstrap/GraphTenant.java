@@ -200,9 +200,11 @@ public final class GraphTenant implements AutoCloseable {
                 directory, withhold ? null : openServable(id, config, directory, models));
             opened.push(holder);
 
+            // Fenced by the erasure log: staging holds what an outstanding obligation covers
+            // until a compaction erases it, and a build in between must not publish it.
             GraphBuildService buildService = new GraphBuildService(
                 staging, holder, config, models, config.graph().getSingleValuedRelations(),
-                embedder, dimension);
+                embedder, dimension, erasureLog::fence);
 
             GraphErasureService erasureService = new GraphErasureService(
                 coordinator, holder, config, models, withheldMarker);
@@ -704,6 +706,12 @@ public final class GraphTenant implements AutoCloseable {
      * it renamed, and a stop landing inside that window would leave a namespace serving nothing
      * over a graph that is intact on disk. So once a build reaches it, it finishes.</p>
      *
+     * <h3>What it leaves out</h3>
+     * <p>Whatever an erasure obligation this tenant owes covers, as its erasure log stands when
+     * the build takes the replacement lock; an obligation recorded after that refuses the
+     * publish instead. See {@link GraphBuildService}. The obligations stay outstanding: staging
+     * still holds what they cover until a compaction erases it.</p>
+     *
      * <h3>What a stopped build reports</h3>
      * <p>Nothing: it raises {@link com.eonmux.excalibur.graph.build.BuildCancelledException}, because a
      * build publishes by a rename or not at all and there is no partial graph to describe. The
@@ -711,6 +719,8 @@ public final class GraphTenant implements AutoCloseable {
      *
      * @param cancelRequested Read at each of those boundaries; true asks the build to stop
      * @return What was built
+     * @throws com.eonmux.excalibur.graph.staging.PublishRefusedException if an erasure was
+     *                     recorded while the graph was being built; nothing was published
      * @throws IOException if the graph cannot be built or reopened
      * @throws com.eonmux.excalibur.graph.build.BuildCancelledException if the build was asked to stop
      *                     and reached a boundary before publishing
@@ -737,11 +747,13 @@ public final class GraphTenant implements AutoCloseable {
      * time it runs: an explicit build may have published everything since. So the question is
      * asked again under the replacement lock the build itself takes, where no other build or
      * compaction can change the answer. A graph withheld until an interrupted erasure is applied
-     * is not built either: the erasure sweep applies what is owed first, and a build ahead of it
-     * would serve the facts the erasure is removing.</p>
+     * is not built either: the erasure sweep applies what is owed first, and it is the
+     * compaction that finishes the interrupted erasure which puts the graph back in service.</p>
      *
      * @param cancelRequested Read at the build's boundaries; true asks it to stop
      * @return What was built, or empty when there was nothing to build
+     * @throws com.eonmux.excalibur.graph.staging.PublishRefusedException if an erasure was
+     *                     recorded while the graph was being built; nothing was published
      * @throws IOException if the graph cannot be built or reopened
      * @throws com.eonmux.excalibur.graph.build.BuildCancelledException if the build was asked to
      *                     stop and reached a boundary before publishing
