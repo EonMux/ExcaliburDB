@@ -1302,6 +1302,11 @@ they were published. A node with no chat model extracts nothing, and a removal s
 The graph being served changes at the next build — the node's automatic one, or
 `POST /v1/graph/build`.
 
+Queries running during a reindex see each document it rewrites as one version: the previous one
+until the rewrite begins, none while the new version's chunks are written over it, and the new one
+once it is published whole. A document whose rewrite fails after overwriting part of it stays out of
+results until a later reindex publishes it whole, including across a restart.
+
 A document is removed under the same per-document lock a publication or an erasure takes, and only
 if its registry entry is still the one the reindex read when it listed the source. One posted again
 or erased while the reindex ran is left alone — the later write stands — and the next reindex reads

@@ -36,8 +36,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  * content exists, and within the removals the lexical index is erased before storage is
  * tombstoned: a deleted document should stop being findable before its bytes go, not after. A
  * <em>changed</em> document is the opposite case - nothing of its previous version is retired
- * until its replacement has actually been published, because tombstoning first is what makes a
- * failed re-embed destructive.</p>
+ * until its replacement has been written in full, because tombstoning first is what makes a
+ * failed re-embed destructive. That retirement belongs to the {@link DocumentStep}, which makes it
+ * under the document's lock while the document is still hidden, just ahead of the publication:
+ * made here, after the step had published, it would leave the previous version's tail served
+ * beside the new version until it went.</p>
  *
  * <h2>Why a removal takes the document's lock</h2>
  * <p>Change detection reads the registry once, at the start of the pass, and a removal acts on
@@ -46,7 +49,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * registers a new entry the removal is about to delete. So each document is removed under its
  * lock - the one ingestion, the reindex's own publication and an erasure all take - and only if
  * its registry entry is still the one change detection read. An entry that has changed or gone
- * belongs to a later write, which is left alone; the next pass reads it afresh.</p>
+ * belongs to a later write, which is left alone; the next pass reads it afresh. A removed
+ * document's visibility state goes with it, as an erasure's does, so an in-flight mark left by an
+ * attempt that could not publish it does not outlive the chunks it was hiding.</p>
  *
  * <h2>What the graph is told</h2>
  * <p>A removed document is reported to the graph through the same {@link GraphReporter} its
@@ -109,6 +114,9 @@ final class SourceReindexPass {
     /** Tells the graph about every document this pass removes. */
     private final GraphReporter graphReporter;
 
+    /** Forgets a removed document's visibility state, or null on a node that publishes directly. */
+    private final DocumentBatchPublisher publisher;
+
     private final DocumentStep documentStep;
 
     /**
@@ -142,13 +150,17 @@ final class SourceReindexPass {
      * @param lexical       The lexical index to keep in step with storage
      * @param vectorEraser  Retires graph nodes of what this pass removes, or null for none
      * @param graphReporter Tells the graph about every document this pass removes
+     * @param publisher     Forgets a removed document's visibility state, or null when the
+     *                      reindex publishes directly and keeps none
      * @param documentStep  Re-indexes one document
-     * @throws NullPointerException if any argument other than the eraser is null
+     * @throws NullPointerException if any argument other than the eraser or the publisher is
+     *                              null
      */
     SourceReindexPass(DocumentRegistry registry, UpsertHandler upsertHandler,
                       ReindexLexicalIndex lexical,
                       DocumentErasureService.VectorEraser vectorEraser,
-                      GraphReporter graphReporter, DocumentStep documentStep) {
+                      GraphReporter graphReporter, DocumentBatchPublisher publisher,
+                      DocumentStep documentStep) {
         this.registry = Objects.requireNonNull(registry, "registry must not be null");
         this.upsertHandler =
             Objects.requireNonNull(upsertHandler, "upsertHandler must not be null");
@@ -156,6 +168,7 @@ final class SourceReindexPass {
         this.vectorEraser = vectorEraser;
         this.graphReporter =
             Objects.requireNonNull(graphReporter, "graphReporter must not be null");
+        this.publisher = publisher;
         this.documentStep = Objects.requireNonNull(documentStep, "documentStep must not be null");
     }
 
@@ -212,8 +225,8 @@ final class SourceReindexPass {
         try {
             // Only removals are safe to apply before the replacement content exists: a changed
             // document removed now and then failing to re-embed would be lost in both forms.
-            // Changed documents retire their surplus chunks after publishing instead; see
-            // UpsertHandler.tombstoneObsoleteChunks.
+            // Changed documents retire their surplus chunks once the replacement is written,
+            // inside the step; see SupersededVersion.
             removeDeleted(sourceId, changeSet, stop, removals, resultBuilder);
 
             for (String newDocId : changeSet.getNewDocuments()) {
@@ -225,6 +238,9 @@ final class SourceReindexPass {
                     DocumentResult docResult =
                         documentStep.reindex(sourceId, newDocId, fetched, stop);
                     resultBuilder.addDocumentResult(docResult);
+                    // Listed as new, but a client may have posted it since: the step retires
+                    // whatever version the registry held when it wrote this one.
+                    chunksTombstoned += docResult.getChunksRetired();
                 } catch (FetchDisallowedException e) {
                     // The publisher said no, which is not a failure of this run; the source
                     // counts it for the status it reports.
@@ -260,7 +276,7 @@ final class SourceReindexPass {
                     DocumentResult docResult =
                         documentStep.reindex(sourceId, changed.getDocumentId(), fetched, stop);
                     resultBuilder.addDocumentResult(docResult);
-                    chunksTombstoned += retireReplacedVersion(changed, docResult);
+                    chunksTombstoned += docResult.getChunksRetired();
                 } catch (FetchDisallowedException e) {
                     // Change detection asked moments ago and was allowed, so only a redirect
                     // that has since moved onto a disallowed URL gets here. The indexed version
@@ -316,24 +332,6 @@ final class SourceReindexPass {
     }
 
     /**
-     * Tombstones whatever remains of a changed document's previous version once its replacement
-     * has been published; see {@link SupersededVersion} for why only then and only the surplus.
-     *
-     * @param changed   The changed document, carrying the previous version's metadata
-     * @param docResult The outcome of re-indexing it
-     * @return The number of obsolete chunks tombstoned
-     */
-    private int retireReplacedVersion(ChangeSet.ChangedDocument changed, DocumentResult docResult) {
-        if (docResult.getSuccessfulChunks() == 0) {
-            LOG.warn("Keeping previous version of document {}: replacement produced no chunks",
-                changed.getDocumentId());
-            return 0;
-        }
-        return SupersededVersion.retire(changed.getOldMetadata().getChunkIds(),
-            docResult.getChunkIds(), lexical::retire, vectorEraser, upsertHandler);
-    }
-
-    /**
      * Removes every document the source has stopped listing, one at a time under its lock.
      *
      * <p>Within each document the lexical index is erased first, then its graph nodes are
@@ -347,8 +345,8 @@ final class SourceReindexPass {
      *
      * <p>A <em>changed</em> document is not removed here: its replacement shares chunk ids with
      * it, and retiring by document would take the replacement's own nodes. Its surplus chunks are
-     * retired by id once the replacement is published, and the ids it overwrote are superseded by
-     * the integration worker in log order; see {@link SupersededVersion}.</p>
+     * retired by id by the step that writes the replacement, and the ids it overwrote are
+     * superseded by the integration worker in log order; see {@link SupersededVersion}.</p>
      *
      * <p>Checked for cancellation per document, like the indexing loops and for the same
      * reason: a source that dropped a hundred thousand documents is exactly the run an operator
@@ -404,6 +402,9 @@ final class SourceReindexPass {
         lexical.retire(listed.getChunkIds());
         int vectors = retireVectors(documentKey);
         UpsertHandler.UpsertResult stored = upsertHandler.removeDocument(listed);
+        if (publisher != null) {
+            publisher.forget(sourceId, listed.getDocumentId());
+        }
         return new Removed(stored, vectors, graphReporter.removed(documentKey));
     }
 

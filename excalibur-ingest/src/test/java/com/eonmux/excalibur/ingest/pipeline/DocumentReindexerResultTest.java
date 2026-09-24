@@ -33,6 +33,22 @@ class DocumentReindexerResultTest {
         }
 
         @Test
+        @DisplayName("records the chunks its publication retired on a copy, leaving itself alone")
+        void recordsRetiredChunksOnACopy() {
+            DocumentReindexer.DocumentResult result = new DocumentReindexer.DocumentResult(
+                "doc-1", 3, 3, 0, 10L, null, List.of("a", "b", "c"));
+
+            DocumentReindexer.DocumentResult retired = result.withChunksRetired(2);
+
+            assertThat(result.getChunksRetired()).isZero();
+            assertThat(retired.getChunksRetired()).isEqualTo(2);
+            assertThat(retired.getChunkIds()).containsExactly("a", "b", "c");
+            assertThat(retired.isSuccess()).isTrue();
+            assertThatThrownBy(() -> result.withChunksRetired(-1))
+                .isInstanceOf(IllegalArgumentException.class);
+        }
+
+        @Test
         @DisplayName("hasError returns true when error is not null")
         void hasErrorReturnsTrueWhenErrorNotNull() {
             DocumentReindexer.DocumentResult result = new DocumentReindexer.DocumentResult(

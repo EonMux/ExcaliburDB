@@ -132,6 +132,27 @@ class DocumentAtomicityIntegrationTest {
     }
 
     @Test
+    void testPublishedDocumentBeingRewrittenIsHiddenUntilItsNewVersionIsPublished() {
+        tracker.registerDocument("doc1", List.of("doc1:chunk:0", "doc1:chunk:1"), 1L);
+
+        // A new version overwrites chunk ids in place, so while it is being written storage holds
+        // part of each version: the committed entry describes chunks that are no longer there.
+        tracker.beginIngestion("doc1", 3);
+
+        assertTrue(tracker.isDocumentTracked("doc1"));
+        assertFalse(tracker.isDocumentFullyVisible("doc1", 10L));
+        assertFalse(tracker.isChunkVisible("doc1:chunk:0", 10L));
+        assertTrue(tracker.filterPartialDocuments(List.of("doc1:chunk:0"), 10L).isEmpty());
+        assertFalse(tracker.getVisibleDocuments(10L).contains("doc1"));
+
+        tracker.registerDocument("doc1", List.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"), 5L);
+
+        assertTrue(tracker.isDocumentFullyVisible("doc1", 5L));
+        assertFalse(tracker.isDocumentFullyVisible("doc1", 4L));
+        assertTrue(tracker.getVisibleDocuments(5L).contains("doc1"));
+    }
+
+    @Test
     void testDocumentCountAndStatistics() {
         assertEquals(0, tracker.getDocumentCount());
 

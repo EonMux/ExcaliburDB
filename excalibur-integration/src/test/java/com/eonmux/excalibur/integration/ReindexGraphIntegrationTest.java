@@ -95,6 +95,7 @@ class ReindexGraphIntegrationTest {
     private GraphTenants tenants;
     private IngestionWiring.Attachment attachment;
     private ExcaliburDBServer server;
+    private DocumentVisibilityTracker tracker;
     private final HttpClient http = HttpClient.newHttpClient();
 
     @BeforeEach
@@ -122,7 +123,7 @@ class ReindexGraphIntegrationTest {
         // tenants, the server with ingestion attached and the graph routes registered, and then
         // the reindexer - attached after ingestion, as the application attaches it.
         core = CoreComponents.create(config, dataDir, HnswConfigFactory.withDefaults());
-        DocumentVisibilityTracker tracker = new DocumentVisibilityTracker(
+        tracker = new DocumentVisibilityTracker(
             DocumentRegistryFactory.open(dataDir), core.indexOrchestrator().getVisibilityTracker());
         QueryPipeline queryPipeline = QueryPipelineFactory.create(config, core.storageEngine(),
             core.indexOrchestrator(), new DocumentVisibilityTrackerAdapter(tracker));
@@ -141,7 +142,7 @@ class ReindexGraphIntegrationTest {
         server.withGraphSupport(tenants);
         server.withReindexer(ReindexerFactory.create(config, core.storageEngine(),
             core.volumeManager(), core.indexOrchestrator(),
-            tracker.getRegistry(), attachment.chunkIndex()));
+            tracker, attachment.chunkIndex()));
         server.start();
     }
 
@@ -300,6 +301,11 @@ class ReindexGraphIntegrationTest {
             "the first version's fact was staged");
         build();
         assertThat(context("What did Ada Lovelace write?")).contains("Note G");
+        String documentKey = "notes:"
+            + tracker.getRegistry().getDocumentIds("notes").iterator().next();
+        long ingestedAt = tracker.getCommitEpoch(documentKey);
+        assertThat(ingestedAt).as("ingestion published the document through the tracker")
+            .isPositive();
 
         // A later modification time as well as new content, as an edit leaves a file.
         Files.writeString(file, SECOND_VERSION);
@@ -307,6 +313,11 @@ class ReindexGraphIntegrationTest {
             FileTime.fromMillis(Files.getLastModifiedTime(file).toMillis() + 60_000));
         reindex();
 
+        assertThat(tracker.getCommitEpoch(documentKey))
+            .as("the reindex published the new version through the same tracker, at a later "
+                + "epoch, so a query is kept from the document while its chunks are rewritten")
+            .isGreaterThan(ingestedAt);
+        assertThat(tracker.getPendingDocumentCount()).isZero();
         assertThat(staged())
             .as("the second version's fact, in place of the first's rather than beside it")
             .isEqualTo(1);
@@ -319,6 +330,10 @@ class ReindexGraphIntegrationTest {
 
         Files.delete(file);
         reindex();
+
+        assertThat(tracker.isDocumentTracked(documentKey))
+            .as("a document its source dropped leaves no visibility state behind")
+            .isFalse();
 
         assertThat(staged())
             .as("a document its source dropped leaves nothing staged for the next build")

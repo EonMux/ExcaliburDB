@@ -3,6 +3,7 @@ package com.eonmux.excalibur.ingest.pipeline;
 import com.eonmux.excalibur.ingest.processor.TextChunk;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
+import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.store.VisibilityTracker;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -18,6 +19,8 @@ import static org.junit.jupiter.api.Assertions.*;
  * with it, and a publication that fails leaving nothing registered.
  */
 class DocumentBatchPublisherTest {
+
+    private static final String KEY = "source1:doc1";
 
     private VisibilityTracker tracker;
     private DocumentRegistry registry;
@@ -146,6 +149,55 @@ class DocumentBatchPublisherTest {
         assertEquals(total, epochs.size(), "every document is published at an epoch of its own");
         assertEquals(total, tracker.currentEpoch());
         assertEquals(total, registry.size("source1"));
+    }
+
+    @Test
+    void publishingThroughTheDocumentTrackerRegistersTheDocumentAtItsEpoch() {
+        DocumentVisibilityTracker documents = new DocumentVisibilityTracker(registry, tracker);
+        DocumentBatchPublisher tracked = new DocumentBatchPublisher(documents);
+        DocumentBatchBuffer buffer = createBuffer("doc1", 2);
+
+        tracked.begin("source1", "doc1", buffer.getChunkIds());
+        assertTrue(documents.isDocumentTracked(KEY));
+        assertFalse(documents.isDocumentFullyVisible(KEY, Long.MAX_VALUE),
+            "a document is hidden from the moment it is marked in flight");
+
+        long epoch = tracked.publish(buffer, createMetadata("doc1", buffer.getChunkIds())).epoch();
+
+        assertEquals(epoch, tracker.currentEpoch(), "published on the node's clock");
+        assertEquals(epoch, documents.getCommitEpoch(KEY));
+        assertTrue(documents.isDocumentFullyVisible(KEY, epoch));
+        assertFalse(documents.isDocumentFullyVisible(KEY, epoch - 1));
+        assertEquals(0, documents.getPendingDocumentCount());
+        assertSame(registry, tracked.getDocumentRegistry());
+        assertNotNull(registry.get("source1", "doc1"));
+    }
+
+    @Test
+    void anAbandonedDocumentIsReleasedAndAForgottenOneIsNoLongerTracked() {
+        DocumentVisibilityTracker documents = new DocumentVisibilityTracker(registry, tracker);
+        DocumentBatchPublisher tracked = new DocumentBatchPublisher(documents);
+
+        tracked.begin("source1", "doc1", List.of(KEY + ":chunk:0"));
+        tracked.abandon("source1", "doc1");
+        assertFalse(documents.isDocumentTracked(KEY));
+
+        tracked.publish(createBuffer("doc1", 1), createMetadata("doc1", List.of()));
+        assertTrue(documents.isDocumentTracked(KEY));
+        tracked.forget("source1", "doc1");
+        assertFalse(documents.isDocumentTracked(KEY));
+    }
+
+    @Test
+    void withoutADocumentTrackerTheMarksAreNoOps() {
+        publisher.begin("source1", "doc1", List.of(KEY + ":chunk:0"));
+        publisher.abandon("source1", "doc1");
+        publisher.forget("source1", "doc1");
+
+        assertEquals(1, publisher.publish(createBuffer("doc1", 1),
+            createMetadata("doc1", List.of())).chunkCount());
+        assertThrows(NullPointerException.class,
+            () -> new DocumentBatchPublisher((DocumentVisibilityTracker) null));
     }
 
     private static TextChunk createChunk(String documentId, int chunkIndex) {

@@ -14,12 +14,16 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * Retires what a document's previous version held once its replacement has been published.
+ * Retires what a document's previous version held past the end of its replacement.
  *
- * <h2>Why only after publication</h2>
- * <p>Retiring first is what makes a failed replacement destructive: the old chunks are gone and
- * nothing re-inserts them. Retiring after means a replacement that never publishes simply leaves
- * the previous version serving.</p>
+ * <h2>Why once the replacement is written, and before it is published</h2>
+ * <p>Retiring before the replacement is written is what makes a failed replacement destructive:
+ * the old chunks are gone and nothing re-inserts them, where a replacement that cannot be embedded
+ * would otherwise leave the previous version serving untouched. Retiring after the replacement is
+ * published leaves a window in which the document is visible as the new version beside the old
+ * tail - a mix of the two. So the callers retire in between, under the document's lock, while the
+ * document is in flight and hidden: every chunk of the replacement has been written, so the
+ * previous version is already overwritten in place and there is nothing left to preserve.</p>
  *
  * <h2>Why only the surplus</h2>
  * <p>Chunk ids are the document key and an index, so the new version has already overwritten

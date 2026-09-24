@@ -34,8 +34,8 @@ import java.util.function.Function;
  *   <li>Generates an embedding for each chunk, on a node configured with an embedding
  *       endpoint; a node that indexes its corpus lexically skips this step and stores the
  *       chunk with no vector, exactly as its ingestion did</li>
- *   <li>Upserts the new chunks into storage</li>
- *   <li>Tombstones old chunks via the UpsertHandler</li>
+ *   <li>Upserts the new chunks into storage, with the document marked in flight</li>
+ *   <li>Tombstones the old chunks the new version no longer reaches via the UpsertHandler</li>
  *   <li>Updates the document registry with new metadata</li>
  *   <li>Tells the graph, so the facts staged from the document's earlier version are withdrawn
  *       and the new version's staged; a document the source no longer lists has its facts
@@ -44,12 +44,17 @@ import java.util.function.Function;
  *
  * <h2>Atomic Publication</h2>
  * <p>When a {@link DocumentBatchPublisher} is configured, documents are published
- * atomically to the visibility epoch. This ensures:</p>
+ * atomically to the visibility epoch, through the document visibility tracker the ingestion
+ * pipeline publishes through. This ensures:</p>
  * <ul>
- *   <li>No partial documents in query results</li>
+ *   <li>No partial documents in query results: a document is hidden from before its first chunk
+ *       is written until its new version is published whole</li>
+ *   <li>No mix of versions: a query sees the whole previous version, nothing of the document
+ *       while it is rewritten, or the whole new version</li>
  *   <li>Consistent snapshots across concurrent queries</li>
  *   <li>Epoch isolation for in-flight ingestion</li>
  * </ul>
+ * <p>{@link DocumentReindexStep} sets out the order that achieves it.</p>
  *
  * <h2>What this class itself does</h2>
  * <p>It owns the wiring and the entry points, and hands each phase to the collaborator that
@@ -65,7 +70,8 @@ import java.util.function.Function;
  *   <li>Embedding dimensions: configured dimension (typically 1536 for OpenAI ada-002), or
  *       none at all on a lexical-only node</li>
  *   <li>Chunk IDs: unique, format "{documentId}:chunk:{index}"</li>
- *   <li>Old chunks are tombstoned atomically before new chunks are visible</li>
+ *   <li>Old chunks are tombstoned before new chunks are visible, while the document is
+ *       hidden</li>
  *   <li>Errors are collected and reported, not thrown, to continue processing other documents</li>
  *   <li>Content hash: 64-bit xxHash64 for change detection</li>
  *   <li>Timestamps: non-negative epoch milliseconds</li>
@@ -637,7 +643,7 @@ public class DocumentReindexer {
         DocumentReindexStep step = hasAtomicPublication()
             ? step(new DocumentReindexStep.AtomicTarget(offsetAwareWriter, batchPublisher))
             : DocumentReindexStep.writingDirectly(chunker, llmClient, registry, upsertHandler,
-                lexical, graphReporter, storageWriter);
+                lexical, vectorEraser, graphReporter, storageWriter);
         return step.reindex(sourceId, documentId, fetched, stop);
     }
 
@@ -651,13 +657,13 @@ public class DocumentReindexer {
      */
     private SourceReindexPass pass(SourceReindexPass.DocumentStep documentStep) {
         return new SourceReindexPass(registry, upsertHandler, lexical, vectorEraser,
-            graphReporter, documentStep);
+            graphReporter, batchPublisher, documentStep);
     }
 
     /** Builds the per-document step for a run that publishes atomically. */
     private DocumentReindexStep step(DocumentReindexStep.AtomicTarget target) {
         return DocumentReindexStep.publishing(chunker, llmClient, registry, upsertHandler, lexical,
-            graphReporter, target);
+            vectorEraser, graphReporter, target);
     }
 
     /**
@@ -711,6 +717,7 @@ public class DocumentReindexer {
         private final String error;
         private final List<String> chunkIds;
         private final SkipReason skipReason;
+        private final int chunksRetired;
 
         public DocumentResult(String documentId, int totalChunks, int successfulChunks, 
                             int failedChunks, long elapsedMillis, String error) {
@@ -720,12 +727,13 @@ public class DocumentReindexer {
         public DocumentResult(String documentId, int totalChunks, int successfulChunks,
                             int failedChunks, long elapsedMillis, String error, List<String> chunkIds) {
             this(documentId, totalChunks, successfulChunks, failedChunks, elapsedMillis, error,
-                chunkIds, null);
+                chunkIds, null, 0);
         }
 
         private DocumentResult(String documentId, int totalChunks, int successfulChunks,
                                int failedChunks, long elapsedMillis, String error,
-                               List<String> chunkIds, SkipReason skipReason) {
+                               List<String> chunkIds, SkipReason skipReason,
+                               int chunksRetired) {
             this.documentId = documentId;
             this.totalChunks = totalChunks;
             this.successfulChunks = successfulChunks;
@@ -734,6 +742,7 @@ public class DocumentReindexer {
             this.error = error;
             this.chunkIds = chunkIds != null ? List.copyOf(chunkIds) : List.of();
             this.skipReason = skipReason;
+            this.chunksRetired = chunksRetired;
         }
 
         /**
@@ -752,7 +761,7 @@ public class DocumentReindexer {
                                              long elapsedMillis) {
             Objects.requireNonNull(reason, "reason must not be null");
             return new DocumentResult(documentId, 0, 0, 0, elapsedMillis, reason.description(),
-                List.of(), reason);
+                List.of(), reason, 0);
         }
 
         /**
@@ -762,6 +771,32 @@ public class DocumentReindexer {
          */
         public SkipReason getSkipReason() {
             return skipReason;
+        }
+
+        /**
+         * A copy of this result recording how many chunks of the document's previous version were
+         * retired when this version was published.
+         *
+         * @param retired How many chunks storage released
+         * @return The copy
+         * @throws IllegalArgumentException if retired is negative
+         */
+        public DocumentResult withChunksRetired(int retired) {
+            if (retired < 0) {
+                throw new IllegalArgumentException("retired must be non-negative: " + retired);
+            }
+            return new DocumentResult(documentId, totalChunks, successfulChunks, failedChunks,
+                elapsedMillis, error, chunkIds, skipReason, retired);
+        }
+
+        /**
+         * How many chunks of the document's previous version its publication retired: those the
+         * previous version held past the end of this one.
+         *
+         * @return The count, zero when there was no previous version or it was no longer
+         */
+        public int getChunksRetired() {
+            return chunksRetired;
         }
 
         /**

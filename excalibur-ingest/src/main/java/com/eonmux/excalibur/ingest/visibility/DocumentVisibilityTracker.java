@@ -32,7 +32,12 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>All chunks for the document were committed atomically</li>
  *   <li>The commit epoch is &lt;= E</li>
  *   <li>All chunk IDs are registered in the document registry</li>
+ *   <li>No new version of it is in flight</li>
  * </ul>
+ *
+ * <p>Ingestion and reindexing both publish through this class, so a document written either way is
+ * seen as the whole of its published version, as nothing while a new version is written over it,
+ * or as the whole of the new version.</p>
  *
  * <h2>Write Log Offset Tracking</h2>
  * <p>Each document is tracked with:</p>
@@ -447,7 +452,13 @@ public class DocumentVisibilityTracker {
      *   <li>It is registered in the visibility tracker</li>
      *   <li>Its commit epoch is &lt;= the query epoch</li>
      *   <li>All its chunks are registered (not partial)</li>
+     *   <li>No new version of it is in flight</li>
      * </ul>
+     *
+     * <p>The last condition is what keeps a rewrite from being served as a mix. A new version is
+     * written over the chunk ids of the one it replaces, one chunk at a time, so while it is in
+     * flight storage holds part of each and the committed entry describes chunks that are no
+     * longer there. The document is hidden until the new version is published whole.</p>
      *
      * @param documentId The document identifier
      * @param queryEpoch The epoch at which the query was started
@@ -456,6 +467,9 @@ public class DocumentVisibilityTracker {
     public boolean isDocumentFullyVisible(String documentId, long queryEpoch) {
         Objects.requireNonNull(documentId, "documentId must not be null");
 
+        if (pendingChunks.containsKey(documentId)) {
+            return false;
+        }
         DocumentVisibility visibility = documentVisibility.get(documentId);
         if (visibility == null) {
             return false;
@@ -508,7 +522,8 @@ public class DocumentVisibilityTracker {
     public Set<String> getVisibleDocuments(long queryEpoch) {
         Set<String> visible = new HashSet<>();
         for (Map.Entry<String, DocumentVisibility> entry : documentVisibility.entrySet()) {
-            if (entry.getValue().commitEpoch() <= queryEpoch) {
+            if (entry.getValue().commitEpoch() <= queryEpoch
+                    && !pendingChunks.containsKey(entry.getKey())) {
                 visible.add(entry.getKey());
             }
         }

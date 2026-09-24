@@ -10,8 +10,10 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
@@ -69,11 +71,17 @@ final class ReindexLexicalIndex {
     }
 
     /**
-     * Indexes a published document's chunks.
+     * Indexes a published document's chunks, as one unit.
      *
      * <p>Called once the document is published rather than as each chunk is written: a reindex
      * that fails partway leaves the previous version in place, and indexing the fragments it did
      * write would make half of the new version searchable beside all of the old one.</p>
+     *
+     * <p>Added in one call rather than chunk by chunk for the same reason, one step further on.
+     * Runs over different sources share this index and refresh it on their own schedules, so a
+     * refresh can land between any two calls made into it, and it would publish the chunks added
+     * before it without the ones after. {@link ChunkIndex#addDocument} is published by a refresh
+     * whole or not at all, as ingestion's documents are.</p>
      *
      * @param chunkIds The published chunk ids
      * @param chunks   Their text, positionally aligned with the ids
@@ -83,15 +91,17 @@ final class ReindexLexicalIndex {
         if (target == null || chunkIds.isEmpty()) {
             return;
         }
+        Map<String, String> byId = new LinkedHashMap<>(chunkIds.size() * 2);
         for (int i = 0; i < chunkIds.size() && i < chunks.size(); i++) {
-            try {
-                target.add(chunkIds.get(i), chunks.get(i).getText());
-            } catch (IOException e) {
-                // The chunk is in storage and the document is published; losing one chunk from
-                // BM25 costs recall on that chunk, where failing here would cost the document.
-                LOG.warn("Chunk {} reindexed but not lexically indexed: {}",
-                    chunkIds.get(i), e.getMessage());
-            }
+            byId.put(chunkIds.get(i), chunks.get(i).getText());
+        }
+        try {
+            target.addDocument(byId);
+        } catch (IOException e) {
+            // The chunks are in storage and the document is published; losing them from BM25
+            // costs recall on this document, where failing here would cost the run.
+            LOG.warn("{} chunk(s) reindexed but not lexically indexed: {}", byId.size(),
+                e.getMessage());
         }
     }
 
