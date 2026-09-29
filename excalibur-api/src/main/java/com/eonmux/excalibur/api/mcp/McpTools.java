@@ -818,7 +818,8 @@ public final class McpTools {
             + "tracks is done; 'applied' when nothing is searchable or served any more and the "
             + "index has still to reclaim the space; 'pending' while the graph still owes "
             + "withdrawals; 'incomplete' when some documents could not be removed and the "
-            + "erasure has to be repeated for them. 'remaining' says what is still owed. It "
+            + "erasure has to be repeated for them - that is final for this id, so follow the "
+            + "repeat's own 'request_id'. 'remaining' says what is still owed. It "
             + "names no documents. A 404 means the node keeps no receipt with that id - only "
             + "the most recent erasures are kept.",
             ToolSchema.object(

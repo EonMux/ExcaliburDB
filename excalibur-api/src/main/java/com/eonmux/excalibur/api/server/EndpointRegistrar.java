@@ -828,7 +828,7 @@ final class EndpointRegistrar {
      * Readiness over the four signals it is decided from.
      *
      * <p>The coverage threshold is the one {@code /health} uses, so the two agree about that
-     * half of the question. The free-disk floor is compiled in: it is not a tuning knob but
+     * half of the question. The free-disk floor is {@code excalibur.health.min-free-disk-ratio}:
      * the point past which a compaction or a rolling reindex can no longer be relied on to
      * write its replacement segment.</p>
      *

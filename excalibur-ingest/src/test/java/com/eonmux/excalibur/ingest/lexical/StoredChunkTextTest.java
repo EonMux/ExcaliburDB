@@ -140,6 +140,52 @@ class StoredChunkTextTest {
     }
 
     @Test
+    @DisplayName("an entry too short for the payload header is permanently unreadable")
+    void aTruncatedEntryIsUnrecoverable() {
+        // Answered with null, compaction would drop the chunk with nobody told.
+        storage.put("kb:a.txt:chunk:0".getBytes(StandardCharsets.UTF_8), new byte[] {1, 0});
+
+        assertThatThrownBy(() -> text.apply("kb:a.txt:chunk:0"))
+            .isInstanceOfSatisfying(UnrecoverableTextException.class,
+                e -> assertThat(e.key()).isEqualTo("kb:a.txt:chunk:0"));
+    }
+
+    @Test
+    @DisplayName("an entry whose header declares more embedding than it holds is permanently "
+        + "unreadable")
+    void anEntryShorterThanItsDimensionIsUnrecoverable() {
+        byte[] whole = ChunkPayloadCodec.encode("memory pressure", new float[] {0.1f, 0.2f});
+        byte[] cut = java.util.Arrays.copyOf(whole, 6);
+        storage.put("kb:a.txt:chunk:0".getBytes(StandardCharsets.UTF_8), cut);
+
+        assertThatThrownBy(() -> text.apply("kb:a.txt:chunk:0"))
+            .isInstanceOf(UnrecoverableTextException.class);
+    }
+
+    @Test
+    @DisplayName("text that is not UTF-8 is permanently unreadable, not read as replacement "
+        + "characters")
+    void malformedUtf8IsUnrecoverable() {
+        byte[] value = ChunkPayloadCodec.encodeTextOnly("ok");
+        byte[] damaged = java.util.Arrays.copyOf(value, value.length + 1);
+        damaged[damaged.length - 1] = (byte) 0xC3; // a lead byte with no continuation
+        storage.put("kb:a.txt:chunk:0".getBytes(StandardCharsets.UTF_8), damaged);
+
+        assertThatThrownBy(() -> text.apply("kb:a.txt:chunk:0"))
+            .isInstanceOfSatisfying(UnrecoverableTextException.class,
+                e -> assertThat(e.getCause())
+                    .isInstanceOf(java.nio.charset.CharacterCodingException.class));
+    }
+
+    @Test
+    @DisplayName("text outside the Basic Multilingual Plane reads back intact")
+    void supplementaryCharactersReadBack() {
+        put("kb:a.txt:chunk:0", "naïve 𝛼-decay 🚀");
+
+        assertThat(text.apply("kb:a.txt:chunk:0")).isEqualTo("naïve 𝛼-decay 🚀");
+    }
+
+    @Test
     @DisplayName("any other failure of storage is transient: the read could not say")
     void otherFailuresAreTransient() {
         StorageEngine failing = org.mockito.Mockito.mock(StorageEngine.class);

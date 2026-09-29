@@ -42,7 +42,9 @@ import java.util.regex.Pattern;
  * </pre>
  * <ul>
  *   <li>{@code incomplete} - some documents could not be fully removed; the request failed for
- *       them and has to be repeated. The other fields still say what the rest did.</li>
+ *       them and has to be repeated. Final for this request: the receipt names no documents, so
+ *       it cannot see a repeat finish them, and the repeat reports under its own id. The other
+ *       fields still say what the rest did.</li>
  *   <li>{@code pending} - the graph still owes some of the obligations this erasure
  *       submitted.</li>
  *   <li>{@code applied} - nothing is searchable or served any more, and the lexical index has

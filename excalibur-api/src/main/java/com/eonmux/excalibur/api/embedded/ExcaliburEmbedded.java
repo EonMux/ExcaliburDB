@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.embedded;
 import com.eonmux.excalibur.api.bootstrap.ApiConfigKeys;
 import com.eonmux.excalibur.api.bootstrap.NodeAssembly;
 import com.eonmux.excalibur.api.endpoint.SourceIds;
+import com.eonmux.excalibur.api.retrieval.ChunkTextResolver;
 import com.eonmux.excalibur.api.retrieval.VisibleChunkText;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.server.InProcessServices;
@@ -10,6 +11,8 @@ import com.eonmux.excalibur.api.server.ShutdownBudget;
 import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.config.ConfigLoader;
 import com.eonmux.excalibur.config.ConfigValidation;
+import com.eonmux.excalibur.core.datadir.DataDirectoryLockedException;
+import com.eonmux.excalibur.core.datadir.LockHolder;
 import com.eonmux.excalibur.core.memory.ForeignMemoryBootstrap;
 import com.eonmux.excalibur.core.text.SourceScope;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
@@ -120,8 +123,14 @@ public final class ExcaliburEmbedded implements AutoCloseable {
         this.erasure = services.documentErasure();
         this.registry = services.documentRegistry();
         this.sourceCatalog = services.sourceCatalog();
-        this.chunkText = VisibleChunkText.over(StoredChunkText.of(services.storageEngine()),
-            services.queryPipeline().getVisibilityChecker());
+        // Through the resolver the HTTP routes read with, so a chunk whose text cannot be read
+        // is a hit or a fetch without text rather than a failed search. Unclipped: a caller in
+        // this process has asked for the chunk itself, and no response body is being bounded.
+        ChunkTextResolver resolver = ChunkTextResolver.over(
+            VisibleChunkText.over(StoredChunkText.of(services.storageEngine()),
+                services.queryPipeline().getVisibilityChecker()),
+            Integer.MAX_VALUE);
+        this.chunkText = chunkId -> resolver.resolve(chunkId).text();
         this.executor = Executors.newVirtualThreadPerTaskExecutor();
         this.retrieval = new EmbeddedRetrieval(services, limits, chunkText, executor);
         this.defaultTimeoutMs = Math.min(services.config().visibility().getQueryTimeoutMs(),
@@ -184,7 +193,7 @@ public final class ExcaliburEmbedded implements AutoCloseable {
      *                                  registered in this data directory, or no document is given
      * @throws IllegalStateException    if the node is closed, closing, or already ingesting this
      *                                  source
-     * @throws IngestionOrchestrator.IngestionFailedException if the run failed outright
+     * @throws SupplyFailedException    if the run failed outright
      */
     public SupplyOutcome supply(String sourceId, List<EmbeddedDocument> documents) {
         requireOpen();
@@ -200,8 +209,12 @@ public final class ExcaliburEmbedded implements AutoCloseable {
                 document.text().getBytes(StandardCharsets.UTF_8), document.contentType(),
                 document.lastModifiedMillis()));
         }
-        IngestionOrchestrator.IngestionOutcome outcome =
-            ingestion.ingestNow(InlineSource.of(sourceId, batch));
+        IngestionOrchestrator.IngestionOutcome outcome;
+        try {
+            outcome = ingestion.ingestNow(InlineSource.of(sourceId, batch));
+        } catch (IngestionOrchestrator.IngestionFailedException e) {
+            throw new SupplyFailedException(e.getMessage(), e);
+        }
         awaitNextEpoch();
         return new SupplyOutcome(sourceId, outcome.documentsIngested(), outcome.chunksIngested(),
             outcome.documentsFailed(), outcome.stopped());
@@ -542,6 +555,8 @@ public final class ExcaliburEmbedded implements AutoCloseable {
          * Opens the data directory and starts the node.
          *
          * @return The running node
+         * @throws DataDirectoryInUseException if a server, another node or an operator tool
+         *                                  holds the data directory
          * @throws IOException              if the data directory or the properties file cannot be
          *                                  read or created
          * @throws IllegalStateException    if the configuration is invalid, asks for graph
@@ -560,9 +575,13 @@ public final class ExcaliburEmbedded implements AutoCloseable {
             Duration shutdownTimeout =
                 ShutdownBudget.configuredTimeout(config.getEffectiveProperties());
 
-            NodeAssembly node =
-                NodeAssembly.open(config, dataDirectory.toAbsolutePath(), limits, 0,
+            NodeAssembly node;
+            try {
+                node = NodeAssembly.open(config, dataDirectory.toAbsolutePath(), limits, 0,
                     NodeAssembly.EMBEDDED_LOCK_HOLDER);
+            } catch (DataDirectoryLockedException e) {
+                throw inUse(e);
+            }
             InProcessServices services;
             try {
                 services = node.server().startInProcess();
@@ -578,6 +597,20 @@ public final class ExcaliburEmbedded implements AutoCloseable {
             }
             LOGGER.info("Embedded node open over {}", node.dataDirectory());
             return new ExcaliburEmbedded(node, services, limits, shutdownTimeout);
+        }
+
+        /**
+         * Restates the engine's refusal in the facade's own type, which a caller can catch with
+         * only {@code excalibur-api} on its compile classpath.
+         *
+         * @param refusal The engine's refusal
+         * @return The facade's
+         */
+        private static DataDirectoryInUseException inUse(DataDirectoryLockedException refusal) {
+            Optional<LockHolder> holder = refusal.holder();
+            return new DataDirectoryInUseException(refusal.directory().toAbsolutePath(),
+                holder.map(LockHolder::pid).orElse(LockHolder.UNKNOWN_PID),
+                holder.map(LockHolder::description).orElse(null), refusal);
         }
 
         /**

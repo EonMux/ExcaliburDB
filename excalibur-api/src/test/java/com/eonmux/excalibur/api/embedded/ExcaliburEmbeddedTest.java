@@ -86,6 +86,19 @@ class ExcaliburEmbeddedTest {
             .containsExactly("team:tiering.txt:chunk:0");
     }
 
+    private static int indexOf(byte[] haystack, byte[] needle, int from) {
+        outer:
+        for (int i = from; i <= haystack.length - needle.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) {
+                    continue outer;
+                }
+            }
+            return i;
+        }
+        return -1;
+    }
+
     private static List<EmbeddedDocument> handbook() {
         return List.of(
             EmbeddedDocument.of("tiering.txt",
@@ -146,6 +159,43 @@ class ExcaliburEmbeddedTest {
                     });
                 assertThat(db.documents("nothing")).isEmpty();
                 assertThat(db.dataDirectory()).isEqualTo(dataDir.toAbsolutePath());
+            }
+        }
+
+        @Test
+        @DisplayName("a chunk whose stored text is damaged is a hit without text, not a failed "
+            + "search or fetch")
+        void damagedTextIsAHitWithoutText() throws Exception {
+            try (ExcaliburEmbedded db = lexicalNode().open()) {
+                db.supply("handbook", handbook());
+            }
+            byte[] marker = "tiering policy".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            int damaged = 0;
+            try (var files = Files.walk(dataDir)) {
+                for (Path file : files.filter(Files::isRegularFile).toList()) {
+                    byte[] bytes = Files.readAllBytes(file);
+                    boolean changed = false;
+                    for (int at = indexOf(bytes, marker, 0); at >= 0;
+                         at = indexOf(bytes, marker, at + marker.length)) {
+                        bytes[at] ^= 0x01;
+                        changed = true;
+                    }
+                    if (changed) {
+                        Files.write(file, bytes);
+                        damaged++;
+                    }
+                }
+            }
+            assertThat(damaged).as("files holding the chunk's text").isPositive();
+
+            try (ExcaliburEmbedded db = lexicalNode().open()) {
+                SearchAnswer answer = db.query("which policy moves cold segments", 3);
+
+                assertThat(answer.hits()).extracting(SearchHit::chunkId).contains(TIERING_CHUNK);
+                assertThat(answer.hits()).filteredOn(hit -> hit.chunkId().equals(TIERING_CHUNK))
+                    .singleElement().satisfies(hit -> assertThat(hit.text()).isNull());
+                assertThat(db.fetch(TIERING_CHUNK)).isEmpty();
+                assertThat(db.fetch("handbook:hnsw.txt:chunk:0")).isPresent();
             }
         }
 
@@ -560,7 +610,13 @@ class ExcaliburEmbeddedTest {
                     .extracting(LockHolder::description)
                     .isEqualTo(NodeAssembly.EMBEDDED_LOCK_HOLDER);
                 assertThatThrownBy(() -> lexicalNode().open())
-                    .isInstanceOf(DataDirectoryLockedException.class)
+                    .isInstanceOfSatisfying(DataDirectoryInUseException.class, e -> {
+                        assertThat(e.directory()).isEqualTo(dataDir.toAbsolutePath());
+                        assertThat(e.holderDescription())
+                            .contains(NodeAssembly.EMBEDDED_LOCK_HOLDER);
+                        assertThat(e.holderPid()).hasValue(ProcessHandle.current().pid());
+                        assertThat(e).hasCauseInstanceOf(DataDirectoryLockedException.class);
+                    })
                     .hasMessageContaining(NodeAssembly.EMBEDDED_LOCK_HOLDER);
                 db.supply("handbook", handbook());
             }
@@ -578,7 +634,8 @@ class ExcaliburEmbeddedTest {
             try (DataDirectoryLock ignored =
                      DataDirectoryLock.acquire(dataDir, "excalibur-fsck --repair")) {
                 assertThatThrownBy(() -> lexicalNode().open())
-                    .isInstanceOf(DataDirectoryLockedException.class)
+                    .isInstanceOfSatisfying(DataDirectoryInUseException.class,
+                        e -> assertThat(e.holderDescription()).contains("excalibur-fsck --repair"))
                     .hasMessageContaining("excalibur-fsck --repair");
             }
         }

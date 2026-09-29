@@ -9,6 +9,9 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 import java.util.function.Function;
@@ -36,7 +39,8 @@ import java.util.function.Function;
  *
  * <h2>Damage is neither</h2>
  * <p>An entry storage holds and cannot verify - a record or slot that fails its checksum, see
- * {@link CorruptSegmentEntryException} - is not a failure that passes. Reported as one, it would
+ * {@link CorruptSegmentEntryException}, or one that cannot be decoded as a chunk payload with
+ * UTF-8 text - is not a failure that passes. Reported as one, it would
  * abandon its group on every compaction, and an erasure recorded anywhere in that group could
  * never be discharged. Reported as absence, the chunk would vanish from lexical search with
  * nobody told. So it is its own answer, {@link UnrecoverableTextException}: the rewrite drops the
@@ -100,6 +104,39 @@ public final class StoredChunkText implements Function<String, String> {
             throw new UncheckedIOException(new IOException(
                 "Could not read chunk " + chunkId + " back from storage: " + e.getMessage(), e));
         }
-        return ChunkPayloadCodec.textOf(bytes);
+        return decode(chunkId, bytes);
+    }
+
+    /**
+     * Decodes an entry storage holds, strictly.
+     *
+     * <p>Every entry this node writes is a chunk payload whose text is well-formed UTF-8, so one
+     * that is not - cut short of its header or of the embedding the header declares, or holding
+     * bytes that are not UTF-8 - is damage that passed any checksum its format has, and reads
+     * the same way on every attempt. Returning null would drop the chunk with nobody told, and
+     * substituting replacement characters would index text the document never held.</p>
+     *
+     * @return The text, or null for an entry that carries none
+     * @throws UnrecoverableTextException if the entry cannot be decoded
+     */
+    private static String decode(String chunkId, byte[] bytes) {
+        if (ChunkPayloadCodec.dimensionOf(bytes) < 0) {
+            throw new UnrecoverableTextException(chunkId, new IOException("its " + bytes.length
+                + "-byte entry is not a chunk payload: it is shorter than its header, or than "
+                + "the embedding its header declares"));
+        }
+        byte[] text = ChunkPayloadCodec.textBytesOf(bytes);
+        if (text == null) {
+            return null;
+        }
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(text))
+                .toString();
+        } catch (CharacterCodingException e) {
+            throw new UnrecoverableTextException(chunkId, e);
+        }
     }
 }
