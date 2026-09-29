@@ -9,6 +9,8 @@
 
 # Visibility Configuration
 excalibur.visibility.epoch-tick-ms=100
+# The timeout a query that names none gets. Must not exceed excalibur.api.max-query-timeout-ms,
+# or every such query would be refused; the node refuses to start instead.
 excalibur.visibility.query-timeout-ms=30000
 
 # Ingest Configuration
@@ -39,6 +41,7 @@ excalibur.ingest.crawl-delay-ms=200
 # half of it. Changing either only affects what is ingested or re-indexed afterwards: chunks
 # already written keep the shape they were written with until their source is re-indexed.
 excalibur.ingest.chunk-target-tokens=512
+# Must be less than chunk-target-tokens: an overlap at or past the target never advances.
 excalibur.ingest.chunk-overlap-tokens=64
 
 # API Server Configuration
@@ -75,7 +78,9 @@ excalibur.api.rate-limit-max-clients=10000
 # client could not have written. Never set it to a range you do not control: the header is
 # whatever a caller types.
 #excalibur.api.trusted-proxies=10.0.0.0/8,192.168.1.7
-# Bounds applied to client-supplied query fields before they size anything server-side.
+# Bounds applied to client-supplied query fields before they size anything server-side. Each must
+# be at least the default it caps - excalibur.query.top-k-default and
+# excalibur.visibility.query-timeout-ms - or the node refuses to start.
 excalibur.api.max-top-k=1000
 excalibur.api.max-query-timeout-ms=60000
 # The query text is embedded, and on the lexical path expanded, so its length is an outbound
@@ -226,8 +231,9 @@ excalibur.graph.require-explicit-namespaces=false
 # is what makes an obligation a promise rather than a tuning knob, since a single request on a large
 # store would otherwise never reach the ratio.
 excalibur.graph.erasure-tombstone-ratio=0.2
-# Checked every tenth of this by a sweep over the open namespaces, so an obligation submitted to
-# a node that then goes quiet is still discharged on time.
+# Checked every tenth of this by a sweep over every namespace on disk - an evicted one is reopened
+# when it has an overdue obligation - so one submitted to a node that then goes quiet is still
+# discharged on time.
 excalibur.graph.erasure-max-latency-seconds=3600
 
 # Automatic builds. Ingestion stages every change - a new document's facts, and the withdrawal of
@@ -305,6 +311,7 @@ excalibur.ingest.bm25-k1=1.2
 excalibur.ingest.bm25-b=0.75
 
 # Health Configuration
+# Must not exceed healthy-threshold; the node refuses to start otherwise.
 excalibur.health.readiness-threshold=0.5
 excalibur.health.healthy-threshold=0.9
 excalibur.health.max-latency-ms=5000
@@ -324,6 +331,8 @@ excalibur.query.top-k-default=100
 excalibur.query.threshold=0.0
 # excalibur.query.threshold=0.3
 excalibur.query.include-partial-segments=true
+# Must equal excalibur.llm.embeddings-dimensions, the embedding model's native width; the node
+# refuses to start otherwise.
 excalibur.query.vector-dimensions=1536
 excalibur.query.llm-timeout-ms=60000
 # What one query-expansion call is allowed, separate from the scoring call above. Expansion runs
@@ -434,9 +443,8 @@ excalibur.shard.default-max-connections-layer0=0
 # When a segment is worth rewriting, and how often the question is asked. A segment is compacted
 # once this fraction of it is tombstoned, or once its write log passes the size below - the second
 # is what keeps a segment that is appended to but never deleted from accumulating an unbounded
-# log. The concurrency bound is what stops a burst of eligible segments from spending the whole
-# machine on rewrites; it is 1 to 16, and a value outside that is refused at startup against the
-# property name rather than aborting the boot with a message naming no key.
+# log. The per-sweep bound below is 1 to 16, and a value outside that is refused at startup
+# against the property name rather than aborting the boot with a message naming no key.
 excalibur.shard.compaction-interval-ms=5000
 # How often the index registry is reconciled with the storage engine's directory. The sweep is
 # what notices a segment the engine created without announcing it, so this is the longest a new
@@ -503,8 +511,9 @@ excalibur.shard.pq-oversample=4
 # each part is clustered to pq-centroids centroids, so the code is one byte per subspace. More
 # subspaces means better recall and a larger index; high-dimensional embeddings need more of them
 # to keep each part small enough for that many clusters to describe. Training runs while a segment
-# is warming and nothing may query it, which is what pq-training-samples bounds - set it to 0 to
-# train on every vector the segment holds. It must be at least pq-centroids: k-means cannot fill a
+# is warming; it stays queryable from its full-precision vectors throughout, and PQ search has
+# nothing to use on it until the codebook is fitted. pq-training-samples bounds how long that
+# lasts - set it to 0 to train on every vector the segment holds. It must be at least pq-centroids: k-means cannot fill a
 # codebook from fewer samples than it has centroids.
 excalibur.shard.pq-subspaces=8
 excalibur.shard.pq-centroids=256

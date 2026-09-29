@@ -845,7 +845,7 @@ it does read.
 | `excalibur.shard.segment-sync-interval-ms` | 1000 | How often the index registry is reconciled with the storage engine's directory. The sweep is what notices a segment the engine created without announcing it, so this is the longest a new segment can stay unsearchable. Refused rather than clamped below the sweep's own floor. At least 250 |
 | `excalibur.shard.compaction-tombstone-ratio` | 0.2 | Tombstoned fraction of a segment at which a rewrite repays itself. Above 0, at most 1 |
 | `excalibur.shard.compaction-write-log-mb` | 32 | Write-log size that compacts a segment whatever its tombstone ratio — what keeps a segment that is appended to but never deleted from accumulating an unbounded log. 1 to 48: a write-ahead log holds a fixed size and cannot grow, so a trigger above it would never fire |
-| `excalibur.shard.compaction-max-concurrent` | 4 | Segments the scheduled sweep will rewrite in one pass, so a burst of eligible segments cannot spend the whole machine on rewrites. They are rewritten one after another, not at once, and `POST /v1/compact` is not subject to this. 1 to 16; a value outside that is refused at startup against the property name |
+| `excalibur.shard.compaction-max-concurrent` | 4 | Segments the scheduled sweep will rewrite in one pass. They are rewritten one after another on a single thread, not at once, so this bounds how long a sweep lasts rather than how much of the machine it uses, and `POST /v1/compact` is not subject to this. 1 to 16; a value outside that is refused at startup against the property name |
 | `excalibur.shard.hnsw-compaction-interval-ms` | 60000 | The same sweep for the vector graph, which reclaims deleted nodes by renumbering rather than by rewriting a log. At least 10000 |
 | `excalibur.shard.hnsw-compaction-tombstone-ratio` | 0.2 | Deleted fraction of a graph at which its nodes are worth renumbering. 0.05 to 0.5 |
 | `excalibur.shard.lsh-hash-tables` | 15 | Hash tables in a segment's LSH index, whose bucket-mates of a query are measured exactly beside the graph search and ranked in with its results. More names more of the true neighbours the graph search might walk past, and costs more buckets probed and more nodes measured per query. The candidates only ever add to an answer, so no shape can lose a result. At most 256: each table allocates hash-functions × dimensions floats, per segment |
@@ -1212,8 +1212,10 @@ to finish it. That is a failure rather than a partial success: the caller asked 
 gone and some of it is not.
 
 Every `POST /v1/erasure` answer carries a `request_id`, and `GET /v1/erasure/{request_id}` says
-where that erasure stands, after the response and after a restart. The answer is `incomplete` while
-a document the request named is still held (repeat the request), `pending` while a graph erasure
+where that erasure stands, after the response and after a restart. The answer is `incomplete` when
+a document the request named was still held as it answered, and stays so: the receipt keeps no
+document ids to check again, so repeat the request and follow the `request_id` the repeat returns.
+Otherwise it is `pending` while a graph erasure
 it queued has not been discharged, `applied` while the lexical index still keeps the removed
 content's bytes awaiting a compaction, and `discharged` once nothing the request removed remains
 anywhere the node keeps it, with `discharged_at_ms` — null when that time is recorded nowhere: a

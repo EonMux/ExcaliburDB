@@ -253,11 +253,16 @@ docker run --rm -v excalibur-data:/var/lib/excalibur \
   --entrypoint excalibur-fsck excalibur \
   /var/lib/excalibur --repair --quarantine-dir=/var/lib/excalibur-quarantine
 
-# Snapshot it into a backup volume, then verify the image.
+# Snapshot it into a backup volume, then verify the image; --deep adds the SHA-256 and the
+# fsck checks to the CRC32C pass.
+SNAPSHOT=/var/lib/excalibur-backups/$(date +%F)
 docker run --rm -v excalibur-data:/var/lib/excalibur \
   -v excalibur-backups:/var/lib/excalibur-backups \
   --entrypoint excalibur-backup excalibur \
-  snapshot --data-dir /var/lib/excalibur --out /var/lib/excalibur-backups/$(date +%F)
+  snapshot --data-dir /var/lib/excalibur --out "$SNAPSHOT"
+docker run --rm -v excalibur-backups:/var/lib/excalibur-backups \
+  --entrypoint excalibur-backup excalibur \
+  verify --snapshot "$SNAPSHOT" --deep
 
 # Restore an image over the volume. /var/lib/excalibur is a mount point, which cannot be
 # renamed, so restore works inside it; --force because the volume holds a data directory.
@@ -1928,7 +1933,7 @@ curl http://localhost:8080/v1/erasure/0b7e1f7a-3c1d-4e59-9a4f-2a6f1d0c9e11
 
 | State | Meaning |
 |---|---|
-| `incomplete` | A document the request named is still held — the request answered `500`. Repeat it |
+| `incomplete` | A document the request named was still held when it answered `500`. Final for this id: the receipt names no documents, so it cannot see a retry finish them. Repeat the request and follow the repeat's `request_id` |
 | `pending` | A graph obligation it queued has not been discharged yet |
 | `applied` | Out of storage, the index and the graph, but the lexical index still keeps the removed chunks' bytes on disk until a compaction reclaims them |
 | `discharged` | Nothing the request removed remains anywhere the node keeps it. `discharged_at_ms` says when, where the node can know (below) |
@@ -3403,6 +3408,20 @@ of it:
 | `type=VisibilityEpoch` | `epoch` |
 | `type=IngestionThroughput` | `entriesIngested`, `queriesExecuted`, `ingestionRate`, `peakIngestionRate` |
 
+Each MBean is also a notification emitter: subscribe to it (JConsole's *Notifications* tab, or
+`addNotificationListener` from code) and it sends one notification each time the figure it
+reports is recorded, carrying the value as its user data. No notification is sent while no listener is
+subscribed.
+
+| MBean | Notification type | Sent when | User data |
+|---|---|---|---|
+| `type=QueryLatency` | `excalibur.query.latency` | a query's response is assembled | that query's latency, ms (`Long`) |
+| `type=SystemHealth` | `excalibur.system.health` | the health score is set | the score, 0.0–1.0 (`Double`) |
+| `type=IngestionQueue` | `excalibur.ingest.queue` | the HNSW integration backlog is measured | the backlog depth (`Long`) |
+| `type=HnswQueueDepth` | `excalibur.hnsw.queue` | the same measurement — the two beans report one queue | the backlog depth (`Long`) |
+| `type=VisibilityEpoch` | `excalibur.visibility.epoch` | the visibility epoch advances | the new epoch (`Long`) |
+| `type=IngestionThroughput` | `excalibur.ingest.throughput` | a document's chunks are published | total entries ingested (`Long`) |
+
 Everything else in the table above is served by `/metrics` only: HTTP responses and rejections,
 the active, registered and cancelled query counts, segments by state, corpus size, visible
 segments, volumes, the index orchestrator, segments without a vector index, the circuit breakers,
@@ -4212,7 +4231,7 @@ dependencies {
 }
 ```
 
-One coordinate is enough. Every type the facade's methods take or return is either a JDK type or
+One coordinate is enough. Every type the facade's methods take, return or declare they throw is either a JDK type or
 one of its own in `com.eonmux.excalibur.api.embedded`, so nothing else has to be on the compile
 classpath, and the modules underneath arrive at run time as `excalibur-api`'s own dependencies.
 `excalibur-integration`'s `embeddedExampleTest` compiles and runs the example below against
@@ -4310,7 +4329,10 @@ What each call does:
   embedded and indexed, and the call returns once the documents are searchable. A document id
   supplied again replaces the previous version, the new one published before the old one's
   surplus is removed, so a query sees one or the other and never neither. The `SupplyOutcome`
-  counts what was ingested and what failed. `EmbeddedDocument` is checked the way the HTTP route
+  counts what was ingested and what failed. A run that fails outright - storage, the chunk index
+  or the embedding endpoint failing underneath it - throws `SupplyFailedException`, a
+  `RuntimeException` in `com.eonmux.excalibur.api.embedded`: the batch's outcome is not known, and
+  supplying it again is the remedy. `EmbeddedDocument` is checked the way the HTTP route
   checks a posted document: an id, and content that is text (`text/plain` unless a content type
   is given). A source id a crawl was registered under in this directory is refused, because its
   documents belong to that crawl.
@@ -4376,7 +4398,8 @@ served node built over the same directory; erase through the HTTP API where a gr
 - **One node per data directory.** An embedded node claims its directory with the same lock a
   server takes (`.excalibur-lock`), so a server, another embedded node - in this process or
   another - or an `excalibur-fsck --repair` or `excalibur-backup restore` on it is refused with a
-  `DataDirectoryLockedException` naming the holder. `close()` gives the claim back once the node
+  `DataDirectoryInUseException`, an `IOException` in `com.eonmux.excalibur.api.embedded` whose
+  `holderDescription()` and `holderPid()` say what the holder recorded about itself. `close()` gives the claim back once the node
   has shut down cleanly, so the directory can be opened again in the same process; a shutdown that
   left work running keeps it claimed until the process exits.
 - **Call `ExcaliburEmbedded.prepare()` first if your application starts threads that might reach
