@@ -137,7 +137,7 @@ public record IngestionWiring(Config config,
             LLMClientConfig chatClientConfig = LLMClientConfig.forChat(config.llm());
             EmbeddingClient embeddingClient =
                 createEmbeddingClient(capabilities, embeddingClientConfig);
-            int vectorDimensions = resolveVectorDimensions(embeddingClientConfig);
+            int vectorDimensions = resolveVectorDimensions();
             chunkIndex = openChunkIndex();
             LshIngestionService lshIngestionService =
                 createLshIngestionService(capabilities, vectorDimensions);
@@ -244,16 +244,14 @@ public record IngestionWiring(Config config,
     /**
      * Settles how wide a vector this node writes.
      *
-     * <p>Configuration wins when it is set, because a corpus already built at one width has to
-     * keep being written at that width. When it is not set the embedding model's own dimension is
-     * the only answer that cannot disagree with the vectors the client will return.</p>
+     * <p>{@code excalibur.query.vector-dimensions} always has a value, and configuration
+     * validation has already refused a node where it differs from the embedding model's width, so
+     * the index and the vectors the client returns cannot disagree.</p>
      *
-     * @param embeddingClientConfig The resolved embedding endpoint, which knows its model's width
      * @return The vector width the LSH pre-filter is sized for
      */
-    private int resolveVectorDimensions(LLMClientConfig embeddingClientConfig) {
-        int configured = config.query().getVectorDimensions();
-        return configured > 0 ? configured : embeddingClientConfig.getEmbeddingDimension();
+    private int resolveVectorDimensions() {
+        return config.query().getVectorDimensions();
     }
 
     /**
