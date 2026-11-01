@@ -5,12 +5,15 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
 import java.nio.file.FileSystemLoopException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.HashSet;
 import java.util.Locale;
@@ -41,9 +44,10 @@ import java.util.stream.StreamSupport;
  * <ul>
  *   <li>Root path must be an existing, readable directory</li>
  *   <li>File extensions are case-insensitive (e.g., ".TXT" == ".txt")</li>
- *   <li>Maximum file size: 100 MiB, the largest document ingestion indexes (configurable
- *       downwards). A larger file is still listed, and refused when it is fetched, so a run
- *       counts it failed rather than a re-crawl taking it as deleted</li>
+ *   <li>Maximum file size: 1 GiB for a PDF and 100 MiB for anything else, the largest documents
+ *       ingestion indexes (configurable downwards). A larger file is still listed, and refused
+ *       when it is fetched, so a run counts it failed rather than a re-crawl taking it as
+ *       deleted</li>
  *   <li>Symlinks are not followed by default (configurable). When they are followed, a path
  *       whose real location lies outside the root is not part of the source</li>
  *   <li>Hidden files are excluded by default (configurable), and so is everything under a
@@ -72,7 +76,7 @@ public class FilesystemSource implements Source {
 
     private static final String SOURCE_TYPE = "filesystem";
 
-    private static final long DEFAULT_MAX_FILE_SIZE = DocumentLimits.MAX_DOCUMENT_BYTES;
+    private static final long DEFAULT_MAX_FILE_SIZE = DocumentLimits.MAX_PDF_BYTES;
     private static final int DEFAULT_MAX_DEPTH = 100;
     private static final long MILLIS_PER_SECOND = 1000L;
 
@@ -239,6 +243,16 @@ public class FilesystemSource implements Source {
                     sourceId
                 );
             }
+            // Only a PDF may be larger than a text document; its header says whether it is one,
+            // and reading the header first keeps a large file of any other kind out of memory.
+            if (fileSize > DocumentLimits.MAX_DOCUMENT_BYTES && !isPdf(filePath)) {
+                throw new DocumentRefusedException(
+                    "File too large: " + fileSize + " bytes (max: "
+                        + DocumentLimits.MAX_DOCUMENT_BYTES + " for a document that is not a PDF): "
+                        + documentId,
+                    sourceId
+                );
+            }
 
             byte[] content = Files.readAllBytes(filePath);
             String contentType = detectContentType(filePath);
@@ -248,8 +262,10 @@ public class FilesystemSource implements Source {
             LOG.debug("Fetched document: {} ({} bytes, {}, {})",
                 documentId, content.length, contentType, encoding);
 
-            return new FetchedDocument(documentId, content, contentType, encoding,
-                lastModifiedMillis);
+            // Handed over rather than copied: nothing else holds the array just read, and a
+            // copy of the largest PDF would be another gigabyte of heap.
+            return FetchedDocument.adopting(documentId, content, contentType, encoding,
+                lastModifiedMillis, null);
 
         } catch (IOException e) {
             if (e instanceof java.nio.file.NoSuchFileException) {
@@ -588,6 +604,33 @@ public class FilesystemSource implements Source {
         }
     }
 
+    /**
+     * Whether a file is a PDF, judged from its first and last kilobyte without reading the rest.
+     *
+     * @param file The file
+     * @return Whether {@link PdfSignature} takes it for a PDF
+     * @throws IOException if the file cannot be read
+     */
+    private static boolean isPdf(Path file) throws IOException {
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
+            long size = channel.size();
+            int window = (int) Math.min(size, PdfSignature.SEARCH_WINDOW);
+            return PdfSignature.isPdf(readFully(channel, 0, window),
+                readFully(channel, size - window, window));
+        }
+    }
+
+    private static ByteBuffer readFully(FileChannel channel, long position, int length)
+            throws IOException {
+        ByteBuffer buffer = ByteBuffer.allocate(length);
+        while (buffer.hasRemaining()) {
+            if (channel.read(buffer, position + buffer.position()) < 0) {
+                break;
+            }
+        }
+        return buffer.flip();
+    }
+
     /** Where a path reached by following links lies; see {@link #containment}. */
     private enum Containment { INSIDE, OUTSIDE, GONE, UNRESOLVED }
 
@@ -850,8 +893,11 @@ public class FilesystemSource implements Source {
          * counts it failed and a re-crawl keeps whatever version of it was indexed before it
          * grew, rather than taking it as deleted.</p>
          *
-         * @param maxBytes The bound, at most {@link DocumentLimits#MAX_DOCUMENT_BYTES}, which
-         *                 is also the default; {@link #build()} refuses a larger one
+         * <p>A file that is not a PDF is also held to {@link DocumentLimits#MAX_DOCUMENT_BYTES}
+         * whatever this says; see {@link DocumentLimits}.</p>
+         *
+         * @param maxBytes The bound, at most {@link DocumentLimits#MAX_PDF_BYTES}, which is also
+         *                 the default; {@link #build()} refuses a larger one
          * @return This builder
          */
         public Builder maxFileSize(long maxBytes) {

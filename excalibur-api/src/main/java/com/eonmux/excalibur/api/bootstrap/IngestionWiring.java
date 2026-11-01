@@ -9,6 +9,7 @@ import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
 import com.eonmux.excalibur.ingest.lexical.StoredChunkText;
 import com.eonmux.excalibur.ingest.lsh.LshIngestionService;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
+import com.eonmux.excalibur.ingest.processor.DocumentDecoder;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.llm.client.LLMClientConfig;
@@ -61,6 +62,7 @@ import java.util.Optional;
  * @param documentVisibilityTracker The atomicity tracker shared with the query pipeline
  * @param graphTenants              Every namespace's graph, for the staging store ingestion
  *                                  writes facts into
+ * @param documentDecoder           How fetched documents become text, shared with the reindexer
  * @author ExcaliburDB
  */
 public record IngestionWiring(Config config,
@@ -68,14 +70,35 @@ public record IngestionWiring(Config config,
                               StorageEngine storageEngine,
                               IndexOrchestrator indexOrchestrator,
                               DocumentVisibilityTracker documentVisibilityTracker,
-                              GraphTenants graphTenants) {
+                              GraphTenants graphTenants,
+                              DocumentDecoder documentDecoder) {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(IngestionWiring.class);
 
     /**
+     * Wires ingestion with the decoder the configuration describes, built for it alone.
+     *
+     * <p>For a caller assembling ingestion without a reindexer. A node that has both builds one
+     * decoder with {@link DocumentDecoders#from} and hands it to each, so they read documents
+     * alike and share one bound on PDF conversions.</p>
+     *
+     * @throws NullPointerException     if any component is null
+     * @throws IllegalArgumentException if the configured PDF converter is not an executable
+     */
+    public IngestionWiring(Config config, Path dataDirectory, StorageEngine storageEngine,
+                           IndexOrchestrator indexOrchestrator,
+                           DocumentVisibilityTracker documentVisibilityTracker,
+                           GraphTenants graphTenants) {
+        this(config, dataDirectory, storageEngine, indexOrchestrator, documentVisibilityTracker,
+            graphTenants, DocumentDecoders.from(
+                Objects.requireNonNull(config, "config cannot be null").ingest(),
+                Objects.requireNonNull(dataDirectory, "dataDirectory cannot be null")));
+    }
+
+    /**
      * Validates that every collaborator is present.
      *
-     * <p>All six are required. None of them has a sensible absent case: a missing one is a
+     * <p>All seven are required. None of them has a sensible absent case: a missing one is a
      * composition-root bug, and left unchecked it surfaces as the pipeline quietly declining to
      * configure itself, which reads in the log exactly like an unreachable embedding endpoint.</p>
      *
@@ -88,6 +111,7 @@ public record IngestionWiring(Config config,
         Objects.requireNonNull(indexOrchestrator, "indexOrchestrator cannot be null");
         Objects.requireNonNull(documentVisibilityTracker, "documentVisibilityTracker cannot be null");
         Objects.requireNonNull(graphTenants, "graphTenants cannot be null");
+        Objects.requireNonNull(documentDecoder, "documentDecoder cannot be null");
     }
 
     /**
@@ -100,11 +124,23 @@ public record IngestionWiring(Config config,
      * null is an ordinary outcome, not an error - a node whose chunk index would not open serves
      * vectors and nothing else.</p>
      *
+     * <p>The decoder is returned for the same reason: an OCR reader holds its models and threads
+     * until it is released, which is the node's to do once ingestion has stopped.</p>
+     *
      * @param chunkIndex          The BM25 index over this node's chunks, or null if none opened
      * @param lexicalErasureSweep The timer enforcing that index's erasure deadline, or null when
      *                            there is no index for it to compact
+     * @param documentDecoder     How ingestion reads documents; never null
      */
-    public record Attachment(ChunkIndex chunkIndex, LexicalErasureSweep lexicalErasureSweep) {
+    public record Attachment(ChunkIndex chunkIndex, LexicalErasureSweep lexicalErasureSweep,
+                             DocumentDecoder documentDecoder) {
+
+        /**
+         * @throws NullPointerException if documentDecoder is null
+         */
+        public Attachment {
+            Objects.requireNonNull(documentDecoder, "documentDecoder cannot be null");
+        }
     }
 
     /**
@@ -177,7 +213,7 @@ public record IngestionWiring(Config config,
             // Continue without the pipeline: registration is bookkeeping and does not need one,
             // and /v1/ingest/status reports every source as unconfigured rather than as ingested.
         }
-        return new Attachment(chunkIndex, sweep);
+        return new Attachment(chunkIndex, sweep, documentDecoder);
     }
 
     /**
@@ -318,6 +354,7 @@ public record IngestionWiring(Config config,
         IngestionOrchestrator ingestion = server.getIngestionOrchestrator();
         if (ingestion != null) {
             ingestion.setVectorEraser(SegmentVectorEraser.of(storageEngine));
+            ingestion.setDocumentDecoder(documentDecoder);
         }
     }
 

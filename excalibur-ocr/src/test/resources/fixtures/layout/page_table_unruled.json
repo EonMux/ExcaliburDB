@@ -1,0 +1,252 @@
+{
+ "page": "table_unruled",
+ "table_heads": false,
+ "runs": [
+  {
+   "wh": [
+    1100,
+    1400
+   ],
+   "texts": [
+    "Vol. 2 (2026)",
+    "Journal of Synthetic Pages",
+    "Results per machine are listed below.",
+    "Machine",
+    "Cores",
+    "Time",
+    "alpha 8",
+    "12.4",
+    "beta 16 7.9",
+    "gamma 32",
+    "4.1",
+    "delta 4",
+    "25.0",
+    "Times are wall-clock seconds for one full pass.",
+    "11"
+   ],
+   "order": [
+    1,
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14
+   ],
+   "inner_orders": [
+    [
+     1,
+     0,
+     2,
+     3,
+     4,
+     5
+    ]
+   ],
+   "xycut_blocks": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     7
+    ],
+    [
+     8
+    ],
+    [
+     9,
+     10
+    ],
+    [
+     11
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     0
+    ],
+    [
+     14
+    ]
+   ],
+   "order_xycut": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    0,
+    14
+   ]
+  }
+ ],
+ "cells": {
+  "line": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   6,
+   7,
+   8,
+   8,
+   8,
+   9,
+   9,
+   10,
+   11,
+   11,
+   12,
+   13,
+   14
+  ],
+  "texts": [
+   "Vol. 2 (2026)",
+   "Journal of Synthetic Pages",
+   "Results per machine are listed below.",
+   "Machine ",
+   "Cores ",
+   "Time",
+   "alpha",
+   "8",
+   "12.4",
+   "beta",
+   "16",
+   "7.9",
+   "gamma",
+   "32",
+   "4.1",
+   "delta",
+   "4",
+   "25.0",
+   "Times are wall-clock seconds for one full pass.",
+   "11"
+  ]
+ },
+ "page_blocks": [
+  {
+   "label": "Page-Header",
+   "bbox": [
+    68.7,
+    37.6,
+    275.8,
+    53.6
+   ],
+   "text": "Journal of Synthetic Pages"
+  },
+  {
+   "label": "Page-Header",
+   "bbox": [
+    899.8,
+    35.9,
+    1006.0,
+    52.6
+   ],
+   "text": "Vol. 2 (2026)"
+  },
+  {
+   "label": "Text",
+   "bbox": [
+    71.1,
+    135.5,
+    423.8,
+    153.7
+   ],
+   "text": "Results per machine are listed below."
+  },
+  {
+   "label": "Table",
+   "bbox": [
+    117.9,
+    215.4,
+    363.2,
+    390.9
+   ],
+   "text": "Machine\nCores\nTime\nalpha 8\n12.4\nbeta 16 7.9\ngamma 32\n4.1\ndelta 4\n25.0"
+  },
+  {
+   "label": "Text",
+   "bbox": [
+    71.1,
+    465.2,
+    514.0,
+    483.4
+   ],
+   "text": "Times are wall-clock seconds for one full pass."
+  },
+  {
+   "label": "Page-Footer",
+   "bbox": [
+    539.5,
+    1346.5,
+    565.2,
+    1359.5
+   ],
+   "text": "11"
+  }
+ ],
+ "markdown": [
+  {
+   "keep_furniture": false,
+   "tab": false,
+   "pictures": false,
+   "markdown": "Results per machine are listed below.\n\n<table>\n<tr><th>Machine </th><th></th><th>Cores  Time</th></tr>\n<tr><td>alpha</td><td>8</td><td>12.4</td></tr>\n<tr><td>beta</td><td>16</td><td>7.9</td></tr>\n<tr><td>gamma</td><td>32</td><td>4.1</td></tr>\n<tr><td>delta</td><td>4</td><td>25.0</td></tr>\n</table>\n\nTimes are wall-clock seconds for one full pass."
+  },
+  {
+   "keep_furniture": false,
+   "tab": true,
+   "pictures": false,
+   "markdown": "Results per machine are listed below.\n\n<table>\n<tr><th>Machine</th><th>Cores</th><th>Time</th></tr>\n<tr><td>alpha 8</td><td>12.4</td><td></td></tr>\n<tr><td colspan=\"2\">beta 16 7.9</td><td></td></tr>\n<tr><td>gamma 32</td><td>4.1</td><td></td></tr>\n<tr><td>delta 4</td><td>25.0</td><td></td></tr>\n</table>\n\nTimes are wall-clock seconds for one full pass."
+  },
+  {
+   "keep_furniture": true,
+   "tab": false,
+   "pictures": false,
+   "markdown": "Journal of Synthetic Pages\n\nVol. 2 (2026)\n\nResults per machine are listed below.\n\n<table>\n<tr><th>Machine </th><th></th><th>Cores  Time</th></tr>\n<tr><td>alpha</td><td>8</td><td>12.4</td></tr>\n<tr><td>beta</td><td>16</td><td>7.9</td></tr>\n<tr><td>gamma</td><td>32</td><td>4.1</td></tr>\n<tr><td>delta</td><td>4</td><td>25.0</td></tr>\n</table>\n\nTimes are wall-clock seconds for one full pass.\n\n11"
+  },
+  {
+   "keep_furniture": true,
+   "tab": true,
+   "pictures": false,
+   "markdown": "Journal of Synthetic Pages\n\nVol. 2 (2026)\n\nResults per machine are listed below.\n\n<table>\n<tr><th>Machine</th><th>Cores</th><th>Time</th></tr>\n<tr><td>alpha 8</td><td>12.4</td><td></td></tr>\n<tr><td colspan=\"2\">beta 16 7.9</td><td></td></tr>\n<tr><td>gamma 32</td><td>4.1</td><td></td></tr>\n<tr><td>delta 4</td><td>25.0</td><td></td></tr>\n</table>\n\nTimes are wall-clock seconds for one full pass.\n\n11"
+  }
+ ]
+}

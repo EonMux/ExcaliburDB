@@ -40,7 +40,7 @@
 # front of this process terminates TLS. The image sets none of them: a default that listened on
 # every interface unauthenticated would be the one mistake this policy exists to prevent.
 #
-# Four directories belong to the node's user, and only the first is declared a volume:
+# Five directories belong to the node's user, and only the first is declared a volume:
 #
 #   /var/lib/excalibur              The data directory. A VOLUME, so it outlives the container.
 #   /var/lib/excalibur-diagnostics  Where an out-of-memory heap dump is written. Mount it to keep
@@ -51,11 +51,15 @@
 #                                   preserved is deleted with a `docker run --rm` container.
 #   /var/lib/excalibur-backups      Where `excalibur-backup snapshot --out` writes an image when
 #                                   run from this image. Mount it, for the same reason.
+#   /var/cache/excalibur            Where Indra OCR's models are downloaded the first time a
+#                                   node reads a PDF with excalibur.ingest.pdf-reader=indra. Mount
+#                                   it to keep them, 76 MB (96 MB with indra-math), past the
+#                                   container.
 #
 # A named volume mounted on any of them takes that directory's owner, so the process can write
 # to it; a host directory bind-mounted there has to be owned by the node's uid first - 10001, or
 # whatever the EXCALIBUR_UID/EXCALIBUR_GID build arguments set, so an image built with
-# `--build-arg EXCALIBUR_UID=$(id -u)` can use a directory the host user already owns. The last three are
+# `--build-arg EXCALIBUR_UID=$(id -u)` can use a directory the host user already owns. The last four are
 # not VOLUMEs on purpose. A declared volume that is not mounted becomes an anonymous volume,
 # which `--rm` deletes with the container - so a declaration would promise a persistence that
 # only an explicit mount delivers, and hide that it was missing.
@@ -111,9 +115,9 @@ RUN groupadd --system --gid "${EXCALIBUR_GID}" excalibur \
  && useradd --system --uid "${EXCALIBUR_UID}" --gid excalibur \
       --home-dir /var/lib/excalibur --shell /usr/sbin/nologin excalibur \
  && mkdir -p /var/lib/excalibur /var/lib/excalibur-diagnostics /var/lib/excalibur-quarantine \
-      /var/lib/excalibur-backups /opt/excalibur \
+      /var/lib/excalibur-backups /var/cache/excalibur /opt/excalibur \
  && chown excalibur:excalibur /var/lib/excalibur /var/lib/excalibur-diagnostics \
-      /var/lib/excalibur-quarantine /var/lib/excalibur-backups
+      /var/lib/excalibur-quarantine /var/lib/excalibur-backups /var/cache/excalibur
 
 # Owned by root and read-only to the process: the node has no reason to be able to rewrite its
 # own code, and an ingestion path that could would be a remote code execution.
@@ -155,6 +159,11 @@ ENV PATH="/opt/excalibur-fsck/bin:/opt/excalibur-backup/bin:${PATH}"
 # Where segments, write-ahead logs, catalogs, the lexical index and the source registry live.
 # ExcaliburApplication reads this variable and nothing else; there is no properties key for it.
 ENV EXCALIBUR_DATA_DIR=/var/lib/excalibur
+
+# The cache Indra OCR's models are downloaded into (excalibur.ingest.pdf-reader=indra), as
+# $XDG_CACHE_HOME/excalibur/indra-ocr/. Not the default ~/.cache: this user's home is the data
+# directory, which holds only the node's own files, and a node refuses a model directory there.
+ENV XDG_CACHE_HOME=/var/cache/excalibur
 
 # Heap from the container's limit rather than a fixed -Xmx, so the same image is correct under
 # every `docker run -m`. 60% and not the usual 75%: this engine keeps its segments in

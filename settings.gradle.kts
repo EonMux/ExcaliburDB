@@ -31,6 +31,7 @@ include(
     "excalibur-shard",
     "excalibur-query",
     "excalibur-llm",
+    "excalibur-ocr",
     "excalibur-ingest",
     "excalibur-api",
     "excalibur-backup",

@@ -26,7 +26,8 @@ ExcaliburDB is built on Java 21's Panama Foreign Function & Memory API for zero-
 - **Retrieval without embedding the corpus** - every ingested chunk is indexed into the engine's own inverted index, and a node with no embedding endpoint answers `POST /v1/query` from BM25 instead of refusing the query
 - **Hybrid retrieval on the document route** - a node with an embedding model runs BM25 and vector search concurrently on `POST /v1/query` and fuses their rankings by reciprocal rank, so the inverted index it maintains anyway is read rather than merely paid for; `excalibur.query.hybrid-retrieval=false` restores vector-only ranking
 - **Query-side semantic expansion** - a chat model turns one question into the vocabulary a matching document would contain (`out of RAM` becomes `OOM killer`, `ENOMEM`, `SIGKILL`, `cgroup memory limit`) and weights each formulation itself, so the semantic work is paid for once per query instead of once per chunk of the corpus. It runs on a node that has a chat model and does not embed its corpus, which is where it replaces work the embeddings would otherwise have done; a node doing both takes it with `excalibur.query.expand-hybrid-queries=true`
-- **Text, and only text** - a crawl with no extension filter lists every file under its root, and a file's content type is guessed from its name, so what a document actually holds is decided by decoding it: anything whose decoded characters carry a U+0000, or run a third or more replacement characters, is passed over before it is chunked rather than indexed as several kilobytes of mojibake and paid for at the embedding endpoint. Skipped files are counted into `entries_skipped` on the source's status and are deliberately not errors - a directory holding photographs beside its documents is the ordinary case. HTML and XHTML are the one markup the node reads through: a page is indexed by the text it shows, with its tags, scripts and stylesheets stripped and its character references decoded. There are no other format parsers: a PDF or a `.docx` is skipped, not extracted
+- **Text, and only text** - a crawl with no extension filter lists every file under its root, and a file's content type is guessed from its name, so what a document actually holds is decided by decoding it: anything whose decoded characters carry a U+0000, or run a third or more replacement characters, is passed over before it is chunked rather than indexed as several kilobytes of mojibake and paid for at the embedding endpoint. Skipped files are counted into `entries_skipped` on the source's status and are deliberately not errors - a directory holding photographs beside its documents is the ordinary case. HTML and XHTML are the one markup the node reads through: a page is indexed by the text it shows, with its tags, scripts and stylesheets stripped and its character references decoded
+- **PDFs, typeset or scanned** - a PDF is read from its text layer out of the box. Set `excalibur.ingest.pdf-reader=indra` and every PDF is read by [Indra OCR](https://github.com/datalab-to/indra), run inside the node with nothing to install: text layers where they can be trusted, OCR of scanned pages elsewhere, in reading order, indexed as Markdown. Its models are downloaded on first use and carry a licence of their own (see [PDFs](#pdfs)). An external converter can be configured instead. Other binary formats - a `.docx`, an image - are still skipped, not extracted
 - **One copy of the corpus** - the chunk index stores postings and not text, reading a chunk's text back from the storage engine on the rare occasion a compaction needs it, so indexing does not double what a corpus costs on disk
 - **Erasure that removes chunks too** - a rolled-back or erased chunk is recorded durably, hidden immediately, and physically rewritten out of the index by a compaction driven by the oldest outstanding obligation rather than by accumulated volume
 
@@ -286,7 +287,7 @@ out, every check has to explain, and on a volume sized for the data, possibly th
 it. Mount a volume there, as above, to keep a dump past the container; without one it lives in the
 container's writable layer and goes with `docker rm`.
 
-The image owns four directories for its unprivileged user (uid 10001), and declares only the data
+The image owns five directories for its unprivileged user (uid 10001), and declares only the data
 directory a volume:
 
 | Directory | Holds | Mount it |
@@ -295,10 +296,12 @@ directory a volume:
 | `/var/lib/excalibur-diagnostics` | heap dumps from an out-of-memory exit | to keep a dump |
 | `/var/lib/excalibur-quarantine` | files `excalibur-fsck --repair` sets aside | for every repair |
 | `/var/lib/excalibur-backups` | snapshots `excalibur-backup` writes from the image | for every snapshot |
+| `/var/cache/excalibur` | Indra OCR's models, with `pdf-reader=indra` (`XDG_CACHE_HOME`) | to keep them past the container |
 
-The last three are deliberately not `VOLUME`s: an unmounted declared volume is an anonymous one,
+The last four are deliberately not `VOLUME`s: an unmounted declared volume is an anonymous one,
 which `docker run --rm` deletes with the container — a repair's quarantined evidence or a fresh
-backup gone the moment the command returns, with nothing to say so. A named volume takes the
+backup gone the moment the command returns, with nothing to say so. Unmounted, the model cache
+lasts as long as the container, and a new container downloads the models again. A named volume takes the
 directory's owner when first mounted; a host directory bind-mounted in its place needs
 `chown 10001:10001` first. The uid and gid are build arguments, `EXCALIBUR_UID` and
 `EXCALIBUR_GID`, both `10001` by default: `docker build --build-arg EXCALIBUR_UID=1000
@@ -395,12 +398,15 @@ with no shorter limit of their own:
 2. Together: the request threads it stopped waiting for, a reindex, the query executors (the BM25
    half and the vector pipeline's segment searches), a compaction, a graph build and an ingestion
    run.
-3. The segment workers, once nothing is left that could hand them work: HNSW integration,
+3. With `pdf-reader=indra`, the OCR engine, once no conversion is left to use it: it frees its
+   models and threads. One the ingestion drain could not stop keeps them, and the shutdown is
+   reported as not clean.
+4. The segment workers, once nothing is left that could hand them work: HNSW integration,
    warming, graph and segment compaction, reindex scheduling and the segment sync sweep, one after
    another out of the same remainder.
-4. The storage engine's own splits and segment lifecycle checks, once the segment workers can no
+5. The storage engine's own splits and segment lifecycle checks, once the segment workers can no
    longer start one.
-5. The lexical erasure sweep.
+6. The lexical erasure sweep.
 
 The graph erasure sweep is given whatever is left of the whole deadline once the writes are done.
 Raising the deadline therefore gives a slow drain longer to finish. One still running when its
@@ -863,6 +869,20 @@ it does read.
 | `excalibur.ingest.crawl-delay-ms` | 200 | The shortest gap a web crawl leaves between two requests to its host — 200ms is five a second. A crawl walks sequentially and makes two requests per page, one to read its links and one to fetch it, so nothing but the host's own latency limited how fast it was asked for pages. A registration's `crawl_delay_ms` may ask for a longer gap and never a shorter one. `0` paces nothing; the maximum is 60000, and a value outside that range is refused at startup against the property name |
 | `excalibur.ingest.chunk-target-tokens` | 512 | Tokens one chunk aims for. Larger chunks carry more context into a single result; smaller ones rank more precisely, because a chunk's score is diluted by whatever in it the question did not ask about. At least 1 |
 | `excalibur.ingest.chunk-overlap-tokens` | 64 | Tokens a chunk repeats from the one before it, so an answer that straddles a boundary is not split across two chunks holding half of it each. Must be less than the target, or chunking would never advance; the node refuses the pair at startup rather than failing on the first document |
+| `excalibur.ingest.pdf-reader` | _(text-layer, or command)_ | How PDFs are read: `text-layer`, their text layer only, which finds nothing on a scanned page; `indra`, Indra OCR in process; `command`, the external `pdf-converter-command`. Unset, `command` when a converter command is set and `text-layer` otherwise; a command beside another reader stops the node at startup. See [PDFs](#pdfs) |
+| `excalibur.ingest.indra-accept-model-license` | false | Records that the operator accepts the [licence of Indra's model weights](https://huggingface.co/datalab-to/indra-ocr/blob/v1.1.0/LICENSE), which restricts commercial use. `pdf-reader=indra` refuses to start without it |
+| `excalibur.ingest.indra-model-dir` | _(per-user cache)_ | Where Indra's models are kept. Empty for `$XDG_CACHE_HOME/excalibur/indra-ocr/v1.1.0`, or `~/.cache/excalibur/indra-ocr/v1.1.0` when that is unset. A directory inside the data directory stops the node at startup |
+| `excalibur.ingest.indra-model-download` | true | Whether models missing from the model directory are downloaded from Hugging Face when the first PDF needs them. `false` reads only what is there, and stops the node at startup when a file is missing |
+| `excalibur.ingest.indra-mode` | `auto` | `auto` reads a page's text layer where it passes Indra's checks and recognises the page elsewhere; `ocr` recognises every page; `text` keeps every text layer, even one that fails the checks |
+| `excalibur.ingest.indra-dpi` | 200 | Resolution pages are rendered at for recognition. 72 to 600 |
+| `excalibur.ingest.indra-threads` | 0 | Pages one conversion reads at once; 0 for every core the node may use. 0 to 256 |
+| `excalibur.ingest.indra-math` | false | Read lines holding formulas as LaTeX. Downloads 20 MB more of models and costs several times as much on pages with math |
+| `excalibur.ingest.indra-keep-furniture` | false | Keep running headers, footers and page numbers in the text |
+| `excalibur.ingest.indra-image-ocr` | true | On a page read from its text layer, also recognise text inside its pictures |
+| `excalibur.ingest.pdf-converter-command` | _(empty)_ | The program the `command` reader converts every PDF with: a path, or a name looked up on the `PATH`. A command that names no executable stops the node at startup |
+| `excalibur.ingest.pdf-converter-args` | _(empty)_ | Arguments placed before the PDF's path, split on whitespace, such as `--format md` |
+| `excalibur.ingest.pdf-converter-timeout-seconds` | 3600 | How long one conversion by Indra or a command may run before it is stopped and the document is failed; a command is killed with every process it started. 1 to 86400 |
+| `excalibur.ingest.pdf-converter-parallelism` | 1 | Conversions by Indra or a command run at once, across ingestion and re-crawls together. OCR uses every core it is given, so more than one mostly adds memory. 1 to 64 |
 | `excalibur.ingest.bm25-k1` | 1.2 | Where a repeated term stops earning more score. 0 reduces term frequency to a yes-or-no. Under `lexical-engine=native` this is **recorded in the index** and an index built under one value refuses to open under another — not because the bytes depend on it, but because changing it changes every score the corpus can produce, and with it every ranking and every threshold a deployment has calibrated. Changing it means reingesting. Under `lexical-engine=lucene` it is applied at query time and nothing is recorded, so a change takes effect on the next query. At least 0 |
 | `excalibur.ingest.bm25-b` | 0.75 | How much a match is discounted for the length of the chunk it was found in. 1 normalises fully by length, 0 not at all. Recorded, or not, on the same terms as `bm25-k1`. 0 to 1 |
 | `excalibur.llm.api-key` | _(none)_ | Key both endpoints fall back to. Supply as `EXCALIBUR_LLM_API_KEY`, not in this file. Only the hosted default endpoint needs one: a role left on `https://api.openai.com/v1` with no key is off (the corpus is still chunked, stored and term-indexed; the startup log says what is missing). A keyless server — Ollama, vLLM, TGI — is used without one, and a server that does want one answers 401, which is logged naming these keys |
@@ -2261,12 +2281,12 @@ rather than a silent clamp:
 | `excluded_directories` | filesystem | — | Directory names the walk does not descend into, matched at any depth below the root. The walk never opens them, so a large `node_modules` costs nothing and a link cycle inside one cannot abort the crawl. A file that shares a name with one is still a file |
 | `follow_symlinks` | filesystem | — | Whether the walk descends through symbolic links. A link out of the allowed root is still refused: the real path is what is checked |
 | `include_hidden` | filesystem | — | Whether dot-files are read, and whether the walk enters dot-directories — `.config/notes.md` is hidden with its directory. The root itself may be hidden |
-| `max_file_bytes` | filesystem | 1 – 100 MiB | Largest single file the crawl will read; 100 MiB when absent. A larger file is listed and not read: it fails that document, counted in `documents_failed`, and a file that grew past the limit keeps the version indexed before rather than being taken as deleted. The ceiling is the largest document the node indexes (see below) |
+| `max_file_bytes` | filesystem | 1 B – 1 GiB | Largest single file the crawl will read; 1 GiB when absent. A larger file is listed and not read: it fails that document, counted in `documents_failed`, and a file that grew past the limit keeps the version indexed before rather than being taken as deleted. Only a PDF may be larger than 100 MiB; the ceiling is the largest document the node indexes (see below) |
 | `charset` | filesystem | any encoding the JVM supports | The encoding a file without a byte-order mark is read in; UTF-8 when absent. A name the node cannot decode is a 400, not a silent fall-back to UTF-8. Recorded under its canonical name, which is what `GET /v1/ingest` shows. Refused on an HTTP crawl, whose responses each name their own encoding — see [What gets indexed](#what-gets-indexed) |
 | `included_path_patterns` | http | — | Substrings a URL path must contain to be crawled |
 | `excluded_path_patterns` | http | — | Substrings that keep a URL path out of the crawl; `/api`, `/admin`, `/login` and `/logout` when absent. Given, it replaces that list, and `[]` clears it. A registration whose patterns keep out the `base_url` page itself is a 400 naming the pattern, since the walk starts there and would list nothing |
 | `max_documents` | http | 1 – 10000000 | How many pages one crawl fetches. A crawl that reaches it has not listed the whole site, so a re-crawl keeps the indexed pages it did not reach rather than removing them |
-| `max_response_bytes` | http | 1 – 100 MiB | Largest single response body held; 10 MiB when absent. A larger body fails that document. The ceiling is the largest document the node indexes (see below) |
+| `max_response_bytes` | http | 1 B – 1 GiB | Largest single response body held; 10 MiB when absent. A larger body fails that document. Only a PDF may be larger than 100 MiB; the ceiling is the largest document the node indexes (see below) |
 | `timeout_seconds` | http | 1 – 600 | How long one request may take |
 | `user_agent` | http | ≤ 200 chars | What the crawl identifies itself as. Screened for header injection |
 | `crawl_delay_ms` | http | 0 – 60000 | The gap this crawl leaves between requests to its host. The node takes the larger of this and `excalibur.ingest.crawl-delay-ms`, so it can ask to be gentler than the deployment requires and never quicker |
@@ -2283,12 +2303,15 @@ every such field and listing the ones the source type takes, and so is a top-lev
 than `source_type` and `config`. Ignored, it would be answered `registered` and the source crawled
 without the setting the caller believes it made.
 
-Whatever these say, one document is indexed only up to 100 MiB and 10,000 chunks — at the default
-chunking (512 tokens, 64 overlapping) the chunk bound is met first, at about 18 MB. A document past
-either is counted in `documents_failed`, on the first crawl and every re-crawl alike, including one
-supplied to `POST /v1/documents`. The byte limit is why `max_file_bytes` and `max_response_bytes`
-stop at 100 MiB: a larger file or body could only be read to be discarded. A registration recorded
-with a larger value by an earlier version is restored at the limit, with a warning, not refused.
+Whatever these say, one document is indexed only up to 100 MiB — 1 GiB for a PDF — and 10,000
+chunks. At the default chunking (512 tokens, 64 overlapping) the chunk bound is met first by a text
+document, at about 18 MB. A PDF has a byte bound of its own because most of its bytes are images and
+fonts rather than text: a scanned book of several hundred megabytes holds a few megabytes of text,
+and the chunk bound still governs what that text may cost. A document past either bound is counted
+in `documents_failed`, on the first crawl and every re-crawl alike, including one supplied to
+`POST /v1/documents`. The byte limit is why `max_file_bytes` and `max_response_bytes` stop at 1 GiB:
+a larger file or body could only be read to be discarded. A registration recorded with a larger
+value by an earlier version is restored at the limit, with a warning, not refused.
 
 `source_id` is bounded at 256 characters. A copy of it is kept in every document's registry record
 and printed with every log line about the source, so its length is multiplied by the size of the
@@ -2388,7 +2411,7 @@ reads them.
 
 ### What gets indexed
 
-Text, and only text. A crawl with no `included_extensions` lists **every** file under its root,
+Text, and PDFs (see [PDFs](#pdfs)). A crawl with no `included_extensions` lists **every** file under its root,
 and a file's content type is guessed from its extension, so neither its name nor its type says
 what it actually holds: a `.txt` can be a core dump and a `.dat` can be YAML. Each document's
 bytes are therefore decoded and judged on what comes out.
@@ -2448,9 +2471,118 @@ with is collapsed. The text test above is applied before the markup goes, so a b
 `.html` name is still passed over. The same extracted text is what the graph extracts facts from.
 Every other type keeps its angle brackets: in XML, Markdown or source code they are content.
 
-There are no other format parsers. A PDF, a `.docx` or an image is skipped, not extracted; the
-node indexes documents you can already read as text. `included_extensions` is still worth setting on a
-mixed root, because it stops those files being read at all rather than read and discarded.
+A PDF is the one binary format the node extracts. A `.docx` or an image is skipped, not
+extracted. `included_extensions` is still worth setting on a mixed root, because it stops those
+files being read at all rather than read and discarded.
+
+#### PDFs
+
+A document is a PDF when it opens with `%PDF-`, the header the specification puts at its first
+byte; its name and its content type are not consulted. Readers also accept the header a few bytes
+in, after junk some tools prepend, and so does the node, but only when it begins a line within the
+first kilobyte, carries a version, and the document ends with a PDF's `%%EOF` trailer, so a note
+or source file that merely mentions `%PDF-` is still read as text. How a PDF is read is chosen by
+`excalibur.ingest.pdf-reader`:
+
+- **`text-layer` (the default).** The node reads the PDF's text layer itself, with
+  [Apache PDFBox](https://pdfbox.apache.org/), page by page, a blank line between pages. That is
+  exact for a typeset document and fast, and needs nothing installed. A scanned page has no text
+  layer, so a PDF that is all scans is skipped and counted into `entries_skipped`, with a log line
+  naming the reader below. A PDF that needs a password is skipped the same way.
+- **`indra`.** Every PDF is read by [Indra OCR](https://github.com/datalab-to/indra), run inside
+  the node: a Java port of Indra 1.1.2 ships in it, so there is nothing to install. Page by page,
+  Indra uses the text layer where it passes its checks and recognises the page where it does not
+  - scans, broken font maps, legacy fonts that store other characters - straightening and turning
+  pages upright first. It writes the document as Markdown in reading order, columns included,
+  with running headers, footers and page numbers removed and tables as HTML:
+
+  ```properties
+  excalibur.ingest.pdf-reader=indra
+  excalibur.ingest.indra-accept-model-license=true
+  ```
+
+  **Its models are not part of the node.** The code is Apache-2.0, as the node is, but Indra's
+  model weights are published under the
+  [AI Pubs Open RAIL-M License (Modified)](https://huggingface.co/datalab-to/indra-ocr/blob/v1.1.0/LICENSE),
+  whose terms bind whoever uses them. Among them, the weights may not be used by a person or
+  organisation with more than US$20 million in revenue the prior year, or more than US$20 million
+  raised, except for personal use or research, nor by anyone offering a product that competes
+  with Datalab's; Datalab offers other licences for those. The node therefore refuses to start
+  with `pdf-reader=indra` until `excalibur.ingest.indra-accept-model-license=true` records that
+  the operator has read and accepted them.
+
+  The first PDF a node reads downloads the models - 76 MB, or 96 MB with `indra-math` - from
+  Hugging Face into `excalibur.ingest.indra-model-dir`, by default
+  `$XDG_CACHE_HOME/excalibur/indra-ocr/v1.1.0` (`~/.cache/...` when that is unset). The
+  directory must be outside the data directory, which holds only the node's own files: a node
+  configured with one inside it does not start. So snapshots and backups do not carry the models,
+  and in the container image, whose user's home is the data directory, the cache is
+  `/var/cache/excalibur`. Every file is pinned to
+  the revision the port was tested against by its length and SHA-256 digest: a download that
+  delivers other bytes is refused, and so is a file in the directory that does not match. The
+  licence's text is downloaded with them, as `LICENSE`, and the download is logged with a warning
+  naming it. A node without access to Hugging Face is given the files by hand: copy the revision's
+  files into a directory, name it in `indra-model-dir`, and set
+  `excalibur.ingest.indra-model-download=false`, which stops the node at startup when a file is
+  missing rather than at the first PDF. Two nodes may share one model directory.
+
+  `indra-mode=ocr` recognises every page, ignoring text layers; `indra-mode=text` keeps every
+  text layer, even one that fails the checks. `indra-math=true` reads lines holding formulas as
+  LaTeX, at several times the cost on pages with math. `indra-keep-furniture=true` keeps headers
+  and footers. `indra-image-ocr=false` stops recognising text inside pictures on pages read from
+  their text layer. `indra-dpi` is the resolution pages are rendered at for recognition, 200 by
+  default. One conversion reads `indra-threads` pages at once, every core by default; each page
+  holds a rendered image of up to 100 megapixels while it is read. Pages being read share half
+  the JVM's maximum heap, at about 8 bytes per rendered pixel, so large pages on many cores wait
+  for one another instead of running the node out of memory; give the node more heap (`-Xmx`)
+  to read more of them at once. Two documents converted at once take turns at the cores page by
+  page, and the models are downloaded before a document's timeout starts.
+
+  Pages are drawn with PDFBox, and the images inside them - JPEG, JBIG2 and JPEG 2000, as scans
+  hold - are decoded by codecs that ship in the node. Given the same page image the port writes
+  what Indra writes, character for character; Indra draws pages with pdfium instead, whose
+  anti-aliasing and stand-ins for missing glyphs differ slightly, so on a page read by OCR the two
+  can differ by a few characters.
+- **`command`.** Every PDF is handed to an external program instead,
+  `excalibur.ingest.pdf-converter-command`: the node writes it to a temporary file in
+  `java.io.tmpdir`, runs `<command> <pdf-converter-args> <file>`, and indexes what the program
+  prints on standard output, read as UTF-8. Anything that prints a document's text works; a
+  program that wants its arguments in another order is wrapped in a one-line script. The program
+  runs without the node's `EXCALIBUR_*` environment variables, which carry its secrets. Where
+  `/tmp` is held in memory, as on many Linux distributions, a large PDF costs its size in RAM while
+  it is converted; start the node with `-Djava.io.tmpdir=<a directory on disk>` to stage it there
+  instead. Setting a converter command without `pdf-reader` selects this reader; setting it beside
+  another reader stops the node at startup.
+
+A conversion by Indra or by a command that runs past
+`excalibur.ingest.pdf-converter-timeout-seconds`, produces more than 100 MiB of text, or - for a
+command - exits non-zero fails that document, counted in `documents_failed`, and the reason is
+logged with it: a converter's last output on standard error, or the page Indra failed on. A stopped
+run ends Indra at its next step, and kills a converter and everything it started; so does a
+converter's exit, for any process it left running. Indra reads past a page it cannot read, logging
+it, as its own command line does, and a PDF it cannot open at all - damaged, or locked with a
+password - fails. A document with no text is not indexed, as an empty file is not. At most
+`excalibur.ingest.pdf-converter-parallelism` conversions run at once across the whole node; OCR
+is the slow part of indexing a scanned library.
+
+A failed or empty document is not registered, so every re-crawl comes back to it. A conversion
+that timed out, produced too much, produced nothing, or could not open its PDF would end the same
+way again, so the node remembers those bytes and does not convert them again until the file
+changes, the reader's configuration changes, or the node restarts; each re-crawl still counts a
+failed one in `documents_failed`. Any other failure - a command's non-zero exit, models that could
+not be downloaded - is retried by the next re-crawl, because it is fixed outside the node.
+
+How a PDF was read is recorded with it - for Indra, the port's version, the model revision and
+every setting that changes the text; for a command, its file name and arguments - so choosing
+another reader, or changing how it reads, reads every PDF again on the next re-crawl, once, even
+though no file changed. An HTTP source is asked for each such PDF in full rather than
+conditionally, since its server would answer that nothing changed. `indra-threads`, the timeout
+and the parallelism change only how fast, and read nothing again. A command upgraded in place,
+under the same name, changes nothing recorded, and a re-index reads again only what changed; to
+have every PDF read by the new version, change `pdf-converter-args` - reordering two flags is
+enough. Indexing a large library with OCR is therefore best done by configuring it before the
+first crawl. Going back to `text-layer` reads every PDF again from its text layer; a scan, which
+has none, keeps the text OCR recognised, and is tried again by each re-crawl after.
 
 #### robots.txt
 
@@ -4403,6 +4535,12 @@ means disabled, not unrestricted** — so the first request always fails until y
 same is true of `excalibur.ingest.allowed-hosts` for URL sources. A path is canonicalised before
 it is compared, so symlinks and `..` cannot escape the list.
 
+**My PDFs are counted in `entries_skipped`.**
+They are scans, or need a password. By default a PDF is read from its text layer, and a scanned
+page has none; the log names each one it skipped and why. Set `excalibur.ingest.pdf-reader=indra`
+(and accept its models' licence) and the next re-crawl reads the scans with OCR — see
+[PDFs](#pdfs). A PDF locked with a password stays unreadable either way.
+
 **Do I need an embedding model at all?**
 No. Documents are chunked, stored and lexically indexed without one, and `POST /v1/query`
 answers from BM25 with `"retrieval": "lexical"`. An embedding endpoint adds dense retrieval as a
@@ -4714,3 +4852,8 @@ machine-written, so counting them measures code generation rather than testing, 
 ## License
 
 [Apache License 2.0](LICENSE).
+
+The node ships third-party libraries under their own licences. The port of Indra OCR and the
+libraries it uses are listed, with their notices, in [`excalibur-ocr/NOTICE`](excalibur-ocr/NOTICE),
+also bundled in the jar; the JPEG 2000 decoder among them is not Apache-2.0 but under the JJ2000
+licence and a BSD licence. Indra's model weights are not part of the node (see [PDFs](#pdfs)).

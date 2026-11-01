@@ -1,8 +1,6 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
 import com.eonmux.excalibur.ingest.graph.GraphIngestSink;
-import com.eonmux.excalibur.ingest.processor.TextContent;
-import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -211,22 +209,28 @@ final class GraphReporter {
      * <p>A version a later one has already superseded is not reported at all; see the class
      * documentation.</p>
      *
-     * @param publication What {@link #published} or {@link #removed} returned
-     * @param doc         The fetched document, whose text is decoded the way it was for
-     *                    chunking; null for a removal, which has no content
-     * @throws IllegalArgumentException if a published version comes without its document
+     * <p>Handed the text that was chunked rather than the fetched bytes, so facts are extracted
+     * from exactly what was indexed and a document is never decoded twice - which for a PDF
+     * would be a second conversion, OCR and all.</p>
+     *
+     * @param publication     What {@link #published} or {@link #removed} returned
+     * @param text            The version's text as it was chunked; null for a removal, which
+     *                        has no content
+     * @param statedAtMillis  The document's own date, which its facts are ordered by: its
+     *                        modification time, or 0 when unknown
+     * @throws IllegalArgumentException if a published version comes without its text
      */
-    void report(Publication publication, FetchedDocument doc) {
+    void report(Publication publication, String text, long statedAtMillis) {
         Objects.requireNonNull(publication, "publication must not be null");
-        if (doc == null && !publication.removal()) {
+        if (text == null && !publication.removal()) {
             throw new IllegalArgumentException("a published version of "
-                + publication.documentKey + " must be reported with its document");
+                + publication.documentKey + " must be reported with its text");
         }
         Reports reports = publication.reports;
         reports.lock.lock();
         try {
             if (publication.number == reports.latest) {
-                deliver(publication, doc);
+                deliver(publication, text, statedAtMillis);
             }
         } finally {
             reports.lock.unlock();
@@ -238,10 +242,11 @@ final class GraphReporter {
     /**
      * Hands one publication to the sink.
      *
-     * @param publication The version to report
-     * @param doc         Its fetched content
+     * @param publication    The version to report
+     * @param text           Its text as it was chunked, or null for a removal
+     * @param statedAtMillis Its own date, or 0 when unknown
      */
-    private void deliver(Publication publication, FetchedDocument doc) {
+    private void deliver(Publication publication, String text, long statedAtMillis) {
         GraphIngestSink sink = this.graphSink;
         if (sink == null) {
             return;
@@ -255,9 +260,9 @@ final class GraphReporter {
             // says rather than from its tags.
             switch (publication.change) {
                 case PUBLISHED -> sink.onDocumentPublished(sourceId, documentKey,
-                    TextContent.decode(doc), doc.getLastModifiedMillis());
+                    text, statedAtMillis);
                 case REPLACED -> sink.onDocumentReplaced(sourceId, documentKey,
-                    TextContent.decode(doc), doc.getLastModifiedMillis());
+                    text, statedAtMillis);
                 case REMOVED -> sink.onDocumentRemoved(sourceId, documentKey);
             }
         } catch (RuntimeException e) {

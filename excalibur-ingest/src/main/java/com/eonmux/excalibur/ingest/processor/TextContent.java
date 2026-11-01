@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.ingest.processor;
 
-import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.TextEncoding;
 
 import java.nio.charset.Charset;
@@ -91,9 +90,10 @@ public final class TextContent {
     /**
      * Decodes a document's bytes as text, reducing HTML and XHTML to the text they show.
      *
-     * <p>This is how every source's documents become the text that is chunked: the encoding is
-     * the one the source declared, the rules are the ones the class describes, and markup is
-     * stripped for the content types {@link HtmlText#isMarkup} names.</p>
+     * <p>This is how every source's text documents become the text that is chunked: the encoding
+     * is the one the source declared, the rules are the ones the class describes, and markup is
+     * stripped for the content types {@link HtmlText#isMarkup} names. A PDF is read by
+     * {@link DocumentDecoder} instead, before these rules are reached.</p>
      *
      * @param content     The bytes the source handed back
      * @param charset     The encoding the source declared them to be in
@@ -111,39 +111,28 @@ public final class TextContent {
     }
 
     /**
-     * Decodes a fetched document by the encoding and content type its source reported.
+     * Names how a text document's bytes become its text, apart from the bytes themselves.
      *
-     * @param document What the source handed back
-     * @return The document's text, or {@code null} when it is not text
-     * @throws NullPointerException if document is null
-     */
-    public static String decode(FetchedDocument document) {
-        Objects.requireNonNull(document, "document must not be null");
-        return decode(document.getContent(), document.getCharset(), document.getContentType());
-    }
-
-    /**
-     * Names how a fetched document's bytes become its text, apart from the bytes themselves.
-     *
-     * <p>{@link #decode(FetchedDocument)} depends on exactly two things besides the content: the
-     * encoding the bytes are read in, and whether they are markup to be reduced to the text it
-     * shows. This names both - {@code windows-1252}, or {@code UTF-8+markup} - and nothing else,
-     * so it moves when the same bytes would decode to different text and not otherwise. A source
-     * registered again with another {@code charset}, or a server that starts labelling the same
-     * page with another encoding or as HTML, moves it; a new crawl delay, a moved modification
-     * time or a content type that is still not markup do not.</p>
+     * <p>{@link #decode(byte[], Charset, String)} depends on exactly two things besides the
+     * content: the encoding the bytes are read in, and whether they are markup to be reduced to
+     * the text it shows. This names both - {@code windows-1252}, or {@code UTF-8+markup} - and
+     * nothing else, so it moves when the same bytes would decode to different text and not
+     * otherwise. A source registered again with another {@code charset}, or a server that starts
+     * labelling the same page with another encoding or as HTML, moves it; a new crawl delay, a
+     * moved modification time or a content type that is still not markup do not.</p>
      *
      * <p>Recorded beside each indexed document, so a re-crawl can tell a document whose bytes
-     * are unchanged but whose text would not be from one it can leave alone.</p>
+     * are unchanged but whose text would not be from one it can leave alone. A PDF is named by
+     * {@link DocumentDecoder#decodingOf} instead, since neither of these says how it is read.</p>
      *
-     * @param document What the source handed back
+     * @param charset     The encoding the source declared
+     * @param contentType The content type the source reported, or null when it reported none
      * @return The decoding, never null
-     * @throws NullPointerException if document is null
+     * @throws NullPointerException if charset is null
      */
-    public static String decodingOf(FetchedDocument document) {
-        Objects.requireNonNull(document, "document must not be null");
-        String charset = document.getCharset().name();
-        return HtmlText.isMarkup(document.getContentType()) ? charset + MARKUP_DECODING : charset;
+    public static String decodingOf(Charset charset, String contentType) {
+        Objects.requireNonNull(charset, "charset must not be null");
+        return HtmlText.isMarkup(contentType) ? charset.name() + MARKUP_DECODING : charset.name();
     }
 
     /**

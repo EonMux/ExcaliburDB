@@ -35,6 +35,9 @@ class EvaluationCorpusTest {
 
     private static final IngestConfig INGEST = new Config(Map.of()).ingest();
 
+    /** The evaluation nodes' data root, which reading the corpus never writes to. */
+    private static final Path INDEX = Path.of("/nonexistent/evaluation-index");
+
     @Test
     @DisplayName("names every chunk the way a node's ingestion of the same directory does")
     void namesChunksAsIngestionDoes(@TempDir Path root) throws Exception {
@@ -42,7 +45,7 @@ class EvaluationCorpusTest {
         Files.writeString(root.resolve("notes/oom.txt"), "the OOM killer ran");
         Files.writeString(root.resolve("tls.txt"), "the handshake failed");
 
-        EvaluationCorpus corpus = EvaluationCorpus.read(root, INGEST);
+        EvaluationCorpus corpus = EvaluationCorpus.read(root, INGEST, INDEX);
 
         assertThat(corpus.chunks()).extracting(EvaluationCorpus.Chunk::id)
             .containsExactlyInAnyOrder(
@@ -62,7 +65,7 @@ class EvaluationCorpusTest {
         }
         Files.writeString(root.resolve("long.txt"), text);
 
-        EvaluationCorpus corpus = EvaluationCorpus.read(root, INGEST);
+        EvaluationCorpus corpus = EvaluationCorpus.read(root, INGEST, INDEX);
 
         String documentKey = ChunkIdentifiers.documentKey(EvaluationCorpus.SOURCE_ID, "long.txt");
         List<TextChunk> expected = new TextChunker(INGEST.getChunkTargetTokens(),
@@ -85,7 +88,7 @@ class EvaluationCorpusTest {
             (byte) 0xFF, (byte) 0xFE, 0, 1, 2, 3, 0, 0, 0});
         Files.writeString(root.resolve(".hidden.txt"), "never crawled");
 
-        EvaluationCorpus corpus = EvaluationCorpus.read(root, INGEST);
+        EvaluationCorpus corpus = EvaluationCorpus.read(root, INGEST, INDEX);
 
         assertThat(corpus.chunks()).extracting(EvaluationCorpus.Chunk::id)
             .containsExactly(ChunkIdentifiers.chunkId(EvaluationCorpus.SOURCE_ID, "kept.txt", 0));
@@ -96,7 +99,7 @@ class EvaluationCorpusTest {
     void emptyDocuments(@TempDir Path root) throws Exception {
         Files.writeString(root.resolve("empty.txt"), "", StandardCharsets.UTF_8);
 
-        EvaluationCorpus corpus = EvaluationCorpus.read(root, INGEST);
+        EvaluationCorpus corpus = EvaluationCorpus.read(root, INGEST, INDEX);
 
         assertThat(corpus.chunks()).isEmpty();
         assertThat(corpus.documents()).isEqualTo(1);
@@ -106,7 +109,7 @@ class EvaluationCorpusTest {
     @DisplayName("a fact's provenance leads back to the document it was extracted from")
     void provenanceLeadsToTheDocument(@TempDir Path root) throws Exception {
         Files.writeString(root.resolve("ada.txt"), "Ada Lovelace wrote Note G");
-        EvaluationCorpus corpus = EvaluationCorpus.read(root, INGEST);
+        EvaluationCorpus corpus = EvaluationCorpus.read(root, INGEST, INDEX);
         String documentKey = ChunkIdentifiers.documentKey(EvaluationCorpus.SOURCE_ID, "ada.txt");
 
         Provenance extracted = Provenance.of(SourceType.DOCUMENT,
@@ -127,7 +130,7 @@ class EvaluationCorpusTest {
     void notADirectory(@TempDir Path root) throws Exception {
         Path file = Files.writeString(root.resolve("file.txt"), "x");
 
-        assertThatThrownBy(() -> EvaluationCorpus.read(file, INGEST))
+        assertThatThrownBy(() -> EvaluationCorpus.read(file, INGEST, INDEX))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("directory");
     }

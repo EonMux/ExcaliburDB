@@ -124,6 +124,13 @@
     <!-- Reduce noise from third-party libraries -->
     <logger name="org.slf4j" level="WARN" />
     <logger name="ch.qos.logback" level="WARN" />
+    <!--
+        PDFBox warns about every damaged font table and unmapped glyph it reads past, several
+        lines per page of an ordinary real-world PDF. A PDF it cannot read at all is logged by
+        ingestion, naming the document, so only its errors are kept.
+    -->
+    <logger name="org.apache.pdfbox" level="ERROR" />
+    <logger name="org.apache.fontbox" level="ERROR" />
 
     <!--
         The audit trail: one event per mutating or administrative request - erasures, source

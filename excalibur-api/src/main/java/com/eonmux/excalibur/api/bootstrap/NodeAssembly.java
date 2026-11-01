@@ -9,6 +9,7 @@ import com.eonmux.excalibur.ingest.erasure.SegmentVectorEraser;
 import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
 import com.eonmux.excalibur.ingest.lexical.StoredChunkText;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
+import com.eonmux.excalibur.ingest.processor.DocumentDecoder;
 import com.eonmux.excalibur.ingest.registry.ErasureReceiptFile;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
 import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
@@ -207,9 +208,15 @@ public final class NodeAssembly {
         // source reports from its next run.
         server.withSourceStatus(SourceStatusFile.open(dataDir));
 
+        // One decoder for the crawl and the re-crawl, so both read a document alike and share one
+        // bound on PDF conversions. Built before anything is attached: a configured converter
+        // that cannot be found stops the node here rather than failing every PDF it is given.
+        DocumentDecoder documentDecoder = DocumentDecoders.from(config.ingest(), dataDir);
+        opened.documentDecoder = documentDecoder;
+
         IngestionWiring.Attachment ingestion = new IngestionWiring(config, dataDir,
-            core.storageEngine(), core.indexOrchestrator(), tracker, graphTenants)
-            .attachTo(server);
+            core.storageEngine(), core.indexOrchestrator(), tracker, graphTenants,
+            documentDecoder).attachTo(server);
         opened.ingestion = ingestion;
 
         // Erasure, wired after the pipeline because it removes what the pipeline wrote and needs
@@ -240,7 +247,7 @@ public final class NodeAssembly {
         // because it keeps the chunk index ingestion opened in step with what it rewrites.
         server.withReindexer(ReindexerFactory.create(config, core.storageEngine(),
             core.volumeManager(), core.indexOrchestrator(), tracker,
-            ingestion.chunkIndex()));
+            ingestion.chunkIndex(), documentDecoder));
         LOGGER.info("Document reindexer configured");
 
         return new NodeAssembly(config, dataDir, hnswConfigFactory, core, tracker, queryPipeline,
@@ -278,7 +285,7 @@ public final class NodeAssembly {
     public NodeShutdown shutdown(Duration shutdownTimeout) {
         return new NodeShutdown(server, core.indexOrchestrator(), ingestion.lexicalErasureSweep(),
             ingestion.chunkIndex(), documentVisibilityTracker, graphTenants,
-            core.storageEngine(), core.arena(), shutdownTimeout);
+            ingestion.documentDecoder(), core.storageEngine(), core.arena(), shutdownTimeout);
     }
 
     /**
@@ -404,6 +411,7 @@ public final class NodeAssembly {
         private final CoreComponents core;
         private QueryPipeline queryPipeline;
         private GraphTenants graphTenants;
+        private DocumentDecoder documentDecoder;
         private ExcaliburDBServer server;
         private IngestionWiring.Attachment ingestion;
 
@@ -420,6 +428,9 @@ public final class NodeAssembly {
             }
             if (queryPipeline != null) {
                 steps.add(() -> queryPipeline.shutdown(ABANDON_WAIT));
+            }
+            if (documentDecoder != null) {
+                steps.add(() -> releasePdfReader(documentDecoder));
             }
             if (ingestion != null && ingestion.lexicalErasureSweep() != null) {
                 steps.add(() -> ingestion.lexicalErasureSweep().close());
@@ -450,6 +461,18 @@ public final class NodeAssembly {
                 } catch (RuntimeException e) {
                     failure.addSuppressed(e);
                 }
+            }
+        }
+
+        private static void releasePdfReader(DocumentDecoder decoder) {
+            try {
+                if (!decoder.release(ABANDON_WAIT)) {
+                    throw new IllegalStateException("The PDF reader's OCR models were left "
+                        + "loaded: a conversion was still running");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while releasing the PDF reader", e);
             }
         }
     }

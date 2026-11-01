@@ -1,5 +1,8 @@
 package com.eonmux.excalibur.ingest.source;
 
+import com.eonmux.excalibur.core.hash.XxHash64;
+
+import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
@@ -84,14 +87,42 @@ public final class FetchedDocument {
      */
     public FetchedDocument(String documentId, byte[] content, String contentType,
                            Charset charset, long lastModifiedMillis, String entityTag) {
+        this(requireContent(content).clone(), documentId, contentType, charset,
+            lastModifiedMillis, entityTag);
+    }
+
+    /**
+     * Creates a FetchedDocument over an array the caller hands over rather than shares.
+     *
+     * <p>For a source that has just read the bytes into an array nothing else holds. The public
+     * constructors copy, which is what keeps a caller's later writes out of the document; an array
+     * no one else can reach needs no such protection, and copying it costs one more document's
+     * worth of heap at the moment the document is largest - a gigabyte for the largest PDF this
+     * node reads.</p>
+     *
+     * @param documentId        Unique identifier for this document (non-null, non-empty)
+     * @param content           The bytes, owned by the document from here on
+     * @param contentType       MIME type, or null for unknown
+     * @param charset           The encoding {@code content} is in; UTF-8 when null
+     * @param lastModifiedMillis Last modification timestamp in epoch millis (0 if unknown)
+     * @param entityTag         The server's entity tag for this version, or null for none
+     * @return The document
+     * @throws IllegalArgumentException if documentId is null or empty, or content is null
+     */
+    static FetchedDocument adopting(String documentId, byte[] content, String contentType,
+                                    Charset charset, long lastModifiedMillis, String entityTag) {
+        return new FetchedDocument(requireContent(content), documentId, contentType, charset,
+            lastModifiedMillis, entityTag);
+    }
+
+    /** Every constructor ends here, with an array that is the document's own. */
+    private FetchedDocument(byte[] owned, String documentId, String contentType,
+                            Charset charset, long lastModifiedMillis, String entityTag) {
         if (documentId == null || documentId.isEmpty()) {
             throw new IllegalArgumentException("Document ID must be non-null and non-empty");
         }
-        if (content == null) {
-            throw new IllegalArgumentException("Content must be non-null (use empty array for empty documents)");
-        }
         this.documentId = documentId;
-        this.content = content.clone();
+        this.content = owned;
         this.contentType = contentType != null ? contentType : "application/octet-stream";
         this.charset = charset != null ? charset : StandardCharsets.UTF_8;
         this.lastModifiedMillis = Math.max(0, lastModifiedMillis);
@@ -128,6 +159,31 @@ public final class FetchedDocument {
      */
     public byte[] getContent() {
         return content.clone();
+    }
+
+    /**
+     * Returns the content as a read-only view, without copying it.
+     *
+     * <p>For a reader that only reads, such as a PDF parser walking a document of hundreds of
+     * megabytes. {@link #getContent()} copies, which for those is a second document's worth
+     * of heap for nothing. The view cannot write through to the content, so the document stays
+     * immutable.</p>
+     *
+     * @return A read-only buffer over the content, positioned at its start
+     */
+    public ByteBuffer contentView() {
+        return ByteBuffer.wrap(content).asReadOnlyBuffer();
+    }
+
+    /**
+     * The content's hash, as the registry records it to tell one version from another.
+     *
+     * <p>Computed over the content in place, so a large document is not copied to be hashed.</p>
+     *
+     * @return The XXH64 hash, seed 0, of the content
+     */
+    public long contentHash() {
+        return XxHash64.hash(content);
     }
 
     /**
@@ -204,6 +260,13 @@ public final class FetchedDocument {
      */
     public boolean hasKnownLastModified() {
         return lastModifiedMillis > 0;
+    }
+
+    private static byte[] requireContent(byte[] content) {
+        if (content == null) {
+            throw new IllegalArgumentException("Content must be non-null (use empty array for empty documents)");
+        }
+        return content;
     }
 
     @Override

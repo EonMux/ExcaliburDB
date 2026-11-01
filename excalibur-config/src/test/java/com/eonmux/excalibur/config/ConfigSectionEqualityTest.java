@@ -151,7 +151,9 @@ class ConfigSectionEqualityTest {
     }
 
     private static SectionUnderTest ingest() {
-        return new SectionUnderTest(IngestConfig.class, IngestConfig::new, Map.of(), List.of(
+        return new SectionUnderTest(IngestConfig.class, IngestConfig::new,
+            // A converter command in every instance, so the command reader is a valid variant.
+            Map.of("excalibur.ingest.pdf-converter-command", "pdftotext"), List.of(
             v("documentTimeoutMs", "excalibur.ingest.document-atomicity-timeout-ms", "3000"),
             v("documentAtomicity", "excalibur.ingest.document-atomicity", "false"),
             v("reindexIntervalMs", "excalibur.ingest.reindex-interval-ms", "7200000"),
@@ -164,7 +166,21 @@ class ConfigSectionEqualityTest {
             v("chunkTargetTokens", "excalibur.ingest.chunk-target-tokens", "1024"),
             v("chunkOverlapTokens", "excalibur.ingest.chunk-overlap-tokens", "128"),
             v("bm25K1", "excalibur.ingest.bm25-k1", "1.5"),
-            v("bm25B", "excalibur.ingest.bm25-b", "0.55")));
+            v("bm25B", "excalibur.ingest.bm25-b", "0.55"),
+            v("pdfConverterCommand", "excalibur.ingest.pdf-converter-command", "indra-ocr"),
+            v("pdfConverterArgs", "excalibur.ingest.pdf-converter-args", "--format md"),
+            v("pdfConverterTimeoutSeconds", "excalibur.ingest.pdf-converter-timeout-seconds", "600"),
+            v("pdfConverterParallelism", "excalibur.ingest.pdf-converter-parallelism", "2"),
+            v("pdfReader", "excalibur.ingest.pdf-reader", "command"),
+            v("indraModelDir", "excalibur.ingest.indra-model-dir", "/srv/models"),
+            v("indraModelDownload", "excalibur.ingest.indra-model-download", "false"),
+            v("indraAcceptModelLicense", "excalibur.ingest.indra-accept-model-license", "true"),
+            v("indraMode", "excalibur.ingest.indra-mode", "ocr"),
+            v("indraDpi", "excalibur.ingest.indra-dpi", "300"),
+            v("indraThreads", "excalibur.ingest.indra-threads", "4"),
+            v("indraMath", "excalibur.ingest.indra-math", "true"),
+            v("indraKeepFurniture", "excalibur.ingest.indra-keep-furniture", "true"),
+            v("indraImageOcr", "excalibur.ingest.indra-image-ocr", "false")));
     }
 
     private static SectionUnderTest health() {

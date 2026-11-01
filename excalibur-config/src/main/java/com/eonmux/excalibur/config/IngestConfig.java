@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.config;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -95,6 +96,67 @@ public final class IngestConfig {
     /** How much BM25 discounts a match for the length of the chunk it was found in. */
     public static final double DEFAULT_BM25_B = 0.75;
 
+    /** Reads a PDF's text layer as it stands, in process; cannot read a scanned page. */
+    public static final String PDF_READER_TEXT_LAYER = "text-layer";
+
+    /**
+     * Reads PDFs with Indra OCR, in process: text layers where they can be trusted, OCR
+     * elsewhere, in reading order, as markdown. Its models are downloaded on first use and are
+     * published under their own licence, which must be accepted first.
+     */
+    public static final String PDF_READER_INDRA = "indra";
+
+    /** Hands every PDF to the external program {@code excalibur.ingest.pdf-converter-command}. */
+    public static final String PDF_READER_COMMAND = "command";
+
+    /**
+     * The external program PDFs are converted to text with; empty for none.
+     *
+     * <p>Empty by default, because a node ships with no such program.</p>
+     */
+    public static final String DEFAULT_PDF_CONVERTER_COMMAND = "";
+
+    /** Arguments placed between the converter and the PDF's path; none by default. */
+    public static final String DEFAULT_PDF_CONVERTER_ARGS = "";
+
+    /** The longest one PDF may take to convert before its document fails: an hour. */
+    public static final int DEFAULT_PDF_CONVERTER_TIMEOUT_SECONDS = 3600;
+
+    /** The most a deployment may give one PDF: a day. */
+    public static final int MAX_PDF_CONVERTER_TIMEOUT_SECONDS = 86_400;
+
+    /**
+     * How many PDFs a node converts at once.
+     *
+     * <p>One, because a converter that OCRs runs its pages in parallel on every core it may use;
+     * two of them at once compete for the same cores and finish no sooner.</p>
+     */
+    public static final int DEFAULT_PDF_CONVERTER_PARALLELISM = 1;
+
+    /** The most conversions a node may run at once. */
+    public static final int MAX_PDF_CONVERTER_PARALLELISM = 64;
+
+    /** Indra reads a text layer where it passes its checks, and OCRs every other page. */
+    public static final String INDRA_MODE_AUTO = "auto";
+
+    /** Indra OCRs every page, never reading a text layer. */
+    public static final String INDRA_MODE_OCR = "ocr";
+
+    /** Indra reads every text layer, even one that fails its checks; OCRs pages with none. */
+    public static final String INDRA_MODE_TEXT = "text";
+
+    /** The resolution pages are rendered at for OCR, Indra's own default. */
+    public static final int DEFAULT_INDRA_DPI = 200;
+
+    /** The lowest rendering resolution: one pixel per point. */
+    public static final int MIN_INDRA_DPI = 72;
+
+    /** The highest rendering resolution; past it a page's pixels outgrow what OCR gains. */
+    public static final int MAX_INDRA_DPI = 600;
+
+    /** The most threads one conversion may be given. */
+    public static final int MAX_INDRA_THREADS = 256;
+
     // All fields final for immutability
     private final int documentTimeoutMs;
     private final boolean documentAtomicity;
@@ -109,6 +171,21 @@ public final class IngestConfig {
     private final int chunkOverlapTokens;
     private final double bm25K1;
     private final double bm25B;
+    private final String pdfConverterCommand;
+    private final List<String> pdfConverterArgs;
+    private final int pdfConverterTimeoutSeconds;
+    private final int pdfConverterParallelism;
+    /** The reader as configured, empty when it is left to follow the converter command. */
+    private final String pdfReader;
+    private final String indraModelDir;
+    private final boolean indraModelDownload;
+    private final boolean indraAcceptModelLicense;
+    private final String indraMode;
+    private final int indraDpi;
+    private final int indraThreads;
+    private final boolean indraMath;
+    private final boolean indraKeepFurniture;
+    private final boolean indraImageOcr;
 
     /**
      * Creates an Ingest config from properties.
@@ -195,6 +272,185 @@ public final class IngestConfig {
             throw new IllegalArgumentException("excalibur.ingest.bm25-b must be in [0, 1], "
                 + "got: " + bm25B);
         }
+        this.pdfConverterCommand = PropertyParser.parseString(props,
+            "excalibur.ingest.pdf-converter-command", DEFAULT_PDF_CONVERTER_COMMAND).strip();
+        String args = PropertyParser.parseString(props,
+            "excalibur.ingest.pdf-converter-args", DEFAULT_PDF_CONVERTER_ARGS).strip();
+        this.pdfConverterArgs = args.isEmpty() ? List.of() : List.of(args.split("\\s+"));
+        // Validated whether or not a converter is named, so a file that is wrong is refused when
+        // it is written rather than on the day someone sets the command.
+        this.pdfConverterTimeoutSeconds = PropertyParser.parseInt(props,
+            "excalibur.ingest.pdf-converter-timeout-seconds",
+            DEFAULT_PDF_CONVERTER_TIMEOUT_SECONDS);
+        if (pdfConverterTimeoutSeconds < 1
+                || pdfConverterTimeoutSeconds > MAX_PDF_CONVERTER_TIMEOUT_SECONDS) {
+            throw new IllegalArgumentException("excalibur.ingest.pdf-converter-timeout-seconds "
+                + "must be between 1 and " + MAX_PDF_CONVERTER_TIMEOUT_SECONDS + ", got: "
+                + pdfConverterTimeoutSeconds);
+        }
+        this.pdfConverterParallelism = PropertyParser.parseInt(props,
+            "excalibur.ingest.pdf-converter-parallelism", DEFAULT_PDF_CONVERTER_PARALLELISM);
+        if (pdfConverterParallelism < 1
+                || pdfConverterParallelism > MAX_PDF_CONVERTER_PARALLELISM) {
+            throw new IllegalArgumentException("excalibur.ingest.pdf-converter-parallelism must "
+                + "be between 1 and " + MAX_PDF_CONVERTER_PARALLELISM + ", got: "
+                + pdfConverterParallelism);
+        }
+        this.pdfReader = parsePdfReader(props, pdfConverterCommand);
+        this.indraModelDir = PropertyParser.parseString(props,
+            "excalibur.ingest.indra-model-dir", "").strip();
+        this.indraModelDownload = PropertyParser.parseBoolean(props,
+            "excalibur.ingest.indra-model-download", true);
+        this.indraAcceptModelLicense = PropertyParser.parseBoolean(props,
+            "excalibur.ingest.indra-accept-model-license", false);
+        this.indraMode = PropertyParser.parseString(props, "excalibur.ingest.indra-mode",
+            INDRA_MODE_AUTO).toLowerCase(java.util.Locale.ROOT);
+        if (!List.of(INDRA_MODE_AUTO, INDRA_MODE_OCR, INDRA_MODE_TEXT).contains(indraMode)) {
+            throw new IllegalArgumentException("excalibur.ingest.indra-mode must be "
+                + INDRA_MODE_AUTO + ", " + INDRA_MODE_OCR + " or " + INDRA_MODE_TEXT + ", got: "
+                + indraMode);
+        }
+        this.indraDpi = PropertyParser.parseInt(props, "excalibur.ingest.indra-dpi",
+            DEFAULT_INDRA_DPI);
+        if (indraDpi < MIN_INDRA_DPI || indraDpi > MAX_INDRA_DPI) {
+            throw new IllegalArgumentException("excalibur.ingest.indra-dpi must be between "
+                + MIN_INDRA_DPI + " and " + MAX_INDRA_DPI + ", got: " + indraDpi);
+        }
+        this.indraThreads = PropertyParser.parseInt(props, "excalibur.ingest.indra-threads", 0);
+        if (indraThreads < 0 || indraThreads > MAX_INDRA_THREADS) {
+            throw new IllegalArgumentException("excalibur.ingest.indra-threads must be between "
+                + "0 (every core) and " + MAX_INDRA_THREADS + ", got: " + indraThreads);
+        }
+        this.indraMath = PropertyParser.parseBoolean(props, "excalibur.ingest.indra-math",
+            false);
+        this.indraKeepFurniture = PropertyParser.parseBoolean(props,
+            "excalibur.ingest.indra-keep-furniture", false);
+        this.indraImageOcr = PropertyParser.parseBoolean(props,
+            "excalibur.ingest.indra-image-ocr", true);
+    }
+
+    /**
+     * Reads the PDF reader setting and refuses one that contradicts the converter command.
+     *
+     * <p>Refused at startup rather than resolved either way: a command beside another reader, or
+     * the command reader without one, is an operator who meant one of the two, and guessing
+     * which reads every PDF the way they did not intend.</p>
+     */
+    private static String parsePdfReader(Map<String, String> props, String command) {
+        String reader = PropertyParser.parseString(props, "excalibur.ingest.pdf-reader", "")
+            .toLowerCase(java.util.Locale.ROOT);
+        if (!reader.isEmpty() && !List.of(PDF_READER_TEXT_LAYER, PDF_READER_INDRA,
+                PDF_READER_COMMAND).contains(reader)) {
+            throw new IllegalArgumentException("excalibur.ingest.pdf-reader must be "
+                + PDF_READER_TEXT_LAYER + ", " + PDF_READER_INDRA + " or " + PDF_READER_COMMAND
+                + ", got: " + reader);
+        }
+        if (reader.equals(PDF_READER_COMMAND) && command.isEmpty()) {
+            throw new IllegalArgumentException("excalibur.ingest.pdf-reader is " + reader
+                + ", but excalibur.ingest.pdf-converter-command names no program");
+        }
+        if (!reader.isEmpty() && !reader.equals(PDF_READER_COMMAND) && !command.isEmpty()) {
+            throw new IllegalArgumentException("excalibur.ingest.pdf-converter-command is set, "
+                + "but excalibur.ingest.pdf-reader is " + reader + ", which does not run it; "
+                + "clear one of the two");
+        }
+        return reader;
+    }
+
+    /**
+     * The external program PDFs are converted with.
+     *
+     * @return A name on the {@code PATH} or a path; empty when PDFs are read by the built-in
+     *         text-layer reader
+     */
+    public String getPdfConverterCommand() {
+        return pdfConverterCommand;
+    }
+
+    /**
+     * The arguments placed between the converter and the PDF's path.
+     *
+     * @return The arguments, split on whitespace; empty for none
+     */
+    public List<String> getPdfConverterArgs() {
+        return pdfConverterArgs;
+    }
+
+    /** The longest one PDF may take to convert, in seconds. */
+    public int getPdfConverterTimeoutSeconds() {
+        return pdfConverterTimeoutSeconds;
+    }
+
+    /** How many PDFs this node converts at once, across every source. */
+    public int getPdfConverterParallelism() {
+        return pdfConverterParallelism;
+    }
+
+    /**
+     * How PDFs are read.
+     *
+     * @return {@link #PDF_READER_TEXT_LAYER}, {@link #PDF_READER_INDRA} or
+     *         {@link #PDF_READER_COMMAND}; when none is configured, the command reader if a
+     *         converter command is set and the text-layer reader otherwise
+     */
+    public String getPdfReader() {
+        if (!pdfReader.isEmpty()) {
+            return pdfReader;
+        }
+        return pdfConverterCommand.isEmpty() ? PDF_READER_TEXT_LAYER : PDF_READER_COMMAND;
+    }
+
+    /**
+     * Where Indra OCR's models are kept.
+     *
+     * @return A directory; empty for the per-user cache directory
+     */
+    public String getIndraModelDir() {
+        return indraModelDir;
+    }
+
+    /** Whether models missing from the model directory are downloaded when first needed. */
+    public boolean isIndraModelDownload() {
+        return indraModelDownload;
+    }
+
+    /** Whether the operator has accepted the licence Indra OCR's models are published under. */
+    public boolean isIndraAcceptModelLicense() {
+        return indraAcceptModelLicense;
+    }
+
+    /**
+     * Where Indra reads a page from.
+     *
+     * @return {@link #INDRA_MODE_AUTO}, {@link #INDRA_MODE_OCR} or {@link #INDRA_MODE_TEXT}
+     */
+    public String getIndraMode() {
+        return indraMode;
+    }
+
+    /** The resolution pages are rendered at for OCR, in dots per inch. */
+    public int getIndraDpi() {
+        return indraDpi;
+    }
+
+    /** Threads one conversion may use; 0 for every core this process may run on. */
+    public int getIndraThreads() {
+        return indraThreads;
+    }
+
+    /** Whether formulas are read as LaTeX, which takes five more models. */
+    public boolean isIndraMath() {
+        return indraMath;
+    }
+
+    /** Whether page headers and footers are kept in the text. */
+    public boolean isIndraKeepFurniture() {
+        return indraKeepFurniture;
+    }
+
+    /** Whether text inside pictures on text-layer pages is OCRed too. */
+    public boolean isIndraImageOcr() {
+        return indraImageOcr;
     }
 
     /** Tokens one chunk aims for. */
@@ -313,7 +569,9 @@ public final class IngestConfig {
         return "Ingest{documentTimeoutMs=" + documentTimeoutMs +
                ", documentAtomicity=" + documentAtomicity +
                ", reindexIntervalMs=" + reindexIntervalMs +
-               ", crawlDelayMs=" + crawlDelayMs + '}';
+               ", crawlDelayMs=" + crawlDelayMs +
+               ", pdfReader=" + getPdfReader() +
+               ", pdfConverterCommand=" + pdfConverterCommand + '}';
     }
 
     @Override
@@ -337,13 +595,31 @@ public final class IngestConfig {
             && chunkOverlapTokens == other.chunkOverlapTokens
             && Double.compare(bm25K1, other.bm25K1) == 0
             && Double.compare(bm25B, other.bm25B) == 0
-            && Objects.equals(lexicalEngine, other.lexicalEngine);
+            && Objects.equals(lexicalEngine, other.lexicalEngine)
+            && Objects.equals(pdfConverterCommand, other.pdfConverterCommand)
+            && Objects.equals(pdfConverterArgs, other.pdfConverterArgs)
+            && pdfConverterTimeoutSeconds == other.pdfConverterTimeoutSeconds
+            && pdfConverterParallelism == other.pdfConverterParallelism
+            && pdfReader.equals(other.pdfReader)
+            && indraModelDir.equals(other.indraModelDir)
+            && indraModelDownload == other.indraModelDownload
+            && indraAcceptModelLicense == other.indraAcceptModelLicense
+            && indraMode.equals(other.indraMode)
+            && indraDpi == other.indraDpi
+            && indraThreads == other.indraThreads
+            && indraMath == other.indraMath
+            && indraKeepFurniture == other.indraKeepFurniture
+            && indraImageOcr == other.indraImageOcr;
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(documentTimeoutMs, documentAtomicity, reindexIntervalMs, crawlDelayMs,
             lexicalEngine, lexicalTombstoneRatio, lexicalMaxLatencySeconds, lexicalMaxSegments,
-            lexicalRefreshIntervalMs, chunkTargetTokens, chunkOverlapTokens, bm25K1, bm25B);
+            lexicalRefreshIntervalMs, chunkTargetTokens, chunkOverlapTokens, bm25K1, bm25B,
+            pdfConverterCommand, pdfConverterArgs, pdfConverterTimeoutSeconds,
+            pdfConverterParallelism, pdfReader, indraModelDir, indraModelDownload,
+            indraAcceptModelLicense, indraMode, indraDpi, indraThreads, indraMath,
+            indraKeepFurniture, indraImageOcr);
     }
 }

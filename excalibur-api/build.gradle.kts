@@ -68,6 +68,8 @@ dependencies {
     // and encode them the way logback.xml does.
     testImplementation("ch.qos.logback:logback-classic:1.5.12")
     testImplementation("net.logstash.logback:logstash-logback-encoder:8.0")
+    // Builds a scanned PDF for the test that reads one through the node's Indra OCR decoder.
+    testImplementation("org.apache.pdfbox:pdfbox:3.0.8")
 
     // Phase 1 (core primitives) - for memory segment abstraction
     implementation(project(":excalibur-core"))
@@ -131,6 +133,12 @@ tasks.shadowJar {
 
     // Merge service files
     mergeServiceFiles()
+
+    // Every bundled library's licence and notice files travel with it. Several jars name them
+    // alike, and a fat jar keeps only the first of a name unless told otherwise, which would drop
+    // attributions their licences require.
+    listOf("META-INF/LICENSE", "META-INF/LICENSE.txt", "META-INF/NOTICE", "META-INF/NOTICE.txt")
+        .forEach { append(it) }
 
     // Exclude unnecessary files
     exclude("META-INF/*.SF")

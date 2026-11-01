@@ -3,7 +3,8 @@ package com.eonmux.excalibur.ingest.pipeline;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.processor.TextChunk;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
-import com.eonmux.excalibur.ingest.processor.TextContent;
+import com.eonmux.excalibur.ingest.processor.DocumentDecoder;
+import com.eonmux.excalibur.ingest.processor.PdfConversionException;
 import com.eonmux.excalibur.ingest.registry.DocumentLocks;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
@@ -148,6 +149,19 @@ final class DocumentReindexStep {
     /** Tells the graph about each version this step publishes. */
     private final GraphReporter graphReporter;
 
+    /** Reads fetched documents into text, as the first crawl does. */
+    private final DocumentDecoder decoder;
+
+    /**
+     * One version of a document as this step read it.
+     *
+     * @param fetched  What the source handed back, whose bytes the registry hashes
+     * @param text     The text it was read into, which was chunked and goes to the graph
+     * @param decoding How those bytes became that text; see {@link DocumentDecoder#decodingOf}
+     */
+    private record Version(FetchedDocument fetched, String text, String decoding) {
+    }
+
     /**
      * What publishing a version produced under the document's lock.
      *
@@ -217,15 +231,17 @@ final class DocumentReindexStep {
      * @param lexical       The lexical index to keep in step with storage
      * @param vectorEraser  Retires a replaced version's surplus graph nodes, or null for none
      * @param graphReporter Tells the graph about each version published
+     * @param decoder       Reads fetched documents into text
      * @param target        Where the chunks go and how they are made visible
      */
     static DocumentReindexStep publishing(TextChunker chunker, LLMHttpClient llmClient,
                                           DocumentRegistry registry, UpsertHandler upsertHandler,
                                           ReindexLexicalIndex lexical,
                                           DocumentErasureService.VectorEraser vectorEraser,
-                                          GraphReporter graphReporter, AtomicTarget target) {
+                                          GraphReporter graphReporter, DocumentDecoder decoder,
+                                          AtomicTarget target) {
         return new DocumentReindexStep(chunker, llmClient, registry, upsertHandler, lexical,
-            vectorEraser, graphReporter,
+            vectorEraser, graphReporter, decoder,
             Objects.requireNonNull(target, "target must not be null"), null);
     }
 
@@ -239,6 +255,7 @@ final class DocumentReindexStep {
      * @param lexical       The lexical index to keep in step with storage
      * @param vectorEraser  Retires a replaced version's surplus graph nodes, or null for none
      * @param graphReporter Tells the graph about each version published
+     * @param decoder       Reads fetched documents into text
      * @param storageWriter Persists one chunk
      */
     static DocumentReindexStep writingDirectly(TextChunker chunker, LLMHttpClient llmClient,
@@ -247,9 +264,10 @@ final class DocumentReindexStep {
                                                ReindexLexicalIndex lexical,
                                                DocumentErasureService.VectorEraser vectorEraser,
                                                GraphReporter graphReporter,
+                                               DocumentDecoder decoder,
                                                DocumentReindexer.StorageWriter storageWriter) {
         return new DocumentReindexStep(chunker, llmClient, registry, upsertHandler, lexical,
-            vectorEraser, graphReporter, null,
+            vectorEraser, graphReporter, decoder, null,
             Objects.requireNonNull(storageWriter, "storageWriter must not be null"));
     }
 
@@ -257,7 +275,8 @@ final class DocumentReindexStep {
                                 DocumentRegistry registry, UpsertHandler upsertHandler,
                                 ReindexLexicalIndex lexical,
                                 DocumentErasureService.VectorEraser vectorEraser,
-                                GraphReporter graphReporter, AtomicTarget atomic,
+                                GraphReporter graphReporter, DocumentDecoder decoder,
+                                AtomicTarget atomic,
                                 DocumentReindexer.StorageWriter storageWriter) {
         this.chunker = chunker;
         this.llmClient = llmClient;
@@ -267,6 +286,7 @@ final class DocumentReindexStep {
         this.vectorEraser = vectorEraser;
         this.graphReporter =
             Objects.requireNonNull(graphReporter, "graphReporter must not be null");
+        this.decoder = Objects.requireNonNull(decoder, "decoder must not be null");
         this.atomic = atomic;
         this.storageWriter = storageWriter;
     }
@@ -276,10 +296,11 @@ final class DocumentReindexStep {
      * chunk, and publishes the lot or none of it.
      *
      * <p>The stop is not a checkpoint here - a document is written whole or not at all - but it
-     * may interrupt the embedding requests, which wait on the endpoint and touch nothing this
-     * node shares. A chunk whose embedding a stop cut short fails like any other unembeddable
-     * chunk, so the document is left on its previous version with nothing written, and every
-     * write runs with the thread's interrupt flag clear.</p>
+     * may interrupt reading the document - a PDF's conversion - and the embedding requests,
+     * which wait on a process or the endpoint and touch nothing this node shares. A chunk whose
+     * embedding a stop cut short fails like any other unembeddable chunk, so the document is left
+     * on its previous version with nothing written, and every write runs with the thread's
+     * interrupt flag clear.</p>
      *
      * @param sourceId   The source the document belongs to
      * @param documentId The document
@@ -288,35 +309,45 @@ final class DocumentReindexStep {
      * @return The outcome, carrying the chunk ids the new version consists of
      * @throws IllegalArgumentException if the content or its chunk count exceeds
      *                                  {@link DocumentLimits}
+     * @throws PdfConversionException   if the PDF converter fails on the document, or a stop
+     *                                  ends its conversion
      */
     DocumentResult reindex(String sourceId, String documentId, FetchedDocument fetched,
                            StopSignal stop) {
         Objects.requireNonNull(stop, "stop must not be null");
         long startTime = System.currentTimeMillis();
 
-        byte[] content = fetched.getContent();
-        if (content == null || content.length == 0) {
+        if (fetched.getContentLength() == 0) {
             return DocumentResult.skipped(documentId, DocumentResult.SkipReason.EMPTY_CONTENT,
                 System.currentTimeMillis() - startTime);
         }
 
-        if (content.length > DocumentLimits.MAX_DOCUMENT_BYTES) {
-            throw new IllegalArgumentException("Content length " + content.length
-                + " exceeds maximum " + DocumentLimits.MAX_DOCUMENT_BYTES);
+        if (DocumentLimits.exceeds(fetched)) {
+            throw new IllegalArgumentException("Content length " + fetched.getContentLength()
+                + " exceeds the ingest limit for its kind");
         }
 
         // The same gate the first crawl applies. Without it a re-crawl is the way binary
         // content gets into an index that refused it once: a source is crawled by
         // DocumentIngestor only the first time, and by this step on every pass after it.
-        String text = TextContent.decode(content, fetched.getCharset(),
-            fetched.getContentType());
-        if (text == null) {
-            LOG.info("Skipping document {}: its {} bytes are not text in {}",
-                documentId, content.length, fetched.getCharset());
+        // A PDF is read, or converted with OCR, here; a stop may cut that short, since it touches
+        // nothing shared: memory, or a temporary file and the converter's process, and the first
+        // time OCR runs, a model download of its own. Both a stop and a converter failure leave
+        // the document on its previous version, and the run counts it failed.
+        DocumentDecoder.Decoded decoded;
+        try {
+            decoded = stop.interruptibly(() -> decoder.decode(fetched));
+        } catch (InterruptedException e) {
+            throw new PdfConversionException("Reading " + documentId
+                + " was stopped before it finished", e);
+        }
+        if (!decoded.isText()) {
+            LOG.info("Skipping document {}: {}", documentId, decoded.refusal());
             return DocumentResult.skipped(documentId, DocumentResult.SkipReason.NOT_TEXT,
                 System.currentTimeMillis() - startTime);
         }
 
+        String text = decoded.text();
         List<TextChunk> chunks = chunker.chunk(documentId, text);
         if (chunks.isEmpty()) {
             return DocumentResult.skipped(documentId, DocumentResult.SkipReason.NO_CHUNKS,
@@ -342,11 +373,12 @@ final class DocumentReindexStep {
                 leftUnchanged(embeddings.failures(), embeddings.errors(), chunks.size()));
         }
 
+        Version version = new Version(fetched, text, decoder.decodingOf(fetched));
         if (atomic != null) {
-            return publishAtomically(sourceId, documentId, fetched, content, chunks,
+            return publishAtomically(sourceId, documentId, version, chunks,
                 embeddings.vectors(), startTime);
         }
-        return writeDirectly(sourceId, documentId, fetched, content, chunks,
+        return writeDirectly(sourceId, documentId, version, chunks,
             embeddings.vectors(), startTime);
     }
 
@@ -355,12 +387,12 @@ final class DocumentReindexStep {
      * under the document's lock; see the class documentation for the order and why.
      */
     private DocumentResult publishAtomically(String sourceId, String documentId,
-                                             FetchedDocument fetched, byte[] content,
+                                             Version version,
                                              List<TextChunk> chunks, List<float[]> vectors,
                                              long startTime) {
         String documentKey = ChunkIdentifiers.documentKey(sourceId, documentId);
         Attempt attempt = DocumentLocks.shared().inDocument(documentKey,
-            () -> writeAndPublish(sourceId, documentId, documentKey, fetched, content, chunks,
+            () -> writeAndPublish(sourceId, documentId, documentKey, version, chunks,
                 vectors));
         ChunkWrites writes = attempt.writes();
         long elapsed = System.currentTimeMillis() - startTime;
@@ -375,7 +407,7 @@ final class DocumentReindexStep {
         Committed committed = attempt.committed();
         LOG.info("Document {} published atomically at epoch {}: {} chunks in {}ms",
             documentId, committed.epoch(), writes.successes(), elapsed);
-        indexAndReport(writes.chunkIds(), chunks, committed, fetched);
+        indexAndReport(writes.chunkIds(), chunks, committed, version);
         return new DocumentResult(documentId, chunks.size(), writes.successes(),
             writes.failures(), elapsed, null, writes.chunkIds())
             .withChunksRetired(committed.retired());
@@ -386,7 +418,7 @@ final class DocumentReindexStep {
      * it, with the document's lock held.
      */
     private Attempt writeAndPublish(String sourceId, String documentId, String documentKey,
-                                    FetchedDocument fetched, byte[] content,
+                                    Version version,
                                     List<TextChunk> chunks, List<float[]> vectors) {
         String keyTaken = keyTaken(sourceId, documentId);
         if (keyTaken != null) {
@@ -432,7 +464,7 @@ final class DocumentReindexStep {
         }
 
         batchBuffer.seal();
-        DocumentMetadata metadata = metadataOf(sourceId, documentId, content, fetched,
+        DocumentMetadata metadata = metadataOf(sourceId, documentId, version,
             writes.chunkIds());
 
         // Before the publication, while the document is still hidden: retired after it, the
@@ -475,7 +507,7 @@ final class DocumentReindexStep {
      * epoch-based visibility management.
      */
     private DocumentResult writeDirectly(String sourceId, String documentId,
-                                         FetchedDocument fetched, byte[] content,
+                                         Version version,
                                          List<TextChunk> chunks, List<float[]> vectors,
                                          long startTime) {
         // Under the document's lock from the first write, for the reasons the atomic path holds
@@ -484,7 +516,7 @@ final class DocumentReindexStep {
         // when they land.
         String documentKey = ChunkIdentifiers.documentKey(sourceId, documentId);
         Attempt attempt = DocumentLocks.shared().inDocument(documentKey,
-            () -> writeAndRegister(sourceId, documentId, documentKey, fetched, content, chunks,
+            () -> writeAndRegister(sourceId, documentId, documentKey, version, chunks,
                 vectors));
         ChunkWrites writes = attempt.writes();
         if (attempt.committed() == null) {
@@ -496,7 +528,7 @@ final class DocumentReindexStep {
         LOG.debug("Re-indexed document {}: {} chunks in {}ms",
             documentId, writes.successes(), elapsed);
 
-        indexAndReport(writes.chunkIds(), chunks, committed, fetched);
+        indexAndReport(writes.chunkIds(), chunks, committed, version);
         return new DocumentResult(documentId, chunks.size(), writes.successes(),
             writes.failures(), elapsed, null, writes.chunkIds())
             .withChunksRetired(committed.retired());
@@ -507,7 +539,7 @@ final class DocumentReindexStep {
      * lock held.
      */
     private Attempt writeAndRegister(String sourceId, String documentId, String documentKey,
-                                     FetchedDocument fetched, byte[] content,
+                                     Version version,
                                      List<TextChunk> chunks, List<float[]> vectors) {
         String keyTaken = keyTaken(sourceId, documentId);
         if (keyTaken != null) {
@@ -531,8 +563,8 @@ final class DocumentReindexStep {
                 leftUnchanged(writes.failures(), writes.errors(), chunks.size()));
         }
 
-        DocumentMetadata metadata = metadataOf(sourceId, documentId, content,
-            fetched, writes.chunkIds());
+        DocumentMetadata metadata = metadataOf(sourceId, documentId, version,
+            writes.chunkIds());
         DocumentMetadata previous = registry.get(sourceId, documentId);
         int retired = retireSuperseded(previous, writes.chunkIds());
         registry.register(metadata);
@@ -582,11 +614,12 @@ final class DocumentReindexStep {
      * reported would hold its document's entry in the reporter for good.</p>
      */
     private void indexAndReport(List<String> chunkIds, List<TextChunk> chunks,
-                                Committed committed, FetchedDocument fetched) {
+                                Committed committed, Version version) {
         try {
             lexical.index(chunkIds, chunks);
         } finally {
-            graphReporter.report(committed.publication(), fetched);
+            graphReporter.report(committed.publication(), version.text(),
+                version.fetched().getLastModifiedMillis());
         }
     }
 
@@ -669,18 +702,17 @@ final class DocumentReindexStep {
      * the decoding: the next run reads these bytes again only if they would now become other
      * text.</p>
      */
-    private static DocumentMetadata metadataOf(String sourceId, String documentId, byte[] content,
-                                               FetchedDocument fetched,
-                                               List<String> chunkIds) {
-        DocumentValidators version = fetched.validators();
+    private static DocumentMetadata metadataOf(String sourceId, String documentId,
+                                               Version version, List<String> chunkIds) {
+        DocumentValidators validators = version.fetched().validators();
         return DocumentMetadata.builder()
             .sourceId(sourceId)
             .documentId(documentId)
-            .lastModifiedMillis(version.lastModifiedMillis())
-            .entityTag(version.entityTag())
-            .decoding(TextContent.decodingOf(fetched))
-            .contentHash(DocumentRegistry.computeContentHash(content))
-            .contentLength(content.length)
+            .lastModifiedMillis(validators.lastModifiedMillis())
+            .entityTag(validators.entityTag())
+            .decoding(version.decoding())
+            .contentHash(version.fetched().contentHash())
+            .contentLength(version.fetched().getContentLength())
             .chunkIds(chunkIds)
             .indexTimeMillis(System.currentTimeMillis())
             .build();

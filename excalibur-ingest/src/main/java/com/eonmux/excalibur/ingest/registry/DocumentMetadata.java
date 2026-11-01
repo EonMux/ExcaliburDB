@@ -58,7 +58,7 @@ import java.util.Objects;
  *   <li>contentLength: non-negative byte count</li>
  *   <li>chunkIds: immutable list of non-null strings</li>
  *   <li>entityTag: the tag exactly as the source reported it, or null for none</li>
- *   <li>decoding: as {@link com.eonmux.excalibur.ingest.processor.TextContent#decodingOf} names
+ *   <li>decoding: as {@link com.eonmux.excalibur.ingest.processor.DocumentDecoder#decodingOf} names
  *       it, or null when it was not recorded</li>
  * </ul>
  */
@@ -144,7 +144,7 @@ public final class DocumentMetadata {
     /**
      * How the indexed text was read out of the document's bytes.
      *
-     * @return The decoding, as {@link com.eonmux.excalibur.ingest.processor.TextContent#decodingOf}
+     * @return The decoding, as {@link com.eonmux.excalibur.ingest.processor.DocumentDecoder#decodingOf}
      *         names it, or null when the entry was recorded without one
      */
     public String getDecoding() {
@@ -340,7 +340,7 @@ public final class DocumentMetadata {
         /**
          * Records how the indexed text was read out of the document's bytes.
          *
-         * @param decoding As {@link com.eonmux.excalibur.ingest.processor.TextContent#decodingOf}
+         * @param decoding As {@link com.eonmux.excalibur.ingest.processor.DocumentDecoder#decodingOf}
          *                 names it, or null when it is not known
          * @return This builder
          */
@@ -374,7 +374,7 @@ public final class DocumentMetadata {
          * @param contentHash        The hash of the bytes, 0 when not computed
          * @param contentLength      The number of bytes
          * @param decoding           As
-         *                           {@link com.eonmux.excalibur.ingest.processor.TextContent#decodingOf}
+         *                           {@link com.eonmux.excalibur.ingest.processor.DocumentDecoder#decodingOf}
          *                           names it, or null when it is not known
          */
         public FetchedDocumentInfo(long lastModifiedMillis, long contentHash, long contentLength,

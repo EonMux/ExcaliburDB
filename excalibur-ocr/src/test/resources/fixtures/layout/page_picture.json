@@ -1,0 +1,227 @@
+{
+ "page": "picture",
+ "table_heads": false,
+ "runs": [
+  {
+   "wh": [
+    1100,
+    1400
+   ],
+   "texts": [
+    "Vol. 2 (2026)",
+    "Journal of Synthetic Pages",
+    "6 Appearance",
+    "Figure 1 shows a rendered sample page. The detector marks",
+    "the picture region so that its text is not read as lines.",
+    "Figure 1: A rendered sample with shapes.",
+    "The caption sits below the figure and is read after it; the",
+    "paragraph that follows continues the section.",
+    "10"
+   ],
+   "order": [
+    1,
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+   ],
+   "inner_orders": [
+    [
+     1,
+     0,
+     2,
+     3,
+     4,
+     5,
+     6
+    ]
+   ],
+   "xycut_blocks": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     0
+    ],
+    [
+     5
+    ],
+    [
+     6,
+     7
+    ],
+    [
+     8
+    ]
+   ],
+   "order_xycut": [
+    1,
+    2,
+    3,
+    4,
+    0,
+    5,
+    6,
+    7,
+    8
+   ]
+  }
+ ],
+ "cells": {
+  "line": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8
+  ],
+  "texts": [
+   "Vol. 2 (2026)",
+   "Journal of Synthetic Pages",
+   "6 Appearance",
+   "Figure 1 shows a rendered sample page. The detector marks",
+   "the picture region so that its text is not read as lines.",
+   "Figure 1: A rendered sample with shapes.",
+   "The caption sits below the figure and is read after it; the",
+   "paragraph that follows continues the section.",
+   "10"
+  ]
+ },
+ "page_blocks": [
+  {
+   "label": "Page-Header",
+   "bbox": [
+    68.7,
+    37.5,
+    275.8,
+    53.5
+   ],
+   "text": "Journal of Synthetic Pages"
+  },
+  {
+   "label": "Page-Header",
+   "bbox": [
+    899.8,
+    35.8,
+    1006.0,
+    52.6
+   ],
+   "text": "Vol. 2 (2026)"
+  },
+  {
+   "label": "Section-Header",
+   "bbox": [
+    70.3,
+    101.4,
+    257.8,
+    124.7
+   ],
+   "text": "6 Appearance"
+  },
+  {
+   "label": "Text",
+   "bbox": [
+    68.2,
+    155.0,
+    642.7,
+    206.1
+   ],
+   "text": "Figure 1 shows a rendered sample page. The detector marks\nthe picture region so that its text is not read as lines."
+  },
+  {
+   "label": "Caption",
+   "bbox": [
+    300.7,
+    745.1,
+    691.9,
+    764.0
+   ],
+   "text": "Figure 1: A rendered sample with shapes."
+  },
+  {
+   "label": "Text",
+   "bbox": [
+    68.2,
+    824.9,
+    604.4,
+    875.9
+   ],
+   "text": "The caption sits below the figure and is read after it; the\nparagraph that follows continues the section."
+  },
+  {
+   "label": "Page-Footer",
+   "bbox": [
+    539.5,
+    1346.7,
+    565.2,
+    1359.3
+   ],
+   "text": "10"
+  }
+ ],
+ "markdown": [
+  {
+   "keep_furniture": false,
+   "tab": false,
+   "pictures": true,
+   "markdown": "## 6 Appearance\n\nFigure 1 shows a rendered sample page. The detector marks the picture region so that its text is not read as lines.\n\n![](picture-0)\n\nFigure 1: A rendered sample with shapes.\n\nThe caption sits below the figure and is read after it; the paragraph that follows continues the section."
+  },
+  {
+   "keep_furniture": false,
+   "tab": false,
+   "pictures": false,
+   "markdown": "## 6 Appearance\n\nFigure 1 shows a rendered sample page. The detector marks the picture region so that its text is not read as lines.\n\nFigure 1: A rendered sample with shapes.\n\nThe caption sits below the figure and is read after it; the paragraph that follows continues the section."
+  },
+  {
+   "keep_furniture": false,
+   "tab": true,
+   "pictures": true,
+   "markdown": "## 6 Appearance\n\nFigure 1 shows a rendered sample page. The detector marks the picture region so that its text is not read as lines.\n\n![](picture-0)\n\nFigure 1: A rendered sample with shapes.\n\nThe caption sits below the figure and is read after it; the paragraph that follows continues the section."
+  },
+  {
+   "keep_furniture": false,
+   "tab": true,
+   "pictures": false,
+   "markdown": "## 6 Appearance\n\nFigure 1 shows a rendered sample page. The detector marks the picture region so that its text is not read as lines.\n\nFigure 1: A rendered sample with shapes.\n\nThe caption sits below the figure and is read after it; the paragraph that follows continues the section."
+  },
+  {
+   "keep_furniture": true,
+   "tab": false,
+   "pictures": true,
+   "markdown": "Journal of Synthetic Pages\n\nVol. 2 (2026)\n\n## 6 Appearance\n\nFigure 1 shows a rendered sample page. The detector marks the picture region so that its text is not read as lines.\n\n![](picture-0)\n\nFigure 1: A rendered sample with shapes.\n\nThe caption sits below the figure and is read after it; the paragraph that follows continues the section.\n\n10"
+  },
+  {
+   "keep_furniture": true,
+   "tab": false,
+   "pictures": false,
+   "markdown": "Journal of Synthetic Pages\n\nVol. 2 (2026)\n\n## 6 Appearance\n\nFigure 1 shows a rendered sample page. The detector marks the picture region so that its text is not read as lines.\n\nFigure 1: A rendered sample with shapes.\n\nThe caption sits below the figure and is read after it; the paragraph that follows continues the section.\n\n10"
+  },
+  {
+   "keep_furniture": true,
+   "tab": true,
+   "pictures": true,
+   "markdown": "Journal of Synthetic Pages\n\nVol. 2 (2026)\n\n## 6 Appearance\n\nFigure 1 shows a rendered sample page. The detector marks the picture region so that its text is not read as lines.\n\n![](picture-0)\n\nFigure 1: A rendered sample with shapes.\n\nThe caption sits below the figure and is read after it; the paragraph that follows continues the section.\n\n10"
+  },
+  {
+   "keep_furniture": true,
+   "tab": true,
+   "pictures": false,
+   "markdown": "Journal of Synthetic Pages\n\nVol. 2 (2026)\n\n## 6 Appearance\n\nFigure 1 shows a rendered sample page. The detector marks the picture region so that its text is not read as lines.\n\nFigure 1: A rendered sample with shapes.\n\nThe caption sits below the figure and is read after it; the paragraph that follows continues the section.\n\n10"
+  }
+ ]
+}

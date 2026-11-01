@@ -90,7 +90,7 @@ class SourceRestorationTest {
 
         assertThat(restored).isEqualTo(1);
         assertThat(((FilesystemSource) registry.get("big-files")).getMaxFileSize())
-            .isEqualTo(DocumentLimits.MAX_DOCUMENT_BYTES);
+            .isEqualTo(DocumentLimits.MAX_PDF_BYTES);
     }
 
     @Test

@@ -3,6 +3,7 @@ package com.eonmux.excalibur.ingest.pipeline;
 import com.eonmux.excalibur.core.util.StopSignal;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
+import com.eonmux.excalibur.ingest.processor.DocumentDecoder;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.ChangeDetector;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
@@ -404,6 +405,26 @@ public class DocumentReindexer {
     }
 
     /**
+     * How fetched documents become text; PDFs by their text layer until a converter is wired.
+     * Read per run, like the other collaborators wired after construction.
+     */
+    private volatile DocumentDecoder documentDecoder = DocumentDecoder.builtIn();
+
+    /**
+     * Reads documents with the given decoder from now on.
+     *
+     * <p>The same decoder ingestion reads with, so a re-crawl turns the same bytes into the same
+     * text, and records the same decoding, as the crawl that first indexed them.</p>
+     *
+     * @param documentDecoder The decoder
+     * @throws NullPointerException if documentDecoder is null
+     */
+    public void setDocumentDecoder(DocumentDecoder documentDecoder) {
+        this.documentDecoder = Objects.requireNonNull(documentDecoder,
+            "documentDecoder must not be null");
+    }
+
+    /**
      * Reports through the given reporter from now on.
      *
      * @param graphReporter The reporter ingestion reports through
@@ -710,7 +731,7 @@ public class DocumentReindexer {
         DocumentReindexStep step = hasAtomicPublication()
             ? step(new DocumentReindexStep.AtomicTarget(offsetAwareWriter, batchPublisher))
             : DocumentReindexStep.writingDirectly(chunker, llmClient, registry, upsertHandler,
-                lexical, vectorEraser, graphReporter, storageWriter);
+                lexical, vectorEraser, graphReporter, documentDecoder, storageWriter);
         return step.reindex(sourceId, documentId, fetched, stop);
     }
 
@@ -724,13 +745,13 @@ public class DocumentReindexer {
      */
     private SourceReindexPass pass(SourceReindexPass.DocumentStep documentStep) {
         return new SourceReindexPass(registry, upsertHandler, lexical, vectorEraser,
-            graphReporter, batchPublisher, documentStep);
+            graphReporter, batchPublisher, documentDecoder, documentStep);
     }
 
     /** Builds the per-document step for a run that publishes atomically. */
     private DocumentReindexStep step(DocumentReindexStep.AtomicTarget target) {
         return DocumentReindexStep.publishing(chunker, llmClient, registry, upsertHandler, lexical,
-            vectorEraser, graphReporter, target);
+            vectorEraser, graphReporter, documentDecoder, target);
     }
 
     /**

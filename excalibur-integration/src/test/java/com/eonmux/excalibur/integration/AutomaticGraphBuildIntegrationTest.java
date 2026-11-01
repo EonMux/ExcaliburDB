@@ -139,7 +139,7 @@ class AutomaticGraphBuildIntegrationTest {
         server.withGraphSupport(tenants);
         server.withReindexer(ReindexerFactory.create(config, core.storageEngine(),
             core.volumeManager(), core.indexOrchestrator(),
-            tracker, attachment.chunkIndex()));
+            tracker, attachment.chunkIndex(), attachment.documentDecoder()));
         server.start();
     }
 

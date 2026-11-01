@@ -1,0 +1,906 @@
+{
+ "cases": [
+  {
+   "mode": "auto",
+   "math": false,
+   "furniture": false,
+   "documents": {
+    "scan.pdf": [
+     {
+      "part": "## Field Notes on River Sediment\n\nSamples were taken at four stations along the lower reach, each at a depth of two metres, over three days in spring. Fine silt dominated the slow inner bends, while coarse sand and gravel lined the faster outer banks of the channel. 1. Station A: mostly silt, with traces of organic matter. 2. Station B: medium sand, well sorted, little clay. 3. Station C: gravel bars exposed at low water.\n\nThe results suggest that deposition follows flow speed closely, as expected for a meandering lowland river.",
+      "source": "ocr"
+     },
+     {
+      "part": "## Field Notes on River Sediment\n\nSamples were taken at four stations along the lower reach, each at a depth of two metres, over three days in spring. Fine silt dominated the slow inner bends, while coarse sand and gravel lined the faster outer banks of the channel. 1. Station A: mostly silt, with traces of organic matter. 2. Station B: medium sand, well sorted, little clay. 3. Station C: gravel bars exposed at low water.\n\nThe results suggest that deposition follows flow speed closely, as expected for a meandering lowland river.",
+      "source": "ocr"
+     },
+     {
+      "part": "## Field Notes on River Sediment\n\nSamples were taken at four stations along the lower reach, each at a depth of two metres, over three days in spring. Fine silt dominated the slow inner bends, while coarse sand and gravel lined the faster outer banks of the channel. 1. Station A: mostly silt, with traces of organic matter. 2. Station B: medium sand, well sorted, little clay. 3. Station C: gravel bars exposed at low water.\n\nThe results suggest that deposition follows flow speed closely, as expected for a meandering lowland river.",
+      "source": "ocr"
+     }
+    ],
+    "layout.pdf": [
+     {
+      "part": "## A Single Column Page\n\nThe quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow the last word of this line is broken by a hyphen, as in example, and the line goes on after it as usual.\n\nWater is H2O and energy is mc2 , as footnote12 says.",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nThe quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "text"
+     },
+     {
+      "part": "ofice flow\n\nefficient final flow ffort naïve café Über æsthetic",
+      "source": "text"
+     },
+     {
+      "part": "",
+      "source": "ocr"
+     },
+     {
+      "part": "Each gl yph her e i s i t s own obj ect\n\nThe quick brown fox jumps over the lazy dog while the five\n\nreplacement text\n\nafter the span",
+      "source": "text"
+     }
+    ],
+    "scripts.pdf": [
+     {
+      "part": "שלום עולם זהו משפט בעברית مرحبا بالعالم هذا نص عربي השורה השלישית בדף הזה\n\nA Latin line between them.",
+      "source": "text"
+     },
+     {
+      "part": "שלום עולם זהו משפט בעברית مرحبا بالعالم هذا نص عربي השורה השלישית בדף הזה",
+      "source": "ocr"
+     },
+     {
+      "part": "吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。\n\n猫の本",
+      "source": "text"
+     }
+    ],
+    "orient.pdf": [
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "text"
+     },
+     {
+      "part": "pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "text"
+     }
+    ],
+    "sideways.pdf": [
+     {
+      "part": "<table>\n<tr><th>Region 221</th><th>North 224</th><th>South 227</th><th>East 230</th><th>West 233</th><th>Total 236</th></tr>\n<tr><td>Region 204</td><td>North 207</td><td>South 210</td><td>East 213</td><td>West 216</td><td>Total 219</td></tr>\n<tr><td>Region 187</td><td>North 190</td><td>South 193</td><td>East 196</td><td>West 199</td><td>Total 202</td></tr>\n<tr><td>Region 170</td><td>North 173</td><td>South 176</td><td>East 179</td><td>West 182</td><td>Total 185</td></tr>\n<tr><td>Region 153</td><td>North 156</td><td>South 159</td><td>East 162</td><td>West 165</td><td>Total 168</td></tr>\n<tr><td>Region 136</td><td>North 139</td><td>South 142</td><td>East 145</td><td>West 148</td><td>Total 151</td></tr>\n<tr><td>Region 119</td><td>North 122</td><td>South 125</td><td>East 128</td><td>West 131</td><td>Total 134</td></tr>\n<tr><td>Region 102</td><td>North 105</td><td>South 108</td><td>East 111</td><td>West 114</td><td>Total 117</td></tr>\n<tr><td>Region 85</td><td>North 88</td><td>South 91</td><td>East 94</td><td>West 97</td><td>Total 100</td></tr>\n<tr><td>Region 68</td><td>North 71</td><td>South 74</td><td>East 77</td><td>West 80</td><td>Total 83</td></tr>\n<tr><td>Region 51</td><td>North 54</td><td>South 57</td><td>East 60</td><td>West 63</td><td>Total 66</td></tr>\n<tr><td>Region 34</td><td>North 37</td><td>South 40</td><td>East 43</td><td>West 46</td><td>Total 49</td></tr>\n<tr><td>Region 17</td><td>North 20</td><td>South 23</td><td>East 26</td><td>West 29</td><td>Total 32</td></tr>\n<tr><td>Region</td><td>North</td><td>South</td><td>East</td><td>West</td><td>Total</td></tr>\n</table>",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nturned the other way\n\nvertical axis label\n\nupside down text",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\none upright line",
+      "source": "hybrid"
+     }
+    ],
+    "fonts.pdf": [
+     {
+      "part": "0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 סססססססססססססססססססססססססססססססססססססססם 0000000000000000000000000000000000000000 00000000000000000000000ס000ס00000000000ם 000000000000000000000000000000000000000ם ס0000000000000סס000ס0000000000000000000ם 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nαβ\n\n☞✁✔\n\nà",
+      "source": "text"
+     }
+    ],
+    "hidden.pdf": [
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     }
+    ],
+    "forms.pdf": [
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nline one two forms deep hidden three forms deep hidden one five forms de line two two forms deep hidden two five forms de line three two forms deep hidden three five forms de",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\na label turned in its form\n\nXQZXQZ\n\nafter the form span",
+      "source": "text"
+     }
+    ]
+   }
+  },
+  {
+   "mode": "ocr",
+   "math": false,
+   "furniture": false,
+   "documents": {
+    "scan.pdf": [
+     {
+      "part": "## Field Notes on River Sediment\n\nSamples were taken at four stations along the lower reach, each at a depth of two metres, over three days in spring. Fine silt dominated the slow inner bends, while coarse sand and gravel lined the faster outer banks of the channel. 1. Station A: mostly silt, with traces of organic matter. 2. Station B: medium sand, well sorted, little clay. 3. Station C: gravel bars exposed at low water.\n\nThe results suggest that deposition follows flow speed closely, as expected for a meandering lowland river.",
+      "source": "ocr"
+     },
+     {
+      "part": "## Field Notes on River Sediment\n\nSamples were taken at four stations along the lower reach, each at a depth of two metres, over three days in spring. Fine silt dominated the slow inner bends, while coarse sand and gravel lined the faster outer banks of the channel. 1. Station A: mostly silt, with traces of organic matter. 2. Station B: medium sand, well sorted, little clay. 3. Station C: gravel bars exposed at low water.\n\nThe results suggest that deposition follows flow speed closely, as expected for a meandering lowland river.",
+      "source": "ocr"
+     },
+     {
+      "part": "## Field Notes on River Sediment\n\nSamples were taken at four stations along the lower reach, each at a depth of two metres, over three days in spring. Fine silt dominated the slow inner bends, while coarse sand and gravel lined the faster outer banks of the channel. 1. Station A: mostly silt, with traces of organic matter. 2. Station B: medium sand, well sorted, little clay. 3. Station C: gravel bars exposed at low water.\n\nThe results suggest that deposition follows flow speed closely, as expected for a meandering lowland river.",
+      "source": "ocr"
+     }
+    ],
+    "layout.pdf": [
+     {
+      "part": "## A Single Column Page\n\nThe quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow the last word of this line is broken by a hyphen, as in example, and the line goes on after it as usual.\n\nWater is H2O and energy is mc2, as footnote12 says.",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nThe quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     },
+     {
+      "part": "ofice flow\n\nefficient final flow ffort naïve café Über æsthetic",
+      "source": "ocr"
+     },
+     {
+      "part": "",
+      "source": "ocr"
+     },
+     {
+      "part": "Each gl yph here i s it s own obj ect\n\nThe quick brown fox jumps over the lazy dog while the five\n\nXQZXQZXQZ after the span",
+      "source": "ocr"
+     }
+    ],
+    "scripts.pdf": [
+     {
+      "part": "שלום עולם זהו משפט בעברית مرحبا بالعالم هذا نص عربي השורה השלישית בדף הזה\n\nA Latin line between them.",
+      "source": "ocr"
+     },
+     {
+      "part": "שלום עולם זהו משפט בעברית مرحبا بالعالم هذا نص عربي השורה השלישית בדף הזה",
+      "source": "ocr"
+     },
+     {
+      "part": "<table>\n<tr><th></th><th></th><th></th><th></th><th></th></tr>\n<tr><td></td><td>d</td><td>13</td><td></td><td>d</td></tr>\n<tr><td>田</td><td></td><td></td><td></td><td></td></tr>\n<tr><td></td><td></td><td>7</td><td></td><td></td></tr>\n<tr><td></td><td>あ</td><td>あ</td><td></td><td></td></tr>\n<tr><td>5</td><td>5</td><td>る</td><td></td><td></td></tr>\n<tr><td>o</td><td>o</td><td>o</td><td></td><td></td></tr>\n<tr><td>6</td><td></td><td>E</td><td></td><td></td></tr>\n<tr><td>BU</td><td></td><td>BU</td><td></td><td></td></tr>\n<tr><td></td><td></td><td>は</td><td></td><td></td></tr>\n<tr><td>ま</td><td>ま</td><td>ま</td><td></td><td>ま</td></tr>\n<tr><td></td><td></td><td>12</td><td></td><td></td></tr>\n<tr><td></td><td></td><td></td><td></td><td></td></tr>\n<tr><td>61</td><td>61</td><td>61</td><td></td><td>61</td></tr>\n<tr><td>o</td><td>o</td><td>o</td><td></td><td></td></tr>\n<tr><td>تسم</td><td> C</td><td></td><td></td><td></td></tr>\n<tr><td></td><td></td><td></td><td></td><td></td></tr>\n<tr><td>7</td><td>で</td><td>73</td><td></td><td>7</td></tr>\n<tr><td>4</td><td>4</td><td>4</td><td></td><td>4</td></tr>\n<tr><td></td><td>n</td><td>n</td><td></td><td>n</td></tr>\n<tr><td>It</td><td>It</td><td>た</td><td></td><td>た</td></tr>\n<tr><td>か</td><td>か</td><td></td><td></td><td>か</td></tr>\n<tr><td>سلے ho سل</td><td>E hu</td><td>E ho </td><td></td><td>2 C h</td></tr>\n<tr><td></td><td>見</td><td></td><td></td><td></td></tr>\n<tr><td></td><td></td><td></td><td></td><td></td></tr>\n<tr><td>7</td><td></td><td>7۱</td><td></td><td></td></tr>\n<tr><td></td><td>D</td><td></td><td></td><td>)</td></tr>\n<tr><td></td><td>か</td><td>か</td><td></td><td>か</td></tr>\n<tr><td></td><td>82</td><td>82</td><td></td><td>82</td></tr>\n</table>",
+      "source": "ocr"
+     }
+    ],
+    "orient.pdf": [
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     },
+     {
+      "part": "pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     }
+    ],
+    "sideways.pdf": [
+     {
+      "part": "<table>\n<tr><th colspan=\"2\">8</th><th colspan=\"2\">๑ N</th><th></th><th colspan=\"2\"></th><th colspan=\"2\">8</th><th colspan=\"2\"></th><th></th><th colspan=\"2\">-</th><th colspan=\"2\">5</th><th colspan=\"2\"></th><th colspan=\"2\">8</th><th>0)</th></tr>\n<tr><td colspan=\"2\"> 8</td><td colspan=\"2\"> 8</td><td>8</td><td colspan=\"2\">2 </td><td colspan=\"2\">ᄀ 8</td><td colspan=\"2\">뭉 8</td><td></td><td colspan=\"2\"> 8</td><td colspan=\"2\"> 6</td><td colspan=\"2\"> </td><td colspan=\"2\"> 8</td><td></td></tr>\n<tr><td colspan=\"2\">co </td><td colspan=\"2\">2 </td><td>8</td><td colspan=\"2\">8</td><td colspan=\"2\">8</td><td colspan=\"2\"></td><td></td><td colspan=\"2\"></td><td colspan=\"2\">S</td><td colspan=\"2\"></td><td colspan=\"2\"></td><td></td></tr>\n<tr><td colspan=\"2\">B</td><td colspan=\"2\">B</td><td></td><td colspan=\"2\"></td><td colspan=\"2\"></td><td colspan=\"2\"></td><td></td><td colspan=\"2\">8</td><td colspan=\"2\">8</td><td colspan=\"2\">B</td><td colspan=\"2\"></td><td>8</td></tr>\n<tr><td colspan=\"2\">R</td><td colspan=\"2\"> </td><td>8</td><td colspan=\"2\"></td><td colspan=\"2\">8</td><td colspan=\"2\"></td><td></td><td colspan=\"2\"></td><td colspan=\"2\">3</td><td colspan=\"2\"></td><td colspan=\"2\"></td><td> 8</td></tr>\n<tr><td colspan=\"2\"> ພື</td><td colspan=\"2\"></td><td></td><td colspan=\"2\"></td><td colspan=\"2\"></td><td colspan=\"2\"></td><td></td><td colspan=\"2\">8</td><td colspan=\"2\">8</td><td colspan=\"2\">8</td><td colspan=\"2\"> ມື້</td><td>22 8   8</td></tr>\n<tr><td colspan=\"2\">21</td><td colspan=\"2\"> </td><td>o</td><td colspan=\"2\">N</td><td colspan=\"2\"></td><td colspan=\"2\"></td><td>N</td><td colspan=\"2\">o</td><td colspan=\"2\">๑</td><td colspan=\"2\"></td><td colspan=\"2\">๒</td><td>유 8</td></tr>\n<tr><td></td><td></td><td colspan=\"2\"></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>\n<tr><td colspan=\"2\"> </td><td colspan=\"2\">8 </td><td> </td><td colspan=\"2\"> </td><td colspan=\"2\"> </td><td colspan=\"2\"> </td><td>8 </td><td colspan=\"2\"> </td><td colspan=\"2\"> </td><td colspan=\"2\"> </td><td colspan=\"2\"> </td><td>6 </td></tr>\n<tr><td colspan=\"2\">S</td><td colspan=\"2\"></td><td>5</td><td colspan=\"2\">R</td><td colspan=\"2\"></td><td colspan=\"2\"></td><td>N</td><td colspan=\"2\">8</td><td colspan=\"2\"></td><td colspan=\"2\"></td><td colspan=\"2\"></td><td></td></tr>\n<tr><td colspan=\"2\">8</td><td colspan=\"2\">5</td><td>§</td><td></td><td></td><td colspan=\"2\">5</td><td colspan=\"2\">5</td><td>5</td><td colspan=\"2\"></td><td colspan=\"2\">8</td><td colspan=\"2\">5</td><td colspan=\"2\">5</td><td></td></tr>\n<tr><td colspan=\"2\"></td><td colspan=\"2\">8</td><td></td><td colspan=\"2\"></td><td colspan=\"2\">16</td><td colspan=\"2\"></td><td>o </td><td colspan=\"2\"> 9</td><td colspan=\"2\"></td><td colspan=\"2\">8</td><td colspan=\"2\">ما</td><td> </td></tr>\n<tr><td colspan=\"2\">2</td><td colspan=\"2\"></td><td></td><td></td><td></td><td colspan=\"2\">2</td><td colspan=\"2\">Q</td><td></td><td colspan=\"2\"></td><td colspan=\"2\"></td><td colspan=\"2\"></td><td colspan=\"2\"></td><td> 2</td></tr>\n<tr><td colspan=\"2\"> X</td><td colspan=\"2\">X</td><td>  X</td><td colspan=\"2\"> D X</td><td colspan=\"2\">8 X</td><td colspan=\"2\"> D X</td><td> X</td><td colspan=\"2\"> X</td><td colspan=\"2\"> Y</td><td colspan=\"2\"> X</td><td colspan=\"2\">X</td><td> D </td></tr>\n</table>",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\n1x) umop pisdn",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\n## \n\none upright line",
+      "source": "ocr"
+     }
+    ],
+    "fonts.pdf": [
+     {
+      "part": "0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 סססססססססססססססססססססססססססססססססססססססם 0000000000000000000000000000000000000000 00000000000000000000000ס000ס00000000000ם 000000000000000000000000000000000000000ם ס0000000000000סס000ס0000000000000000000ם 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\n000",
+      "source": "ocr"
+     }
+    ],
+    "hidden.pdf": [
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     }
+    ],
+    "forms.pdf": [
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nline one two forms deep line two two forms deep line three two forms deep",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\n2\n\nXQZXQZ\n\nafter the form span",
+      "source": "ocr"
+     }
+    ]
+   }
+  },
+  {
+   "mode": "text",
+   "math": false,
+   "furniture": false,
+   "documents": {
+    "scan.pdf": [
+     {
+      "part": "## Field Notes on River Sediment\n\nSamples were taken at four stations along the lower reach, each at a depth of two metres, over three days in spring. Fine silt dominated the slow inner bends, while coarse sand and gravel lined the faster outer banks of the channel. 1. Station A: mostly silt, with traces of organic matter. 2. Station B: medium sand, well sorted, little clay. 3. Station C: gravel bars exposed at low water.\n\nThe results suggest that deposition follows flow speed closely, as expected for a meandering lowland river.",
+      "source": "ocr"
+     },
+     {
+      "part": "## Field Notes on River Sediment\n\nSamples were taken at four stations along the lower reach, each at a depth of two metres, over three days in spring. Fine silt dominated the slow inner bends, while coarse sand and gravel lined the faster outer banks of the channel. 1. Station A: mostly silt, with traces of organic matter. 2. Station B: medium sand, well sorted, little clay. 3. Station C: gravel bars exposed at low water.\n\nThe results suggest that deposition follows flow speed closely, as expected for a meandering lowland river.",
+      "source": "ocr"
+     },
+     {
+      "part": "## Field Notes on River Sediment\n\nSamples were taken at four stations along the lower reach, each at a depth of two metres, over three days in spring. Fine silt dominated the slow inner bends, while coarse sand and gravel lined the faster outer banks of the channel. 1. Station A: mostly silt, with traces of organic matter. 2. Station B: medium sand, well sorted, little clay. 3. Station C: gravel bars exposed at low water.\n\nThe results suggest that deposition follows flow speed closely, as expected for a meandering lowland river.",
+      "source": "ocr"
+     }
+    ],
+    "layout.pdf": [
+     {
+      "part": "## A Single Column Page\n\nThe quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow the last word of this line is broken by a hyphen, as in example, and the line goes on after it as usual.\n\nWater is H2O and energy is mc2 , as footnote12 says.",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nThe quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "text"
+     },
+     {
+      "part": "ofice flow\n\nefficient final flow ffort naïve café Über æsthetic",
+      "source": "text"
+     },
+     {
+      "part": "",
+      "source": "ocr"
+     },
+     {
+      "part": "Each gl yph her e i s i t s own obj ect\n\nThe quick brown fox jumps over the lazy dog while the five\n\nreplacement text\n\nafter the span",
+      "source": "text"
+     }
+    ],
+    "scripts.pdf": [
+     {
+      "part": "שלום עולם זהו משפט בעברית مرحبا بالعالم هذا نص عربي השורה השלישית בדף הזה\n\nA Latin line between them.",
+      "source": "text"
+     },
+     {
+      "part": "תירבעב טפשמ והז םלוע םולש يبرع صن اذه ملاعلاب ابحرم הזה ףדב תישילשה הרושה",
+      "source": "text"
+     },
+     {
+      "part": "吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。\n\n猫の本",
+      "source": "text"
+     }
+    ],
+    "orient.pdf": [
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "text"
+     },
+     {
+      "part": "pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "text"
+     }
+    ],
+    "sideways.pdf": [
+     {
+      "part": "<table>\n<tr><th>Region 221</th><th>North 224</th><th>South 227</th><th>East 230</th><th>West 233</th><th>Total 236</th></tr>\n<tr><td>Region 204</td><td>North 207</td><td>South 210</td><td>East 213</td><td>West 216</td><td>Total 219</td></tr>\n<tr><td>Region 187</td><td>North 190</td><td>South 193</td><td>East 196</td><td>West 199</td><td>Total 202</td></tr>\n<tr><td>Region 170</td><td>North 173</td><td>South 176</td><td>East 179</td><td>West 182</td><td>Total 185</td></tr>\n<tr><td>Region 153</td><td>North 156</td><td>South 159</td><td>East 162</td><td>West 165</td><td>Total 168</td></tr>\n<tr><td>Region 136</td><td>North 139</td><td>South 142</td><td>East 145</td><td>West 148</td><td>Total 151</td></tr>\n<tr><td>Region 119</td><td>North 122</td><td>South 125</td><td>East 128</td><td>West 131</td><td>Total 134</td></tr>\n<tr><td>Region 102</td><td>North 105</td><td>South 108</td><td>East 111</td><td>West 114</td><td>Total 117</td></tr>\n<tr><td>Region 85</td><td>North 88</td><td>South 91</td><td>East 94</td><td>West 97</td><td>Total 100</td></tr>\n<tr><td>Region 68</td><td>North 71</td><td>South 74</td><td>East 77</td><td>West 80</td><td>Total 83</td></tr>\n<tr><td>Region 51</td><td>North 54</td><td>South 57</td><td>East 60</td><td>West 63</td><td>Total 66</td></tr>\n<tr><td>Region 34</td><td>North 37</td><td>South 40</td><td>East 43</td><td>West 46</td><td>Total 49</td></tr>\n<tr><td>Region 17</td><td>North 20</td><td>South 23</td><td>East 26</td><td>West 29</td><td>Total 32</td></tr>\n<tr><td>Region</td><td>North</td><td>South</td><td>East</td><td>West</td><td>Total</td></tr>\n</table>",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nturned the other way\n\nvertical axis label\n\nupside down text",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\none upright line",
+      "source": "hybrid"
+     }
+    ],
+    "fonts.pdf": [
+     {
+      "part": "\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010 \b \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u000f\u0014\u0019 \u0005 \u000f\u0014\u0019 \u0005 \u000f\u0014\u0019 \u0005 \u000f\u0014\u0019 \u0005 \u000f\u0014\u0019 \u0005 \u000f\u0014\u0019 \u0005 \u000f\u0014\u0019 \u0016\u001b-\u0007 \u0011\u0016\u001b-\u0007 \u0011\u0016\u001b-\u0007 \u0011\u0016\u001b-\u0007 \u0011\u0016\u001b-\u0007 \u0011\u0016\u001b-\u0007 \u0011\u0016\u001b-\u0007 \u0004 \u000e\u0013\u0018 \u0004 \u000e\u0013\u0018 \u0004 \u000e\u0013\u0018 \u0004 \u000e\u0013\u0018 \u0004 \u000e\u0013\u0018 \u0004 \u000e\u0013\u0018 \u0004 \u000e \u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015 \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0014\u0019 \u0005 \u000f\u0014\u0019 \u0005 \u000f\u0014\u0019 \u0005 \u000f\u0014\u0019 \u0005 \u000f\u0014\u0019 \u0005 \u000f\u0014\u0019 \u0005 \u000f\u0014\u0019 \u0005 \u001b-\u0007 \u0011\u0016\u001b-\u0007 \u0011\u0016\u001b-\u0007 \u0011\u0016\u001b-\u0007 \u0011\u0016\u001b-\u0007 \u0011\u0016\u001b-\u0007 \u0011\u0016\u001b-\u0007 \u0004 \u000e\u0013\u0018 \u0004 \u000e\u0013\u0018 \u0004 \u000e\u0013\u0018 \u0004 \u000e\u0013\u0018 \u0004 \u000e\u0013\u0018 \u0004 \u000e\u0013\u0018 \u0004 \u000e\u0013 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a\u0001\u0006 \u0010\u0015\u001a \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0003\b \u0012\u0017 \u0003",
+      "source": "text"
+     },
+     {
+      "part": "7KH\u0003TXLFN\u0003EURZQ\u0003IR[\u0003MXPSV\u0003RYHU\u0003WKH\u0003OD]\\\u0003GRJ\u0003ZKLOH\u0003WKH\u0003ILYH ER[LQJ\u0003ZL]DUGV\u0003MXPS\u0003TXLFNO\\\u0003DQG\u0003D\u0003ZL]DUG V\u0003MRE\u0003LV\u0003WR\u0003YH[ FKXPSV\u0003TXLFNO\\\u0003LQ\u0003IRJ\u0003DV\u0003SDFN\u0003P\\\u0003ER[\u0003ZLWK\u0003ILYH\u0003GR]HQ\u0003OLTXRU MXJV\u0003DQG\u0003VSKLQ[\u0003RI\u0003EODFN\u0003TXDUW]\u0003MXGJH\u0003P\\\u0003YRZ\u00037KH\u0003TXLFN\u0003EURZQ IR[\u0003MXPSV\u0003RYHU\u0003WKH\u0003OD]\\\u0003GRJ\u0003ZKLOH\u0003WKH\u0003ILYH\u0003ER[LQJ\u0003ZL]DUGV MXPS\u0003TXLFNO\\\u0003DQG\u0003D\u0003ZL]DUG V\u0003MRE\u0003LV\u0003WR\u0003YH[\u0003FKXPSV\u0003TXLFNO\\\u0003LQ IRJ\u0003DV\u0003SDFN\u0003P\\\u0003ER[\u0003ZLWK\u0003ILYH\u0003GR]HQ\u0003OLTXRU\u0003MXJV\u0003DQG\u0003VSKLQ[\u0003RI EODFN\u0003TXDUW]\u0003MXGJH\u0003P\\\u0003YRZ",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nαβ\n\n☞✁✔\n\nà",
+      "source": "text"
+     }
+    ],
+    "hidden.pdf": [
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     }
+    ],
+    "forms.pdf": [
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nline one two forms deep hidden three forms deep hidden one five forms de line two two forms deep hidden two five forms de line three two forms deep hidden three five forms de",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\na label turned in its form\n\nXQZXQZ\n\nafter the form span",
+      "source": "text"
+     }
+    ]
+   }
+  },
+  {
+   "mode": "auto",
+   "math": true,
+   "furniture": true,
+   "documents": {
+    "scan.pdf": [
+     {
+      "part": "## Field Notes on River Sediment\n\nSamples were taken at four stations along the lower reach, each at a depth of two metres, over three days in spring. Fine silt dominated the slow inner bends, while coarse sand and gravel lined the faster outer banks of the channel. 1. Station A: mostly silt, with traces of organic matter. 2. Station B: medium sand, well sorted, little clay. 3. Station C: gravel bars exposed at low water.\n\nThe results suggest that deposition follows flow speed closely, as expected for a meandering lowland river.",
+      "source": "ocr"
+     },
+     {
+      "part": "## Field Notes on River Sediment\n\nSamples were taken at four stations along the lower reach, each at a depth of two metres, over three days in spring. Fine silt dominated the slow inner bends, while coarse sand and gravel lined the faster outer banks of the channel. 1. Station A: mostly silt, with traces of organic matter. 2. Station B: medium sand, well sorted, little clay. 3. Station C: gravel bars exposed at low water.\n\nThe results suggest that deposition follows flow speed closely, as expected for a meandering lowland river.",
+      "source": "ocr"
+     },
+     {
+      "part": "## Field Notes on River Sediment\n\nSamples were taken at four stations along the lower reach, each at a depth of two metres, over three days in spring. Fine silt dominated the slow inner bends, while coarse sand and gravel lined the faster outer banks of the channel. 1. Station A: mostly silt, with traces of organic matter. 2. Station B: medium sand, well sorted, little clay. 3. Station C: gravel bars exposed at low water.\n\nThe results suggest that deposition follows flow speed closely, as expected for a meandering lowland river.",
+      "source": "ocr"
+     }
+    ],
+    "layout.pdf": [
+     {
+      "part": "## A Single Column Page\n\nThe quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow the last word of this line is broken by a hyphen, as in example, and the line goes on after it as usual.\n\nWater is H2O and energy is mc2 , as footnote12 says.",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nThe quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "text"
+     },
+     {
+      "part": "ofice flow\n\nefficient final flow ffort naïve café Über æsthetic",
+      "source": "text"
+     },
+     {
+      "part": "",
+      "source": "ocr"
+     },
+     {
+      "part": "Each gl yph her e i s i t s own obj ect\n\nThe quick brown fox jumps over the lazy dog while the five\n\nreplacement text\n\nafter the span",
+      "source": "text"
+     }
+    ],
+    "scripts.pdf": [
+     {
+      "part": "שלום עולם זהו משפט בעברית مرحبا بالعالم هذا نص عربي השורה השלישית בדף הזה\n\nA Latin line between them.",
+      "source": "text"
+     },
+     {
+      "part": "שלום עולם זהו משפט בעברית مرحبا بالعالم هذا نص عربي השורה השלישית בדף הזה",
+      "source": "ocr"
+     },
+     {
+      "part": "吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。\n\n猫の本",
+      "source": "text"
+     }
+    ],
+    "orient.pdf": [
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "text"
+     },
+     {
+      "part": "pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "text"
+     }
+    ],
+    "sideways.pdf": [
+     {
+      "part": "Table 3\n\n<table>\n<tr><th>Region 221</th><th>North 224</th><th>South 227</th><th>East 230</th><th>West 233</th><th>Total 236</th></tr>\n<tr><td>Region 204</td><td>North 207</td><td>South 210</td><td>East 213</td><td>West 216</td><td>Total 219</td></tr>\n<tr><td>Region 187</td><td>North 190</td><td>South 193</td><td>East 196</td><td>West 199</td><td>Total 202</td></tr>\n<tr><td>Region 170</td><td>North 173</td><td>South 176</td><td>East 179</td><td>West 182</td><td>Total 185</td></tr>\n<tr><td>Region 153</td><td>North 156</td><td>South 159</td><td>East 162</td><td>West 165</td><td>Total 168</td></tr>\n<tr><td>Region 136</td><td>North 139</td><td>South 142</td><td>East 145</td><td>West 148</td><td>Total 151</td></tr>\n<tr><td>Region 119</td><td>North 122</td><td>South 125</td><td>East 128</td><td>West 131</td><td>Total 134</td></tr>\n<tr><td>Region 102</td><td>North 105</td><td>South 108</td><td>East 111</td><td>West 114</td><td>Total 117</td></tr>\n<tr><td>Region 85</td><td>North 88</td><td>South 91</td><td>East 94</td><td>West 97</td><td>Total 100</td></tr>\n<tr><td>Region 68</td><td>North 71</td><td>South 74</td><td>East 77</td><td>West 80</td><td>Total 83</td></tr>\n<tr><td>Region 51</td><td>North 54</td><td>South 57</td><td>East 60</td><td>West 63</td><td>Total 66</td></tr>\n<tr><td>Region 34</td><td>North 37</td><td>South 40</td><td>East 43</td><td>West 46</td><td>Total 49</td></tr>\n<tr><td>Region 17</td><td>North 20</td><td>South 23</td><td>East 26</td><td>West 29</td><td>Total 32</td></tr>\n<tr><td>Region</td><td>North</td><td>South</td><td>East</td><td>West</td><td>Total</td></tr>\n</table>",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nturned the other way\n\nvertical axis label\n\nupside down text",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\none upright line",
+      "source": "hybrid"
+     }
+    ],
+    "fonts.pdf": [
+     {
+      "part": "0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 סססססססססססססססססססססססססססססססססססססססם 0000000000000000000000000000000000000000 00000000000000000000000ס000ס00000000000ם 000000000000000000000000000000000000000ם ס0000000000000סס000ס0000000000000000000ם 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nαβ\n\n☞✁✔\n\nà",
+      "source": "text"
+     }
+    ],
+    "hidden.pdf": [
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow",
+      "source": "ocr"
+     }
+    ],
+    "forms.pdf": [
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\nline one two forms deep hidden three forms deep hidden one five forms de line two two forms deep hidden two five forms de line three two forms deep hidden three five forms de",
+      "source": "text"
+     },
+     {
+      "part": "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and a wizard's job is to vex chumps quickly in fog as pack my box with five dozen liquor jugs and sphinx of black quartz judge my vow\n\na label turned in its form\n\nXQZXQZ\n\nafter the form span",
+      "source": "text"
+     }
+    ]
+   }
+  }
+ ],
+ "renders": [
+  {
+   "pdf": "fonts.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r0"
+  },
+  {
+   "pdf": "fonts.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r1"
+  },
+  {
+   "pdf": "fonts.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r2"
+  },
+  {
+   "pdf": "fonts.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r3"
+  },
+  {
+   "pdf": "fonts.pdf",
+   "page": 2,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r4"
+  },
+  {
+   "pdf": "fonts.pdf",
+   "page": 2,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r5"
+  },
+  {
+   "pdf": "forms.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r6"
+  },
+  {
+   "pdf": "forms.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r7"
+  },
+  {
+   "pdf": "forms.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r8"
+  },
+  {
+   "pdf": "forms.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r9"
+  },
+  {
+   "pdf": "hidden.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r10"
+  },
+  {
+   "pdf": "hidden.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r11"
+  },
+  {
+   "pdf": "hidden.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r12"
+  },
+  {
+   "pdf": "hidden.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r13"
+  },
+  {
+   "pdf": "hidden.pdf",
+   "page": 2,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r14"
+  },
+  {
+   "pdf": "hidden.pdf",
+   "page": 2,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r15"
+  },
+  {
+   "pdf": "layout.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r16"
+  },
+  {
+   "pdf": "layout.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r17"
+  },
+  {
+   "pdf": "layout.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r18"
+  },
+  {
+   "pdf": "layout.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r19"
+  },
+  {
+   "pdf": "layout.pdf",
+   "page": 2,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r20"
+  },
+  {
+   "pdf": "layout.pdf",
+   "page": 2,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r21"
+  },
+  {
+   "pdf": "layout.pdf",
+   "page": 3,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r22"
+  },
+  {
+   "pdf": "layout.pdf",
+   "page": 3,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r23"
+  },
+  {
+   "pdf": "layout.pdf",
+   "page": 4,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r24"
+  },
+  {
+   "pdf": "layout.pdf",
+   "page": 4,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r25"
+  },
+  {
+   "pdf": "orient.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r26"
+  },
+  {
+   "pdf": "orient.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r27"
+  },
+  {
+   "pdf": "orient.pdf",
+   "page": 0,
+   "rotation": 90,
+   "scale": 1.0,
+   "key": "r28"
+  },
+  {
+   "pdf": "orient.pdf",
+   "page": 0,
+   "rotation": 90,
+   "scale": 2.7777777777777777,
+   "key": "r29"
+  },
+  {
+   "pdf": "orient.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r30"
+  },
+  {
+   "pdf": "orient.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r31"
+  },
+  {
+   "pdf": "orient.pdf",
+   "page": 2,
+   "rotation": 270,
+   "scale": 1.0,
+   "key": "r32"
+  },
+  {
+   "pdf": "orient.pdf",
+   "page": 2,
+   "rotation": 270,
+   "scale": 2.7777777777777777,
+   "key": "r33"
+  },
+  {
+   "pdf": "orient.pdf",
+   "page": 3,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r34"
+  },
+  {
+   "pdf": "orient.pdf",
+   "page": 3,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r35"
+  },
+  {
+   "pdf": "orient.pdf",
+   "page": 3,
+   "rotation": 180,
+   "scale": 1.0,
+   "key": "r36"
+  },
+  {
+   "pdf": "orient.pdf",
+   "page": 3,
+   "rotation": 180,
+   "scale": 2.7777777777777777,
+   "key": "r37"
+  },
+  {
+   "pdf": "scan.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r38"
+  },
+  {
+   "pdf": "scan.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r39"
+  },
+  {
+   "pdf": "scan.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r40"
+  },
+  {
+   "pdf": "scan.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r41"
+  },
+  {
+   "pdf": "scan.pdf",
+   "page": 2,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r42"
+  },
+  {
+   "pdf": "scan.pdf",
+   "page": 2,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r43"
+  },
+  {
+   "pdf": "scripts.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r44"
+  },
+  {
+   "pdf": "scripts.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r45"
+  },
+  {
+   "pdf": "scripts.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r46"
+  },
+  {
+   "pdf": "scripts.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r47"
+  },
+  {
+   "pdf": "scripts.pdf",
+   "page": 2,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r48"
+  },
+  {
+   "pdf": "scripts.pdf",
+   "page": 2,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r49"
+  },
+  {
+   "pdf": "sideways.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r50"
+  },
+  {
+   "pdf": "sideways.pdf",
+   "page": 0,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r51"
+  },
+  {
+   "pdf": "sideways.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r52"
+  },
+  {
+   "pdf": "sideways.pdf",
+   "page": 1,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r53"
+  },
+  {
+   "pdf": "sideways.pdf",
+   "page": 2,
+   "rotation": 0,
+   "scale": 1.0,
+   "key": "r54"
+  },
+  {
+   "pdf": "sideways.pdf",
+   "page": 2,
+   "rotation": 0,
+   "scale": 2.7777777777777777,
+   "key": "r55"
+  }
+ ]
+}

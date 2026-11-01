@@ -1,7 +1,6 @@
 package com.eonmux.excalibur.ingest.registry;
 
 import com.eonmux.excalibur.core.text.ChunkIdentifiers;
-import com.eonmux.excalibur.ingest.processor.TextContent;
 import com.eonmux.excalibur.store.hash.XxHash64;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -630,19 +629,22 @@ public final class DocumentRegistry {
      * Creates a FetchedDocumentInfo from a FetchedDocument for change comparison.
      *
      * @param document The fetched document
+     * @param decoding How its bytes would become text now; see
+     *                 {@link com.eonmux.excalibur.ingest.processor.DocumentDecoder#decodingOf}
      * @return FetchedDocumentInfo for comparison
-     * @throws NullPointerException if document is null
+     * @throws NullPointerException if document or decoding is null
      */
     public static DocumentMetadata.FetchedDocumentInfo toFetchedInfo(
-            com.eonmux.excalibur.ingest.source.FetchedDocument document) {
+            com.eonmux.excalibur.ingest.source.FetchedDocument document, String decoding) {
         Objects.requireNonNull(document, "document must not be null");
-        
-        long hash = computeContentHash(document.getContent());
+        Objects.requireNonNull(decoding, "decoding must not be null");
+
+        long hash = document.contentHash();
         return new DocumentMetadata.FetchedDocumentInfo(
             document.getLastModifiedMillis(),
             hash,
             document.getContentLength(),
-            TextContent.decodingOf(document)
+            decoding
         );
     }
 

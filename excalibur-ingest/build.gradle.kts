@@ -39,4 +39,11 @@ dependencies {
     // parses markup to the specification, drops script and style bodies and decodes character
     // references, which a pattern over the raw page does not.
     implementation("org.apache.lucene:lucene-analysis-common:10.5.1")
+    // The built-in PDF reader: a PDF's text layer, read in process. Pure Java, so a node needs
+    // nothing installed to index a PDF that already carries its text.
+    implementation("org.apache.pdfbox:pdfbox:3.0.8")
+    // OCR of scanned pages, in process: the Java port of Indra OCR
+    // (excalibur.ingest.pdf-reader=indra). api rather than implementation: IndraPdfReader is
+    // built from an IndraOcr, so a caller that wires one needs the type.
+    api(project(":excalibur-ocr"))
 }

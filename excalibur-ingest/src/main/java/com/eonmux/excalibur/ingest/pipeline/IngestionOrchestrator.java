@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
+import com.eonmux.excalibur.ingest.processor.DocumentDecoder;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
@@ -412,6 +413,21 @@ public class IngestionOrchestrator {
      */
     public void setVectorEraser(DocumentErasureService.VectorEraser vectorEraser) {
         this.documentIngestor.setVectorEraser(vectorEraser);
+    }
+
+    /**
+     * Reads documents with the given decoder from now on.
+     *
+     * <p>Set after construction, like the eraser: whether PDFs go to an external converter is the
+     * node's configuration, and the same decoder is handed to the reindexer, so a re-crawl reads
+     * a document exactly as the crawl that first indexed it did. Until this is called, PDFs are
+     * read by the built-in text-layer reader.</p>
+     *
+     * @param documentDecoder The decoder
+     * @throws NullPointerException if documentDecoder is null
+     */
+    public void setDocumentDecoder(DocumentDecoder documentDecoder) {
+        this.documentIngestor.setDocumentDecoder(documentDecoder);
     }
 
     /**

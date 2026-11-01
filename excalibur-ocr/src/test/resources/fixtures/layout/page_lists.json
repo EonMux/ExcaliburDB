@@ -1,0 +1,277 @@
+{
+ "page": "lists",
+ "table_heads": false,
+ "runs": [
+  {
+   "wh": [
+    1100,
+    1400
+   ],
+   "texts": [
+    "Vol. 2 (2026)",
+    "Journal of Synthetic Pages",
+    "5 Checklist",
+    "Before a page is accepted it is checked against the",
+    "following points, in this order:",
+    "- the page is upright and straight;",
+    "- every line has been read, including lines that are",
+    "very short or very long;",
+    "* tables keep their rows and columns;",
+    "Steps to reproduce",
+    "1. Render the page at 150 dots per inch.",
+    "2) Run the detector and the recognizer.",
+    "(a) Order the lines and group them.",
+    "b) Write the markdown.",
+    "The list above is numbered; the one before it uses dashes and",
+    "stars, and both are written one item per line.",
+    "8"
+   ],
+   "order": [
+    1,
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16
+   ],
+   "inner_orders": [
+    [
+     1,
+     0,
+     2,
+     3,
+     4,
+     5,
+     6,
+     7,
+     8
+    ]
+   ],
+   "xycut_blocks": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     5,
+     6,
+     7,
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10,
+     11,
+     12,
+     13
+    ],
+    [
+     14,
+     15
+    ],
+    [
+     0
+    ],
+    [
+     16
+    ]
+   ],
+   "order_xycut": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    0,
+    16
+   ]
+  }
+ ],
+ "cells": {
+  "line": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   11,
+   12,
+   13,
+   14,
+   15,
+   16
+  ],
+  "texts": [
+   "Vol. 2 (2026)",
+   "Journal of Synthetic Pages",
+   "5 Checklist",
+   "Before a page is accepted it is checked against the",
+   "following points, in this order:",
+   "- the page is upright and straight;",
+   "- every line has been read, including lines that are",
+   "very short or very long;",
+   "* tables keep their rows and columns;",
+   "Steps to reproduce",
+   "1. Render the page at 150 dots per inch.",
+   "2) Run the detector and the recognizer.",
+   "(a) Order the lines and group them.",
+   "b) Write the markdown.",
+   "The list above is numbered; the one before it uses dashes and",
+   "stars, and both are written one item per line.",
+   "8"
+  ]
+ },
+ "page_blocks": [
+  {
+   "label": "Page-Header",
+   "bbox": [
+    68.7,
+    37.6,
+    275.8,
+    53.4
+   ],
+   "text": "Journal of Synthetic Pages"
+  },
+  {
+   "label": "Page-Header",
+   "bbox": [
+    899.8,
+    35.9,
+    1006.0,
+    52.6
+   ],
+   "text": "Vol. 2 (2026)"
+  },
+  {
+   "label": "Section-Header",
+   "bbox": [
+    71.0,
+    100.6,
+    221.6,
+    119.7
+   ],
+   "text": "5 Checklist"
+  },
+  {
+   "label": "Text",
+   "bbox": [
+    68.3,
+    154.8,
+    552.5,
+    205.9
+   ],
+   "text": "Before a page is accepted it is checked against the\nfollowing points, in this order:"
+  },
+  {
+   "label": "List-Group",
+   "bbox": [
+    90.1,
+    239.0,
+    558.0,
+    353.9
+   ],
+   "text": "- the page is upright and straight;\n- every line has been read, including lines that are\nvery short or very long;\n* tables keep their rows and columns;"
+  },
+  {
+   "label": "Section-Header",
+   "bbox": [
+    70.6,
+    394.9,
+    298.5,
+    416.1
+   ],
+   "text": "Steps to reproduce"
+  },
+  {
+   "label": "List-Group",
+   "bbox": [
+    90.1,
+    442.0,
+    473.2,
+    554.2
+   ],
+   "text": "1. Render the page at 150 dots per inch.\n2) Run the detector and the recognizer.\n(a) Order the lines and group them.\nb) Write the markdown."
+  },
+  {
+   "label": "Text",
+   "bbox": [
+    68.3,
+    599.8,
+    656.3,
+    650.8
+   ],
+   "text": "The list above is numbered; the one before it uses dashes and\nstars, and both are written one item per line."
+  },
+  {
+   "label": "Page-Footer",
+   "bbox": [
+    539.4,
+    1346.4,
+    554.3,
+    1359.7
+   ],
+   "text": "8"
+  }
+ ],
+ "markdown": [
+  {
+   "keep_furniture": false,
+   "tab": false,
+   "pictures": false,
+   "markdown": "## 5 Checklist\n\nBefore a page is accepted it is checked against the following points, in this order:\n\n- the page is upright and straight;\n- every line has been read, including lines that are very short or very long;\n* tables keep their rows and columns;\n\n## Steps to reproduce\n\n1. Render the page at 150 dots per inch.\n2) Run the detector and the recognizer.\n(a) Order the lines and group them.\nb) Write the markdown.\n\nThe list above is numbered; the one before it uses dashes and stars, and both are written one item per line."
+  },
+  {
+   "keep_furniture": false,
+   "tab": true,
+   "pictures": false,
+   "markdown": "## 5 Checklist\n\nBefore a page is accepted it is checked against the following points, in this order:\n\n- the page is upright and straight;\n- every line has been read, including lines that are very short or very long;\n* tables keep their rows and columns;\n\n## Steps to reproduce\n\n1. Render the page at 150 dots per inch.\n2) Run the detector and the recognizer.\n(a) Order the lines and group them.\nb) Write the markdown.\n\nThe list above is numbered; the one before it uses dashes and stars, and both are written one item per line."
+  },
+  {
+   "keep_furniture": true,
+   "tab": false,
+   "pictures": false,
+   "markdown": "Journal of Synthetic Pages\n\nVol. 2 (2026)\n\n## 5 Checklist\n\nBefore a page is accepted it is checked against the following points, in this order:\n\n- the page is upright and straight;\n- every line has been read, including lines that are very short or very long;\n* tables keep their rows and columns;\n\n## Steps to reproduce\n\n1. Render the page at 150 dots per inch.\n2) Run the detector and the recognizer.\n(a) Order the lines and group them.\nb) Write the markdown.\n\nThe list above is numbered; the one before it uses dashes and stars, and both are written one item per line.\n\n8"
+  },
+  {
+   "keep_furniture": true,
+   "tab": true,
+   "pictures": false,
+   "markdown": "Journal of Synthetic Pages\n\nVol. 2 (2026)\n\n## 5 Checklist\n\nBefore a page is accepted it is checked against the following points, in this order:\n\n- the page is upright and straight;\n- every line has been read, including lines that are very short or very long;\n* tables keep their rows and columns;\n\n## Steps to reproduce\n\n1. Render the page at 150 dots per inch.\n2) Run the detector and the recognizer.\n(a) Order the lines and group them.\nb) Write the markdown.\n\nThe list above is numbered; the one before it uses dashes and stars, and both are written one item per line.\n\n8"
+  }
+ ]
+}

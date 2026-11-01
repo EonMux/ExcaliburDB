@@ -44,6 +44,48 @@ excalibur.ingest.chunk-target-tokens=512
 # Must be less than chunk-target-tokens: an overlap at or past the target never advances.
 excalibur.ingest.chunk-overlap-tokens=64
 
+# PDFs: text-layer reads a PDF's text layer, which a scanned page does not have. indra reads every
+# PDF with Indra OCR inside the node, scans included, as Markdown in reading order. command hands
+# every PDF to pdf-converter-command. Empty, command when a converter command is set and
+# text-layer otherwise. Changing the reader or how it reads reads every PDF again on the next
+# re-crawl, so set it before the first crawl of a large library.
+excalibur.ingest.pdf-reader=
+# Indra's model weights are not Apache-2.0: they are published under the AI Pubs Open RAIL-M
+# License (Modified), which restricts commercial use; read it at
+# https://huggingface.co/datalab-to/indra-ocr/blob/v1.1.0/LICENSE. pdf-reader=indra refuses to
+# start until it is accepted here.
+excalibur.ingest.indra-accept-model-license=false
+# Where the models (76 MB, 96 MB with math) are kept; empty for
+# $XDG_CACHE_HOME/excalibur/indra-ocr/v1.1.0. Each file is checked against a pinned SHA-256.
+# Never inside the data directory: a node configured so does not start.
+excalibur.ingest.indra-model-dir=
+# Download missing models from Hugging Face at the first PDF. false reads only what is in the
+# directory, and stops the node at startup when a file is missing.
+excalibur.ingest.indra-model-download=true
+# auto: text layer where it passes the checks, OCR elsewhere; ocr: always OCR; text: keep every
+# text layer.
+excalibur.ingest.indra-mode=auto
+# Render resolution for OCR. 72 to 600.
+excalibur.ingest.indra-dpi=200
+# Pages one conversion reads at once; 0 for every core. 0 to 256.
+excalibur.ingest.indra-threads=0
+# Formulas as LaTeX: 20 MB more of models, several times slower on pages with math.
+excalibur.ingest.indra-math=false
+# Keep running headers, footers and page numbers.
+excalibur.ingest.indra-keep-furniture=false
+# On text-layer pages, also recognise text inside pictures.
+excalibur.ingest.indra-image-ocr=true
+# The command reader: `<command> <args> <pdf file>`, indexing what it prints. A command that
+# names no executable stops the node at startup.
+#excalibur.ingest.pdf-converter-command=/opt/tools/bin/pdf-to-markdown
+excalibur.ingest.pdf-converter-command=
+excalibur.ingest.pdf-converter-args=
+# A conversion by Indra or a command running longer than this is stopped (a command is killed,
+# with everything it started) and the document fails. 1 to 86400.
+excalibur.ingest.pdf-converter-timeout-seconds=3600
+# Conversions at once, node-wide. OCR already uses every core. 1 to 64.
+excalibur.ingest.pdf-converter-parallelism=1
+
 # API Server Configuration
 # Port to listen on. EXCALIBUR_PORT in the environment overrides this; a value that is not a
 # port number fails startup rather than quietly falling back to 8080.

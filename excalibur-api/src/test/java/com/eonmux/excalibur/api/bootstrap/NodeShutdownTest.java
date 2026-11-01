@@ -3,6 +3,8 @@ package com.eonmux.excalibur.api.bootstrap;
 import com.eonmux.excalibur.api.server.ExcaliburDBServer;
 import com.eonmux.excalibur.api.server.ShutdownBudget;
 import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
+import com.eonmux.excalibur.ingest.processor.DocumentDecoder;
+import com.eonmux.excalibur.ingest.processor.PdfReader;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
@@ -53,6 +55,8 @@ class NodeShutdownTest {
     private GraphTenants tenants;
     private StorageEngine storageEngine;
     private Arena arena;
+    private PdfReader pdfReader;
+    private DocumentDecoder decoder;
 
     @BeforeEach
     void setUp() {
@@ -71,6 +75,9 @@ class NodeShutdownTest {
         when(indexOrchestrator.shutdown(any(Duration.class))).thenReturn(true);
         when(storageEngine.stopBackgroundWork(any(Duration.class))).thenReturn(true);
         arena = Arena.ofShared();
+        pdfReader = mock(PdfReader.class);
+        when(pdfReader.identity()).thenReturn("ocr");
+        decoder = DocumentDecoder.reading(pdfReader);
     }
 
     @AfterEach
@@ -94,7 +101,7 @@ class NodeShutdownTest {
      */
     private NodeShutdown shutdown(LexicalErasureSweep withSweep, ChunkIndex withChunkIndex) {
         return new NodeShutdown(server, indexOrchestrator, withSweep, withChunkIndex,
-            tracker, tenants, storageEngine, arena, TIMEOUT);
+            tracker, tenants, decoder, storageEngine, arena, TIMEOUT);
     }
 
     @Test
@@ -121,6 +128,31 @@ class NodeShutdownTest {
         order.verify(registry).persist();
         order.verify(tenants).close(any(Duration.class));
         order.verify(storageEngine).close();
+    }
+
+    @Test
+    @DisplayName("releases the PDF reader once ingestion has drained, and says so when it cannot")
+    void releasesThePdfReader() throws Exception {
+        when(pdfReader.release(any(Duration.class))).thenReturn(true);
+
+        assertThat(shutdown(sweep, chunkIndex).run()).isTrue();
+
+        InOrder order = inOrder(server, pdfReader, storageEngine);
+        order.verify(server).stop(any(ShutdownBudget.class));
+        order.verify(pdfReader).release(any(Duration.class));
+        order.verify(storageEngine).close();
+    }
+
+    @Test
+    @DisplayName("a PDF reader still converting is left loaded, and the shutdown is not clean")
+    void aBusyPdfReaderIsReported() throws Exception {
+        when(pdfReader.release(any(Duration.class))).thenReturn(false);
+
+        assertThat(shutdown(sweep, chunkIndex).run()).isFalse();
+
+        // Nothing after it depends on it, so every other step still runs.
+        verify(registry).persist();
+        verify(storageEngine).close();
     }
 
     @Test
@@ -379,15 +411,15 @@ class NodeShutdownTest {
     @DisplayName("refuses to be built without the components every running node has")
     void refusesMissingComponents() {
         assertThatThrownBy(() -> new NodeShutdown(null, indexOrchestrator, null, null, tracker,
-            tenants, storageEngine, arena, TIMEOUT))
+            tenants, null, storageEngine, arena, TIMEOUT))
             .isInstanceOf(NullPointerException.class)
             .hasMessageContaining("server");
         assertThatThrownBy(() -> new NodeShutdown(server, indexOrchestrator, null, null, null,
-            tenants, storageEngine, arena, TIMEOUT))
+            tenants, null, storageEngine, arena, TIMEOUT))
             .isInstanceOf(NullPointerException.class)
             .hasMessageContaining("documentVisibilityTracker");
         assertThatThrownBy(() -> new NodeShutdown(server, indexOrchestrator, null, null, tracker,
-            tenants, null, arena, TIMEOUT))
+            tenants, null, null, arena, TIMEOUT))
             .isInstanceOf(NullPointerException.class)
             .hasMessageContaining("storageEngine");
     }
@@ -398,11 +430,11 @@ class NodeShutdownTest {
         // Found when the node is wired rather than when it is asked to stop: a shutdown that
         // cannot even build its budget would skip every step, the durable writes included.
         assertThatThrownBy(() -> new NodeShutdown(server, indexOrchestrator, null, null, tracker,
-            tenants, storageEngine, arena, ShutdownBudget.DURABILITY_RESERVE))
+            tenants, null, storageEngine, arena, ShutdownBudget.DURABILITY_RESERVE))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("durable writes");
         assertThatThrownBy(() -> new NodeShutdown(server, indexOrchestrator, null, null, tracker,
-            tenants, storageEngine, arena, null))
+            tenants, null, storageEngine, arena, null))
             .isInstanceOf(NullPointerException.class)
             .hasMessageContaining("shutdownTimeout");
     }
@@ -416,7 +448,7 @@ class NodeShutdownTest {
         // step would run. That is the shutdown where the damage is permanent: the listener never
         // stops, the registry is never persisted, and storage never closes durably.
         new NodeShutdown(server, indexOrchestrator, sweep, chunkIndex, tracker, tenants,
-            storageEngine, null, TIMEOUT).run();
+            null, storageEngine, null, TIMEOUT).run();
 
         InOrder order = inOrder(server, indexOrchestrator, registry, storageEngine);
         order.verify(server).stop(any(ShutdownBudget.class));

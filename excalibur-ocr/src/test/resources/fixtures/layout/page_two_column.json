@@ -1,0 +1,395 @@
+{
+ "page": "two_column",
+ "table_heads": false,
+ "runs": [
+  {
+   "wh": [
+    1100,
+    1400
+   ],
+   "texts": [
+    "Vol. 2 (2026)",
+    "Journal of Synthetic Pages",
+    "Reading Order on Synthetic Pages",
+    "A. Author and B. Writer",
+    "1 Introduction",
+    "3 Method",
+    "Documents set in two columns are",
+    "We score every pair of lines with a",
+    "read down the left column first and",
+    "small network and decode an order",
+    "then down the right one. A model",
+    "from the pairwise scores. Lines that",
+    "that orders lines must learn where",
+    "belong together, such as the tumori-",
+    "one column ends and the next one",
+    "genesis example, form one block.",
+    "begins, even when a short last line",
+    "sits beside the other column.",
+    "4 Results",
+    "The decoded order matches the true",
+    "2 Related Work",
+    "order on most pages; errors cluster",
+    "Earlier systems cut the page at its",
+    "around captions and footnotes.",
+    "widest gaps, first across and then",
+    "down, which works for clean pages",
+    "but fails on ragged layouts.",
+    "7"
+   ],
+   "order": [
+    1,
+    0,
+    2,
+    3,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14,
+    16,
+    17,
+    20,
+    22,
+    24,
+    25,
+    26,
+    5,
+    7,
+    9,
+    11,
+    13,
+    15,
+    18,
+    19,
+    21,
+    23,
+    27
+   ],
+   "inner_orders": [
+    [
+     1,
+     0,
+     2,
+     3,
+     4,
+     6,
+     10,
+     11,
+     5,
+     7,
+     8,
+     9,
+     12
+    ]
+   ],
+   "xycut_blocks": [
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3
+    ],
+    [
+     0
+    ],
+    [
+     4
+    ],
+    [
+     6,
+     8,
+     10,
+     12,
+     14,
+     16,
+     17
+    ],
+    [
+     20
+    ],
+    [
+     22,
+     24,
+     25,
+     26
+    ],
+    [
+     5
+    ],
+    [
+     7,
+     9,
+     11,
+     13,
+     15
+    ],
+    [
+     18
+    ],
+    [
+     19,
+     21,
+     23
+    ],
+    [
+     27
+    ]
+   ],
+   "order_xycut": [
+    1,
+    2,
+    3,
+    0,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14,
+    16,
+    17,
+    20,
+    22,
+    24,
+    25,
+    26,
+    5,
+    7,
+    9,
+    11,
+    13,
+    15,
+    18,
+    19,
+    21,
+    23,
+    27
+   ]
+  }
+ ],
+ "cells": {
+  "line": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   11,
+   12,
+   13,
+   14,
+   15,
+   16,
+   17,
+   18,
+   19,
+   20,
+   21,
+   22,
+   23,
+   24,
+   25,
+   26,
+   27
+  ],
+  "texts": [
+   "Vol. 2 (2026)",
+   "Journal of Synthetic Pages",
+   "Reading Order on Synthetic Pages",
+   "A. Author and B. Writer",
+   "1 Introduction",
+   "3 Method",
+   "Documents set in two columns are",
+   "We score every pair of lines with a",
+   "read down the left column first and",
+   "small network and decode an order",
+   "then down the right one. A model",
+   "from the pairwise scores. Lines that",
+   "that orders lines must learn where",
+   "belong together, such as the tumori-",
+   "one column ends and the next one",
+   "genesis example, form one block.",
+   "begins, even when a short last line",
+   "sits beside the other column.",
+   "4 Results",
+   "The decoded order matches the true",
+   "2 Related Work",
+   "order on most pages; errors cluster",
+   "Earlier systems cut the page at its",
+   "around captions and footnotes.",
+   "widest gaps, first across and then",
+   "down, which works for clean pages",
+   "but fails on ragged layouts.",
+   "7"
+  ]
+ },
+ "page_blocks": [
+  {
+   "label": "Page-Header",
+   "bbox": [
+    68.7,
+    37.5,
+    275.9,
+    53.6
+   ],
+   "text": "Journal of Synthetic Pages"
+  },
+  {
+   "label": "Page-Header",
+   "bbox": [
+    899.9,
+    36.0,
+    1006.0,
+    52.6
+   ],
+   "text": "Vol. 2 (2026)"
+  },
+  {
+   "label": "Section-Header",
+   "bbox": [
+    189.2,
+    99.0,
+    792.5,
+    132.1
+   ],
+   "text": "Reading Order on Synthetic Pages"
+  },
+  {
+   "label": "Text",
+   "bbox": [
+    399.5,
+    154.7,
+    617.6,
+    170.7
+   ],
+   "text": "A. Author and B. Writer"
+  },
+  {
+   "label": "Section-Header",
+   "bbox": [
+    71.0,
+    221.3,
+    246.1,
+    239.8
+   ],
+   "text": "1 Introduction"
+  },
+  {
+   "label": "Text",
+   "bbox": [
+    68.4,
+    270.2,
+    407.2,
+    477.7
+   ],
+   "text": "Documents set in two columns are\nread down the left column first and\nthen down the right one. A model\nthat orders lines must learn where\none column ends and the next one\nbegins, even when a short last line\nsits beside the other column."
+  },
+  {
+   "label": "Section-Header",
+   "bbox": [
+    71.1,
+    530.9,
+    254.3,
+    549.0
+   ],
+   "text": "2 Related Work"
+  },
+  {
+   "label": "Text",
+   "bbox": [
+    68.2,
+    579.0,
+    402.0,
+    694.1
+   ],
+   "text": "Earlier systems cut the page at its\nwidest gaps, first across and then\ndown, which works for clean pages\nbut fails on ragged layouts."
+  },
+  {
+   "label": "Section-Header",
+   "bbox": [
+    579.7,
+    221.5,
+    694.5,
+    239.7
+   ],
+   "text": "3 Method"
+  },
+  {
+   "label": "Text",
+   "bbox": [
+    579.6,
+    269.7,
+    932.5,
+    416.8
+   ],
+   "text": "We score every pair of lines with a\nsmall network and decode an order\nfrom the pairwise scores. Lines that\nbelong together, such as the tumori-\ngenesis example, form one block."
+  },
+  {
+   "label": "Section-Header",
+   "bbox": [
+    579.7,
+    466.9,
+    694.5,
+    484.8
+   ],
+   "text": "4 Results"
+  },
+  {
+   "label": "Text",
+   "bbox": [
+    579.6,
+    515.0,
+    929.5,
+    597.9
+   ],
+   "text": "The decoded order matches the true\norder on most pages; errors cluster\naround captions and footnotes."
+  },
+  {
+   "label": "Page-Footer",
+   "bbox": [
+    541.9,
+    1345.8,
+    551.9,
+    1360.7
+   ],
+   "text": "7"
+  }
+ ],
+ "markdown": [
+  {
+   "keep_furniture": false,
+   "tab": false,
+   "pictures": false,
+   "markdown": "## Reading Order on Synthetic Pages\n\nA. Author and B. Writer\n\n## 1 Introduction\n\nDocuments set in two columns are read down the left column first and then down the right one. A model that orders lines must learn where one column ends and the next one begins, even when a short last line sits beside the other column.\n\n## 2 Related Work\n\nEarlier systems cut the page at its widest gaps, first across and then down, which works for clean pages but fails on ragged layouts.\n\n## 3 Method\n\nWe score every pair of lines with a small network and decode an order from the pairwise scores. Lines that belong together, such as the tumorigenesis example, form one block.\n\n## 4 Results\n\nThe decoded order matches the true order on most pages; errors cluster around captions and footnotes."
+  },
+  {
+   "keep_furniture": false,
+   "tab": true,
+   "pictures": false,
+   "markdown": "## Reading Order on Synthetic Pages\n\nA. Author and B. Writer\n\n## 1 Introduction\n\nDocuments set in two columns are read down the left column first and then down the right one. A model that orders lines must learn where one column ends and the next one begins, even when a short last line sits beside the other column.\n\n## 2 Related Work\n\nEarlier systems cut the page at its widest gaps, first across and then down, which works for clean pages but fails on ragged layouts.\n\n## 3 Method\n\nWe score every pair of lines with a small network and decode an order from the pairwise scores. Lines that belong together, such as the tumorigenesis example, form one block.\n\n## 4 Results\n\nThe decoded order matches the true order on most pages; errors cluster around captions and footnotes."
+  },
+  {
+   "keep_furniture": true,
+   "tab": false,
+   "pictures": false,
+   "markdown": "Journal of Synthetic Pages\n\nVol. 2 (2026)\n\n## Reading Order on Synthetic Pages\n\nA. Author and B. Writer\n\n## 1 Introduction\n\nDocuments set in two columns are read down the left column first and then down the right one. A model that orders lines must learn where one column ends and the next one begins, even when a short last line sits beside the other column.\n\n## 2 Related Work\n\nEarlier systems cut the page at its widest gaps, first across and then down, which works for clean pages but fails on ragged layouts.\n\n## 3 Method\n\nWe score every pair of lines with a small network and decode an order from the pairwise scores. Lines that belong together, such as the tumorigenesis example, form one block.\n\n## 4 Results\n\nThe decoded order matches the true order on most pages; errors cluster around captions and footnotes.\n\n7"
+  },
+  {
+   "keep_furniture": true,
+   "tab": true,
+   "pictures": false,
+   "markdown": "Journal of Synthetic Pages\n\nVol. 2 (2026)\n\n## Reading Order on Synthetic Pages\n\nA. Author and B. Writer\n\n## 1 Introduction\n\nDocuments set in two columns are read down the left column first and then down the right one. A model that orders lines must learn where one column ends and the next one begins, even when a short last line sits beside the other column.\n\n## 2 Related Work\n\nEarlier systems cut the page at its widest gaps, first across and then down, which works for clean pages but fails on ragged layouts.\n\n## 3 Method\n\nWe score every pair of lines with a small network and decode an order from the pairwise scores. Lines that belong together, such as the tumorigenesis example, form one block.\n\n## 4 Results\n\nThe decoded order matches the true order on most pages; errors cluster around captions and footnotes.\n\n7"
+  }
+ ]
+}

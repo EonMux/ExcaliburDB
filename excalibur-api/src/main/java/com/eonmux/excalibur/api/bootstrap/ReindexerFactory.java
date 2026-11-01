@@ -6,6 +6,7 @@ import com.eonmux.excalibur.ingest.lexical.StoredChunkText;
 import com.eonmux.excalibur.ingest.pipeline.DocumentBatchPublisher;
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.pipeline.OffsetAwareStorageWriter;
+import com.eonmux.excalibur.ingest.processor.DocumentDecoder;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
@@ -83,7 +84,7 @@ public final class ReindexerFactory {
     }
 
     /**
-     * Creates a fully wired document reindexer.
+     * Creates a fully wired document reindexer that reads documents with the given decoder.
      *
      * @param config             Application configuration (LLM settings)
      * @param storageEngine      Storage engine chunks are written to and tombstoned in
@@ -92,6 +93,7 @@ public final class ReindexerFactory {
      * @param documents          The document visibility tracker the ingestion pipeline
      *                           publishes through, and through it the document registry
      * @param chunkIndex         Lexical index to keep in step with storage, or null for none
+     * @param documentDecoder    How fetched documents become text: the decoder ingestion uses
      * @return A configured reindexer
      * @throws NullPointerException if any required argument is null
      */
@@ -100,8 +102,10 @@ public final class ReindexerFactory {
                                            VolumeManager volumeManager,
                                            IndexOrchestrator indexOrchestrator,
                                            DocumentVisibilityTracker documents,
-                                           ChunkIndex chunkIndex) {
+                                           ChunkIndex chunkIndex,
+                                           DocumentDecoder documentDecoder) {
         Objects.requireNonNull(config, "config cannot be null");
+        Objects.requireNonNull(documentDecoder, "documentDecoder cannot be null");
         Objects.requireNonNull(storageEngine, "storageEngine cannot be null");
         Objects.requireNonNull(indexOrchestrator, "indexOrchestrator cannot be null");
         Objects.requireNonNull(documents, "documents cannot be null");
@@ -158,6 +162,7 @@ public final class ReindexerFactory {
         // The pace ingestion refreshes the index at, so a re-crawl's documents become lexically
         // searchable on the same schedule as the crawl that first indexed them.
         reindexer.setLexicalRefreshIntervalMs(config.ingest().getLexicalRefreshIntervalMs());
+        reindexer.setDocumentDecoder(documentDecoder);
 
         // The counterpart of the lexical retirement above, for the vector signal. A reindex that
         // finds a document deleted at the source tombstones its chunks and retires its terms; a

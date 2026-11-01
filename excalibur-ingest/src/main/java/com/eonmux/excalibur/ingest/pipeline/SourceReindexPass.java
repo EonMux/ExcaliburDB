@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
+import com.eonmux.excalibur.ingest.processor.DocumentDecoder;
 import com.eonmux.excalibur.ingest.registry.ChangeDetector;
 import com.eonmux.excalibur.ingest.registry.ChangeSet;
 import com.eonmux.excalibur.ingest.registry.DocumentLocks;
@@ -138,6 +139,7 @@ final class SourceReindexPass {
     /** Forgets a removed document's visibility state, or null on a node that publishes directly. */
     private final DocumentBatchPublisher publisher;
 
+    private final DocumentDecoder decoder;
     private final DocumentStep documentStep;
 
     /**
@@ -173,6 +175,8 @@ final class SourceReindexPass {
      * @param graphReporter Tells the graph about every document this pass removes
      * @param publisher     Forgets a removed document's visibility state, or null when the
      *                      reindex publishes directly and keeps none
+     * @param decoder       Names how each document's bytes become text, so change detection
+     *                      sees a document whose text would now be different
      * @param documentStep  Re-indexes one document
      * @throws NullPointerException if any argument other than the eraser or the publisher is
      *                              null
@@ -181,7 +185,7 @@ final class SourceReindexPass {
                       ReindexLexicalIndex lexical,
                       DocumentErasureService.VectorEraser vectorEraser,
                       GraphReporter graphReporter, DocumentBatchPublisher publisher,
-                      DocumentStep documentStep) {
+                      DocumentDecoder decoder, DocumentStep documentStep) {
         this.registry = Objects.requireNonNull(registry, "registry must not be null");
         this.upsertHandler =
             Objects.requireNonNull(upsertHandler, "upsertHandler must not be null");
@@ -190,6 +194,7 @@ final class SourceReindexPass {
         this.graphReporter =
             Objects.requireNonNull(graphReporter, "graphReporter must not be null");
         this.publisher = publisher;
+        this.decoder = Objects.requireNonNull(decoder, "decoder must not be null");
         this.documentStep = Objects.requireNonNull(documentStep, "documentStep must not be null");
     }
 
@@ -212,7 +217,7 @@ final class SourceReindexPass {
         String sourceId = source.getSourceId();
         LOG.info("Starting re-index for source: {}", sourceId);
 
-        ChangeDetector detector = new ChangeDetector(registry);
+        ChangeDetector detector = new ChangeDetector(registry, decoder);
         ChangeSet changeSet;
         try {
             changeSet = stop.interruptibly(() -> detector.detectChanges(source));
@@ -431,7 +436,7 @@ final class SourceReindexPass {
             }
             // Outside the lock, as ingestion reports: withdrawing staged facts may be slow, and
             // the removal was numbered under the lock, which is what orders it.
-            graphReporter.report(removed.publication(), null);
+            graphReporter.report(removed.publication(), null, 0L);
             removals.documents += removed.stored().getDocumentsDeleted();
             removals.chunksTombstoned += removed.stored().getChunksTombstoned();
             removals.vectorsRetired += removed.vectors();

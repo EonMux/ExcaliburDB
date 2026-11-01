@@ -1,0 +1,228 @@
+{
+ "page": "furniture",
+ "table_heads": false,
+ "runs": [
+  {
+   "wh": [
+    1100,
+    1400
+   ],
+   "texts": [
+    "SYNTHETIC REPORT",
+    "Page 12 of 40",
+    "Appendix B",
+    "This appendix repeats the setup in full. Running headers and",
+    "footers repeat on every page and are left out of the text unless",
+    "they are asked for; the page number is one of them.1",
+    "A second paragraph follows after a blank line, so that the two",
+    "paragraphs are read as separate blocks of text.",
+    "1 The footnote explains a detail of the first paragraph.",
+    "Confidential draft - do not distribute",
+    "12"
+   ],
+   "order": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+   ],
+   "inner_orders": [
+    [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5,
+     6,
+     7
+    ]
+   ],
+   "xycut_blocks": [
+    [
+     0
+    ],
+    [
+     2
+    ],
+    [
+     3,
+     4,
+     5
+    ],
+    [
+     6,
+     7
+    ],
+    [
+     1
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ]
+   ],
+   "order_xycut": [
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    1,
+    8,
+    9,
+    10
+   ]
+  }
+ ],
+ "cells": {
+  "line": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10
+  ],
+  "texts": [
+   "SYNTHETIC REPORT",
+   "Page 12 of 40",
+   "Appendix B",
+   "This appendix repeats the setup in full. Running headers and",
+   "footers repeat on every page and are left out of the text unless",
+   "they are asked for; the page number is one of them.1",
+   "A second paragraph follows after a blank line, so that the two",
+   "paragraphs are read as separate blocks of text.",
+   "1 The footnote explains a detail of the first paragraph.",
+   "Confidential draft - do not distribute",
+   "12"
+  ]
+ },
+ "page_blocks": [
+  {
+   "label": "Page-Header",
+   "bbox": [
+    69.3,
+    38.2,
+    226.1,
+    50.4
+   ],
+   "text": "SYNTHETIC REPORT"
+  },
+  {
+   "label": "Page-Header",
+   "bbox": [
+    919.0,
+    37.2,
+    1027.9,
+    53.6
+   ],
+   "text": "Page 12 of 40"
+  },
+  {
+   "label": "Section-Header",
+   "bbox": [
+    67.5,
+    110.7,
+    222.4,
+    134.9
+   ],
+   "text": "Appendix B"
+  },
+  {
+   "label": "Text",
+   "bbox": [
+    68.3,
+    170.2,
+    672.7,
+    252.9
+   ],
+   "text": "This appendix repeats the setup in full. Running headers and\nfooters repeat on every page and are left out of the text unless\nthey are asked for; the page number is one of them.1"
+  },
+  {
+   "label": "Text",
+   "bbox": [
+    68.3,
+    296.3,
+    656.3,
+    346.7
+   ],
+   "text": "A second paragraph follows after a blank line, so that the two\nparagraphs are read as separate blocks of text."
+  },
+  {
+   "label": "Footnote",
+   "bbox": [
+    68.9,
+    1238.1,
+    447.9,
+    1253.0
+   ],
+   "text": "1 The footnote explains a detail of the first paragraph."
+  },
+  {
+   "label": "Page-Footer",
+   "bbox": [
+    69.3,
+    1338.3,
+    327.2,
+    1350.1
+   ],
+   "text": "Confidential draft - do not distribute"
+  },
+  {
+   "label": "Page-Footer",
+   "bbox": [
+    1001.6,
+    1337.4,
+    1024.6,
+    1350.0
+   ],
+   "text": "12"
+  }
+ ],
+ "markdown": [
+  {
+   "keep_furniture": false,
+   "tab": false,
+   "pictures": false,
+   "markdown": "## Appendix B\n\nThis appendix repeats the setup in full. Running headers and footers repeat on every page and are left out of the text unless they are asked for; the page number is one of them.1\n\nA second paragraph follows after a blank line, so that the two paragraphs are read as separate blocks of text.\n\n1 The footnote explains a detail of the first paragraph."
+  },
+  {
+   "keep_furniture": false,
+   "tab": true,
+   "pictures": false,
+   "markdown": "## Appendix B\n\nThis appendix repeats the setup in full. Running headers and footers repeat on every page and are left out of the text unless they are asked for; the page number is one of them.1\n\nA second paragraph follows after a blank line, so that the two paragraphs are read as separate blocks of text.\n\n1 The footnote explains a detail of the first paragraph."
+  },
+  {
+   "keep_furniture": true,
+   "tab": false,
+   "pictures": false,
+   "markdown": "SYNTHETIC REPORT\n\nPage 12 of 40\n\n## Appendix B\n\nThis appendix repeats the setup in full. Running headers and footers repeat on every page and are left out of the text unless they are asked for; the page number is one of them.1\n\nA second paragraph follows after a blank line, so that the two paragraphs are read as separate blocks of text.\n\n1 The footnote explains a detail of the first paragraph.\n\nConfidential draft - do not distribute\n\n12"
+  },
+  {
+   "keep_furniture": true,
+   "tab": true,
+   "pictures": false,
+   "markdown": "SYNTHETIC REPORT\n\nPage 12 of 40\n\n## Appendix B\n\nThis appendix repeats the setup in full. Running headers and footers repeat on every page and are left out of the text unless they are asked for; the page number is one of them.1\n\nA second paragraph follows after a blank line, so that the two paragraphs are read as separate blocks of text.\n\n1 The footnote explains a detail of the first paragraph.\n\nConfidential draft - do not distribute\n\n12"
+  }
+ ]
+}

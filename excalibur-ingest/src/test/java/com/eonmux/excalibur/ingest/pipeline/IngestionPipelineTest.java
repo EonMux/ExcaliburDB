@@ -2226,4 +2226,83 @@ class IngestionPipelineTest {
             assertThat(text).doesNotContain("<", "analytics", "margin");
         }
     }
+
+    @Nested
+    @DisplayName("a PDF")
+    class PdfDocument {
+
+        private String chunkText(String documentId) {
+            byte[] value = storedChunk("docs", documentId, 0);
+            return value == null ? null
+                : com.eonmux.excalibur.core.codec.ChunkPayloadCodec.textOf(value);
+        }
+
+        @Test
+        @DisplayName("is indexed by its text layer, and a scan is skipped rather than failed")
+        void textLayerIsIndexed() {
+            FakeSource source = new FakeSource("docs", Map.of())
+                .withRaw("paper.pdf", com.eonmux.excalibur.ingest.processor.PdfFixtures
+                    .withPages("Turing machines decide nothing about halting."), "application/pdf")
+                .withRaw("scan.pdf", com.eonmux.excalibur.ingest.processor.PdfFixtures
+                    .withoutText(2), "application/pdf");
+
+            RecordingStatus status = ingest(
+                new IngestionOrchestrator(new TextChunker(), null, storage, index, registry), source);
+
+            assertThat(chunkText("paper.pdf"))
+                .isEqualTo("Turing machines decide nothing about halting.");
+            assertThat(storedChunkExists("docs", "scan.pdf", 0)).isFalse();
+            assertThat(status.skipped).isEqualTo(1);
+            assertThat(status.error).isNull();
+        }
+
+        @Test
+        @org.junit.jupiter.api.condition.DisabledOnOs(org.junit.jupiter.api.condition.OS.WINDOWS)
+        @DisplayName("is indexed by what the configured converter prints")
+        void converterOutputIsIndexed() throws Exception {
+            Path program = tempDir.resolve("fake-ocr");
+            java.nio.file.Files.writeString(program,
+                "#!/bin/sh\necho '# Scanned lecture notes'\n");
+            java.nio.file.Files.setPosixFilePermissions(program,
+                java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"));
+            IngestionOrchestrator orchestrator =
+                new IngestionOrchestrator(new TextChunker(), null, storage, index, registry);
+            orchestrator.setDocumentDecoder(
+                com.eonmux.excalibur.ingest.processor.DocumentDecoder.reading(
+                    com.eonmux.excalibur.ingest.processor.PdfConverter.of(program.toString(),
+                        List.of(), java.time.Duration.ofSeconds(30), 1)));
+            FakeSource source = new FakeSource("docs", Map.of())
+                .withRaw("scan.pdf", com.eonmux.excalibur.ingest.processor.PdfFixtures
+                    .withoutText(1), "application/pdf");
+
+            RecordingStatus status = ingest(orchestrator, source);
+
+            assertThat(chunkText("scan.pdf")).isEqualTo("# Scanned lecture notes");
+            assertThat(status.skipped).isZero();
+        }
+
+        @Test
+        @org.junit.jupiter.api.condition.DisabledOnOs(org.junit.jupiter.api.condition.OS.WINDOWS)
+        @DisplayName("a converter that fails leaves the document unindexed and the run going")
+        void converterFailureIsContained() throws Exception {
+            Path program = tempDir.resolve("broken-ocr");
+            java.nio.file.Files.writeString(program, "#!/bin/sh\nexit 1\n");
+            java.nio.file.Files.setPosixFilePermissions(program,
+                java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"));
+            IngestionOrchestrator orchestrator =
+                new IngestionOrchestrator(new TextChunker(), null, storage, index, registry);
+            orchestrator.setDocumentDecoder(
+                com.eonmux.excalibur.ingest.processor.DocumentDecoder.reading(
+                    com.eonmux.excalibur.ingest.processor.PdfConverter.of(program.toString(),
+                        List.of(), java.time.Duration.ofSeconds(30), 1)));
+            FakeSource source = new FakeSource("docs", Map.of("a.txt", "Ada Lovelace"))
+                .withRaw("scan.pdf", com.eonmux.excalibur.ingest.processor.PdfFixtures
+                    .withoutText(1), "application/pdf");
+
+            ingest(orchestrator, source);
+
+            assertThat(storedChunkExists("docs", "scan.pdf", 0)).isFalse();
+            assertThat(storedChunkExists("docs", "a.txt", 0)).isTrue();
+        }
+    }
 }

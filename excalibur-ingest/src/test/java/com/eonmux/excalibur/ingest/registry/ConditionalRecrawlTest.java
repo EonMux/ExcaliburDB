@@ -1,6 +1,6 @@
 package com.eonmux.excalibur.ingest.registry;
 
-import com.eonmux.excalibur.ingest.processor.TextContent;
+import com.eonmux.excalibur.ingest.processor.DocumentDecoder;
 import com.eonmux.excalibur.ingest.source.DocumentValidators;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.HttpSource;
@@ -210,7 +210,7 @@ class ConditionalRecrawlTest {
                     .documentId(id)
                     .lastModifiedMillis(doc.getLastModifiedMillis())
                     .entityTag(withTags ? doc.getEntityTag() : null)
-                    .decoding(TextContent.decodingOf(doc))
+                    .decoding(DocumentDecoder.builtIn().decodingOf(doc))
                     .contentHash(DocumentRegistry.computeContentHash(content))
                     .contentLength(content.length)
                     .chunkIds(List.of(id + "#0"))

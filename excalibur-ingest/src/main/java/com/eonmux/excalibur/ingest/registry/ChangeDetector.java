@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.ingest.registry;
 
+import com.eonmux.excalibur.ingest.processor.DocumentDecoder;
 import com.eonmux.excalibur.ingest.source.DocumentNotFoundException;
 import com.eonmux.excalibur.ingest.source.DocumentRefusedException;
 import com.eonmux.excalibur.ingest.source.DocumentValidators;
@@ -81,14 +82,29 @@ public class ChangeDetector {
 
     private final DocumentRegistry registry;
 
+    /** Names how a document's bytes would become text now, to compare with how they did. */
+    private final DocumentDecoder decoder;
+
     /**
-     * Creates a new ChangeDetector with the specified registry.
+     * Creates a ChangeDetector for a node that reads PDFs with the built-in reader.
      *
      * @param registry The document registry to compare against
      * @throws NullPointerException if registry is null
      */
     public ChangeDetector(DocumentRegistry registry) {
+        this(registry, DocumentDecoder.builtIn());
+    }
+
+    /**
+     * Creates a ChangeDetector that compares decodings as the given decoder names them.
+     *
+     * @param registry The document registry to compare against
+     * @param decoder  How this node reads documents into text
+     * @throws NullPointerException if either argument is null
+     */
+    public ChangeDetector(DocumentRegistry registry, DocumentDecoder decoder) {
         this.registry = Objects.requireNonNull(registry, "registry must not be null");
+        this.decoder = Objects.requireNonNull(decoder, "decoder must not be null");
     }
 
     /**
@@ -193,6 +209,12 @@ public class ChangeDetector {
      * first; only a document the source actually sent back is compared by timestamp, length and
      * content hash.</p>
      *
+     * <p>Except for a PDF indexed by another way of reading PDFs than the node's now - before a
+     * converter was configured, or with another one. Its bytes are unchanged, so a source that
+     * can answer a conditional request answers that nothing changed, and the document would
+     * keep the text the old reader made of it for as long as its server kept its validators. It
+     * is fetched whole instead, and found changed by its decoding.</p>
+     *
      * <p>A document sent back in full and found unchanged still brought news: the validators
      * its source now names this version by, and the decoding it would be read with. They are
      * recorded, so the next re-crawl asks with them - see {@link #refreshRecord}.</p>
@@ -205,12 +227,14 @@ public class ChangeDetector {
      */
     private Optional<DocumentMetadata.FetchedDocumentInfo> changedVersion(
             Source source, String documentId, DocumentMetadata existing) throws SourceException {
-        Optional<FetchedDocument> fetched =
-            source.fetchIfChanged(documentId, existing.validators());
+        Optional<FetchedDocument> fetched = decoder.readsOtherwise(existing.getDecoding())
+            ? Optional.of(source.fetch(documentId))
+            : source.fetchIfChanged(documentId, existing.validators());
         if (fetched.isEmpty()) {
             return Optional.empty();
         }
-        DocumentMetadata.FetchedDocumentInfo info = DocumentRegistry.toFetchedInfo(fetched.get());
+        DocumentMetadata.FetchedDocumentInfo info = DocumentRegistry.toFetchedInfo(fetched.get(),
+            decoder.decodingOf(fetched.get()));
         if (existing.isChanged(info)) {
             return Optional.of(info);
         }

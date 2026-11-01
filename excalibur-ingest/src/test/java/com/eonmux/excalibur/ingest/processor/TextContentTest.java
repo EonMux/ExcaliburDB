@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.ingest.processor;
 
-import com.eonmux.excalibur.ingest.source.FetchedDocument;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -101,16 +100,6 @@ class TextContentTest {
 
             assertThat(TextContent.decode(content, StandardCharsets.UTF_8, "application/xhtml+xml"))
                 .isEqualTo("Ada & Charles");
-        }
-
-        @Test
-        @DisplayName("A fetched document is decoded by its own content type and encoding")
-        void fetchedDocumentIsExtracted() {
-            FetchedDocument document = new FetchedDocument("page.html",
-                "<p>Café</p>".getBytes(StandardCharsets.ISO_8859_1), "text/html",
-                StandardCharsets.ISO_8859_1, 0L);
-
-            assertThat(TextContent.decode(document)).isEqualTo("Café");
         }
 
         @Test
@@ -231,40 +220,36 @@ class TextContentTest {
     @DisplayName("The decoding is named")
     class DecodingIsNamed {
 
-        private FetchedDocument document(String contentType, Charset charset) {
-            return new FetchedDocument("doc", "caf\u00e9".getBytes(charset), contentType, charset,
-                0L);
-        }
-
         @Test
         @DisplayName("by the charset the bytes are read in")
         void namesTheCharset() {
-            assertThat(TextContent.decodingOf(document("text/plain", StandardCharsets.UTF_8)))
+            assertThat(TextContent.decodingOf(StandardCharsets.UTF_8, "text/plain"))
                 .isEqualTo("UTF-8");
-            assertThat(TextContent.decodingOf(
-                    document("text/plain", Charset.forName("windows-1252"))))
+            assertThat(TextContent.decodingOf(Charset.forName("windows-1252"), "text/plain"))
                 .isEqualTo("windows-1252");
         }
 
         @Test
         @DisplayName("and by whether markup is reduced to its text")
         void namesMarkup() {
-            assertThat(TextContent.decodingOf(
-                    document("text/html; charset=utf-8", StandardCharsets.UTF_8)))
+            assertThat(TextContent.decodingOf(StandardCharsets.UTF_8, "text/html; charset=utf-8"))
                 .isEqualTo("UTF-8+markup");
         }
 
         @Test
         @DisplayName("and by nothing else a content type says")
         void ignoresTypesThatDecodeAlike() {
-            assertThat(TextContent.decodingOf(document("text/markdown", StandardCharsets.UTF_8)))
-                .isEqualTo(TextContent.decodingOf(document("text/plain", StandardCharsets.UTF_8)));
+            assertThat(TextContent.decodingOf(StandardCharsets.UTF_8, "text/markdown"))
+                .isEqualTo(TextContent.decodingOf(StandardCharsets.UTF_8, "text/plain"));
+            assertThat(TextContent.decodingOf(StandardCharsets.UTF_8, null))
+                .isEqualTo("UTF-8");
         }
 
         @Test
-        @DisplayName("Null document is refused")
-        void nullDocument() {
-            assertThatNullPointerException().isThrownBy(() -> TextContent.decodingOf(null));
+        @DisplayName("Null charset is refused")
+        void nullCharset() {
+            assertThatNullPointerException()
+                .isThrownBy(() -> TextContent.decodingOf(null, "text/plain"));
         }
     }
 }

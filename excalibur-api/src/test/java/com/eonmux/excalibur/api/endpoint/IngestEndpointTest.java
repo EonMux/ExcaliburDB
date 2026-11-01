@@ -652,7 +652,7 @@ class IngestEndpointTest {
             // A walk told to read further than the engine indexes reads the file into memory
             // only for ingestion to discard it, and reports a failure for a file the setting
             // said would be read.
-            long limit = DocumentLimits.MAX_DOCUMENT_BYTES;
+            long limit = DocumentLimits.MAX_PDF_BYTES;
             Response refused = post(root, null, "{\"source_type\": \"filesystem\", "
                 + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
                 + "\"max_file_bytes\": " + (limit + 1) + "}}");
@@ -668,7 +668,7 @@ class IngestEndpointTest {
         @Test
         @DisplayName("a response size bound past what ingestion can index is refused")
         void responseSizeStopsAtTheEngineLimit(@TempDir Path root) throws IOException {
-            long limit = DocumentLimits.MAX_DOCUMENT_BYTES;
+            long limit = DocumentLimits.MAX_PDF_BYTES;
             Response response = post(root, null, "{\"source_type\": \"http\", "
                 + "\"config\": {\"source_id\": \"site\", "
                 + "\"base_url\": \"https://example.com/docs\", "

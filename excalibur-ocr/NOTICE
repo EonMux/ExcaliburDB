@@ -1,0 +1,231 @@
+ExcaliburDB OCR module
+
+This module contains a Java port of Indra OCR (https://github.com/datalab-to/indra), version
+1.1.2, by Datalab, licensed under the Apache License, Version 2.0. The port translates Indra's
+Python inference code - page rendering, line detection and recognition, reading order, layout and
+markdown - to Java; each ported source file names the Indra module it was translated from.
+
+Indra's model weights are not part of this module or of any ExcaliburDB distribution. A node
+configured to use them downloads them from https://huggingface.co/datalab-to/indra-ocr, where
+they are published under their own licence, the AI Pubs Open RAIL-M License (Modified), whose
+use restrictions apply to whoever downloads and uses them.
+
+Code ported from other projects, besides Indra:
+
+- pdfium (https://pdfium.googlesource.com/pdfium). The PDF text layer reader (package
+  com.eonmux.excalibur.ocr.pdf) reproduces, on Apache PDFBox, the text page that Indra reads
+  through pdfium: its character layout, line building, generated spaces and line breaks,
+  bidirectional ordering and glyph metrics follow pdfium's CPDF_TextPage and font code. Source
+  files that follow a pdfium function name it. Licensed under the BSD 3-Clause License:
+
+  Copyright 2014 The PDFium Authors
+
+  Redistribution and use in source and binary forms, with or without modification, are permitted
+  provided that the following conditions are met:
+
+  * Redistributions of source code must retain the above copyright notice, this list of
+    conditions and the following disclaimer.
+
+  * Redistributions in binary form must reproduce the above copyright notice, this list of
+    conditions and the following disclaimer in the documentation and/or other materials provided
+    with the distribution.
+
+  * Neither the name of Google Inc. nor the names of its contributors may be used to endorse or
+    promote products derived from this software without specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
+  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+  FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+  CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+  OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.
+
+- numpy (https://numpy.org). The numeric routines in com.eonmux.excalibur.ocr.array reproduce
+  numpy's float32 logarithm, pairwise summation, sorting and median. Licensed under the BSD
+  3-Clause License:
+
+  Copyright (c) 2005-2025, NumPy Developers.
+  All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without modification, are permitted
+  provided that the following conditions are met:
+
+  * Redistributions of source code must retain the above copyright notice, this list of
+    conditions and the following disclaimer.
+
+  * Redistributions in binary form must reproduce the above copyright notice, this list of
+    conditions and the following disclaimer in the documentation and/or other materials provided
+    with the distribution.
+
+  * Neither the name of the NumPy Developers nor the names of its contributors may be used to endorse or
+    promote products derived from this software without specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
+  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+  FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+  CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+  OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.
+
+- Arm Optimized Routines (https://github.com/ARM-software/optimized-routines), as the GNU C
+  Library carries them. NumpyMath.expf follows its single-precision exponential and table.
+  Copyright (c) 1999-2022, Arm Limited. Offered under "MIT OR Apache-2.0 WITH LLVM-exception";
+  used here under the MIT License:
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+  and associated documentation files (the "Software"), to deal in the Software without
+  restriction, including without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+  Software is furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies or
+  substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+  BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+  DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+- OpenCV (https://opencv.org). The image operations in com.eonmux.excalibur.ocr.image (resizing,
+  affine warping, connected components) reproduce OpenCV's. Licensed under the Apache License,
+  Version 2.0.
+
+Third-party libraries this module uses at run time. Each jar carries its own licence and notice
+files; ExcaliburDB's single-file distribution keeps every one of them.
+
+- Apache PDFBox, FontBox and PDFBox IO (https://pdfbox.apache.org), Copyright The Apache Software
+  Foundation, licensed under the Apache License, Version 2.0.
+
+- ONNX Runtime (https://onnxruntime.ai), licensed under the MIT License; its jar also carries
+  ThirdPartyNotices.txt for the software it incorporates:
+
+  MIT License
+
+  Copyright (c) Microsoft Corporation
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+  and associated documentation files (the "Software"), to deal in the Software without
+  restriction, including without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+  Software is furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies or
+  substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+  BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+  DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+- PDFBox JBIG2 ImageIO plugin (https://github.com/apache/pdfbox-jbig2), Copyright The Apache
+  Software Foundation, licensed under the Apache License, Version 2.0.
+
+- TwelveMonkeys ImageIO (https://github.com/haraldk/TwelveMonkeys), reads JPEG images Java's
+  own reader rejects:
+
+  BSD 3-Clause License
+
+  Copyright (c) 2008-2020, Harald Kuhr
+  All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without modification, are permitted
+  provided that the following conditions are met:
+
+  * Redistributions of source code must retain the above copyright notice, this list of
+    conditions and the following disclaimer.
+
+  * Redistributions in binary form must reproduce the above copyright notice, this list of
+    conditions and the following disclaimer in the documentation and/or other materials provided
+    with the distribution.
+
+  * Neither the name of the copyright holder nor the names of its contributors may be used to
+    endorse or promote products derived from this software without specific prior written
+    permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
+  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+  FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+  CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+  OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.
+
+- Java Advanced Imaging Image I/O Tools, JPEG 2000 plugin (jai-imageio-core and
+  jai-imageio-jpeg2000, https://github.com/jai-imageio), reads JPEG 2000 images. It is licensed
+  under the two licences below, neither of which is the Apache License:
+
+  Copyright (c) 2005 Sun Microsystems, Inc.
+  Copyright (c) 2010-2018 Stian Soiland-Reyes
+  Copyright (c) 2015 Peter Hull
+  Copyright (c) 2010-2018 University of Manchester
+  Copyright (c) 2015 Yannick De Turck
+  Copyright (c) 2015 Robin Stevens
+  Copyright (c) 2015 Mark Carroll
+  Copyright (c) 2015 Butch Howard
+  Copyright (c) 2015-2016 Luca Bellonda
+  Copyright (c) 2017 Ghislain Bonamy
+  Copyright (c) 2017 Curtis Rueden
+  Copyright (c) 2017 Roger Leigh
+  Copyright (c) 2017 Mykola Pavluchynskyi
+  Copyright (c) 2017 Sebastien Besson
+  Copyright (c) 2018 Peter Jodeleit
+
+  All Rights Reserved.
+
+  Redistribution and use in source and binary forms, with or without modification, are permitted
+  provided that the following conditions are met:
+
+  - Redistribution of source code must retain the above copyright notice, this list of
+    conditions and the following disclaimer.
+
+  - Redistribution in binary form must reproduce the above copyright notice, this list of
+    conditions and the following disclaimer in the documentation and/or other materials provided
+    with the distribution.
+
+  Neither the name of Sun Microsystems, Inc. or the names of contributors may be used to endorse
+  or promote products derived from this software without specific prior written permission.
+
+  This software is provided "AS IS," without a warranty of any kind. ALL EXPRESS OR IMPLIED
+  CONDITIONS, REPRESENTATIONS AND WARRANTIES, INCLUDING ANY IMPLIED WARRANTY OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE OR NON-INFRINGEMENT, ARE HEREBY EXCLUDED. SUN MIDROSYSTEMS, INC.
+  ("SUN") AND ITS LICENSORS SHALL NOT BE LIABLE FOR ANY DAMAGES SUFFERED BY LICENSEE AS A RESULT
+  OF USING, MODIFYING OR DISTRIBUTING THIS SOFTWARE OR ITS DERIVATIVES. IN NO EVENT WILL SUN OR ITS
+  LICENSORS BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR FOR DIRECT, INDIRECT, SPECIAL,
+  CONSEQUENTIAL, INCIDENTAL OR PUNITIVE DAMAGES, HOWEVER CAUSED AND REGARDLESS OF THE THEORY OF
+  LIABILITY, ARISING OUT OF THE USE OF OR INABILITY TO USE THIS SOFTWARE, EVEN IF SUN HAS BEEN
+  ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+  You acknowledge that this software is not designed or intended for use in the design,
+  construction, operation or maintenance of any nuclear facility.
+
+  This software module was originally developed by Raphaël Grosbois and Diego Santa Cruz (Swiss
+  Federal Institute of Technology-EPFL); Joel Askelöf (Ericsson Radio Systems AB); and Bertrand
+  Berthelot, David Bouchard, Félix Henry, Gerard Mozelle and Patrice Onno (Canon Research Centre
+  France S.A) in the course of development of the JPEG2000 standard as specified by ISO/IEC 15444
+  (JPEG 2000 Standard). This software module is an implementation of a part of the JPEG 2000
+  Standard. Swiss Federal Institute of Technology-EPFL, Ericsson Radio Systems AB and Canon
+  Research Centre France S.A (collectively JJ2000 Partners) agree not to assert against ISO/IEC
+  and users of the JPEG 2000 Standard (Users) any of their rights under the copyright, not
+  including other intellectual property rights, for this software module with respect to the
+  usage by ISO/IEC and Users of this software module or modifications thereof for use in hardware
+  or software products claiming conformance to the JPEG 2000 Standard. Those intending to use this
+  software module in hardware or software products are advised that their use may infringe
+  existing patents. The original developers of this software module, JJ2000 Partners and ISO/IEC
+  assume no liability for use of this software module or modifications thereof. No license or
+  right to this software module is granted for non JPEG 2000 Standard conforming products. JJ2000
+  Partners have full right to use this software module for his/her own purpose, assign or donate
+  this software module to any third party and to inhibit third parties from using this software
+  module for non JPEG 2000 Standard conforming products. This copyright notice must be included in
+  all copies or derivative works of this software module.
+
+  Copyright (c) 1999/2000 JJ2000 Partners.

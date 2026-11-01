@@ -37,7 +37,8 @@ class GraphCitationsTest {
     void readCorpus(@TempDir Path root) throws Exception {
         Files.writeString(root.resolve("ada.txt"), "Ada Lovelace wrote Note G.");
         Files.writeString(root.resolve("babbage.txt"), "Charles Babbage designed the engine.");
-        corpus = EvaluationCorpus.read(root, new Config(Map.of()).ingest());
+        corpus = EvaluationCorpus.read(root, new Config(Map.of()).ingest(),
+            root.resolveSibling("index"));
     }
 
     private static SubgraphEdge factFrom(String documentId, long index) {

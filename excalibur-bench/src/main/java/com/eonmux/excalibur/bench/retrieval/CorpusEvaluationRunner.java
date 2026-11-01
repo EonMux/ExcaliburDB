@@ -122,7 +122,8 @@ public final class CorpusEvaluationRunner {
         // also validates the model arguments the way a node would refuse them.
         Config nodeConfig = EvaluationNode.configFor(arguments, arguments.engines().get(0),
             corpusRoot, false);
-        EvaluationCorpus corpus = EvaluationCorpus.read(corpusRoot, nodeConfig.ingest());
+        EvaluationCorpus corpus = EvaluationCorpus.read(corpusRoot, nodeConfig.ingest(),
+            arguments.indexRoot());
         System.out.printf("  corpus: %,d documents, %,d chunks%n", corpus.documents(),
             corpus.chunks().size());
 

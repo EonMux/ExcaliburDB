@@ -20,9 +20,14 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 
@@ -86,17 +91,55 @@ class ExcaliburEmbeddedTest {
             .containsExactly("team:tiering.txt:chunk:0");
     }
 
-    private static int indexOf(byte[] haystack, byte[] needle, int from) {
-        outer:
-        for (int i = from; i <= haystack.length - needle.length; i++) {
-            for (int j = 0; j < needle.length; j++) {
-                if (haystack[i + j] != needle[j]) {
-                    continue outer;
+    /** Bytes of a file {@link #damage} compares at a time. */
+    private static final int DAMAGE_BLOCK = 1 << 20;
+
+    /**
+     * Flips one bit in every copy of some bytes a file holds, reading it a block at a time. A
+     * node's vector segments are sparse files of hundreds of megabytes, nearly all zeros, so a
+     * block of zeros is passed over with one comparison and no file is held in memory whole.
+     *
+     * @return Whether the file held the bytes
+     */
+    private static boolean damage(Path file, byte[] marker) throws IOException {
+        // Each read takes the block and the bytes a copy crossing into the next one needs.
+        int span = DAMAGE_BLOCK + marker.length - 1;
+        byte[] zeros = new byte[span];
+        ByteBuffer buffer = ByteBuffer.allocate(span);
+        boolean changed = false;
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ,
+                StandardOpenOption.WRITE)) {
+            long size = channel.size();
+            for (long start = 0; start < size; start += DAMAGE_BLOCK) {
+                int length = readAt(channel, buffer, start);
+                byte[] bytes = buffer.array();
+                if (Arrays.mismatch(bytes, 0, length, zeros, 0, length) < 0) {
+                    continue;
+                }
+                // Copies starting in the overlap are the next block's, so none is counted twice.
+                int last = Math.min(DAMAGE_BLOCK, length - marker.length + 1);
+                for (int at = 0; at < last; at++) {
+                    if (Arrays.equals(bytes, at, at + marker.length, marker, 0, marker.length)) {
+                        bytes[at] ^= 0x01;
+                        channel.write(ByteBuffer.wrap(bytes, at, 1), start + at);
+                        changed = true;
+                    }
                 }
             }
-            return i;
         }
-        return -1;
+        return changed;
+    }
+
+    /** Fills a buffer from a position, as far as the file goes; returns the bytes read. */
+    private static int readAt(FileChannel channel, ByteBuffer buffer, long position)
+            throws IOException {
+        buffer.clear();
+        while (buffer.hasRemaining()) {
+            if (channel.read(buffer, position + buffer.position()) <= 0) {
+                break;
+            }
+        }
+        return buffer.position();
     }
 
     private static List<EmbeddedDocument> handbook() {
@@ -173,15 +216,7 @@ class ExcaliburEmbeddedTest {
             int damaged = 0;
             try (var files = Files.walk(dataDir)) {
                 for (Path file : files.filter(Files::isRegularFile).toList()) {
-                    byte[] bytes = Files.readAllBytes(file);
-                    boolean changed = false;
-                    for (int at = indexOf(bytes, marker, 0); at >= 0;
-                         at = indexOf(bytes, marker, at + marker.length)) {
-                        bytes[at] ^= 0x01;
-                        changed = true;
-                    }
-                    if (changed) {
-                        Files.write(file, bytes);
+                    if (damage(file, marker)) {
                         damaged++;
                     }
                 }

@@ -449,7 +449,8 @@ final class EvaluationNode implements AutoCloseable {
         new NodeShutdown(server, core.indexOrchestrator(),
             attachment == null ? null : attachment.lexicalErasureSweep(),
             attachment == null ? null : attachment.chunkIndex(),
-            tracker, tenants, core.storageEngine(), core.arena(),
+            tracker, tenants, attachment == null ? null : attachment.documentDecoder(),
+            core.storageEngine(), core.arena(),
             ShutdownBudget.configuredTimeout(config.getEffectiveProperties())).run();
     }
 

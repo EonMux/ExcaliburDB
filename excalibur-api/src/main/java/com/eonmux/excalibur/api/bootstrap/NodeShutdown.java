@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.bootstrap;
 import com.eonmux.excalibur.api.server.ExcaliburDBServer;
 import com.eonmux.excalibur.api.server.ShutdownBudget;
 import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
+import com.eonmux.excalibur.ingest.processor.DocumentDecoder;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.store.StorageEngine;
@@ -64,6 +65,8 @@ import java.util.Objects;
  * @param chunkIndex                The BM25 index, or null if none opened
  * @param documentVisibilityTracker Holds the registry that says which documents this node has
  * @param graphTenants              Every open namespace graph
+ * @param documentDecoder           How ingestion reads documents, whose PDF reader may hold OCR
+ *                                  models; or null when no ingestion was wired
  * @param storageEngine             Storage, closed after every reader has drained
  * @param arena                     The shared arena backing the mappings, or null when
  *                                  there is none to close
@@ -77,6 +80,7 @@ public record NodeShutdown(ExcaliburDBServer server,
                            ChunkIndex chunkIndex,
                            DocumentVisibilityTracker documentVisibilityTracker,
                            GraphTenants graphTenants,
+                           DocumentDecoder documentDecoder,
                            StorageEngine storageEngine,
                            Arena arena,
                            Duration shutdownTimeout) {
@@ -172,6 +176,11 @@ public record NodeShutdown(ExcaliburDBServer server,
                                       ShutdownBudget budget) {
         return new ShutdownSequence()
             .add("stop HTTP server and drain in-flight requests", () -> server.stop(budget))
+            // Once ingestion has drained, so no conversion is left to use what is released. One
+            // the drain could not stop keeps its models: freeing them under a page being read
+            // would end the process rather than fail the page.
+            .addIfPresent("release PDF reader", documentDecoder,
+                decoder -> releasePdfReader(decoder, budget))
             // The server's stop has already drained both of these when it was running, and then
             // they answer at once. They wait here only for what that stop left running, or for
             // what a server that never started did not reach; and no longer than the drains have
@@ -239,6 +248,29 @@ public record NodeShutdown(ExcaliburDBServer server,
         // Everything it waits for has already ended, so this returns without waiting.
         indexOrchestrator.close(budget.forDrains());
         return true;
+    }
+
+    /**
+     * Releases what the PDF reader holds - an OCR engine's models and threads - within what the
+     * drains have left.
+     *
+     * @param decoder How ingestion reads documents
+     * @param budget  The shutdown's deadline
+     * @throws IllegalStateException if a conversion was still running at the end of the wait, so
+     *                               the outcome line says the shutdown was not clean
+     */
+    private static void releasePdfReader(DocumentDecoder decoder, ShutdownBudget budget) {
+        boolean released;
+        try {
+            released = decoder.release(budget.forDrains());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while releasing the PDF reader", e);
+        }
+        if (!released) {
+            throw new IllegalStateException("left the PDF reader's OCR models loaded: a "
+                + "conversion still running after the drain is using them");
+        }
     }
 
     /**

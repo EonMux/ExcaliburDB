@@ -61,13 +61,15 @@ import java.util.stream.Stream;
  *
  * <p>Response bodies are read through a bounded stream, so {@code maxResponseSize} caps what
  * is allocated rather than being checked after the whole body is already on the heap. The
- * bound may not exceed {@link DocumentLimits#MAX_DOCUMENT_BYTES}: a larger body could not be
- * indexed, and a larger bound would only let one be held before it failed.</p>
+ * bound may not exceed {@link DocumentLimits#MAX_PDF_BYTES}, the largest document of any kind
+ * that can be indexed; a body over {@link DocumentLimits#MAX_DOCUMENT_BYTES} that is not a PDF is
+ * refused by ingestion once read, so a bound above that is worth setting only for a site that
+ * serves large PDFs.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Base URL must be a valid HTTP or HTTPS URL</li>
- *   <li>Maximum response size: 10 MiB (configurable up to 100 MiB), enforced while reading</li>
+ *   <li>Maximum response size: 10 MiB (configurable up to 1 GiB), enforced while reading</li>
  *   <li>Maximum documents per crawl: 10,000 (configurable)</li>
  *   <li>Maximum redirect hops: 5, each re-checked against the URL filters</li>
  *   <li>Request timeout: 30 seconds (configurable)</li>
@@ -953,7 +955,7 @@ public class HttpSource implements Source {
     private byte[] readBoundedBody(HttpResponse<InputStream> response, String url)
             throws SourceException, IOException {
         // One byte past the bound tells a body at the limit from one over it. The builder holds
-        // maxResponseSize to DocumentLimits.MAX_DOCUMENT_BYTES, so the sum fits an int.
+        // maxResponseSize to DocumentLimits.MAX_PDF_BYTES, 1 GiB, so the sum fits an int.
         byte[] content = readUpTo(response, url, (int) maxResponseSize + 1);
         if (content.length > maxResponseSize) {
             throw new DocumentRefusedException(
@@ -1139,7 +1141,8 @@ public class HttpSource implements Source {
             LOG.debug("Fetched document: {} ({} bytes, {}, {})",
                 documentId, content.length, contentType, charset);
 
-            return new FetchedDocument(documentId, content, contentType, charset,
+            // Handed over rather than copied: the array was read for this document alone.
+            return FetchedDocument.adopting(documentId, content, contentType, charset,
                 lastModifiedMillis, entityTag);
 
         } catch (DocumentNotFoundException e) {
@@ -1779,8 +1782,8 @@ public class HttpSource implements Source {
          * Sets the largest response body a fetch holds; a larger one fails the document.
          *
          * @param maxBytes The bound, 10 MiB by default and at most
-         *                 {@link DocumentLimits#MAX_DOCUMENT_BYTES}; {@link #build()} refuses a
-         *                 larger one
+         *                 {@link DocumentLimits#MAX_PDF_BYTES}; {@link #build()} refuses a larger
+         *                 one
          * @return This builder
          */
         public Builder maxResponseSize(long maxBytes) {

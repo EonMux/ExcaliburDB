@@ -99,9 +99,10 @@ public final class SourceFactory {
 
     /**
      * Largest single file a filesystem crawl may be asked to read: the largest document ingestion
-     * indexes, since a larger file would be read whole only to be refused.
+     * indexes, a PDF, since a larger file would be read whole only to be refused. A file that is
+     * not a PDF is still held to {@link DocumentLimits#MAX_DOCUMENT_BYTES}.
      */
-    public static final long FILE_BYTES_LIMIT = DocumentLimits.MAX_DOCUMENT_BYTES;
+    public static final long FILE_BYTES_LIMIT = DocumentLimits.MAX_PDF_BYTES;
 
     /** Most pages one crawl may be asked to fetch. */
     public static final int DOCUMENTS_LIMIT = 10_000_000;
@@ -110,7 +111,7 @@ public final class SourceFactory {
      * Largest single response body a crawl may be asked to hold: the largest document ingestion
      * indexes, for the same reason as {@link #FILE_BYTES_LIMIT}.
      */
-    public static final long RESPONSE_BYTES_LIMIT = DocumentLimits.MAX_DOCUMENT_BYTES;
+    public static final long RESPONSE_BYTES_LIMIT = DocumentLimits.MAX_PDF_BYTES;
 
     /** Longest one HTTP request may be given, ten minutes. */
     public static final int TIMEOUT_SECONDS_LIMIT = 600;

@@ -2,7 +2,8 @@ package com.eonmux.excalibur.ingest.pipeline;
 
 import com.eonmux.excalibur.ingest.processor.TextChunk;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
-import com.eonmux.excalibur.ingest.processor.TextContent;
+import com.eonmux.excalibur.ingest.processor.DocumentDecoder;
+import com.eonmux.excalibur.ingest.processor.PdfConversionException;
 import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.registry.DocumentLocks;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
@@ -132,6 +133,20 @@ final class DocumentIngestor {
         this.vectorEraser = vectorEraser;
     }
 
+    /** How fetched documents become text; PDFs by their text layer until a converter is wired. */
+    private volatile DocumentDecoder documentDecoder = DocumentDecoder.builtIn();
+
+    /**
+     * Wires how fetched documents become text.
+     *
+     * @param documentDecoder The decoder, the same one the reindex path reads documents with
+     * @throws NullPointerException if documentDecoder is null
+     */
+    void setDocumentDecoder(DocumentDecoder documentDecoder) {
+        this.documentDecoder = Objects.requireNonNull(documentDecoder,
+            "documentDecoder must not be null");
+    }
+
     /**
      * Ingests one document as an atomic unit.
      *
@@ -161,9 +176,9 @@ final class DocumentIngestor {
         // The sources this node builds never read past this bound, so a document reaching it
         // here came from a source that does not know the limit. It is already in memory by now,
         // which is why the sources check first; this is what keeps it from going further.
-        if (doc.getContentLength() > DocumentLimits.MAX_DOCUMENT_BYTES) {
-            LOGGER.warn("Skipping document {}: {} bytes exceeds the {} byte ingest limit",
-                documentId, doc.getContentLength(), DocumentLimits.MAX_DOCUMENT_BYTES);
+        if (DocumentLimits.exceeds(doc)) {
+            LOGGER.warn("Skipping document {}: {} bytes exceeds the ingest limit for its kind",
+                documentId, doc.getContentLength());
             return DocumentOutcome.DROPPED;
         }
 
@@ -175,13 +190,29 @@ final class DocumentIngestor {
         // decoded leniently it is kilobytes of replacement characters, and left unchecked those
         // are chunked, term-indexed, paid for at the embedding endpoint and returned as a search
         // result. An HTML page is reduced to the text it shows here too, so its tags and scripts
-        // are not indexed as though they were its words.
-        String text = TextContent.decode(doc);
-        if (text == null) {
-            LOGGER.info("Skipping document {}: its {} bytes are not text in {}",
-                documentId, doc.getContentLength(), doc.getCharset());
+        // are not indexed as though they were its words, and a PDF is read - or converted, OCR
+        // included - into the text it holds.
+        DocumentDecoder decoder = this.documentDecoder;
+        DocumentDecoder.Decoded decoded;
+        try {
+            // A stop may cut this short: converting a scanned book takes minutes, and it touches
+            // nothing shared - memory, or a temporary file and the converter's process, which is
+            // killed, and the first time OCR runs, a model download of its own.
+            decoded = stop.interruptibly(() -> decoder.decode(doc));
+        } catch (InterruptedException e) {
+            LOGGER.info("Document {} not ingested: its run was stopped while it was read",
+                documentId);
+            return DocumentOutcome.DROPPED;
+        } catch (PdfConversionException e) {
+            LOGGER.warn("Skipping document {}: {}", documentId, e.getMessage());
+            return DocumentOutcome.DROPPED;
+        }
+        if (!decoded.isText()) {
+            LOGGER.info("Skipping document {}: {}", documentId, decoded.refusal());
             return DocumentOutcome.NOT_TEXT;
         }
+        String text = decoded.text();
+        String decoding = decoder.decodingOf(doc);
         List<TextChunk> chunks = textChunker.chunk(documentKey, text);
 
         if (chunks.isEmpty()) {
@@ -211,7 +242,8 @@ final class DocumentIngestor {
         // registration would then put an entry back for content that has gone; the opposite
         // order leaves the chunks with no entry at all, which no later erasure can find.
         Written written = DocumentLocks.shared().inDocument(documentKey,
-            () -> writeAndPublish(sourceId, documentId, documentKey, doc, chunks, embeddings));
+            () -> writeAndPublish(sourceId, documentId, documentKey, doc, decoding, chunks,
+                embeddings));
         if (written.publication() == null) {
             return written.outcome();
         }
@@ -219,7 +251,7 @@ final class DocumentIngestor {
         // Outside the lock: it neither reads nor writes the registry, the visibility entry or
         // the chunks, and the graph sink may be slow. The publication was numbered under the
         // lock, which is what keeps a slow report of this version from undoing a later one's.
-        graphReporter.report(written.publication(), doc);
+        graphReporter.report(written.publication(), text, doc.getLastModifiedMillis());
         return written.outcome();
     }
 
@@ -234,7 +266,7 @@ final class DocumentIngestor {
 
     /** Writes every chunk and publishes the document, undoing the writes if anything fails. */
     private Written writeAndPublish(String sourceId, String documentId, String documentKey,
-                                    FetchedDocument doc, List<TextChunk> chunks,
+                                    FetchedDocument doc, String decoding, List<TextChunk> chunks,
                                     Map<Integer, float[]> embeddings) {
         List<String> writtenKeys = new ArrayList<>(chunks.size());
         // Before anything is written: the chunk ids about to be written begin with the document
@@ -263,7 +295,7 @@ final class DocumentIngestor {
             beginIngestion(documentKey, chunks);
             writeChunks(documentKey, chunks, embeddings, writtenKeys);
             retireSupersededVersion(documentKey, previous, writtenKeys);
-            publishDocument(sourceId, documentId, documentKey, doc, chunks);
+            publishDocument(sourceId, documentId, documentKey, doc, decoding, chunks);
         } catch (Exception e) {
             rollbackChunks(sourceId, documentId, documentKey, previous, writtenKeys, e);
             return new Written(DocumentOutcome.DROPPED, null);
@@ -498,8 +530,8 @@ final class DocumentIngestor {
      * change and tombstone exactly these chunk ids.</p>
      */
     private void publishDocument(String sourceId, String documentId, String documentKey,
-                                 FetchedDocument doc, List<TextChunk> chunks) {
-        byte[] content = doc.getContent();
+                                 FetchedDocument doc, String decoding,
+                                 List<TextChunk> chunks) {
         List<String> chunkIds = new ArrayList<>(chunks.size());
         for (TextChunk chunk : chunks) {
             chunkIds.add(ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex()));
@@ -514,9 +546,9 @@ final class DocumentIngestor {
             .entityTag(doc.getEntityTag())
             // Kept so the next re-crawl can tell these bytes being read into other text - a
             // charset changed since - from the same text it already holds.
-            .decoding(TextContent.decodingOf(doc))
-            .contentHash(DocumentRegistry.computeContentHash(content))
-            .contentLength(content.length)
+            .decoding(decoding)
+            .contentHash(doc.contentHash())
+            .contentLength(doc.getContentLength())
             .chunkIds(chunkIds)
             .indexTimeMillis(System.currentTimeMillis())
             .build();
