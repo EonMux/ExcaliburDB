@@ -101,8 +101,15 @@ public final class IndraPdfReader implements PdfReader {
             return DocumentDecoder.Decoded.refused("a PDF Indra OCR cannot open: "
                 + e.getMessage());
         } catch (ConversionTimeoutException e) {
-            throw new PdfConversions.Unrepeatable("Indra OCR did not finish " + documentId
-                + " within " + conversions.timeout().toSeconds() + "s; raise "
+            String late = "Indra OCR did not finish " + documentId + " within "
+                + conversions.timeout().toSeconds() + "s";
+            if (e.shared()) {
+                // Other conversions took turns at the page readers meanwhile, so the time was not
+                // the document's alone: failed for now, and tried again by a later crawl.
+                throw new PdfConversionException(late + " while other PDFs were converted "
+                    + "alongside it; a later crawl tries it again");
+            }
+            throw new PdfConversions.Unrepeatable(late + "; raise "
                 + "excalibur.ingest.pdf-converter-timeout-seconds if it is that large");
         } catch (ModelUnavailableException e) {
             throw new PdfConversionException("Indra OCR could not read " + documentId + ": "

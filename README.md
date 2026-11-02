@@ -2281,12 +2281,12 @@ rather than a silent clamp:
 | `excluded_directories` | filesystem | — | Directory names the walk does not descend into, matched at any depth below the root. The walk never opens them, so a large `node_modules` costs nothing and a link cycle inside one cannot abort the crawl. A file that shares a name with one is still a file |
 | `follow_symlinks` | filesystem | — | Whether the walk descends through symbolic links. A link out of the allowed root is still refused: the real path is what is checked |
 | `include_hidden` | filesystem | — | Whether dot-files are read, and whether the walk enters dot-directories — `.config/notes.md` is hidden with its directory. The root itself may be hidden |
-| `max_file_bytes` | filesystem | 1 B – 1 GiB | Largest single file the crawl will read; 1 GiB when absent. A larger file is listed and not read: it fails that document, counted in `documents_failed`, and a file that grew past the limit keeps the version indexed before rather than being taken as deleted. Only a PDF may be larger than 100 MiB; the ceiling is the largest document the node indexes (see below) |
+| `max_file_bytes` | filesystem | 1 B – 1 GiB | Largest single file the crawl will read; 1 GiB when absent. A larger file is listed and not read: it fails that document, counted in `documents_failed`, and a file that grew past the limit keeps the version indexed before rather than being taken as deleted. Only a PDF may be larger than 100 MiB, up to a quarter of the node's heap; the ceiling is the largest document the node indexes (see below) |
 | `charset` | filesystem | any encoding the JVM supports | The encoding a file without a byte-order mark is read in; UTF-8 when absent. A name the node cannot decode is a 400, not a silent fall-back to UTF-8. Recorded under its canonical name, which is what `GET /v1/ingest` shows. Refused on an HTTP crawl, whose responses each name their own encoding — see [What gets indexed](#what-gets-indexed) |
 | `included_path_patterns` | http | — | Substrings a URL path must contain to be crawled |
 | `excluded_path_patterns` | http | — | Substrings that keep a URL path out of the crawl; `/api`, `/admin`, `/login` and `/logout` when absent. Given, it replaces that list, and `[]` clears it. A registration whose patterns keep out the `base_url` page itself is a 400 naming the pattern, since the walk starts there and would list nothing |
 | `max_documents` | http | 1 – 10000000 | How many pages one crawl fetches. A crawl that reaches it has not listed the whole site, so a re-crawl keeps the indexed pages it did not reach rather than removing them |
-| `max_response_bytes` | http | 1 B – 1 GiB | Largest single response body held; 10 MiB when absent. A larger body fails that document. Only a PDF may be larger than 100 MiB; the ceiling is the largest document the node indexes (see below) |
+| `max_response_bytes` | http | 1 B – 1 GiB | Largest single response body held; 10 MiB when absent. A larger body fails that document. Only a PDF may be larger than 100 MiB, up to a quarter of the node's heap; the ceiling is the largest document the node indexes (see below) |
 | `timeout_seconds` | http | 1 – 600 | How long one request may take |
 | `user_agent` | http | ≤ 200 chars | What the crawl identifies itself as. Screened for header injection |
 | `crawl_delay_ms` | http | 0 – 60000 | The gap this crawl leaves between requests to its host. The node takes the larger of this and `excalibur.ingest.crawl-delay-ms`, so it can ask to be gentler than the deployment requires and never quicker |
@@ -2303,11 +2303,14 @@ every such field and listing the ones the source type takes, and so is a top-lev
 than `source_type` and `config`. Ignored, it would be answered `registered` and the source crawled
 without the setting the caller believes it made.
 
-Whatever these say, one document is indexed only up to 100 MiB — 1 GiB for a PDF — and 10,000
-chunks. At the default chunking (512 tokens, 64 overlapping) the chunk bound is met first by a text
+Whatever these say, one document is indexed only up to 100 MiB — for a PDF, a quarter of the
+node's maximum heap, between 100 MiB and 1 GiB — and 10,000 chunks. At the default chunking (512 tokens, 64 overlapping) the chunk bound is met first by a text
 document, at about 18 MB. A PDF has a byte bound of its own because most of its bytes are images and
 fonts rather than text: a scanned book of several hundred megabytes holds a few megabytes of text,
-and the chunk bound still governs what that text may cost. A document past either bound is counted
+and the chunk bound still governs what that text may cost. A PDF is read whole and its pages take
+up to half the heap while it is converted, so its bound follows the heap: a node needs a 4 GiB heap
+(`-Xmx4g`) to read a 1 GiB PDF, and a larger one on a smaller heap fails, with a message saying so,
+rather than ending the process. A document past either bound is counted
 in `documents_failed`, on the first crawl and every re-crawl alike, including one supplied to
 `POST /v1/documents`. The byte limit is why `max_file_bytes` and `max_response_bytes` stop at 1 GiB:
 a larger file or body could only be read to be discarded. A registration recorded with a larger
@@ -2570,7 +2573,9 @@ that timed out, produced too much, produced nothing, or could not open its PDF w
 way again, so the node remembers those bytes and does not convert them again until the file
 changes, the reader's configuration changes, or the node restarts; each re-crawl still counts a
 failed one in `documents_failed`. Any other failure - a command's non-zero exit, models that could
-not be downloaded - is retried by the next re-crawl, because it is fixed outside the node.
+not be downloaded - is retried by the next re-crawl, because it is fixed outside the node. So is
+an Indra conversion that ran out of time while other PDFs were converted alongside it, since
+taking turns with them may be what made it late.
 
 How a PDF was read is recorded with it - for Indra, the port's version, the model revision and
 every setting that changes the text; for a command, its file name and arguments - so choosing

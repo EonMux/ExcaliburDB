@@ -133,7 +133,31 @@ class DocumentLimitsTest {
             large, 0, 8);
         assertThat(DocumentLimits.exceeds(new FetchedDocument("big.pdf", large, null)))
             .isFalse();
-        assertThat(DocumentLimits.maxBytes(true)).isEqualTo(DocumentLimits.MAX_PDF_BYTES);
+        assertThat(DocumentLimits.maxBytes(true)).isEqualTo(DocumentLimits.maxPdfBytes());
         assertThat(DocumentLimits.maxBytes(false)).isEqualTo(DocumentLimits.MAX_DOCUMENT_BYTES);
+    }
+
+    @Test
+    @DisplayName("reads a PDF up to a quarter of the heap, within 1 GiB and never below 100 MiB")
+    void pdfBoundFollowsTheHeap() {
+        long gib = 1024L * 1024 * 1024;
+        assertThat(DocumentLimits.maxPdfBytes(256L * 1024 * 1024))
+            .isEqualTo(DocumentLimits.MAX_DOCUMENT_BYTES);
+        assertThat(DocumentLimits.maxPdfBytes(2 * gib)).isEqualTo(512 * 1024 * 1024);
+        assertThat(DocumentLimits.maxPdfBytes(16 * gib)).isEqualTo(DocumentLimits.MAX_PDF_BYTES);
+        assertThat(DocumentLimits.maxPdfBytes(Long.MAX_VALUE))
+            .isEqualTo(DocumentLimits.MAX_PDF_BYTES);
+        assertThat(DocumentLimits.maxPdfBytes())
+            .isBetween(DocumentLimits.MAX_DOCUMENT_BYTES, DocumentLimits.MAX_PDF_BYTES);
+    }
+
+    @Test
+    @DisplayName("says more heap reads a PDF only when the heap, not 1 GiB, refuses it")
+    void pdfTooLargeNamesTheHeap() {
+        assertThat(DocumentLimits.pdfTooLarge(600_000_000L, 512 * 1024 * 1024))
+            .isEqualTo("600000000 bytes (max: 536870912 for a PDF, 25% of this node's maximum"
+                + " heap; a larger heap (-Xmx) reads it)");
+        assertThat(DocumentLimits.pdfTooLarge(2_000_000_000L, DocumentLimits.MAX_PDF_BYTES))
+            .isEqualTo("2000000000 bytes (max: 1073741824 for a PDF)");
     }
 }

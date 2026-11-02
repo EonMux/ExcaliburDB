@@ -13,6 +13,8 @@ import com.eonmux.excalibur.ingest.source.DocumentLimits;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.FilesystemSource;
 import com.eonmux.excalibur.ingest.source.SourceException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
@@ -44,6 +46,8 @@ import java.util.stream.Stream;
  * {@link #documentOf(Provenance)} runs that derivation backwards over the documents read here.
  */
 final class EvaluationCorpus {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(EvaluationCorpus.class);
 
     /** The source id the corpus is ingested under, and so the first part of every chunk name. */
     static final String SOURCE_ID = "corpus";
@@ -195,6 +199,13 @@ final class EvaluationCorpus {
         try {
             DocumentDecoder.Decoded decoded = decoder.decode(fetched);
             return decoded.isText() ? decoded.text() : null;
+        } catch (RuntimeException e) {
+            // A conversion that fails - PdfConversionException among them - fails that one
+            // document in ingestion, which goes on to the next; the node never holds it. Said
+            // here as ingestion says it, so a corpus quietly smaller than its files is explained.
+            LOGGER.warn("Leaving {} out of the corpus: {}", fetched.getDocumentId(),
+                e.getMessage());
+            return null;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new InterruptedIOException("Interrupted reading " + fetched.getDocumentId());

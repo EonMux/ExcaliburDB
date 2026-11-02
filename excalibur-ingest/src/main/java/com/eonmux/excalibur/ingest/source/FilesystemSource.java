@@ -254,6 +254,12 @@ public class FilesystemSource implements Source {
                 );
             }
 
+            // A PDF is read only as large as this node's heap can hold alongside its conversion.
+            if (fileSize > DocumentLimits.maxPdfBytes()) {
+                throw new DocumentRefusedException("File too large: "
+                    + DocumentLimits.pdfTooLarge(fileSize) + ": " + documentId, sourceId);
+            }
+
             byte[] content = Files.readAllBytes(filePath);
             String contentType = detectContentType(filePath);
             long lastModifiedMillis = attrs.lastModifiedTime().toMillis();

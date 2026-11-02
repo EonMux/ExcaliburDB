@@ -25,6 +25,7 @@ import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -167,6 +168,40 @@ class IndraOcrTest {
             assertThat(longDone.get()).as("the long document finished").isPositive();
             assertThat(shortDone).as("the short one did not wait out the long one")
                 .isLessThan(longDone.get());
+        }
+    }
+
+    @Test
+    @DisplayName("says whether a conversion that ran out of time shared the readers with another")
+    void timeoutSaysWhetherShared() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        FakePages pages = new FakePages((doc, i) -> {
+            release.await(10, TimeUnit.SECONDS);
+            return new PageText("p", "");
+        });
+        IndraOptions oneThread = new IndraOptions(ReadMode.AUTO, 200, false, false, true, 1);
+        try (IndraOcr ocr = ocr(pages, oneThread)) {
+            ocr.prepare();
+            assertThatThrownBy(() -> ocr.convert(pdf(1), Deadline.after(Duration.ofMillis(100))))
+                .isInstanceOfSatisfying(ConversionTimeoutException.class,
+                    e -> assertThat(e.shared()).as("ran alone").isFalse());
+
+            Thread other = Thread.ofPlatform().start(() -> {
+                try {
+                    ocr.convert(pdf(1), Deadline.NONE);
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+            try {
+                assertThatThrownBy(() -> ocr.convert(pdf(1),
+                        Deadline.after(Duration.ofMillis(300))))
+                    .isInstanceOfSatisfying(ConversionTimeoutException.class,
+                        e -> assertThat(e.shared()).as("ran beside another").isTrue());
+            } finally {
+                release.countDown();
+                other.join(10_000);
+            }
         }
     }
 
@@ -387,6 +422,24 @@ class IndraOcrTest {
                 })) {
             assertThatThrownBy(() -> broken.convert(pdf(1), Deadline.NONE))
                 .isInstanceOf(ModelUnavailableException.class).hasMessageContaining("bad model");
+        }
+        // A model whose metadata does not parse, or a runtime whose native library will not load
+        // here, fails a conversion as a missing model does rather than escaping as an error.
+        try (IndraOcr unparsable = IndraOcr.create(ModelStore.local(Models.dir()), FOUR_THREADS,
+                (dir, options) -> {
+                    throw new IllegalStateException("bad metadata");
+                })) {
+            assertThatThrownBy(() -> unparsable.convert(pdf(1), Deadline.NONE))
+                .isInstanceOf(ModelUnavailableException.class)
+                .hasMessageContaining("IllegalStateException: bad metadata");
+        }
+        try (IndraOcr unlinked = IndraOcr.create(ModelStore.local(Models.dir()), FOUR_THREADS,
+                (dir, options) -> {
+                    throw new UnsatisfiedLinkError("no onnxruntime here");
+                })) {
+            assertThatThrownBy(unlinked::prepare)
+                .isInstanceOf(ModelUnavailableException.class)
+                .hasMessageContaining("UnsatisfiedLinkError: no onnxruntime here");
         }
     }
 

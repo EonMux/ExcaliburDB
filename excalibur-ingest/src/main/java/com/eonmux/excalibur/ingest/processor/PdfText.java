@@ -95,6 +95,12 @@ final class PdfText implements PdfReader {
                 + "without a password");
         } catch (IOException e) {
             return DocumentDecoder.Decoded.refused("not a readable PDF: " + e.getMessage());
+        } catch (RuntimeException e) {
+            // PDFBox reports some damaged structures - a wrong object type, a broken content
+            // stream - as unchecked exceptions rather than I/O failures; the document is as
+            // unreadable either way.
+            return DocumentDecoder.Decoded.refused("not a readable PDF: "
+                + e.getClass().getSimpleName() + ": " + e.getMessage());
         }
     }
 

@@ -217,17 +217,27 @@ public final class PdfConverter implements PdfReader {
                 + stderr.describe());
         }
         // A program that exits leaving a child behind holding its output open would keep the
-        // readers waiting; nothing it started has any work left once it has answered.
-        killTree(process, started);
+        // readers waiting; nothing it started has any work left once it has answered. Only what
+        // it started is killed: destroying the exited program itself closes its output streams,
+        // under a reader that may not have finished reading them.
+        killDescendants(process, started);
         outReader.join(READER_GRACE);
         errReader.join(READER_GRACE);
+        boolean stillReading = outReader.isAlive();
+        if (stillReading || errReader.isAlive()) {
+            // Something outside the tree still holds the pipes open: closing them, which
+            // destroying the exited program does, is what ends the readers.
+            process.destroyForcibly();
+        }
 
         int exit = process.exitValue();
         if (exit != 0) {
             throw new PdfConversionException(executable.getFileName() + " exited " + exit
                 + " converting " + documentId + stderr.describe());
         }
-        if (stdoutFailure.get() != null) {
+        // A reader still running at the end of its grace fails on the pipe closed under it;
+        // that is reported as the wait it is, below.
+        if (stdoutFailure.get() != null && !stillReading) {
             throw new PdfConversionException("Could not read " + executable.getFileName()
                 + "'s output for " + documentId + ": " + stdoutFailure.get().getMessage(),
                 stdoutFailure.get());
@@ -322,12 +332,23 @@ public final class PdfConverter implements PdfReader {
      * @param started Descendants seen while it ran, some of which may since have been adopted
      */
     private static void killTree(Process process, Set<ProcessHandle> started) {
+        killDescendants(process, started);
+        process.destroyForcibly();
+    }
+
+    /**
+     * Kills everything a process started, children first so none is orphaned, leaving the
+     * process itself and its streams alone.
+     *
+     * @param process The program
+     * @param started Descendants seen while it ran, some of which may since have been adopted
+     */
+    private static void killDescendants(Process process, Set<ProcessHandle> started) {
         process.descendants().forEach(ProcessHandle::destroyForcibly);
         for (ProcessHandle seen : started) {
             seen.descendants().forEach(ProcessHandle::destroyForcibly);
             seen.destroyForcibly();
         }
-        process.destroyForcibly();
     }
 
     private static void deleteQuietly(Path file) {

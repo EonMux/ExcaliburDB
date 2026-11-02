@@ -302,7 +302,7 @@ public class HttpSource implements Source {
         this.excludedPathPatterns = Set.copyOf(builder.excludedPathPatterns);
         this.includedContentTypes = builder.includedContentTypes.isEmpty()
             ? Set.of("text/html", "application/xhtml+xml", "text/plain", "text/markdown",
-                "application/json", "application/xml")
+                "application/json", "application/xml", "application/pdf")
             : Set.copyOf(normalizeContentTypes(builder.includedContentTypes));
         this.maxDepth = Math.max(0, builder.maxDepth);
         this.maxDocuments = Math.max(1, builder.maxDocuments);
@@ -954,12 +954,17 @@ public class HttpSource implements Source {
      */
     private byte[] readBoundedBody(HttpResponse<InputStream> response, String url)
             throws SourceException, IOException {
+        // No body is held past what this node's heap can take for a PDF, the largest kind.
+        long bound = Math.min(maxResponseSize, DocumentLimits.maxPdfBytes());
         // One byte past the bound tells a body at the limit from one over it. The builder holds
         // maxResponseSize to DocumentLimits.MAX_PDF_BYTES, 1 GiB, so the sum fits an int.
-        byte[] content = readUpTo(response, url, (int) maxResponseSize + 1);
-        if (content.length > maxResponseSize) {
-            throw new DocumentRefusedException(
-                "Response too large: exceeds " + maxResponseSize + " bytes: " + url,
+        byte[] content = readUpTo(response, url, (int) bound + 1);
+        if (content.length > bound) {
+            // The body was read only one byte past the bound, so the bound is what can be said.
+            throw new DocumentRefusedException(bound < maxResponseSize
+                ? "Response too large: exceeds " + bound + " bytes, the largest PDF this node's "
+                    + "heap holds; a larger heap (-Xmx) reads it: " + url
+                : "Response too large: exceeds " + maxResponseSize + " bytes: " + url,
                 sourceId);
         }
         return content;

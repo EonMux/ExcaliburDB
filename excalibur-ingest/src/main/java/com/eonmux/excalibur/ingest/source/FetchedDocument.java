@@ -35,6 +35,13 @@ public final class FetchedDocument {
     private final String entityTag;
 
     /**
+     * The content's hash once computed; see {@link #contentHash()}. Written before
+     * {@link #hashed}, so a thread that reads {@code hashed} as true reads the hash too.
+     */
+    private long contentHash;
+    private volatile boolean hashed;
+
+    /**
      * Creates a new FetchedDocument.
      *
      * @param documentId        Unique identifier for this document (non-null, non-empty)
@@ -178,12 +185,19 @@ public final class FetchedDocument {
     /**
      * The content's hash, as the registry records it to tell one version from another.
      *
-     * <p>Computed over the content in place, so a large document is not copied to be hashed.</p>
+     * <p>Computed over the content in place, so a large document is not copied to be hashed,
+     * and once: the content never changes, and the registry, change detection and a PDF
+     * reader's memory of conversions each ask for it, over as much as a gigabyte.</p>
      *
      * @return The XXH64 hash, seed 0, of the content
      */
     public long contentHash() {
-        return XxHash64.hash(content);
+        if (!hashed) {
+            // Two threads racing here compute the same value; either write is the right one.
+            contentHash = XxHash64.hash(content);
+            hashed = true;
+        }
+        return contentHash;
     }
 
     /**

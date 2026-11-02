@@ -746,7 +746,7 @@ wherever the node was started.
 | `max_depth` | integer | 100 | Directory levels below the root to descend, 1 to 1000 |
 | `follow_symlinks` | bool | `false` | Whether the walk descends through symbolic links. A link whose real target lies outside the root is skipped whatever this is set to, so a link cannot be used to read a directory the allow-list does not permit |
 | `include_hidden` | bool | `false` | Whether dot-files are indexed. While `false`, the walk does not enter a dot-directory either, so `.config/notes.md` is left out with its directory. The root itself is never judged: registering `~/.notes` indexes what is in it |
-| `max_file_bytes` | integer | 1073741824 | Largest single file read, 1 byte to 1 GiB — the [largest document the node indexes](#document-size-limits). A file that is not a PDF is held to 100 MiB whatever this says. A larger file is listed but never read, so it is neither indexed nor truncated; it counts in `documents_failed` |
+| `max_file_bytes` | integer | 1073741824 | Largest single file read, 1 byte to 1 GiB — the [largest document the node indexes](#document-size-limits). A file that is not a PDF is held to 100 MiB whatever this says, and a PDF to a quarter of the node's heap. A larger file is listed but never read, so it is neither indexed nor truncated; it counts in `documents_failed` |
 | `charset` | string | UTF-8 | The encoding a file is read in when it carries no byte-order mark, by any name or alias the JVM knows (`windows-1252`, `latin1`, `UTF-16LE`). A file that does carry a mark is read in the encoding the mark names, whatever is declared here: the mark was written by the program that encoded that file, the declaration by someone describing the whole directory. An unknown name is a `400`, never a quiet fall-back to UTF-8, and the name is stored and read back in its canonical form |
 
 A value outside its range is answered `400` rather than clamped: clamping would register the
@@ -788,7 +788,7 @@ curl -X POST http://localhost:8080/v1/ingest \
 |-------|------|---------|---------|
 | `max_depth` | integer | 3 | Link hops followed from the base URL, 0 to 1000 |
 | `max_documents` | integer | 10000 | Pages fetched before the crawl stops, 1 to 10000000. A crawl that stops here has not listed the whole site, so it is a [gap in the listing](#pages-whose-links-cannot-be-read): a re-crawl keeps the indexed pages it did not reach rather than removing them |
-| `max_response_bytes` | integer | 10485760 | Largest response body held, 1 byte to 1 GiB — the [largest document the node indexes](#document-size-limits). A body that is not a PDF is held to 100 MiB whatever this says. A larger body fails that page's document; it is never truncated |
+| `max_response_bytes` | integer | 10485760 | Largest response body held, 1 byte to 1 GiB — the [largest document the node indexes](#document-size-limits). A body that is not a PDF is held to 100 MiB whatever this says, and a PDF to a quarter of the node's heap. A larger body fails that page's document; it is never truncated |
 | `timeout_seconds` | integer | 30 | Budget for one request, 1 to 600 |
 | `included_path_patterns` | array of string | _(all)_ | A URL path must contain one of these substrings to be crawled. Plain substrings, not globs or regexes |
 | `excluded_path_patterns` | array of string | `/api`, `/admin`, `/login`, `/logout` | A URL path containing one of these is skipped. Supplying this **replaces** the default list, and `[]` clears it |
@@ -910,7 +910,7 @@ a crawled file, a fetched page, or one supplied to `POST /v1/documents`:
 
 | Limit | Value | What happens past it |
 |-------|-------|----------------------|
-| Bytes | 104857600 (100 MiB); 1073741824 (1 GiB) for a PDF | The document is not indexed |
+| Bytes | 104857600 (100 MiB); for a PDF, a quarter of the node's maximum heap, from 104857600 (100 MiB) to 1073741824 (1 GiB) | The document is not indexed |
 | Chunks | 10000 | The document is not indexed |
 
 At the default chunk size (512 tokens, 64 overlapping) the chunk limit is the one a text document
@@ -922,7 +922,10 @@ that grew past `max_file_bytes` is still there, and is not taken as deleted. A l
 to be split before it is ingested.
 
 A PDF has the larger bound because most of its bytes are images and fonts, not text; the chunk
-limit still governs what its text may cost. `max_file_bytes` and `max_response_bytes` cannot be set
+limit still governs what its text may cost. It is read whole, and its pages take up to half the
+heap while it is converted, so the bound follows the heap: reading a 1 GiB PDF takes a 4 GiB heap
+(`-Xmx4g`), and a larger PDF on a smaller heap fails, its message naming the heap, rather than
+running the node out of memory. `max_file_bytes` and `max_response_bytes` cannot be set
 past 1 GiB, since a larger file or body could only be read to be discarded. A filesystem crawl lists a file over its
 `max_file_bytes` and does not read it: it counts as a failed document, not in `entries_skipped`,
 and the reason, `File too large`, is in the node's log. An HTTP response over `max_response_bytes`

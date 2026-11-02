@@ -27,14 +27,25 @@ package com.eonmux.excalibur.ingest.source;
  * inside the chunk bound. So a PDF - recognised by its header, see {@link PdfSignature} - is
  * read up to {@link #MAX_PDF_BYTES}, and the chunk bound still governs what its text may cost.
  * Everything else keeps {@link #MAX_DOCUMENT_BYTES}, because for text the bytes are the text.</p>
+ *
+ * <h2>Why a PDF's bound follows the heap</h2>
+ * <p>A PDF is read whole, and while it is converted the pages being read take up to half the
+ * heap besides. A gigabyte-sized file on a node with a heap of a gigabyte or two would end the
+ * process - the container image exits on running out of memory - and every crawl after the
+ * restart would read it again. So a PDF is read only up to {@link #PDF_HEAP_SHARE} of the
+ * maximum heap, within {@link #MAX_PDF_BYTES} and never below {@link #MAX_DOCUMENT_BYTES}; a
+ * larger one fails, with a message that says more heap reads it, and the node stays up.</p>
  */
 public final class DocumentLimits {
 
     /** The largest document other than a PDF, in bytes, that is read and indexed: 100 MiB. */
     public static final int MAX_DOCUMENT_BYTES = 100 * 1024 * 1024;
 
-    /** The largest PDF, in bytes, that is read and indexed: 1 GiB. */
+    /** The largest PDF, in bytes, that is read and indexed, on a heap that can hold it: 1 GiB. */
     public static final int MAX_PDF_BYTES = 1024 * 1024 * 1024;
+
+    /** The share of the maximum heap one PDF's bytes may take. */
+    public static final double PDF_HEAP_SHARE = 0.25;
 
     /** The most chunks one document may produce and still be indexed. */
     public static final int MAX_CHUNKS_PER_DOCUMENT = 10_000;
@@ -43,10 +54,58 @@ public final class DocumentLimits {
      * The largest a document of this kind may be.
      *
      * @param pdf Whether the document is a PDF
-     * @return {@link #MAX_PDF_BYTES} for a PDF, {@link #MAX_DOCUMENT_BYTES} for anything else
+     * @return {@link #maxPdfBytes()} for a PDF, {@link #MAX_DOCUMENT_BYTES} for anything else
      */
     public static int maxBytes(boolean pdf) {
-        return pdf ? MAX_PDF_BYTES : MAX_DOCUMENT_BYTES;
+        return pdf ? maxPdfBytes() : MAX_DOCUMENT_BYTES;
+    }
+
+    /**
+     * The largest PDF this process reads: {@link #PDF_HEAP_SHARE} of its maximum heap, within
+     * {@link #MAX_PDF_BYTES} and never below {@link #MAX_DOCUMENT_BYTES}.
+     *
+     * @return The bound in bytes
+     */
+    public static int maxPdfBytes() {
+        return maxPdfBytes(Runtime.getRuntime().maxMemory());
+    }
+
+    /**
+     * The largest PDF a process with this maximum heap reads.
+     *
+     * @param maxHeap The maximum heap in bytes; {@link Long#MAX_VALUE} when it is unbounded
+     * @return The bound in bytes
+     */
+    static int maxPdfBytes(long maxHeap) {
+        long share = (long) (maxHeap * PDF_HEAP_SHARE);
+        return (int) Math.max(MAX_DOCUMENT_BYTES, Math.min(MAX_PDF_BYTES, share));
+    }
+
+    /**
+     * Why a PDF of this size is not read, naming the heap when it, not {@link #MAX_PDF_BYTES},
+     * is what refuses it.
+     *
+     * @param bytes The PDF's size, larger than {@link #maxPdfBytes()}
+     * @return The reason, for a refusal's message
+     */
+    public static String pdfTooLarge(long bytes) {
+        return pdfTooLarge(bytes, maxPdfBytes());
+    }
+
+    /**
+     * Why a PDF of this size is not read under a given bound.
+     *
+     * @param bytes The PDF's size
+     * @param bound The largest PDF read, from {@link #maxPdfBytes(long)}
+     * @return The reason
+     */
+    static String pdfTooLarge(long bytes, int bound) {
+        String reason = bytes + " bytes (max: " + bound + " for a PDF";
+        if (bound < MAX_PDF_BYTES) {
+            reason += ", " + Math.round(PDF_HEAP_SHARE * 100) + "% of this node's maximum heap;"
+                + " a larger heap (-Xmx) reads it";
+        }
+        return reason + ")";
     }
 
     /**
@@ -58,7 +117,7 @@ public final class DocumentLimits {
     public static boolean exceeds(FetchedDocument document) {
         int length = document.getContentLength();
         return length > MAX_DOCUMENT_BYTES
-            && (length > MAX_PDF_BYTES || !PdfSignature.isPdf(document.contentView()));
+            && (length > maxPdfBytes() || !PdfSignature.isPdf(document.contentView()));
     }
 
     /**

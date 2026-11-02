@@ -192,7 +192,7 @@ public final class IndraOcr implements AutoCloseable {
         }
         PageConverter converter = pages();
         Work work = new Work(converter, bytes, deadline, count);
-        works.add(work);
+        enlist(work);
         try {
             if (closed) {
                 throw closedWhileConverting();
@@ -202,9 +202,25 @@ public final class IndraOcr implements AutoCloseable {
                 work.start();
             }
             return work.await();
+        } catch (ConversionTimeoutException e) {
+            throw work.shared ? new ConversionTimeoutException(e.getMessage(), true) : e;
         } finally {
             works.remove(work);
             work.stopAndAwait();
+        }
+    }
+
+    /**
+     * Adds a conversion to those under way, marking it and every other as shared when there is
+     * more than one: from then on they take turns at the page readers.
+     */
+    private void enlist(Work work) {
+        synchronized (works) {
+            if (!works.isEmpty()) {
+                work.shared = true;
+                works.forEach(other -> other.shared = true);
+            }
+            works.add(work);
         }
     }
 
@@ -299,9 +315,12 @@ public final class IndraOcr implements AutoCloseable {
             Path dir = store.ensure(IndraModels.files(options.math()));
             try {
                 loaded = factory.load(dir, options);
-            } catch (IOException e) {
+            } catch (IOException | RuntimeException | LinkageError e) {
+                // A model's metadata that does not parse, or an ONNX Runtime whose native library
+                // will not load on this platform, fails every conversion as surely as a missing
+                // file; reported as one, it fails the document rather than the run reading it.
                 throw new ModelUnavailableException("Could not load Indra OCR's models from "
-                    + dir + ": " + e.getMessage(), e);
+                    + dir + ": " + e.getClass().getSimpleName() + ": " + e.getMessage(), e);
             }
             synchronized (this) {
                 if (closed) {
@@ -431,6 +450,8 @@ public final class IndraOcr implements AutoCloseable {
         private int active;
         private boolean stopped;
         private Throwable failure;
+        /** Whether another conversion was under way at some time while this one was. */
+        private volatile boolean shared;
 
         Work(PageConverter converter, ByteBuffer bytes, Deadline deadline, int pages) {
             this.converter = converter;

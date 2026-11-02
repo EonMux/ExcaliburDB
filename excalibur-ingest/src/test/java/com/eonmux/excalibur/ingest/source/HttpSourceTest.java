@@ -42,6 +42,7 @@ class HttpSourceTest {
         server.createContext("/status/", new StatusHandler());
         server.createContext("/large.html", new LargeContentHandler());
         server.createContext("/api/data.json", new ApiHandler());
+        server.createContext("/paper.pdf", new PdfHandler());
         server.createContext("/redirect-in-policy.html", new RedirectHandler("/page1.html"));
         server.createContext("/redirect-off-host.html", new RedirectHandler(null));
         server.createContext("/redirect-excluded.html", new RedirectHandler("/api/data.json"));
@@ -227,6 +228,15 @@ class HttpSourceTest {
             assertThat(doc.getContentType()).contains("application/json");
             
             jsonSource.close();
+        }
+
+        @Test
+        @DisplayName("fetch accepts a PDF without being told to, as it reads PDFs by default")
+        void fetch_acceptsPdfByDefault() throws SourceException, DocumentNotFoundException {
+            FetchedDocument doc = source.fetch(baseUrl + "/paper.pdf");
+
+            assertThat(doc.getContentType()).contains("application/pdf");
+            assertThat(PdfSignature.isPdf(doc.contentView())).isTrue();
         }
 
         @Test
@@ -1018,6 +1028,18 @@ class HttpSourceTest {
                 html.append("<a href=\"/hub/leaf-").append(i).append(".html\">leaf ").append(i).append("</a>");
             }
             return html.append("</body></html>").toString();
+        }
+    }
+
+    private static class PdfHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            byte[] response = "%PDF-1.4\n%%EOF\n"
+                .getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+            exchange.getResponseHeaders().set("Content-Type", "application/pdf");
+            exchange.sendResponseHeaders(200, response.length);
+            exchange.getResponseBody().write(response);
+            exchange.getResponseBody().close();
         }
     }
 

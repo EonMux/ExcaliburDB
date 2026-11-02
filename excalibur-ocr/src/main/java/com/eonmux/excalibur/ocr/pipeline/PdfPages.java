@@ -132,7 +132,10 @@ public final class PdfPages implements AutoCloseable {
      */
     private Layer readLayer(PdfPage page, Deadline deadline)
             throws IOException, ConversionTimeoutException, InterruptedException {
-        double s = DocumentLayer.CHECK_DPI / 72.0;
+        // Bounded like every other render: at one pixel per point, a page whose box a damaged or
+        // hostile file sets to tens of thousands of points a side would otherwise allocate
+        // gigabytes for the check alone, past what the page's memory lease accounts for.
+        double s = DocumentLayer.pageScale(page.width(), page.height(), DocumentLayer.CHECK_DPI);
         GrayImage check = renderer.render(page, s);
         TextLayer tl = TextLayers.read(page, check, s);
         // A table set sideways: most characters share one quarter turn. Read the page turned

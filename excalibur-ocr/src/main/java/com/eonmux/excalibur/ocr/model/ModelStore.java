@@ -29,6 +29,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * A directory of pinned model files, filled from their source the first time they are needed.
@@ -60,8 +61,11 @@ public final class ModelStore {
 
     private static final String LOCK_FILE = ".download.lock";
 
-    /** One monitor per directory, so two stores over the same directory take turns. */
-    private static final ConcurrentHashMap<Path, Object> MONITORS = new ConcurrentHashMap<>();
+    /**
+     * One lock per directory, so two stores over the same directory take turns. A lock rather
+     * than a monitor: a thread waiting out another's download must still answer an interrupt.
+     */
+    private static final ConcurrentHashMap<Path, ReentrantLock> LOCKS = new ConcurrentHashMap<>();
 
     private final Path directory;
     private final URI source;
@@ -190,7 +194,9 @@ public final class ModelStore {
         if (verified.containsAll(files)) {
             return directory;
         }
-        synchronized (MONITORS.computeIfAbsent(directory, d -> new Object())) {
+        ReentrantLock lock = LOCKS.computeIfAbsent(directory, d -> new ReentrantLock());
+        lock.lockInterruptibly();
+        try {
             List<ModelFile> invalid = unverified(files);
             if (invalid.isEmpty()) {
                 return directory;
@@ -202,6 +208,8 @@ public final class ModelStore {
                     + "downloading them is turned off");
             }
             downloadUnderLock(invalid);
+        } finally {
+            lock.unlock();
         }
         return directory;
     }
